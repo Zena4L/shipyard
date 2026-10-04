@@ -44,6 +44,8 @@ pub enum SignalError {
 }
 
 impl Signal {
+    /// `SIGINT`: interrupt, as sent by Ctrl-C.
+    pub const INT: Self = Self(libc::SIGINT);
     /// `SIGTERM`: please exit. The default stop signal.
     pub const TERM: Self = Self(libc::SIGTERM);
     /// `SIGKILL`: exit now. Can't be caught or ignored.

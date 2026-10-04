@@ -21,7 +21,13 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # Features are added as each stage needs them.
-nix = { version = "0.31", default-features = false, features = ["fs", "signal", "user"] }
+nix = { version = "0.31", default-features = false, features = [
+  "fs",
+  "process",
+  "resource",
+  "signal",
+  "user",
+] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
+use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
 };
@@ -90,10 +91,26 @@ impl RunArgs {
     }
 }
 
+/// Runs the command and exits the way it did: with its exit code, or `128 + N`
+/// if signal N killed it. Failures to start it exit 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
+    // The stop policy is used once shipyard forwards signals (next step).
     let (spec, stop) = args.into_spec()?;
-    tracing::debug!(?spec, ?stop, "validated process spec");
-    bail!("the command and its settings are valid, but this version can't run commands yet")
+    tracing::debug!(?spec, ?stop, "running");
+    let status = match process::run_foreground(&spec) {
+        Ok(status) => status,
+        Err(err) => {
+            let code = err.exit_code();
+            return Ok(crate::report(&anyhow::Error::from(err), code));
+        }
+    };
+    if let ExitStatus::Signaled { signal, .. } = status
+        && signal == Signal::INT
+    {
+        // So that a shell loop around `shipyard run` stops on Ctrl-C too.
+        process::die_from(signal);
+    }
+    Ok(ExitCode::from(status.code()))
 }
 
 /// `KEY=VALUE` sets a variable; a bare `KEY` copies it from shipyard's own

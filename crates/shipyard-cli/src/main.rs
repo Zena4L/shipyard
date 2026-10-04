@@ -87,12 +87,17 @@ fn main() -> ExitCode {
     result.unwrap_or_else(|err| fail(&err))
 }
 
-/// Reports an error from shipyard itself, with its full cause chain
-/// ("doing X: because Y"), and returns exit code 125.
+/// Reports an error from shipyard itself and returns exit code 125.
 fn fail(err: &anyhow::Error) -> ExitCode {
+    report(err, EXIT_ENGINE_ERROR)
+}
+
+/// Prints an error with its full cause chain ("doing X: because Y") and
+/// returns `code` as the exit code.
+fn report(err: &dyn std::fmt::Display, code: u8) -> ExitCode {
     // Not `eprintln!`: it panics if stderr is a closed pipe.
     let _ = writeln!(std::io::stderr().lock(), "shipyard: {err:#}");
-    ExitCode::from(EXIT_ENGINE_ERROR)
+    ExitCode::from(code)
 }
 
 fn doctor() -> Result<ExitCode> {

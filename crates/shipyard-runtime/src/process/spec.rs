@@ -15,9 +15,11 @@ use super::rlimit::{Rlimit, RlimitError, RlimitKind};
 /// The most supplementary groups a process may have (`NGROUPS_MAX`).
 #[cfg(target_os = "linux")]
 pub const MAX_GROUPS: usize = 65_536;
-/// The most supplementary groups a process may have (`NGROUPS_MAX`).
+/// The most supplementary groups a process may have. macOS allows 16 entries
+/// (`NGROUPS_MAX`), but stores the primary group in the same list, which leaves
+/// 15 for supplementary groups.
 #[cfg(not(target_os = "linux"))]
-pub const MAX_GROUPS: usize = 16;
+pub const MAX_GROUPS: usize = 15;
 
 /// A process to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,9 +106,12 @@ pub enum SpecError {
     /// The working directory is relative.
     #[error("working directory \"{}\" must be an absolute path", .0.display())]
     CwdNotAbsolute(PathBuf),
-    /// The working directory contains a NUL byte.
-    #[error("working directory contains a NUL byte")]
-    NulInCwd,
+    /// A path or string that must become a C string contains a NUL byte.
+    #[error("{field} contains a NUL byte")]
+    ContainsNul {
+        /// Which field, in words.
+        field: &'static str,
+    },
     /// An ID of `u32::MAX`, which the kernel treats as "leave unchanged".
     /// Allowing it would silently keep the process's current (maybe root) ID.
     #[error(
@@ -162,7 +167,9 @@ impl ProcessSpec {
 
     fn validate_cwd(&self) -> Result<(), SpecError> {
         if self.cwd.as_os_str().as_bytes().contains(&0) {
-            return Err(SpecError::NulInCwd);
+            return Err(SpecError::ContainsNul {
+                field: "working directory",
+            });
         }
         if !self.cwd.is_absolute() {
             return Err(SpecError::CwdNotAbsolute(self.cwd.clone()));
@@ -237,7 +244,9 @@ mod tests {
         );
         assert_eq!(
             rejects(|s| s.cwd = OsStr::from_bytes(b"/a\0b").into()),
-            SpecError::NulInCwd
+            SpecError::ContainsNul {
+                field: "working directory"
+            }
         );
     }
 

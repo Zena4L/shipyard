@@ -465,6 +465,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap-markdown",
+ "libc",
  "proptest",
  "shipyard-runtime",
  "tracing",
@@ -479,6 +480,7 @@ dependencies = [
  "nix",
  "proptest",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

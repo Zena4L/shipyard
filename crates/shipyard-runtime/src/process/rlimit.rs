@@ -282,7 +282,7 @@ pub enum RlimitError {
 }
 
 impl RlimitError {
-    fn unsupported(kind: RlimitKind) -> Self {
+    pub(crate) fn unsupported(kind: RlimitKind) -> Self {
         Self::Unsupported {
             kind,
             os: std::env::consts::OS,
