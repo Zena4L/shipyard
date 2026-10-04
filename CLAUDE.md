@@ -22,7 +22,11 @@ the previous one. Don't jump ahead or build later stages early.
 - `docs/ROADMAP.md`: stages, TLPI chapter mapping, and recorded decisions.
 - `docs/FEATURES.md`: the full feature list per stage, the production-quality bar, and what's
   out of scope.
-- `docs/DEVELOPMENT.md`: setup, commands, and the Lima VM for Linux-only work on macOS.
+- `docs/DEVELOPMENT.md`: setup, commands, and running Linux-only code from macOS (a
+  container via `scripts/test-linux.sh`, or the Lima VM).
+- `docs/stages/`: stage notes, the engineering record of each finished stage (decisions,
+  failure modes, platform differences, items carried forward).
+- `scripts/`: developer scripts (`test-linux.sh`).
 - `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
   - `cli.md` is generated from the clap definitions; never edit it by hand.
   - Describe only what works in the current version.
@@ -99,8 +103,8 @@ behavior, exit codes, messages):
 
 Every public Rust item needs a doc comment; the `missing_docs` lint enforces it.
 
-Linux-only behavior must also be *run* in the Lima VM (see `docs/DEVELOPMENT.md`), not just
-compiled. Test as you build: every stage ships with tests.
+Linux-only behavior must also be *run* on Linux, not just compiled:
+`scripts/test-linux.sh` (a container) or the Lima VM (see `docs/DEVELOPMENT.md`). Test as you build: every stage ships with tests.
 
 ## Working with the author
 

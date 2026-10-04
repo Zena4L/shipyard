@@ -72,6 +72,8 @@ pub(crate) struct FailureContext {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) rlimits: Vec<Rlimit>,
+    /// Whether shipyard runs as root (as root, an EPERM isn't about privileges).
+    pub(crate) root: bool,
 }
 
 /// Errors from `execve` that mean "no program at this path", so a PATH
@@ -189,7 +191,7 @@ fn describe_rlimit(errno: Errno, detail: u64, ctx: &FailureContext) -> String {
     };
     if errno == Errno::EPERM {
         let nofile = limit.is_some_and(|limit| limit.kind == RlimitKind::Nofile);
-        let hint = match (nix::unistd::geteuid().is_root(), nofile) {
+        let hint = match (ctx.root, nofile) {
             (false, _) => " (raising a hard limit needs root)",
             (true, true) => " (the kernel's maximum is lower; on Linux see fs.nr_open)",
             (true, false) => "",
@@ -307,6 +309,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             rlimits: vec!["nofile=10:20".parse().unwrap()],
+            root: false,
         }
     }
 
@@ -457,6 +460,22 @@ mod tests {
             "{limit}"
         );
         assert!(limit.to_string().contains("needs root"), "{limit}");
+
+        // As root, an EPERM can't mean "needs root".
+        let as_root = FailureContext {
+            root: true,
+            ..ctx.clone()
+        };
+        let limit = describe(
+            ChildFailure {
+                step: ChildStep::Rlimit,
+                errno: Errno::EPERM,
+                detail: 0,
+            },
+            &as_root,
+        );
+        assert!(!limit.to_string().contains("needs root"), "{limit}");
+        assert!(limit.to_string().contains("kernel's maximum"), "{limit}");
 
         assert_eq!(
             fail(ChildStep::SetUid, Errno::EPERM, 0).to_string(),
