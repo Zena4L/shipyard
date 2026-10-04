@@ -19,10 +19,13 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Spawning:** `fork`/`exec` with the right environment, working directory, user and groups.
 - **Exit status:** reported faithfully: normal exit, killed by signal, `128 + N`.
 - **Graceful stop:** `SIGTERM`, then a grace period, then `SIGKILL`.
-- **Signal forwarding:** from the CLI to the container.
-- **Minimal PID 1 init** (tini-like): reaps zombies, forwards signals, exits with the
-  child's code.
-- **Process controls:** `kill`, `wait`, and rlimits (open files, process count, core dumps).
+- **Signal forwarding:** from the CLI to the command.
+- **Reaping and cleanup:** every process the command started is reaped, and leftovers are
+  killed when it exits (Linux: as a child subreaper). This is the stage-1 groundwork for
+  stage 2's PID-1 init.
+- **Resource limits:** rlimits (open files, process count, core dumps, …).
+- **Terminal-aware:** with a terminal, the command shares it and job control (Ctrl-C,
+  Ctrl-Z) works normally; `TERM` is passed through.
 
 ## 2. Namespaces — stage 2
 
@@ -31,10 +34,14 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Joining namespaces:** `setns` into a running container. This is the basis of `exec`
   and the UI's Shell.
 - **Per-container identity:** hostname, domain name, and namespaced sysctls.
+- **Own session:** each container is a new session (`setsid`), detached from the host's
+  terminal.
+- **Minimal PID 1 init** (tini-like): inside the container's PID namespace, reaps zombies,
+  forwards signals, and exits with the main process's code.
 - **Setup handshake:** a parent/child sync pipe, so the parent can finish setup before the
   child `exec`s the user's program.
 
-## 3. Filesystem isolation — stage 3
+## 3. Filesystem isolation and OCI bundles — stage 3
 
 - **Root switch:** `pivot_root` (never `chroot`), then detach the old root.
 - **Mount propagation:** controlled so mounts never leak between host and container.
@@ -45,6 +52,11 @@ Shipyard has three layers, mirroring how the established tools split up:
   - `/dev/pts`, `/dev/shm`, `/dev/mqueue`
 - **Masked and read-only paths:** e.g. `/proc/kcore`, `/proc/keys`.
 - **Optional read-only root filesystem.**
+- **OCI bundles:** read an OCI `config.json` plus root filesystem, and implement the OCI
+  runtime commands `create / start / kill / delete / state`. From here on, the engine
+  drives the runtime the way Podman drives runc.
+- **User and group names:** `--user nobody` and `--group-add wheel`, resolved from the
+  container's own `/etc/passwd` and `/etc/group`.
 
 ## 4. Users and security — stage 4
 
@@ -128,6 +140,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Pseudoterminals** for `-it`, with resize via `SIGWINCH` and the `TIOCSWINSZ` ioctl.
 - **`attach` / detach:** with detach keys.
 - **`exec` sessions:** each with its own terminal.
+- **File-descriptor passing:** `--preserve-fds` and systemd-style socket activation
+  (`LISTEN_FDS`).
 - **Logs:** log files with rotation; `logs --follow --tail --since --timestamps`.
 - **`cp`:** copy files into and out of a container.
 
@@ -143,6 +157,8 @@ Shipyard has three layers, mirroring how the established tools split up:
   monitor rather than a daemon.
 - **Health checks:** with health state exposed to the CLI and UI.
 - **`events` stream:** start, stop, die, OOM, pull, …
+- **Commands across processes:** `kill`, `wait`, `stop` and `ps` work on containers started
+  by other shipyard invocations, using the on-disk state.
 - *Optional:* generated systemd units so containers start at boot.
 
 ## 10. Compose and stacks — stage 10

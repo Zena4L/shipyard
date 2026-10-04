@@ -6,7 +6,7 @@
 //! writes one 16-byte record first. 16 bytes is far below `PIPE_BUF`, so the
 //! write is atomic: the parent sees all of it or none of it.
 
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};
@@ -77,31 +77,77 @@ fn decode(record: [u8; RECORD_LEN]) -> Option<ChildFailure> {
     })
 }
 
-/// Waits for the child's verdict: `None` if `exec` succeeded, or the failure
-/// it reported.
-pub(crate) fn read_report(pipe: &OwnedFd) -> Result<Option<ChildFailure>> {
-    let mut record = [0u8; RECORD_LEN];
-    let mut filled = 0;
-    while let Some(rest) = record.get_mut(filled..).filter(|rest| !rest.is_empty()) {
-        match nix::unistd::read(pipe.as_fd(), rest) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(Errno::EINTR) => {}
-            Err(e) => return Err(Error::sys("reading the child's startup report", e)),
+/// What the report pipe has said so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// Nothing conclusive yet.
+    Pending,
+    /// End-of-file with no record: `exec` succeeded.
+    Running,
+    /// The child reported a failure.
+    Failed(ChildFailure),
+}
+
+/// Reads the report pipe without blocking, collecting the record across
+/// calls. A blocking read would let a child that stopped half-way (SIGSTOP
+/// can't be blocked) freeze the supervisor.
+#[derive(Debug)]
+pub(crate) struct ReportReader {
+    pipe: OwnedFd,
+    record: [u8; RECORD_LEN],
+    filled: usize,
+}
+
+impl ReportReader {
+    pub(crate) fn new(pipe: OwnedFd) -> Result<Self> {
+        let flags = fcntl(&pipe, FcntlArg::F_GETFL)
+            .map_err(|e| Error::sys("reading the report pipe's flags", e))?;
+        let flags = nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+        fcntl(&pipe, FcntlArg::F_SETFL(flags))
+            .map_err(|e| Error::sys("making the report pipe non-blocking", e))?;
+        Ok(Self {
+            pipe,
+            record: [0; RECORD_LEN],
+            filled: 0,
+        })
+    }
+
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.pipe.as_fd()
+    }
+
+    /// Reads whatever is available.
+    pub(crate) fn read(&mut self) -> Result<Report> {
+        loop {
+            let Some(rest) = self.record.get_mut(self.filled..).filter(|r| !r.is_empty()) else {
+                // A whole record: no need to wait for end-of-file.
+                return decode(self.record).map(Report::Failed).ok_or_else(|| {
+                    Error::sys(
+                        "the child's startup report names an unknown step",
+                        Errno::EPROTO,
+                    )
+                });
+            };
+            match nix::unistd::read(self.pipe.as_fd(), rest) {
+                Ok(0) => return self.at_end_of_file(),
+                Ok(n) => self.filled += n,
+                Err(Errno::EAGAIN) => return Ok(Report::Pending),
+                Err(Errno::EINTR) => {}
+                Err(e) => return Err(Error::sys("reading the child's startup report", e)),
+            }
         }
     }
-    match filled {
-        0 => Ok(None),
-        RECORD_LEN => decode(record).map(Some).ok_or_else(|| {
-            Error::sys(
-                "the child's startup report names an unknown step",
+
+    fn at_end_of_file(&self) -> Result<Report> {
+        match self.filled {
+            0 => Ok(Report::Running),
+            partial => Err(Error::sys(
+                format!(
+                    "the child's startup report was cut short ({partial} of {RECORD_LEN} bytes)"
+                ),
                 Errno::EPROTO,
-            )
-        }),
-        partial => Err(Error::sys(
-            format!("the child's startup report was cut short ({partial} of {RECORD_LEN} bytes)"),
-            Errno::EPROTO,
-        )),
+            )),
+        }
     }
 }
 
@@ -139,24 +185,48 @@ mod tests {
         assert!(write.as_raw_fd() >= 3);
     }
 
+    fn reader_with(bytes: &[u8], close: bool) -> (ReportReader, Option<OwnedFd>) {
+        let (read, write) = report_pipe().unwrap();
+        if !bytes.is_empty() {
+            nix::unistd::write(&write, bytes).unwrap();
+        }
+        let write = if close {
+            drop(write);
+            None
+        } else {
+            Some(write)
+        };
+        (ReportReader::new(read).unwrap(), write)
+    }
+
     #[test]
-    fn report_reads_eof_record_and_short_writes() {
-        // EOF with nothing written: exec succeeded.
-        let (read, write) = report_pipe().unwrap();
-        drop(write);
-        assert_eq!(read_report(&read).unwrap(), None);
+    fn end_of_file_with_nothing_written_means_running() {
+        let (mut reader, _) = reader_with(&[], true);
+        assert_eq!(reader.read().unwrap(), Report::Running);
+    }
 
-        // A full record.
-        let (read, write) = report_pipe().unwrap();
-        nix::unistd::write(&write, &encode(ChildStep::Chdir, libc::ENOENT, 0)).unwrap();
-        drop(write);
-        let failure = read_report(&read).unwrap().unwrap();
-        assert_eq!(failure.step, ChildStep::Chdir);
+    #[test]
+    fn an_open_empty_pipe_is_pending_not_blocking() {
+        let (mut reader, _write) = reader_with(&[], false);
+        assert_eq!(reader.read().unwrap(), Report::Pending);
+    }
 
-        // A truncated record is a protocol error, not a silent success.
-        let (read, write) = report_pipe().unwrap();
-        nix::unistd::write(&write, &[1, 0, 0]).unwrap();
-        drop(write);
-        assert!(read_report(&read).is_err());
+    #[test]
+    fn a_record_arriving_in_pieces_is_collected() {
+        let record = encode(ChildStep::Chdir, libc::ENOENT, 0);
+        let (first, second) = record.split_at(5);
+        let (mut reader, write) = reader_with(first, false);
+        assert_eq!(reader.read().unwrap(), Report::Pending);
+        nix::unistd::write(write.as_ref().unwrap(), second).unwrap();
+        match reader.read().unwrap() {
+            Report::Failed(failure) => assert_eq!(failure.step, ChildStep::Chdir),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_truncated_record_is_a_protocol_error() {
+        let (mut reader, _) = reader_with(&[1, 0, 0], true);
+        assert!(reader.read().is_err());
     }
 }

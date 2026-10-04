@@ -4,7 +4,9 @@ version = 2
 
 [licenses]
 version = 2
-allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC"]
+# Only licenses a dependency actually uses: cargo-deny warns about unused
+# entries, and a short list is easier to review when a new one appears.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "warn"

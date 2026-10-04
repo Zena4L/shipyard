@@ -24,22 +24,16 @@ use std::os::fd::RawFd;
 use nix::errno::Errno;
 use nix::sys::signal::{SigSet, SigmaskHow, sigprocmask};
 use nix::sys::stat::{Mode, umask};
-use nix::unistd::{Gid, Uid};
+use nix::unistd::{Gid, Pid, Uid, getpgrp, getpid, setpgid};
 
 use super::channel::encode;
 use super::failure::ChildStep;
 use super::plan::{ChildPlan, Credentials, FdSweep};
+use super::signal::MAX_SIGNAL;
 
 /// The child's exit code when setup fails. The parent normally reads the
 /// failure from the report pipe instead; this is only what's left if it can't.
 const SETUP_FAILED: libc::c_int = 125;
-
-/// The highest signal number to reset: Linux's real-time signals end at 64;
-/// macOS's last signal is 31.
-#[cfg(target_os = "linux")]
-const MAX_SIGNAL: libc::c_int = 64;
-#[cfg(not(target_os = "linux"))]
-const MAX_SIGNAL: libc::c_int = 31;
 
 /// A failed setup step, as it travels to the parent.
 struct Failure {
@@ -60,6 +54,11 @@ impl Failure {
 
 /// If anything unwinds (it shouldn't: see the lints above), exit instead of
 /// running the parent's code in this copy of its process.
+///
+/// A last resort, not a safety net: in builds that unwind (debug, tests), the
+/// panic hook runs *before* this, and it allocates and locks stderr. Release
+/// builds abort on panic and never get here. The real protection is the
+/// lints, which keep panics out of this module.
 struct ExitOnUnwind;
 
 impl Drop for ExitOnUnwind {
@@ -89,7 +88,12 @@ pub(crate) unsafe fn child_main(plan: &ChildPlan, report: RawFd) -> ! {
 /// Runs the setup steps in order, then tries each exec candidate.
 /// Only returns on failure.
 fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
-    reset_signal_dispositions()?;
+    reset_signal_dispositions(&plan.keep_ignored)?;
+    if plan.new_process_group {
+        // Its own group, so the supervisor can signal everything the command
+        // starts at once. Only without a terminal; see `SpawnOptions`.
+        start_process_group()?;
+    }
     mark_inherited_fds_cloexec(&plan.inherited_fds)?;
     apply_rlimits(plan)?;
     umask(Mode::from_bits_truncate(plan.umask));
@@ -97,34 +101,39 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     // Change directory as the original user first (root may be able to enter
     // a directory the target user can't). If that fails and the user is about
     // to change, try again afterwards, when the new user's permissions apply.
+    // Only a permission error is worth retrying (runc does the same): any
+    // other error, like a missing directory, won't change with the user.
     let chdir_error = chdir(plan).err();
     if let Some(credentials) = &plan.credentials {
         switch_credentials(credentials)?;
     }
-    if let Some(errno) = chdir_error {
-        if plan.credentials.is_none() {
-            return Err(Failure::at(ChildStep::Chdir, errno));
+    match chdir_error {
+        None => {}
+        Some(Errno::EACCES | Errno::EPERM) if plan.credentials.is_some() => {
+            chdir(plan).map_err(|errno| Failure::at(ChildStep::Chdir, errno))?;
         }
-        chdir(plan).map_err(|errno| Failure::at(ChildStep::Chdir, errno))?;
+        Some(errno) => return Err(Failure::at(ChildStep::Chdir, errno)),
     }
 
-    // macOS has no parent-death signal; step 4's supervisor covers that case.
+    // macOS has no parent-death signal: if shipyard is killed with SIGKILL
+    // there, the command keeps running (documented in docs/user/run.md).
     #[cfg(target_os = "linux")]
     die_with_parent(plan)?;
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
-        .map_err(|errno| Failure::at(ChildStep::ResetSignals, errno))?;
+        .map_err(|errno| Failure::at(ChildStep::SignalMask, errno))?;
     Err(exec_first_candidate(plan))
 }
 
-/// Puts every signal back to its default action. Shipyard ignores SIGPIPE
-/// (Rust does by default) and may ignore others; an ignored signal stays
-/// ignored across `exec`, which would silently change how the command behaves.
-fn reset_signal_dispositions() -> Result<(), Failure> {
+/// Puts every signal back to its default action, except those in
+/// `keep_ignored`. Shipyard ignores SIGPIPE (Rust does by default) and
+/// catches others; an ignored signal stays ignored across `exec`, which would
+/// silently change how the command behaves.
+fn reset_signal_dispositions(keep_ignored: &[libc::c_int]) -> Result<(), Failure> {
     // SAFETY: a zeroed `sigaction` is a valid value (no handler, no flags,
     // empty mask); we then set the handler to SIG_DFL.
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
     default.sa_sigaction = libc::SIG_DFL;
-    for signal in 1..=MAX_SIGNAL {
+    for signal in (1..=MAX_SIGNAL).filter(|signal| !keep_ignored.contains(signal)) {
         // SAFETY: `sigaction` is async-signal-safe; installing SIG_DFL runs no
         // code of ours. EINVAL is expected for SIGKILL, SIGSTOP and the
         // signals the C library reserves.
@@ -134,6 +143,30 @@ fn reset_signal_dispositions() -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+/// Makes this process the leader of a new process group.
+///
+/// The parent makes the same call for the child (TLPI §34.2: with both
+/// calling it, the order in which they run doesn't matter). On macOS the two
+/// calls can collide, and this one then fails with EPERM although the
+/// parent's has done the job, or is about to. So success is judged by the
+/// result, with a few retries while the parent's call finishes.
+fn start_process_group() -> Result<(), Failure> {
+    const ATTEMPTS: u32 = 100;
+    let mut last = Errno::UnknownErrno;
+    for _ in 0..ATTEMPTS {
+        match setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+            Ok(()) => return Ok(()),
+            Err(errno) => last = errno,
+        }
+        if getpgrp() == getpid() {
+            return Ok(());
+        }
+        // SAFETY: `sched_yield` is a plain system call with no arguments.
+        unsafe { libc::sched_yield() };
+    }
+    Err(Failure::at(ChildStep::ProcessGroup, last))
 }
 
 /// Marks every descriptor above 2 close-on-exec, so the command inherits only
@@ -182,19 +215,32 @@ fn set_cloexec(fd: RawFd) -> Result<(), Failure> {
 /// a hard limit needs privileges the new user may not have.
 fn apply_rlimits(plan: &ChildPlan) -> Result<(), Failure> {
     for (index, limit) in plan.rlimits.iter().enumerate() {
-        let value = libc::rlimit {
-            rlim_cur: limit.soft,
-            rlim_max: limit.hard,
-        };
-        // SAFETY: `value` is a valid `rlimit`; `setrlimit` is a direct system
-        // call wrapper with no locks or allocation.
-        if unsafe { libc::setrlimit(limit.resource, &raw const value) } == -1 {
-            return Err(Failure {
-                step: ChildStep::Rlimit,
-                errno: Errno::last(),
-                detail: u64::try_from(index).unwrap_or(u64::MAX),
-            });
+        let mut result = set_rlimit(limit.resource, limit.soft, limit.hard);
+        if let (Err(Errno::EINVAL), Some(soft)) = (result, limit.fallback_soft) {
+            result = set_rlimit(limit.resource, soft, limit.hard);
         }
+        result.map_err(|errno| Failure {
+            step: ChildStep::Rlimit,
+            errno,
+            detail: u64::try_from(index).unwrap_or(u64::MAX),
+        })?;
+    }
+    Ok(())
+}
+
+fn set_rlimit(
+    resource: super::plan::RawResource,
+    soft: libc::rlim_t,
+    hard: libc::rlim_t,
+) -> Result<(), Errno> {
+    let value = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: `value` is a valid `rlimit`; `setrlimit` is a direct system
+    // call wrapper with no locks or allocation.
+    if unsafe { libc::setrlimit(resource, &raw const value) } == -1 {
+        return Err(Errno::last());
     }
     Ok(())
 }
@@ -215,19 +261,18 @@ fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
     verify_credentials(credentials)
 }
 
-#[cfg(target_os = "linux")]
-fn set_groups(groups: &[Gid]) -> Result<(), Failure> {
-    nix::unistd::setgroups(groups).map_err(|errno| Failure::at(ChildStep::SetGroups, errno))
-}
-
-/// nix doesn't offer `setgroups` on macOS, so call it directly.
-#[cfg(not(target_os = "linux"))]
-fn set_groups(groups: &[Gid]) -> Result<(), Failure> {
+/// Raw `libc::setgroups` on both platforms: nix doesn't offer it on macOS,
+/// and its `Gid` isn't guaranteed to have `gid_t`'s layout, so a `&[Gid]`
+/// can't be handed to the kernel as an array of `gid_t`.
+fn set_groups(groups: &[libc::gid_t]) -> Result<(), Failure> {
+    #[cfg(target_os = "linux")]
+    let count = groups.len();
+    #[cfg(not(target_os = "linux"))]
     let count = libc::c_int::try_from(groups.len())
         .map_err(|_| Failure::at(ChildStep::SetGroups, Errno::EINVAL))?;
-    // SAFETY: `Gid` is a transparent wrapper around `gid_t`, so the slice is a
-    // valid array of `count` group IDs for the duration of the call.
-    let rc = unsafe { libc::setgroups(count, groups.as_ptr().cast()) };
+    // SAFETY: `groups` is a valid array of `count` group IDs for the duration
+    // of the call; `setgroups` only reads it.
+    let rc = unsafe { libc::setgroups(count, groups.as_ptr()) };
     if rc == -1 {
         return Err(Failure::at(ChildStep::SetGroups, Errno::last()));
     }
@@ -293,14 +338,14 @@ fn ids_match(credentials: &Credentials) -> bool {
 
 /// On Linux, `setgroups` sets the list exactly, so there is nothing to check.
 #[cfg(target_os = "linux")]
-fn groups_match(_expected: &[Gid]) -> bool {
+fn groups_match(_expected: &[libc::gid_t]) -> bool {
     true
 }
 
 /// On macOS the group list shares storage with the effective group, so check
 /// that every requested group survived `setgid`.
 #[cfg(not(target_os = "linux"))]
-fn groups_match(expected: &[Gid]) -> bool {
+fn groups_match(expected: &[libc::gid_t]) -> bool {
     let mut actual: [libc::gid_t; 16] = [0; 16];
     // SAFETY: `actual` is a writable array of 16 `gid_t`, and 16 is passed as
     // its length, so the kernel can't write past it.
@@ -311,7 +356,7 @@ fn groups_match(expected: &[Gid]) -> bool {
     let Some(actual) = actual.get(..count) else {
         return false;
     };
-    expected.iter().all(|gid| actual.contains(&gid.as_raw()))
+    expected.iter().all(|gid| actual.contains(gid))
 }
 
 /// On Linux, makes the command die if shipyard dies, so it can't be left
@@ -321,7 +366,8 @@ fn die_with_parent(plan: &ChildPlan) -> Result<(), Failure> {
     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
         .map_err(|errno| Failure::at(ChildStep::ParentDeathSignal, errno))?;
     // The parent may have died before the call above: then the signal will
-    // never come, so check by hand.
+    // never come, so check by hand. (In a new PID namespace, stage 2,
+    // `getppid` returns 0: this check must change with it.)
     if nix::unistd::getppid().as_raw() != plan.parent_pid {
         // SAFETY: see `ExitOnUnwind::drop`. Nobody is left to report to.
         unsafe { libc::_exit(SETUP_FAILED) }

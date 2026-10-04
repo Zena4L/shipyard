@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use nix::errno::Errno;
 
-use crate::process::{EXIT_ENGINE_ERROR, SpawnError, SpecError};
+use crate::process::{EXIT_ENGINE_ERROR, SpawnError, SpecError, StopSignalError};
 
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]
@@ -33,9 +33,19 @@ pub enum Error {
     #[error(transparent)]
     InvalidSpec(#[from] SpecError),
 
+    /// The stop signal can't end a process (it stops or continues it).
+    #[error(transparent)]
+    StopSignal(#[from] StopSignalError),
+
     /// Running as another user or group, or adding groups, needs root.
     #[error("running as a different user or group needs root: {0}")]
     NeedsRoot(String),
+
+    /// A [`Supervisor`](crate::process::Supervisor) already exists in this
+    /// process. It owns the process's signal handlers, so there can be only
+    /// one at a time.
+    #[error("a supervisor is already running in this process")]
+    AlreadySupervising,
 
     /// The command was started but never got to run.
     #[error(transparent)]

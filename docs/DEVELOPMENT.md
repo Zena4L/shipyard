@@ -28,8 +28,27 @@ cargo doc --workspace --no-deps --open
 cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu
 ```
 
-CI runs fmt, clippy and tests on both Linux and macOS, the docs build (warnings as errors), and
-cargo-deny on every push and PR.
+CI runs, on every push and PR:
+
+- fmt;
+- clippy and tests on Linux and macOS;
+- the tests again as root on Linux (see below);
+- clippy for `x86_64-unknown-linux-musl`;
+- the docs build (warnings as errors);
+- cargo-deny.
+
+### Tests that need root
+
+Tests that switch user or groups are marked `#[ignore]`, so a normal
+`cargo test` skips them. To run them (in the Lima VM, never on your Mac), let
+cargo run the test binaries through `sudo`, so the build itself isn't root:
+
+```sh
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="sudo -E" \
+  cargo test --workspace -- --include-ignored
+```
+
+(Use `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER` on an Intel machine.)
 
 ## Running Linux-only stages on macOS: Lima VM
 
@@ -48,14 +67,15 @@ Inside the VM:
 ```sh
 sudo apt-get update && sudo apt-get install -y build-essential
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-cd ~/Desktop/shipyard        # same path as on the Mac
+cd "/Users/$USER/Desktop/shipyard"   # the Mac's path, mounted by Lima
 
 # Keep Linux build artifacts separate from the macOS ones in ./target
 export CARGO_TARGET_DIR="$HOME/.cache/shipyard-target"
 cargo run -- doctor
 ```
 
-Edit on macOS, build and run in the VM. Many later stages need root (or user
+Lima mounts your Mac's home directory at the same path (`/Users/<you>`), not
+at the VM's own `~`. Edit on macOS, build and run in the VM. Many later stages need root (or user
 namespaces), so expect to use `sudo` inside the VM — never on your Mac.
 
 ## Conventions

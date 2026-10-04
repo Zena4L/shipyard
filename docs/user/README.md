@@ -4,8 +4,9 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 
 > **Status: early development.** Shipyard doesn't isolate commands yet. Today
 > `shipyard run` starts a command the way a container runtime does (clean
-> environment, chosen user, working directory and resource limits) and reports
-> exactly how it ended. These docs describe only what works in the current
+> environment, chosen user, working directory and resource limits), supervises it
+> (passing signals on, stopping it gracefully, cleaning up what it leaves
+> behind), and reports exactly how it ended. These docs describe only what works in the current
 > version, and they are updated with every release.
 
 ## Pages

@@ -23,6 +23,7 @@ libc = "0.2"
 # Features are added as each stage needs them.
 nix = { version = "0.31", default-features = false, features = [
   "fs",
+  "poll",
   "process",
   "resource",
   "signal",
