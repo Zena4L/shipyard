@@ -18,6 +18,9 @@ shipyard-runtime = { path = "crates/shipyard-runtime" }
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+# Features are added as each stage needs them.
+nix = { version = "0.31", default-features = false, features = ["fs", "signal", "user"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -33,6 +36,8 @@ pedantic = { level = "warn", priority = -1 }
 # Every `unsafe` block must explain why it is sound.
 undocumented_unsafe_blocks = "deny"
 module_name_repetitions = "allow"
+# POSIX names (uid/gid, pid/pgid, euid/egid) are clearer than invented ones.
+similar_names = "allow"
 missing_errors_doc = "allow"
 
 [profile.release]

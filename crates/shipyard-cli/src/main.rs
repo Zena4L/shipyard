@@ -1,8 +1,10 @@
 use std::io::Write;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use shipyard_runtime::Backend;
+use shipyard_runtime::process::{self, EXIT_ENGINE_ERROR};
 use tracing_subscriber::EnvFilter;
 
 /// A lightweight container engine.
@@ -23,16 +25,45 @@ enum Command {
     Doctor,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    // Security check first: a setuid binary must not do anything at all.
+    if let Err(err) = process::refuse_setid_execution() {
+        return fail(&err.into());
+    }
+    // Before anything else opens a file; see `ensure_std_fds_open`.
+    if let Err(err) = process::ensure_std_fds_open() {
+        return fail(&err.into());
+    }
+
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // `--help` and `--version` are not failures. Usage errors exit 125
+            let _ = err.print();
+            return if err.use_stderr() {
+                ExitCode::from(EXIT_ENGINE_ERROR)
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
     init_tracing(cli.verbose);
 
-    match cli.command {
+    let result = match cli.command {
         Command::Doctor => doctor(),
-    }
+    };
+    result.unwrap_or_else(|err| fail(&err))
 }
 
-fn doctor() -> Result<()> {
+/// Reports an error from shipyard itself, with its full cause chain
+/// ("doing X: because Y"), and returns exit code 125.
+fn fail(err: &anyhow::Error) -> ExitCode {
+    // Not `eprintln!`: it panics if stderr is a closed pipe.
+    let _ = writeln!(std::io::stderr().lock(), "shipyard: {err:#}");
+    ExitCode::from(EXIT_ENGINE_ERROR)
+}
+
+fn doctor() -> Result<ExitCode> {
     let backend = match shipyard_runtime::host_backend() {
         Backend::Native => "native (host kernel)",
         Backend::LinuxVm => "linux-vm (not implemented yet)",
@@ -47,7 +78,7 @@ fn doctor() -> Result<()> {
         std::env::consts::ARCH
     )?;
     writeln!(out, "backend: {backend}")?;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn init_tracing(verbose: u8) {
