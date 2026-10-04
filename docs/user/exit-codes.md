@@ -2,10 +2,6 @@
 
 Shipyard's exit codes follow Docker's, so existing scripts keep working.
 
-> **Status:** this version validates commands but can't start them yet, so
-> today you'll only see `0` (for `--help` and `--version`) and `125`. The rest of
-> this page describes the contract that applies once commands run; it won't
-> change when that lands.
 
 When the command runs and exits, its exit code passes through unchanged,
 whatever it is (0–255). The codes below have a special meaning:
@@ -13,8 +9,8 @@ whatever it is (0–255). The codes below have a special meaning:
 | Code | Meaning |
 |---|---|
 | `125` | **Shipyard failed.** The command never ran. Causes include an unknown option, an invalid value (signal, limit, user ID, environment variable), a relative working directory, or a host problem. The message on stderr says which. |
-| `126` | **The command could not be executed.** It exists but isn't executable, or isn't a valid program. |
-| `127` | **The command was not found.** This is also the code when a script's `#!` interpreter is missing. |
+| `126` | **The command could not be executed.** It isn't executable, is a directory, isn't a valid program (for example a script with no `#!` line), or the user hit its process limit. |
+| `127` | **The command was not found.** Also when the file exists but its `#!` interpreter (or, for a binary, its loader) is missing; the message says so. |
 | `128 + N` | **The command was killed by signal N.** |
 
 A command can also exit with 125–127, or above 128, by itself. If you need to

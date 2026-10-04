@@ -60,6 +60,22 @@ the previous one. Don't jump ahead or build later stages early.
 - **Dependencies:** declare versions once in `[workspace.dependencies]`; members use
   `.workspace = true`.
 
+## Code that runs after `fork`
+
+`crates/shipyard-runtime/src/process/child.rs` (and anything it calls) runs in the
+child between `fork` and `exec`. If the parent had other threads, any lock they held
+(the allocator's, stdio's) stays locked forever in the child. So that code must:
+
+- **never allocate, panic or take a lock**: no `Vec`/`String`/`format!`, no
+  `println!`, no `tracing`. The module denies indexing, arithmetic side effects,
+  `unwrap`, `expect` and `panic`.
+- **call only async-signal-safe functions**, or nix wrappers that are thin calls to
+  them. nix's `execve` allocates, so `libc::execve` is used directly.
+- **report failures as numbers** (step, errno, detail) over the report pipe, then
+  `_exit`. The parent turns them into messages (`failure.rs`).
+
+Everything the child needs is prepared before `fork`, in `plan.rs`.
+
 ## Before calling work done
 
 ```sh

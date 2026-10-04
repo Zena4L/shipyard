@@ -7,9 +7,10 @@ shipyard run [OPTIONS] COMMAND [ARGS...]
 `shipyard run` starts a command the way a container runtime does: with a clean
 environment and exactly the user, working directory and limits you ask for.
 
-> **Status:** `run` currently checks the command and every setting, reports any
-> problem, and stops before starting the command. Starting it is the next feature
-> to land. Isolation (namespaces, a separate filesystem) comes after that.
+> **Status:** `run` starts the command with exactly the settings below and
+> reports how it ended. It doesn't isolate it yet: the command sees the host's
+> filesystem, processes and network. Isolation (namespaces, a separate
+> filesystem) comes in a later version.
 
 ## Arguments
 
@@ -84,9 +85,16 @@ These are rejected:
 
 - **ID `4294967295`.** The kernel reads it as "leave unchanged", so allowing it
   could silently leave the command running as root.
-- **Too many supplementary groups.** The limit is 16 on macOS and 65536 on Linux.
+- **Too many supplementary groups.** The limit is 15 on macOS (the system's 16
+  slots include the primary group) and 65536 on Linux.
 
-Switching to another user requires running `shipyard` as root.
+Switching to another user or group, or adding groups, requires running
+`shipyard` as root. Otherwise it fails before starting, and says what differs:
+for example `-u 501` alone asks for group `0`, so use `-u 501:20` to keep your
+own group.
+
+When running as root, the command gets **only** the groups you ask for; root's
+own supplementary groups are always dropped.
 
 ## Resource limits
 
@@ -128,7 +136,28 @@ Names are case-insensitive, and accept both Docker style (`nofile`) and OCI styl
 On macOS, the largest finite value is `9223372036854775806` (2⁶³ − 2). `rss` is
 Linux-only because macOS treats it as another name for `as`.
 
+## Inherited state
+
+The command starts clean, whatever state Shipyard was started in:
+
+- **Signals:** every signal is back to its default action and none are blocked.
+  (Shipyard itself ignores `SIGPIPE`, as Rust programs do; the command doesn't.)
+- **File descriptors:** only stdin, stdout and stderr are passed on. Any other
+  open descriptor is closed when the command starts.
+- **umask:** `022`.
+- **On Linux:** if Shipyard is killed, the command is killed too.
+
 ## Stopping
+
+**Ctrl-C** and **Ctrl-\\** go straight to the command, which handles them as it
+would without Shipyard. If Ctrl-C ends the command, Shipyard also stops as if
+interrupted, so a shell loop around `shipyard run` stops too.
+
+> **Not yet supported:** signals sent to Shipyard's own process ID (for example
+> `kill -INT <pid>`, or `timeout -s INT`) aren't passed on to the command yet, and
+> on macOS killing Shipyard with `SIGTERM` leaves the command running. Signal
+> forwarding comes in the next version. `--stop-signal` and `--stop-timeout`
+> are accepted now and take effect then.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -145,6 +174,5 @@ Signals can be given as:
 
 ## Exit codes
 
-See [Exit codes](exit-codes.md). Today `run` exits `125` after validating, since
-it can't start commands yet. `125` always means Shipyard itself rejected
-something, such as an invalid option.
+See [Exit codes](exit-codes.md). In short: `run` returns the command's own exit
+code, `128 + N` if signal N killed it, and `125`–`127` if it never ran.

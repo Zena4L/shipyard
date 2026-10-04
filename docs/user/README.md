@@ -2,11 +2,11 @@
 
 Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 
-> **Status: early development.** Shipyard can't run containers yet. Today you can
-> install it, check your host with `shipyard doctor`, and use `shipyard run` to
-> validate a command and its settings. Starting the command is the next feature to
-> land. These docs describe only what works in the current version, and they are
-> updated with every release.
+> **Status: early development.** Shipyard doesn't isolate commands yet. Today
+> `shipyard run` starts a command the way a container runtime does (clean
+> environment, chosen user, working directory and resource limits) and reports
+> exactly how it ended. These docs describe only what works in the current
+> version, and they are updated with every release.
 
 ## Pages
 
@@ -52,10 +52,16 @@ backend: linux-vm (not implemented yet)
 On Linux, containers run directly on the host kernel. On macOS they will run
 inside a lightweight Linux VM that Shipyard manages.
 
-Validate a command and its settings:
+Run a command:
 
 ```sh
-shipyard run -e GREETING=hello -w /tmp ls -l
+shipyard run -e GREETING=hello sh -c 'echo "$GREETING, $(id -un)"; exit 3'
+echo $?
+```
+
+```text
+hello, yourname
+3
 ```
 
 See [Running commands](run.md) for everything `run` accepts.

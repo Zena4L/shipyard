@@ -31,6 +31,27 @@ pub enum ExitStatus {
 }
 
 impl ExitStatus {
+    /// Decodes a raw status from `waitpid` (TLPI §26.1.3).
+    ///
+    /// Returns `None` for statuses that don't mean the process ended (stopped
+    /// or continued). Decoded by hand with the `WIF*` macros because nix's
+    /// `WaitStatus` can't represent Linux real-time signals.
+    #[must_use]
+    pub fn from_wait_status(raw: libc::c_int) -> Option<Self> {
+        if libc::WIFEXITED(raw) {
+            return u8::try_from(libc::WEXITSTATUS(raw)).ok().map(Self::Exited);
+        }
+        if libc::WIFSIGNALED(raw) {
+            return Signal::from_raw(libc::WTERMSIG(raw))
+                .ok()
+                .map(|signal| Self::Signaled {
+                    signal,
+                    core_dumped: libc::WCOREDUMP(raw),
+                });
+        }
+        None
+    }
+
     /// The code a shell would report: the exit code, or `128 + signal`.
     ///
     /// Signals never exceed 64 on Linux or macOS, so `128 + signal` always
@@ -77,6 +98,36 @@ mod tests {
             signal,
             core_dumped: false,
         }
+    }
+
+    #[test]
+    fn decodes_raw_wait_statuses() {
+        // The encodings are the same on Linux and macOS (TLPI figure 26-1).
+        assert_eq!(ExitStatus::from_wait_status(0), Some(ExitStatus::Exited(0)));
+        assert_eq!(
+            ExitStatus::from_wait_status(3 << 8),
+            Some(ExitStatus::Exited(3))
+        );
+        assert_eq!(
+            ExitStatus::from_wait_status(255 << 8),
+            Some(ExitStatus::Exited(255))
+        );
+        assert_eq!(
+            ExitStatus::from_wait_status(libc::SIGKILL),
+            Some(killed(Signal::KILL))
+        );
+        assert_eq!(
+            ExitStatus::from_wait_status(libc::SIGSEGV | 0x80),
+            Some(ExitStatus::Signaled {
+                signal: Signal::from_raw(libc::SIGSEGV).unwrap(),
+                core_dumped: true,
+            })
+        );
+        // Stopped by SIGSTOP: not an exit.
+        assert_eq!(
+            ExitStatus::from_wait_status(0x7f | (libc::SIGSTOP << 8)),
+            None
+        );
     }
 
     #[test]
