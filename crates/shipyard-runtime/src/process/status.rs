@@ -37,7 +37,7 @@ impl ExitStatus {
     /// or continued). Decoded by hand with the `WIF*` macros because nix's
     /// `WaitStatus` can't represent Linux real-time signals.
     #[must_use]
-    pub fn from_wait_status(raw: libc::c_int) -> Option<Self> {
+    pub(crate) fn from_wait_status(raw: libc::c_int) -> Option<Self> {
         if libc::WIFEXITED(raw) {
             return u8::try_from(libc::WEXITSTATUS(raw)).ok().map(Self::Exited);
         }

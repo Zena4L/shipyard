@@ -16,6 +16,7 @@ use nix::unistd::{Gid, Uid, geteuid, getgid, getuid};
 use super::env::DEFAULT_PATH;
 use super::failure::FailureContext;
 use super::rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
+use super::spawn::SpawnOptions;
 use super::spec::{ProcessSpec, SpecError, User};
 use crate::{Error, Result};
 
@@ -34,6 +35,11 @@ pub(crate) struct ChildPlan {
     pub(crate) umask: libc::mode_t,
     pub(crate) rlimits: Vec<RawLimit>,
     pub(crate) inherited_fds: FdSweep,
+    /// Whether the child starts its own process group.
+    pub(crate) new_process_group: bool,
+    /// Signals that stay ignored in the command; every other one is reset to
+    /// its default (see `SpawnOptions::keep_ignored`).
+    pub(crate) keep_ignored: Vec<libc::c_int>,
     /// For the Linux parent-death check: who the child's parent should be.
     #[cfg(target_os = "linux")]
     pub(crate) parent_pid: libc::pid_t,
@@ -45,7 +51,8 @@ pub(crate) struct Credentials {
     pub(crate) uid: Uid,
     pub(crate) gid: Gid,
     /// In the layout `setgroups` needs on this platform (see [`group_list`]).
-    pub(crate) groups: Vec<Gid>,
+    /// Raw `gid_t`s, since that's what `setgroups` reads.
+    pub(crate) groups: Vec<libc::gid_t>,
 }
 
 /// The C type of a resource number: glibc declares its own enum type.
@@ -60,13 +67,16 @@ pub(crate) struct RawLimit {
     pub(crate) resource: RawResource,
     pub(crate) soft: libc::rlim_t,
     pub(crate) hard: libc::rlim_t,
+    /// A soft limit to retry with if the kernel rejects `soft` as invalid.
+    pub(crate) fallback_soft: Option<libc::rlim_t>,
 }
 
 /// Which inherited descriptors the child must mark close-on-exec.
 pub(crate) enum FdSweep {
     /// The descriptors (3 and up) that were open when the plan was built.
     Listed(Vec<RawFd>),
-    /// `/dev/fd` was unreadable: every descriptor from 3 below this bound.
+    /// `/dev/fd` couldn't be read completely: every descriptor from 3 below
+    /// this bound.
     Below(RawFd),
 }
 
@@ -99,7 +109,12 @@ impl CStringArray {
 
 impl ChildPlan {
     /// Builds the plan, plus what the parent needs to explain a failure.
-    pub(crate) fn new(spec: &ProcessSpec) -> Result<(Self, FailureContext)> {
+    ///
+    /// Build it right before `fork`: it lists the descriptors open *now*.
+    pub(crate) fn new(
+        spec: &ProcessSpec,
+        options: &SpawnOptions,
+    ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
         let credentials = credentials_for(&spec.user)?;
 
@@ -144,6 +159,8 @@ impl ChildPlan {
                 .map(raw_limit)
                 .collect::<Result<_, _>>()?,
             inherited_fds: inherited_fds(),
+            new_process_group: options.new_process_group,
+            keep_ignored: options.keep_ignored.clone(),
             #[cfg(target_os = "linux")]
             parent_pid: nix::unistd::getpid().as_raw(),
         };
@@ -225,13 +242,13 @@ fn credentials_for(user: &User) -> Result<Option<Credentials>> {
 /// On macOS the kernel keeps the effective group in the same list (as entry
 /// 0), so `setgid` would overwrite whatever is there. Putting the primary group
 /// first, and not repeating it, keeps every supplementary group intact.
-fn group_list(gid: u32, additional: &[u32]) -> Vec<Gid> {
-    let extras = additional.iter().copied().map(Gid::from_raw);
+fn group_list(gid: u32, additional: &[u32]) -> Vec<libc::gid_t> {
+    let extras = additional.iter().copied();
     if cfg!(target_os = "linux") {
         extras.collect()
     } else {
-        std::iter::once(Gid::from_raw(gid))
-            .chain(extras.filter(|g| g.as_raw() != gid))
+        std::iter::once(gid)
+            .chain(extras.filter(|g| *g != gid))
             .collect()
     }
 }
@@ -242,24 +259,20 @@ fn raw_limit(limit: &Rlimit) -> Result<RawLimit, SpecError> {
         RlimitValue::Finite(n) => n,
         RlimitValue::Unlimited => libc::RLIM_INFINITY,
     };
-    let mut soft = raw(limit.soft);
+    let soft = raw(limit.soft);
     let hard = raw(limit.hard);
-    if cfg!(target_os = "macos")
-        && limit.kind == RlimitKind::Nofile
-        && limit.soft == RlimitValue::Unlimited
-    {
-        // macOS rejects an unlimited soft NOFILE (EINVAL); "as high as allowed"
-        // is the closest honest meaning.
-        soft = macos_max_open_files().min(hard);
-        tracing::warn!(
-            soft,
-            "nofile soft limit can't be unlimited on macOS; using {soft}"
-        );
-    }
+    // Older macOS versions reject an unlimited soft NOFILE (EINVAL); newer
+    // ones accept it. So the child tries unlimited first and only then falls
+    // back to "as high as this system allows".
+    let fallback_soft = (limit.kind == RlimitKind::Nofile && limit.soft == RlimitValue::Unlimited)
+        .then(max_open_files_per_process)
+        .flatten()
+        .map(|max| max.min(hard));
     Ok(RawLimit {
         resource,
         soft,
         hard,
+        fallback_soft,
     })
 }
 
@@ -302,11 +315,9 @@ fn resource_of(kind: RlimitKind) -> Option<RawResource> {
     }
 }
 
-/// The highest soft `NOFILE` macOS accepts: `OPEN_MAX` (10240, from
-/// `<sys/syslimits.h>`), lowered further if `kern.maxfilesperproc` is smaller.
+/// `kern.maxfilesperproc`: the most descriptors macOS lets one process have.
 #[cfg(target_os = "macos")]
-fn macos_max_open_files() -> libc::rlim_t {
-    const OPEN_MAX: libc::rlim_t = 10_240;
+fn max_open_files_per_process() -> Option<libc::rlim_t> {
     let mut value: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>();
     // SAFETY: `value` and `len` describe a valid, writable c_int buffer, the
@@ -320,32 +331,44 @@ fn macos_max_open_files() -> libc::rlim_t {
             0,
         )
     };
-    match libc::rlim_t::try_from(value) {
-        Ok(per_proc) if rc == 0 && per_proc > 0 => per_proc.min(OPEN_MAX),
-        _ => OPEN_MAX,
-    }
+    libc::rlim_t::try_from(value)
+        .ok()
+        .filter(|max| rc == 0 && *max > 0)
 }
 
+/// Linux accepts any NOFILE up to `fs.nr_open`, so there's nothing to retry.
 #[cfg(not(target_os = "macos"))]
-fn macos_max_open_files() -> libc::rlim_t {
-    libc::RLIM_INFINITY
+fn max_open_files_per_process() -> Option<libc::rlim_t> {
+    None
 }
 
 /// The descriptors (3 and up) open right now, which the child must not leak
 /// into the command.
 fn inherited_fds() -> FdSweep {
-    // Without /dev/fd (an unusual chroot), fall back to sweeping a range.
+    listed_fds().unwrap_or_else(|| FdSweep::Below(sweep_bound()))
+}
+
+/// The list from `/dev/fd`, or `None` if any part of it couldn't be read (an
+/// unusual chroot without `/dev/fd`, or an I/O error): a partial list could
+/// miss a descriptor.
+fn listed_fds() -> Option<FdSweep> {
+    let mut fds = Vec::new();
+    for entry in std::fs::read_dir("/dev/fd").ok()? {
+        let fd: RawFd = entry.ok()?.file_name().to_str()?.parse().ok()?;
+        if fd >= 3 {
+            fds.push(fd);
+        }
+    }
+    Some(FdSweep::Listed(fds))
+}
+
+/// How far a blind sweep goes. The *hard* limit, not the soft one: a
+/// descriptor opened before the soft limit was lowered can sit above it.
+/// Capped, so an unlimited hard limit doesn't mean billions of calls.
+fn sweep_bound() -> RawFd {
     const CAP: RawFd = 1 << 20;
-    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
-        let soft = getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(soft, _)| soft);
-        return FdSweep::Below(RawFd::try_from(soft).map_or(CAP, |soft| soft.min(CAP)));
-    };
-    FdSweep::Listed(
-        entries
-            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|fd: &RawFd| *fd >= 3)
-            .collect(),
-    )
+    let hard = getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(_, hard)| hard);
+    RawFd::try_from(hard).map_or(CAP, |hard| hard.clamp(4, CAP))
 }
 
 #[cfg(test)]
@@ -386,10 +409,7 @@ mod tests {
 
     #[test]
     fn group_list_layout_matches_the_platform() {
-        let groups: Vec<u32> = group_list(1000, &[20, 1000, 30])
-            .into_iter()
-            .map(Gid::as_raw)
-            .collect();
+        let groups = group_list(1000, &[20, 1000, 30]);
         if cfg!(target_os = "linux") {
             assert_eq!(groups, [20, 1000, 30]);
         } else {
@@ -428,6 +448,15 @@ mod tests {
             ..me
         };
         assert!(credentials_for(&extra_groups).is_err());
+    }
+
+    #[test]
+    fn unlimited_nofile_has_a_fallback_only_where_needed() {
+        let limit = raw_limit(&"nofile=unlimited".parse().unwrap()).unwrap();
+        assert_eq!(limit.soft, libc::RLIM_INFINITY);
+        assert_eq!(limit.fallback_soft.is_some(), cfg!(target_os = "macos"));
+        let finite = raw_limit(&"nofile=100:200".parse().unwrap()).unwrap();
+        assert_eq!(finite.fallback_soft, None);
     }
 
     #[test]

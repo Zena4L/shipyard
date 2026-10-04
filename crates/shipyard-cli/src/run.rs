@@ -87,17 +87,19 @@ impl RunArgs {
             signal: self.stop_signal,
             timeout: Duration::from_secs(self.stop_timeout),
         };
+        stop.validate()?;
         Ok((spec, stop))
     }
 }
 
-/// Runs the command and exits the way it did: with its exit code, or `128 + N`
-/// if signal N killed it. Failures to start it exit 125, 126 or 127.
+/// Runs the command under the supervisor and exits the way it did: with its
+/// exit code, or `128 + N` if signal N killed it. Failures to start it exit
+/// 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
-    // The stop policy is used once shipyard forwards signals (next step).
     let (spec, stop) = args.into_spec()?;
     tracing::debug!(?spec, ?stop, "running");
-    let status = match process::run_foreground(&spec) {
+    let mut supervisor = process::Supervisor::install()?;
+    let status = match supervisor.supervise(&spec, stop) {
         Ok(status) => status,
         Err(err) => {
             let code = err.exit_code();

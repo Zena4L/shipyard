@@ -5,7 +5,7 @@
 
 mod run;
 
-use std::io::Write;
+use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -125,9 +125,14 @@ fn init_tracing(log_level: Option<LogLevel>, debug: bool) {
         Some(level) => EnvFilter::new(level.as_filter()),
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
     };
+    // Colour only on a terminal, and never with NO_COLOR set (no-color.org):
+    // escape codes in a log file or CI output are just noise.
+    let colour = std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(colour)
         .init();
 }
 

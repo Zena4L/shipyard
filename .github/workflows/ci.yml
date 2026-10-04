@@ -9,10 +9,11 @@ on:
 permissions:
   contents: read
 
-# A new push to the same branch or PR cancels the run it supersedes.
+# A new push to the same PR branch cancels the run it supersedes. Runs on main
+# are never cancelled, so every commit there gets a full result.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +25,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - run: cargo fmt --all --check
@@ -36,14 +38,42 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A hung supervisor test must fail the job, not hold a runner for hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --workspace --all-targets
       - run: cargo test --locked --workspace
 
+  # Tests that need root (switching user and groups) are #[ignore]d in normal
+  # runs. Here they run as root through a cargo runner, so cargo itself (and
+  # the build) never does.
+  root:
+    name: test as root (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace -- --include-ignored
+
+  # musl (static, Alpine-style builds) has different libc types and wrappers;
+  # make sure the code compiles there too.
+  musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-musl
+
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -54,6 +84,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2

@@ -46,6 +46,8 @@ pub enum SignalError {
 impl Signal {
     /// `SIGINT`: interrupt, as sent by Ctrl-C.
     pub const INT: Self = Self(libc::SIGINT);
+    /// `SIGCONT`: continue a stopped process.
+    pub const CONT: Self = Self(libc::SIGCONT);
     /// `SIGTERM`: please exit. The default stop signal.
     pub const TERM: Self = Self(libc::SIGTERM);
     /// `SIGKILL`: exit now. Can't be caught or ignored.
@@ -53,7 +55,7 @@ impl Signal {
 
     /// Accepts a signal number if this platform has it.
     pub fn from_raw(number: i32) -> Result<Self, SignalError> {
-        let max = max_signal();
+        let max = MAX_SIGNAL;
         if (1..=max).contains(&number) {
             Ok(Self(number))
         } else {
@@ -138,6 +140,15 @@ fn alias(name: &str) -> Option<i32> {
     }
 }
 
+/// The highest signal number: Linux's real-time signals end at 64; macOS's
+/// last signal is 31 (`NSIG` is 32).
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_SIGNAL: libc::c_int = 64;
+/// The highest signal number: Linux's real-time signals end at 64; macOS's
+/// last signal is 31 (`NSIG` is 32).
+#[cfg(not(target_os = "linux"))]
+pub(crate) const MAX_SIGNAL: libc::c_int = 31;
+
 /// Real-time signal names use the kernel's numbering, not the C library's.
 ///
 /// The kernel's real-time range is 32–64, but glibc reserves 32–33 (so its
@@ -148,17 +159,6 @@ fn alias(name: &str) -> Option<i32> {
 const RTMIN: i32 = 34;
 #[cfg(target_os = "linux")]
 const RTMAX: i32 = 64;
-
-#[cfg(target_os = "linux")]
-fn max_signal() -> i32 {
-    RTMAX
-}
-
-/// `NSIG` is 32 in `<sys/signal.h>`, so the highest signal is 31 (`SIGUSR2`).
-#[cfg(not(target_os = "linux"))]
-fn max_signal() -> i32 {
-    31
-}
 
 #[cfg(target_os = "linux")]
 fn realtime(name: &str) -> Option<i32> {
@@ -268,7 +268,7 @@ mod tests {
         }
 
         #[test]
-        fn every_valid_signal_round_trips(number in 1..=max_signal()) {
+        fn every_valid_signal_round_trips(number in 1..=MAX_SIGNAL) {
             let signal = Signal::from_raw(number).unwrap();
             prop_assert_eq!(parse(&signal.to_string()), Ok(signal));
         }

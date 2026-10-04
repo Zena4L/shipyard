@@ -26,10 +26,12 @@ pub(crate) enum ChildStep {
     VerifyCredentials = 8,
     ParentDeathSignal = 9,
     Exec = 10,
+    ProcessGroup = 11,
+    SignalMask = 12,
 }
 
 impl ChildStep {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 12] = [
         Self::ResetSignals,
         Self::CloseFds,
         Self::Rlimit,
@@ -40,6 +42,8 @@ impl ChildStep {
         Self::VerifyCredentials,
         Self::ParentDeathSignal,
         Self::Exec,
+        Self::ProcessGroup,
+        Self::SignalMask,
     ];
 
     pub(crate) fn from_raw(raw: u16) -> Option<Self> {
@@ -65,6 +69,14 @@ pub(crate) struct FailureContext {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) rlimits: Vec<Rlimit>,
+}
+
+impl FailureContext {
+    /// Where the child found `path`: relative paths are relative to the
+    /// command's working directory (always absolute, see `ProcessSpec`).
+    fn resolve(&self, path: &Path) -> PathBuf {
+        self.cwd.join(path)
+    }
 }
 
 /// Why a command never got to run.
@@ -149,6 +161,8 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
                 .into(),
         ),
         ChildStep::ParentDeathSignal => setup("setting the parent-death signal".into()),
+        ChildStep::ProcessGroup => setup("starting a new process group".into()),
+        ChildStep::SignalMask => setup("clearing the signal mask".into()),
     }
 }
 
@@ -183,7 +197,9 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
         Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::ENAMETOOLONG => {
             // The file can exist and still give ENOENT: then it's the `#!`
             // interpreter or the dynamic loader that's missing.
-            if let Some(found) = ctx.candidates.iter().find(|c| c.is_file()) {
+            // Checked where the child looked: relative candidates are
+            // relative to the command's working directory, not shipyard's.
+            if let Some(found) = ctx.candidates.iter().find(|c| ctx.resolve(c).is_file()) {
                 let message = format!(
                     "{}: found, but its interpreter or loader is missing \
                      (check the #! line)",
@@ -203,7 +219,7 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
             SpawnError::new(NotFound, message, errno)
         }
         Errno::EACCES => {
-            let message = if candidate.is_dir() {
+            let message = if ctx.resolve(candidate).is_dir() {
                 format!("{path}: is a directory")
             } else {
                 format!("{path}: permission denied (is it executable?)")
@@ -212,7 +228,10 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
         }
         Errno::ENOEXEC => SpawnError::new(
             CannotExecute,
-            format!("{path}: not a valid program (scripts need a #! line)"),
+            format!(
+                "{path}: not a program this system can run \
+                 (built for another CPU architecture, or a script without a #! line)"
+            ),
             errno,
         ),
         Errno::ETXTBSY => SpawnError::new(
@@ -324,6 +343,23 @@ mod tests {
     }
 
     #[test]
+    fn relative_candidates_are_checked_from_the_commands_directory() {
+        // `hosts` exists in /etc, not in shipyard's own directory.
+        let mut in_etc = ctx("./hosts", &["./hosts"]);
+        in_etc.cwd = "/etc".into();
+        let err = exec(Errno::ENOENT, 0, &in_etc);
+        assert!(err.to_string().contains("interpreter or loader"), "{err}");
+
+        // And a file next to shipyard doesn't count when the command ran in /.
+        let here = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(here.is_file(), "the test runs in the crate directory");
+        let mut in_root = ctx("./Cargo.toml", &["./Cargo.toml"]);
+        in_root.cwd = "/".into();
+        let err = exec(Errno::ENOENT, 0, &in_root);
+        assert_eq!(err.to_string(), "./Cargo.toml: no such file");
+    }
+
+    #[test]
     fn permission_problems() {
         let dir = exec(Errno::EACCES, 0, &ctx("/tmp", &["/tmp"]));
         assert_eq!(dir.exit_code(), 126);
@@ -340,7 +376,7 @@ mod tests {
         assert!(
             exec(Errno::ENOEXEC, 0, &ctx)
                 .to_string()
-                .contains("not a valid program")
+                .contains("another CPU architecture")
         );
         assert!(exec(Errno::ETXTBSY, 0, &ctx).to_string().contains("busy"));
         assert!(

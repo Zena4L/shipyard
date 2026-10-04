@@ -136,33 +136,78 @@ Names are case-insensitive, and accept both Docker style (`nofile`) and OCI styl
 On macOS, the largest finite value is `9223372036854775806` (2⁶³ − 2). `rss` is
 Linux-only because macOS treats it as another name for `as`.
 
+`nofile=unlimited` on macOS: recent versions accept it as is. Older ones refuse
+an unlimited soft limit, and the command then gets the most the system allows
+per process (`sysctl kern.maxfilesperproc`). On Linux, `unlimited` is always refused,
+because the kernel caps `nofile` at `fs.nr_open`; use a number instead.
+
 ## Inherited state
 
 The command starts clean, whatever state Shipyard was started in:
 
 - **Signals:** every signal is back to its default action and none are blocked.
   (Shipyard itself ignores `SIGPIPE`, as Rust programs do; the command doesn't.)
+  The one exception: if Shipyard was started ignoring `SIGHUP`, `SIGINT` or
+  `SIGQUIT`, the command keeps ignoring it. That's how `nohup shipyard run …`
+  and `shipyard run … &` in a script keep protecting the command from hangups
+  and Ctrl-C.
 - **File descriptors:** only stdin, stdout and stderr are passed on. Any other
   open descriptor is closed when the command starts.
 - **umask:** `022`.
-- **On Linux:** if Shipyard is killed, the command is killed too.
+- **`TERM`:** when Shipyard runs in a terminal, your `TERM` is passed on (unless
+  you set one with `-e`), so full-screen programs like `top` and `vim` work.
+- **On Linux:** if Shipyard is killed with `SIGKILL`, the command is killed too.
+  (On macOS it can be left running in that one case.)
 
-## Stopping
+## Signals and stopping
 
-**Ctrl-C** and **Ctrl-\\** go straight to the command, which handles them as it
-would without Shipyard. If Ctrl-C ends the command, Shipyard also stops as if
-interrupted, so a shell loop around `shipyard run` stops too.
+Shipyard stays with the command until it has exited, and passes signals on.
 
-> **Not yet supported:** signals sent to Shipyard's own process ID (for example
-> `kill -INT <pid>`, or `timeout -s INT`) aren't passed on to the command yet, and
-> on macOS killing Shipyard with `SIGTERM` leaves the command running. Signal
-> forwarding comes in the next version. `--stop-signal` and `--stop-timeout`
-> are accepted now and take effect then.
+**From the terminal.** Ctrl-C, Ctrl-\\ and Ctrl-Z reach the command directly,
+just as without Shipyard, and `fg`/`bg` work as usual. Shipyard doesn't pass
+them on a second time. If Ctrl-C ends the command, Shipyard also stops as if
+interrupted, so a shell loop around `shipyard run` stops too (unless Shipyard
+itself was started ignoring Ctrl-C).
+
+**Sent to Shipyard.** A signal sent to Shipyard's process ID (`kill`, `timeout`,
+a CI runner, a service manager) is passed on to the command, with these
+exceptions:
+
+- **`SIGTERM` stops the command gracefully, like `docker stop`:** the command
+  gets the `--stop-signal`, and if it hasn't exited after `--stop-timeout`, it's
+  killed with `SIGKILL`.
+- **Not passed on:**
+  - job-control signals (`SIGTSTP`, `SIGCONT`, …), which the shell handles for
+    both;
+  - signals about Shipyard's own state (crashes, `SIGPIPE`, `SIGCHLD`).
+- **Signals Shipyard was started ignoring** (for example under `nohup`) stay
+  ignored and aren't passed on.
+- **Signals the command sends to Shipyard** aren't bounced back to it. (On
+  macOS this is best effort: if two signals arrive at the same instant, the
+  system can report the wrong sender for one of them.)
+- **On macOS, in a terminal:** while Shipyard runs in the foreground, the
+  signals a terminal can send (`SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGWINCH`,
+  `SIGINFO`) aren't passed on even when sent with `kill`. macOS reports a
+  terminal's Ctrl-C exactly like a `kill`, and the terminal has already
+  delivered it to the command. Send them to the command itself instead, or use
+  `SIGTERM`. Linux tells the two apart, so this doesn't apply there.
+
+Shipyard catches signals even if the program that started it had blocked
+them, so it can always be stopped and always notices when the command exits.
+
+A signal sent to Shipyard's whole *process group* (as `timeout` does, and
+`kill -SIG -<pgid>`) reaches the command twice when Shipyard runs in a terminal:
+once directly and once passed on. A signal that arrives before the command has
+finished starting gets the command's default reaction (for most signals, it
+exits).
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--stop-signal SIGNAL` | `SIGTERM` | Signal sent to ask the command to exit |
 | `--stop-timeout SECONDS` | `10` | How long to wait before forcing it with `SIGKILL` |
+
+The stop signal can't be `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` or `SIGCONT`:
+those pause or resume the command instead of ending it.
 
 Signals can be given as:
 
@@ -171,6 +216,20 @@ Signals can be given as:
 - on Linux, a real-time signal: `RTMIN` (34), `RTMIN+3`, `RTMAX-2`, `RTMAX` (64).
   These use the kernel's numbers, the same as Docker, so `RTMIN+3` is always
   signal 37.
+
+## Cleanup
+
+When the command exits, Shipyard cleans up what it left behind:
+
+- **Without a terminal** (CI, services, scripts): the command runs in its own
+  process group, and anything still running in that group is killed.
+- **On Linux:** every leftover process is killed, even ones that left the
+  command's group (for example with `setsid`). Shipyard registers as their parent
+  (a "child subreaper") to find them.
+- **On macOS, from a terminal:** background processes the command started can be
+  left running. Full isolation (a later version) removes this gap.
+- **Laptop sleep:** if the computer sleeps during `--stop-timeout`, the sleep
+  doesn't count toward the timeout.
 
 ## Exit codes
 
