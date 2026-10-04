@@ -12,6 +12,7 @@
 compile_error!("shipyard only supports UNIX platforms (Linux, macOS)");
 
 mod error;
+pub mod process;
 
 pub use error::{Error, Result};
 
