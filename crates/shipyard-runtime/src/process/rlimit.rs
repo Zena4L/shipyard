@@ -356,7 +356,8 @@ mod tests {
             let limit = parse(form).unwrap();
             assert_eq!((limit.soft, limit.hard), (Unlimited, Unlimited), "{form}");
         }
-        assert_eq!(parse("nofile=1024:-1").unwrap().hard, Unlimited);
+        // Not `nofile`: Linux refuses an unlimited one (see the test below).
+        assert_eq!(parse("nproc=1024:-1").unwrap().hard, Unlimited);
     }
 
     #[test]

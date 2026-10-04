@@ -54,6 +54,26 @@ keeps running Rust code after `fork`, which is only safe in a single-threaded
 process, and the standard harness runs tests on threads. So **never start a
 thread in that test binary.**
 
+### Running the Linux tests in a container
+
+`scripts/test-linux.sh` runs what CI runs on Linux, in a `rust:1-bookworm`
+container (Docker, OrbStack or any compatible engine):
+
+1. clippy with warnings as errors;
+2. the whole test suite as a normal user;
+3. the suite again with the root-only tests, run as root through `sudo` (as the
+   CI `root` job does).
+
+```sh
+scripts/test-linux.sh            # everything; exits non-zero on any failure
+scripts/test-linux.sh --shell    # a shell in the same container, to debug
+```
+
+The repository is mounted read-only. Build output, the cargo registry and the
+pinned toolchain live in Docker volumes named `shipyard-linux-*`, so later runs
+are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
+(below) is for interactive work and the root-heavy later stages.
+
 ### Tests that need root
 
 Tests that switch user or groups are marked `#[ignore]`, so a normal

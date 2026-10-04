@@ -176,6 +176,7 @@ impl ChildPlan {
             uid: spec.user.uid,
             gid: spec.user.gid,
             rlimits: spec.rlimits.clone(),
+            root: geteuid().is_root(),
         };
         Ok((plan, context))
     }
@@ -483,11 +484,18 @@ mod tests {
         assert!(credentials_for(&extra_groups).is_err());
     }
 
+    /// Only macOS needs a fallback for an unlimited `nofile` (Linux refuses
+    /// one when it's parsed).
+    #[cfg(target_os = "macos")]
     #[test]
-    fn unlimited_nofile_has_a_fallback_only_where_needed() {
+    fn unlimited_nofile_has_a_fallback_on_macos() {
         let limit = raw_limit(&"nofile=unlimited".parse().unwrap()).unwrap();
         assert_eq!(limit.soft, libc::RLIM_INFINITY);
-        assert_eq!(limit.fallback_soft.is_some(), cfg!(target_os = "macos"));
+        assert!(limit.fallback_soft.is_some());
+    }
+
+    #[test]
+    fn finite_limits_have_no_fallback() {
         let finite = raw_limit(&"nofile=100:200".parse().unwrap()).unwrap();
         assert_eq!(finite.fallback_soft, None);
     }
