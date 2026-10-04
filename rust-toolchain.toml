@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
+# Linux targets so macOS hosts can `cargo check --target ...` the Linux-only code.
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+profile = "minimal"

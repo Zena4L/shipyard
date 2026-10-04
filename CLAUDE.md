@@ -1,0 +1,88 @@
+# CLAUDE.md
+
+Guidance for AI coding assistants working in this repository.
+
+## Project
+
+Shipyard is a lightweight, **daemonless** container engine in Rust, an alternative to
+Docker / Podman / OrbStack. It has two goals that carry equal weight:
+
+1. **Production-grade software.**
+2. **Learning systems programming.** It's built step by step using *The Linux Programming
+   Interface* (TLPI) as the reference.
+
+Work follows the staged plan in [`docs/ROADMAP.md`](docs/ROADMAP.md). Each stage builds on
+the previous one. Don't jump ahead or build later stages early.
+
+## Repository map
+
+- `crates/shipyard-cli/`: the `shipyard` binary (clap, anyhow, tracing).
+- `crates/shipyard-runtime/`: low-level primitives (processes, namespaces, mounts, cgroups).
+  Library errors use `thiserror`.
+- `docs/ROADMAP.md`: stages, TLPI chapter mapping, and recorded decisions.
+- `docs/FEATURES.md`: the full feature list per stage, the production-quality bar, and what's
+  out of scope.
+- `docs/DEVELOPMENT.md`: setup, commands, and the Lima VM for Linux-only work on macOS.
+- `docs/design/`: UI concept.
+  - `shipyard-ui.html`: interactive mock.
+  - `README.md`: concepts, interaction rules, tokens, and the data the UI needs. Read this
+    before any UI or engine-API work.
+
+## Decisions already made (don't relitigate)
+
+- **Daemonless** (Podman-style): no long-running root daemon; one tiny monitor process per
+  container.
+- **macOS-first, UNIX-only.**
+  - The CLI, engine and UI run natively on macOS and Linux.
+  - Kernel isolation is Linux-only. On macOS it runs inside a lightweight Linux VM managed
+    by Shipyard (stage 12).
+- **OCI runtime:** `shipyard-runtime` implements the OCI runtime spec; the engine calls it
+  like Podman calls runc.
+- **Syscalls:** use `std` first, then `nix`/`rustix`, and raw `libc` only when neither
+  covers the call.
+
+## Conventions
+
+- **Platform gating:**
+  - `#[cfg(unix)]` for POSIX code, which must work on both macOS and Linux.
+  - `#[cfg(target_os = "linux")]` for namespaces, mounts and cgroups; return
+    `Error::LinuxOnly` elsewhere.
+- **`unsafe`:** every block needs a `// SAFETY:` comment (clippy denies otherwise).
+- **Lints:** clippy `pedantic` is on and CI runs with `-D warnings`. Fix lints rather than
+  `#[allow]`-ing them; if an allow is genuinely needed, give it a `reason`.
+- **Errors:** `thiserror` enums in libraries, `anyhow` in the CLI. Don't `unwrap()` in
+  non-test code.
+- **CLI output:** use `writeln!` to a locked stdout, not `println!`, so broken pipes become
+  errors instead of panics.
+- **Dependencies:** declare versions once in `[workspace.dependencies]`; members use
+  `.workspace = true`.
+
+## Before calling work done
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu   # Linux-only code, from macOS
+cargo test --workspace
+```
+
+Linux-only behavior must also be *run* in the Lima VM (see `docs/DEVELOPMENT.md`), not just
+compiled. Test as you build: every stage ships with tests.
+
+## Working with the author
+
+- Explain the systems concept behind each step (which syscall, what the kernel does, which
+  TLPI chapter) before or alongside the code. Learning is a first-class goal.
+- Keep changes scoped to the current stage.
+
+## Git
+
+- Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
+  `docs:`, `chore:`, …).
+- **Never add AI attribution to commits or pull requests:**
+  - no `Co-Authored-By: Claude …` trailer
+  - no "Generated with Claude Code" line
+  - no AI tool listed as an author or contributor
+
+  Commits are authored solely by the repository owner.
+- Only commit or push when asked.

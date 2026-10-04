@@ -1,0 +1,16 @@
+[package]
+name = "shipyard-runtime"
+description = "Low-level Linux container primitives: processes, namespaces, mounts, cgroups."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

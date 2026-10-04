@@ -1,0 +1,1626 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shipyard Desktop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@600;800&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil:wght@600;800&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #dfe4e1;
+    --window: #f7f8f6;
+    --panel: #eef1ef;
+    --sunken: #e6eae7;
+    --ink: #13202a;
+    --muted: #5a6a72;
+    --faint: #8b9a9f;
+    --line: #d2d9d6;
+    --steel: #2c4a5e;
+    --steel-ink: #e9f0f2;
+    --accent: #f5b800;
+    --accent-ink: #1d1600;
+    --ok: #1d9a60;
+    --bad: #d2453c;
+    --pause: #5b7fbf;
+    --warn: #d9661a;
+    --net-a: #2f86d6;
+    --net-b: #8a5cd1;
+    --net-c: #9aa7ab;
+    --lay-alpine: #2f9e9e;
+    --lay-bookworm: #c0673f;
+    --lay-distroless: #8c9a3b;
+    --idle: #9aa7ab;
+    --term: #0f171d;
+    --term-ink: #cfe0d6;
+    --shadow: 0 1px 0 rgba(19,32,42,.04), 0 24px 60px -24px rgba(19,32,42,.35);
+    --display: "Big Shoulders Stencil Display", "Big Shoulders Stencil", "Arial Narrow", Impact, sans-serif;
+    --sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground: #080d11;
+      --window: #10181e;
+      --panel: #131d24;
+      --sunken: #0c1318;
+      --ink: #e3eae7;
+      --muted: #8c9ca3;
+      --faint: #5f7079;
+      --line: #213039;
+      --steel: #2f536b;
+      --steel-ink: #e6eef1;
+      --term: #080d11;
+      --idle: #5f7079;
+      --warn: #f08a3c;
+      --net-a: #5aa5ea;
+      --net-b: #a685e8;
+      --net-c: #6c7d86;
+      --lay-alpine: #4fc0c0;
+      --lay-bookworm: #d9805a;
+      --lay-distroless: #a9b850;
+      --shadow: 0 0 0 1px rgba(255,255,255,.03), 0 30px 80px -30px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #080d11;
+    --window: #10181e;
+    --panel: #131d24;
+    --sunken: #0c1318;
+    --ink: #e3eae7;
+    --muted: #8c9ca3;
+    --faint: #5f7079;
+    --line: #213039;
+    --steel: #2f536b;
+    --steel-ink: #e6eef1;
+    --term: #080d11;
+    --idle: #5f7079;
+    --warn: #f08a3c;
+    --net-a: #5aa5ea;
+    --net-b: #a685e8;
+    --net-c: #6c7d86;
+    --lay-alpine: #4fc0c0;
+    --lay-bookworm: #d9805a;
+    --lay-distroless: #a9b850;
+    --shadow: 0 0 0 1px rgba(255,255,255,.03), 0 30px 80px -30px rgba(0,0,0,.8);
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+    padding: 28px 24px 48px;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .stage { max-width: 1320px; margin: 0 auto; display: grid; gap: 18px; }
+  .caption { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+  .caption b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- window ---------- */
+  .win {
+    background: var(--window);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    min-height: 760px;
+  }
+  .titlebar {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .lights { display: flex; gap: 8px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; background: var(--line); display: block; }
+  .lights i:nth-child(1) { background: #ec6a5e; } .lights i:nth-child(2) { background: #f4bf4f; } .lights i:nth-child(3) { background: #61c554; }
+  .wintitle { font-weight: 600; font-size: 13px; color: var(--muted); letter-spacing: .02em; }
+  .cmd {
+    justify-self: end; display: flex; align-items: center; gap: 10px;
+    background: var(--window); border: 1px solid var(--line); border-radius: 7px;
+    padding: 5px 8px 5px 10px; color: var(--faint); font-size: 12.5px; min-width: 0;
+  }
+  .cmd:hover { color: var(--ink); border-color: var(--faint); }
+  kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; color: var(--muted); background: var(--panel); }
+
+  .body { display: grid; grid-template-columns: 196px minmax(0, 1fr) 360px; min-height: 0; }
+
+  /* ---------- rail ---------- */
+  .rail { border-right: 1px solid var(--line); padding: 16px 10px; display: flex; flex-direction: column; gap: 22px; background: var(--panel); }
+  .brand { display: flex; align-items: center; gap: 9px; padding: 0 8px; }
+  .brand svg { flex: none; }
+  .brand span { font-family: var(--display); font-weight: 800; font-size: 22px; letter-spacing: .04em; text-transform: uppercase; line-height: 1; }
+  .nav { display: grid; gap: 2px; }
+  .nav button {
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    border: 0; background: none; text-align: left; padding: 7px 10px; border-radius: 6px; color: var(--muted); font-weight: 500;
+  }
+  .nav button:hover { background: var(--sunken); color: var(--ink); }
+  .nav button[aria-current="page"] { background: var(--window); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
+  .nav small { font-family: var(--mono); font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .railhead { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); padding: 0 10px 6px; font-weight: 600; }
+  .host { margin-top: auto; padding: 12px 10px; border-top: 1px solid var(--line); display: grid; gap: 8px; font-size: 12.5px; }
+  .host .row { display: flex; justify-content: space-between; color: var(--muted); }
+  .host .row b { color: var(--ink); font-weight: 500; font-family: var(--mono); font-size: 12px; }
+  .bar { height: 4px; border-radius: 2px; background: var(--sunken); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--steel); border-radius: 2px; transition: width .6s ease; }
+
+  /* ---------- main ---------- */
+  .main { display: flex; flex-direction: column; min-width: 0; }
+  .mainhead { display: flex; align-items: center; gap: 14px; padding: 16px 22px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .mainhead h1 { margin: 0; font-family: var(--display); font-weight: 800; font-size: 30px; line-height: 1; text-transform: uppercase; letter-spacing: .03em; }
+  .tally { display: flex; gap: 12px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+  .tally span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; background: var(--idle); flex: none; }
+  .dot.running { background: var(--ok); } .dot.failed { background: var(--bad); } .dot.paused { background: var(--pause); } .dot.restarting { background: var(--accent); }
+  .spacer { flex: 1; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; padding: 2px; background: var(--panel); }
+  .seg button { border: 0; background: none; padding: 4px 11px; border-radius: 5px; color: var(--muted); font-size: 12.5px; font-weight: 500; }
+  .seg button[aria-pressed="true"] { background: var(--window); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .btn {
+    border: 1px solid var(--line); background: var(--window); border-radius: 7px; padding: 6px 12px;
+    font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 7px;
+  }
+  .btn:hover { border-color: var(--faint); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .btn.primary:hover { filter: brightness(1.04); }
+  .btn.danger { color: var(--bad); }
+  .btn:disabled { opacity: .45; cursor: default; }
+
+  /* ---------- run sheet ---------- */
+  .runsheet { border-bottom: 1px solid var(--line); background: var(--panel); padding: 14px 22px; }
+  .runsheet form { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(110px, 1fr) minmax(110px, 1fr) minmax(120px, 1fr) auto; gap: 10px; align-items: end; }
+  .field { display: grid; gap: 4px; min-width: 0; }
+  .field label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; }
+  .field input, .field select {
+    border: 1px solid var(--line); background: var(--window); border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 12.5px; min-width: 0; width: 100%;
+  }
+  .runsheet .hint { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+  .runsheet .hint code { font-family: var(--mono); font-size: 11.5px; color: var(--ink); }
+
+  /* ---------- yard ---------- */
+  .viewport { flex: 1; overflow: auto; min-height: 0; }
+  .yard { position: relative; padding: 46px 22px 28px; display: grid; gap: 26px; }
+  .gantry { position: absolute; left: 0; right: 0; top: 10px; height: 22px; pointer-events: none; }
+  .gantry .rail-beam {
+    position: absolute; left: 14px; right: 14px; top: 4px; height: 6px; border-radius: 1px;
+    background: repeating-linear-gradient(-45deg, var(--accent) 0 8px, var(--accent-ink) 8px 12px);
+    opacity: .9;
+  }
+  .trolley {
+    position: absolute; top: 0; left: 0; width: 46px; height: 18px; border-radius: 3px;
+    background: var(--accent); box-shadow: inset 0 -3px 0 rgba(0,0,0,.18);
+    transition: transform .55s cubic-bezier(.6,.05,.25,1);
+  }
+  .trolley::before, .trolley::after { content: ""; position: absolute; top: 5px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-ink); }
+  .trolley::before { left: 7px; } .trolley::after { right: 7px; }
+  .cable {
+    position: absolute; top: 18px; left: 0; width: 0; border-left: 2px solid var(--accent);
+    transition: transform .55s cubic-bezier(.6,.05,.25,1), height .35s ease .2s;
+  }
+  .cable::after { content: ""; position: absolute; left: -6px; bottom: -2px; width: 10px; height: 6px; border: 2px solid var(--accent); border-top: 0; border-radius: 0 0 6px 6px; }
+
+  .bay { display: grid; gap: 10px; }
+  .bayhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .bayhead h2 { margin: 0; font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+  .bayhead p { margin: 0; font-size: 12px; color: var(--faint); font-family: var(--mono); }
+  .berths {
+    display: flex; flex-wrap: wrap; gap: 10px; padding: 12px; border-radius: 8px;
+    /* painted berth markings sit in the gaps between 20′ slots (120px + 10px gap) */
+    background-color: var(--sunken);
+    background-image: repeating-linear-gradient(90deg, transparent 0 124px, var(--line) 124px 126px, transparent 126px 130px);
+    background-position: 12px 0;
+  }
+  .box {
+    --w: 120px;
+    position: relative; width: var(--w); height: 74px; border-radius: 3px; border: 1.5px solid transparent;
+    padding: 8px 10px 8px 9px; text-align: left; color: var(--steel-ink);
+    background-color: var(--steel);
+    background-image: repeating-linear-gradient(90deg, rgba(255,255,255,.09) 0 2px, transparent 2px 7px);
+    display: flex; flex-direction: column; justify-content: space-between;
+    transition: background-color .25s ease, color .25s ease, transform .15s ease;
+  }
+  .box.ft40 { --w: 250px; }
+  .box:hover { transform: translateY(-2px); }
+  /* door bars on the right end */
+  .box::after {
+    content: ""; position: absolute; right: 6px; top: 7px; bottom: 7px; width: 9px;
+    border-left: 2px solid rgba(255,255,255,.22); border-right: 2px solid rgba(255,255,255,.22);
+  }
+  .box .code { font-family: var(--display); font-weight: 600; font-size: 13px; letter-spacing: .08em; opacity: .85; line-height: 1; }
+  .box .nm { font-weight: 700; font-size: 14px; line-height: 1.1; padding-right: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .box .sub { font-family: var(--mono); font-size: 10.5px; opacity: .7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 18px; }
+  .box .lamp { position: absolute; top: 8px; right: 24px; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); box-shadow: 0 0 0 2px rgba(0,0,0,.18); }
+  .box.running .lamp { background: #33d17a; }
+  .box.paused .lamp { background: #8fb0ff; }
+  .box.restarting .lamp { background: var(--accent); }
+  .box.paused { background-image: repeating-linear-gradient(-45deg, rgba(255,255,255,.12) 0 3px, transparent 3px 10px); }
+  .box.failed { box-shadow: inset 0 -5px 0 var(--bad); }
+  .box.failed .lamp { background: #ff6b5f; }
+  .box.exited { background-color: transparent; background-image: none; border: 1.5px dashed var(--faint); color: var(--muted); }
+  .box.exited::after { border-color: var(--line); }
+  .box.sel {
+    background-color: var(--accent); color: var(--accent-ink); border-color: var(--accent);
+    background-image: repeating-linear-gradient(90deg, rgba(0,0,0,.07) 0 2px, transparent 2px 7px);
+    border-style: solid;
+  }
+  .box.sel::after { border-color: rgba(0,0,0,.18); }
+  .box.drop { animation: drop .7s cubic-bezier(.3,.0,.3,1) both; }
+  @keyframes drop {
+    0% { transform: translateY(-140px); }
+    70% { transform: translateY(3px); }
+    85% { transform: translateY(-2px); }
+    100% { transform: translateY(0); }
+  }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; gap: 7px; align-items: center; }
+  .legend i { display: inline-block; height: 10px; border-radius: 1px; background: var(--steel); }
+
+  /* ---------- manifest ---------- */
+  .manifest-wrap { padding: 18px 22px 28px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 760px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; padding: 0 10px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 10px; border-bottom: 1px solid var(--line); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover td { background: var(--panel); }
+  tbody tr.sel td { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  td .stencil { font-family: var(--display); font-weight: 600; letter-spacing: .07em; font-size: 14px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 2px 9px 2px 7px; border-radius: 999px; background: var(--sunken); color: var(--muted); }
+  .pill.running { color: var(--ok); background: color-mix(in srgb, var(--ok) 13%, transparent); }
+  .pill.failed { color: var(--bad); background: color-mix(in srgb, var(--bad) 13%, transparent); }
+  .pill.paused { color: var(--pause); background: color-mix(in srgb, var(--pause) 15%, transparent); }
+  .pill.restarting { color: #a27a00; background: color-mix(in srgb, var(--accent) 20%, transparent); }
+
+  .dot.degraded { background: var(--warn); }
+  .pill.degraded { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .box.degraded .lamp { background: var(--warn); }
+  .box.degraded { outline: 2px solid var(--warn); outline-offset: 3px; }
+  .box.affected { outline: 2px dashed color-mix(in srgb, var(--warn) 60%, transparent); outline-offset: 3px; }
+  .box, .hostchip, .edge, .elabel { transition: opacity .18s ease, background-color .25s ease, color .25s ease, transform .15s ease, stroke-width .18s ease; }
+  .dimmed { opacity: .2; }
+
+  /* ---------- map ---------- */
+  .mapwrap { padding: 16px 22px 24px; display: grid; gap: 14px; }
+  .mapstatus { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; padding: 9px 12px; border-radius: 7px; background: var(--panel); }
+  .mapstatus.warn { background: color-mix(in srgb, var(--warn) 11%, transparent); }
+  .mapstatus b { font-weight: 700; }
+  .mapstatus .btn { padding: 4px 10px; font-size: 12.5px; margin-left: auto; }
+  .mapscroll { overflow-x: auto; margin-inline: -4px; padding-inline: 4px; }
+  .mapcanvas { position: relative; }
+  .mapcanvas svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+  .mnode { position: absolute; }
+  .mnode .box { --w: 90px; }
+  .mnode .box.ft40 { --w: 180px; }
+  .mnode .box .code { font-size: 11px; }
+  .colhead { position: absolute; top: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); font-weight: 600; white-space: nowrap; }
+  .edge { fill: none; stroke: var(--steel); stroke-width: 1.6; }
+  .edge.observed { stroke: var(--warn); stroke-dasharray: 2 5; stroke-linecap: round; }
+  .edge.broken { stroke: var(--bad); stroke-dasharray: 7 5; }
+  .edge.idle { stroke: var(--idle); stroke-dasharray: 3 5; }
+  .edge.hot { stroke-width: 2.8; }
+  .elabel { font-family: var(--mono); font-size: 10.5px; fill: var(--muted); paint-order: stroke; stroke: var(--window); stroke-width: 5px; stroke-linejoin: round; }
+  .elabel.observed { fill: var(--warn); }
+  .elabel.broken { fill: var(--bad); }
+  .packet { fill: var(--ink); opacity: .55; }
+  .hostchip {
+    position: absolute; left: 0; height: 26px; display: flex; align-items: center; gap: 7px; padding: 0 9px;
+    border: 1px solid var(--line); border-radius: 5px; background: var(--window); font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+  }
+  .hostchip svg { position: static; width: 12px; height: 12px; }
+  .mapfoot { display: flex; gap: 10px 22px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
+  .mapfoot .order { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .mapfoot .order b { font-family: var(--mono); font-size: 11.5px; font-weight: 500; color: var(--ink); }
+  .mapfoot .order em { font-style: normal; color: var(--faint); }
+  .mapfoot svg { vertical-align: middle; }
+  .loose { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding-top: 4px; border-top: 1px solid var(--line); }
+  .loose button { border: 1px dashed var(--line); background: none; border-radius: 5px; padding: 3px 9px; font-family: var(--mono); font-size: 11.5px; display: inline-flex; gap: 6px; align-items: center; }
+  .loose button:hover { border-color: var(--faint); }
+
+  /* ---------- map overlays ---------- */
+  .maptools { display: flex; gap: 6px 8px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .toggle { border: 1px solid var(--line); background: var(--window); border-radius: 999px; padding: 3px 10px 3px 8px; font-size: 12px; font-weight: 600; display: inline-flex; gap: 6px; align-items: center; color: var(--faint); }
+  .toggle svg { width: 12px; height: 12px; }
+  .toggle[aria-pressed="true"] { color: var(--ink); border-color: var(--ink); }
+  .netkey { display: inline-flex; gap: 6px; align-items: center; font-family: var(--mono); font-size: 11.5px; padding: 3px 7px; border-radius: 5px; border: 0; background: none; color: var(--ink); }
+  .netkey span { color: var(--faint); }
+  .netkey:hover { background: var(--sunken); }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+  .mnode { display: flex; flex-direction: column; align-items: flex-start; }
+  .mnode.dimmed, .tap.dimmed { opacity: .2; }
+  .livery { display: flex; gap: 2px; height: 4px; margin-bottom: 4px; width: 100%; }
+  .livery i { flex: 1; border-radius: 1px; }
+  .strata-row { display: flex; align-items: center; gap: 6px; height: 14px; margin-bottom: 4px; width: 100%; border: 0; background: none; padding: 0; }
+  .strata { display: flex; gap: 1px; height: 6px; flex: 1; border-radius: 1px; overflow: hidden; min-width: 0; }
+  .strata i, .bigstrata i { display: block; height: 100%; min-width: 2px; transition: opacity .15s ease, transform .15s ease; }
+  .strata-row > span { font-family: var(--mono); font-size: 10px; color: var(--faint); white-space: nowrap; }
+  .strata-row:hover > span { color: var(--ink); }
+  .vchip {
+    margin-top: 6px; display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px 0 5px; max-width: var(--maxw, 160px);
+    border: 1px solid var(--line); border-radius: 4px; background: var(--window); font-family: var(--mono); font-size: 11px; white-space: nowrap; overflow: hidden; color: var(--ink);
+  }
+  .vchip + .vchip { margin-top: 2px; }
+  .vchip em { font-style: normal; color: var(--faint); }
+  .vchip.lit { border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink); }
+  .vchip svg, .ico { flex: none; }
+  [data-layer].lit { transform: scaleY(1.5); }
+  [data-layer].dim { opacity: .18; }
+
+  /* ---------- images / volumes / networks ---------- */
+  .secwrap { padding: 16px 22px 28px; display: grid; gap: 14px; align-content: start; }
+  .secsum { display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; font-size: 13px; padding: 9px 12px; border-radius: 7px; background: var(--panel); }
+  .secsum b { font-weight: 700; }
+  .secsum .btn { margin-left: auto; padding: 4px 10px; font-size: 12.5px; }
+  .secsum.confirming { background: color-mix(in srgb, var(--bad) 10%, transparent); }
+  .capline { margin: 0; font-size: 12.5px; color: var(--muted); min-height: 38px; display: flex; gap: 8px; align-items: flex-start; }
+  .capline code { font-family: var(--mono); font-size: 11.5px; color: var(--ink); overflow-wrap: anywhere; }
+  .rows { display: grid; gap: 2px; }
+  .rowhead, .irow, .vrow { display: grid; gap: 14px; align-items: center; padding: 10px; }
+  .rowhead { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; padding-block: 0 6px; border-bottom: 1px solid var(--line); }
+  .irow, .rowhead.i { grid-template-columns: minmax(150px, 1.2fr) minmax(140px, 2fr) 64px minmax(110px, 1fr); }
+  .vrow, .rowhead.v { grid-template-columns: 30px minmax(120px, 1fr) minmax(170px, 2fr) 64px; }
+  .irow, .vrow { border-radius: 7px; border: 1px solid transparent; cursor: pointer; }
+  .irow:hover, .vrow:hover { background: var(--panel); }
+  .irow.sel, .vrow.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent); }
+  .irow .ref, .vrow .ref { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+  .ref small { display: block; font-family: var(--mono); font-size: 11px; color: var(--faint); font-weight: 400; }
+  .num { font-family: var(--mono); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .bigstrata { display: flex; gap: 2px; height: 14px; }
+  .bigstrata i { border-radius: 2px; }
+  .chips { display: flex; gap: 4px; flex-wrap: wrap; min-width: 0; }
+  .chip { border: 1px solid var(--line); border-radius: 4px; padding: 2px 7px; font-family: var(--mono); font-size: 11px; background: var(--window); display: inline-flex; gap: 5px; align-items: center; max-width: 100%; }
+  .chip em { font-style: normal; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button.chip:hover { border-color: var(--faint); }
+  .chip.none { border-style: dashed; color: var(--faint); background: none; }
+  .legendrow { display: flex; gap: 8px 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .legendrow span { display: inline-flex; gap: 6px; align-items: center; }
+
+  .netband { display: grid; gap: 12px; padding: 14px 14px 16px; border-radius: 8px; border: 1px solid var(--line); cursor: pointer; background: var(--window); }
+  .netband:hover { border-color: var(--faint); }
+  .netband.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .nethead { display: flex; gap: 6px 12px; align-items: center; flex-wrap: wrap; }
+  .nethead b { font-size: 14px; }
+  .nethead .mono { color: var(--muted); }
+  .bus { display: flex; flex-wrap: wrap; align-items: flex-end; row-gap: 14px; }
+  .bus > * { border-bottom: 4px solid var(--nc); align-self: stretch; display: flex; flex-direction: column; justify-content: flex-end; }
+  .gw { padding: 0 16px 6px 0; font-family: var(--mono); font-size: 11px; color: var(--muted); gap: 2px; }
+  .gw b { color: var(--ink); font-weight: 500; }
+  .tap { align-items: center; padding: 0 12px; }
+  .tap .box, .tap .box.ft40 { --w: 112px; height: 58px; }
+  .tap .tag { font-family: var(--mono); font-size: 10.5px; color: var(--muted); height: 18px; display: flex; gap: 4px; align-items: center; white-space: nowrap; }
+  .tap .tag button { border: 0; background: none; padding: 0; font: inherit; color: inherit; display: inline-flex; gap: 4px; align-items: center; }
+  .tap .tag button:hover { color: var(--ink); }
+  .stem { position: relative; width: 100%; height: 26px; }
+  .stem::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--nc); }
+  .stem span { position: absolute; left: calc(50% + 7px); top: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+  .egress { flex: 1 1 120px; align-items: flex-end; padding: 0 0 6px 16px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .egress.closed { color: var(--pause); }
+
+  .layers { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+  .layers li { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; gap: 2px 9px; align-items: start; padding: 5px 6px; border-radius: 5px; font-size: 12px; }
+  .layers li.lit { background: var(--sunken); transform: none; }
+  .layers li.dim { opacity: 1; }
+  .layers .swatch { margin-top: 3px; }
+  .layers code { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+  .layers span { font-family: var(--mono); font-size: 11.5px; color: var(--muted); text-align: right; }
+  .layers em { grid-column: 2 / -1; font-style: normal; font-size: 11px; color: var(--faint); }
+  .files { margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.7; color: var(--muted); background: var(--sunken); border-radius: 6px; padding: 8px 10px; overflow-x: auto; }
+  .att { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 6px 10px; align-items: start; font-size: 12.5px; }
+  .attk { color: var(--muted); padding-top: 4px; }
+  .attlist { display: grid; gap: 1px; min-width: 0; }
+  .attv { border: 0; background: none; padding: 3px 6px; border-radius: 5px; display: flex; gap: 4px 7px; align-items: center; text-align: left; min-width: 0; flex-wrap: wrap; }
+  button.attv:hover { background: var(--sunken); }
+  .attv b { font-weight: 600; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .attv em { font-style: normal; font-family: var(--mono); font-size: 11px; color: var(--faint); overflow-wrap: anywhere; }
+  .strata.mini { flex: none; width: 36px; }
+
+  /* ---------- dependency tree (inspector) ---------- */
+  .treegrp { display: grid; gap: 4px; }
+  .treegrp > span { font-size: 12px; color: var(--muted); }
+  .tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+  .tree ul { margin-left: 7px; }
+  .tree ul li { position: relative; padding: 2px 0 2px 18px; border-left: 1px solid var(--line); }
+  .tree ul li:last-child { border-left-color: transparent; }
+  .tree ul li::before { content: ""; position: absolute; left: -1px; top: 0; width: 14px; height: 15px; border-left: 1px solid var(--line); border-bottom: 1px solid var(--line); border-bottom-left-radius: 7px; }
+  .tnode { display: inline-flex; align-items: center; gap: 8px; min-height: 26px; }
+  .tlink { border: 0; background: none; padding: 2px 7px 2px 5px; border-radius: 5px; font-weight: 600; font-size: 13px; display: inline-flex; gap: 7px; align-items: center; }
+  .tlink:hover { background: var(--sunken); }
+  .troot { font-weight: 700; padding-left: 5px; display: inline-flex; gap: 7px; align-items: center; }
+  .tmeta { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  .tmeta.observed { color: var(--warn); }
+  .tmeta.broken { color: var(--bad); }
+  .tnote { font-size: 12.5px; color: var(--muted); margin: 0; }
+  .tnote b { color: var(--ink); }
+  .hintbox { font-size: 12.5px; padding: 9px 11px; border-radius: 7px; background: color-mix(in srgb, var(--warn) 10%, transparent); border-left: 3px solid var(--warn); display: grid; gap: 8px; justify-items: start; }
+  .hintbox .btn { padding: 4px 10px; font-size: 12px; }
+  .warnbox { font-size: 12.5px; padding: 9px 11px; border-radius: 7px; background: color-mix(in srgb, var(--warn) 10%, transparent); border-left: 3px solid var(--warn); }
+
+  /* ---------- inspector ---------- */
+  .insp { border-left: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; background: var(--window); }
+  .insp-top { padding: 18px 20px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 12px; }
+  .bigcode { display: flex; align-items: center; gap: 8px; font-family: var(--display); font-weight: 800; font-size: 34px; line-height: 1; letter-spacing: .05em; }
+  .bigcode .chk { border: 2.5px solid currentColor; padding: 1px 5px 0; font-size: 28px; line-height: 1; }
+  .ident { display: grid; gap: 2px; }
+  .ident h3 { margin: 0; font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ident p { margin: 0; font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .actions .btn { padding: 5px 10px; font-size: 12.5px; }
+  .confirm { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12.5px; padding: 9px 10px; border-radius: 7px; background: color-mix(in srgb, var(--bad) 10%, transparent); color: var(--ink); }
+  .confirm .btn { padding: 4px 10px; }
+  .alert { font-size: 12.5px; padding: 9px 11px; border-radius: 7px; background: color-mix(in srgb, var(--bad) 10%, transparent); border-left: 3px solid var(--bad); }
+  .alert b { display: block; margin-bottom: 2px; }
+  .alert code { font-family: var(--mono); font-size: 11.5px; }
+
+  .insp-scroll { overflow: auto; flex: 1; min-height: 0; }
+  .sect { padding: 14px 20px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+  .sect h4 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); font-weight: 600; display: flex; justify-content: space-between; }
+  .sect h4 span { text-transform: none; letter-spacing: 0; font-family: var(--mono); font-weight: 400; }
+  .metric { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: end; }
+  .metric .lbl { font-size: 12.5px; color: var(--muted); }
+  .metric .val { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .metric svg, .metric .membar { grid-column: 1 / -1; }
+  .spark { width: 100%; height: 44px; display: block; }
+  .membar { position: relative; height: 10px; background: var(--sunken); border-radius: 2px; overflow: visible; }
+  .membar > i { position: absolute; inset: 0 auto 0 0; background: var(--steel); border-radius: 2px; transition: width .6s ease; }
+  .membar.full > i { background: var(--bad); }
+  .membar::after { content: "memory.max"; position: absolute; right: 0; top: 13px; font-family: var(--mono); font-size: 10px; color: var(--faint); }
+  .membar b { position: absolute; right: -1px; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
+  .ns { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+  .ns span {
+    font-family: var(--mono); font-size: 11.5px; text-align: center; padding: 4px 0; border-radius: 4px;
+    border: 1px dashed var(--line); color: var(--faint);
+  }
+  .ns span.on { border: 1px solid var(--steel); background: color-mix(in srgb, var(--steel) 14%, transparent); color: var(--ink); }
+
+  .term { background: var(--term); color: var(--term-ink); display: flex; flex-direction: column; min-height: 210px; }
+  .termtabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid rgba(255,255,255,.07); }
+  .termtabs button { border: 0; background: none; color: #7f948b; font-size: 12px; font-weight: 600; padding: 5px 10px 7px; border-bottom: 2px solid transparent; }
+  .termtabs button[aria-selected="true"] { color: var(--term-ink); border-bottom-color: var(--accent); }
+  .termbody { font-family: var(--mono); font-size: 11.5px; line-height: 1.6; padding: 10px 12px; overflow: auto; height: 190px; white-space: pre-wrap; word-break: break-word; }
+
+  /* console docked under the yard: takes whatever height the yard doesn't use */
+  .main.docked .viewport { flex: 0 1 auto; }
+  .dock { flex: 1 1 280px; min-height: 240px; display: flex; flex-direction: column; border-top: 1px solid var(--line); background: var(--term); }
+  .dock .term { flex: 1; min-height: 0; }
+  .dock .termbody { height: auto; flex: 1; min-height: 120px; padding: 12px 16px; font-size: 12px; }
+  .dock .termtabs { align-items: center; padding: 4px 8px 0 12px; }
+  .dock .shellline { padding: 0 16px 12px; font-size: 12px; }
+  .dock .shellline input { font-size: 12px; }
+  .dockmeta { margin-left: auto; display: inline-flex; gap: 8px; align-items: center; font-family: var(--mono); font-size: 11px; color: #7f948b; padding-bottom: 3px; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .dockmeta b { color: var(--term-ink); font-weight: 500; }
+  .dockbtn { border: 0; background: none; color: #7f948b; width: 26px; height: 24px; border-radius: 5px; display: grid; place-items: center; margin-bottom: 3px; flex: none; }
+  .dockbtn:hover { color: var(--term-ink); background: rgba(255,255,255,.06); }
+  .dockbtn svg { transition: transform .2s ease; }
+  .dock.collapsed { flex: 0 0 auto; min-height: 0; }
+  .dock.collapsed .termbody, .dock.collapsed .shellline { display: none; }
+  .dock.collapsed .dockbtn svg { transform: rotate(180deg); }
+  .main.docked:has(.dock.collapsed) .viewport { flex: 1; }
+  .termbody .t { color: #5f7a6e; }
+  .termbody .w { color: #f2c94c; }
+  .termbody .e { color: #ff7b72; }
+  .termbody .p { color: var(--accent); }
+  .shellline { display: flex; gap: 8px; align-items: center; padding: 0 12px 10px; font-family: var(--mono); font-size: 11.5px; }
+  .shellline span { color: var(--accent); }
+  .shellline input { flex: 1; background: none; border: 0; outline: none; color: var(--term-ink); font-family: var(--mono); font-size: 11.5px; min-width: 0; }
+
+  /* ---------- status bar ---------- */
+  .status { display: flex; gap: 18px; align-items: center; padding: 7px 14px; border-top: 1px solid var(--line); background: var(--panel); font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .status .mono { font-size: 11.5px; }
+  .status b { color: var(--ink); font-weight: 600; }
+
+  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 24px; padding-top: 6px; }
+  .notes div { display: grid; gap: 4px; align-content: start; }
+  .notes h5 { margin: 0; font-size: 13px; font-weight: 700; }
+  .notes p { margin: 0; color: var(--muted); font-size: 13px; max-width: 46ch; }
+
+  @media (min-width: 1181px) {
+    .win { height: clamp(760px, calc(100vh - 140px), 1000px); }
+    .body { grid-template-rows: minmax(0, 1fr); overflow: hidden; }
+    .main, .insp { min-height: 0; overflow: hidden; }
+  }
+  @media (max-width: 1180px) {
+    .body { grid-template-columns: 180px minmax(0, 1fr); }
+    .insp { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); }
+    .insp-scroll { overflow: visible; }
+  }
+  @media (max-width: 760px) {
+    body { padding: 16px 16px 32px; }
+    .irow, .vrow, .rowhead.i, .rowhead.v { grid-template-columns: 1fr; gap: 8px; }
+    .rowhead { display: none; }
+    .vrow svg.drum { display: none; }
+    .num { text-align: left; }
+    .body { grid-template-columns: minmax(0, 1fr); }
+    .rail { border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; gap: 10px; }
+    .rail .railhead, .rail .host { display: none; }
+    .nav { grid-auto-flow: column; overflow-x: auto; }
+    .titlebar { grid-template-columns: auto 1fr; }
+    .wintitle { display: none; }
+    .cmd span.long { display: none; }
+    .runsheet form { grid-template-columns: 1fr 1fr; }
+    .runsheet form .field:first-child { grid-column: 1 / -1; }
+    .notes { grid-template-columns: 1fr; }
+    .win { min-height: 0; }
+    .box.ft40 { --w: min(250px, 100%); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="stage">
+  <div class="caption">
+    <span><b>Shipyard</b> — desktop interface study</span>
+    <span>Interactive mock. Hover anything to trace it, click any image, network or volume to jump to it, and press <kbd>⌘K</kbd> to run a container.</span>
+  </div>
+
+  <div class="win" role="application" aria-label="Shipyard">
+    <div class="titlebar">
+      <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="wintitle">Shipyard</div>
+      <button class="cmd" id="cmdk" type="button"><span class="long">Run an image…</span><kbd>⌘K</kbd></button>
+    </div>
+
+    <div class="body">
+      <aside class="rail">
+        <div class="brand">
+          <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="1" y="3" width="22" height="3" fill="var(--accent)"/>
+            <rect x="15" y="6" width="2" height="6" fill="var(--accent)"/>
+            <rect x="3" y="13" width="18" height="9" rx="1" fill="var(--steel)"/>
+            <path d="M7 14.5v6M10 14.5v6M13 14.5v6M16 14.5v6" stroke="var(--steel-ink)" stroke-opacity=".35" stroke-width="1"/>
+          </svg>
+          <span>Shipyard</span>
+        </div>
+        <div>
+          <div class="railhead">Local</div>
+          <nav class="nav" aria-label="Sections">
+            <button type="button" data-section="yard" aria-current="page">Yard <small id="navCount">7</small></button>
+            <button type="button" data-section="images">Images <small id="navImages">9</small></button>
+            <button type="button" data-section="volumes">Volumes <small id="navVolumes">5</small></button>
+            <button type="button" data-section="networks">Networks <small id="navNetworks">3</small></button>
+          </nav>
+        </div>
+        <div class="host">
+          <div class="row"><span>Linux VM</span><b>vz · arm64</b></div>
+          <div class="row"><span>Memory</span><b id="vmMem">1.1 / 4.0 GiB</b></div>
+          <div class="bar"><i id="vmBar" style="width:28%"></i></div>
+          <div class="row"><span>Kernel</span><b>6.12.9</b></div>
+        </div>
+      </aside>
+
+      <section class="main">
+        <div class="mainhead">
+          <h1 id="mainTitle">Yard</h1>
+          <div class="tally" id="tally"></div>
+          <div class="spacer"></div>
+          <div class="seg" role="group" aria-label="View" id="viewSeg">
+            <button type="button" id="vYard" aria-pressed="false">Yard</button>
+            <button type="button" id="vMap" aria-pressed="true">Map</button>
+            <button type="button" id="vList" aria-pressed="false">Manifest</button>
+          </div>
+          <button class="btn primary" type="button" id="runBtn">Run image</button>
+        </div>
+
+        <div class="runsheet" id="runsheet" hidden>
+          <form id="runform" autocomplete="off">
+            <div class="field"><label for="rImage">Image</label><input id="rImage" value="alpine:3.20" required></div>
+            <div class="field"><label for="rName">Name</label><input id="rName" placeholder="auto"></div>
+            <div class="field"><label for="rMem">Memory limit</label>
+              <select id="rMem"><option value="128">128 MiB</option><option value="256" selected>256 MiB</option><option value="512">512 MiB</option><option value="1024">1 GiB</option><option value="2048">2 GiB</option></select>
+            </div>
+            <div class="field"><label for="rPort">Publish port</label><input id="rPort" placeholder="8081:80"></div>
+            <button class="btn primary" type="submit">Run</button>
+          </form>
+          <p class="hint">Same as <code id="cliEcho">shipyard run --memory 256m alpine:3.20</code></p>
+        </div>
+
+        <div class="viewport" id="viewport">
+          <div class="yard" id="yard" hidden>
+            <div class="gantry" aria-hidden="true">
+              <div class="rail-beam"></div>
+              <div class="trolley" id="trolley"></div>
+              <div class="cable" id="cable"></div>
+            </div>
+            <div id="bays" style="display:grid;gap:26px"></div>
+            <div class="legend">
+              <span><i style="width:16px"></i>20′ — memory.max ≤ 512 MiB</span>
+              <span><i style="width:32px"></i>40′ — memory.max &gt; 512 MiB</span>
+              <span><i style="width:16px;background:transparent;border:1.5px dashed var(--faint)"></i>stopped</span>
+              <span><i style="width:16px;box-shadow:inset 0 -3px 0 var(--bad)"></i>failed</span>
+            </div>
+          </div>
+          <div class="mapwrap" id="map">
+            <div class="mapstatus" id="mapstatus"></div>
+            <div class="maptools" id="maptools"></div>
+            <div class="mapscroll"><div class="mapcanvas" id="mapcanvas"></div></div>
+            <div class="mapfoot" id="mapfoot"></div>
+          </div>
+          <div class="manifest-wrap" id="manifest" hidden></div>
+          <div class="secwrap" id="secImages" hidden></div>
+          <div class="secwrap" id="secVolumes" hidden></div>
+          <div class="secwrap" id="secNetworks" hidden></div>
+        </div>
+        <div class="dock" id="dock" hidden></div>
+      </section>
+
+      <aside class="insp" id="insp" aria-live="polite"></aside>
+    </div>
+
+    <div class="status">
+      <span><span class="dot running"></span>&nbsp; <b>Daemonless</b> — nothing runs when no containers do</span>
+      <span class="mono" id="monitors"></span>
+      <span class="spacer"></span>
+      <span class="mono">rootless · cgroup v2 · overlayfs</span>
+      <span class="mono">shipyard 0.0.1</span>
+    </div>
+  </div>
+
+  <div class="notes">
+    <div>
+      <h5>The yard is the list</h5>
+      <p>Each container is drawn as a shipping container: 20′ or 40′ by its memory limit, grouped into bays by stack. The crane follows your selection.</p>
+    </div>
+    <div>
+      <h5>Dependencies, drawn live</h5>
+      <p>The Map lays containers out by dependency depth. Solid lines come from <code>depends_on</code>; dotted orange lines are connections Shipyard sees in each container's <code>/proc/net/tcp</code> but that nobody declared.</p>
+    </div>
+    <div>
+      <h5>IDs you can read aloud</h5>
+      <p>IDs follow ISO 6346, the real freight-container format: owner code <b>SHP</b>, category <b>U</b>, six-digit serial, and a boxed check digit computed the real way.</p>
+    </div>
+    <div>
+      <h5>The kernel, made visible</h5>
+      <p>The inspector shows the real mechanics: which namespaces are on, the cgroup path, memory.max, host PID versus PID 1. It's the systems work you're building, shown as UI.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ---------- ISO 6346 ----------
+  const LV = {}; { let v = 10; for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") { if (v % 11 === 0) v++; LV[c] = v++; } }
+  const checkDigit = s => { let sum = 0; for (let i = 0; i < 10; i++) { const c = s[i]; sum += (/\d/.test(c) ? +c : LV[c]) * 2 ** i; } return sum % 11 % 10; };
+  const iso = serial => ({ owner: "SHPU", serial, chk: checkDigit("SHPU" + serial) });
+
+  // ---------- data ----------
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const series = (base, jit) => Array.from({ length: 48 }, () => Math.max(0, base + rnd(-jit, jit)));
+  const ALL_NS = ["cgroup", "ipc", "mnt", "net", "pid", "user", "uts", "time"];
+  const STD_NS = ["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"];
+
+  const LOGS = {
+    web: () => `172.18.0.1 - - [04/Oct/2026:12:${String(Math.floor(rnd(10,59))).padStart(2,"0")}:0${Math.floor(rnd(0,9))} +0000] "GET ${["/", "/healthz", "/assets/app.4f1c.js", "/api/orders"][Math.floor(rnd(0,4))]} HTTP/1.1" 200 ${Math.floor(rnd(2, 9000))}`,
+    api: () => `<span class="t">${new Date().toISOString().slice(11,23)}</span> INFO  request method=${["GET","GET","POST"][Math.floor(rnd(0,3))]} path=/v1/orders status=200 dur=${Math.floor(rnd(3,40))}ms`,
+    postgres: () => `<span class="t">2026-10-04 12:${Math.floor(rnd(10,59))} UTC</span> LOG:  checkpoint complete: wrote ${Math.floor(rnd(8,90))} buffers (0.${Math.floor(rnd(1,9))}%)`,
+    redis: () => `1:M 04 Oct 2026 12:${Math.floor(rnd(10,59))}:0${Math.floor(rnd(0,9))}.${Math.floor(rnd(100,999))} * ${["Background saving started by pid 31", "DB saved on disk", "Background saving terminated with success"][Math.floor(rnd(0,3))]}`,
+  };
+
+  let containers = [
+    { serial: "304812", name: "web", stack: "acme-shop", image: "nginx:1.27-alpine", state: "running", memMax: 256, mem: 18.4, cpu: series(2, 1.5), ports: "8080 → 80/tcp", pid1: "nginx: master process", hostPid: 48213, ns: STD_NS, up: "3h 12m",
+      log: ['/docker-entrypoint.sh: Configuration complete; ready for start up', '2026/10/04 09:01:12 [notice] 1#1: nginx/1.27.2', '2026/10/04 09:01:12 [notice] 1#1: start worker processes'] },
+    { serial: "304813", name: "api", stack: "acme-shop", image: "ghcr.io/acme/api:2.4.1", state: "running", memMax: 1024, mem: 212, cpu: series(9, 6), ports: "3000 → 3000/tcp", pid1: "/app/api --config /etc/api.toml", hostPid: 48240, ns: STD_NS, up: "3h 12m",
+      log: ['<span class="t">09:01:14.208</span> INFO  listening addr=0.0.0.0:3000', '<span class="t">09:01:14.211</span> INFO  db pool ready size=10'] },
+    { serial: "304814", name: "postgres", stack: "acme-shop", image: "postgres:16.4", state: "running", memMax: 2048, mem: 486, cpu: series(4, 3), ports: "5432 → 5432/tcp", pid1: "postgres", hostPid: 48198, ns: STD_NS, up: "3h 13m",
+      log: ['<span class="t">2026-10-04 09:01:09 UTC</span> LOG:  database system is ready to accept connections'] },
+    { serial: "304815", name: "redis", stack: "acme-shop", image: "redis:7.4-alpine", state: "running", memMax: 256, mem: 9.1, cpu: series(0.6, .4), ports: "—", pid1: "redis-server *:6379", hostPid: 48201, ns: STD_NS, up: "3h 13m",
+      log: ['1:M 04 Oct 2026 09:01:09.871 * Ready to accept connections tcp'] },
+    { serial: "304816", name: "worker", stack: "acme-shop", image: "ghcr.io/acme/worker:2.4.1", state: "failed", exit: 137, memMax: 256, mem: 256, cpu: series(0, 0), ports: "—", pid1: "/app/worker", hostPid: null, ns: STD_NS, up: "exited 14m ago",
+      log: ['<span class="t">11:57:02.114</span> INFO  processing batch=4181 items=2048', '<span class="t">11:57:09.880</span> INFO  processing batch=4182 items=2048', '<span class="t">11:57:11.302</span> <span class="w">WARN</span>  memory pressure: 251 MiB / 256 MiB', '<span class="e">Killed</span>', '<span class="p">[shipyard]</span> oom-kill: memory.max reached in /shipyard/acme-shop/worker — exit 137'] },
+    { serial: "209441", name: "build-cache", stack: "standalone", image: "rust:1.98-slim", state: "exited", exit: 0, memMax: 4096, mem: 0, cpu: series(0, 0), ports: "—", pid1: "cargo build --release", hostPid: null, ns: STD_NS, up: "exited 2h ago",
+      log: ['   Compiling shipyard-runtime v0.0.1', '   Compiling shipyard-cli v0.0.1', '    Finished `release` profile [optimized] target(s) in 41.07s'] },
+    { serial: "118027", name: "playground", stack: "standalone", image: "alpine:3.20", state: "paused", memMax: 128, mem: 1.2, cpu: series(0, 0), ports: "—", pid1: "/bin/sh", hostPid: 50117, ns: ALL_NS, up: "paused 6m",
+      log: ['<span class="p">[shipyard]</span> froze cgroup /shipyard/standalone/playground (cgroup.freeze=1)'] },
+  ];
+  // Declared links come from depends_on; observed ones are seen in /proc/net/tcp.
+  let links = [
+    { from: "web", to: "api", port: 3000, kind: "declared", rate: 1.6 },
+    { from: "api", to: "postgres", port: 5432, kind: "declared", rate: 1.1 },
+    { from: "api", to: "redis", port: 6379, kind: "declared", rate: 1.8 },
+    { from: "worker", to: "redis", port: 6379, kind: "declared", rate: 1 },
+    { from: "worker", to: "postgres", port: 5432, kind: "observed", rate: .8 },
+  ];
+  const HOST_RATE = { web: 2.2, api: .7, postgres: .15 };
+
+  // ---------- images: layers bottom → top; identical digests are stored once ----------
+  const hash = str => { let x = 2166136261; for (const ch of str) { x ^= ch.charCodeAt(0); x = Math.imul(x, 16777619); } return (x >>> 0).toString(16).padStart(8, "0"); };
+  const BASE = {
+    alpine: { cmd: "ADD alpine-minirootfs-3.20.3-aarch64.tar.gz /", size: 8.8, fam: "alpine" },
+    bookworm: { cmd: "ADD rootfs.tar.xz /   # debian:bookworm-slim", size: 97.1, fam: "bookworm" },
+    distroless: { cmd: "FROM gcr.io/distroless/cc-debian12", size: 23.4, fam: "distroless" },
+  };
+  const FAM = { alpine: ["var(--lay-alpine)", "alpine 3.20 base"], bookworm: ["var(--lay-bookworm)", "debian bookworm-slim base"], distroless: ["var(--lay-distroless)", "distroless cc-debian12 base"] };
+  const mkImage = (ref, created, base, own) => ({ ref, created, id: hash(ref) + hash(ref + "!"),
+    layers: [...(base ? [BASE[base]] : []), ...own.map(([cmd, size]) => ({ cmd, size }))].map(l => ({ ...l, d: hash(l.cmd) })) });
+  let images = [
+    mkImage("nginx:1.27-alpine", "3 weeks ago", "alpine", [["RUN apk add --no-cache nginx=1.27.2-r0 nginx-module-njs", 38.6], ["COPY docker-entrypoint.sh /", .004], ["COPY 20-envsubst-on-templates.sh /docker-entrypoint.d/", .003]]),
+    mkImage("ghcr.io/acme/api:2.4.1", "2 days ago", "distroless", [["COPY --from=build /app/target/release/api /app/api", 18.2], ["COPY config/ /etc/api/", .01]]),
+    mkImage("postgres:16.4", "5 weeks ago", "bookworm", [["RUN apt-get install -y gosu locales libnss-wrapper", 21.4], ["RUN apt-get install -y postgresql-16=16.4-1.pgdg120+2", 312.6], ["COPY docker-entrypoint.sh /usr/local/bin/", .02]]),
+    mkImage("redis:7.4-alpine", "4 weeks ago", "alpine", [["RUN addgroup -S redis && adduser -S -G redis redis", .006], ["RUN apk add --no-cache redis=7.4.1-r0", 28.9], ["COPY docker-entrypoint.sh /usr/local/bin/", .002]]),
+    mkImage("ghcr.io/acme/worker:2.4.1", "2 days ago", "distroless", [["COPY --from=build /app/target/release/worker /app/worker", 14.7]]),
+    mkImage("rust:1.98-slim", "1 month ago", "bookworm", [["RUN apt-get install -y gcc libc6-dev ca-certificates", 186.0], ["RUN rustup-init -y --profile minimal --default-toolchain 1.98.1", 572.4]]),
+    mkImage("alpine:3.20", "2 months ago", "alpine", []),
+    mkImage("node:22-alpine", "3 months ago", "alpine", [["RUN apk add --no-cache libstdc++ && build node 22.9.0", 142.3], ["RUN npm i -g yarn@1.22.22", 5.4]]),
+    mkImage("python:3.13-slim", "3 months ago", "bookworm", [["RUN build python 3.13.0 --enable-optimizations", 41.8], ["RUN pip install --upgrade pip", 12.1]]),
+  ];
+
+  let volumes = [
+    { name: "pgdata", size: 1240, created: "21 days ago", files: ["PG_VERSION", "base/", "global/", "pg_wal/", "pg_stat/", "postgresql.conf", "postmaster.pid"] },
+    { name: "redis-data", size: 46, created: "21 days ago", files: ["appendonlydir/", "dump.rdb"] },
+    { name: "uploads", size: 312, created: "21 days ago", files: ["2026/09/", "2026/10/", "thumbs/", ".keep"] },
+    { name: "cargo-cache", size: 2150, created: "2 months ago", files: ["registry/index/", "registry/cache/", "registry/src/", "git/db/"] },
+    { name: "old-pgdata", size: 840, created: "9 months ago", files: ["PG_VERSION", "base/", "global/", "pg_wal/"] },
+  ];
+
+  const networks = [
+    { name: "frontend", full: "acme-shop_frontend", subnet: "10.89.1.0/24", gw: "10.89.1.1", bridge: "sy-br7c1e", internal: false, color: "var(--net-a)" },
+    { name: "backend", full: "acme-shop_backend", subnet: "10.89.2.0/24", gw: "10.89.2.1", bridge: "sy-br2f90", internal: true, color: "var(--net-b)" },
+    { name: "shipyard", full: "shipyard (default)", subnet: "10.88.0.0/16", gw: "10.88.0.1", bridge: "sy-br0", internal: false, color: "var(--net-c)" },
+  ];
+  const ATTACH = {
+    web: { nets: { frontend: "10.89.1.2" }, mounts: [{ vol: "uploads", path: "/usr/share/nginx/html/uploads", mode: "ro" }], binds: [{ src: "./nginx.conf", path: "/etc/nginx/conf.d/default.conf", mode: "ro" }] },
+    api: { nets: { frontend: "10.89.1.3", backend: "10.89.2.2" }, mounts: [{ vol: "uploads", path: "/srv/uploads", mode: "rw" }] },
+    postgres: { nets: { backend: "10.89.2.3" }, mounts: [{ vol: "pgdata", path: "/var/lib/postgresql/data", mode: "rw" }] },
+    redis: { nets: { backend: "10.89.2.4" }, mounts: [{ vol: "redis-data", path: "/data", mode: "rw" }] },
+    worker: { nets: { backend: "10.89.2.5" } },
+    "build-cache": { nets: { shipyard: "10.88.0.12" }, mounts: [{ vol: "cargo-cache", path: "/usr/local/cargo/registry", mode: "rw" }], binds: [{ src: "~/Desktop/shipyard", path: "/src", mode: "rw" }] },
+    playground: { nets: { shipyard: "10.88.0.27" } },
+  };
+  containers.forEach(c => Object.assign(c, { mounts: [], binds: [] }, ATTACH[c.name]));
+
+  let sel = "api";
+  let view = "map";
+  let section = "yard";
+  let selImage = "nginx:1.27-alpine", selVol = "uploads", selNet = "backend";
+  let ov = { networks: true, volumes: true, images: true };
+  let pendingPrune = null, confirmItem = false;
+  let termTab = "logs";
+  let confirmRemove = false;
+  const shellHistory = {};
+
+  const $ = id => document.getElementById(id);
+  const byName = n => containers.find(c => c.name === n);
+  const fmtMem = m => m >= 1024 ? (m / 1024).toFixed(m % 1024 ? 1 : 0) + " GiB" : (m < 10 ? m.toFixed(1) : Math.round(m)) + " MiB";
+  const STATE_LABEL = { running: "Running", exited: "Stopped", failed: "Failed", paused: "Paused", restarting: "Restarting" };
+  const live = c => c.state === "running";
+
+  // ---------- dependency graph ----------
+  const graph = () => links.filter(l => byName(l.from) && byName(l.to));
+  const hostPort = c => (/^(\d+)/.exec(c.ports) || [])[1] || null;
+  const isUp = n => byName(n)?.state === "running";
+  const degraded = c => live(c) && graph().some(l => l.from === c.name && !isUp(l.to));
+  function walk(name, dir) { // dir "down" = what it needs, "up" = what needs it
+    const out = new Set(), st = [name];
+    while (st.length) { const n = st.pop(); for (const l of graph()) { const [a, b] = dir === "down" ? [l.from, l.to] : [l.to, l.from]; if (a === n && !out.has(b) && b !== name) { out.add(b); st.push(b); } } }
+    return out;
+  }
+  const affected = c => live(c) && !degraded(c) && [...walk(c.name, "down")].some(n => !isUp(n) || degraded(byName(n)));
+  function startOrder(stack) { // dependencies first, from declared links only
+    const cs = containers.filter(c => c.stack === stack), L = graph().filter(l => l.kind === "declared");
+    const h = Object.fromEntries(cs.map(c => [c.name, 0]));
+    for (let i = 0; i < cs.length; i++) for (const l of L) if (l.from in h && l.to in h) h[l.from] = Math.max(h[l.from], h[l.to] + 1);
+    const tiers = []; cs.forEach(c => (tiers[h[c.name]] ||= []).push(c.name));
+    return tiers.filter(Boolean);
+  }
+
+  // ---------- render: tally / yard / manifest ----------
+  function renderTally() {
+    const n = s => containers.filter(c => c.state === s).length;
+    const parts = [["running", "running"], ["paused", "paused"], ["exited", "stopped"], ["failed", "failed"]]
+      .filter(([s]) => n(s)).map(([s, l]) => `<span><i class="dot ${s}"></i>${n(s)} ${l}</span>`);
+    const dg = containers.filter(degraded).length;
+    if (dg) parts.splice(1, 0, `<span><i class="dot degraded"></i>${dg} degraded</span>`);
+    $("navImages").textContent = images.length; $("navVolumes").textContent = volumes.length; $("navNetworks").textContent = networks.length;
+    if (section === "images") { const u = images.filter(i => !usersOfImage(i.ref).length).length; $("tally").innerHTML = `<span>${images.length} images</span><span>${fmtSize(diskTotals().unique)} on disk</span>${u ? `<span><i class="dot"></i>${u} unused</span>` : ""}`; }
+    else if (section === "volumes") { const u = volumes.filter(v => !usersOfVol(v.name).length).length; $("tally").innerHTML = `<span>${volumes.length} volumes</span>${u ? `<span><i class="dot"></i>${u} not mounted</span>` : ""}`; }
+    else if (section === "networks") $("tally").innerHTML = `<span>${networks.length} networks</span><span>${networks.filter(n => n.internal).length} internal</span>`;
+    else $("tally").innerHTML = parts.join("");
+    $("navCount").textContent = containers.length;
+    const mons = containers.filter(c => c.state === "running" || c.state === "paused").length;
+    $("monitors").textContent = `${mons} monitor${mons === 1 ? "" : "s"} · ${(mons * 0.42).toFixed(1)} MiB`;
+  }
+
+  function boxHTML(c, plain = false) {
+    const code = iso(c.serial);
+    const big = c.memMax > 512 ? " ft40" : "";
+    const health = degraded(c) ? " degraded" : affected(c) ? " affected" : "";
+    return `<button type="button" class="box ${c.state}${big}${health}${c.name === sel && !plain ? " sel" : ""}" data-name="${c.name}" aria-pressed="${c.name === sel}" aria-label="${c.name}, ${STATE_LABEL[c.state]}">
+      <span class="code">${code.owner} ${code.serial} ${code.chk}</span>
+      <span class="lamp"></span>
+      <span><span class="nm" style="display:block">${c.name}</span><span class="sub" style="display:block">${c.image}</span></span>
+    </button>`;
+  }
+
+  function renderYard() {
+    const stacks = [...new Set(containers.map(c => c.stack))];
+    $("bays").innerHTML = stacks.map(s => {
+      const cs = containers.filter(c => c.stack === s);
+      const up = cs.filter(live).length;
+      const meta = s === "standalone" ? `${cs.length} containers` : `compose stack · ${up}/${cs.length} running`;
+      const bnets = [...new Set(cs.flatMap(netsOf))];
+      const nk = bnets.map(n => `<button class="netkey" type="button" data-hl="net:${n}" data-goto-net="${n}"><i class="swatch" style="background:${netColor(n)}"></i>${n}</button>`).join("");
+      return `<section class="bay"><div class="bayhead"><h2>${s}</h2><p>${meta}</p><span class="spacer"></span>${nk}</div><div class="berths">${cs.map(boxHTML).join("")}</div></section>`;
+    }).join("");
+    requestAnimationFrame(moveCrane);
+  }
+
+  function renderManifest() {
+    $("manifest").innerHTML = `<table><thead><tr><th>Container ID</th><th>Name</th><th>Image</th><th>State</th><th>CPU</th><th>Memory</th><th>Ports</th><th>Uptime</th></tr></thead><tbody>${
+      containers.map(c => { const k = iso(c.serial); const cpu = live(c) ? c.cpu[c.cpu.length - 1].toFixed(1) + "%" : "—";
+        return `<tr data-name="${c.name}" class="${c.name === sel ? "sel" : ""}" tabindex="0">
+        <td><span class="stencil">${k.owner} ${k.serial} ${k.chk}</span></td><td><b>${c.name}</b></td><td class="mono">${c.image}</td>
+        <td><span class="pill ${c.state}"><i class="dot ${c.state}"></i>${STATE_LABEL[c.state]}${c.exit ? " · " + c.exit : ""}</span></td>
+        <td class="mono">${cpu}</td><td class="mono">${live(c) || c.state === "paused" ? fmtMem(c.mem) : "—"} / ${fmtMem(c.memMax)}</td><td class="mono">${c.ports}</td><td>${c.up}</td></tr>`; }).join("")
+    }</tbody></table>`;
+  }
+
+  // ---------- map ----------
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let pEdges = [], packets = [], rafId = 0, lastT = 0;
+  const SVGNS = "http://www.w3.org/2000/svg";
+
+  function renderMap() {
+    const L = graph();
+    const linked = containers.filter(c => L.some(l => l.from === c.name || l.to === c.name) || hostPort(c));
+    const loose = containers.filter(c => !linked.includes(c));
+
+    // columns by longest path from the entry points
+    const depth = Object.fromEntries(linked.map(c => [c.name, 0]));
+    for (let i = 0; i < linked.length; i++) for (const l of L) depth[l.to] = Math.max(depth[l.to], depth[l.from] + 1);
+    const cols = []; linked.forEach(c => (cols[depth[c.name]] ||= []).push(c));
+    const idx = {}; cols.forEach(col => col.forEach((c, i) => idx[c.name] = i));
+    const bary = c => { const ps = L.filter(l => l.to === c.name).map(l => idx[l.from]); return ps.length ? ps.reduce((a, b) => a + b, 0) / ps.length : 99; };
+    for (let d = 1; d < cols.length; d++) { cols[d].sort((a, b) => bary(a) - bary(b)); cols[d].forEach((c, i) => idx[c.name] = i); }
+
+    // geometry
+    const NODE_H = 74, VGAP = 26, TOP = 32, HOSTW = 76, MINGAP = 52;
+    const topX = () => (ov.images ? 18 : 0) + (ov.networks ? 8 : 0);
+    const botX = c => ov.volumes && c.mounts.length ? 6 + c.mounts.length * 24 : 0;
+    const hgt = c => topX() + NODE_H + botX(c);
+    const w = c => c.memMax > 512 ? 180 : 90;
+    const colW = cols.map(col => Math.max(...col.map(w)));
+    const avail = $("map").clientWidth - 44;
+    const need = HOSTW + MINGAP + colW.reduce((a, b) => a + b, 0) + MINGAP * Math.max(0, cols.length - 1);
+    const W = Math.max(need, avail);
+    const gap = cols.length > 1 ? Math.max(MINGAP, (W - HOSTW - MINGAP - colW.reduce((a, b) => a + b, 0)) / (cols.length - 1)) : MINGAP;
+    const colHs = cols.map(col => col.reduce((a, c) => a + hgt(c), 0) + VGAP * (col.length - 1));
+    const innerH = Math.max(NODE_H, ...colHs);
+    const H = TOP + innerH + 8;
+    const pos = {}; let x = HOSTW + MINGAP;
+    cols.forEach((col, d) => {
+      let y = TOP + (innerH - colHs[d]) / 2;
+      col.forEach(c => { pos[c.name] = { x, y, w: w(c), cy: y + topX() + NODE_H / 2, maxw: w(c) + Math.min(gap - 16, 40) }; y += hgt(c) + VGAP; });
+      x += colW[d] + gap;
+    });
+
+    // host port chips, aligned to their container and kept apart
+    const chips = linked.filter(hostPort).map(c => ({ c, y: pos[c.name].cy - 13 })).sort((a, b) => a.y - b.y);
+    chips.forEach((ch, i) => { if (i && ch.y < chips[i - 1].y + 32) ch.y = chips[i - 1].y + 32; });
+
+    // edges
+    const edges = [
+      ...chips.map(ch => ({ host: true, from: "host", to: ch.c.name, port: hostPort(ch.c), x1: HOSTW, y1: ch.y + 13, rate: HOST_RATE[ch.c.name] ?? .5 })),
+      ...L.map(l => ({ ...l, x1: pos[l.from].x + pos[l.from].w, y1: pos[l.from].cy })),
+    ];
+    edges.forEach(e => { e.x2 = pos[e.to].x; e.y2 = pos[e.to].cy; });
+    const spread = (key, ykey) => { const g = {}; edges.forEach(e => (g[e[key]] ||= []).push(e));
+      Object.values(g).forEach(es => { es.sort((a, b) => (key === "to" ? a.y1 - b.y1 : a.y2 - b.y2)); es.forEach((e, i) => e[ykey] += (i - (es.length - 1) / 2) * 9); }); };
+    spread("to", "y2"); spread("from", "y1");
+    edges.forEach(e => {
+      e.state = e.host ? (isUp(e.to) ? "active" : "idle") : !isUp(e.from) ? "idle" : !isUp(e.to) ? "broken" : "active";
+      const dx = Math.max(28, (e.x2 - e.x1) * .5);
+      e.d = `M${e.x1},${e.y1} C${e.x1 + dx},${e.y1} ${e.x2 - dx},${e.y2} ${e.x2 - 2},${e.y2}`;
+    });
+    const touchesSel = e => e.from === sel || e.to === sel;
+    const cls = e => `edge ${e.kind === "observed" ? "observed" : ""} ${e.state === "active" ? "" : e.state}${touchesSel(e) ? " hot" : ""}`;
+
+    const hostIcon = `<svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1" y="2" width="10" height="7" rx="1" fill="none" stroke="currentColor"/><path d="M4 11h4" stroke="currentColor"/></svg>`;
+    $("mapcanvas").style.width = W + "px";
+    $("mapcanvas").style.height = H + "px";
+    $("mapcanvas").innerHTML = `
+      <svg viewBox="0 0 ${W} ${H}" id="mapsvg" aria-hidden="true">
+        <defs><marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L7.5,4 L0,7.5 z" fill="context-stroke"/></marker></defs>
+        ${edges.map(e => `<path class="${cls(e)}" d="${e.d}" marker-end="url(#arr)" data-from="${e.from}" data-to="${e.to}"/>`).join("")}
+        <g id="labels"></g><g id="packets"></g>
+      </svg>
+      <span class="colhead" style="left:0">Host</span>
+      <span class="colhead" style="left:${HOSTW + MINGAP}px">Depends on →</span>
+      ${chips.map(ch => `<span class="hostchip" style="top:${ch.y}px" data-to="${ch.c.name}">${hostIcon}:${hostPort(ch.c)}</span>`).join("")}
+      ${linked.map(c => { const p = pos[c.name], img = imgOf(c);
+        return `<div class="mnode" style="left:${p.x}px;top:${p.y}px;width:${p.w}px">
+          ${ov.images ? (img ? `<button type="button" class="strata-row" data-goto-image="${img.ref}" data-hl="img:${img.ref}" title="${img.ref} · ${img.layers.length} layers">${strataHTML(img, "strata")}<span>${fmtSize(imgSize(img))}</span></button>` : `<span class="strata-row"></span>`) : ""}
+          ${ov.networks ? `<span class="livery">${netsOf(c).map(n => `<i style="background:${netColor(n)}" title="${n} · ${c.nets[n]}"></i>`).join("")}</span>` : ""}
+          ${boxHTML(c)}
+          ${ov.volumes ? c.mounts.map(m => `<button type="button" class="vchip" data-vol="${m.vol}" data-hl="vol:${m.vol}" data-goto-vol="${m.vol}" style="--maxw:${p.maxw}px" title="${m.vol} → ${m.path} (${m.mode})">${drumIco}${m.vol}${m.mode === "ro" ? " <em>ro</em>" : ""}</button>`).join("") : ""}
+        </div>`; }).join("")}`;
+
+    // overlay toggles + network key
+    const mapNets = networks.filter(n => linked.some(c => c.nets?.[n.name]));
+    $("maptools").innerHTML = `<span>Show</span>
+      <button class="toggle" type="button" data-ov="networks" aria-pressed="${ov.networks}">${netIco}Networks</button>
+      <button class="toggle" type="button" data-ov="volumes" aria-pressed="${ov.volumes}">${drumIco}Volumes</button>
+      <button class="toggle" type="button" data-ov="images" aria-pressed="${ov.images}">${layersIco}Images</button>
+      <span class="spacer"></span>
+      ${ov.networks ? mapNets.map(n => `<button class="netkey" type="button" data-hl="net:${n.name}" data-goto-net="${n.name}"><i class="swatch" style="background:${n.color}"></i>${n.name} <span>${n.subnet}</span></button>`).join("") : ""}`;
+
+    // labels at each link's midpoint
+    const paths = [...$("mapsvg").querySelectorAll("path.edge")];
+    const lg = $("labels");
+    pEdges = [];
+    edges.forEach((e, i) => {
+      const path = paths[i], len = path.getTotalLength();
+      if (!e.host) {
+        const m = path.getPointAtLength(len / 2);
+        const t = document.createElementNS(SVGNS, "text");
+        t.setAttribute("x", m.x); t.setAttribute("y", m.y - 6); t.setAttribute("text-anchor", "middle");
+        t.setAttribute("class", `elabel ${e.kind === "observed" ? "observed" : ""} ${e.state === "broken" ? "broken" : ""}`);
+        t.dataset.from = e.from; t.dataset.to = e.to;
+        t.textContent = e.state === "broken" ? `tcp ${e.port} · refused` : `tcp ${e.port}${e.kind === "observed" ? " · undeclared" : ""}`;
+        lg.appendChild(t);
+      }
+      if (e.state === "active") pEdges.push({ path, len, rate: e.rate, acc: Math.random(), from: e.from, to: e.to });
+    });
+    packets = [];
+
+    // status line
+    const down = containers.filter(c => !live(c) && graph().some(l => l.to === c.name && isUp(l.from)));
+    const dg = containers.filter(degraded).map(c => c.name), af = containers.filter(affected).map(c => c.name);
+    const observed = graph().filter(l => l.kind === "observed");
+    const list = a => a.length === 1 ? a[0] : a.slice(0, -1).join(", ") + " and " + a[a.length - 1];
+    if (down.length) {
+      $("mapstatus").className = "mapstatus warn";
+      $("mapstatus").innerHTML = `<i class="dot degraded"></i><span><b>${list(down.map(c => c.name))}</b> ${down.length === 1 ? "is" : "are"} ${down.length === 1 ? STATE_LABEL[down[0].state].toLowerCase() : "down"}: ${list(dg)} ${dg.length === 1 ? "is" : "are"} degraded${af.length ? `, ${list(af)} affected through ${af.length === 1 ? "it" : "them"}` : ""}.</span>${down.length === 1 ? `<button class="btn" type="button" data-fix="${down[0].name}">Start ${down[0].name}</button>` : ""}`;
+    } else {
+      const n = graph().filter(l => isUp(l.from)).length;
+      $("mapstatus").className = "mapstatus";
+      $("mapstatus").innerHTML = `<i class="dot running"></i><span><b>All ${n} active links healthy.</b> ${observed.length ? `${observed.length} undeclared connection${observed.length === 1 ? "" : "s"} detected.` : "Every connection is declared."}</span>`;
+    }
+
+    // footer: start order + legend, then unconnected containers
+    const order = startOrder("acme-shop");
+    const lgd = (style, label) => `<span><svg width="26" height="8" aria-hidden="true"><line x1="1" y1="4" x2="25" y2="4" style="${style}" stroke-width="1.8"/></svg> ${label}</span>`;
+    $("mapfoot").innerHTML = `
+      <span class="order">Start order <em>acme-shop</em> ${order.map(t => t.map(n => `<b>${n}</b>`).join(" · ")).join(" <em>→</em> ")}</span>
+      <span class="spacer"></span>
+      ${lgd("stroke:var(--steel)", "declared")}${lgd("stroke:var(--warn);stroke-dasharray:2 4;stroke-linecap:round", "observed")}${lgd("stroke:var(--bad);stroke-dasharray:6 4", "refused")}
+      ${loose.length ? `<div class="loose" style="flex-basis:100%">Not connected to anything ${loose.map(c => `<button type="button" data-goto="${c.name}"><i class="dot ${c.state}"></i>${c.name}</button>`).join("")}</div>` : ""}`;
+
+    startPackets();
+  }
+
+  function startPackets() {
+    cancelAnimationFrame(rafId);
+    if (reduceMotion || view !== "map" || section !== "yard") return;
+    lastT = performance.now();
+    rafId = requestAnimationFrame(tickPackets);
+  }
+  function tickPackets(now) {
+    const dt = Math.min(.05, (now - lastT) / 1000); lastT = now;
+    const g = $("packets"); if (!g) return;
+    for (const e of pEdges) {
+      e.acc += dt * e.rate;
+      if (e.acc >= 1) { e.acc -= 1; const el = document.createElementNS(SVGNS, "circle"); el.setAttribute("r", "2.4"); el.setAttribute("class", "packet"); g.appendChild(el); packets.push({ e, t: 0, el }); }
+    }
+    packets = packets.filter(p => {
+      p.t += dt * (140 / p.e.len);
+      if (p.t >= 1) { p.el.remove(); return false; }
+      const pt = p.e.path.getPointAtLength(p.t * p.e.len);
+      p.el.setAttribute("cx", pt.x); p.el.setAttribute("cy", pt.y);
+      p.el.style.opacity = p.e.path.classList.contains("dimmed") ? .1 : "";
+      return true;
+    });
+    rafId = requestAnimationFrame(tickPackets);
+  }
+
+  // hover / focus: trace a container's dependencies, or everything on one network / volume / image
+  let traced = null;
+  function applyDim(keep, edgeOn = () => false, volKey = null) {
+    document.querySelectorAll(".box").forEach(b => (b.closest(".mnode, .tap") || b).classList.toggle("dimmed", !!keep && !keep.has(b.dataset.name)));
+    document.querySelectorAll("#mapcanvas .edge, #mapcanvas .elabel").forEach(el => el.classList.toggle("dimmed", !!keep && !edgeOn(el.dataset.from, el.dataset.to)));
+    document.querySelectorAll(".hostchip").forEach(h => h.classList.toggle("dimmed", !!keep && !edgeOn("host", h.dataset.to)));
+    document.querySelectorAll(".vchip").forEach(v => v.classList.toggle("lit", !!volKey && v.dataset.vol === volKey));
+  }
+  function trace(name) {
+    if (traced === name) return; traced = name;
+    if (!name) return applyDim(null);
+    if (name.includes(":")) {
+      const i = name.indexOf(":"), kind = name.slice(0, i), id = name.slice(i + 1);
+      const keep = new Set(containers.filter(c => kind === "net" ? c.nets?.[id] : kind === "vol" ? c.mounts.some(m => m.vol === id) : c.image === id).map(c => c.name));
+      return applyDim(keep, (a, b) => (a === "host" || keep.has(a)) && keep.has(b), kind === "vol" ? id : null);
+    }
+    if (section !== "yard") return applyDim(new Set([name]));
+    const down = walk(name, "down"), up = walk(name, "up");
+    applyDim(new Set([name, ...down, ...up]), (a, b) => a === "host" ? (b === name || up.has(b))
+      : ((a === name || down.has(a)) && down.has(b)) || ((b === name || up.has(b)) && up.has(a)));
+  }
+  function retrace() { const t = traced; traced = undefined; trace(t ?? null); }
+  function pointAt(target) {
+    const ly = target.closest?.("[data-layer]"); litLayer(ly ? ly.dataset.layer : null);
+    const b = target.closest?.(".box"); if (b) return trace(b.dataset.name);
+    const h = target.closest?.("[data-hl]"); trace(h ? h.dataset.hl : null);
+  }
+  document.addEventListener("mouseover", e => pointAt(e.target));
+  document.addEventListener("focusin", e => pointAt(e.target));
+
+  // ---------- attachments ----------
+  const fmtSize = mb => mb >= 1024 ? (mb / 1024).toFixed(2) + " GB" : mb >= 10 ? Math.round(mb) + " MB" : mb >= 1 ? mb.toFixed(1) + " MB" : mb > 0 ? Math.max(1, Math.round(mb * 1024)) + " KB" : "0 B";
+  const imgOf = c => images.find(i => i.ref === c.image);
+  const imgSize = img => img.layers.reduce((a, l) => a + l.size, 0);
+  const sharers = d => images.filter(i => i.layers.some(l => l.d === d));
+  const usersOfImage = ref => containers.filter(c => c.image === ref);
+  const usersOfVol = name => containers.flatMap(c => c.mounts.filter(m => m.vol === name).map(m => ({ c, m })));
+  const membersOf = net => containers.filter(c => c.nets?.[net]);
+  const netsOf = c => Object.keys(c.nets || {});
+  const netColor = n => networks.find(x => x.name === n)?.color || "var(--net-c)";
+  const layerColor = l => l.fam ? FAM[l.fam][0] : "var(--faint)";
+  const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const veth = (c, n) => "veth" + hash(c + n).slice(0, 5);
+  function diskTotals() {
+    const seen = new Map(); let naive = 0;
+    images.forEach(i => i.layers.forEach(l => { naive += l.size; seen.set(l.d, l.size); }));
+    const unique = [...seen.values()].reduce((a, b) => a + b, 0);
+    return { naive, unique };
+  }
+  function strataHTML(img, cls, style = "") {
+    const total = imgSize(img) || 1;
+    return `<span class="${cls}" style="${style}">${img.layers.map(l => `<i data-layer="${l.d}" style="flex:${Math.max(l.size, total * .035)} 1 0;background:${layerColor(l)}${l.fam ? "" : ";opacity:.55"}"></i>`).join("")}</span>`;
+  }
+  let drumN = 0;
+  function drum(fill, size = 22, dashed = false) {
+    const id = "dr" + (drumN++), h = Math.round(size * 1.2);
+    return `<svg class="drum" width="${size}" height="${h}" viewBox="0 0 22 26" aria-hidden="true"><defs><clipPath id="${id}"><path d="M1 4V22A10 3 0 0 0 21 22V4Z"/></clipPath></defs>
+      <path d="M1 4V22A10 3 0 0 0 21 22V4" fill="var(--sunken)" stroke="var(--faint)" ${dashed ? 'stroke-dasharray="2 2"' : ""}/>
+      <rect x="0" y="${26 - Math.max(.08, fill) * 22}" width="22" height="26" fill="var(--steel)" opacity=".85" clip-path="url(#${id})"/>
+      <ellipse cx="11" cy="4" rx="10" ry="3" fill="var(--window)" stroke="var(--faint)" ${dashed ? 'stroke-dasharray="2 2"' : ""}/></svg>`;
+  }
+  const drumIco = `<svg class="ico" width="11" height="12" viewBox="0 0 22 26" aria-hidden="true"><path d="M1 4V22A10 3 0 0 0 21 22V4" fill="none" stroke="currentColor" stroke-width="2.4"/><ellipse cx="11" cy="4" rx="10" ry="3" fill="none" stroke="currentColor" stroke-width="2.4"/></svg>`;
+  const folderIco = `<svg class="ico" width="12" height="11" viewBox="0 0 12 11" aria-hidden="true"><path d="M1 2h3.5l1 1.3H11V10H1z" fill="none" stroke="currentColor"/></svg>`;
+  const layersIco = `<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1 3.5h10M1 6h10M1 8.5h10" stroke="currentColor" stroke-width="1.6"/></svg>`;
+  const netIco = `<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1 9h10M3 9V4M9 9V4M6 9V2" stroke="currentColor" stroke-width="1.4"/></svg>`;
+  const list = a => a.length <= 1 ? (a[0] ?? "") : a.slice(0, -1).join(", ") + " and " + a[a.length - 1];
+
+  function attachedHTML(c) {
+    const img = imgOf(c);
+    const nets = netsOf(c);
+    const vols = c.mounts.map(m => `<button class="attv" type="button" data-goto-vol="${m.vol}">${drumIco}<b>${m.vol}</b><em>${m.path} · ${m.mode}</em></button>`)
+      .concat(c.binds.map(b => `<span class="attv">${folderIco}<b>${b.src}</b><em>${b.path} · ${b.mode} · bind</em></span>`));
+    return `<div class="sect"><h4>Attached</h4><div class="att">
+      <span class="attk">Image</span>
+      <div class="attlist">${img ? `<button class="attv" type="button" data-goto-image="${img.ref}">${strataHTML(img, "strata mini")}<b>${img.ref}</b><em>${img.layers.length} layers · ${fmtSize(imgSize(img))}</em></button>` : `<span class="attv"><b>${c.image}</b></span>`}</div>
+      <span class="attk">Networks</span>
+      <div class="attlist">${nets.map(n => `<button class="attv" type="button" data-goto-net="${n}"><i class="swatch" style="background:${netColor(n)}"></i><b>${n}</b><em>${c.nets[n]}</em></button>`).join("") || `<span class="attv"><em>none</em></span>`}</div>
+      <span class="attk">Storage</span>
+      <div class="attlist">${vols.join("") || `<p class="tnote" style="padding:3px 6px">None. Writes go to the container's own layer and are lost when it's removed.</p>`}</div>
+    </div></div>`;
+  }
+
+  // ---------- section: images ----------
+  const CAP_IMG = `Hover a layer to see what it is and which images share it.`;
+  function renderImages() {
+    const { naive, unique } = diskTotals();
+    const unused = images.filter(i => !usersOfImage(i.ref).length);
+    const unusedSize = unused.reduce((a, i) => a + i.layers.filter(l => sharers(l.d).length === 1).reduce((x, l) => x + l.size, 0), 0);
+    const maxSize = Math.max(...images.map(imgSize));
+    const sum = pendingPrune === "images"
+      ? `<div class="secsum confirming"><span>Remove <b>${list(unused.map(i => i.ref))}</b>? This frees ${fmtSize(unusedSize)}. Shared layers stay.</span><button class="btn danger" type="button" data-prune-yes="images">Remove</button><button class="btn" type="button" data-prune-no style="margin-left:0">Cancel</button></div>`
+      : `<div class="secsum"><span><b>${fmtSize(unique)}</b> on disk for ${images.length} images. Shared layers save ${fmtSize(naive - unique)}.</span>${unused.length ? `<button class="btn" type="button" data-prune="images">Remove ${unused.length} unused</button>` : ""}</div>`;
+    $("secImages").innerHTML = `${sum}
+      <p class="capline" id="layercap">${CAP_IMG}</p>
+      <div class="rows">
+        <div class="rowhead i"><span>Image</span><span>Layers, bottom → top</span><span style="text-align:right">Size</span><span>Used by</span></div>
+        ${images.map(img => { const users = usersOfImage(img.ref), size = imgSize(img);
+          return `<div class="irow${img.ref === selImage ? " sel" : ""}" data-sel-image="${img.ref}" tabindex="0" role="button" aria-pressed="${img.ref === selImage}">
+            <div class="ref">${img.ref}<small>${img.layers.length} layer${img.layers.length === 1 ? "" : "s"} · ${img.created}</small></div>
+            <div>${strataHTML(img, "bigstrata", `width:${Math.max(10, Math.sqrt(size / maxSize) * 100)}%`)}</div>
+            <div class="num">${fmtSize(size)}</div>
+            <div class="chips">${users.map(c => `<button class="chip" type="button" data-goto="${c.name}"><i class="dot ${c.state}"></i>${c.name}</button>`).join("") || `<span class="chip none">unused</span>`}</div>
+          </div>`; }).join("")}
+      </div>
+      <div class="legendrow">${Object.values(FAM).map(([c, l]) => `<span><i class="swatch" style="background:${c}"></i>${l}</span>`).join("")}<span><i class="swatch" style="background:var(--faint);opacity:.55"></i>image's own layers</span></div>`;
+  }
+  let litD = null;
+  function litLayer(d) {
+    if (d === litD) return; litD = d;
+    document.querySelectorAll("[data-layer]").forEach(el => { el.classList.toggle("lit", !!d && el.dataset.layer === d); el.classList.toggle("dim", !!d && el.dataset.layer !== d); });
+    const cap = $("layercap"); if (!cap) return;
+    if (!d) { cap.innerHTML = CAP_IMG; return; }
+    const owners = sharers(d), l = owners[0].layers.find(x => x.d === d);
+    cap.innerHTML = `<i class="swatch" style="background:${layerColor(l)};margin-top:3px"></i><span><code>${esc(l.cmd)}</code><br>sha256:${d}… · ${fmtSize(l.size)} · ${owners.length > 1 ? `shared by <b>${list(owners.map(i => i.ref))}</b>, stored once` : `only in ${owners[0].ref}`}</span>`;
+  }
+
+  // ---------- section: volumes ----------
+  function renderVolumes() {
+    const unused = volumes.filter(v => !usersOfVol(v.name).length);
+    const total = volumes.reduce((a, v) => a + v.size, 0), maxV = Math.max(...volumes.map(v => v.size));
+    const sum = pendingPrune === "volumes"
+      ? `<div class="secsum confirming"><span>Delete <b>${list(unused.map(v => v.name))}</b> and all ${fmtSize(unused.reduce((a, v) => a + v.size, 0))} of data in ${unused.length === 1 ? "it" : "them"}? This can't be undone.</span><button class="btn danger" type="button" data-prune-yes="volumes">Delete</button><button class="btn" type="button" data-prune-no style="margin-left:0">Cancel</button></div>`
+      : `<div class="secsum"><span><b>${fmtSize(total)}</b> in ${volumes.length} volumes.${unused.length ? ` ${fmtSize(unused.reduce((a, v) => a + v.size, 0))} isn't mounted by any container.` : ""}</span>${unused.length ? `<button class="btn" type="button" data-prune="volumes">Delete ${unused.length} unused</button>` : ""}</div>`;
+    $("secVolumes").innerHTML = `${sum}
+      <div class="rows">
+        <div class="rowhead v"><span></span><span>Volume</span><span>Mounted by</span><span style="text-align:right">Size</span></div>
+        ${volumes.map(v => { const us = usersOfVol(v.name);
+          return `<div class="vrow${v.name === selVol ? " sel" : ""}" data-sel-vol="${v.name}" tabindex="0" role="button" aria-pressed="${v.name === selVol}">
+            ${drum(v.size / maxV, 24, !us.length)}
+            <div class="ref">${v.name}<small>local · ${v.created}</small></div>
+            <div class="chips">${us.map(({ c, m }) => `<button class="chip" type="button" data-goto="${c.name}"><i class="dot ${c.state}"></i>${c.name} <em>${m.path}</em> ${m.mode}</button>`).join("") || `<span class="chip none">not mounted</span>`}</div>
+            <div class="num">${fmtSize(v.size)}</div>
+          </div>`; }).join("")}
+      </div>
+      <div class="legendrow"><span>${drum(.6, 14)} fill shows size relative to the largest volume</span><span>${drum(.3, 14, true)} not mounted</span></div>`;
+  }
+
+  // ---------- section: networks ----------
+  function renderNetworks() {
+    $("secNetworks").innerHTML = `
+      <div class="secsum"><span><b>${networks.length} bridge networks</b>, ${containers.reduce((a, c) => a + netsOf(c).length, 0)} endpoints. Each endpoint is a veth pair: <code class="mono">eth0</code> in the container, the other end on the bridge.</span></div>
+      ${networks.map(n => { const ms = membersOf(n.name);
+        return `<div class="netband${n.name === selNet ? " sel" : ""}" data-sel-net="${n.name}" tabindex="0" role="button" aria-pressed="${n.name === selNet}" style="--nc:${n.color}">
+          <div class="nethead"><i class="swatch" style="background:${n.color}"></i><b>${n.name}</b><span class="mono">${n.subnet}</span>${n.internal ? `<span class="pill paused">internal</span>` : ""}<span class="spacer"></span><span class="mono">${n.bridge}</span></div>
+          <div class="bus">
+            <div class="gw"><span>gateway</span><b>${n.gw}</b></div>
+            ${ms.map(c => { const other = netsOf(c).filter(x => x !== n.name); const hp = hostPort(c);
+              return `<div class="tap">
+                <span class="tag">${other.length ? `<button type="button" data-goto-net="${other[0]}"><i class="swatch" style="background:${netColor(other[0])}"></i>also ${other[0]}</button>` : hp && !n.internal ? `host :${hp}` : ""}</span>
+                ${boxHTML(c, true)}
+                <div class="stem"><span>${c.nets[n.name]}</span></div>
+              </div>`; }).join("") || `<div class="tap"><span class="tag"></span><span class="tnote" style="padding:20px 0">No containers attached</span><div class="stem"></div></div>`}
+            <div class="egress${n.internal ? " closed" : ""}">${n.internal ? "⊘ no route out" : "NAT → internet"}</div>
+          </div>
+        </div>`; }).join("")}`;
+  }
+
+  // ---------- item inspectors ----------
+  function imageInsp() {
+    const img = images.find(i => i.ref === selImage);
+    if (!img) return `<div class="sect"><p class="tnote">Select an image.</p></div>`;
+    const users = usersOfImage(img.ref), size = imgSize(img);
+    const own = img.layers.filter(l => sharers(l.d).length === 1).reduce((a, l) => a + l.size, 0);
+    const i = img.ref.lastIndexOf(":"), repo = img.ref.slice(0, i), tag = img.ref.slice(i + 1);
+    return `<div class="insp-top">
+        <div class="bigcode" style="font-size:30px">${esc(repo.split("/").pop().toUpperCase())} <span class="chk" style="font-size:20px;padding:2px 6px 1px">${esc(tag)}</span></div>
+        <div class="ident"><h3 style="font-size:16px">${img.ref}</h3><p>sha256:${img.id}… · pulled ${img.created}</p></div>
+        ${confirmItem ? `<div class="confirm">Remove <b>${img.ref}</b>? Frees ${fmtSize(own)}. <span class="spacer"></span><button class="btn danger" type="button" data-iact="remove-yes">Remove</button><button class="btn" type="button" data-iact="remove-no">Keep</button></div>`
+          : `<div class="actions"><button class="btn" type="button" data-iact="run">Run</button><span class="spacer"></span><button class="btn danger" type="button" data-iact="remove" ${users.length ? `disabled title="In use by ${users.map(c => c.name).join(", ")}"` : ""}>Remove</button></div>`}
+      </div>
+      <div class="insp-scroll">
+        <div class="sect"><h4>Layers <span>${img.layers.length} · ${fmtSize(size)}</span></h4>
+          ${strataHTML(img, "bigstrata")}
+          <ol class="layers">${[...img.layers].reverse().map(l => { const sh = sharers(l.d).length; return `<li data-layer="${l.d}"><i class="swatch" style="background:${layerColor(l)}${l.fam ? "" : ";opacity:.55"}"></i><code>${esc(l.cmd)}</code><span>${fmtSize(l.size)}</span>${sh > 1 ? `<em>shared with ${sh - 1} other image${sh > 2 ? "s" : ""}</em>` : ""}</li>`; }).join("")}</ol>
+          <p class="tnote">${fmtSize(own)} is unique to this image. The other ${fmtSize(size - own)} is shared and stored once, and each container stacks its own writable layer on top with overlayfs.</p>
+        </div>
+        <div class="sect"><h4>Used by</h4>${users.length ? `<div class="chips">${users.map(c => `<button class="chip" type="button" data-goto="${c.name}"><i class="dot ${c.state}"></i>${c.name}</button>`).join("")}</div>` : `<p class="tnote">No containers. Safe to remove.</p>`}</div>
+      </div>`;
+  }
+  function volumeInsp() {
+    const v = volumes.find(x => x.name === selVol);
+    if (!v) return `<div class="sect"><p class="tnote">Select a volume.</p></div>`;
+    const us = usersOfVol(v.name);
+    const rw = us.filter(u => u.m.mode === "rw").length;
+    const tree = v.files.map((f, i) => `${i === v.files.length - 1 ? "└──" : "├──"} ${esc(f)}`).join("\n");
+    return `<div class="insp-top">
+        <div class="bigcode" style="font-size:30px">${drum(Math.min(1, v.size / 2150), 26, !us.length)} ${esc(v.name.toUpperCase())}</div>
+        <div class="ident"><h3 style="font-size:16px">${v.name} <span class="pill ${us.length ? "running" : ""}">${us.length ? "Mounted" : "Not mounted"}</span></h3><p>local volume · ${fmtSize(v.size)} · created ${v.created}</p></div>
+        ${confirmItem ? `<div class="confirm">Delete <b>${v.name}</b> and its ${fmtSize(v.size)} of data? <span class="spacer"></span><button class="btn danger" type="button" data-iact="remove-yes">Delete</button><button class="btn" type="button" data-iact="remove-no">Keep</button></div>`
+          : `<div class="actions"><span class="spacer"></span><button class="btn danger" type="button" data-iact="remove" ${us.length ? `disabled title="Mounted by ${us.map(u => u.c.name).join(", ")}"` : ""}>Delete</button></div>`}
+      </div>
+      <div class="insp-scroll">
+        <div class="sect"><h4>Mounted by <span>${us.length}</span></h4>
+          ${us.length ? `<div class="attlist">${us.map(({ c, m }) => `<button class="attv" type="button" data-goto="${c.name}"><i class="dot ${c.state}"></i><b>${c.name}</b><em>${m.path} · ${m.mode === "ro" ? "read-only" : "read-write"}</em></button>`).join("")}</div>` : `<p class="tnote">No container mounts this volume. Its data is kept until you delete it.</p>`}
+          ${us.length > 1 ? `<p class="tnote">Shared by ${us.length} containers; ${rw === 1 ? "only one can write" : rw + " can write"}.</p>` : ""}
+        </div>
+        <div class="sect"><h4>Location</h4><dl class="kv"><dt>Path in VM</dt><dd>/var/lib/shipyard/volumes/${v.name}/_data</dd><dt>Driver</dt><dd>local</dd></dl></div>
+        <div class="sect"><h4>Files</h4><pre class="files">${v.name}/\n${tree}</pre></div>
+      </div>`;
+  }
+  function networkInsp() {
+    const n = networks.find(x => x.name === selNet);
+    const ms = membersOf(n.name);
+    const bridges = ms.filter(c => netsOf(c).length > 1);
+    return `<div class="insp-top">
+        <div class="bigcode" style="font-size:30px"><i class="swatch" style="background:${n.color};width:18px;height:18px"></i> ${n.name.toUpperCase()}</div>
+        <div class="ident"><h3 style="font-size:16px">${n.full} ${n.internal ? `<span class="pill paused">internal</span>` : `<span class="pill">bridge</span>`}</h3><p>${n.subnet} · gateway ${n.gw}</p></div>
+      </div>
+      <div class="insp-scroll">
+        <div class="sect"><h4>Endpoints <span>${ms.length}</span></h4>
+          <div class="attlist">${ms.map(c => `<button class="attv" type="button" data-goto="${c.name}"><i class="dot ${c.state}"></i><b>${c.name}</b><em>${c.nets[n.name]} · ${veth(c.name, n.name)}</em></button>`).join("") || `<p class="tnote">No containers attached.</p>`}</div>
+          ${bridges.map(c => `<p class="tnote"><b>${c.name}</b> is also on ${list(netsOf(c).filter(x => x !== n.name))}, so it's the only path between ${n.name} and ${list(netsOf(c).filter(x => x !== n.name))}.</p>`).join("")}
+        </div>
+        <div class="sect"><h4>Under the hood</h4><dl class="kv">
+          <dt>Bridge</dt><dd>${n.bridge}</dd><dt>MTU</dt><dd>1500</dd>
+          <dt>Egress</dt><dd>${n.internal ? "none (no masquerade rule)" : "nftables masquerade"}</dd>
+          <dt>DNS</dt><dd>${n.name === "shipyard" ? "host resolver" : "names resolve per stack"}</dd></dl>
+          ${n.internal ? `<p class="tnote">Internal networks have no NAT rule, so containers on ${n.name} can reach each other but not the internet.</p>` : ""}
+        </div>
+      </div>`;
+  }
+
+  // ---------- crane ----------
+  function moveCrane() {
+    if (view !== "yard") return;
+    const yard = $("yard"), box = yard.querySelector(".box.sel");
+    const trolley = $("trolley"), cable = $("cable");
+    if (!box) { cable.style.height = "0px"; return; }
+    const yr = yard.getBoundingClientRect(), br = box.getBoundingClientRect();
+    const x = br.left - yr.left + Math.min(br.width / 2, 60);
+    trolley.style.transform = `translateX(${x - 23}px)`;
+    cable.style.transform = `translateX(${x - 1}px)`;
+    cable.style.height = Math.max(0, br.top - yr.top - 10 - 18 - 8) + "px";
+  }
+  window.addEventListener("resize", moveCrane);
+
+  // ---------- inspector ----------
+  function sparkSVG(data, max) {
+    const W = 320, H = 44, n = data.length;
+    const top = Math.max(max, ...data) || 1;
+    const pts = data.map((v, i) => [(i / (n - 1)) * W, H - 3 - (v / top) * (H - 8)]);
+    const line = pts.map(p => p.map(v => v.toFixed(1)).join(",")).join(" ");
+    const last = pts[n - 1];
+    return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+      <line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="var(--line)" stroke-dasharray="2 4"/>
+      <polygon points="0,${H} ${line} ${W},${H}" fill="var(--steel)" fill-opacity=".14"/>
+      <polyline points="${line}" fill="none" stroke="var(--steel)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>
+      <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)" stroke="var(--window)" stroke-width="1.5"/>
+    </svg>`;
+  }
+
+  function metricsHTML(c) {
+    const cpu = live(c) ? c.cpu[c.cpu.length - 1] : 0;
+    const pct = Math.min(100, (c.mem / c.memMax) * 100);
+    return `<div class="metric"><span class="lbl">CPU</span><span class="val">${live(c) ? cpu.toFixed(1) + "%" : "—"}</span>${sparkSVG(c.cpu, 10)}</div>
+      <div class="metric" style="padding-bottom:12px"><span class="lbl">Memory</span><span class="val">${c.state === "exited" ? "—" : fmtMem(c.mem)} / ${fmtMem(c.memMax)}</span>
+        <div class="membar${pct >= 99 ? " full" : ""}"><i style="width:${c.state === "exited" ? 0 : pct}%"></i><b></b></div></div>`;
+  }
+
+  let dockCollapsed = false;
+  const chevron = `<svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>`;
+  function termHTML(c) {
+    const body = termTab === "logs"
+      ? c.log.slice(-80).join("\n")
+      : (shellHistory[c.name] || `<span class="t">connected to ${c.name} via setns(2) — try ps, hostname, id, ls /, cat /proc/1/cgroup</span>`);
+    const shellOk = c.state === "running";
+    return `<div class="term">
+      <div class="termtabs" role="tablist">
+        <button type="button" role="tab" data-tab="logs" aria-selected="${termTab === "logs"}">Logs</button>
+        <button type="button" role="tab" data-tab="shell" aria-selected="${termTab === "shell"}">Shell</button>
+        <span class="dockmeta"><i class="dot ${degraded(c) ? "degraded" : c.state}"></i><b>${c.name}</b><span>${c.image}</span>${c.hostPid ? `<span>host PID ${c.hostPid}</span>` : ""}</span>
+        <button type="button" class="dockbtn" data-dock-toggle aria-expanded="${!dockCollapsed}" aria-label="${dockCollapsed ? "Expand" : "Collapse"} console" title="${dockCollapsed ? "Expand" : "Collapse"} console">${chevron}</button>
+      </div>
+      <div class="termbody" id="termbody">${body}</div>
+      ${termTab === "shell" ? (shellOk
+        ? `<form class="shellline" id="shellform"><span>/ #</span><input id="shellin" aria-label="Shell command" autocomplete="off" spellcheck="false"></form>`
+        : `<div class="shellline"><span>!</span> container is not running — start it to open a shell</div>`) : ""}
+    </div>`;
+  }
+
+  function tnode(name, l, dir) {
+    const t = byName(name);
+    const broken = dir === "down" && !isUp(name) && isUp(l.from);
+    const meta = `tcp ${l.port}${l.kind === "observed" ? " · undeclared" : ""}${broken ? " · refused" : ""}`;
+    return `<span class="tnode"><button class="tlink" type="button" data-goto="${name}"><i class="dot ${degraded(t) ? "degraded" : t.state}"></i>${name}</button><span class="tmeta ${broken ? "broken" : l.kind === "observed" ? "observed" : ""}">${meta}</span></span>`;
+  }
+  function subtree(name, dir, seen) {
+    const ls = graph().filter(l => (dir === "down" ? l.from : l.to) === name);
+    const host = dir === "up" && hostPort(byName(name)) ? `<li><span class="tnode"><span class="troot" style="font-weight:500;color:var(--muted)">host</span><span class="tmeta">:${hostPort(byName(name))} → ${name}</span></span></li>` : "";
+    if (!ls.length && !host) return "";
+    return `<ul>${ls.map(l => { const n = dir === "down" ? l.to : l.from; return `<li>${tnode(n, l, dir)}${seen.has(n) ? "" : subtree(n, dir, new Set([...seen, n]))}</li>`; }).join("")}${host}</ul>`;
+  }
+  function depsHTML(c) {
+    const down = subtree(c.name, "down", new Set([c.name]));
+    const up = subtree(c.name, "up", new Set([c.name]));
+    const root = `<span class="troot"><i class="dot ${degraded(c) ? "degraded" : c.state}"></i>${c.name}</span>`;
+    if (!down && !up) return `<div class="sect"><h4>Dependencies</h4><p class="tnote">${c.name} doesn't depend on anything, and nothing depends on it.</p></div>`;
+    const needers = [...walk(c.name, "up")].filter(isUp);
+    const direct = graph().filter(l => l.to === c.name && isUp(l.from)).map(l => l.from);
+    const indirect = needers.filter(n => !direct.includes(n));
+    const list = a => a.length === 1 ? a[0] : a.slice(0, -1).join(", ") + " and " + a[a.length - 1];
+    let impact = "";
+    if (!live(c) && direct.length) impact = `<div class="warnbox"><b>${list(direct)}</b> ${direct.length === 1 ? "is" : "are"} degraded because ${c.name} is ${STATE_LABEL[c.state].toLowerCase()}. Start it to restore ${direct.length === 1 ? "it" : "them"}.</div>`;
+    else if (live(c) && needers.length) impact = `<p class="tnote">If ${c.name} stops, <b>${list(direct)}</b> lose${direct.length === 1 ? "s" : ""} a dependency${indirect.length ? `, and <b>${list(indirect)}</b> ${indirect.length === 1 ? "is" : "are"} affected through ${direct.length === 1 ? "it" : "them"}` : ""}.</p>`;
+    else if (!needers.length && graph().some(l => l.from === c.name)) impact = `<p class="tnote">Nothing depends on ${c.name}${c.state === "failed" ? ", so the failure is contained" : ""}.</p>`;
+    const hints = graph().filter(l => l.from === c.name && l.kind === "observed").map(l =>
+      `<div class="hintbox"><span>${c.name} connects to <b>${l.to}:${l.port}</b> but doesn't declare it, so it can start before ${l.to} is ready.</span><button class="btn" type="button" data-declare="${l.from}>${l.to}">Add ${l.to} to depends_on</button></div>`).join("");
+    return `<div class="sect"><h4>Dependencies <span>${graph().filter(l => l.from === c.name).length} out · ${graph().filter(l => l.to === c.name).length} in</span></h4>
+      ${down ? `<div class="treegrp"><span>Needs</span><ul class="tree"><li>${root}${down}</li></ul></div>` : ""}
+      ${up ? `<div class="treegrp"><span>Needed by</span><ul class="tree"><li>${root}${up}</li></ul></div>` : ""}
+      ${impact}${hints}
+    </div>`;
+  }
+
+  function renderDock() {
+    const c = byName(sel), on = section === "yard" && !!c;
+    $("dock").hidden = !on;
+    document.querySelector(".main").classList.toggle("docked", on);
+    $("dock").classList.toggle("collapsed", dockCollapsed);
+    if (!on) { $("dock").innerHTML = ""; return; }
+    $("dock").innerHTML = termHTML(c);
+    const tb = $("termbody"); if (tb) tb.scrollTop = tb.scrollHeight;
+  }
+
+  function renderInspector() {
+    if (section === "images") { $("insp").innerHTML = imageInsp(); return; }
+    if (section === "volumes") { $("insp").innerHTML = volumeInsp(); return; }
+    if (section === "networks") { $("insp").innerHTML = networkInsp(); return; }
+    const c = byName(sel);
+    if (!c) { $("insp").innerHTML = `<div class="sect"><p style="margin:0;color:var(--muted)">Select a container in the yard.</p></div>`; return; }
+    const k = iso(c.serial);
+    const startStop = c.state === "running" || c.state === "paused"
+      ? `<button class="btn" type="button" data-act="stop">Stop</button>`
+      : `<button class="btn" type="button" data-act="start">Start</button>`;
+    const pause = c.state === "running" ? `<button class="btn" type="button" data-act="pause">Pause</button>`
+      : c.state === "paused" ? `<button class="btn" type="button" data-act="resume">Resume</button>` : "";
+    const alert = c.state === "failed"
+      ? `<div class="alert"><b>Killed: out of memory (exit 137)</b>The worker hit its 256 MiB <code>memory.max</code> limit. Raise the limit or reduce the batch size, then restart.</div>` : "";
+    $("insp").innerHTML = `
+      <div class="insp-top">
+        <div class="bigcode" aria-label="Container ID ${k.owner} ${k.serial} ${k.chk}">${k.owner} ${k.serial} <span class="chk">${k.chk}</span></div>
+        <div class="ident">
+          <h3>${c.name} <span class="pill ${c.state}"><i class="dot ${c.state}"></i>${STATE_LABEL[c.state]}</span>${degraded(c) ? `<span class="pill degraded"><i class="dot degraded"></i>Degraded</span>` : ""}</h3>
+          <p>${c.image}</p>
+        </div>
+        ${alert}
+        ${confirmRemove
+          ? `<div class="confirm">Remove <b>${c.name}</b>? Its writable layer is deleted. <span class="spacer"></span><button class="btn danger" type="button" data-act="remove-yes">Remove</button><button class="btn" type="button" data-act="remove-no">Keep</button></div>`
+          : `<div class="actions">${startStop}${pause}<button class="btn" type="button" data-act="restart" ${c.state === "exited" ? "disabled" : ""}>Restart</button><button class="btn" type="button" data-act="shell" ${c.state !== "running" ? "disabled" : ""}>Shell</button><span class="spacer"></span><button class="btn danger" type="button" data-act="remove">Remove</button></div>`}
+      </div>
+      <div class="insp-scroll">
+        ${depsHTML(c)}
+        ${attachedHTML(c)}
+        <div class="sect"><h4>Resources <span>${c.state === "running" ? "live · 1s" : ""}</span></h4><div id="metrics" style="display:grid;gap:12px">${metricsHTML(c)}</div></div>
+        <div class="sect"><h4>Isolation <span>${c.ns.length}/8 namespaces</span></h4>
+          <div class="ns">${ALL_NS.map(n => `<span class="${c.ns.includes(n) ? "on" : ""}">${n}</span>`).join("")}</div>
+          <dl class="kv">
+            <dt>cgroup</dt><dd>/shipyard/${c.stack}/${c.name}</dd>
+            <dt>PID 1</dt><dd>${c.pid1}</dd>
+            <dt>Host PID</dt><dd>${c.hostPid ?? "—"}</dd>
+            <dt>User</dt><dd>root → uid 100000 (rootless)</dd>
+          </dl>
+        </div>
+        <div class="sect"><h4>Ports</h4>
+          <dl class="kv"><dt>Published</dt><dd>${c.ports}</dd><dt>Uptime</dt><dd>${c.up}</dd></dl>
+        </div>
+      </div>`;
+  }
+
+  function renderAll() {
+    renderTally();
+    if (section === "images") renderImages();
+    else if (section === "volumes") renderVolumes();
+    else if (section === "networks") renderNetworks();
+    else if (view === "yard") renderYard(); else if (view === "map") renderMap(); else renderManifest();
+    renderInspector();
+    renderDock();
+    if (section === "yard" && view === "yard") moveCrane();
+    litD = undefined; litLayer(null);
+    traced = undefined; trace(null);
+  }
+
+  function select(name) {
+    if (section !== "yard") { sel = name; confirmRemove = false; termTab = "logs"; return setSection("yard"); }
+    if (sel === name) return;
+    sel = name; confirmRemove = false;
+    if (termTab === "shell" && byName(name)?.state !== "running") termTab = "logs";
+    if (view === "list") renderManifest();
+    else if (view === "map") renderMap();
+    else {
+      document.querySelectorAll(".box").forEach(b => {
+        const on = b.dataset.name === name; b.classList.toggle("sel", on); b.setAttribute("aria-pressed", on);
+      });
+      moveCrane();
+    }
+    renderInspector();
+    renderDock();
+    retrace();
+  }
+
+  // ---------- shell ----------
+  function shellRun(c, cmd) {
+    const ps = `PID   USER     TIME  COMMAND\n    1 root      0:02 ${c.pid1}\n   ${Math.floor(rnd(20, 60))} root      0:00 /bin/sh\n   ${Math.floor(rnd(61, 90))} root      0:00 ps`;
+    const out = {
+      "": "",
+      ps, "ps aux": ps,
+      hostname: c.name,
+      id: "uid=0(root) gid=0(root) groups=0(root)",
+      whoami: "root",
+      "ls /": "bin   dev   etc   home  lib   media mnt   opt   proc  root  run   sbin  srv   sys   tmp   usr   var",
+      "cat /proc/1/cgroup": "0::/",
+      "cat /etc/hostname": c.name,
+      "uname -a": `Linux ${c.name} 6.12.9 #1 SMP aarch64 GNU/Linux`,
+      "cat /sys/fs/cgroup/memory.max": String(c.memMax * 1024 * 1024),
+      clear: null,
+    };
+    const prev = shellHistory[c.name] || "";
+    if (cmd === "clear") { shellHistory[c.name] = ""; return; }
+    const res = cmd in out ? out[cmd] : `sh: ${cmd.split(" ")[0]}: not found`;
+    shellHistory[c.name] = prev + (prev ? "\n" : "") + `<span class="p">/ #</span> ${cmd.replace(/</g, "&lt;")}` + (res ? "\n" + res : "");
+  }
+
+  // ---------- actions ----------
+  function act(a) {
+    const c = byName(sel); if (!c) return;
+    const sys = msg => c.log.push(`<span class="p">[shipyard]</span> ${msg}`);
+    switch (a) {
+      case "stop": c.state = "exited"; c.exit = 0; c.hostPid = null; c.up = "exited just now"; sys("SIGTERM → PID 1, exited 0"); break;
+      case "start": c.state = "running"; c.exit = undefined; c.hostPid = Math.floor(rnd(50200, 59000)); c.up = "just now"; c.mem = Math.min(c.memMax * .2, rnd(4, 60)); sys("started"); break;
+      case "pause": c.state = "paused"; c.up = "paused just now"; sys(`froze cgroup /shipyard/${c.stack}/${c.name} (cgroup.freeze=1)`); break;
+      case "resume": c.state = "running"; c.up = "just now"; sys("thawed (cgroup.freeze=0)"); break;
+      case "restart":
+        c.state = "restarting"; sys("restarting"); renderAll();
+        setTimeout(() => { c.state = "running"; c.exit = undefined; c.hostPid = Math.floor(rnd(50200, 59000)); c.up = "just now"; c.mem = Math.min(c.memMax * .3, rnd(4, 60)); sys("started"); renderAll(); }, 900);
+        return;
+      case "shell": termTab = "shell"; dockCollapsed = false; renderDock(); $("shellin")?.focus(); return;
+      case "remove": confirmRemove = true; renderInspector(); return;
+      case "remove-no": confirmRemove = false; renderInspector(); return;
+      case "remove-yes": {
+        const i = containers.indexOf(c); containers.splice(i, 1);
+        links = links.filter(l => l.from !== c.name && l.to !== c.name);
+        confirmRemove = false; sel = containers[Math.min(i, containers.length - 1)]?.name; break;
+      }
+    }
+    renderAll();
+  }
+
+  // ---------- events ----------
+  document.addEventListener("click", e => {
+    const nav = e.target.closest("[data-section]"); if (nav) return setSection(nav.dataset.section);
+    const gi = e.target.closest("[data-goto-image]"); if (gi) { selImage = gi.dataset.gotoImage; return setSection("images"); }
+    const gv = e.target.closest("[data-goto-vol]"); if (gv) { selVol = gv.dataset.gotoVol; return setSection("volumes"); }
+    const gn = e.target.closest("[data-goto-net]"); if (gn) { selNet = gn.dataset.gotoNet; return setSection("networks"); }
+    const box = e.target.closest(".box, tbody tr, [data-goto]"); if (box) return select(box.dataset.name || box.dataset.goto);
+    const ovb = e.target.closest("[data-ov]"); if (ovb) { ov[ovb.dataset.ov] = !ov[ovb.dataset.ov]; renderMap(); return retrace(); }
+    const si = e.target.closest("[data-sel-image]"); if (si) { selImage = si.dataset.selImage; confirmItem = false; return renderAll(); }
+    const sv = e.target.closest("[data-sel-vol]"); if (sv) { selVol = sv.dataset.selVol; confirmItem = false; return renderAll(); }
+    const sn = e.target.closest("[data-sel-net]"); if (sn) { selNet = sn.dataset.selNet; return renderAll(); }
+    const pr = e.target.closest("[data-prune]"); if (pr) { pendingPrune = pr.dataset.prune; return renderAll(); }
+    if (e.target.closest("[data-prune-no]")) { pendingPrune = null; return renderAll(); }
+    const py = e.target.closest("[data-prune-yes]");
+    if (py) {
+      if (py.dataset.pruneYes === "images") images = images.filter(i => usersOfImage(i.ref).length);
+      else volumes = volumes.filter(v => usersOfVol(v.name).length);
+      if (!images.some(i => i.ref === selImage)) selImage = images[0]?.ref;
+      if (!volumes.some(v => v.name === selVol)) selVol = volumes[0]?.name;
+      pendingPrune = null; return renderAll();
+    }
+    const ia = e.target.closest("[data-iact]");
+    if (ia) {
+      const a = ia.dataset.iact;
+      if (a === "run") { $("rImage").value = selImage; return openRun(); }
+      if (a === "remove") confirmItem = true;
+      if (a === "remove-no") confirmItem = false;
+      if (a === "remove-yes") {
+        confirmItem = false;
+        if (section === "images") { const i = images.findIndex(x => x.ref === selImage); images.splice(i, 1); selImage = images[Math.min(i, images.length - 1)]?.ref; }
+        if (section === "volumes") { const i = volumes.findIndex(x => x.name === selVol); volumes.splice(i, 1); selVol = volumes[Math.min(i, volumes.length - 1)]?.name; }
+      }
+      return renderAll();
+    }
+    const dec = e.target.closest("[data-declare]");
+    if (dec) {
+      const [f, t] = dec.dataset.declare.split(">"); const l = links.find(x => x.from === f && x.to === t);
+      if (l) { l.kind = "declared"; byName(f).log.push(`<span class="p">[shipyard]</span> added ${t} to depends_on for ${f} in compose.yaml`); }
+      return renderAll();
+    }
+    const fix = e.target.closest("[data-fix]");
+    if (fix) { const was = sel; sel = fix.dataset.fix; act("start"); sel = was; return renderAll(); }
+    const ab = e.target.closest("[data-act]"); if (ab) return act(ab.dataset.act);
+    const tab = e.target.closest("[data-tab]"); if (tab) { termTab = tab.dataset.tab; dockCollapsed = false; renderDock(); if (termTab === "shell") $("shellin")?.focus(); return; }
+    if (e.target.closest("[data-dock-toggle]")) { dockCollapsed = !dockCollapsed; renderDock(); if (view === "yard") moveCrane(); return; }
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Enter" && e.target.matches("tbody tr")) select(e.target.dataset.name);
+    if ((e.key === "Enter" || e.key === " ") && e.target.matches("[data-sel-image], [data-sel-vol], [data-sel-net]")) { e.preventDefault(); e.target.click(); }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openRun(); }
+    if (e.key === "Escape" && !$("runsheet").hidden) { $("runsheet").hidden = true; $("runBtn").focus(); }
+  });
+  document.addEventListener("submit", e => {
+    if (e.target.id !== "shellform") return;
+    e.preventDefault();
+    const c = byName(sel); const v = $("shellin").value.trim();
+    shellRun(c, v); renderDock(); $("shellin")?.focus();
+  });
+
+  const TITLES = { yard: "Yard", images: "Images", volumes: "Volumes", networks: "Networks" };
+  function layout() {
+    const inYard = section === "yard";
+    $("viewSeg").hidden = !inYard;
+    $("mainTitle").textContent = TITLES[section];
+    document.querySelectorAll("[data-section]").forEach(b => b.toggleAttribute("aria-current", b.dataset.section === section));
+    document.querySelectorAll("[data-section][aria-current]").forEach(b => b.setAttribute("aria-current", "page"));
+    [["yard", "vYard", "yard"], ["map", "vMap", "map"], ["list", "vList", "manifest"]].forEach(([k, btn, el]) => {
+      $(btn).setAttribute("aria-pressed", String(k === view)); $(el).hidden = !(inYard && k === view);
+    });
+    [["images", "secImages"], ["volumes", "secVolumes"], ["networks", "secNetworks"]].forEach(([k, el]) => $(el).hidden = section !== k);
+    if (!(inYard && view === "map")) cancelAnimationFrame(rafId);
+  }
+  function setView(v) { view = v; section = "yard"; layout(); renderAll(); }
+  function setSection(sct) {
+    section = sct; pendingPrune = null; confirmItem = false;
+    layout(); renderAll();
+    document.querySelector(".viewport").scrollTop = 0;
+    const row = document.querySelector(".irow.sel, .vrow.sel, .netband.sel");
+    if (row) row.scrollIntoView({ block: "nearest" });
+  }
+  $("vYard").onclick = () => setView("yard");
+  $("vMap").onclick = () => setView("map");
+  $("vList").onclick = () => setView("list");
+  let rz = 0;
+  window.addEventListener("resize", () => { cancelAnimationFrame(rz); rz = requestAnimationFrame(() => { if (section === "yard" && view === "map") { renderMap(); retrace(); } }); });
+
+  // ---------- run ----------
+  function openRun() { $("runsheet").hidden = false; $("rImage").focus(); $("rImage").select(); updateEcho(); }
+  $("runBtn").onclick = () => $("runsheet").hidden ? openRun() : ($("runsheet").hidden = true);
+  $("cmdk").onclick = openRun;
+  function slug(img) { return img.split("/").pop().split(":")[0].replace(/[^a-z0-9-]/gi, "").toLowerCase() || "box"; }
+  function nextName(img) { const base = slug(img); let n = base, i = 2; while (byName(n)) n = `${base}-${i++}`; return n; }
+  function updateEcho() {
+    const m = +$("rMem").value; const p = $("rPort").value.trim(); const nm = $("rName").value.trim();
+    $("cliEcho").textContent = `shipyard run${nm ? " --name " + nm : ""} --memory ${m >= 1024 ? m / 1024 + "g" : m + "m"}${p ? " -p " + p : ""} ${$("rImage").value.trim() || "IMAGE"}`;
+  }
+  ["rImage", "rName", "rMem", "rPort"].forEach(id => $(id).addEventListener("input", updateEcho));
+  $("runform").addEventListener("submit", e => {
+    e.preventDefault();
+    const img = $("rImage").value.trim(); if (!img) return;
+    const name = $("rName").value.trim().replace(/[^a-z0-9_.-]/gi, "-") || nextName(img);
+    if (byName(name)) { $("rName").setCustomValidity(`"${name}" is already in the yard`); $("rName").reportValidity(); return; }
+    const port = $("rPort").value.trim();
+    let serial; do { serial = String(Math.floor(rnd(100000, 999999))); } while (containers.some(c => c.serial === serial));
+    const memMax = +$("rMem").value;
+    const ref = img.includes(":") ? img : img + ":latest";
+    if (!images.some(i => i.ref === ref)) images.push(mkImage(ref, "just now", /alpine/.test(ref) ? "alpine" : "bookworm", [[`pulled ${ref}`, Math.round(rnd(4, 60))]]));
+    const usedIps = new Set(containers.map(c => c.nets?.shipyard).filter(Boolean)); let ipn = 30; while (usedIps.has("10.88.0." + ipn)) ipn++;
+    containers.push({ nets: { shipyard: "10.88.0." + ipn }, mounts: [], binds: [], serial, name, stack: "standalone", image: img.includes(":") ? img : img + ":latest", state: "running", memMax, mem: rnd(1, 12),
+      cpu: series(0, 0).map((v, i, a) => i > a.length - 4 ? rnd(4, 18) : 0), ports: port ? port.replace(":", " → ") + "/tcp" : "—",
+      pid1: "/bin/sh", hostPid: Math.floor(rnd(50200, 59000)), ns: STD_NS, up: "just now",
+      log: [`<span class="p">[shipyard]</span> pulled ${img} · unpacked 1 layer (overlayfs)`, `<span class="p">[shipyard]</span> clone(CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWNET|CLONE_NEWUSER)`, `<span class="p">[shipyard]</span> pivot_root → /var/lib/shipyard/${serial}/rootfs`, `<span class="p">[shipyard]</span> exec /bin/sh as PID 1`] });
+    $("runsheet").hidden = true; $("rName").value = ""; $("rPort").value = "";
+    sel = name; termTab = "logs"; confirmRemove = false;
+    if (view !== "yard" || section !== "yard") setView("yard"); else renderAll();
+    const b = document.querySelector(`.box[data-name="${CSS.escape(name)}"]`);
+    if (b) b.classList.add("drop");
+  });
+  $("rName").addEventListener("input", () => $("rName").setCustomValidity(""));
+
+  // ---------- live ticks ----------
+  setInterval(() => {
+    let vm = 0;
+    for (const c of containers) {
+      if (live(c)) {
+        const lastv = c.cpu[c.cpu.length - 1];
+        c.cpu.push(Math.max(0.1, lastv + rnd(-1.6, 1.6) * (c.name === "api" ? 2.4 : 1)));
+        c.cpu.shift();
+        c.mem = Math.min(c.memMax * .9, Math.max(1, c.mem + rnd(-.8, .9) * (c.memMax / 512)));
+        if (LOGS[c.name] && Math.random() < .45) { c.log.push(LOGS[c.name]()); if (c.log.length > 200) c.log.shift(); }
+      }
+      if (c.state !== "exited" && c.state !== "failed") vm += c.mem;
+    }
+    const used = 0.38 + vm / 1024;
+    $("vmMem").textContent = `${used.toFixed(1)} / 4.0 GiB`;
+    $("vmBar").style.width = Math.min(100, (used / 4) * 100) + "%";
+    if (section !== "yard") return;
+    if (view === "list") renderManifest();
+    const c = byName(sel);
+    if (c && live(c)) {
+      const m = $("metrics"); if (m) m.innerHTML = metricsHTML(c);
+      if (termTab === "logs") {
+        const tb = $("termbody");
+        if (tb) { const atEnd = tb.scrollHeight - tb.scrollTop - tb.clientHeight < 30; tb.innerHTML = c.log.slice(-80).join("\n"); if (atEnd) tb.scrollTop = tb.scrollHeight; }
+      }
+    }
+  }, 1000);
+
+  setView(view);
+  if (document.fonts) document.fonts.ready.then(() => { if (section === "yard") view === "map" ? renderMap() : moveCrane(); });
+})();
+</script>
