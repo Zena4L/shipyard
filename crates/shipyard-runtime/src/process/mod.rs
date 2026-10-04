@@ -5,8 +5,18 @@
 //! Later stages wrap the same pipeline in namespaces (stage 2) and reuse the
 //! supervisor in the per-container monitor (stage 8).
 
+mod env;
+mod rlimit;
+mod signal;
+mod spec;
 mod startup;
 mod status;
+mod stop;
 
-pub use startup::{ensure_std_fds_open, refuse_setid_execution};
+pub use env::{DEFAULT_PATH, Env, EnvError};
+pub use rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
+pub use signal::{Signal, SignalError};
+pub use spec::{MAX_GROUPS, ProcessSpec, SpecError, User};
+pub use startup::refuse_privileged_start;
 pub use status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND, ExitStatus};
+pub use stop::{DEFAULT_STOP_TIMEOUT_SECS, StopPolicy};

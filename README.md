@@ -24,6 +24,7 @@ crates/
   shipyard-cli/       # `shipyard` binary: argument parsing, UX, output
   shipyard-runtime/   # low-level Linux primitives: processes, namespaces, mounts, cgroups
 docs/
+  user/               # user-facing docs, published to the website
   ROADMAP.md          # staged build plan mapped to TLPI chapters
   FEATURES.md         # full feature list per stage, quality bar, scope
   DEVELOPMENT.md      # local setup (including running on macOS via a Linux VM)
@@ -32,6 +33,10 @@ docs/
 
 New crates (image handling, networking, the engine/API layer) will be added as the
 roadmap reaches them.
+
+## Documentation
+
+User documentation lives in [`docs/user/`](docs/user/README.md) and is published to the website.
 
 ## Quick start
 

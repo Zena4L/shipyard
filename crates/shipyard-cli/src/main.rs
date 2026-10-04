@@ -1,37 +1,67 @@
+//! The `shipyard` command-line interface.
+//!
+//! This crate only parses flags and reports results; the work happens in
+//! `shipyard-runtime`.
+
+mod run;
+
 use std::io::Write;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use shipyard_runtime::Backend;
 use shipyard_runtime::process::{self, EXIT_ENGINE_ERROR};
 use tracing_subscriber::EnvFilter;
 
 /// A lightweight container engine.
 #[derive(Debug, Parser)]
-#[command(name = "shipyard", version, about, propagate_version = true)]
+#[command(name = "shipyard", version, propagate_version = true)]
 struct Cli {
-    /// Increase log verbosity (-v, -vv, -vvv).
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    verbose: u8,
+    /// Show debug logs (same as --log-level debug).
+    #[arg(short = 'D', long, global = true)]
+    debug: bool,
+
+    /// How much to log.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<LogLevel>,
 
     #[command(subcommand)]
     command: Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_filter(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a command the way a container would (no isolation yet).
+    Run(run::RunArgs),
     /// Show how this host will run containers.
     Doctor,
 }
 
 fn main() -> ExitCode {
-    // Security check first: a setuid binary must not do anything at all.
-    if let Err(err) = process::refuse_setid_execution() {
-        return fail(&err.into());
-    }
-    // Before anything else opens a file; see `ensure_std_fds_open`.
-    if let Err(err) = process::ensure_std_fds_open() {
+    // Before anything else: a privileged start must not get any further.
+    if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into());
     }
 
@@ -39,6 +69,7 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => {
             // `--help` and `--version` are not failures. Usage errors exit 125
+            // like Docker, so they can't be mistaken for the command's own code.
             let _ = err.print();
             return if err.use_stderr() {
                 ExitCode::from(EXIT_ENGINE_ERROR)
@@ -47,9 +78,10 @@ fn main() -> ExitCode {
             };
         }
     };
-    init_tracing(cli.verbose);
+    init_tracing(cli.log_level, cli.debug);
 
     let result = match cli.command {
+        Command::Run(args) => run::run(args),
         Command::Doctor => doctor(),
     };
     result.unwrap_or_else(|err| fail(&err))
@@ -81,17 +113,73 @@ fn doctor() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn init_tracing(verbose: u8) {
-    let default = match verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
+/// Flags win over `RUST_LOG`, which wins over the default (`warn`).
+fn init_tracing(log_level: Option<LogLevel>, debug: bool) {
+    let flag = log_level.or(debug.then_some(LogLevel::Debug));
+    let filter = match flag {
+        Some(level) => EnvFilter::new(level.as_filter()),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
     };
-    // `RUST_LOG` overrides the -v flags when set.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::*;
+
+    /// `docs/user/cli.md` is generated from the flag definitions above, so the
+    /// published reference can never drift from the real CLI.
+    #[test]
+    fn cli_reference_is_up_to_date() {
+        const HEADER: &str = "<!-- Generated from the CLI's flag definitions. Do not edit by hand.\n     \
+             Regenerate: UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference -->\n\n";
+        let options = clap_markdown::MarkdownOptions::new()
+            .title("Command reference".to_owned())
+            .show_footer(false)
+            .show_table_of_contents(true);
+        let generated = format!(
+            "{HEADER}{}",
+            clap_markdown::help_markdown_custom::<Cli>(&options)
+        );
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/user/cli.md");
+
+        if std::env::var_os("UPDATE_DOCS").is_some() {
+            std::fs::write(&path, &generated).expect("writing docs/user/cli.md");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            committed == generated,
+            "docs/user/cli.md is out of date with the CLI. Regenerate it with:\n\n    \
+             UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference\n"
+        );
+    }
+
+    #[test]
+    fn global_logging_flags() {
+        let cli = Cli::try_parse_from(["shipyard", "-D", "doctor"]).unwrap();
+        assert!(cli.debug);
+        let cli = Cli::try_parse_from(["shipyard", "doctor", "--log-level", "trace"]).unwrap();
+        assert_eq!(cli.log_level, Some(LogLevel::Trace));
+        assert!(Cli::try_parse_from(["shipyard", "--log-level", "loud", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn dash_v_is_reserved_for_volumes() {
+        assert!(Cli::try_parse_from(["shipyard", "-v", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn run_subcommand_parses() {
+        let cli = Cli::try_parse_from(["shipyard", "run", "-D", "ls", "-l"]).unwrap();
+        assert!(cli.debug, "-D before the command is shipyard's flag");
+        assert!(matches!(cli.command, Command::Run(_)));
+    }
 }

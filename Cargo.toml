@@ -5,9 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+# Only the pinned toolchain (rust-toolchain.toml) is built and tested.
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/OWNER/shipyard"
+repository = "https://github.com/Zena4L/shipyard"
 authors = ["Clement Owireku-Bogyah"]
 publish = false
 
@@ -25,8 +26,14 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Test-only crates.
+clap-markdown = "0.1"
+proptest = "1"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# Every public item is documented; `cargo doc` output is part of the product.
+missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 
@@ -39,6 +46,9 @@ module_name_repetitions = "allow"
 # POSIX names (uid/gid, pid/pgid, euid/egid) are clearer than invented ones.
 similar_names = "allow"
 missing_errors_doc = "allow"
+# No unwrap/expect outside tests (see clippy.toml); return errors instead.
+unwrap_used = "warn"
+expect_used = "warn"
 
 [profile.release]
 lto = "fat"

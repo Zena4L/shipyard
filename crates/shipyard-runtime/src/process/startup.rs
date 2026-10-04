@@ -1,64 +1,59 @@
-//! Checks that run first thing in `main`, before anything else opens a file.
+//! Checks that run first thing in `main`.
+//!
+//! Closed standard descriptors need no check here: Rust's own startup code
+//! reopens any closed fd 0, 1 or 2 on `/dev/null` before `main` runs (or aborts),
+//! so a later `open` can never land on them (TLPI §4.3, §5.5).
 
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
-
-use nix::fcntl::{OFlag, open};
-use nix::sys::stat::Mode;
 use nix::unistd::{getegid, geteuid, getgid, getuid};
 
 use crate::{Error, Result};
 
-/// Makes sure file descriptors 0, 1 and 2 are open, pointing any closed one at
-/// `/dev/null`.
+/// Refuses to run if shipyard was started with privileges its caller doesn't
+/// have: a setuid or setgid bit, Linux file capabilities, or a security-module
+/// transition.
 ///
-/// The kernel always hands out the lowest free descriptor number (TLPI §4.3).
-/// If shipyard is started with, say, fd 1 closed (by a daemon that closed its
-/// stdio, or `shipyard run … >&-`), the next file we open becomes fd 1. That
-/// could be one of our internal pipes, which the container would then inherit
-/// as its stdout. Filling the gaps first rules this out.
-///
-/// Call this before anything else in the process opens a file.
-pub fn ensure_std_fds_open() -> Result<()> {
-    for fd in 0..=2 {
-        if is_open(fd) {
-            continue;
-        }
-        // Deliberately not O_CLOEXEC: the container inherits these.
-        let null = open("/dev/null", OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())
-            .map_err(|e| Error::sys("opening /dev/null for a closed standard fd", e))?;
-        if null.as_raw_fd() == fd {
-            // Keep it open for the life of the process.
-            let _ = null.into_raw_fd();
-        }
-        // Otherwise another thread took `fd` first, so it's open after all.
-        // Dropping `null` closes our spare copy without touching theirs.
+/// Shipyard is never meant to be installed that way. If it were, any user could
+/// run commands with elevated privileges, so we stop immediately.
+pub fn refuse_privileged_start() -> Result<()> {
+    match privileged_start() {
+        Some(reason) => Err(Error::PrivilegedStart { reason }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// Whether `fd` refers to an open file description.
-fn is_open(fd: RawFd) -> bool {
-    // Raw `fcntl` rather than nix: nix's version needs a `BorrowedFd`, and
-    // borrowing a descriptor that may be closed is exactly what I/O safety forbids.
-    // SAFETY: F_GETFD only reads the descriptor's flags and has no side effects,
-    // even when `fd` is closed (it then fails with EBADF).
-    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
-}
-
-/// Refuses to run if shipyard was started through a setuid or setgid bit.
-///
-/// Shipyard is never meant to be installed that way. If it were, any user
-/// could run commands with the owner's privileges, so we stop immediately.
-pub fn refuse_setid_execution() -> Result<()> {
+/// Why this start is privileged, if it is.
+fn privileged_start() -> Option<String> {
     let (real_uid, effective_uid) = (getuid(), geteuid());
-    let (real_gid, effective_gid) = (getgid(), getegid());
-    if real_uid == effective_uid && real_gid == effective_gid {
-        return Ok(());
+    if real_uid != effective_uid {
+        return Some(format!(
+            "setuid bit: real uid {real_uid}, effective uid {effective_uid}"
+        ));
     }
-    Err(Error::PrivilegedExecutable {
-        uid: real_uid.as_raw(),
-        euid: effective_uid.as_raw(),
-        gid: real_gid.as_raw(),
-        egid: effective_gid.as_raw(),
+    let (real_gid, effective_gid) = (getgid(), getegid());
+    if real_gid != effective_gid {
+        return Some(format!(
+            "setgid bit: real gid {real_gid}, effective gid {effective_gid}"
+        ));
+    }
+    // Catches what the ID comparison can't, such as file capabilities, where
+    // the real and effective IDs stay equal.
+    kernel_flags_secure_exec().then(|| {
+        "the kernel flagged this start as privileged (for example file capabilities)".to_owned()
     })
+}
+
+/// The kernel's own verdict: `AT_SECURE` is set for setuid, setgid and
+/// file-capability execs alike.
+#[cfg(target_os = "linux")]
+fn kernel_flags_secure_exec() -> bool {
+    // SAFETY: `getauxval` only reads the auxiliary vector the kernel passed at
+    // exec; it has no preconditions and returns 0 for unknown entries.
+    unsafe { libc::getauxval(libc::AT_SECURE) != 0 }
+}
+
+/// `issetugid` reports whether the process gained privileges at exec.
+#[cfg(not(target_os = "linux"))]
+fn kernel_flags_secure_exec() -> bool {
+    // SAFETY: `issetugid` takes no arguments and only reads process state.
+    unsafe { libc::issetugid() != 0 }
 }

@@ -18,11 +18,18 @@ cargo fmt --all                            # format
 cargo clippy --workspace --all-targets     # lint
 cargo deny check                           # licenses & advisories (cargo install cargo-deny)
 
+# Regenerate docs/user/cli.md after changing any command or flag
+UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference
+
+# API docs (also checked in CI with warnings as errors)
+cargo doc --workspace --no-deps --open
+
 # On macOS: type-check the Linux-only code without leaving the Mac
 cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu
 ```
 
-CI runs fmt, clippy, tests (Linux + macOS), and cargo-deny on every push and PR.
+CI runs fmt, clippy and tests on both Linux and macOS, the docs build (warnings as errors), and
+cargo-deny on every push and PR.
 
 ## Running Linux-only stages on macOS: Lima VM
 
@@ -61,6 +68,7 @@ namespaces), so expect to use `sudo` inside the VM — never on your Mac.
     Other hosts get `Error::LinuxOnly`.
   - Non-UNIX targets are rejected at compile time.
 - **Errors** — libraries use `thiserror` enums; the CLI uses `anyhow`.
-- **Logging** — `tracing`; control with `-v`/`-vv`/`-vvv` or `RUST_LOG`.
+- **Logging** — `tracing`; control with `-D/--debug`, `--log-level LEVEL` or `RUST_LOG`
+  (flags win). `-v` is reserved for volumes.
 - **Commits** — [Conventional Commits](https://www.conventionalcommits.org/)
   (`feat:`, `fix:`, `docs:`, …).

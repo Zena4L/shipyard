@@ -20,5 +20,9 @@ shipyard-runtime.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+clap-markdown.workspace = true
+proptest.workspace = true
+
 [lints]
 workspace = true
