@@ -53,7 +53,7 @@ impl LogLevel {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a command the way a container would (no isolation yet).
+    /// Run a command in a container: isolated in Linux namespaces (no separate filesystem yet).
     Run(run::RunArgs),
     /// Show how this host will run containers.
     Doctor,

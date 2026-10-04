@@ -23,8 +23,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 clap-markdown.workspace = true
 libc.workspace = true
-# `term` for `openpty` in the terminal tests.
-nix = { workspace = true, features = ["term"] }
+# `term` for `openpty` in the terminal tests, `hostname` for the isolation tests.
+nix = { workspace = true, features = ["hostname", "term"] }
 proptest.workspace = true
 
 # Terminal (pseudo-terminal) tests. Not on libtest: the harness forks a fake

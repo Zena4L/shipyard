@@ -88,7 +88,19 @@ pub(crate) unsafe fn child_main(plan: &ChildPlan, report: RawFd) -> ! {
 /// Runs the setup steps in order, then tries each exec candidate.
 /// Only returns on failure.
 fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
+    // Our copy of the parent's end of the go pipe: closed at once, so that
+    // the pipe reports when the *parent's* copy closes.
+    // SAFETY: `close` is async-signal-safe; the descriptor is ours.
+    unsafe { libc::close(plan.handshake.parent_end) };
     reset_signal_dispositions(&plan.keep_ignored)?;
+    wait_for_go(plan.handshake.read)?;
+    #[cfg(target_os = "linux")]
+    if let Some(container) = &plan.container {
+        set_up_container(container)?;
+    } else if plan.new_process_group {
+        start_process_group()?;
+    }
+    #[cfg(not(target_os = "linux"))]
     if plan.new_process_group {
         // Its own group, so the supervisor can signal everything the command
         // starts at once. Only without a terminal; see `SpawnOptions`.
@@ -141,6 +153,91 @@ fn reset_signal_dispositions(keep_ignored: &[libc::c_int]) -> Result<(), Failure
         if rc == -1 && Errno::last() != Errno::EINVAL {
             return Err(Failure::at(ChildStep::ResetSignals, Errno::last()));
         }
+    }
+    Ok(())
+}
+
+/// Waits for the parent's "go" (see `channel.rs`). End-of-file means the
+/// parent died before sending it: nobody is left to supervise the command,
+/// or to report to, so exit quietly.
+fn wait_for_go(pipe: RawFd) -> Result<(), Failure> {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: `read` is async-signal-safe; `byte` is one writable byte.
+        let n = unsafe { libc::read(pipe, (&raw mut byte).cast(), 1) };
+        match n {
+            1 => return Ok(()),
+            // SAFETY: see `ExitOnUnwind::drop`.
+            0 => unsafe { libc::_exit(SETUP_FAILED) },
+            _ if Errno::last() == Errno::EINTR => {}
+            _ => return Err(Failure::at(ChildStep::Handshake, Errno::last())),
+        }
+    }
+}
+
+/// Inside the new namespaces: a session of its own (no controlling
+/// terminal, its own process group), mounts that don't propagate to the
+/// host, a `/proc` for the new PID namespace, and the hostname.
+#[cfg(target_os = "linux")]
+fn set_up_container(container: &super::plan::ContainerSetup) -> Result<(), Failure> {
+    // SAFETY: `setsid` is async-signal-safe.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(Failure::at(ChildStep::Session, Errno::last()));
+    }
+    if container.private_mounts {
+        // First, before any mount: on hosts where `/` is shared (systemd),
+        // a mount made here would otherwise appear on the host too.
+        mount(
+            None,
+            c"/",
+            None,
+            libc::MS_REC | libc::MS_PRIVATE,
+            ChildStep::MountPrivate,
+        )?;
+    }
+    if container.mount_proc {
+        // Mounted by this process, so it shows the new PID namespace.
+        mount(
+            Some(c"proc"),
+            c"/proc",
+            Some(c"proc"),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            ChildStep::MountProc,
+        )?;
+    }
+    if let Some(hostname) = &container.hostname {
+        let name = hostname.as_bytes();
+        // SAFETY: `name` is valid for its length; `sethostname` only reads it.
+        if unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) } == -1 {
+            return Err(Failure::at(ChildStep::Hostname, Errno::last()));
+        }
+    }
+    Ok(())
+}
+
+/// `mount(2)` with C strings that need no allocation.
+#[cfg(target_os = "linux")]
+fn mount(
+    source: Option<&std::ffi::CStr>,
+    target: &std::ffi::CStr,
+    fstype: Option<&std::ffi::CStr>,
+    flags: libc::c_ulong,
+    step: ChildStep,
+) -> Result<(), Failure> {
+    let or_null = |s: Option<&std::ffi::CStr>| s.map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
+    // SAFETY: every pointer is NULL or a NUL-terminated string that outlives
+    // the call; no data argument.
+    let rc = unsafe {
+        libc::mount(
+            or_null(source),
+            target.as_ptr(),
+            or_null(fstype),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc == -1 {
+        return Err(Failure::at(step, Errno::last()));
     }
     Ok(())
 }
@@ -377,9 +474,19 @@ fn die_with_parent(plan: &ChildPlan) -> Result<(), Failure> {
     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
         .map_err(|errno| Failure::at(ChildStep::ParentDeathSignal, errno))?;
     // The parent may have died before the call above: then the signal will
-    // never come, so check by hand. (In a new PID namespace, stage 2,
-    // `getppid` returns 0: this check must change with it.)
-    if nix::unistd::getppid().as_raw() != plan.parent_pid {
+    // never come, so check by hand. Not with `getppid`: inside a new PID
+    // namespace it returns 0. Instead, the parent holds its end of the go
+    // pipe open until `exec`; once every writer is gone, the pipe reports a
+    // hang-up.
+    let mut watch = libc::pollfd {
+        fd: plan.handshake.read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` is async-signal-safe; `watch` is one valid pollfd, and a
+    // zero timeout never blocks.
+    let rc = unsafe { libc::poll(&raw mut watch, 1, 0) };
+    if rc == 1 && watch.revents & libc::POLLHUP != 0 {
         // SAFETY: see `ExitOnUnwind::drop`. Nobody is left to report to.
         unsafe { libc::_exit(SETUP_FAILED) }
     }

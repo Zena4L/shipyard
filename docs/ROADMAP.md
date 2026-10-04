@@ -14,7 +14,7 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 |---|-------|---------|-----------|--------|
 | 0 | **Foundation** | Workspace, lints, CI, docs, UI concept | — | done |
 | 1 | **Process lifecycle** *(POSIX: runs natively on macOS)* | `shipyard run -- /bin/sh` spawns, waits, forwards signals, stops gracefully, returns the exit code; reaps and cleans up everything the command started | TLPI 6, 20–22, 24–27, 34 | [done](stages/01-process-lifecycle.md) |
-| 2 | **Namespaces** | `clone3` / `unshare` into PID, mount, UTS, IPC (then net, user, cgroup, time); own session; minimal PID 1 init; `setns` to join a running container | TLPI 28; `namespaces(7)`, `pid_namespaces(7)` | |
+| 2 | **Namespaces** | `clone3` / `unshare` into PID, mount, UTS, IPC (then net, user, cgroup, time); own session; minimal PID 1 init; `setns` to join a running container | TLPI 28; `namespaces(7)`, `pid_namespaces(7)` | [in progress](stages/02-namespaces.md) |
 | 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names | TLPI 14, 18; `mount_namespaces(7)`, `pivot_root(2)`; OCI runtime spec | |
 | 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp, device access control | TLPI 8, 9, 39; `user_namespaces(7)`, `seccomp(2)` | |
 | 5 | **Resource control** | cgroups v2 limits, OOM detection, live stats, pause/resume | TLPI 36; `cgroups(7)` | |

@@ -26,7 +26,8 @@ the previous one. Don't jump ahead or build later stages early.
   container via `scripts/test-linux.sh`, or the Lima VM).
 - `docs/stages/`: stage notes, the engineering record of each finished stage (decisions,
   failure modes, platform differences, items carried forward).
-- `scripts/`: developer scripts (`test-linux.sh`).
+- `scripts/`: developer scripts (`test-linux.sh`) and kernel probes (`probes/`) that check
+  the kernel behaviour a stage relies on.
 - `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
   - `cli.md` is generated from the clap definitions; never edit it by hand.
   - Describe only what works in the current version.

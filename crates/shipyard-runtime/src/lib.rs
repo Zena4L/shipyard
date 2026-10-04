@@ -18,6 +18,7 @@ compile_error!("shipyard only supports UNIX platforms (Linux, macOS)");
 compile_error!("shipyard only supports 64-bit platforms");
 
 mod error;
+pub mod isolation;
 pub mod process;
 
 pub use error::{Error, Result};

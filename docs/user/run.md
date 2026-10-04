@@ -7,10 +7,10 @@ shipyard run [OPTIONS] COMMAND [ARGS...]
 `shipyard run` starts a command the way a container runtime does: with a clean
 environment and exactly the user, working directory and limits you ask for.
 
-> **Status:** `run` starts the command with exactly the settings below and
-> reports how it ended. It doesn't isolate it yet: the command sees the host's
-> filesystem, processes and network. Isolation (namespaces, a separate
-> filesystem) comes in a later version.
+> **Status:** on Linux, `run` isolates the command in its own process IDs, mounts,
+> hostname and IPC (see [Isolation](#isolation)), but it still sees the host's
+> filesystem and network: a separate root filesystem and networking come in later
+> versions. On macOS the command isn't isolated yet.
 
 ## Arguments
 
@@ -29,6 +29,50 @@ shipyard run -- --program-starting-with-dash
 ```
 
 Arguments are passed through byte for byte, including ones that aren't valid UTF-8.
+
+## Isolation
+
+On Linux, `shipyard run` starts the command in new **namespaces**, so it gets
+its own view of:
+
+| What | Inside the container |
+|---|---|
+| Process IDs | The command is PID 1 and sees only its own processes (`ps`, `/proc`). |
+| Mounts | Mounts made inside stay inside; the host never sees them. |
+| Hostname | Its own copy; set it with `--hostname`. |
+| IPC | Its own System V IPC objects and POSIX message queues. |
+
+The command still sees the host's files and network for now; a separate root
+filesystem and networking come in later versions.
+
+- **Needs root.** Creating namespaces needs root privileges (support for running
+  without root comes later). Otherwise `run` stops before starting anything, with
+  exit code 125 and a message saying so.
+- **`--no-isolation`** runs the command without namespaces: it shares the host's
+  processes, mounts and hostname, and doesn't need root.
+- **`--hostname NAME`** sets the hostname inside: letters, digits and hyphens in
+  dot-separated parts (like `web-1` or `db.internal`), at most 64 characters, no
+  part starting or ending with a hyphen. Not with `--no-isolation`.
+- **The command is PID 1 for now.** Like Docker without `--init`, a signal the
+  command has no handler for is ignored, so `SIGTERM` may not stop a program
+  that doesn't handle it; it's then killed with `SIGKILL` after
+  `--stop-timeout`. A small init process in a later version removes this.
+- **Terminal:** the command runs in a session of its own. Ctrl-C and Ctrl-\ are
+  passed on to it, but as PID 1 it ignores them unless it handles them (a shell
+  script with a `trap` does; `sleep` doesn't). Ctrl-Z stops only Shipyard (the
+  command keeps running), and `fg`/`bg` don't reach the command. Use
+  `--no-isolation` for full job control.
+- **If Shipyard is killed**, the whole container goes with it.
+- **Not a security boundary yet.** The command runs as root on the host's own
+  files; isolation keeps it from *seeing* and *disturbing* the rest of the
+  system by accident, not from breaking out on purpose. Running untrusted code
+  safely needs a separate root filesystem, dropped capabilities and seccomp,
+  which come in later versions.
+- If `/` isn't a mount point (for example inside a plain `chroot`), isolation
+  fails with "making the container's mounts private: Invalid argument"; use
+  `--no-isolation` there.
+- **macOS:** commands aren't isolated yet (as with `--no-isolation`); `--hostname`
+  is an error there.
 
 ## Environment
 

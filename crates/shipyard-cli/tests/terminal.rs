@@ -11,6 +11,10 @@
 //! thread stays locked forever in the copy). That's why these tests don't use
 //! the standard test harness, which runs tests on threads: `main` below runs
 //! them one by one. Never start a thread here.
+//!
+//! Runs use `--no-isolation`: these test process behaviour that's the same
+//! with or without namespaces, without needing root. `isolation.rs` tests
+//! the namespaces.
 
 #![allow(
     clippy::expect_used,
@@ -18,15 +22,13 @@
     reason = "in a test binary, a panic is a test failure with a clear message"
 )]
 
-// Each test binary uses only part of the shared helpers.
-#[allow(dead_code, reason = "only `killed_by` is used here")]
 mod common;
 mod pty;
 
 use std::io::Write as _;
 use std::process::ExitCode;
 
-use common::killed_by;
+use common::{child_of, killed_by};
 use pty::{Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped};
 
 const CTRL_C: &[u8] = b"\x03";
@@ -162,7 +164,10 @@ fn main() -> ExitCode {
 macro_rules! foreground_sh {
     ($script:expr) => {
         |shell: &mut Shell| {
-            let job = shell.spawn(Mode::Foreground, &["run", "sh", "-c", $script]);
+            let job = shell.spawn(
+                Mode::Foreground,
+                &["run", "--no-isolation", "sh", "-c", $script],
+            );
             shell.wait(job);
         }
     };
@@ -188,6 +193,7 @@ fn ctrl_c_reaches_the_command_exactly_once() {
             &[
                 "--debug",
                 "run",
+                "--no-isolation",
                 "sh",
                 "-c",
                 "trap 'echo got-\"\"int; kill $!' INT; echo re\"\"ady; sleep 5 & wait; echo e\"\"nd",
@@ -233,6 +239,7 @@ fn ctrl_backslash_quits_the_command() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-isolation",
                 "--ulimit",
                 "core=0",
                 "sh",
@@ -259,6 +266,7 @@ fn ctrl_z_stops_both_and_fg_resumes() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-isolation",
                 "sh",
                 "-c",
                 "echo pid $$; read line; echo \"got $line\"",
@@ -287,7 +295,13 @@ fn bg_resumes_a_stopped_job() {
     let mut session = Session::start(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "sh", "-c", "echo ready; sleep 3; echo done"],
+            &[
+                "run",
+                "--no-isolation",
+                "sh",
+                "-c",
+                "echo ready; sleep 3; echo done",
+            ],
         );
         shell.wait(job);
         shell.bg(job);
@@ -308,7 +322,13 @@ fn a_background_job_reading_the_terminal_waits_for_fg() {
     let mut session = Session::start(|shell| {
         let job = shell.spawn(
             Mode::Background,
-            &["run", "sh", "-c", "read x; echo \"got $x\""],
+            &[
+                "run",
+                "--no-isolation",
+                "sh",
+                "-c",
+                "read x; echo \"got $x\"",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -330,7 +350,13 @@ fn a_command_that_stops_itself_stops_shipyard_too() {
     let mut session = Session::start(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "sh", "-c", "echo ready; kill -STOP $$; echo resumed"],
+            &[
+                "run",
+                "--no-isolation",
+                "sh",
+                "-c",
+                "echo ready; kill -STOP $$; echo resumed",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -351,7 +377,13 @@ fn continuing_shipyard_alone_continues_the_command() {
     let mut session = Session::start(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "sh", "-c", "echo ready; kill -STOP $$; echo resumed"],
+            &[
+                "run",
+                "--no-isolation",
+                "sh",
+                "-c",
+                "echo ready; kill -STOP $$; echo resumed",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -387,6 +419,7 @@ fn kill_to_a_background_shipyard_is_forwarded() {
             Mode::Background,
             &[
                 "run",
+                "--no-isolation",
                 "sh",
                 "-c",
                 "trap 'echo got INT; kill $!; exit 3' INT; echo ready; sleep 100 & wait",
@@ -461,6 +494,7 @@ fn a_stop_request_still_kills_a_command_that_stops_itself() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-isolation",
                 "--stop-timeout",
                 "1",
                 "sh",
@@ -497,7 +531,7 @@ fn without_job_control_shipyard_does_not_stop_itself() {
                 concat!(
                     "'",
                     env!("CARGO_BIN_EXE_shipyard"),
-                    "' --debug run sh -c 'sleep 0.5; kill -STOP $$' & echo \"shipyard $!\""
+                    "' --debug run --no-isolation sh -c 'sleep 0.5; kill -STOP $$' & echo \"shipyard $!\""
                 ),
             ],
         );
@@ -525,26 +559,4 @@ fn without_job_control_shipyard_does_not_stop_itself() {
     );
     session.go();
     session.finish();
-}
-
-/// The PID of `parent`'s child, once it has one (`pgrep -P`).
-fn child_of(parent: libc::pid_t) -> libc::pid_t {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let output = std::process::Command::new("pgrep")
-            .args(["-P", &parent.to_string()])
-            .output()
-            .expect("running pgrep");
-        if let Some(pid) = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.trim().parse().ok())
-        {
-            return pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "process {parent} never had a child"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
 }

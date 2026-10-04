@@ -29,6 +29,11 @@ pub(crate) enum ChildStep {
     Exec = 10,
     ProcessGroup = 11,
     SignalMask = 12,
+    Handshake = 13,
+    Session = 14,
+    MountPrivate = 15,
+    MountProc = 16,
+    Hostname = 17,
 }
 
 impl ChildStep {
@@ -49,6 +54,11 @@ impl ChildStep {
             10 => Self::Exec,
             11 => Self::ProcessGroup,
             12 => Self::SignalMask,
+            13 => Self::Handshake,
+            14 => Self::Session,
+            15 => Self::MountPrivate,
+            16 => Self::MountProc,
+            17 => Self::Hostname,
             _ => return None,
         })
     }
@@ -178,7 +188,29 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
         ChildStep::ParentDeathSignal => setup("setting the parent-death signal".into()),
         ChildStep::ProcessGroup => setup("starting a new process group".into()),
         ChildStep::SignalMask => setup("clearing the signal mask".into()),
+        ChildStep::Handshake => setup("waiting for shipyard to finish its setup".into()),
+        ChildStep::Session => setup("starting a new session".into()),
+        ChildStep::MountPrivate => {
+            isolation_setup("making the container's mounts private", errno, ctx)
+        }
+        ChildStep::MountProc => isolation_setup("mounting /proc for the container", errno, ctx),
+        ChildStep::Hostname => isolation_setup("setting the container's hostname", errno, ctx),
     }
+}
+
+/// A namespace setup step that failed. EPERM there means missing privileges:
+/// root's, or (when shipyard is root) the container's or a security policy's.
+fn isolation_setup(doing: &str, errno: Errno, ctx: &FailureContext) -> SpawnError {
+    let mut message = format!("{doing}: {}", errno.desc());
+    if errno == Errno::EPERM {
+        message.push_str(if ctx.root {
+            " (the system refused it: inside a container without privileges, \
+             or a security policy?; or use --no-isolation)"
+        } else {
+            " (isolation needs root; or use --no-isolation)"
+        });
+    }
+    SpawnError::new(SpawnErrorKind::Setup, message, errno)
 }
 
 fn describe_rlimit(errno: Errno, detail: u64, ctx: &FailureContext) -> String {
@@ -329,7 +361,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 12, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 17, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -481,5 +513,33 @@ mod tests {
             fail(ChildStep::SetUid, Errno::EPERM, 0).to_string(),
             "switching to user 1000: Operation not permitted"
         );
+
+        let proc = fail(ChildStep::MountProc, Errno::EPERM, 0);
+        assert_eq!(proc.exit_code(), 125);
+        assert_eq!(
+            proc.to_string(),
+            "mounting /proc for the container: Operation not permitted \
+             (isolation needs root; or use --no-isolation)"
+        );
+        assert!(
+            !fail(ChildStep::Hostname, Errno::EINVAL, 0)
+                .to_string()
+                .contains("needs root")
+        );
+        // As root, EPERM isn't about being root.
+        let as_root = FailureContext {
+            root: true,
+            ..ctx.clone()
+        };
+        let refused = describe(
+            ChildFailure {
+                step: ChildStep::MountProc,
+                errno: Errno::EPERM,
+                detail: 0,
+            },
+            &as_root,
+        );
+        assert!(refused.to_string().contains("refused"), "{refused}");
+        assert!(!refused.to_string().contains("needs root"), "{refused}");
     }
 }

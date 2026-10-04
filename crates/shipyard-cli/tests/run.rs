@@ -7,6 +7,10 @@
 //! "Hostile parent" tests start shipyard in a deliberately bad state (leaked
 //! descriptors, ignored or blocked signals) and check that the command still
 //! starts clean.
+//!
+//! Runs use `--no-isolation`: these test process behaviour that's the same
+//! with or without namespaces, without needing root. `isolation.rs` tests
+//! the namespaces.
 
 #![allow(
     clippy::expect_used,
@@ -16,11 +20,9 @@
 
 mod common;
 
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::Command;
 
-use common::{TIMEOUT, block, ignore, killed_by, shipyard, shipyard_run_with};
+use common::{Run, block, ignore, is_root, killed_by, run, shipyard, shipyard_run_with};
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -33,47 +35,8 @@ const BAD_INTERPRETER: &str = concat!(
     "/tests/fixtures/bad-interpreter"
 );
 
-struct Run {
-    /// The exit code; `None` if shipyard itself was killed by a signal.
-    code: Option<i32>,
-    signal: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-/// Runs shipyard to completion, killing it if it takes longer than `TIMEOUT`.
-fn run(mut command: Command) -> Run {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = command.spawn().expect("starting shipyard");
-    let pid = libc::pid_t::try_from(child.id()).expect("pid fits in pid_t");
-    let (done, finished) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done.send(child.wait_with_output());
-    });
-    let Ok(output) = finished.recv_timeout(TIMEOUT) else {
-        // SAFETY: `pid` is the shipyard process this test started.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        panic!("shipyard did not finish within {TIMEOUT:?}");
-    };
-    let output = output.expect("waiting for shipyard");
-    Run {
-        code: output.status.code(),
-        signal: output.status.signal(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
 fn shipyard_run(args: &[&str]) -> Run {
-    run(shipyard(&[&["run"], args].concat()))
-}
-
-fn is_root() -> bool {
-    // SAFETY: `geteuid` has no preconditions.
-    unsafe { libc::geteuid() == 0 }
+    run(shipyard(&[&["run", "--no-isolation"], args].concat()))
 }
 
 #[test]
@@ -331,7 +294,7 @@ fn children_shipyard_had_before_are_left_running() {
         concat!(
             "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exec '",
             env!("CARGO_BIN_EXE_shipyard"),
-            "' run true"
+            "' run --no-isolation true"
         ),
     ]);
     let run = run(command);
@@ -389,6 +352,7 @@ fn environment_values_never_reach_the_logs() {
         "--log-level",
         "trace",
         "run",
+        "--no-isolation",
         "-e",
         "SECRET=hunter2-value",
         "-e",
@@ -403,4 +367,21 @@ fn environment_values_never_reach_the_logs() {
             run.stderr
         );
     }
+}
+
+#[test]
+fn hostname_mistakes_are_usage_errors() {
+    // Contradictory flags.
+    let both = run(shipyard(&[
+        "run",
+        "--no-isolation",
+        "--hostname",
+        "box",
+        "true",
+    ]));
+    assert_eq!(both.code, Some(125), "{}", both.stderr);
+    // An invalid name; on macOS, no namespaces to give one to.
+    let bad = run(shipyard(&["run", "--hostname", "bad_name", "true"]));
+    assert_eq!(bad.code, Some(125), "{}", bad.stderr);
+    assert!(bad.stderr.contains("hostname"), "{}", bad.stderr);
 }

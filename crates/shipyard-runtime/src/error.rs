@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use nix::errno::Errno;
 
+use crate::isolation::IsolationError;
 use crate::process::{EXIT_ENGINE_ERROR, SpawnError, SpecError, StopSignalError};
 
 /// Errors produced by the runtime.
@@ -33,9 +34,29 @@ pub enum Error {
     #[error(transparent)]
     InvalidSpec(#[from] SpecError),
 
+    /// The isolation (namespaces, hostname) is invalid; nothing was started.
+    #[error(transparent)]
+    InvalidIsolation(#[from] IsolationError),
+
     /// The stop signal can't end a process (it stops or continues it).
     #[error(transparent)]
     StopSignal(#[from] StopSignalError),
+
+    /// Isolating the command in new namespaces needs privileges (root, until
+    /// rootless support with user namespaces arrives).
+    #[error(
+        "isolating the command in namespaces needs root (rootless support comes later); \
+         run as root, or use --no-isolation"
+    )]
+    IsolationNeedsRoot,
+
+    /// Running as root, the system still refused to create namespaces.
+    #[error(
+        "the system refused to create namespaces: shipyard may be running inside a \
+         container without privileges, or under a security policy (seccomp, AppArmor, \
+         SELinux); run it with privileges, or use --no-isolation"
+    )]
+    IsolationRefused,
 
     /// Running as another user or group, or adding groups, needs root.
     #[error("running as a different user or group needs root: {0}")]

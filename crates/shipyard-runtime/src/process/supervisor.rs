@@ -37,6 +37,7 @@ use super::spawn::{Child, SpawnOptions, spawn};
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
 use super::stop::StopPolicy;
+use crate::isolation::Isolation;
 use crate::{Error, Result};
 
 /// When to first warn that a command killed with SIGKILL still hasn't exited, and how
@@ -98,13 +99,34 @@ impl Supervisor {
     /// - SIGTERM is a stop request, like `docker stop`: the command gets
     ///   `stop.signal` (and SIGCONT, in case it's stopped), then SIGKILL once
     ///   `stop.timeout` has passed.
-    pub fn supervise(&mut self, spec: &ProcessSpec, stop: StopPolicy) -> Result<ExitStatus> {
+    /// - With `isolation` (Linux), the command starts in new namespaces and a
+    ///   session of its own. It's then never in the terminal's process group,
+    ///   so signals from the terminal are forwarded like any other, and the
+    ///   shell's job control doesn't extend to it.
+    ///
+    /// # Errors
+    ///
+    /// Invalid input, isolation on macOS or without root, or a failure to
+    /// start the command (see [`Error::exit_code`]).
+    pub fn supervise(
+        &mut self,
+        spec: &ProcessSpec,
+        stop: StopPolicy,
+        isolation: Option<&Isolation>,
+    ) -> Result<ExitStatus> {
         stop.validate()?;
+        if let Some(isolation) = isolation {
+            check_isolation(isolation)?;
+        }
         let terminal = Terminal::open();
+        // With isolation the command has a session of its own, so it never
+        // shares the terminal's group, whether or not shipyard has one.
+        let job_terminal = terminal.as_ref().filter(|_| isolation.is_none());
         tracing::debug!(
             terminal = terminal.is_some(),
+            isolated = isolation.is_some(),
             "{}",
-            if terminal.is_some() {
+            if job_terminal.is_some() {
                 "sharing shipyard's process group with the command"
             } else {
                 "giving the command its own process group"
@@ -112,7 +134,8 @@ impl Supervisor {
         );
         let spec = with_terminal_env(spec, terminal.is_some(), std::env::var_os("TERM"));
         let options = SpawnOptions {
-            new_process_group: terminal.is_none(),
+            isolation: isolation.cloned(),
+            new_process_group: job_terminal.is_none(),
             keep_ignored: self
                 .signals
                 .ignored_at_startup()
@@ -123,7 +146,7 @@ impl Supervisor {
         };
         let started = |pid: Pid| self.signals.set_child(pid.as_raw());
         let result = spawn(&spec, &options, started).and_then(|mut child| {
-            let result = self.watch(&mut child, stop, terminal.as_ref());
+            let result = self.watch(&mut child, stop, job_terminal);
             if result.is_err() {
                 // Never leave the command running unsupervised.
                 child.kill_all();
@@ -199,6 +222,23 @@ impl Supervisor {
             Err(e) => Err(Error::sys("waiting for signals and the command", e)),
         }
     }
+}
+
+/// Rejects an isolation that can't work here, before anything starts.
+fn check_isolation(isolation: &Isolation) -> Result<()> {
+    isolation.validate()?;
+    if !cfg!(target_os = "linux") {
+        return Err(Error::LinuxOnly {
+            feature: "namespace isolation",
+            os: std::env::consts::OS,
+        });
+    }
+    // Creating namespaces needs CAP_SYS_ADMIN. Checked here for a clear
+    // message; a clone or mount failing with EPERM says the same thing.
+    if !nix::unistd::geteuid().is_root() {
+        return Err(Error::IsolationNeedsRoot);
+    }
+    Ok(())
 }
 
 /// Keeps shipyard's state in step with the command's, so the shell's job

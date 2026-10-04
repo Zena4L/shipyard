@@ -7,6 +7,8 @@
 
 mod channel;
 mod child;
+#[cfg(target_os = "linux")]
+mod clone;
 mod env;
 mod failure;
 mod plan;

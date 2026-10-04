@@ -62,12 +62,18 @@ container (Docker, OrbStack or any compatible engine):
 1. clippy with warnings as errors;
 2. the whole test suite as a normal user;
 3. the suite again with the root-only tests, run as root through `sudo` (as the
-   CI `root` job does).
+   CI `root` job does). Before it, `/` is made a shared mount, as on systemd
+   hosts, so a mount namespace that leaks mounts would be caught.
 
 ```sh
 scripts/test-linux.sh            # everything; exits non-zero on any failure
 scripts/test-linux.sh --shell    # a shell in the same container, to debug
 ```
+
+The container is **privileged**, because creating namespaces and mounting
+(stage 2 on) need `CAP_SYS_ADMIN` and Docker's default seccomp profile blocks
+them. The normal-user pass still has no capabilities, so it checks what an
+unprivileged user sees. Use it for development only.
 
 The repository is mounted read-only. Build output, the cargo registry and the
 pinned toolchain live in Docker volumes named `shipyard-linux-*`, so later runs

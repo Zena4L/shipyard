@@ -1,5 +1,12 @@
-//! The child's report pipe: how a failure between `fork` and `exec` reaches the
-//! parent (TLPI §28.3 describes the idea).
+//! The pipes between shipyard and a child it's starting (TLPI §28.3
+//! describes the idea).
+//!
+//! - **The report pipe** (child → parent): how a failure between `fork` and
+//!   `exec` reaches the parent.
+//! - **The go pipe** (parent → child), the setup handshake: the child waits
+//!   for one byte before setting up, so the parent can finish its own part
+//!   first. The parent keeps its end open until `exec` resolves, which also
+//!   tells the child whether the parent is still alive (see `child.rs`).
 //!
 //! Both ends are close-on-exec. If `exec` succeeds, the kernel closes the
 //! child's write end and the parent reads end-of-file. If it fails, the child
@@ -17,17 +24,36 @@ use crate::{Error, Result};
 /// Size of one failure record.
 pub(crate) const RECORD_LEN: usize = 16;
 
-/// Creates the pipe, returning `(read, write)`. Both ends are close-on-exec,
-/// and the write end is at fd 3 or above.
+/// Creates the report pipe, returning `(read, write)`. Both ends are
+/// close-on-exec, and the child's (write) end is at fd 3 or above.
 pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let (read, write) = cloexec_pipe()?;
     Ok((read, above_stdio(write)?))
 }
 
+/// Creates the go pipe, returning `(read, write)`. Both ends are
+/// close-on-exec and at fd 3 or above: the child holds both until it closes
+/// the parent's copy.
+pub(crate) fn go_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = cloexec_pipe()?;
+    Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+/// Tells the child to go ahead. If the child already died, the write fails
+/// (EPIPE): that's fine, its exit is reported the usual way.
+pub(crate) fn send_go(pipe: &OwnedFd) {
+    loop {
+        match nix::unistd::write(pipe, b"g") {
+            Err(Errno::EINTR) => {}
+            _ => return,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
     nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
-        .map_err(|e| Error::sys("creating the child's report pipe", e))
+        .map_err(|e| Error::sys("creating a pipe to the child", e))
 }
 
 /// macOS has no `pipe2`, so the flag is set separately. Another thread forking
@@ -37,10 +63,10 @@ fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
 fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
     use nix::fcntl::FdFlag;
     let (read, write) =
-        nix::unistd::pipe().map_err(|e| Error::sys("creating the child's report pipe", e))?;
+        nix::unistd::pipe().map_err(|e| Error::sys("creating a pipe to the child", e))?;
     for fd in [&read, &write] {
         fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-            .map_err(|e| Error::sys("marking the report pipe close-on-exec", e))?;
+            .map_err(|e| Error::sys("marking a pipe to the child close-on-exec", e))?;
     }
     Ok((read, write))
 }
@@ -53,7 +79,7 @@ fn above_stdio(fd: OwnedFd) -> Result<OwnedFd> {
         return Ok(fd);
     }
     let moved = fcntl(&fd, FcntlArg::F_DUPFD_CLOEXEC(3))
-        .map_err(|e| Error::sys("moving the report pipe above the standard descriptors", e))?;
+        .map_err(|e| Error::sys("moving a pipe above the standard descriptors", e))?;
     // SAFETY: `F_DUPFD_CLOEXEC` just returned this new descriptor, and nothing
     // else owns it.
     Ok(unsafe { OwnedFd::from_raw_fd(moved) })
@@ -173,6 +199,22 @@ mod tests {
         let mut record = encode(ChildStep::Exec, libc::ENOENT, 0);
         record[0] = 0xff;
         assert_eq!(decode(record), None);
+    }
+
+    #[test]
+    fn go_pipe_ends_are_close_on_exec_and_above_stdio() {
+        let (read, write) = go_pipe().unwrap();
+        for fd in [&read, &write] {
+            let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap();
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            assert!(fd.as_raw_fd() >= 3);
+        }
+        send_go(&write);
+        let mut byte = [0u8; 1];
+        assert_eq!(nix::unistd::read(&read, &mut byte), Ok(1));
+        // A child that already died: no panic, no error to handle.
+        drop(read);
+        send_go(&write);
     }
 
     #[test]

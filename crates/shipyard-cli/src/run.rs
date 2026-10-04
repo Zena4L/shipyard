@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
+use shipyard_runtime::isolation::Isolation;
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
@@ -44,6 +45,16 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     stop_timeout: u64,
 
+    /// Run without isolation: the command sees the host's processes, mounts
+    /// and hostname. On Linux, commands are isolated by default (which needs
+    /// root); on macOS they always run like this for now.
+    #[arg(long)]
+    no_isolation: bool,
+
+    /// Hostname inside the container (Linux).
+    #[arg(long, value_name = "NAME", conflicts_with = "no_isolation")]
+    hostname: Option<String>,
+
     /// The command to run, followed by its arguments.
     #[arg(
         required = true,
@@ -54,9 +65,18 @@ pub(crate) struct RunArgs {
     command: Vec<OsString>,
 }
 
+/// Everything a `shipyard run` needs, checked.
+#[derive(Debug)]
+pub(crate) struct Invocation {
+    spec: ProcessSpec,
+    stop: StopPolicy,
+    isolation: Option<Isolation>,
+}
+
 impl RunArgs {
-    /// Builds the process spec and stop policy, and validates the spec.
-    pub(crate) fn into_spec(self) -> Result<(ProcessSpec, StopPolicy)> {
+    /// Builds and validates the process spec, stop policy and isolation.
+    pub(crate) fn into_invocation(self) -> Result<Invocation> {
+        let isolation = isolation(self.no_isolation, self.hostname)?;
         let mut user = match self.user {
             Some((uid, gid)) => User {
                 uid,
@@ -88,18 +108,49 @@ impl RunArgs {
             timeout: Duration::from_secs(self.stop_timeout),
         };
         stop.validate()?;
-        Ok((spec, stop))
+        Ok(Invocation {
+            spec,
+            stop,
+            isolation,
+        })
     }
+}
+
+/// The isolation for this run: the standard namespaces on Linux unless
+/// `--no-isolation`; none on macOS, where namespaces don't exist (yet: the VM
+/// comes in a later version).
+fn isolation(no_isolation: bool, hostname: Option<String>) -> Result<Option<Isolation>> {
+    if no_isolation {
+        return Ok(None);
+    }
+    if !cfg!(target_os = "linux") {
+        if hostname.is_some() {
+            bail!(
+                "--hostname needs Linux namespaces, which aren't available on {} yet",
+                std::env::consts::OS
+            );
+        }
+        tracing::debug!("no namespaces on this system; running without isolation");
+        return Ok(None);
+    }
+    let mut isolation = Isolation::standard();
+    isolation.hostname = hostname;
+    isolation.validate()?;
+    Ok(Some(isolation))
 }
 
 /// Runs the command under the supervisor and exits the way it did: with its
 /// exit code, or `128 + N` if signal N killed it. Failures to start it exit
 /// 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
-    let (spec, stop) = args.into_spec()?;
-    tracing::debug!(?spec, ?stop, "running");
+    let Invocation {
+        spec,
+        stop,
+        isolation,
+    } = args.into_invocation()?;
+    tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;
-    let status = match supervisor.supervise(&spec, stop) {
+    let status = match supervisor.supervise(&spec, stop, isolation.as_ref()) {
         Ok(status) => status,
         Err(err) => {
             let code = err.exit_code();
@@ -224,7 +275,7 @@ mod tests {
     }
 
     fn spec(args: &[&str]) -> ProcessSpec {
-        parse(args).unwrap().into_spec().unwrap().0
+        parse(args).unwrap().into_invocation().unwrap().spec
     }
 
     #[test]
@@ -339,7 +390,7 @@ mod tests {
     fn relative_workdir_fails_validation() {
         let err = parse(&["-w", "tmp", "true"])
             .unwrap()
-            .into_spec()
+            .into_invocation()
             .unwrap_err();
         assert!(err.to_string().contains("absolute"), "{err}");
     }
@@ -370,7 +421,7 @@ mod tests {
         for entry in ["=hunter2", "A=b\0hunter2"] {
             let err = parse(&["-e", entry, "true"])
                 .unwrap()
-                .into_spec()
+                .into_invocation()
                 .unwrap_err();
             assert!(!format!("{err:#}").contains("hunter2"), "{entry}: {err:#}");
         }
@@ -381,7 +432,7 @@ mod tests {
         for entry in ["", "TOKEN hunter2"] {
             let err = parse(&["-e", entry, "true"])
                 .unwrap()
-                .into_spec()
+                .into_invocation()
                 .unwrap_err();
             assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
         }
@@ -389,14 +440,42 @@ mod tests {
 
     #[test]
     fn stop_policy() {
-        let (_, stop) = parse(&["--stop-signal", "INT", "--stop-timeout", "3", "true"])
+        let stop = parse(&["--stop-signal", "INT", "--stop-timeout", "3", "true"])
             .unwrap()
-            .into_spec()
-            .unwrap();
+            .into_invocation()
+            .unwrap()
+            .stop;
         assert_eq!(stop.signal, "SIGINT".parse().unwrap());
         assert_eq!(stop.timeout, Duration::from_secs(3));
-        let (_, default) = parse(&["true"]).unwrap().into_spec().unwrap();
+        let default = parse(&["true"]).unwrap().into_invocation().unwrap().stop;
         assert_eq!(default, StopPolicy::default());
+    }
+
+    #[test]
+    fn isolation_is_the_default_on_linux_only() {
+        let isolation = |args: &[&str]| parse(args).unwrap().into_invocation().unwrap().isolation;
+        assert_eq!(
+            isolation(&["true"]).is_some(),
+            cfg!(target_os = "linux"),
+            "isolated by default exactly on Linux"
+        );
+        assert_eq!(isolation(&["--no-isolation", "true"]), None);
+        if cfg!(target_os = "linux") {
+            let named = isolation(&["--hostname", "box", "true"]).unwrap();
+            assert_eq!(named.hostname.as_deref(), Some("box"));
+        }
+    }
+
+    #[test]
+    fn hostname_problems_are_usage_errors() {
+        // Both: together they contradict each other.
+        assert!(parse(&["--no-isolation", "--hostname", "box", "true"]).is_err());
+        // An invalid name, or (macOS) no namespaces to give it to.
+        let err = parse(&["--hostname", "bad_name", "true"])
+            .unwrap()
+            .into_invocation()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("hostname"), "{err:#}");
     }
 
     proptest! {

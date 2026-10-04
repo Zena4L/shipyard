@@ -40,9 +40,32 @@ pub(crate) struct ChildPlan {
     /// Signals that stay ignored in the command; every other one is reset to
     /// its default (see `SpawnOptions::keep_ignored`).
     pub(crate) keep_ignored: Vec<libc::c_int>,
-    /// For the Linux parent-death check: who the child's parent should be.
+    /// The setup handshake (see `channel.rs`).
+    pub(crate) handshake: Handshake,
+    /// The container setup to do inside new namespaces, if isolated.
     #[cfg(target_os = "linux")]
-    pub(crate) parent_pid: libc::pid_t,
+    pub(crate) container: Option<ContainerSetup>,
+}
+
+/// The child's view of the go pipe.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Handshake {
+    /// The end the child reads "go" from, and later watches for the parent's
+    /// end closing.
+    pub(crate) read: RawFd,
+    /// The parent's end. The child inherits a copy and closes it at once:
+    /// only then does the pipe report the parent's end closing.
+    pub(crate) parent_end: RawFd,
+}
+
+/// What the child sets up in its new namespaces, before switching user.
+#[cfg(target_os = "linux")]
+pub(crate) struct ContainerSetup {
+    /// Remount `/` recursively private: in a new mount namespace, first.
+    pub(crate) private_mounts: bool,
+    /// Mount a fresh `/proc` for the new PID namespace.
+    pub(crate) mount_proc: bool,
+    pub(crate) hostname: Option<CString>,
 }
 
 /// The user and groups to switch to.
@@ -114,6 +137,7 @@ impl ChildPlan {
     pub(crate) fn new(
         spec: &ProcessSpec,
         options: &SpawnOptions,
+        handshake: Handshake,
     ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
         let credentials = credentials_for(&spec.user)?;
@@ -163,8 +187,13 @@ impl ChildPlan {
             inherited_fds: inherited_fds(),
             new_process_group: options.new_process_group,
             keep_ignored: options.keep_ignored.clone(),
+            handshake,
             #[cfg(target_os = "linux")]
-            parent_pid: nix::unistd::getpid().as_raw(),
+            container: options
+                .isolation
+                .as_ref()
+                .map(container_setup)
+                .transpose()?,
         };
         let context = FailureContext {
             program: PathBuf::from(program),
@@ -180,6 +209,23 @@ impl ChildPlan {
         };
         Ok((plan, context))
     }
+}
+
+/// The setup steps an isolation needs. `validate` already guaranteed that a
+/// PID namespace comes with a mount namespace, and a hostname with a UTS one.
+#[cfg(target_os = "linux")]
+fn container_setup(isolation: &crate::isolation::Isolation) -> Result<ContainerSetup> {
+    use crate::isolation::Namespace;
+    isolation.validate()?;
+    Ok(ContainerSetup {
+        private_mounts: isolation.has(Namespace::Mount),
+        mount_proc: isolation.has(Namespace::Pid) && isolation.has(Namespace::Mount),
+        hostname: isolation
+            .hostname
+            .as_deref()
+            .map(|name| c_string(name.as_bytes(), "the hostname"))
+            .transpose()?,
+    })
 }
 
 fn c_string(bytes: &[u8], field: &'static str) -> Result<CString, SpecError> {
