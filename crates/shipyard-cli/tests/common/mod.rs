@@ -7,6 +7,17 @@ use std::time::Duration;
 /// The longest any one shipyard run in a test may take.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `shipyard run ARGS…` like [`shipyard`], with `setup` applied to the
+/// process just before shipyard starts: to start it in a deliberately bad
+/// state (a "hostile parent"). `setup` must only make async-signal-safe
+/// calls, as `pre_exec` requires (like [`block`] and [`ignore`]).
+pub(crate) fn shipyard_run_with(args: &[&str], setup: fn() -> std::io::Result<()>) -> Command {
+    let mut command = shipyard(&[&["run"], args].concat());
+    // SAFETY: `setup` only makes async-signal-safe calls (see above).
+    unsafe { command.pre_exec(setup) };
+    command
+}
+
 /// The exit code for a death by `signal`.
 pub(crate) fn killed_by(signal: libc::c_int) -> i32 {
     128 + signal

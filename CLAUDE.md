@@ -76,6 +76,10 @@ child between `fork` and `exec`. If the parent had other threads, any lock they 
 
 Everything the child needs is prepared before `fork`, in `plan.rs`.
 
+The terminal tests (`crates/shipyard-cli/tests/terminal.rs`, `harness = false`)
+fork a fake shell that keeps running Rust code, so that test binary must stay
+single-threaded: never start a thread in it.
+
 ## Before calling work done
 
 ```sh

@@ -16,11 +16,11 @@
 
 mod common;
 
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-use common::{TIMEOUT, block, ignore, killed_by, shipyard};
+use common::{TIMEOUT, block, ignore, killed_by, shipyard, shipyard_run_with};
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -214,13 +214,9 @@ fn root_switches_user_and_drops_its_own_groups() {
 
 // --- A hostile parent: shipyard is started in a deliberately bad state. ---
 
-/// Starts shipyard with `setup` applied to its process just before it runs.
+/// Runs shipyard with `setup` applied to its process just before it runs.
 fn hostile(args: &[&str], setup: fn() -> std::io::Result<()>) -> Run {
-    let mut command = shipyard(&[&["run"], args].concat());
-    // SAFETY: each `setup` below only makes async-signal-safe libc calls,
-    // which is what `pre_exec` requires.
-    unsafe { command.pre_exec(setup) };
-    run(command)
+    run(shipyard_run_with(args, setup))
 }
 
 #[test]
@@ -229,7 +225,9 @@ fn leaked_descriptors_do_not_reach_the_command() {
         &[
             "sh",
             "-c",
-            "if : <&9 2>/dev/null; then echo open; else echo closed; fi",
+            // `true`, not `:`: in dash a failed redirection on a special
+            // builtin like `:` exits the whole shell.
+            "if true 2>/dev/null <&9; then echo open; else echo closed; fi",
         ],
         || {
             // A descriptor without close-on-exec, as a careless parent would
@@ -321,4 +319,88 @@ fn shipyard_does_not_re_raise_a_sigint_it_was_told_to_ignore() {
     );
     assert_eq!(run.signal, None, "{}", run.stderr);
     assert_eq!(run.code, Some(killed_by(libc::SIGINT)), "{}", run.stderr);
+}
+
+#[test]
+fn children_shipyard_had_before_are_left_running() {
+    // `exec` keeps a process's children: here `sleep` becomes shipyard's
+    // child, but it isn't the command's, so cleanup must leave it alone.
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        concat!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exec '",
+            env!("CARGO_BIN_EXE_shipyard"),
+            "' run true"
+        ),
+    ]);
+    let run = run(command);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let sleeper: libc::pid_t = run.stdout.trim().parse().unwrap();
+    // SAFETY: signal 0 only checks; then this test's own `sleep` is killed.
+    unsafe {
+        let alive = libc::kill(sleeper, 0) == 0;
+        libc::kill(sleeper, libc::SIGKILL);
+        assert!(alive, "shipyard killed a child it didn't start");
+    }
+}
+
+#[test]
+fn without_a_terminal_the_command_leads_its_own_process_group() {
+    let run = shipyard_run(&["sh", "-c", "echo $$; ps -o pgid= -p $$"]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let mut lines = run.stdout.lines().map(str::trim);
+    assert_eq!(lines.next(), lines.next(), "pid and process group differ");
+}
+
+#[test]
+fn descriptors_above_a_lowered_limit_do_not_reach_the_command() {
+    let run = hostile(
+        &[
+            "sh",
+            "-c",
+            "if [ -e /dev/fd/60 ]; then echo open; else echo closed; fi",
+        ],
+        || {
+            // A descriptor above the soft limit, as after a parent lowered it.
+            // SAFETY: `dup2` and `setrlimit` are async-signal-safe.
+            unsafe {
+                if libc::dup2(2, 60) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit);
+                limit.rlim_cur = 32;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "closed\n", "fd 60 leaked into the command");
+}
+
+#[test]
+fn environment_values_never_reach_the_logs() {
+    // Also a value given without `KEY=`, which looks like a name.
+    let run = run(shipyard(&[
+        "--log-level",
+        "trace",
+        "run",
+        "-e",
+        "SECRET=hunter2-value",
+        "-e",
+        "ghp_BARETOKEN123",
+        "true",
+    ]));
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    for secret in ["hunter2-value", "ghp_BARETOKEN123"] {
+        assert!(
+            !run.stderr.contains(secret),
+            "{secret} logged:\n{}",
+            run.stderr
+        );
+    }
 }

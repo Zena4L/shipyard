@@ -15,7 +15,8 @@ whatever it is (0–255). The codes below have a special meaning:
 
 A command can also exit with 125–127, or above 128, by itself. If you need to
 tell the cases apart, check stderr: when the code comes from Shipyard, the
-message starts with `shipyard:` or `error:`.
+message starts with `shipyard:` or `error:`. (One exception: `shipyard` with
+no command at all prints its help and exits with `125`.)
 
 ## Common signal codes
 

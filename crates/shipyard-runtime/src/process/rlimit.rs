@@ -213,6 +213,12 @@ impl Rlimit {
                 return Err(RlimitError::TooLarge(n.to_string()));
             }
         }
+        if cfg!(target_os = "linux")
+            && self.kind == RlimitKind::Nofile
+            && self.hard == RlimitValue::Unlimited
+        {
+            return Err(RlimitError::NofileUnlimited);
+        }
         if self.soft > self.hard {
             return Err(RlimitError::SoftAboveHard {
                 kind: self.kind,
@@ -269,6 +275,13 @@ pub enum RlimitError {
     /// A number at or above the platform's "infinity" value.
     #[error("limit value \"{0}\" is too large for this platform")]
     TooLarge(String),
+    /// Linux caps open files at `fs.nr_open`, so it refuses "unlimited" even
+    /// for root.
+    #[error(
+        "nofile can't be unlimited on Linux (the kernel caps it at fs.nr_open); \
+         give a number, such as nofile=1048576"
+    )]
+    NofileUnlimited,
     /// The soft limit is higher than the hard limit, which the kernel refuses.
     #[error("soft limit {soft} is above hard limit {hard} for \"{kind}\"")]
     SoftAboveHard {
@@ -312,6 +325,17 @@ mod tests {
         ] {
             assert_eq!(name.parse(), Ok(RlimitKind::Nofile), "{name}");
         }
+    }
+
+    #[test]
+    fn unlimited_nofile_is_refused_only_on_linux() {
+        let parsed = parse("nofile=unlimited");
+        if cfg!(target_os = "linux") {
+            assert_eq!(parsed, Err(RlimitError::NofileUnlimited));
+        } else {
+            assert!(parsed.is_ok(), "{parsed:?}");
+        }
+        assert!(parse("core=unlimited").is_ok());
     }
 
     #[test]

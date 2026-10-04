@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
 
-use super::rlimit::Rlimit;
+use super::rlimit::{Rlimit, RlimitKind};
 use super::status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND};
 
-/// The child's setup steps, in order. The numbers travel over the report pipe.
+/// The child's setup steps. The numbers travel over the report pipe, so
+/// they never change; new steps get new numbers, wherever they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub(crate) enum ChildStep {
@@ -31,23 +32,25 @@ pub(crate) enum ChildStep {
 }
 
 impl ChildStep {
-    const ALL: [Self; 12] = [
-        Self::ResetSignals,
-        Self::CloseFds,
-        Self::Rlimit,
-        Self::Chdir,
-        Self::SetGroups,
-        Self::SetGid,
-        Self::SetUid,
-        Self::VerifyCredentials,
-        Self::ParentDeathSignal,
-        Self::Exec,
-        Self::ProcessGroup,
-        Self::SignalMask,
-    ];
-
+    /// The step a number names. An explicit table rather than a list to
+    /// search: a step left out of it would turn the child's real failure
+    /// into "unknown step".
     pub(crate) fn from_raw(raw: u16) -> Option<Self> {
-        Self::ALL.into_iter().find(|step| *step as u16 == raw)
+        Some(match raw {
+            1 => Self::ResetSignals,
+            2 => Self::CloseFds,
+            3 => Self::Rlimit,
+            4 => Self::Chdir,
+            5 => Self::SetGroups,
+            6 => Self::SetGid,
+            7 => Self::SetUid,
+            8 => Self::VerifyCredentials,
+            9 => Self::ParentDeathSignal,
+            10 => Self::Exec,
+            11 => Self::ProcessGroup,
+            12 => Self::SignalMask,
+            _ => return None,
+        })
     }
 }
 
@@ -69,6 +72,16 @@ pub(crate) struct FailureContext {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) rlimits: Vec<Rlimit>,
+}
+
+/// Errors from `execve` that mean "no program at this path", so a PATH
+/// search moves on to the next directory. Shared with the child (it's a
+/// plain comparison, safe after `fork`).
+pub(crate) const fn means_not_found(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::ENAMETOOLONG
+    )
 }
 
 impl FailureContext {
@@ -175,11 +188,13 @@ fn describe_rlimit(errno: Errno, detail: u64, ctx: &FailureContext) -> String {
         None => format!("setting a resource limit: {}", errno.desc()),
     };
     if errno == Errno::EPERM {
-        message.push_str(" (raising a hard limit needs root");
-        if cfg!(target_os = "linux") {
-            message.push_str("; Linux also caps nofile at fs.nr_open");
-        }
-        message.push(')');
+        let nofile = limit.is_some_and(|limit| limit.kind == RlimitKind::Nofile);
+        let hint = match (nix::unistd::geteuid().is_root(), nofile) {
+            (false, _) => " (raising a hard limit needs root)",
+            (true, true) => " (the kernel's maximum is lower; on Linux see fs.nr_open)",
+            (true, false) => "",
+        };
+        message.push_str(hint);
     }
     message
 }
@@ -194,7 +209,7 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
     let path = candidate.display();
 
     match errno {
-        Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::ENAMETOOLONG => {
+        errno if means_not_found(errno) => {
             // The file can exist and still give ENOENT: then it's the `#!`
             // interpreter or the dynamic loader that's missing.
             // Checked where the child looked: relative candidates are
@@ -219,8 +234,13 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
             SpawnError::new(NotFound, message, errno)
         }
         Errno::EACCES => {
-            let message = if ctx.resolve(candidate).is_dir() {
+            let resolved = ctx.resolve(candidate);
+            let message = if resolved.is_dir() {
                 format!("{path}: is a directory")
+            } else if !resolved.exists() {
+                // `exists` follows the same path, so this also catches a
+                // file shipyard can see but the command's user can't reach.
+                format!("{path}: permission denied (a directory on the way isn't searchable)")
             } else {
                 format!("{path}: permission denied (is it executable?)")
             };
@@ -303,7 +323,11 @@ mod tests {
 
     #[test]
     fn steps_round_trip_through_their_numbers() {
-        for step in ChildStep::ALL {
+        // Every number from 1 up names a step, with no gaps, until the first
+        // unknown one; and each step maps back to its number.
+        let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
+        assert_eq!(known.len(), 12, "a new step needs a number in from_raw");
+        for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
         assert_eq!(ChildStep::from_raw(0), None);
@@ -368,6 +392,15 @@ mod tests {
         let file = exec(Errno::EACCES, 0, &ctx("/etc/hosts", &["/etc/hosts"]));
         assert_eq!(file.exit_code(), 126);
         assert!(file.to_string().contains("permission denied"), "{file}");
+
+        // EACCES for a file that isn't there: a directory on the way can't
+        // be searched.
+        let missing = exec(Errno::EACCES, 0, &ctx("/no/such/x", &["/no/such/x"]));
+        assert_eq!(missing.exit_code(), 126);
+        assert!(
+            missing.to_string().contains("isn't searchable"),
+            "{missing}"
+        );
     }
 
     #[test]

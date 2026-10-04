@@ -32,10 +32,27 @@ CI runs, on every push and PR:
 
 - fmt;
 - clippy and tests on Linux and macOS;
-- the tests again as root on Linux (see below);
+- the tests again as root on Linux and macOS (see below);
 - clippy for `x86_64-unknown-linux-musl`;
 - the docs build (warnings as errors);
 - cargo-deny.
+
+### Terminal tests
+
+`crates/shipyard-cli/tests/terminal.rs` tests Ctrl-C, Ctrl-Z, `fg`/`bg`,
+hangup and signals on a real (pseudo-)terminal. A small fake shell, forked from
+the test process, runs shipyard as a job and does job control on it like bash;
+the test types keys into the terminal and reads what it shows.
+
+```sh
+cargo test -p shipyard-cli --test terminal              # all of them
+cargo test -p shipyard-cli --test terminal ctrl_z       # by name
+```
+
+They don't use the standard test harness (`harness = false`): the fake shell
+keeps running Rust code after `fork`, which is only safe in a single-threaded
+process, and the standard harness runs tests on threads. So **never start a
+thread in that test binary.**
 
 ### Tests that need root
 

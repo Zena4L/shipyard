@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 #[cfg(not(target_os = "linux"))]
 use std::os::fd::AsRawFd;
+#[cfg(not(target_os = "linux"))]
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
@@ -54,11 +55,18 @@ const KEEP_IGNORED: [c_int; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT];
 /// Supervises commands. Owns this process's signal handlers, so only one can
 /// exist per process; create it before starting anything.
 ///
-/// On Linux it also becomes the parent of every process the command leaves
-/// behind, and reaps and kills *all* of this process's children when the
-/// command exits: don't start other children in a process that supervises.
+/// It reaps every child of this process, and on Linux it also becomes the
+/// parent of every process the command leaves behind and kills them when the
+/// command exits. Children the process already had when the supervisor was
+/// installed are left running (but reaped when they exit). Don't start other
+/// children while supervising.
 pub struct Supervisor {
     signals: Signals,
+    /// Children shipyard already had before it supervised anything: `exec`
+    /// keeps a process's children, so `helper & exec shipyard run app`
+    /// makes `helper` one. They aren't the command's, and are left alone.
+    /// A PID leaves the list when it's reaped (and could be reused).
+    inherited: Vec<libc::pid_t>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -76,7 +84,11 @@ impl Supervisor {
         #[cfg(target_os = "linux")]
         nix::sys::prctl::set_child_subreaper(true)
             .map_err(|e| Error::sys("becoming a child subreaper", e))?;
-        Ok(Self { signals })
+        #[cfg(target_os = "linux")]
+        let inherited = direct_children().unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let inherited = Vec::new();
+        Ok(Self { signals, inherited })
     }
 
     /// Runs the command and supervises it until it has exited and everything
@@ -89,6 +101,15 @@ impl Supervisor {
     pub fn supervise(&mut self, spec: &ProcessSpec, stop: StopPolicy) -> Result<ExitStatus> {
         stop.validate()?;
         let terminal = Terminal::open();
+        tracing::debug!(
+            terminal = terminal.is_some(),
+            "{}",
+            if terminal.is_some() {
+                "sharing shipyard's process group with the command"
+            } else {
+                "giving the command its own process group"
+            }
+        );
         let spec = with_terminal_env(spec, terminal.is_some(), std::env::var_os("TERM"));
         let options = SpawnOptions {
             new_process_group: terminal.is_none(),
@@ -100,25 +121,25 @@ impl Supervisor {
                 .filter(|signal| KEEP_IGNORED.contains(signal))
                 .collect(),
         };
-        let result = spawn(&spec, &options).and_then(|mut child| {
-            self.signals.set_child(child.pid().as_raw());
+        let started = |pid: Pid| self.signals.set_child(pid.as_raw());
+        let result = spawn(&spec, &options, started).and_then(|mut child| {
             let result = self.watch(&mut child, stop, terminal.as_ref());
             if result.is_err() {
                 // Never leave the command running unsupervised.
                 child.kill_all();
-                let _ = child.reap();
+                reap_killed(&mut child);
             }
             result
         });
         #[cfg(target_os = "linux")]
-        kill_leftovers();
+        kill_leftovers(&mut self.inherited);
         self.signals.clear_child();
         result
     }
 
     /// The event loop. Returns once the command has exited and been reaped.
     fn watch(
-        &self,
+        &mut self,
         child: &mut Child,
         stop: StopPolicy,
         terminal: Option<&Terminal>,
@@ -126,20 +147,31 @@ impl Supervisor {
         let mut timers = StopTimers::default();
         loop {
             self.wait_for_event(child, timers.next_wake())?;
+            let mut continued = false;
             for arrival in self.signals.drain() {
-                if arrival.signal == libc::SIGTERM {
+                match arrival.signal {
                     // Whoever sent it, it's a stop request.
-                    timers.request(child, stop);
-                } else if should_forward(arrival, Group::of(terminal)) {
-                    child.signal(arrival.signal);
+                    libc::SIGTERM => timers.request(child, stop),
+                    libc::SIGCONT => continued = true,
+                    _ if should_forward(arrival, Group::of(terminal)) => {
+                        tracing::debug!(
+                            signal = arrival.signal,
+                            "forwarding a signal to the command"
+                        );
+                        child.signal(arrival.signal);
+                    }
+                    _ => {}
                 }
             }
             timers.tick(child, stop, Instant::now());
             // The exec report comes before reaping: a failed exec must be
             // reported as such, not as an ordinary exit.
             child.check_exec()?;
-            if let Some(status) = reap_children(child)? {
+            if let Some(status) = reap_children(child, &mut self.inherited)? {
                 return Ok(status);
+            }
+            if terminal.is_some() {
+                follow_stops(child, &self.signals, continued, timers.requested);
             }
         }
     }
@@ -147,21 +179,94 @@ impl Supervisor {
     /// Sleeps until a signal arrives, the report pipe has something, or
     /// `wake_at` passes.
     fn wait_for_event(&self, child: &Child, wake_at: Option<Instant>) -> Result<()> {
-        let mut fds = vec![PollFd::new(self.signals.wake_fd(), PollFlags::POLLIN)];
-        if let Some(report) = child.report_fd() {
-            fds.push(PollFd::new(report, PollFlags::POLLIN));
-        }
+        // The report pipe only until `exec` resolves; the unused slot just
+        // repeats the wake pipe and isn't passed to `poll`.
+        let wake = self.signals.wake_fd();
+        let report = child.report_fd();
+        let mut fds = [
+            PollFd::new(wake, PollFlags::POLLIN),
+            PollFd::new(report.unwrap_or(wake), PollFlags::POLLIN),
+        ];
+        let watched = if report.is_some() { 2 } else { 1 };
         let now = Instant::now();
         let until = wake_at.map_or(SAFETY_NET, |at| {
             at.saturating_duration_since(now).min(SAFETY_NET)
         });
         let timeout = poll_timeout(until);
-        match poll(&mut fds, timeout) {
+        match poll(&mut fds[..watched], timeout) {
             // EINTR just means a signal arrived: the loop handles it next.
             Ok(_) | Err(Errno::EINTR) => Ok(()),
             Err(e) => Err(Error::sys("waiting for signals and the command", e)),
         }
     }
+}
+
+/// Keeps shipyard's state in step with the command's, so the shell's job
+/// control sees the pair as one job. Only with a terminal: without one,
+/// nobody does job control.
+///
+/// Ctrl-Z needs nothing from us: the terminal stops the whole group. But a
+/// command can stop just itself (`kill -STOP $$`, a debugger). Shipyard would
+/// keep running, the shell would never see a stopped job, and the terminal
+/// would look frozen. So:
+///
+/// - **The command stopped, shipyard didn't:** shipyard stops itself, so the
+///   shell shows the job as stopped. Always with SIGSTOP: SIGTSTP and friends
+///   can be ignored, or discarded in an orphaned process group, and then
+///   shipyard wouldn't stop.
+/// - **Shipyard was continued, the command is still stopped:** continue it
+///   too (as sudo does). That covers `kill -CONT <shipyard>`.
+///
+/// After Ctrl-Z both are stopped and both are continued together, so neither
+/// rule fires: the command is running again by the time shipyard looks.
+///
+/// Shipyard never stops itself when nothing could resume it:
+/// - **During a stop request:** a stopped shipyard couldn't SIGKILL the
+///   command when `--stop-timeout` runs out. (SIGKILL works on a stopped
+///   command, so it's simply left stopped.)
+/// - **In an orphaned process group** (no job-control shell above it: the
+///   shell exited, or shipyard runs under `ssh -t cmd`, `script`, an IDE):
+///   nobody would ever send SIGCONT. The kernel discards terminal stop
+///   signals there for the same reason.
+fn follow_stops(child: &Child, signals: &Signals, continued: bool, stopping: bool) {
+    let Some(signal) = child.stopped() else {
+        return;
+    };
+    if continued {
+        child.signal(libc::SIGCONT);
+        return;
+    }
+    if stopping || !under_job_control() {
+        tracing::trace!(
+            signal,
+            "the command is stopped; nothing would resume shipyard"
+        );
+        return;
+    }
+    tracing::debug!(signal, "the command stopped itself; stopping too");
+    // SAFETY: `kill` has no memory-safety preconditions. This stops
+    // shipyard right here, until something sends it SIGCONT.
+    unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    tracing::debug!("shipyard was continued");
+    // That SIGCONT is handled here: left pending, it would read as a new
+    // "continued" on the next pass and undo a fresh stop of the command.
+    signals.forget(libc::SIGCONT);
+    if child.stopped().is_some() {
+        child.signal(libc::SIGCONT);
+    }
+}
+
+/// Whether a job-control shell could resume shipyard's process group: its
+/// parent is in the same session but another group (POSIX's definition of a
+/// group that isn't orphaned, applied to shipyard's own parent).
+fn under_job_control() -> bool {
+    use nix::unistd::{getpgid, getpgrp, getppid, getsid};
+    let parent = getppid();
+    let same_session = matches!(
+        (getsid(Some(parent)), getsid(None)),
+        (Ok(theirs), Ok(ours)) if theirs == ours
+    );
+    same_session && getpgid(Some(parent)).is_ok_and(|group| group != getpgrp())
 }
 
 /// How the command's process group relates to shipyard's, when a signal is
@@ -216,10 +321,9 @@ fn can_come_from_a_terminal(signal: c_int) -> bool {
 
 /// Shipyard's controlling terminal, kept open while a command runs.
 struct Terminal {
-    #[cfg_attr(
-        target_os = "linux",
-        allow(dead_code, reason = "only macOS asks the terminal anything")
-    )]
+    /// Kept open on macOS to ask for the foreground group; Linux never
+    /// needs to ask.
+    #[cfg(not(target_os = "linux"))]
     fd: OwnedFd,
 }
 
@@ -235,7 +339,14 @@ impl Terminal {
             Mode::empty(),
         )
         .ok()
-        .map(|fd| Self { fd })
+        .map(|fd| {
+            #[cfg(target_os = "linux")]
+            drop(fd);
+            Self {
+                #[cfg(not(target_os = "linux"))]
+                fd,
+            }
+        })
     }
 
     /// Whether shipyard's group is the terminal's foreground group. A
@@ -262,6 +373,7 @@ impl Terminal {
 /// then periodic warnings if the command still doesn't exit.
 #[derive(Debug, Default)]
 struct StopTimers {
+    /// Whether a stop was requested.
     requested: bool,
     /// When to SIGKILL, once a stop was requested.
     kill_at: Option<Instant>,
@@ -288,8 +400,9 @@ impl StopTimers {
         self.requested = true;
         tracing::info!(signal = %stop.signal, timeout = ?stop.timeout, "stopping the command");
         child.signal(stop.signal.as_raw());
-        // A stopped process can't act on the stop signal until it's continued.
-        child.signal(libc::SIGCONT);
+        // A stopped process can't act on the stop signal until it's
+        // continued, nor can the processes it would pass it on to.
+        child.continue_all();
         // An absurd timeout overflows; that just means "wait forever".
         self.kill_at = Instant::now().checked_add(stop.timeout);
     }
@@ -328,27 +441,92 @@ fn poll_timeout(remaining: Duration) -> PollTimeout {
         .unwrap_or(PollTimeout::MAX)
 }
 
+/// Waits for a command that was just sent SIGKILL to exit, then reaps it.
+/// Polled rather than a blocking `waitpid`, so a command stuck in the kernel
+/// (uninterruptible "D" state) gets the same periodic warnings as in the
+/// event loop instead of a silent hang.
+fn reap_killed(child: &mut Child) {
+    let started = Instant::now();
+    let mut warn_at = started.checked_add(STUCK_FIRST_WARNING);
+    while !has_exited(child.pid()) {
+        let now = Instant::now();
+        if warn_at.is_some_and(|at| now >= at) {
+            tracing::warn!(
+                pid = child.pid().as_raw(),
+                waited = ?now.duration_since(started),
+                "the command was killed but hasn't exited; it may be stuck in the kernel"
+            );
+            warn_at = now.checked_add(STUCK_REPEAT_WARNING);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.reap();
+}
+
 /// Reaps every child that has exited. Returns the command's status once it
 /// has exited.
 ///
 /// Children are *peeked* at first (`WNOWAIT`), so the command is still an
 /// unreaped zombie when its process group is killed: until it's reaped, its
 /// process and group IDs can't be reused by an unrelated process.
-fn reap_children(child: &mut Child) -> Result<Option<ExitStatus>> {
-    while let Some(pid) = peek_exited()? {
+///
+/// Other children are reaped quietly, and dropped from `inherited`.
+fn reap_children(
+    child: &mut Child,
+    inherited: &mut Vec<libc::pid_t>,
+) -> Result<Option<ExitStatus>> {
+    loop {
+        let pid = match peek_exited()? {
+            Peek::Exited(pid) => pid,
+            // macOS can report a stopped child ahead of an exited one: ask
+            // about the command directly. (Another exited child stays a
+            // zombie until the next check.)
+            Peek::Stopped if has_exited(child.pid()) => child.pid(),
+            Peek::Nothing | Peek::NoChild | Peek::Stopped => return Ok(None),
+        };
         if pid == child.pid() {
             // Anything still running in its group goes with it.
             child.kill_all();
             return child.reap().map(Some);
         }
         reap_quietly(pid);
+        inherited.retain(|&other| other != pid.as_raw());
     }
-    Ok(None)
+}
+
+/// What a peek at the children found.
+enum Peek {
+    Nothing,
+    /// No such child (ECHILD): none at all, or that one is already reaped.
+    NoChild,
+    Exited(Pid),
+    /// Only macOS: a *stopped* child, reported although only exits were
+    /// asked for.
+    Stopped,
 }
 
 /// The PID of an exited child, without reaping it. Raw `libc::waitid`: nix
 /// doesn't provide it on macOS.
-fn peek_exited() -> Result<Option<Pid>> {
+///
+/// Only real exits count. macOS's `waitid(WEXITED)` also reports a child
+/// that is merely *stopped* (`CLD_STOPPED`), which POSIX doesn't allow;
+/// taken as an exit, it made shipyard kill a command that someone had
+/// paused with `kill -STOP`.
+fn peek_exited() -> Result<Peek> {
+    peek(libc::P_ALL, 0)
+}
+
+/// Whether child `pid` has exited (without reaping it), or is no longer
+/// a child at all.
+fn has_exited(pid: Pid) -> bool {
+    let Ok(id) = libc::id_t::try_from(pid.as_raw()) else {
+        return true;
+    };
+    matches!(peek(libc::P_PID, id), Ok(Peek::Exited(_) | Peek::NoChild))
+}
+
+/// `waitid(WEXITED | WNOHANG | WNOWAIT)` for `which`/`id`.
+fn peek(which: libc::idtype_t, id: libc::id_t) -> Result<Peek> {
     loop {
         // SAFETY: a zeroed `siginfo_t` is valid; `si_pid` stays 0 if there's
         // nothing to report (POSIX leaves that case unspecified otherwise).
@@ -356,8 +534,8 @@ fn peek_exited() -> Result<Option<Pid>> {
         // SAFETY: `info` is valid, writable storage for the result.
         let rc = unsafe {
             libc::waitid(
-                libc::P_ALL,
-                0,
+                which,
+                id,
                 &raw mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -365,13 +543,19 @@ fn peek_exited() -> Result<Option<Pid>> {
         if rc == -1 {
             match Errno::last() {
                 Errno::EINTR => continue,
-                Errno::ECHILD => return Ok(None),
+                Errno::ECHILD => return Ok(Peek::NoChild),
                 errno => return Err(Error::sys("checking for exited children", errno)),
             }
         }
         // SAFETY: `waitid` filled `info` for a child event (or left it zeroed).
         let pid = unsafe { info.si_pid() };
-        return Ok((pid != 0).then(|| Pid::from_raw(pid)));
+        return Ok(match info.si_code {
+            _ if pid == 0 => Peek::Nothing,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => {
+                Peek::Exited(Pid::from_raw(pid))
+            }
+            _ => Peek::Stopped,
+        });
     }
 }
 
@@ -405,44 +589,55 @@ fn with_terminal_env(
 
 /// Linux: kills and reaps every process left behind. As a subreaper,
 /// shipyard has inherited them all (even ones that escaped with `setsid`).
+/// Children it had before supervising (`inherited`) are left running.
 /// Repeats until none are left, since dying ones re-parent their own
 /// children to shipyard; gives up after a short deadline and says so.
 #[cfg(target_os = "linux")]
-fn kill_leftovers() {
+fn kill_leftovers(inherited: &mut Vec<libc::pid_t>) {
     const DEADLINE: Duration = Duration::from_secs(2);
     let started = Instant::now();
     loop {
-        let children = direct_children();
-        for pid in &children {
-            // SAFETY: `kill` has no memory-safety preconditions. These are
-            // our unreaped children, so their PIDs can't have been reused.
-            unsafe { libc::kill(*pid, libc::SIGKILL) };
-        }
-        if !reap_exited_children() {
-            return; // no children left at all
+        reap_exited_children(inherited);
+        let Some(children) = direct_children() else {
+            tracing::warn!(
+                "/proc belongs to another PID namespace; \
+                 processes left behind by the command were not cleaned up"
+            );
+            return;
+        };
+        let leftovers: Vec<libc::pid_t> = children
+            .into_iter()
+            .filter(|pid| !inherited.contains(pid))
+            .collect();
+        if leftovers.is_empty() {
+            return;
         }
         if started.elapsed() >= DEADLINE {
             tracing::warn!(
-                count = children.len(),
+                count = leftovers.len(),
                 "processes left behind by the command didn't exit in time"
             );
             return;
+        }
+        for pid in &leftovers {
+            // SAFETY: `kill` has no memory-safety preconditions. These are
+            // our unreaped children, so their PIDs can't have been reused.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-/// Reaps every child that has exited. Returns whether any children remain.
+/// Reaps every child that has exited, dropping each from `inherited`.
 #[cfg(target_os = "linux")]
-fn reap_exited_children() -> bool {
+fn reap_exited_children(inherited: &mut Vec<libc::pid_t>) {
     loop {
         let mut raw = 0;
         // SAFETY: `raw` is valid storage; WNOHANG never blocks.
         match unsafe { libc::waitpid(-1, &raw mut raw, libc::WNOHANG) } {
             -1 if Errno::last() == Errno::EINTR => {}
-            -1 => return false, // ECHILD: none left
-            0 => return true,   // some, still running
-            _ => {}
+            -1 | 0 => return, // none left, or none exited yet
+            pid => inherited.retain(|&other| other != pid),
         }
     }
 }
@@ -450,8 +645,19 @@ fn reap_exited_children() -> bool {
 /// shipyard's direct children, from `/proc/self/task/*/children` (one file per
 /// thread), or by scanning `/proc/*/stat` for our PID if that file is missing
 /// (kernels built without `CONFIG_PROC_CHILDREN`).
+///
+/// `None` if `/proc` belongs to another PID namespace (mounted for an
+/// ancestor, as after `unshare -p -f` without `--mount-proc`): its PIDs
+/// would name different processes than `kill` does here.
 #[cfg(target_os = "linux")]
-fn direct_children() -> Vec<libc::pid_t> {
+fn direct_children() -> Option<Vec<libc::pid_t>> {
+    let ours = std::fs::read_link("/proc/self")
+        .ok()
+        .and_then(|link| link.to_str()?.parse::<u32>().ok())
+        == Some(std::process::id());
+    if !ours {
+        return None;
+    }
     let lists: Vec<String> = std::fs::read_dir("/proc/self/task")
         .into_iter()
         .flatten()
@@ -461,12 +667,14 @@ fn direct_children() -> Vec<libc::pid_t> {
     if lists.is_empty() {
         // No `children` file could be read: fall back to the slow scan. (An
         // empty file just means no children, and needs no scan.)
-        return children_by_scanning_proc();
+        return Some(children_by_scanning_proc());
     }
-    lists
-        .iter()
-        .flat_map(|list| list.split_whitespace().filter_map(|pid| pid.parse().ok()))
-        .collect()
+    Some(
+        lists
+            .iter()
+            .flat_map(|list| list.split_whitespace().filter_map(|pid| pid.parse().ok()))
+            .collect(),
+    )
 }
 
 #[cfg(target_os = "linux")]

@@ -165,11 +165,8 @@ mod tests {
             return;
         }
         let committed = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            committed == generated,
-            "docs/user/cli.md is out of date with the CLI. Regenerate it with:\n\n    \
-             UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference\n"
-        );
+        assert_eq!(committed, generated, "docs/user/cli.md is out of date with the CLI. Regenerate it with:\n\n    \
+             UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference\n");
     }
 
     #[test]
