@@ -1,41 +1,28 @@
-use nix::errno::Errno;
-
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The feature needs Linux kernel support this host doesn't have.
     #[error("{feature} requires a Linux kernel (current host: {os})")]
     LinuxOnly {
+        /// What was attempted, e.g. "PID namespaces".
         feature: &'static str,
+        /// The host operating system (`std::env::consts::OS`).
         os: &'static str,
     },
 
-    /// A system call failed. `op` says what we were doing, in words; the
-    /// errno is the error's source, so full-chain printing shows both once.
-    #[error("{op}")]
-    Sys {
-        op: &'static str,
-        #[source]
-        source: Errno,
-    },
-
+    /// Shipyard was started with privileges its caller doesn't have (a
+    /// setuid/setgid bit or file capabilities), which would let any user run
+    /// commands with elevated privileges.
     #[error(
-        "refusing to run: shipyard is installed setuid or setgid \
-         (real uid {uid}, effective uid {euid}, real gid {gid}, effective gid {egid}); \
-         reinstall it without the setuid/setgid bit"
+        "refusing to run: shipyard was started with elevated privileges ({reason}); \
+         reinstall it without setuid/setgid bits or file capabilities"
     )]
-    PrivilegedExecutable {
-        uid: u32,
-        euid: u32,
-        gid: u32,
-        egid: u32,
+    PrivilegedStart {
+        /// What made the start privileged.
+        reason: String,
     },
 }
 
-impl Error {
-    pub(crate) fn sys(op: &'static str, source: Errno) -> Self {
-        Self::Sys { op, source }
-    }
-}
-
+/// A `Result` whose error defaults to the runtime's [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -23,6 +23,9 @@ the previous one. Don't jump ahead or build later stages early.
 - `docs/FEATURES.md`: the full feature list per stage, the production-quality bar, and what's
   out of scope.
 - `docs/DEVELOPMENT.md`: setup, commands, and the Lima VM for Linux-only work on macOS.
+- `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
+  - `cli.md` is generated from the clap definitions; never edit it by hand.
+  - Describe only what works in the current version.
 - `docs/design/`: UI concept.
   - `shipyard-ui.html`: interactive mock.
   - `README.md`: concepts, interaction rules, tokens, and the data the UI needs. Read this
@@ -65,6 +68,16 @@ cargo clippy --workspace --all-targets
 cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu   # Linux-only code, from macOS
 cargo test --workspace
 ```
+
+**Docs are part of done.** If a change affects what users see (commands, flags,
+behavior, exit codes, messages):
+
+- update the matching page in `docs/user/`;
+- regenerate the command reference with
+  `UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference`
+  (a test fails while it is stale).
+
+Every public Rust item needs a doc comment; the `missing_docs` lint enforces it.
 
 Linux-only behavior must also be *run* in the Lima VM (see `docs/DEVELOPMENT.md`), not just
 compiled. Test as you build: every stage ships with tests.

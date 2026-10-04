@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use nix::sys::signal::Signal;
+use super::signal::Signal;
 
 /// Shipyard failed before the command could start (bad flags, setup error).
 pub const EXIT_ENGINE_ERROR: u8 = 125;
@@ -17,14 +17,14 @@ pub const EXIT_NOT_FOUND: u8 = 127;
 
 /// How a process ended (TLPI §26.1.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExitStatus {
     /// The process exited normally with this code.
     Exited(u8),
     /// The process was killed by a signal.
     Signaled {
-        /// The signal number. Kept raw because Linux real-time signals have no
-        /// fixed names.
-        signal: i32,
+        /// The signal that killed it.
+        signal: Signal,
         /// Whether the kernel wrote a core dump.
         core_dumped: bool,
     },
@@ -33,13 +33,13 @@ pub enum ExitStatus {
 impl ExitStatus {
     /// The code a shell would report: the exit code, or `128 + signal`.
     ///
-    /// A signal number that doesn't fit (impossible on Linux and macOS, whose
-    /// highest signal is 64) maps to 255 rather than wrapping around.
+    /// Signals never exceed 64 on Linux or macOS, so `128 + signal` always
+    /// fits; the fallback to 255 only guards against that ever changing.
     #[must_use]
     pub fn code(self) -> u8 {
         match self {
             Self::Exited(code) => code,
-            Self::Signaled { signal, .. } => u8::try_from(signal)
+            Self::Signaled { signal, .. } => u8::try_from(signal.as_raw())
                 .ok()
                 .and_then(|s| s.checked_add(128))
                 .unwrap_or(u8::MAX),
@@ -55,9 +55,9 @@ impl fmt::Display for ExitStatus {
                 signal,
                 core_dumped,
             } => {
-                match Signal::try_from(signal) {
-                    Ok(sig) => write!(f, "killed by {}", sig.as_str())?,
-                    Err(_) => write!(f, "killed by signal {signal}")?,
+                match signal.name() {
+                    Some(name) => write!(f, "killed by {name}")?,
+                    None => write!(f, "killed by signal {}", signal.as_raw())?,
                 }
                 if core_dumped {
                     f.write_str(" (core dumped)")?;
@@ -72,7 +72,7 @@ impl fmt::Display for ExitStatus {
 mod tests {
     use super::*;
 
-    fn killed(signal: i32) -> ExitStatus {
+    fn killed(signal: Signal) -> ExitStatus {
         ExitStatus::Signaled {
             signal,
             core_dumped: false,
@@ -88,26 +88,25 @@ mod tests {
 
     #[test]
     fn signals_map_to_128_plus_n() {
-        assert_eq!(killed(libc::SIGKILL).code(), 137);
-        assert_eq!(killed(libc::SIGTERM).code(), 143);
-        // Highest Linux real-time signal.
-        assert_eq!(killed(64).code(), 192);
-    }
-
-    #[test]
-    fn out_of_range_signal_saturates() {
-        assert_eq!(killed(200).code(), 255);
-        assert_eq!(killed(-1).code(), 255);
+        assert_eq!(killed(Signal::KILL).code(), 137);
+        assert_eq!(killed(Signal::TERM).code(), 143);
     }
 
     #[test]
     fn display_names_signals() {
         assert_eq!(ExitStatus::Exited(3).to_string(), "exited with code 3");
         let segv = ExitStatus::Signaled {
-            signal: libc::SIGSEGV,
+            signal: Signal::from_raw(libc::SIGSEGV).unwrap(),
             core_dumped: true,
         };
         assert_eq!(segv.to_string(), "killed by SIGSEGV (core dumped)");
-        assert_eq!(killed(60).to_string(), "killed by signal 60");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn realtime_signals_are_named() {
+        let rt = Signal::from_raw(37).unwrap();
+        assert_eq!(killed(rt).to_string(), "killed by SIGRTMIN+3");
+        assert_eq!(killed(rt).code(), 165);
     }
 }
