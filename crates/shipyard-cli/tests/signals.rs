@@ -3,8 +3,9 @@
 //!
 //! Each test starts a fresh `shipyard` in a new session without a terminal,
 //! so the command gets its own process group, as in CI or under a service
-//! manager. No test sleeps to synchronise: the command prints `ready` once its
-//! traps are set, and the test signals only after reading that line.
+//! manager. Tests synchronise on output, not on time: the command prints
+//! `ready` once its traps are set, and the test signals only after reading
+//! that line. (Sleeps appear only as generous upper bounds.)
 //! Scripts wait with `sleep 100 & wait`, because a shell runs traps between
 //! commands, so a foreground `sleep` would delay them.
 
@@ -17,13 +18,18 @@
 mod common;
 
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
 
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use common::{TIMEOUT, block, ignore, killed_by, shipyard};
+use common::{TIMEOUT, block, ignore, killed_by, shipyard_run_with};
+
+/// How long a leftover shipyard gets to stop after SIGTERM before it's
+/// killed: longer than the default `--stop-timeout` (10 s).
+const STOP_GRACE: Duration = Duration::from_secs(15);
+/// How long a process gets to disappear once it should be gone.
+const GONE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A running shipyard whose stdout is read line by line.
 struct Running {
@@ -37,10 +43,8 @@ fn start(args: &[&str]) -> Running {
 
 /// Starts shipyard, with `setup` applied to its process just before it runs.
 fn start_with(args: &[&str], setup: fn() -> std::io::Result<()>) -> Running {
-    let mut command = shipyard(&[&["run"], args].concat());
+    let mut command = shipyard_run_with(args, setup);
     command.stdin(Stdio::null()).stdout(Stdio::piped());
-    // SAFETY: every `setup` below only makes async-signal-safe calls.
-    unsafe { command.pre_exec(setup) };
     let mut shipyard = command.spawn().expect("starting shipyard");
     let stdout = shipyard.stdout.take().unwrap();
     let (send, lines) = mpsc::channel();
@@ -107,7 +111,7 @@ impl Drop for Running {
         // SIGTERM first, so shipyard stops and cleans up the command too.
         // SAFETY: `kill` only sends a signal to the process this test started.
         unsafe { libc::kill(self.pid(), libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + STOP_GRACE;
         while Instant::now() < deadline {
             if matches!(self.shipyard.try_wait(), Ok(Some(_))) {
                 return;
@@ -196,19 +200,30 @@ fn signals_ignored_when_shipyard_started_are_not_forwarded() {
 
 #[test]
 fn signals_from_the_command_are_not_bounced_back() {
+    // The command sends shipyard USR1, then the test sends USR2. Shipyard
+    // handles pending signals in numeric order (USR1 before USR2), so a
+    // bounced USR1 would be printed before the sentinel, never after.
     let run = start(&[
         "sh",
         "-c",
-        "trap 'echo bounced' USR1; kill -USR1 $PPID; sleep 1; echo done",
+        "trap 'echo bounced' USR1; trap 'echo sentinel; kill $!; exit 0' USR2; \
+         kill -USR1 $PPID; echo sent; while :; do sleep 100 & wait; done",
     ]);
-    let (code, lines) = run.finish();
+    assert_eq!(run.next_line(), "sent");
+    run.signal(libc::SIGUSR2);
+    assert_eq!(
+        run.next_line(),
+        "sentinel",
+        "the command's own USR1 came back"
+    );
+    let (code, rest) = run.finish();
     assert_eq!(code, 0);
-    assert_eq!(lines, ["done"]);
+    assert!(rest.is_empty(), "{rest:?}");
 }
 
-/// Waits up to 5 seconds for `pid` to be gone (not running, not a zombie).
+/// Waits up to `GONE_TIMEOUT` for `pid` to be gone (not running, not a zombie).
 fn gone(pid: libc::pid_t) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + GONE_TIMEOUT;
     while Instant::now() < deadline {
         // SAFETY: `kill` with signal 0 only checks whether the process exists.
         if unsafe { libc::kill(pid, 0) } == -1 {
@@ -254,6 +269,45 @@ fn a_blocked_sigterm_still_stops_the_command() {
             "trap 'exit 5' TERM; echo ready; sleep 100 & wait",
         ],
         || block(libc::SIGTERM),
+    );
+    assert_eq!(run.next_line(), "ready");
+    run.signal(libc::SIGTERM);
+    assert_eq!(run.finish().0, 5);
+}
+
+#[test]
+fn a_command_paused_and_resumed_by_someone_else_carries_on() {
+    // On macOS, `waitid` reports a stopped child as if it had exited; taken
+    // at face value, shipyard killed the paused command (exit 137).
+    let run = start(&["sh", "-c", "echo pid $$; sleep 2; echo done"]);
+    let command: libc::pid_t = run
+        .next_line()
+        .strip_prefix("pid ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    // SAFETY: `kill` only sends signals to the command this test started.
+    unsafe {
+        assert_eq!(libc::kill(command, libc::SIGSTOP), 0);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(libc::kill(command, libc::SIGCONT), 0);
+    }
+    let (code, lines) = run.finish();
+    assert_eq!(code, 0);
+    assert_eq!(lines, ["done"]);
+}
+
+#[test]
+fn a_sigterm_ignored_at_startup_still_stops_the_command() {
+    // SIGTERM is the stop request: even a parent that ignored it mustn't
+    // make shipyard (and so the command) unstoppable.
+    let run = start_with(
+        &[
+            "sh",
+            "-c",
+            "trap 'exit 5' TERM; echo ready; sleep 100 & wait",
+        ],
+        || ignore(libc::SIGTERM),
     );
     assert_eq!(run.next_line(), "ready");
     run.signal(libc::SIGTERM);

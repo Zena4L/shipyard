@@ -27,7 +27,7 @@ use nix::sys::stat::{Mode, umask};
 use nix::unistd::{Gid, Pid, Uid, getpgrp, getpid, setpgid};
 
 use super::channel::encode;
-use super::failure::ChildStep;
+use super::failure::{ChildStep, means_not_found};
 use super::plan::{ChildPlan, Credentials, FdSweep};
 use super::signal::MAX_SIGNAL;
 
@@ -150,21 +150,32 @@ fn reset_signal_dispositions(keep_ignored: &[libc::c_int]) -> Result<(), Failure
 /// The parent makes the same call for the child (TLPI §34.2: with both
 /// calling it, the order in which they run doesn't matter). On macOS the two
 /// calls can collide, and this one then fails with EPERM although the
-/// parent's has done the job, or is about to. So success is judged by the
-/// result, with a few retries while the parent's call finishes.
+/// parent's has done the job, or is about to (seen about once in 1,000
+/// parallel starts on macOS 27). So success is judged by the result: on
+/// EPERM, check whether the group is already ours, and otherwise retry for
+/// up to about 50 ms while the parent's call finishes.
 fn start_process_group() -> Result<(), Failure> {
-    const ATTEMPTS: u32 = 100;
-    let mut last = Errno::UnknownErrno;
+    const ATTEMPTS: u32 = 50;
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    let mut last = Errno::EPERM;
     for _ in 0..ATTEMPTS {
         match setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
             Ok(()) => return Ok(()),
-            Err(errno) => last = errno,
+            Err(Errno::EPERM) => {}
+            Err(errno) => return Err(Failure::at(ChildStep::ProcessGroup, errno)),
         }
         if getpgrp() == getpid() {
             return Ok(());
         }
-        // SAFETY: `sched_yield` is a plain system call with no arguments.
-        unsafe { libc::sched_yield() };
+        // SAFETY: `nanosleep` is async-signal-safe; `pause` is valid and the
+        // remaining time isn't needed.
+        let rc = unsafe { libc::nanosleep(&raw const pause, std::ptr::null_mut()) };
+        if rc == -1 && Errno::last() != Errno::EINTR {
+            last = Errno::last();
+        }
     }
     Err(Failure::at(ChildStep::ProcessGroup, last))
 }
@@ -391,9 +402,7 @@ fn exec_first_candidate(plan: &ChildPlan) -> Failure {
             detail: u64::try_from(index).unwrap_or(u64::MAX),
         };
         match failure.errno {
-            Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::ENAMETOOLONG => {
-                not_found = failure;
-            }
+            errno if means_not_found(errno) => not_found = failure,
             Errno::EACCES => {
                 denied.get_or_insert(failure);
             }

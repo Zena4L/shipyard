@@ -48,16 +48,24 @@ jobs:
 
   # Tests that need root (switching user and groups) are #[ignore]d in normal
   # runs. Here they run as root through a cargo runner, so cargo itself (and
-  # the build) never does.
+  # the build) never does. Both platforms: Linux and macOS switch credentials
+  # differently (setresuid vs setuid, and macOS's group list layout).
   root:
-    name: test as root (ubuntu)
-    runs-on: ubuntu-latest
+    name: test as root (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            runner_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER
+          - os: macos-latest
+            runner_var: CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: echo "${{ matrix.runner_var }}=sudo -E" >> "$GITHUB_ENV"
       - run: cargo test --locked --workspace -- --include-ignored
 
   # musl (static, Alpine-style builds) has different libc types and wrappers;

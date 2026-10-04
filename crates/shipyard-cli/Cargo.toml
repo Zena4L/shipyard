@@ -23,7 +23,17 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 clap-markdown.workspace = true
 libc.workspace = true
+# `term` for `openpty` in the terminal tests.
+nix = { workspace = true, features = ["term"] }
 proptest.workspace = true
+
+# Terminal (pseudo-terminal) tests. Not on libtest: the harness forks a fake
+# shell that keeps running Rust code, which is only sound in a single-threaded
+# process, and libtest runs tests on threads. See tests/terminal.rs.
+[[test]]
+name = "terminal"
+path = "tests/terminal.rs"
+harness = false
 
 [lints]
 workspace = true

@@ -139,7 +139,9 @@ fn add_env(env: &mut Env, entry: &OsStr) -> Result<()> {
         bail!("invalid --env: names can't contain spaces (did you mean KEY=VALUE?)");
     }
     let Some(value) = std::env::var_os(key) else {
-        tracing::debug!(key = %key.to_string_lossy(), "--env KEY not set in shell, skipped");
+        // Not named here either: a value passed without `KEY=` (`-e "$TOKEN"`)
+        // looks exactly like a name that isn't set.
+        tracing::debug!("a bare --env name isn't set in the shell; skipped");
         return Ok(());
     };
     env.set(key, &value).with_context(context)

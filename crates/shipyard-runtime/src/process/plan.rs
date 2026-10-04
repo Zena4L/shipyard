@@ -148,11 +148,13 @@ impl ChildPlan {
                 .collect::<Result<_, _>>()?,
             cwd: c_string(spec.cwd.as_os_str().as_bytes(), "the working directory")?,
             credentials,
-            umask: spec
-                .user
-                .umask
-                .and_then(|mask| libc::mode_t::try_from(mask).ok())
-                .unwrap_or(DEFAULT_UMASK),
+            umask: match spec.user.umask {
+                None => DEFAULT_UMASK,
+                // `validate` already rejected anything above 0o777.
+                Some(mask) => {
+                    libc::mode_t::try_from(mask).map_err(|_| SpecError::UmaskOutOfRange(mask))?
+                }
+            },
             rlimits: spec
                 .rlimits
                 .iter()
@@ -266,8 +268,7 @@ fn raw_limit(limit: &Rlimit) -> Result<RawLimit, SpecError> {
     // back to "as high as this system allows".
     let fallback_soft = (limit.kind == RlimitKind::Nofile && limit.soft == RlimitValue::Unlimited)
         .then(max_open_files_per_process)
-        .flatten()
-        .map(|max| max.min(hard));
+        .flatten();
     Ok(RawLimit {
         resource,
         soft,
@@ -344,8 +345,38 @@ fn max_open_files_per_process() -> Option<libc::rlim_t> {
 
 /// The descriptors (3 and up) open right now, which the child must not leak
 /// into the command.
+///
+/// On Linux the child marks them all with one `close_range` call, so the list
+/// is only a fallback; it isn't built when `close_range` is known to work
+/// here (the child runs under the same kernel and seccomp filter).
 fn inherited_fds() -> FdSweep {
+    #[cfg(target_os = "linux")]
+    if close_range_works() {
+        return FdSweep::Below(sweep_bound());
+    }
     listed_fds().unwrap_or_else(|| FdSweep::Below(sweep_bound()))
+}
+
+/// Whether `close_range(CLOSE_RANGE_CLOEXEC)` works in this process. Tried
+/// once, on a range no descriptor can be in (above `RawFd::MAX`), so it
+/// changes nothing.
+#[cfg(target_os = "linux")]
+fn close_range_works() -> bool {
+    static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WORKS.get_or_init(|| {
+        let above_any_fd = RawFd::MAX.unsigned_abs().saturating_add(1);
+        // SAFETY: `close_range` only changes descriptor flags, and no
+        // descriptor can be in this range.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                above_any_fd,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        rc == 0
+    })
 }
 
 /// The list from `/dev/fd`, or `None` if any part of it couldn't be read (an
@@ -364,11 +395,13 @@ fn listed_fds() -> Option<FdSweep> {
 
 /// How far a blind sweep goes. The *hard* limit, not the soft one: a
 /// descriptor opened before the soft limit was lowered can sit above it.
-/// Capped, so an unlimited hard limit doesn't mean billions of calls.
+/// Capped, so an unlimited hard limit doesn't mean billions of calls; on
+/// macOS by `kern.maxfilesperproc`, which no descriptor number can reach.
 fn sweep_bound() -> RawFd {
-    const CAP: RawFd = 1 << 20;
-    let hard = getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(_, hard)| hard);
-    RawFd::try_from(hard).map_or(CAP, |hard| hard.clamp(4, CAP))
+    const CAP: libc::rlim_t = 1 << 20;
+    let cap = max_open_files_per_process().map_or(CAP, |max| max.min(CAP));
+    let hard = getrlimit(Resource::RLIMIT_NOFILE).map_or(cap, |(_, hard)| hard.min(cap));
+    RawFd::try_from(hard.max(4)).unwrap_or(RawFd::MAX)
 }
 
 #[cfg(test)]
@@ -461,9 +494,25 @@ mod tests {
 
     #[test]
     fn open_descriptors_are_found() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         match inherited_fds() {
-            FdSweep::Listed(fds) => assert!(fds.iter().all(|fd| *fd >= 3)),
-            FdSweep::Below(bound) => assert!(bound > 3),
+            FdSweep::Listed(fds) => {
+                assert!(fds.iter().all(|fd| *fd >= 3));
+                assert!(fds.contains(&fd), "{fd} missing from {fds:?}");
+            }
+            FdSweep::Below(bound) => assert!(bound > fd),
+        }
+    }
+
+    #[test]
+    fn the_blind_sweep_is_bounded_by_the_hard_limit_and_capped() {
+        let bound = sweep_bound();
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        assert!(bound > 3, "{bound}");
+        assert!(bound <= 1 << 20, "capped: {bound}");
+        if hard < 1 << 20 && max_open_files_per_process().is_none() {
+            assert_eq!(libc::rlim_t::try_from(bound).unwrap(), hard.max(4));
         }
     }
 }

@@ -11,3 +11,4 @@
 
 # Local container state during development
 /.shipyard/
+/docs/book

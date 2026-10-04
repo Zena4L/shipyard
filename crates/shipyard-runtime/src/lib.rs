@@ -11,6 +11,12 @@
 #[cfg(not(unix))]
 compile_error!("shipyard only supports UNIX platforms (Linux, macOS)");
 
+// Resource-limit values are handled as 64-bit numbers, and 32-bit glibc's
+// `rlim_t` is 32 bits. Container hosts are 64-bit; refuse rather than
+// half-support them.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("shipyard only supports 64-bit platforms");
+
 mod error;
 pub mod process;
 

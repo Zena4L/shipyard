@@ -50,7 +50,15 @@ pub(crate) struct Child {
 ///
 /// Everything that can fail happens before `fork`: once the child exists,
 /// this function can't return an error and leave it unsupervised.
-pub(crate) fn spawn(spec: &ProcessSpec, options: &SpawnOptions) -> Result<Child> {
+///
+/// `started` is called with the new PID while every signal is still blocked,
+/// so a signal handler can never see the command running without knowing its
+/// PID.
+pub(crate) fn spawn(
+    spec: &ProcessSpec,
+    options: &SpawnOptions,
+    started: impl FnOnce(Pid),
+) -> Result<Child> {
     let (report_read, report_write) = report_pipe()?;
     let report = ReportReader::new(report_read)?;
     // Last, so its list of open descriptors includes the pipe above.
@@ -68,6 +76,7 @@ pub(crate) fn spawn(spec: &ProcessSpec, options: &SpawnOptions) -> Result<Child>
             unsafe { child_main(&plan, report_write.as_raw_fd()) }
         }
         Ok(ForkResult::Parent { child: pid }) => {
+            started(pid);
             drop(mask);
             drop(report_write);
             let group = options.new_process_group.then(|| {
@@ -138,6 +147,29 @@ impl Child {
         unsafe { libc::kill(self.pid.as_raw(), signal) };
     }
 
+    /// The signal that stopped the command, if it's stopped right now.
+    ///
+    /// Peeks with `waitid(WSTOPPED | WNOWAIT)`: nothing is consumed, and
+    /// without `WEXITED` an exited command is never reaped here. Both Linux
+    /// and macOS report only a *current* stop: once SIGCONT resumed the
+    /// command, this returns `None` again.
+    pub(crate) fn stopped(&self) -> Option<libc::c_int> {
+        if self.reaped {
+            return None;
+        }
+        stop_signal_of(self.pid)
+    }
+
+    /// Continues the command and, if it has its own group, everything in it:
+    /// a stopped process can't act on a stop request.
+    pub(crate) fn continue_all(&self) {
+        self.signal(libc::SIGCONT);
+        if let Some(group) = self.own_group() {
+            // SAFETY: `killpg` has no memory-safety preconditions.
+            unsafe { libc::killpg(group.as_raw(), libc::SIGCONT) };
+        }
+    }
+
     /// Kills the command and, if it has its own group, everything in it.
     pub(crate) fn kill_all(&self) {
         if self.reaped {
@@ -146,14 +178,19 @@ impl Child {
         // The command itself first: right after `fork` its group may not
         // exist yet, and then `killpg` alone would miss it.
         self.signal(libc::SIGKILL);
-        if let Some(group) = self.group
-            // Never our own group: that would kill shipyard itself.
-            && group != getpgrp()
-        {
+        if let Some(group) = self.own_group() {
             // SAFETY: `killpg` has no memory-safety preconditions. ESRCH
             // (an empty group) is harmless.
             unsafe { libc::killpg(group.as_raw(), libc::SIGKILL) };
         }
+    }
+
+    /// The command's own process group, while it's safe to signal: not yet
+    /// reaped (an unreaped command keeps the group ID from being reused),
+    /// and never shipyard's own group.
+    fn own_group(&self) -> Option<Pid> {
+        self.group
+            .filter(|group| !self.reaped && *group != getpgrp())
     }
 
     /// Reaps the command, which must have exited, and returns how it ended.
@@ -165,6 +202,35 @@ impl Child {
         self.reaped = true;
         tracing::debug!(pid = self.pid.as_raw(), %status, "exited");
         Ok(status)
+    }
+}
+
+/// The signal that stopped child `pid`, if it's stopped now. Raw
+/// `libc::waitid`: nix doesn't provide it on macOS.
+fn stop_signal_of(pid: Pid) -> Option<libc::c_int> {
+    let id = libc::id_t::try_from(pid.as_raw()).ok()?;
+    loop {
+        // SAFETY: a zeroed `siginfo_t` is valid; it stays zeroed if no child
+        // matches.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is valid, writable storage for the result.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &raw mut info,
+                libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == -1 {
+            if Errno::last() == Errno::EINTR {
+                continue;
+            }
+            return None;
+        }
+        // SAFETY: `waitid` filled `info` (or left it zeroed: `si_pid` 0).
+        let (reported, code, status) = unsafe { (info.si_pid(), info.si_code, info.si_status()) };
+        return (reported == pid.as_raw() && code == libc::CLD_STOPPED).then_some(status);
     }
 }
 
@@ -262,7 +328,37 @@ impl Drop for BlockAllSignals {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    #[test]
+    fn stop_peeks_see_only_a_current_stop_and_consume_nothing() {
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(libc::pid_t::try_from(sleeper.id()).unwrap());
+        let until = |want: Option<libc::c_int>| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while stop_signal_of(pid) != want {
+                assert!(Instant::now() < deadline, "never became {want:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert_eq!(stop_signal_of(pid), None, "running");
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+        until(Some(libc::SIGSTOP));
+        assert_eq!(
+            stop_signal_of(pid),
+            Some(libc::SIGSTOP),
+            "a peek consumes nothing"
+        );
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT).unwrap();
+        until(None);
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
 
     #[test]
     fn only_terminating_signals_are_re_raised() {

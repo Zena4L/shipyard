@@ -49,8 +49,9 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// signals about shipyard's own faults or limits (SEGV, BUS, FPE, ILL, ABRT,
 /// SYS, TRAP, EMT, XCPU, XFSZ); SIGPIPE (Rust ignores it) and SIGURG (socket
 /// noise); SIGKILL and SIGSTOP (can't be caught); and the job-control signals
-/// TSTP, TTIN, TTOU and CONT, left to the shell, which stops and resumes
-/// shipyard and the command together.
+/// TSTP, TTIN, TTOU and CONT. The shell stops and resumes shipyard and the
+/// command together; CONT is caught only to notice that shipyard was resumed
+/// (see `Signals::install`).
 pub(crate) fn is_forwardable(signal: c_int) -> bool {
     let never = [
         libc::SIGKILL,
@@ -112,6 +113,16 @@ pub(crate) struct Arrival {
     pub(crate) sources: Sources,
 }
 
+/// Signals caught even if they were ignored at startup, because shipyard
+/// needs them itself and never forwards them: SIGCHLD (an inherited "ignore"
+/// would make the kernel throw away the command's exit status), SIGCONT (to
+/// notice being resumed) and SIGTERM (the stop request: ignoring it would
+/// leave SIGKILL as the only way to stop shipyard, which then can't stop the
+/// command).
+fn always_caught(signal: c_int) -> bool {
+    matches!(signal, libc::SIGCHLD | libc::SIGCONT | libc::SIGTERM)
+}
+
 /// The installed handlers. Dropping it puts the previous handlers, and the
 /// previous signal mask, back.
 pub(crate) struct Signals {
@@ -129,12 +140,15 @@ pub(crate) struct Signals {
 )]
 impl Signals {
     /// Installs handlers for SIGCHLD (which only wakes the loop, so it can
-    /// reap) and every forwardable signal, then unblocks them.
+    /// reap), SIGCONT (so the loop learns that shipyard was resumed after a
+    /// stop) and every forwardable signal, then unblocks them.
+    ///
+    /// Catching SIGCONT doesn't change what it does: the kernel resumes a
+    /// stopped process when SIGCONT is *sent*, whatever its handler.
     ///
     /// A forwardable signal that was *ignored* when shipyard started (by
     /// `nohup`, or `&` in a script) stays ignored and is never forwarded.
-    /// SIGCHLD is always caught: an inherited "ignore" would make the kernel
-    /// throw away the command's exit status.
+    /// SIGCHLD, SIGCONT and SIGTERM are always caught (see `always_caught`).
     ///
     /// The signal mask is inherited too, and a parent may have blocked
     /// signals. A blocked SIGCHLD would leave shipyard waiting forever for a
@@ -152,7 +166,7 @@ impl Signals {
         };
         ensure_wake_pipe()?;
         for signal in 1..=MAX_SIGNAL {
-            if signal == libc::SIGCHLD || is_forwardable(signal) {
+            if always_caught(signal) || is_forwardable(signal) {
                 installed.catch(signal)?;
             }
         }
@@ -196,7 +210,7 @@ impl Signals {
             // 32–34) can't be queried or caught; skip them.
             return Ok(());
         }
-        if current.sa_sigaction == libc::SIG_IGN && signal != libc::SIGCHLD {
+        if current.sa_sigaction == libc::SIG_IGN && !always_caught(signal) {
             tracing::trace!(signal, "ignored at startup: left ignored, not forwarded");
             self.ignored_at_startup.push(signal);
             return Ok(());
@@ -234,13 +248,21 @@ impl Signals {
         CHILD_PID.store(pid, Ordering::Release);
     }
 
-    /// The forwardable signals that arrived since the last call.
+    /// The signals that arrived since the last call: forwardable ones, and
+    /// SIGCONT.
     ///
     /// In numeric order, not arrival order: the kernel doesn't keep the order
     /// of pending standard signals either. Like standard signals, repeated
     /// deliveries of one signal (even a real-time one) count once.
     pub(crate) fn drain(&self) -> Vec<Arrival> {
         drain_flags(WAKE_READ.load(Ordering::Acquire))
+    }
+
+    /// Forgets that `signal` arrived, if it's pending.
+    pub(crate) fn forget(&self, signal: c_int) {
+        if let Some(flag) = usize::try_from(signal).ok().and_then(|n| PENDING.get(n)) {
+            flag.store(0, Ordering::Release);
+        }
     }
 
     /// Forgets the command: pending signals were meant for it, and its PID
@@ -303,6 +325,9 @@ fn drain_flags(wake_read: RawFd) -> Vec<Arrival> {
 }
 
 /// Creates the non-blocking, close-on-exec wake pipe, once per process.
+///
+/// `pipe` then `fcntl` isn't atomic: a `fork` in another thread in between
+/// could inherit the pipe. Shipyard is single-threaded, so that can't happen.
 fn ensure_wake_pipe() -> Result<()> {
     if WAKE_READ.load(Ordering::Acquire) >= 0 {
         return Ok(());

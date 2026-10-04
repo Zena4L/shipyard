@@ -138,8 +138,9 @@ Linux-only because macOS treats it as another name for `as`.
 
 `nofile=unlimited` on macOS: recent versions accept it as is. Older ones refuse
 an unlimited soft limit, and the command then gets the most the system allows
-per process (`sysctl kern.maxfilesperproc`). On Linux, `unlimited` is always refused,
-because the kernel caps `nofile` at `fs.nr_open`; use a number instead.
+per process (`sysctl kern.maxfilesperproc`). On Linux, `unlimited` is refused before
+anything starts (exit 125), because the kernel caps `nofile` at `fs.nr_open`;
+use a number instead.
 
 ## Inherited state
 
@@ -169,6 +170,24 @@ them on a second time. If Ctrl-C ends the command, Shipyard also stops as if
 interrupted, so a shell loop around `shipyard run` stops too (unless Shipyard
 itself was started ignoring Ctrl-C).
 
+**Stopped jobs.** If the command stops itself (for example with
+`kill -STOP $$`, or under a debugger) rather than through Ctrl-Z, Shipyard stops
+too, so your shell shows the job as stopped instead of the terminal seeming to
+hang. Some shells then say "stopped (signal)" rather than "suspended". `fg`
+resumes both. If only Shipyard is resumed (`kill -CONT <shipyard>`), it resumes
+the command as well.
+
+Shipyard doesn't stop itself when nothing could resume it:
+
+- **while it's stopping the command** (after `SIGTERM`): it has to stay awake
+  to kill the command when `--stop-timeout` runs out;
+- **when no job-control shell is above it** (the shell that started it has
+  exited, or under `ssh -t host cmd`, `script`, or an IDE's run pane).
+
+A job stopped with Ctrl-Z ignores `kill <shipyard>` until it's resumed, like
+any stopped program. The `--stop-timeout` clock keeps running while it's
+stopped.
+
 **Sent to Shipyard.** A signal sent to Shipyard's process ID (`kill`, `timeout`,
 a CI runner, a service manager) is passed on to the command, with these
 exceptions:
@@ -193,7 +212,8 @@ exceptions:
   `SIGTERM`. Linux tells the two apart, so this doesn't apply there.
 
 Shipyard catches signals even if the program that started it had blocked
-them, so it can always be stopped and always notices when the command exits.
+them, and catches `SIGTERM` even if it was started ignoring it. So `SIGTERM`
+always stops it, and it always notices when the command exits.
 
 A signal sent to Shipyard's whole *process group* (as `timeout` does, and
 `kill -SIG -<pgid>`) reaches the command twice when Shipyard runs in a terminal:
@@ -225,7 +245,9 @@ When the command exits, Shipyard cleans up what it left behind:
   process group, and anything still running in that group is killed.
 - **On Linux:** every leftover process is killed, even ones that left the
   command's group (for example with `setsid`). Shipyard registers as their parent
-  (a "child subreaper") to find them.
+  (a "child subreaper") to find them. Processes that were already Shipyard's
+  children when it started (as in `helper & exec shipyard run app`) aren't the
+  command's, and are left running.
 - **On macOS, from a terminal:** background processes the command started can be
   left running. Full isolation (a later version) removes this gap.
 - **Laptop sleep:** if the computer sleeps during `--stop-timeout`, the sleep
