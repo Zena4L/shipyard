@@ -3,9 +3,10 @@
 A lightweight container engine written in Rust — a minimal-overhead alternative to
 Docker / Podman / OrbStack with a small, clean interface.
 
-> **Status:** early development. `shipyard run` already starts and supervises a
-> command (clean environment, user, limits, signals, cleanup), but without any
-> isolation yet: see [Running commands](docs/user/run.md). The project is being
+> **Status:** early development. `shipyard run` starts and supervises a command
+> (clean environment, user, limits, signals, cleanup) and, on Linux, isolates it
+> in its own namespaces (process IDs under a small init, mounts, hostname, IPC);
+> there's no separate filesystem or network yet. See [Running commands](docs/user/run.md). The project is being
 > built step by step, from first principles, using
 > [*The Linux Programming Interface*](https://man7.org/tlpi/) as the primary
 > reference. See the [roadmap](docs/ROADMAP.md).

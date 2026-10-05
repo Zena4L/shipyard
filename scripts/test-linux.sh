@@ -7,6 +7,12 @@
 #   scripts/test-linux.sh            # run everything
 #   scripts/test-linux.sh --shell    # a shell in the same container, to debug
 #
+# The container is privileged: creating namespaces and mounting need
+# CAP_SYS_ADMIN, and Docker's default seccomp profile blocks `clone3` and
+# namespace flags. The root pass uses that; the normal-user pass still has no
+# capabilities, so it sees what an unprivileged user would. For development
+# only: never run untrusted code this way.
+#
 # The repository is mounted read-only: nothing in it changes. Build output,
 # the cargo registry and the pinned toolchain live in named Docker volumes
 # (shipyard-linux-*), so later runs are fast. Remove them with
@@ -61,6 +67,10 @@ echo "== clippy"
 as_tester cargo clippy --locked --workspace --all-targets -- -D warnings
 echo "== tests, as a normal user"
 as_tester cargo test --locked --workspace
+# Like a systemd host, where `/` is a shared mount: then a mount namespace
+# that isn't made private would leak mounts out. (Docker's own `/` is
+# private, which would hide that bug.) Only this container is affected.
+mount --make-rshared /
 echo "== tests, including the root-only ones, run as root"
 as_tester env "$runner=sudo -E" cargo test --locked --workspace -- --include-ignored
 echo "== all Linux checks passed"
@@ -71,7 +81,7 @@ if [ "$mode" = shell ]; then
     tty_flags=(--interactive --tty)
 fi
 
-exec docker run --rm "${tty_flags[@]}" \
+exec docker run --rm --privileged "${tty_flags[@]}" \
     --volume "$repo:/src:ro" \
     --volume shipyard-linux-target:/target \
     --volume shipyard-linux-cargo:/usr/local/cargo \

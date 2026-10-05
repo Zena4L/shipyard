@@ -6,20 +6,24 @@
 //! forked exits, and on macOS a fork in another thread could inherit the
 //! report pipe.
 
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use nix::errno::Errno;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, sigprocmask};
 use nix::sys::signal::{Signal as NixSignal, sigaction};
 use nix::unistd::{ForkResult, Pid, fork, getpgrp, setpgid};
 
-use super::channel::{Report, ReportReader, report_pipe};
+use super::channel::{
+    InitReport, Report, ReportReader, StartMark, go_pipe, read_init_report, report_pipe, send_go,
+    status_pipe,
+};
 use super::child::child_main;
 use super::failure::{FailureContext, describe};
-use super::plan::ChildPlan;
+use super::plan::{ChildPlan, Handshake, InitFds};
 use super::signal::Signal;
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
+use crate::isolation::{Isolation, Join, Namespace};
 use crate::{Error, Result};
 
 /// How to start the process.
@@ -32,6 +36,37 @@ pub(crate) struct SpawnOptions {
     /// Signals the command keeps ignoring instead of having reset to their
     /// defaults: the ones `nohup` or a script's `&` asked shipyard to ignore.
     pub(crate) keep_ignored: Vec<libc::c_int>,
+    /// Which namespaces the command starts in.
+    pub(crate) placement: Placement,
+}
+
+/// Which namespaces the command starts in.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum Placement {
+    /// Shipyard's own.
+    #[default]
+    Host,
+    /// New ones (Linux).
+    New(Isolation),
+    /// A running process's (Linux; see `join.rs`).
+    Join(Join),
+}
+
+impl Placement {
+    /// The new namespaces, if that's where the command starts.
+    pub(crate) fn isolation(&self) -> Option<&Isolation> {
+        match self {
+            Self::New(isolation) => Some(isolation),
+            Self::Host | Self::Join(_) => None,
+        }
+    }
+
+    /// Whether the command starts a session of its own (isolated or joined).
+    /// It then has its own process group too, so `new_process_group`
+    /// doesn't apply, and it never shares the terminal's group.
+    pub(crate) fn has_own_session(&self) -> bool {
+        !matches!(self, Self::Host)
+    }
 }
 
 /// A started process.
@@ -42,6 +77,12 @@ pub(crate) struct Child {
     group: Option<Pid>,
     /// Until `exec` succeeds or fails.
     report: Option<ReportReader>,
+    /// The parent's end of the go pipe, held open until `exec` resolves: the
+    /// child checks it to know the parent is alive (see `channel.rs`).
+    go: Option<OwnedFd>,
+    /// With a container init: where it sends the command's exit status (the
+    /// init itself is the process we reap).
+    status: Option<OwnedFd>,
     context: FailureContext,
     reaped: bool,
 }
@@ -61,49 +102,232 @@ pub(crate) fn spawn(
 ) -> Result<Child> {
     let (report_read, report_write) = report_pipe()?;
     let report = ReportReader::new(report_read)?;
-    // Last, so its list of open descriptors includes the pipe above.
-    let (plan, context) = ChildPlan::new(spec, options)?;
+    let (go_read, go_write) = go_pipe()?;
+    let handshake = Handshake {
+        read: go_read.as_raw_fd(),
+        parent_end: go_write.as_raw_fd(),
+    };
+    // For the container's init, which only a new PID namespace needs (see
+    // `init.rs`): the status pipe, and the binary it re-execs itself as.
+    let needs_init = options
+        .placement
+        .isolation()
+        .is_some_and(|isolation| isolation.has(Namespace::Pid));
+    let status = needs_init.then(status_pipe).transpose()?;
+    let init_exe = needs_init.then(open_own_binary).transpose()?;
+    let init_fds = status
+        .as_ref()
+        .zip(init_exe.as_ref())
+        .map(|((_, status_write), exe)| InitFds {
+            status_write: status_write.as_raw_fd(),
+            exe: exe.as_raw_fd(),
+        });
+    #[cfg(target_os = "linux")]
+    let joining = match &options.placement {
+        Placement::Join(join) => Some(super::join::Joining::open(join)?),
+        Placement::Host | Placement::New(_) => None,
+    };
+    // Last, so its list of open descriptors includes the pipes above.
+    let (plan, context) = ChildPlan::new(
+        spec,
+        options,
+        handshake,
+        init_fds,
+        #[cfg(target_os = "linux")]
+        joining.as_ref().map(super::join::Joining::setup),
+    )?;
 
     // Block every signal across `fork`: the supervisor's handler must never
     // run in the child before the child resets it.
     let mask = BlockAllSignals::new()?;
     // SAFETY: the child branch only runs `child_main`, which is written to be
     // safe after `fork` (no allocation, locks or panics; see child.rs).
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            // SAFETY: this is the child, right after `fork`, with all signals
-            // blocked; `plan` and the pipe were prepared above.
+    let pid = match unsafe {
+        launch(
+            options,
+            #[cfg(target_os = "linux")]
+            joining.as_ref(),
+        )
+    }? {
+        Launched::Child => {
+            // SAFETY: this is the child, right after `fork`/`clone`, with all
+            // signals blocked; `plan` and the pipes were prepared above.
             unsafe { child_main(&plan, report_write.as_raw_fd()) }
         }
-        Ok(ForkResult::Parent { child: pid }) => {
-            started(pid);
-            drop(mask);
-            drop(report_write);
-            let group = options.new_process_group.then(|| {
-                // The child does this too; doing it here as well closes the
-                // window before the child gets to it. Errors mean the child
-                // already did it, or already exec'd or exited: all fine.
-                let _ = setpgid(pid, pid);
-                pid
-            });
-            tracing::debug!(pid = pid.as_raw(), program = %context.program.display(), "started");
-            Ok(Child {
-                pid,
-                group,
-                report: Some(report),
-                context,
-                reaped: false,
-            })
+        Launched::Parent(pid) => pid,
+    };
+    started(pid);
+    drop(mask);
+    drop(report_write);
+    drop(go_read);
+    // Only the init writes to it; with our copy closed, it reads as empty
+    // once the init is gone.
+    let status = status.map(|(read, _write)| read);
+    let group = if options.placement.has_own_session() {
+        // The child starts its own session: it leads the new group.
+        Some(pid)
+    } else {
+        options.new_process_group.then(|| {
+            // The child does this too; doing it here as well closes the
+            // window before the child gets to it. Errors mean the child
+            // already did it, or already exec'd or exited: all fine.
+            let _ = setpgid(pid, pid);
+            pid
+        })
+    };
+    // Everything the child waits for is done.
+    send_go(&go_write);
+    tracing::debug!(pid = pid.as_raw(), program = %context.program.display(), "started");
+    Ok(Child {
+        pid,
+        group,
+        report: Some(report),
+        go: Some(go_write),
+        status,
+        context,
+        reaped: false,
+    })
+}
+
+/// The command's result, from what the container's init sent (`report`)
+/// and how the init itself ended (`init`).
+///
+/// The init's own exit code always mirrors the command's (128 + N for a
+/// signal), so a status record is only believed when it agrees with it:
+/// anything in the container that can reach the pipe could forge one. The
+/// record adds what the exit code can't say, whether the command died by a
+/// signal.
+fn init_outcome(report: InitReport, init: ExitStatus) -> Result<ExitStatus> {
+    match report {
+        InitReport::Finished(mark, raw) => {
+            warn_if_copy(mark);
+            let command =
+                ExitStatus::from_wait_status(raw).filter(|command| command.code() == init.code());
+            if command.is_none() {
+                tracing::warn!(
+                    %init,
+                    "the container's init reported a status that doesn't match how it \
+                     exited; using its own exit status"
+                );
+            }
+            Ok(command.unwrap_or(init))
         }
-        Err(errno) => Err(Error::sys(
-            if errno == Errno::EAGAIN {
-                "starting the command: too many processes"
-            } else {
-                "starting the command (fork)"
-            },
-            errno,
-        )),
+        // Killed before the command ended (the stop timeout's SIGKILL).
+        InitReport::Started(mark) => {
+            warn_if_copy(mark);
+            Ok(init)
+        }
+        InitReport::Unexpected => {
+            tracing::warn!(
+                "unexpected data on the container's status pipe (written from inside the \
+                 container?); using the init's own exit status"
+            );
+            Ok(init)
+        }
+        // Exited, never having run its loop: the re-exec'd image failed to
+        // start. (Killed before it could say so is an ordinary end, say by
+        // the stop timeout.)
+        InitReport::Nothing => match init {
+            ExitStatus::Exited(code) => Err(Error::InitDidNotStart { code }),
+            _ => Ok(init),
+        },
     }
+}
+
+fn warn_if_copy(mark: StartMark) {
+    if mark == StartMark::Copy {
+        tracing::warn!(
+            "the container's init couldn't re-exec itself, so it ran as a copy of shipyard \
+             and held its command line and environment"
+        );
+    }
+}
+
+/// The running shipyard binary, for the container's init to re-exec (see
+/// `init.rs`). Opened by descriptor, before the clone: inside the container
+/// `/proc` is remounted, and the file on disk may be replaced by an upgrade.
+fn open_own_binary() -> Result<OwnedFd> {
+    nix::fcntl::open(
+        "/proc/self/exe",
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|e| Error::sys("opening shipyard's own binary for the container init", e))
+}
+
+/// Which side of the `fork` or `clone` this is.
+enum Launched {
+    Child,
+    Parent(Pid),
+}
+
+/// Starts the child: with `clone` into new namespaces if isolated, with
+/// `fork` otherwise.
+///
+/// # Safety
+///
+/// As for `fork`: the child may only run async-signal-safe code.
+unsafe fn launch(
+    options: &SpawnOptions,
+    #[cfg(target_os = "linux")] joining: Option<&super::join::Joining>,
+) -> Result<Launched> {
+    #[cfg(target_os = "linux")]
+    if let Some(joining) = joining {
+        // SAFETY: the caller's contract.
+        return match unsafe { joining.fork() }? {
+            ForkResult::Child => Ok(Launched::Child),
+            ForkResult::Parent { child } => Ok(Launched::Parent(child)),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(isolation) = options.placement.isolation() {
+        use super::clone::{Cloned, clone_process};
+        // SAFETY: the caller's contract; the flags are namespace flags only
+        // (`Isolation::validate` refuses CLONE_NEWTIME).
+        return match unsafe { clone_process(isolation.clone_flags()) } {
+            Ok(Cloned::Child) => Ok(Launched::Child),
+            Ok(Cloned::Parent(pid)) => Ok(Launched::Parent(pid)),
+            // Root and still refused: a container without privileges, or a
+            // security policy.
+            Err(Errno::EPERM) if nix::unistd::geteuid().is_root() => Err(Error::IsolationRefused),
+            Err(Errno::EPERM) => Err(Error::IsolationNeedsRoot),
+            // The kernel's limit on namespaces is reached (or set to 0).
+            Err(Errno::ENOSPC) => Err(Error::sys(
+                "starting the command in new namespaces (clone): the system's limit on \
+                 namespaces is reached (see /proc/sys/user/max_*_namespaces)",
+                Errno::ENOSPC,
+            )),
+            Err(errno) => Err(Error::sys(
+                "starting the command in new namespaces (clone)",
+                errno,
+            )),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    if options.placement.has_own_session() {
+        return Err(Error::LinuxOnly {
+            feature: "namespace isolation",
+            os: std::env::consts::OS,
+        });
+    }
+    // SAFETY: the caller's contract.
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => Ok(Launched::Child),
+        Ok(ForkResult::Parent { child }) => Ok(Launched::Parent(child)),
+        Err(errno) => Err(fork_error(errno)),
+    }
+}
+
+/// A failed `fork`, explained.
+pub(super) fn fork_error(errno: Errno) -> Error {
+    Error::sys(
+        if errno == Errno::EAGAIN {
+            "starting the command: too many processes"
+        } else {
+            "starting the command (fork)"
+        },
+        errno,
+    )
 }
 
 impl Child {
@@ -127,10 +351,12 @@ impl Child {
             Report::Pending => Ok(()),
             Report::Running => {
                 self.report = None;
+                self.go = None;
                 Ok(())
             }
             Report::Failed(failure) => {
                 self.report = None;
+                self.go = None;
                 Err(describe(failure, &self.context).into())
             }
         }
@@ -194,12 +420,21 @@ impl Child {
     }
 
     /// Reaps the command, which must have exited, and returns how it ended.
+    ///
+    /// Isolated, the process reaped is the container's init, and the
+    /// command's own status comes over the status pipe. If the init sent
+    /// none (it was killed, by the stop timeout's SIGKILL, or failed before
+    /// starting the command), its own status is the answer.
     pub(crate) fn reap(&mut self) -> Result<ExitStatus> {
-        let status = wait_pid(self.pid).inspect_err(|_| {
+        let reaped = wait_pid(self.pid).inspect_err(|_| {
             // ECHILD and the like: the PID is no longer ours to signal.
             self.reaped = true;
         })?;
         self.reaped = true;
+        let status = match self.status.take() {
+            Some(pipe) => init_outcome(read_init_report(&pipe), reaped)?,
+            None => reaped,
+        };
         tracing::debug!(pid = self.pid.as_raw(), %status, "exited");
         Ok(status)
     }
@@ -358,6 +593,82 @@ mod tests {
         until(None);
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
+    }
+
+    /// Without a new PID namespace there's no init: the command is the
+    /// process we started, a child of this one, and its status comes
+    /// straight from it.
+    ///
+    /// While another thread keeps starting and ending threads, as busy
+    /// programs do: a clone taken while it holds the C library's thread-list
+    /// lock gives the child that lock, held forever, and glibc's credential
+    /// wrappers take it (see `child.rs`'s `switch_credentials`). Many spawns,
+    /// to hit that moment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root"]
+    fn isolation_without_a_pid_namespace_starts_no_init() {
+        // Rosetta (x86-64 emulation on Apple silicon) deadlocks inside its own
+        // handling of `clone` while another thread creates threads: the
+        // process wedges on an emulator lock, beyond even SIGTERM. That's
+        // the emulator, not shipyard (native runs never hang), and real
+        // x86-64 kernels have no such lock. Skip there.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        if maps.contains("/mnt/rv/[rosetta]") {
+            eprintln!("under Rosetta emulation, which deadlocks on this stress; skipping");
+            return;
+        }
+        let isolation = Isolation {
+            namespaces: vec![Namespace::Uts],
+            hostname: Some("box".to_owned()),
+        };
+        let script = format!(
+            "test \"$(hostname)\" = box && test $PPID = {} && exit 7",
+            std::process::id()
+        );
+        let spec = ProcessSpec {
+            args: ["sh", "-c", &script].map(Into::into).to_vec(),
+            env: crate::process::Env::new(),
+            cwd: "/".into(),
+            user: crate::process::User::current(),
+            rlimits: Vec::new(),
+        };
+        let options = SpawnOptions {
+            placement: Placement::New(isolation),
+            ..SpawnOptions::default()
+        };
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = std::thread::spawn({
+            let done = std::sync::Arc::clone(&done);
+            move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::spawn(|| {}).join().unwrap();
+                }
+            }
+        });
+        for _ in 0..50 {
+            let mut child = spawn(&spec, &options, |_| {}).unwrap();
+            assert!(child.status.is_none(), "no status pipe without an init");
+            // A hang would be the bug: fail instead of waiting forever.
+            let (reaped, watch) = std::sync::mpsc::channel::<()>();
+            let pid = child.pid();
+            let watchdog = std::thread::spawn(move || {
+                let hung = matches!(
+                    watch.recv_timeout(Duration::from_secs(20)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
+                if hung {
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                }
+                hung
+            });
+            let status = child.reap().unwrap();
+            drop(reaped);
+            assert!(!watchdog.join().unwrap(), "the child hung before exec");
+            assert_eq!(status, ExitStatus::Exited(7));
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
     }
 
     #[test]

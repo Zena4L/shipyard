@@ -130,7 +130,8 @@ prepared in `plan.rs`. `CLAUDE.md` states the rule for contributors.
 ## Known limitations (by design, for stage 1)
 
 - **macOS, with a terminal:** leftovers the command starts in the background can outlive
-  it. PID namespaces (stage 2) remove this.
+  it. (Linux never had this gap: the subreaper finds them.) Isolation removes it, which
+  macOS gets with the VM (stage 12).
 - **macOS, foreground:** `kill -INT <shipyard>` isn't passed on (it looks exactly like the
   terminal's Ctrl-C). `SIGTERM` and other signals are.
 - **A signal sent to shipyard's whole group in terminal mode** reaches the command twice
@@ -156,7 +157,7 @@ prepared in `plan.rs`. `CLAUDE.md` states the rule for contributors.
 | Unit | `crates/shipyard-runtime/src/process/*.rs` | parsing and validation (including property tests), failure messages, the report record, `waitid` peeks, signal-source policy |
 | End to end | `crates/shipyard-cli/tests/run.rs` | exit codes, environment, limits, credentials, hostile parents |
 | Signals | `crates/shipyard-cli/tests/signals.rs` | forwarding, stop requests, cleanup, without a terminal |
-| Terminal | `crates/shipyard-cli/tests/terminal.rs` + `tests/pty/` | a fake job-control shell on a pseudo-terminal; single-threaded, `harness = false` |
+| Terminal | `crates/shipyard-cli/tests/terminal.rs` + `crates/shipyard-test-support/src/pty.rs` | a fake job-control shell on a pseudo-terminal; single-threaded, `harness = false` |
 | Root only | `#[ignore]`d tests | run by CI's `root` job on Linux and macOS through `sudo -E` |
 
 Every fix from the reviews has a regression test, and the important ones were checked by

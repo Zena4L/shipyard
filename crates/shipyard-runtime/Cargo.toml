@@ -17,6 +17,15 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+shipyard-test-support.workspace = true
+
+# Joining running containers, end to end (Linux; root). Not on libtest: the
+# binary is also the container runtime its tests drive, and its `main` must
+# call `init_entry_point` first. See tests/join.rs.
+[[test]]
+name = "join"
+path = "tests/join.rs"
+harness = false
 
 [lints]
 workspace = true

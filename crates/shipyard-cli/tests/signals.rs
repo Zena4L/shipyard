@@ -8,6 +8,10 @@
 //! that line. (Sleeps appear only as generous upper bounds.)
 //! Scripts wait with `sleep 100 & wait`, because a shell runs traps between
 //! commands, so a foreground `sleep` would delay them.
+//!
+//! Runs use `--no-isolation`: these test process behaviour that's the same
+//! with or without namespaces, without needing root. `isolation.rs` tests
+//! the namespaces.
 
 #![allow(
     clippy::expect_used,
@@ -15,27 +19,11 @@
     reason = "in a test crate, a panic is a test failure with a clear message"
 )]
 
-mod common;
-
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Stdio};
-
-use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use common::{TIMEOUT, block, ignore, killed_by, shipyard_run_with};
+use shipyard_test_support::{Running, Shipyard, block, gone, ignore, killed_by, start_command};
 
-/// How long a leftover shipyard gets to stop after SIGTERM before it's
-/// killed: longer than the default `--stop-timeout` (10 s).
-const STOP_GRACE: Duration = Duration::from_secs(15);
-/// How long a process gets to disappear once it should be gone.
-const GONE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A running shipyard whose stdout is read line by line.
-struct Running {
-    shipyard: Child,
-    lines: Receiver<String>,
-}
+const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
 fn start(args: &[&str]) -> Running {
     start_with(args, || Ok(()))
@@ -43,84 +31,7 @@ fn start(args: &[&str]) -> Running {
 
 /// Starts shipyard, with `setup` applied to its process just before it runs.
 fn start_with(args: &[&str], setup: fn() -> std::io::Result<()>) -> Running {
-    let mut command = shipyard_run_with(args, setup);
-    command.stdin(Stdio::null()).stdout(Stdio::piped());
-    let mut shipyard = command.spawn().expect("starting shipyard");
-    let stdout = shipyard.stdout.take().unwrap();
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if send.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    Running { shipyard, lines }
-}
-
-impl Running {
-    fn pid(&self) -> libc::pid_t {
-        libc::pid_t::try_from(self.shipyard.id()).unwrap()
-    }
-
-    /// The next line the command prints.
-    fn next_line(&self) -> String {
-        self.lines
-            .recv_timeout(TIMEOUT)
-            .expect("the command printed nothing")
-    }
-
-    fn signal(&self, signal: libc::c_int) {
-        // SAFETY: `pid` is the shipyard process this test started.
-        assert_eq!(unsafe { libc::kill(self.pid(), signal) }, 0);
-    }
-
-    /// Waits for shipyard to exit; returns its exit code and the rest of the
-    /// command's output.
-    fn finish(mut self) -> (i32, Vec<String>) {
-        let deadline = Instant::now() + TIMEOUT;
-        let status = loop {
-            if let Some(status) = self.shipyard.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() > deadline {
-                let _ = self.shipyard.kill();
-                panic!("shipyard did not finish within {TIMEOUT:?}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut rest = Vec::new();
-        // Lines still in flight; leftover background processes may keep the
-        // pipe open, so stop after a quiet second rather than at end-of-file.
-        while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(1)) {
-            rest.push(line);
-        }
-        let code = status.code().expect("shipyard exited normally");
-        (code, rest)
-    }
-}
-
-/// If a test fails half-way, its shipyard must not outlive it: a leftover
-/// shipyard keeps the test's output pipes open and the test run never ends.
-impl Drop for Running {
-    fn drop(&mut self) {
-        if matches!(self.shipyard.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        // SIGTERM first, so shipyard stops and cleans up the command too.
-        // SAFETY: `kill` only sends a signal to the process this test started.
-        unsafe { libc::kill(self.pid(), libc::SIGTERM) };
-        let deadline = Instant::now() + STOP_GRACE;
-        while Instant::now() < deadline {
-            if matches!(self.shipyard.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let _ = self.shipyard.kill();
-        let _ = self.shipyard.wait();
-    }
+    start_command(SHIPYARD.run_unisolated_with(args, setup))
 }
 
 #[test]
@@ -210,6 +121,13 @@ fn signals_from_the_command_are_not_bounced_back() {
          kill -USR1 $PPID; echo sent; while :; do sleep 100 & wait; done",
     ]);
     assert_eq!(run.next_line(), "sent");
+    // macOS keeps one sender slot per process: with USR1 and USR2 pending in
+    // shipyard at the same time, the test's PID can overwrite the command's,
+    // and shipyard would bounce the USR1 (a documented macOS limitation, not
+    // what this tests). Give it time to take USR1 first. Linux needs no pause.
+    if cfg!(target_os = "macos") {
+        std::thread::sleep(Duration::from_millis(300));
+    }
     run.signal(libc::SIGUSR2);
     assert_eq!(
         run.next_line(),
@@ -219,19 +137,6 @@ fn signals_from_the_command_are_not_bounced_back() {
     let (code, rest) = run.finish();
     assert_eq!(code, 0);
     assert!(rest.is_empty(), "{rest:?}");
-}
-
-/// Waits up to `GONE_TIMEOUT` for `pid` to be gone (not running, not a zombie).
-fn gone(pid: libc::pid_t) -> bool {
-    let deadline = Instant::now() + GONE_TIMEOUT;
-    while Instant::now() < deadline {
-        // SAFETY: `kill` with signal 0 only checks whether the process exists.
-        if unsafe { libc::kill(pid, 0) } == -1 {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    false
 }
 
 #[test]

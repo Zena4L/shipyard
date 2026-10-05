@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use nix::errno::Errno;
 
+use crate::isolation::IsolationError;
 use crate::process::{EXIT_ENGINE_ERROR, SpawnError, SpecError, StopSignalError};
 
 /// Errors produced by the runtime.
@@ -33,9 +34,90 @@ pub enum Error {
     #[error(transparent)]
     InvalidSpec(#[from] SpecError),
 
+    /// The isolation (namespaces, hostname) is invalid; nothing was started.
+    #[error(transparent)]
+    InvalidIsolation(#[from] IsolationError),
+
     /// The stop signal can't end a process (it stops or continues it).
     #[error(transparent)]
     StopSignal(#[from] StopSignalError),
+
+    /// Isolating the command in new namespaces needs privileges (root, until
+    /// rootless support with user namespaces arrives).
+    #[error(
+        "isolating the command in namespaces needs root (rootless support comes later); \
+         run as root, or without isolation"
+    )]
+    IsolationNeedsRoot,
+
+    /// Running as root, the system still refused to create namespaces.
+    #[error(
+        "the system refused to create namespaces: shipyard may be running inside a \
+         container without privileges, or under a security policy (seccomp, AppArmor, \
+         SELinux); run it with privileges, or without isolation"
+    )]
+    IsolationRefused,
+
+    /// Isolation was asked for, but this program never called
+    /// [`init_entry_point`](crate::process::init_entry_point), so its binary
+    /// can't serve as the container's init. A bug in the program, not in
+    /// the request.
+    #[error(
+        "this program can't run isolated commands: it doesn't call \
+         shipyard_runtime::process::init_entry_point() at startup"
+    )]
+    NoInitEntryPoint,
+
+    /// The container's init exited without ever running: the shipyard
+    /// binary, re-executed as the init, failed to start.
+    #[error(
+        "the container's init failed to start (exit code {code}): re-executing shipyard's own \
+         binary didn't work; is shipyard started through the dynamic loader (ld.so), or does it \
+         need environment variables (like LD_LIBRARY_PATH) to start?"
+    )]
+    InitDidNotStart {
+        /// What the init exited with.
+        code: u8,
+    },
+
+    /// Joining a running process's namespaces needs privileges (root, until
+    /// rootless support with user namespaces arrives).
+    #[error("joining a container's namespaces needs root")]
+    JoinNeedsRoot,
+
+    /// Running as root, the system still refused to let us join the
+    /// namespaces.
+    #[error(
+        "the system refused to join the container's namespaces: shipyard may be running \
+         inside a container without privileges, or under a security policy (seccomp, \
+         AppArmor, SELinux)"
+    )]
+    JoinRefused,
+
+    /// `/proc` belongs to another PID namespace than shipyard's, so a PID
+    /// can't be looked up in it safely.
+    #[error(
+        "/proc shows another PID namespace's processes than shipyard's own, so the \
+         container's process can't be found by its PID; mount a /proc for shipyard's \
+         PID namespace"
+    )]
+    ForeignProc,
+
+    /// The process whose namespaces were to be joined doesn't exist (any
+    /// more).
+    #[error("no process {pid} to join (has the container exited?)")]
+    NoSuchProcess {
+        /// The PID asked for, on the host.
+        pid: u32,
+    },
+
+    /// The container is exiting: its init has ended, so no new process can
+    /// start in its PID namespace.
+    #[error("can't join process {pid}'s container: it is exiting")]
+    ContainerExiting {
+        /// The PID asked for, on the host.
+        pid: u32,
+    },
 
     /// Running as another user or group, or adding groups, needs root.
     #[error("running as a different user or group needs root: {0}")]

@@ -7,10 +7,10 @@ shipyard run [OPTIONS] COMMAND [ARGS...]
 `shipyard run` starts a command the way a container runtime does: with a clean
 environment and exactly the user, working directory and limits you ask for.
 
-> **Status:** `run` starts the command with exactly the settings below and
-> reports how it ended. It doesn't isolate it yet: the command sees the host's
-> filesystem, processes and network. Isolation (namespaces, a separate
-> filesystem) comes in a later version.
+> **Status:** on Linux, `run` isolates the command in its own process IDs, mounts,
+> hostname and IPC (see [Isolation](#isolation)), but it still sees the host's
+> filesystem and network: a separate root filesystem and networking come in later
+> versions. On macOS the command isn't isolated yet.
 
 ## Arguments
 
@@ -29,6 +29,85 @@ shipyard run -- --program-starting-with-dash
 ```
 
 Arguments are passed through byte for byte, including ones that aren't valid UTF-8.
+
+## Isolation
+
+On Linux, `shipyard run` starts the command in new **namespaces**, so it gets
+its own view of:
+
+| What | Inside the container |
+|---|---|
+| Process IDs | The command sees only its own processes (`ps`, `/proc`). It's PID 2: PID 1 is a small init (see below). |
+| Mounts | Mounts made inside stay inside; the host never sees them. Mounts the host makes or removes later do reach the container, so a disk unmounted on the host isn't kept busy by it. |
+| Hostname | Its own copy; set it with `--hostname`. |
+| IPC | Its own System V IPC objects and POSIX message queues. |
+
+The command still sees the host's files and network for now; a separate root
+filesystem and networking come in later versions.
+
+- **Needs root.** Creating namespaces needs root privileges (support for running
+  without root comes later). Otherwise `run` stops before starting anything, with
+  exit code 125 and a message saying so.
+- **Refused by the system.** Even as root, namespaces can be refused, for example
+  inside a container started without privileges, or by a security policy
+  (seccomp, AppArmor, SELinux). `run` then exits with 125 and says the system
+  refused; use `--no-isolation` there.
+- **`--no-isolation`** runs the command without namespaces: it shares the host's
+  processes, mounts, hostname and IPC, and doesn't need root.
+- **`--hostname NAME`** sets the hostname inside: letters, digits and hyphens in
+  dot-separated parts (like `web-1` or `db.internal`), at most 64 characters, no
+  part starting or ending with a hyphen. Not with `--no-isolation`.
+- **A small init is PID 1.** The process with PID 1 in a container is special:
+  the system ignores any signal it has no handler for. So Shipyard runs its own
+  small init as PID 1, and the command as PID 2, where signals work normally.
+  The init passes every signal on to the command, cleans up exited processes
+  ("zombies") in the container, and when the command exits, stops everything
+  else left in the container and reports the command's exit status exactly.
+  It shows up as `shipyard-init` in `ps`. It holds none of Shipyard's command
+  line or environment, so `-e` values passed to Shipyard can't be read from it
+  inside the container.
+- **Terminal:** see [On a terminal, isolated](#on-a-terminal-isolated) below.
+- **If Shipyard is killed**, the whole container goes with it.
+- **Not a security boundary yet.** The command runs as root on the host's own
+  files; isolation keeps it from *seeing* and *disturbing* the rest of the
+  system by accident, not from breaking out on purpose. Running untrusted code
+  safely needs a separate root filesystem, dropped capabilities and seccomp,
+  which come in later versions.
+- If `/` isn't a mount point (for example inside a plain `chroot`), isolation
+  fails with "making the container's mounts private: Invalid argument"; use
+  `--no-isolation` there.
+- **macOS:** commands aren't isolated yet (as with `--no-isolation`); `--hostname`
+  is an error there.
+
+### On a terminal, isolated
+
+An isolated command runs in a session of its own. It's never in the terminal's
+foreground group and has no *controlling terminal*, though its input and output
+are still the terminal. So:
+
+- **Ctrl-C and Ctrl-\\** reach it through Shipyard, exactly once. Ctrl-C stops
+  a `sleep` as usual, and Shipyard then ends as if interrupted, so a shell loop
+  around it stops too.
+- **Resizing the window** is passed on (SIGWINCH), and the command sees the new
+  size.
+- **Ctrl-Z stops only Shipyard.** The command keeps running, and its output keeps
+  appearing. `fg` resumes Shipyard. If the command finishes meanwhile, Shipyard
+  reports it once resumed.
+- **Closing the terminal** ends the command (exit code 129), unless the command
+  ignores hangups. Then it keeps running, and Shipyard with it.
+- **A command that stops itself** (`kill -STOP $$`, or a debugger) doesn't stop
+  Shipyard, so the terminal seems to hang. Press Ctrl-Z (Shipyard stops and
+  your shell comes back), then `fg`: that resumes both. Ctrl-Z typed into a
+  program like `vim` or `less` inside doesn't do this; the system ignores that
+  request for an isolated command.
+- **Programs that open `/dev/tty` fail.** That's how `sudo`, `ssh` and others ask
+  for a password, so they can't prompt. Use `--no-isolation` for those, until
+  full terminal support comes in a later version.
+- **Don't run an isolated command that reads the terminal in the background.**
+  Nothing stops it from reading (as a background job normally would be), so it
+  takes keys you type into your shell.
+
+Use `--no-isolation` for full job control.
 
 ## Environment
 
@@ -158,11 +237,19 @@ The command starts clean, whatever state Shipyard was started in:
 - **`TERM`:** when Shipyard runs in a terminal, your `TERM` is passed on (unless
   you set one with `-e`), so full-screen programs like `top` and `vim` work.
 - **On Linux:** if Shipyard is killed with `SIGKILL`, the command is killed too.
-  (On macOS it can be left running in that one case.)
+  (On macOS it can be left running in that one case.) Isolated, the whole
+  container goes. With `--no-isolation`, one exception: a command run as
+  another user (`--user`) that then starts a setuid program loses that
+  protection (the system clears it for such programs), and the program can be
+  left running.
 
 ## Signals and stopping
 
 Shipyard stays with the command until it has exited, and passes signals on.
+
+Isolated commands on a terminal behave differently: see
+[On a terminal, isolated](#on-a-terminal-isolated). This section describes
+`--no-isolation` (and macOS) on a terminal, and every run without one.
 
 **From the terminal.** Ctrl-C, Ctrl-\\ and Ctrl-Z reach the command directly,
 just as without Shipyard, and `fg`/`bg` work as usual. Shipyard doesn't pass
@@ -201,6 +288,9 @@ exceptions:
   - signals about Shipyard's own state (crashes, `SIGPIPE`, `SIGCHLD`).
 - **Signals Shipyard was started ignoring** (for example under `nohup`) stay
   ignored and aren't passed on.
+- **Signals 32 and 33** (Linux): the C library keeps them for itself, so
+  Shipyard can't catch them, and either one ends Shipyard at once (and an
+  isolated command with it). Don't send them to Shipyard.
 - **Signals the command sends to Shipyard** aren't bounced back to it. (On
   macOS this is best effort: if two signals arrive at the same instant, the
   system can report the wrong sender for one of them.)
@@ -216,8 +306,9 @@ them, and catches `SIGTERM` even if it was started ignoring it. So `SIGTERM`
 always stops it, and it always notices when the command exits.
 
 A signal sent to Shipyard's whole *process group* (as `timeout` does, and
-`kill -SIG -<pgid>`) reaches the command twice when Shipyard runs in a terminal:
-once directly and once passed on. A signal that arrives before the command has
+`kill -SIG -<pgid>`) reaches the command twice when Shipyard runs in a terminal
+without isolation: once directly and once passed on. (An isolated command isn't
+in Shipyard's group, so it gets it once.) A signal that arrives before the command has
 finished starting gets the command's default reaction (for most signals, it
 exits).
 
@@ -227,7 +318,8 @@ exits).
 | `--stop-timeout SECONDS` | `10` | How long to wait before forcing it with `SIGKILL` |
 
 The stop signal can't be `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` or `SIGCONT`:
-those pause or resume the command instead of ending it.
+those pause or resume the command instead of ending it. Nor can it be `SIGCHLD`
+or signals 32 and 33, which the container's init can't pass on.
 
 Signals can be given as:
 
@@ -241,8 +333,11 @@ Signals can be given as:
 
 When the command exits, Shipyard cleans up what it left behind:
 
-- **Without a terminal** (CI, services, scripts): the command runs in its own
-  process group, and anything still running in that group is killed.
+- **Isolated** (Linux): when the command exits, the container's init exits and
+  the system kills everything else left in the container.
+- **Without a terminal** (CI, services, scripts), and always when isolated: the
+  command runs in its own process group, and anything still running in that
+  group is killed.
 - **On Linux:** every leftover process is killed, even ones that left the
   command's group (for example with `setsid`). Shipyard registers as their parent
   (a "child subreaper") to find them. Processes that were already Shipyard's

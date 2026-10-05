@@ -18,6 +18,8 @@ the previous one. Don't jump ahead or build later stages early.
 
 - `crates/shipyard-cli/`: the `shipyard` binary (clap, anyhow, tracing).
 - `crates/shipyard-runtime/`: low-level primitives (processes, namespaces, mounts, cgroups).
+- `crates/shipyard-test-support/`: helpers for the end-to-end tests (running the binary,
+  hostile parents, the pseudo-terminal harness). Dev-only, never published.
   Library errors use `thiserror`.
 - `docs/ROADMAP.md`: stages, TLPI chapter mapping, and recorded decisions.
 - `docs/FEATURES.md`: the full feature list per stage, the production-quality bar, and what's
@@ -26,7 +28,8 @@ the previous one. Don't jump ahead or build later stages early.
   container via `scripts/test-linux.sh`, or the Lima VM).
 - `docs/stages/`: stage notes, the engineering record of each finished stage (decisions,
   failure modes, platform differences, items carried forward).
-- `scripts/`: developer scripts (`test-linux.sh`).
+- `scripts/`: developer scripts (`test-linux.sh`) and kernel probes (`probes/`) that check
+  the kernel behaviour a stage relies on.
 - `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
   - `cli.md` is generated from the clap definitions; never edit it by hand.
   - Describe only what works in the current version.
@@ -75,10 +78,19 @@ child between `fork` and `exec`. If the parent had other threads, any lock they 
   `unwrap`, `expect` and `panic`.
 - **call only async-signal-safe functions**, or nix wrappers that are thin calls to
   them. nix's `execve` allocates, so `libc::execve` is used directly.
+- **after a raw `clone` (isolated runs), call no C library function that keeps
+  process-wide state or takes an internal lock** (glibc's `setuid` family, `raise`,
+  `pthread_*`): glibc's fork handling didn't run. Use the raw system call instead
+  (see `switch_credentials`).
 - **report failures as numbers** (step, errno, detail) over the report pipe, then
   `_exit`. The parent turns them into messages (`failure.rs`).
 
 Everything the child needs is prepared before `fork`, in `plan.rs`.
+
+The same rules apply to the container's init (`process/init.rs`) until it re-execs
+itself. It re-execs the running binary, so **every binary that supervises isolated
+commands must call `process::init_entry_point()` first thing in `main`**; isolated
+runs are refused otherwise.
 
 The terminal tests (`crates/shipyard-cli/tests/terminal.rs`, `harness = false`)
 fork a fake shell that keeps running Rust code, so that test binary must stay

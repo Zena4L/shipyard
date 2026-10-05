@@ -53,13 +53,16 @@ impl LogLevel {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a command the way a container would (no isolation yet).
+    /// Run a command in a container: on Linux, isolated in namespaces (no separate filesystem yet).
     Run(run::RunArgs),
     /// Show how this host will run containers.
     Doctor,
 }
 
 fn main() -> ExitCode {
+    // First of all: a container's init re-execs this binary to become a
+    // clean process, and takes over here (it never returns then).
+    process::init_entry_point();
     // Before anything else: a privileged start must not get any further.
     if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into());
@@ -90,6 +93,12 @@ fn main() -> ExitCode {
 /// Reports an error from shipyard itself and returns exit code 125.
 fn fail(err: &anyhow::Error) -> ExitCode {
     report(err, EXIT_ENGINE_ERROR)
+}
+
+/// Prints a hint after an error: what the user can do about it.
+fn hint(text: &str) {
+    // Not `eprintln!`: it panics if stderr is a closed pipe.
+    let _ = writeln!(std::io::stderr().lock(), "shipyard: hint: {text}");
 }
 
 /// Prints an error with its full cause chain ("doing X: because Y") and

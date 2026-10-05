@@ -62,17 +62,47 @@ container (Docker, OrbStack or any compatible engine):
 1. clippy with warnings as errors;
 2. the whole test suite as a normal user;
 3. the suite again with the root-only tests, run as root through `sudo` (as the
-   CI `root` job does).
+   CI `root` job does). Before it, `/` is made a shared mount, as on systemd
+   hosts, so a mount namespace that leaks mounts would be caught.
 
 ```sh
 scripts/test-linux.sh            # everything; exits non-zero on any failure
 scripts/test-linux.sh --shell    # a shell in the same container, to debug
 ```
 
+The container is **privileged**, because creating namespaces and mounting
+(stage 2 on) need `CAP_SYS_ADMIN` and Docker's default seccomp profile blocks
+them. The normal-user pass still has no capabilities, so it checks what an
+unprivileged user sees. Use it for development only.
+
 The repository is mounted read-only. Build output, the cargo registry and the
 pinned toolchain live in Docker volumes named `shipyard-linux-*`, so later runs
 are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
 (below) is for interactive work and the root-heavy later stages.
+
+### x86-64, kernel probes and mutation checks
+
+- **x86-64 from an Apple-silicon Mac:** the same image under emulation, with its own
+  volumes. OrbStack's emulation (Rosetta) lacks `clone3` and `execveat`, so this run also
+  exercises both fallbacks. It's slow (the first `apt-get` alone can take many minutes),
+  and Rosetta itself can deadlock when a raw `clone` meets threads being created, so the
+  one test that stresses exactly that skips itself there. Treat it as a check of the
+  fallback paths, not of concurrency; CI runs real x86-64:
+
+  ```sh
+  docker run --rm --privileged --platform linux/amd64 -v "$PWD":/src:ro \
+    -v shipyard-amd64-target:/target -v shipyard-amd64-cargo:/usr/local/cargo \
+    -v shipyard-amd64-rustup:/usr/local/rustup -e CARGO_TARGET_DIR=/target -w /src \
+    rust:1-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq procps >/dev/null \
+      && mount --make-rshared / && cargo test --workspace -- --include-ignored'
+  ```
+- **Kernel probes:** `scripts/probes/*.c` check the kernel behaviour a stage relies on,
+  before it's built on. Each file's header says how to run it, usually in the privileged
+  container. The stage notes record the results.
+- **Mutation checks:** to prove a test catches a bug, break a scratch copy of the repo,
+  never the working tree. Build it in its **own** cargo target volume (for example
+  `shipyard-mutation-target`). Cargo decides what to rebuild by timestamps, so a mutated
+  build in the shared volume can be reused by the next normal run.
 
 ### Tests that need root
 

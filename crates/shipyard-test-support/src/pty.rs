@@ -16,7 +16,8 @@
 //! shell's observations (job PIDs, exit or stop statuses) over a pipe.
 //!
 //! The shell is forked from the test process and keeps running Rust code, so
-//! the test process must be single-threaded (see `terminal.rs`).
+//! the test process must be single-threaded (see `shipyard-cli`'s
+//! `tests/terminal.rs`).
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -29,13 +30,11 @@ use std::time::{Duration, Instant};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{Winsize, openpty};
 
-/// The shipyard binary under test.
-const SHIPYARD: &str = env!("CARGO_BIN_EXE_shipyard");
 /// How long to wait for any one expected thing before failing.
 const DEADLINE: Duration = Duration::from_secs(20);
 /// The `TERM` the shell gives shipyard, so tests don't depend on the
 /// developer's own terminal.
-pub(crate) const TERM: &str = "xterm-shipyard-test";
+pub const TERM: &str = "xterm-shipyard-test";
 
 /// Set by the shell's SIGHUP handler: the terminal hung up.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
@@ -49,7 +48,7 @@ static ALARM_GROUPS: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
 /// Makes SIGALRM kill the current session's shell and jobs, then this
 /// process. `Drop` doesn't run when a signal kills a process, so without
 /// this a hung test would leave shipyard and its command running.
-pub(crate) fn kill_everything_on_alarm() {
+pub fn kill_everything_on_alarm() {
     extern "C" fn on_alarm(_signal: libc::c_int) {
         const MESSAGE: &[u8] = b"\ntest timed out; killed its processes\n";
         // SAFETY: only async-signal-safe calls: `killpg`, `kill`, `write`
@@ -76,9 +75,12 @@ pub(crate) fn kill_everything_on_alarm() {
 
 /// How a job ended or paused, as the shell's `waitpid` saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Status {
+pub enum Status {
+    /// Exited with this code.
     Exited(i32),
+    /// Killed by this signal.
     Signaled(i32),
+    /// Stopped by this signal.
     Stopped(i32),
 }
 
@@ -121,21 +123,26 @@ impl Status {
 
 /// Whether the shell gives a new job the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
+pub enum Mode {
+    /// The job gets the terminal.
     Foreground,
+    /// The shell keeps the terminal.
     Background,
 }
 
 /// A job the shell started: shipyard, leading its own process group.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Job {
+pub struct Job {
     pid: libc::pid_t,
 }
 
 /// The shell's side: runs in the forked shell process.
-pub(crate) struct Shell {
+#[derive(Debug)]
+pub struct Shell {
     events: File,
     control: File,
+    /// The shipyard binary that [`Shell::spawn`] starts.
+    shipyard: &'static str,
 }
 
 // The job-control methods take `&mut self` on purpose: they're the shell's
@@ -145,12 +152,12 @@ impl Shell {
     /// Starts `shipyard ARGS…` as a job in its own process group, like a
     /// shell with job control does. In the foreground, the job gets the
     /// terminal.
-    pub(crate) fn spawn(&mut self, mode: Mode, args: &[&str]) -> Job {
-        self.spawn_program(mode, SHIPYARD, args)
+    pub fn spawn(&mut self, mode: Mode, args: &[&str]) -> Job {
+        self.spawn_program(mode, self.shipyard, args)
     }
 
     /// Like [`Shell::spawn`], for any program.
-    pub(crate) fn spawn_program(&mut self, mode: Mode, program: &str, args: &[&str]) -> Job {
+    pub fn spawn_program(&mut self, mode: Mode, program: &str, args: &[&str]) -> Job {
         let foreground = mode == Mode::Foreground;
         let mut command = Command::new(program);
         command.args(args).env_clear().env("TERM", TERM);
@@ -197,7 +204,7 @@ impl Shell {
 
     /// Waits until the job exits, is killed, or stops, then takes the
     /// terminal back and reports what happened.
-    pub(crate) fn wait(&mut self, job: Job) -> Status {
+    pub fn wait(&mut self, job: Job) -> Status {
         let status = self.wait_for(job);
         // SAFETY: `getpgrp` has no preconditions.
         give_terminal_to(unsafe { libc::getpgrp() });
@@ -207,7 +214,7 @@ impl Shell {
 
     /// Like [`Shell::wait`], but leaves the terminal with the job's group,
     /// which stays the foreground group after its leader exits.
-    pub(crate) fn wait_leaving_terminal(&mut self, job: Job) -> Status {
+    pub fn wait_leaving_terminal(&mut self, job: Job) -> Status {
         let status = self.wait_for(job);
         self.report(&status.to_event());
         status
@@ -241,27 +248,27 @@ impl Shell {
     }
 
     /// `fg`: gives the job the terminal and continues its whole group.
-    pub(crate) fn fg(&mut self, job: Job) {
+    pub fn fg(&mut self, job: Job) {
         give_terminal_to(job.pid);
         // SAFETY: `killpg` only sends a signal to the job's group.
         unsafe { libc::killpg(job.pid, libc::SIGCONT) };
     }
 
     /// `bg`: continues the job's group without giving it the terminal.
-    pub(crate) fn bg(&mut self, job: Job) {
+    pub fn bg(&mut self, job: Job) {
         // SAFETY: as above.
         unsafe { libc::killpg(job.pid, libc::SIGCONT) };
     }
 
     /// Like `fg`, but continues only shipyard, not the rest of its group.
-    pub(crate) fn fg_shipyard_only(&mut self, job: Job) {
+    pub fn fg_shipyard_only(&mut self, job: Job) {
         give_terminal_to(job.pid);
         // SAFETY: `kill` only sends a signal to the job's leader.
         unsafe { libc::kill(job.pid, libc::SIGCONT) };
     }
 
     /// Blocks until the test calls [`Session::go`].
-    pub(crate) fn await_go(&mut self) {
+    pub fn await_go(&mut self) {
         let mut byte = [0u8; 1];
         self.control
             .read_exact(&mut byte)
@@ -295,7 +302,8 @@ fn give_terminal_to(pgid: libc::pid_t) {
 }
 
 /// The test's side: a running shell on a pseudo-terminal.
-pub(crate) struct Session {
+#[derive(Debug)]
+pub struct Session {
     /// The terminal's master side. `None` after [`Session::hang_up`], or
     /// once nothing has the terminal open any more.
     master: Option<File>,
@@ -314,8 +322,15 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// Starts a shell on a new pseudo-terminal, running `script`.
-    pub(crate) fn start(script: fn(&mut Shell)) -> Self {
+    /// Starts a shell on a new pseudo-terminal, running `script`; its
+    /// [`Shell::spawn`] starts the shipyard binary at `shipyard`.
+    ///
+    /// # Safety
+    ///
+    /// The calling process must be single-threaded. The shell is forked and
+    /// keeps running ordinary Rust code (it allocates, uses `Command`), which
+    /// is only sound when no other thread could hold a lock at the fork.
+    pub unsafe fn start(shipyard: &'static str, script: fn(&mut Shell)) -> Self {
         let size = Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -329,7 +344,7 @@ impl Session {
         set_cloexec(&pty.slave);
         let (events_read, events_write) = cloexec_pipe();
         let (control_read, control_write) = cloexec_pipe();
-        // SAFETY: the test process is single-threaded (see terminal.rs), so
+        // SAFETY: the test process is single-threaded (the caller's promise), so
         // the child may run any code the parent could.
         match unsafe { libc::fork() } {
             -1 => panic!("fork: {}", std::io::Error::last_os_error()),
@@ -340,7 +355,7 @@ impl Session {
                 // Nothing may unwind out of here: it would land in the test
                 // runner's code, and this copy would run the other tests.
                 let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    run_shell(pty.slave, events_write, control_read, script)
+                    run_shell(pty.slave, events_write, control_read, shipyard, script)
                 }))
                 .unwrap_or(1);
                 // SAFETY: `_exit` ends the forked shell without running the
@@ -368,13 +383,28 @@ impl Session {
 
     /// Types `keys` into the terminal: `b"\x03"` is Ctrl-C, `b"\x1c"`
     /// Ctrl-\, `b"\x1a"` Ctrl-Z.
-    pub(crate) fn type_keys(&mut self, keys: &[u8]) {
+    pub fn type_keys(&mut self, keys: &[u8]) {
         let mut master = self.master.as_ref().expect("the terminal is still open");
         master.write_all(keys).expect("typing into the terminal");
     }
 
+    /// Changes the terminal's size, like resizing its window: the kernel
+    /// then sends SIGWINCH to the terminal's foreground process group.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let master = self.master.as_ref().expect("the terminal is still open");
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCSWINSZ` reads one `winsize`, which `size` is.
+        let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &raw const size) };
+        assert_eq!(rc, 0, "resizing: {}", std::io::Error::last_os_error());
+    }
+
     /// Waits until `text` appears in the output after the previous match.
-    pub(crate) fn expect(&mut self, text: &str) {
+    pub fn expect(&mut self, text: &str) {
         let deadline = Instant::now() + DEADLINE;
         loop {
             if let Some(at) = find(&self.output[self.cursor..], text.as_bytes()) {
@@ -391,7 +421,7 @@ impl Session {
     }
 
     /// Waits for a line starting with `prefix`; returns the rest of it.
-    pub(crate) fn expect_line_starting(&mut self, prefix: &str) -> String {
+    pub fn expect_line_starting(&mut self, prefix: &str) -> String {
         self.expect(prefix);
         let deadline = Instant::now() + DEADLINE;
         loop {
@@ -411,12 +441,13 @@ impl Session {
     }
 
     /// How often `text` appears in all the output so far.
-    pub(crate) fn count(&self, text: &str) -> usize {
+    #[must_use]
+    pub fn count(&self, text: &str) -> usize {
         String::from_utf8_lossy(&self.output).matches(text).count()
     }
 
     /// The PID of the next job the shell started.
-    pub(crate) fn job(&mut self) -> libc::pid_t {
+    pub fn job(&mut self) -> libc::pid_t {
         let event = self.event();
         let pid = event
             .strip_prefix("job ")
@@ -433,19 +464,19 @@ impl Session {
     }
 
     /// The next status the shell reported.
-    pub(crate) fn status(&mut self) -> Status {
+    pub fn status(&mut self) -> Status {
         let event = self.event();
         Status::from_event(&event)
             .unwrap_or_else(|| panic!("expected a status, got {event:?}\n{}", self.transcript()))
     }
 
     /// Lets the shell's script continue past [`Shell::await_go`].
-    pub(crate) fn go(&mut self) {
+    pub fn go(&mut self) {
         self.control.write_all(b"g").expect("signalling the shell");
     }
 
     /// Closes the terminal, like closing a terminal window.
-    pub(crate) fn hang_up(&mut self) {
+    pub fn hang_up(&mut self) {
         self.master = None;
     }
 
@@ -455,7 +486,7 @@ impl Session {
     /// On macOS, with a terminal, shipyard can't clean up what the command
     /// leaves running (documented in docs/user/run.md), so test scripts must
     /// stop their own background processes.
-    pub(crate) fn finish(mut self) {
+    pub fn finish(mut self) {
         let deadline = Instant::now() + DEADLINE;
         loop {
             let mut raw = 0;
@@ -500,7 +531,8 @@ impl Session {
     }
 
     /// Everything the terminal showed, for failure messages.
-    pub(crate) fn transcript(&self) -> String {
+    #[must_use]
+    pub fn transcript(&self) -> String {
         format!(
             "--- terminal output ---\n{}\n-----------------------",
             String::from_utf8_lossy(&self.output)
@@ -612,10 +644,17 @@ impl Drop for Session {
 /// The shell process: sets itself up as an interactive shell on the
 /// terminal, then runs `script`. Returns its exit code; failures are also
 /// reported to the test, which shows them.
-fn run_shell(slave: OwnedFd, events: OwnedFd, control: OwnedFd, script: fn(&mut Shell)) -> i32 {
+fn run_shell(
+    slave: OwnedFd,
+    events: OwnedFd,
+    control: OwnedFd,
+    shipyard: &'static str,
+    script: fn(&mut Shell),
+) -> i32 {
     let mut shell = Shell {
         events: File::from(events),
         control: File::from(control),
+        shipyard,
     };
     let became = become_interactive_shell(&slave);
     // Now stdin, stdout and stderr; the original isn't needed.
@@ -680,7 +719,8 @@ extern "C" fn on_hangup(_signal: libc::c_int) {
 }
 
 /// The current state letters of a process, from `ps` (`T` means stopped).
-pub(crate) fn process_state(pid: libc::pid_t) -> String {
+#[must_use]
+pub fn process_state(pid: libc::pid_t) -> String {
     let output = Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
@@ -689,7 +729,7 @@ pub(crate) fn process_state(pid: libc::pid_t) -> String {
 }
 
 /// Waits until process `pid` is stopped.
-pub(crate) fn wait_until_stopped(pid: libc::pid_t) {
+pub fn wait_until_stopped(pid: libc::pid_t) {
     let deadline = Instant::now() + DEADLINE;
     while !process_state(pid).starts_with('T') {
         assert!(

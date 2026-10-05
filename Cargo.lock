@@ -469,6 +469,7 @@ dependencies = [
  "nix",
  "proptest",
  "shipyard-runtime",
+ "shipyard-test-support",
  "tracing",
  "tracing-subscriber",
 ]
@@ -480,8 +481,17 @@ dependencies = [
  "libc",
  "nix",
  "proptest",
+ "shipyard-test-support",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "shipyard-test-support"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "nix",
 ]
 
 [[package]]

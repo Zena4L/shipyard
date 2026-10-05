@@ -2,18 +2,21 @@
 
 Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 
-> **Status: early development.** Shipyard doesn't isolate commands yet. Today
-> `shipyard run` starts a command the way a container runtime does (clean
-> environment, chosen user, working directory and resource limits), supervises it
-> (passing signals on, stopping it gracefully, cleaning up what it leaves
-> behind), and reports exactly how it ended. These docs describe only what works in the current
-> version, and they are updated with every release.
+> **Status: early development.** On Linux, `shipyard run` starts a command in
+> its own namespaces: its own processes (under a small init), mounts, hostname
+> and IPC. It doesn't have its own root filesystem or network yet, and it isn't
+> a security boundary yet. It starts the command the way a container runtime
+> does (clean environment, chosen user, working directory and resource limits),
+> supervises it (passing signals on, stopping it gracefully, cleaning up what it
+> leaves behind), and reports exactly how it ended. On macOS, commands aren't
+> isolated yet. These docs describe only what works in the current version, and
+> they are updated with every release.
 
 ## Pages
 
 | Page | What it covers |
 |---|---|
-| [Running commands](run.md) | `shipyard run`: environment, users, working directory, resource limits, stopping |
+| [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
 | [Exit codes](exit-codes.md) | What each exit code means, for scripts that check them |
 | [Command reference](cli.md) | Every command and flag, generated from the CLI itself |
 
@@ -53,17 +56,21 @@ backend: linux-vm (not implemented yet)
 On Linux, containers run directly on the host kernel. On macOS they will run
 inside a lightweight Linux VM that Shipyard manages.
 
-Run a command:
+Run a command. On Linux, isolation needs root (running without root comes
+later); add `--no-isolation` to run without namespaces instead:
 
 ```sh
-shipyard run -e GREETING=hello sh -c 'echo "$GREETING, $(id -un)"; exit 3'
+sudo shipyard run -e GREETING=hello sh -c 'echo "$GREETING from PID $$"; exit 3'
 echo $?
 ```
 
 ```text
-hello, yourname
+hello from PID 2
 3
 ```
+
+PID 2: the command sees only its own processes, under Shipyard's small init
+(PID 1). On macOS, run it without `sudo`; the PID is then an ordinary one.
 
 See [Running commands](run.md) for everything `run` accepts.
 
