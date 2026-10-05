@@ -80,6 +80,30 @@ pinned toolchain live in Docker volumes named `shipyard-linux-*`, so later runs
 are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
 (below) is for interactive work and the root-heavy later stages.
 
+### x86-64, kernel probes and mutation checks
+
+- **x86-64 from an Apple-silicon Mac:** the same image under emulation, with its own
+  volumes. OrbStack's emulation (Rosetta) lacks `clone3` and `execveat`, so this run also
+  exercises both fallbacks. It's slow (the first `apt-get` alone can take many minutes),
+  and Rosetta itself can deadlock when a raw `clone` meets threads being created, so the
+  one test that stresses exactly that skips itself there. Treat it as a check of the
+  fallback paths, not of concurrency; CI runs real x86-64:
+
+  ```sh
+  docker run --rm --privileged --platform linux/amd64 -v "$PWD":/src:ro \
+    -v shipyard-amd64-target:/target -v shipyard-amd64-cargo:/usr/local/cargo \
+    -v shipyard-amd64-rustup:/usr/local/rustup -e CARGO_TARGET_DIR=/target -w /src \
+    rust:1-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq procps >/dev/null \
+      && mount --make-rshared / && cargo test --workspace -- --include-ignored'
+  ```
+- **Kernel probes:** `scripts/probes/*.c` check the kernel behaviour a stage relies on,
+  before it's built on. Each file's header says how to run it, usually in the privileged
+  container. The stage notes record the results.
+- **Mutation checks:** to prove a test catches a bug, break a scratch copy of the repo,
+  never the working tree. Build it in its **own** cargo target volume (for example
+  `shipyard-mutation-target`). Cargo decides what to rebuild by timestamps, so a mutated
+  build in the shared volume can be reused by the next normal run.
+
 ### Tests that need root
 
 Tests that switch user or groups are marked `#[ignore]`, so a normal

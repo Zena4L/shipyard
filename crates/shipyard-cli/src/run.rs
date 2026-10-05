@@ -45,9 +45,9 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     stop_timeout: u64,
 
-    /// Run without isolation: the command sees the host's processes, mounts
-    /// and hostname. On Linux, commands are isolated by default (which needs
-    /// root); on macOS they always run like this for now.
+    /// Run without isolation: the command sees the host's processes, mounts,
+    /// hostname and IPC. On Linux, commands are isolated by default (which
+    /// needs root); on macOS they always run like this for now.
     #[arg(long)]
     no_isolation: bool,
 
@@ -154,7 +154,13 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
         Ok(status) => status,
         Err(err) => {
             let code = err.exit_code();
-            return Ok(crate::report(&anyhow::Error::from(err), code));
+            let isolation_failed = is_isolation_failure(&err);
+            let exit = crate::report(&anyhow::Error::from(err), code);
+            if isolation_failed {
+                // The runtime can't name the CLI's flag; this is where it's known.
+                crate::hint("--no-isolation runs the command without namespaces");
+            }
+            return Ok(exit);
         }
     };
     if let ExitStatus::Signaled { signal, .. } = status
@@ -164,6 +170,17 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
         process::die_from(signal);
     }
     Ok(ExitCode::from(status.code()))
+}
+
+/// Whether `err` is isolation going wrong (missing privileges, a refusal,
+/// or a failed namespace step), which `--no-isolation` avoids.
+fn is_isolation_failure(err: &shipyard_runtime::Error) -> bool {
+    use shipyard_runtime::Error;
+    match err {
+        Error::IsolationNeedsRoot | Error::IsolationRefused | Error::InitDidNotStart { .. } => true,
+        Error::Spawn(spawn) => spawn.kind() == process::SpawnErrorKind::Isolation,
+        _ => false,
+    }
 }
 
 /// `KEY=VALUE` sets a variable; a bare `KEY` copies it from shipyard's own

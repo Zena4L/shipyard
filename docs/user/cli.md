@@ -19,7 +19,7 @@ A lightweight container engine
 
 ###### **Subcommands:**
 
-* `run` — Run a command in a container: isolated in Linux namespaces (no separate filesystem yet)
+* `run` — Run a command in a container: on Linux, isolated in namespaces (no separate filesystem yet)
 * `doctor` — Show how this host will run containers
 
 ###### **Options:**
@@ -34,7 +34,7 @@ A lightweight container engine
 
 ## `shipyard run`
 
-Run a command in a container: isolated in Linux namespaces (no separate filesystem yet)
+Run a command in a container: on Linux, isolated in namespaces (no separate filesystem yet)
 
 **Usage:** `shipyard run [OPTIONS] <COMMAND>...`
 
@@ -57,7 +57,7 @@ Run a command in a container: isolated in Linux namespaces (no separate filesyst
 * `--stop-timeout <SECONDS>` — Seconds to wait after the stop signal before killing the command
 
   Default value: `10`
-* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts and hostname. On Linux, commands are isolated by default (which needs root); on macOS they always run like this for now
+* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname and IPC. On Linux, commands are isolated by default (which needs root); on macOS they always run like this for now
 * `--hostname <NAME>` — Hostname inside the container (Linux)
 
 

@@ -1,0 +1,18 @@
+[package]
+name = "shipyard-test-support"
+description = "Helpers for Shipyard's end-to-end tests: running the binary, hostile parents, a fake shell on a pseudo-terminal. Dev-only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+# `term` for `openpty`.
+nix = { workspace = true, features = ["term"] }
+
+[lints]
+workspace = true

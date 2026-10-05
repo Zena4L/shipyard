@@ -33,11 +33,11 @@ use nix::sys::stat::Mode;
 use nix::unistd::Pid;
 
 use super::signals::{Arrival, Signals, Sources};
-use super::spawn::{Child, SpawnOptions, spawn};
+use super::spawn::{Child, Placement, SpawnOptions, spawn};
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
 use super::stop::StopPolicy;
-use crate::isolation::Isolation;
+use crate::isolation::{Isolation, Join};
 use crate::{Error, Result};
 
 /// When to first warn that a command killed with SIGKILL still hasn't exited, and how
@@ -102,29 +102,78 @@ impl Supervisor {
     /// - With `isolation` (Linux), the command starts in new namespaces and a
     ///   session of its own. It's then never in the terminal's process group,
     ///   so signals from the terminal are forwarded like any other, and the
-    ///   shell's job control doesn't extend to it.
+    ///   shell's job control doesn't extend to it. With a new PID namespace,
+    ///   its PID 1 is an init that re-execs this program's binary: `main`
+    ///   must call [`init_entry_point`](super::init_entry_point) first.
     ///
     /// # Errors
     ///
-    /// Invalid input, isolation on macOS or without root, or a failure to
-    /// start the command (see [`Error::exit_code`]).
+    /// Invalid input, isolation on macOS or without root, a PID namespace
+    /// without the init entry point, a container init that failed to start
+    /// ([`Error::InitDidNotStart`]), or a failure to start the command (see
+    /// [`Error::exit_code`]).
     pub fn supervise(
         &mut self,
         spec: &ProcessSpec,
         stop: StopPolicy,
         isolation: Option<&Isolation>,
     ) -> Result<ExitStatus> {
+        let placement = isolation.map_or(Placement::Host, |isolation| {
+            Placement::New(isolation.clone())
+        });
+        self.run(spec, stop, placement)
+    }
+
+    /// Like [`supervise`](Self::supervise), but the command starts inside
+    /// the namespaces of a process that's already running (`join.target`,
+    /// normally a container's init), as `exec` into a container does
+    /// (Linux).
+    ///
+    /// The command is shipyard's own child, supervised exactly like an
+    /// isolated one: a session of its own, signals forwarded, the same stop
+    /// policy. Inside the container it's an ordinary process (not PID 1);
+    /// its parent is outside, so `getppid()` there is 0. When it exits,
+    /// whatever is left in its process group is killed, as for
+    /// [`supervise`](Self::supervise); processes that left the group belong
+    /// to the container's init. If the container ends, the kernel kills the
+    /// command (SIGKILL, so 137).
+    ///
+    /// # Errors
+    ///
+    /// An invalid `join`, Linux only, root only ([`Error::JoinNeedsRoot`], or
+    /// [`Error::JoinRefused`] as root), no such process
+    /// ([`Error::NoSuchProcess`]), a container that is exiting
+    /// ([`Error::ContainerExiting`]), a `/proc` of another PID namespace
+    /// ([`Error::ForeignProc`]), or a failure to start the command.
+    pub fn supervise_joined(
+        &mut self,
+        spec: &ProcessSpec,
+        stop: StopPolicy,
+        join: &Join,
+    ) -> Result<ExitStatus> {
+        self.run(spec, stop, Placement::Join(join.clone()))
+    }
+
+    fn run(
+        &mut self,
+        spec: &ProcessSpec,
+        stop: StopPolicy,
+        placement: Placement,
+    ) -> Result<ExitStatus> {
         stop.validate()?;
-        if let Some(isolation) = isolation {
-            check_isolation(isolation)?;
+        match &placement {
+            Placement::Host => {}
+            Placement::New(isolation) => check_isolation(isolation)?,
+            Placement::Join(join) => check_join(join)?,
         }
         let terminal = Terminal::open();
-        // With isolation the command has a session of its own, so it never
-        // shares the terminal's group, whether or not shipyard has one.
-        let job_terminal = terminal.as_ref().filter(|_| isolation.is_none());
+        // With a session of its own, the command never shares the terminal's
+        // group, whether or not shipyard has one.
+        let own_session = placement.has_own_session();
+        let job_terminal = terminal.as_ref().filter(|_| !own_session);
         tracing::debug!(
             terminal = terminal.is_some(),
-            isolated = isolation.is_some(),
+            placement = ?placement,
             "{}",
             if job_terminal.is_some() {
                 "sharing shipyard's process group with the command"
@@ -134,7 +183,7 @@ impl Supervisor {
         );
         let spec = with_terminal_env(spec, terminal.is_some(), std::env::var_os("TERM"));
         let options = SpawnOptions {
-            isolation: isolation.cloned(),
+            placement,
             new_process_group: job_terminal.is_none(),
             keep_ignored: self
                 .signals
@@ -146,7 +195,7 @@ impl Supervisor {
         };
         let started = |pid: Pid| self.signals.set_child(pid.as_raw());
         let result = spawn(&spec, &options, started).and_then(|mut child| {
-            let result = self.watch(&mut child, stop, job_terminal);
+            let result = self.watch(&mut child, stop, job_terminal, own_session);
             if result.is_err() {
                 // Never leave the command running unsupervised.
                 child.kill_all();
@@ -166,6 +215,7 @@ impl Supervisor {
         child: &mut Child,
         stop: StopPolicy,
         terminal: Option<&Terminal>,
+        own_session: bool,
     ) -> Result<ExitStatus> {
         let mut timers = StopTimers::default();
         loop {
@@ -195,6 +245,12 @@ impl Supervisor {
             }
             if terminal.is_some() {
                 follow_stops(child, &self.signals, continued, timers.requested);
+            } else if continued && own_session {
+                // Resumed (`fg` after Ctrl-Z). A command in a session of its
+                // own got no SIGCONT from the shell: if it had stopped itself,
+                // only this resumes it. (One that hadn't just gets a harmless
+                // SIGCONT.)
+                child.continue_all();
             }
         }
     }
@@ -224,6 +280,22 @@ impl Supervisor {
     }
 }
 
+/// Rejects a join that can't work here, before anything starts.
+fn check_join(join: &Join) -> Result<()> {
+    join.validate()?;
+    if !cfg!(target_os = "linux") {
+        return Err(Error::LinuxOnly {
+            feature: "joining namespaces",
+            os: std::env::consts::OS,
+        });
+    }
+    // Joining namespaces needs CAP_SYS_ADMIN, as creating them does.
+    if !nix::unistd::geteuid().is_root() {
+        return Err(Error::JoinNeedsRoot);
+    }
+    Ok(())
+}
+
 /// Rejects an isolation that can't work here, before anything starts.
 fn check_isolation(isolation: &Isolation) -> Result<()> {
     isolation.validate()?;
@@ -232,6 +304,12 @@ fn check_isolation(isolation: &Isolation) -> Result<()> {
             feature: "namespace isolation",
             os: std::env::consts::OS,
         });
+    }
+    // The container's init, which a new PID namespace gets, re-execs this
+    // binary (see `init.rs`).
+    #[cfg(target_os = "linux")]
+    if isolation.has(crate::isolation::Namespace::Pid) && !super::has_init_entry_point() {
+        return Err(Error::NoInitEntryPoint);
     }
     // Creating namespaces needs CAP_SYS_ADMIN. Checked here for a clear
     // message; a clone or mount failing with EPERM says the same thing.
@@ -691,11 +769,7 @@ fn reap_exited_children(inherited: &mut Vec<libc::pid_t>) {
 /// would name different processes than `kill` does here.
 #[cfg(target_os = "linux")]
 fn direct_children() -> Option<Vec<libc::pid_t>> {
-    let ours = std::fs::read_link("/proc/self")
-        .ok()
-        .and_then(|link| link.to_str()?.parse::<u32>().ok())
-        == Some(std::process::id());
-    if !ours {
+    if !super::proc_is_ours() {
         return None;
     }
     let lists: Vec<String> = std::fs::read_dir("/proc/self/task")
@@ -739,6 +813,26 @@ fn children_by_scanning_proc() -> Vec<libc::pid_t> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn isolation_is_linux_only() {
+        assert!(matches!(
+            check_isolation(&Isolation::standard()),
+            Err(Error::LinuxOnly { .. })
+        ));
+    }
+
+    /// This test binary never calls `init_entry_point` (nothing in this
+    /// crate's tests does), so it can't be a container's init.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolation_needs_the_init_entry_point() {
+        assert!(matches!(
+            check_isolation(&Isolation::standard()),
+            Err(Error::NoInitEntryPoint)
+        ));
+    }
 
     #[test]
     fn poll_timeouts_round_up() {

@@ -19,11 +19,11 @@
     reason = "in a test crate, a panic is a test failure with a clear message"
 )]
 
-mod common;
-
 use std::time::{Duration, Instant};
 
-use common::{Running, block, gone, ignore, killed_by, shipyard_run_with, start_command};
+use shipyard_test_support::{Running, Shipyard, block, gone, ignore, killed_by, start_command};
+
+const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
 fn start(args: &[&str]) -> Running {
     start_with(args, || Ok(()))
@@ -31,7 +31,7 @@ fn start(args: &[&str]) -> Running {
 
 /// Starts shipyard, with `setup` applied to its process just before it runs.
 fn start_with(args: &[&str], setup: fn() -> std::io::Result<()>) -> Running {
-    start_command(shipyard_run_with(args, setup))
+    start_command(SHIPYARD.run_unisolated_with(args, setup))
 }
 
 #[test]

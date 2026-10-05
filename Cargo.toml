@@ -15,6 +15,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 shipyard-runtime = { path = "crates/shipyard-runtime" }
+shipyard-test-support = { path = "crates/shipyard-test-support" }
 
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
@@ -26,6 +27,7 @@ nix = { version = "0.31", default-features = false, features = [
   "poll",
   "process",
   "resource",
+  "sched",
   "signal",
   "user",
 ] }

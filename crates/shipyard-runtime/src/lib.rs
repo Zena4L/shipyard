@@ -12,8 +12,11 @@
 compile_error!("shipyard only supports UNIX platforms (Linux, macOS)");
 
 // Resource-limit values are handled as 64-bit numbers, and 32-bit glibc's
-// `rlim_t` is 32 bits. Container hosts are 64-bit; refuse rather than
-// half-support them.
+// `rlim_t` is 32 bits. And the child's raw credential calls (`child.rs`,
+// `switch_credentials`) use the 64-bit architectures' syscalls: on 32-bit
+// Linux, `SYS_setresuid` and friends are the old 16-bit ones, which would cut
+// IDs short and misread the group list. Container hosts are 64-bit; refuse
+// rather than half-support them.
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("shipyard only supports 64-bit platforms");
 

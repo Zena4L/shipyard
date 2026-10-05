@@ -34,6 +34,8 @@ pub(crate) enum ChildStep {
     MountPrivate = 15,
     MountProc = 16,
     Hostname = 17,
+    InitFork = 18,
+    JoinNamespace = 19,
 }
 
 impl ChildStep {
@@ -59,6 +61,8 @@ impl ChildStep {
             15 => Self::MountPrivate,
             16 => Self::MountProc,
             17 => Self::Hostname,
+            18 => Self::InitFork,
+            19 => Self::JoinNamespace,
             _ => return None,
         })
     }
@@ -114,6 +118,9 @@ pub enum SpawnErrorKind {
     CannotExecute,
     /// Setting up the process failed before exec (exit 125).
     Setup,
+    /// Setting up the container's namespaces (or joining them) failed
+    /// before exec (exit 125): the steps a run without isolation skips.
+    Isolation,
 }
 
 /// A command that was started but never ran, with a message saying why.
@@ -156,7 +163,7 @@ impl SpawnError {
         match self.kind {
             SpawnErrorKind::NotFound => EXIT_NOT_FOUND,
             SpawnErrorKind::CannotExecute => EXIT_CANNOT_EXECUTE,
-            SpawnErrorKind::Setup => EXIT_ENGINE_ERROR,
+            SpawnErrorKind::Setup | SpawnErrorKind::Isolation => EXIT_ENGINE_ERROR,
         }
     }
 }
@@ -189,12 +196,46 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
         ChildStep::ProcessGroup => setup("starting a new process group".into()),
         ChildStep::SignalMask => setup("clearing the signal mask".into()),
         ChildStep::Handshake => setup("waiting for shipyard to finish its setup".into()),
-        ChildStep::Session => setup("starting a new session".into()),
+        ChildStep::Session => isolation_setup("starting a new session", errno, ctx),
         ChildStep::MountPrivate => {
             isolation_setup("making the container's mounts private", errno, ctx)
         }
         ChildStep::MountProc => isolation_setup("mounting /proc for the container", errno, ctx),
         ChildStep::Hostname => isolation_setup("setting the container's hostname", errno, ctx),
+        ChildStep::InitFork => {
+            isolation_setup("starting the command inside the container", errno, ctx)
+        }
+        ChildStep::JoinNamespace => join_setup(errno, detail, ctx),
+    }
+}
+
+/// Joining one of a running container's namespaces failed; `detail` says
+/// which (its index in `Namespace::ALL`).
+fn join_setup(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
+    let kind = usize::try_from(detail)
+        .ok()
+        .and_then(|index| crate::isolation::Namespace::ALL.get(index));
+    let mut message = match kind {
+        Some(kind) => format!("joining the container's {kind} namespace: {}", errno.desc()),
+        None => format!("joining the container's namespaces: {}", errno.desc()),
+    };
+    if errno == Errno::EPERM {
+        message.push_str(&permission_hint(ctx.root, "joining a container", ""));
+    }
+    SpawnError::new(SpawnErrorKind::Isolation, message, errno)
+}
+
+/// Why a namespace step got EPERM: missing root, or, as root, the system's
+/// refusal (a container without privileges, or a security policy).
+/// `opt_out` is appended: how to do without the feature.
+fn permission_hint(root: bool, needing_root: &str, opt_out: &str) -> String {
+    if root {
+        format!(
+            " (the system refused it: inside a container without privileges, \
+             or under a security policy{opt_out})"
+        )
+    } else {
+        format!(" ({needing_root} needs root{opt_out})")
     }
 }
 
@@ -203,14 +244,13 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
 fn isolation_setup(doing: &str, errno: Errno, ctx: &FailureContext) -> SpawnError {
     let mut message = format!("{doing}: {}", errno.desc());
     if errno == Errno::EPERM {
-        message.push_str(if ctx.root {
-            " (the system refused it: inside a container without privileges, \
-             or a security policy?; or use --no-isolation)"
-        } else {
-            " (isolation needs root; or use --no-isolation)"
-        });
+        message.push_str(&permission_hint(
+            ctx.root,
+            "isolation",
+            "; or run without isolation",
+        ));
     }
-    SpawnError::new(SpawnErrorKind::Setup, message, errno)
+    SpawnError::new(SpawnErrorKind::Isolation, message, errno)
 }
 
 fn describe_rlimit(errno: Errno, detail: u64, ctx: &FailureContext) -> String {
@@ -361,7 +401,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 17, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 19, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -519,7 +559,7 @@ mod tests {
         assert_eq!(
             proc.to_string(),
             "mounting /proc for the container: Operation not permitted \
-             (isolation needs root; or use --no-isolation)"
+             (isolation needs root; or run without isolation)"
         );
         assert!(
             !fail(ChildStep::Hostname, Errno::EINVAL, 0)
@@ -541,5 +581,30 @@ mod tests {
         );
         assert!(refused.to_string().contains("refused"), "{refused}");
         assert!(!refused.to_string().contains("needs root"), "{refused}");
+
+        // Joining: the namespace is named, and the hint has no
+        // `--no-isolation` (there's nothing to opt out of).
+        let mount = crate::isolation::Namespace::Mount.index();
+        let join = fail(ChildStep::JoinNamespace, Errno::EPERM, mount);
+        assert_eq!(join.exit_code(), 125);
+        assert_eq!(
+            join.to_string(),
+            "joining the container's mnt namespace: Operation not permitted \
+             (joining a container needs root)"
+        );
+        let refused = describe(
+            ChildFailure {
+                step: ChildStep::JoinNamespace,
+                errno: Errno::EPERM,
+                detail: mount,
+            },
+            &as_root,
+        );
+        assert!(refused.to_string().contains("refused"), "{refused}");
+        // A detail that names no namespace still makes a message.
+        assert_eq!(
+            fail(ChildStep::JoinNamespace, Errno::EINVAL, u64::MAX).to_string(),
+            "joining the container's namespaces: Invalid argument"
+        );
     }
 }

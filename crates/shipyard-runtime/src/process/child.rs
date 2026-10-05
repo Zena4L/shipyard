@@ -27,23 +27,24 @@ use nix::sys::stat::{Mode, umask};
 use nix::unistd::{Gid, Pid, Uid, getpgrp, getpid, setpgid};
 
 use super::channel::encode;
+
 use super::failure::{ChildStep, means_not_found};
 use super::plan::{ChildPlan, Credentials, FdSweep};
 use super::signal::MAX_SIGNAL;
 
 /// The child's exit code when setup fails. The parent normally reads the
 /// failure from the report pipe instead; this is only what's left if it can't.
-const SETUP_FAILED: libc::c_int = 125;
+pub(super) const SETUP_FAILED: libc::c_int = 125;
 
 /// A failed setup step, as it travels to the parent.
-struct Failure {
+pub(super) struct Failure {
     step: ChildStep,
     errno: Errno,
     detail: u64,
 }
 
 impl Failure {
-    fn at(step: ChildStep, errno: Errno) -> Self {
+    pub(super) fn at(step: ChildStep, errno: Errno) -> Self {
         Self {
             step,
             errno,
@@ -85,8 +86,12 @@ pub(crate) unsafe fn child_main(plan: &ChildPlan, report: RawFd) -> ! {
     unsafe { libc::_exit(SETUP_FAILED) }
 }
 
-/// Runs the setup steps in order, then tries each exec candidate.
-/// Only returns on failure.
+/// Runs the setup steps in order, then tries each exec candidate. Only
+/// returns on failure.
+///
+/// Isolated with a new PID namespace, this process is its PID 1: after the
+/// namespace setup it becomes the container's init, which starts the
+/// command (PID 2) and runs the rest of the steps there (see `init.rs`).
 fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
     // Our copy of the parent's end of the go pipe: closed at once, so that
     // the pipe reports when the *parent's* copy closes.
@@ -95,17 +100,37 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     reset_signal_dispositions(&plan.keep_ignored)?;
     wait_for_go(plan.handshake.read)?;
     #[cfg(target_os = "linux")]
+    if let Some(join) = &plan.join {
+        // Already in the container's PID namespace (see `join.rs`).
+        join_namespaces(join)?;
+        // A session of its own, as an isolated command has.
+        start_session()?;
+        return prepare_and_exec(plan);
+    }
+    #[cfg(target_os = "linux")]
     if let Some(container) = &plan.container {
         set_up_container(container)?;
-    } else if plan.new_process_group {
-        start_process_group()?;
+        if let Some(init) = &container.init {
+            // The init must die with shipyard too: then the kernel kills the
+            // whole namespace. It never switches user, so nothing clears this.
+            die_with_parent(plan)?;
+            return super::init::run(plan, init);
+        }
+        // No PID namespace, so no init: this process becomes the command.
+        // (It already leads a session of its own.)
+        return prepare_and_exec(plan);
     }
-    #[cfg(not(target_os = "linux"))]
     if plan.new_process_group {
         // Its own group, so the supervisor can signal everything the command
         // starts at once. Only without a terminal; see `SpawnOptions`.
         start_process_group()?;
     }
+    prepare_and_exec(plan)
+}
+
+/// The steps that belong to the command itself, then `exec`: the rest of the
+/// setup, run in the command's own process. Only returns on failure.
+pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
     mark_inherited_fds_cloexec(&plan.inherited_fds)?;
     apply_rlimits(plan)?;
     umask(Mode::from_bits_truncate(plan.umask));
@@ -140,6 +165,11 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
 /// `keep_ignored`. Shipyard ignores SIGPIPE (Rust does by default) and
 /// catches others; an ignored signal stays ignored across `exec`, which would
 /// silently change how the command behaves.
+///
+/// Setting a signal whose default is to be ignored (SIGCHLD, SIGWINCH,
+/// SIGURG, SIGCONT) to its default discards one that's pending, so a
+/// SIGWINCH forwarded this early is lost. Harmless: a command reads the
+/// window size itself when it starts.
 fn reset_signal_dispositions(keep_ignored: &[libc::c_int]) -> Result<(), Failure> {
     // SAFETY: a zeroed `sigaction` is a valid value (no handler, no flags,
     // empty mask); we then set the handler to SIG_DFL.
@@ -175,23 +205,53 @@ fn wait_for_go(pipe: RawFd) -> Result<(), Failure> {
     }
 }
 
+/// A session of its own (`setsid`): no controlling terminal, and its own
+/// process group.
+#[cfg(target_os = "linux")]
+fn start_session() -> Result<(), Failure> {
+    // SAFETY: `setsid` is async-signal-safe.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(Failure::at(ChildStep::Session, Errno::last()));
+    }
+    Ok(())
+}
+
+/// Joins a running container's namespaces, in the order given (the mount
+/// namespace last). This process is single-threaded, which joining a mount
+/// namespace requires.
+#[cfg(target_os = "linux")]
+fn join_namespaces(join: &super::plan::JoinSetup) -> Result<(), Failure> {
+    for namespace in &join.namespaces {
+        // SAFETY: `setns` is a plain system call; the descriptor was opened
+        // before the fork.
+        if unsafe { libc::setns(namespace.fd, namespace.flag) } == -1 {
+            return Err(Failure {
+                step: ChildStep::JoinNamespace,
+                errno: Errno::last(),
+                detail: namespace.index,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Inside the new namespaces: a session of its own (no controlling
 /// terminal, its own process group), mounts that don't propagate to the
 /// host, a `/proc` for the new PID namespace, and the hostname.
 #[cfg(target_os = "linux")]
 fn set_up_container(container: &super::plan::ContainerSetup) -> Result<(), Failure> {
-    // SAFETY: `setsid` is async-signal-safe.
-    if unsafe { libc::setsid() } == -1 {
-        return Err(Failure::at(ChildStep::Session, Errno::last()));
-    }
+    start_session()?;
     if container.private_mounts {
         // First, before any mount: on hosts where `/` is shared (systemd),
-        // a mount made here would otherwise appear on the host too.
+        // a mount made here would otherwise appear on the host too. Slave,
+        // not private (as runc does): nothing propagates out, but the
+        // host's unmounts still propagate in, so a device unmounted on the
+        // host isn't kept busy by the container's copy of the mount.
         mount(
             None,
             c"/",
             None,
-            libc::MS_REC | libc::MS_PRIVATE,
+            libc::MS_REC | libc::MS_SLAVE,
             ChildStep::MountPrivate,
         )?;
     }
@@ -362,6 +422,17 @@ fn chdir(plan: &ChildPlan) -> Result<(), Errno> {
 /// Switches to the target user and groups, in the only safe order (groups,
 /// then group, then user: after `setuid` the others are no longer allowed),
 /// then checks that it worked.
+///
+/// These rely on the 64-bit-only build (see `lib.rs`): on 32-bit Linux,
+/// `SYS_setresuid` and friends are the old 16-bit calls.
+///
+/// **On Linux, raw system calls, not the C library's wrappers.** The kernel
+/// keeps credentials per thread; glibc's wrappers make the change for the
+/// whole process by signalling every other thread and waiting for each to
+/// follow. After our raw `clone` (see `clone.rs`), glibc still lists the
+/// parent's threads, which don't exist here: the wait never ends. (It hung,
+/// in a test binary with other threads running.) This process has one
+/// thread, so the raw call is the whole change.
 fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
     set_groups(&credentials.groups)?;
     set_gid(credentials.gid)?;
@@ -369,13 +440,18 @@ fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
     verify_credentials(credentials)
 }
 
-/// Raw `libc::setgroups` on both platforms: nix doesn't offer it on macOS,
-/// and its `Gid` isn't guaranteed to have `gid_t`'s layout, so a `&[Gid]`
-/// can't be handed to the kernel as an array of `gid_t`.
+/// The raw `setgroups` system call (see [`switch_credentials`]).
+#[cfg(target_os = "linux")]
 fn set_groups(groups: &[libc::gid_t]) -> Result<(), Failure> {
-    #[cfg(target_os = "linux")]
-    let count = groups.len();
-    #[cfg(not(target_os = "linux"))]
+    // SAFETY: `groups` is a valid array of `len` group IDs for the duration
+    // of the call; the kernel only reads it.
+    let rc = unsafe { libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::SetGroups, errno))
+}
+
+/// Raw `libc::setgroups`: nix doesn't offer it on macOS.
+#[cfg(not(target_os = "linux"))]
+fn set_groups(groups: &[libc::gid_t]) -> Result<(), Failure> {
     let count = libc::c_int::try_from(groups.len())
         .map_err(|_| Failure::at(ChildStep::SetGroups, Errno::EINVAL))?;
     // SAFETY: `groups` is a valid array of `count` group IDs for the duration
@@ -387,9 +463,13 @@ fn set_groups(groups: &[libc::gid_t]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The raw `setresgid` system call (see [`switch_credentials`]).
 #[cfg(target_os = "linux")]
 fn set_gid(gid: Gid) -> Result<(), Failure> {
-    nix::unistd::setresgid(gid, gid, gid).map_err(|errno| Failure::at(ChildStep::SetGid, errno))
+    let gid = gid.as_raw();
+    // SAFETY: plain integer arguments.
+    let rc = unsafe { libc::syscall(libc::SYS_setresgid, gid, gid, gid) };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::SetGid, errno))
 }
 
 /// As root, `setgid` sets the real, effective and saved group IDs.
@@ -398,15 +478,25 @@ fn set_gid(gid: Gid) -> Result<(), Failure> {
     nix::unistd::setgid(gid).map_err(|errno| Failure::at(ChildStep::SetGid, errno))
 }
 
+/// The raw `setresuid` system call (see [`switch_credentials`]).
 #[cfg(target_os = "linux")]
 fn set_uid(uid: Uid) -> Result<(), Failure> {
-    nix::unistd::setresuid(uid, uid, uid).map_err(|errno| Failure::at(ChildStep::SetUid, errno))
+    let uid = uid.as_raw();
+    // SAFETY: plain integer arguments.
+    let rc = unsafe { libc::syscall(libc::SYS_setresuid, uid, uid, uid) };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::SetUid, errno))
 }
 
 /// As root, `setuid` sets the real, effective and saved user IDs.
 #[cfg(not(target_os = "linux"))]
 fn set_uid(uid: Uid) -> Result<(), Failure> {
     nix::unistd::setuid(uid).map_err(|errno| Failure::at(ChildStep::SetUid, errno))
+}
+
+/// A raw system call's return value: -1 and `errno` on failure.
+#[cfg(target_os = "linux")]
+fn raw_result(rc: libc::c_long) -> Result<(), Errno> {
+    if rc == -1 { Err(Errno::last()) } else { Ok(()) }
 }
 
 /// Refuses to continue unless every ID changed and root's privileges are
@@ -418,7 +508,7 @@ fn verify_credentials(credentials: &Credentials) -> Result<(), Failure> {
         return Err(mismatch());
     }
     // Dropping root must be permanent: getting it back has to fail.
-    if !credentials.uid.is_root() && nix::unistd::setuid(Uid::from_raw(0)).is_ok() {
+    if !credentials.uid.is_root() && set_uid(Uid::from_raw(0)).is_ok() {
         return Err(mismatch());
     }
     Ok(())
@@ -522,11 +612,20 @@ fn exec_first_candidate(plan: &ChildPlan) -> Failure {
 /// Writes the failure record. Best effort: if the write fails there is no one
 /// to tell, and the parent falls back to the exit status.
 fn report_failure(report: RawFd, failure: &Failure) {
-    let record = encode(failure.step, failure.errno as i32, failure.detail);
+    write_record(
+        report,
+        &encode(failure.step, failure.errno as i32, failure.detail),
+    );
+}
+
+/// Writes a small record to a pipe in one `write`, retrying only if a
+/// signal interrupted it. Small pipe writes are atomic: the reader gets all
+/// of it or none. Best effort: if the write fails, there's no one to tell.
+pub(super) fn write_record(pipe: RawFd, record: &[u8]) {
     loop {
-        // SAFETY: `record` is a valid buffer of `record.len()` bytes, and
-        // `write` is async-signal-safe.
-        let written = unsafe { libc::write(report, record.as_ptr().cast(), record.len()) };
+        // SAFETY: `record` is valid for its length, and `write` is
+        // async-signal-safe.
+        let written = unsafe { libc::write(pipe, record.as_ptr().cast(), record.len()) };
         if written != -1 || Errno::last() != Errno::EINTR {
             return;
         }

@@ -45,6 +45,29 @@ pub(crate) struct ChildPlan {
     /// The container setup to do inside new namespaces, if isolated.
     #[cfg(target_os = "linux")]
     pub(crate) container: Option<ContainerSetup>,
+    /// The namespaces to join, if joining a running process's.
+    #[cfg(target_os = "linux")]
+    pub(crate) join: Option<JoinSetup>,
+}
+
+/// The namespaces the child joins (see `join.rs`), in order. The PID
+/// namespace isn't here: shipyard sets it up around the fork.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct JoinSetup {
+    pub(crate) namespaces: Vec<JoinedNamespace>,
+}
+
+/// One namespace for the child to join.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JoinedNamespace {
+    /// A descriptor for it, opened before the fork.
+    pub(crate) fd: RawFd,
+    /// Its `CLONE_NEW*` flag, for `setns` to check the kind.
+    pub(crate) flag: libc::c_int,
+    /// Its index in `Namespace::ALL`, to name it in a failure report.
+    pub(crate) index: u64,
 }
 
 /// The child's view of the go pipe.
@@ -66,6 +89,40 @@ pub(crate) struct ContainerSetup {
     /// Mount a fresh `/proc` for the new PID namespace.
     pub(crate) mount_proc: bool,
     pub(crate) hostname: Option<CString>,
+    /// The container's init, with a new PID namespace (see `init.rs`).
+    /// Without one, nothing needs it: the command is started directly.
+    pub(crate) init: Option<InitSetup>,
+}
+
+/// What the container's init needs (see `init.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) struct InitSetup {
+    /// Where the init sends the command's raw wait status.
+    pub(crate) status_write: RawFd,
+    /// The shipyard binary, opened before the clone, which the init re-execs
+    /// as a clean process.
+    pub(crate) exe: RawFd,
+    /// `/proc/self/fd/<exe>`: the same binary as a path, for when `execveat`
+    /// isn't available (inside, `/proc` is the container's own, which shows
+    /// the init's descriptors).
+    pub(crate) exe_path: CString,
+    /// The re-exec'd init's arguments: the hidden entry point, the status
+    /// pipe's descriptor and the command's PID (always 2; checked).
+    pub(crate) argv: CStringArray,
+    /// The re-exec'd init's environment: empty.
+    pub(crate) env: CStringArray,
+}
+
+/// The descriptors only a spawn with a container init has: see
+/// [`InitSetup`].
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux container init reads them")
+)]
+pub(crate) struct InitFds {
+    pub(crate) status_write: RawFd,
+    pub(crate) exe: RawFd,
 }
 
 /// The user and groups to switch to.
@@ -138,6 +195,12 @@ impl ChildPlan {
         spec: &ProcessSpec,
         options: &SpawnOptions,
         handshake: Handshake,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            allow(unused_variables, reason = "only Linux has the container init")
+        )]
+        init_fds: Option<InitFds>,
+        #[cfg(target_os = "linux")] join: Option<JoinSetup>,
     ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
         let credentials = credentials_for(&spec.user)?;
@@ -189,11 +252,14 @@ impl ChildPlan {
             keep_ignored: options.keep_ignored.clone(),
             handshake,
             #[cfg(target_os = "linux")]
+            // `spawn` opens the init's descriptors exactly when it needs one.
             container: options
-                .isolation
-                .as_ref()
-                .map(container_setup)
+                .placement
+                .isolation()
+                .map(|isolation| container_setup(isolation, init_fds))
                 .transpose()?,
+            #[cfg(target_os = "linux")]
+            join,
         };
         let context = FailureContext {
             program: PathBuf::from(program),
@@ -214,7 +280,10 @@ impl ChildPlan {
 /// The setup steps an isolation needs. `validate` already guaranteed that a
 /// PID namespace comes with a mount namespace, and a hostname with a UTS one.
 #[cfg(target_os = "linux")]
-fn container_setup(isolation: &crate::isolation::Isolation) -> Result<ContainerSetup> {
+fn container_setup(
+    isolation: &crate::isolation::Isolation,
+    init_fds: Option<InitFds>,
+) -> Result<ContainerSetup> {
     use crate::isolation::Namespace;
     isolation.validate()?;
     Ok(ContainerSetup {
@@ -225,6 +294,27 @@ fn container_setup(isolation: &crate::isolation::Isolation) -> Result<ContainerS
             .as_deref()
             .map(|name| c_string(name.as_bytes(), "the hostname"))
             .transpose()?,
+        init: init_fds.map(init_setup).transpose()?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn init_setup(fds: InitFds) -> Result<InitSetup> {
+    Ok(InitSetup {
+        status_write: fds.status_write,
+        exe: fds.exe,
+        exe_path: c_string(
+            format!("/proc/self/fd/{}", fds.exe).as_bytes(),
+            "the binary",
+        )?,
+        argv: CStringArray::new(vec![
+            // What `ps -f` shows for PID 1 (its name is set too).
+            c"shipyard-init".to_owned(),
+            CString::from(super::INIT_ENTRY_ARG),
+            c_string(fds.status_write.to_string().as_bytes(), "the status pipe")?,
+            c"2".to_owned(),
+        ]),
+        env: CStringArray::new(Vec::new()),
     })
 }
 
@@ -324,15 +414,9 @@ fn raw_limit(limit: &Rlimit) -> Result<RawLimit, SpecError> {
     })
 }
 
-/// The kernel's number for a resource. libc's constants, not nix's enum: nix
-/// leaves out `MEMLOCK` and `NPROC` on macOS, though macOS has both.
-#[cfg_attr(
-    target_os = "linux",
-    allow(
-        clippy::unnecessary_wraps,
-        reason = "every kind exists on Linux, but not on macOS"
-    )
-)]
+/// The kernel's number for a resource, if this platform has it. libc's
+/// constants, not nix's enum: nix leaves out `MEMLOCK` and `NPROC` on macOS,
+/// though macOS has both.
 fn resource_of(kind: RlimitKind) -> Option<RawResource> {
     match kind {
         RlimitKind::As => Some(libc::RLIMIT_AS),
@@ -344,30 +428,44 @@ fn resource_of(kind: RlimitKind) -> Option<RawResource> {
         RlimitKind::Nofile => Some(libc::RLIMIT_NOFILE),
         RlimitKind::Nproc => Some(libc::RLIMIT_NPROC),
         RlimitKind::Stack => Some(libc::RLIMIT_STACK),
-        #[cfg(target_os = "linux")]
+        // Listed, not `_`: a new kind must be placed on purpose.
+        RlimitKind::Locks
+        | RlimitKind::Msgqueue
+        | RlimitKind::Nice
+        | RlimitKind::Rss
+        | RlimitKind::Rtprio
+        | RlimitKind::Rttime
+        | RlimitKind::Sigpending => linux_only_resource(kind),
+    }
+}
+
+/// The resources only Linux has.
+#[cfg(target_os = "linux")]
+fn linux_only_resource(kind: RlimitKind) -> Option<RawResource> {
+    match kind {
         RlimitKind::Locks => Some(libc::RLIMIT_LOCKS),
-        #[cfg(target_os = "linux")]
         RlimitKind::Msgqueue => Some(libc::RLIMIT_MSGQUEUE),
-        #[cfg(target_os = "linux")]
         RlimitKind::Nice => Some(libc::RLIMIT_NICE),
-        #[cfg(target_os = "linux")]
         RlimitKind::Rss => Some(libc::RLIMIT_RSS),
-        #[cfg(target_os = "linux")]
         RlimitKind::Rtprio => Some(libc::RLIMIT_RTPRIO),
-        #[cfg(target_os = "linux")]
         RlimitKind::Rttime => Some(libc::RLIMIT_RTTIME),
-        #[cfg(target_os = "linux")]
         RlimitKind::Sigpending => Some(libc::RLIMIT_SIGPENDING),
-        #[cfg(not(target_os = "linux"))]
+        // The kinds every platform has are handled by `resource_of`.
         _ => None,
     }
+}
+
+/// The resources only Linux has: none here.
+#[cfg(not(target_os = "linux"))]
+fn linux_only_resource(_kind: RlimitKind) -> Option<RawResource> {
+    None
 }
 
 /// `kern.maxfilesperproc`: the most descriptors macOS lets one process have.
 #[cfg(target_os = "macos")]
 fn max_open_files_per_process() -> Option<libc::rlim_t> {
     let mut value: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
+    let mut len = size_of::<libc::c_int>();
     // SAFETY: `value` and `len` describe a valid, writable c_int buffer, the
     // name is a NUL-terminated string, and no new value is being set.
     let rc = unsafe {

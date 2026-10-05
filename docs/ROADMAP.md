@@ -14,12 +14,12 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 |---|-------|---------|-----------|--------|
 | 0 | **Foundation** | Workspace, lints, CI, docs, UI concept | — | done |
 | 1 | **Process lifecycle** *(POSIX: runs natively on macOS)* | `shipyard run -- /bin/sh` spawns, waits, forwards signals, stops gracefully, returns the exit code; reaps and cleans up everything the command started | TLPI 6, 20–22, 24–27, 34 | [done](stages/01-process-lifecycle.md) |
-| 2 | **Namespaces** | `clone3` / `unshare` into PID, mount, UTS, IPC (then net, user, cgroup, time); own session; minimal PID 1 init; `setns` to join a running container | TLPI 28; `namespaces(7)`, `pid_namespaces(7)` | [in progress](stages/02-namespaces.md) |
-| 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names | TLPI 14, 18; `mount_namespaces(7)`, `pivot_root(2)`; OCI runtime spec | |
+| 2 | **Namespaces** | PID, mount, UTS and IPC namespaces (`clone3`); own session; a minimal PID-1 init; `setns` to join a running container. The other namespaces moved to stages 4, 5 and 7 | TLPI 26, 28, 34; `namespaces(7)`, `pid_namespaces(7)`, `setns(2)` | [done](stages/02-namespaces.md) |
+| 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names; domain name and namespaced sysctls | TLPI 14, 18; `mount_namespaces(7)`, `pivot_root(2)`; OCI runtime spec | |
 | 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp, device access control | TLPI 8, 9, 39; `user_namespaces(7)`, `seccomp(2)` | |
-| 5 | **Resource control** | cgroups v2 limits, OOM detection, live stats, pause/resume | TLPI 36; `cgroups(7)` | |
+| 5 | **Resource control** | cgroups v2 limits and cgroup namespaces, OOM detection, live stats, pause/resume | TLPI 36; `cgroups(7)` | |
 | 6 | **Images & storage** | Registry pulls, OCI/Docker manifests, safe layer unpacking, content-addressed store, overlayfs, volumes | OCI image & distribution specs; `overlayfs` docs | |
-| 7 | **Networking** | Bridge + veth over netlink, IPAM, NAT, published ports, rootless networking, embedded DNS | TLPI 56–61; `netlink(7)`, `network_namespaces(7)` | |
+| 7 | **Networking** | Network namespaces, bridge + veth over netlink, IPAM, NAT, published ports, rootless networking, embedded DNS | TLPI 56–61; `netlink(7)`, `network_namespaces(7)` | |
 | 8 | **Terminals, I/O & logs** | Per-container monitor, PTYs, attach/detach, `exec`, log files with rotation, `cp` | TLPI 44, 62–64 | |
 | 9 | **Engine state** | On-disk state, locking, crash recovery, restart policies, health checks, events | TLPI 37, 55 | |
 | 10 | **Compose** | `compose.yaml` subset; `up / down / ps / logs`; dependency-ordered start | Compose spec | |
@@ -69,6 +69,14 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
   `nix`, and raw `libc` only where neither does (stage 1, step 1).
   - `nix` over `rustix`: rustix offers no safe `fork`, `execve` or credential-changing
     API for this use, and nix covers the later stages' `clone`, `mount` and `setns`.
+- **The container's PID 1 is Shipyard's own init** (stage 2). It re-execs the running
+  binary to start clean, so every binary that runs containers calls
+  `process::init_entry_point()` first in `main`. Its status pipe is never trusted beyond
+  what its own exit code confirms.
+- **After a raw `clone`, the child uses raw system calls** where glibc would keep
+  process-wide state (the `setuid` family). They rely on the 64-bit-only build (stage 1).
+- **Container mounts are recursively slave** of the host's (stage 2): nothing leaks out,
+  and host unmounts reach in.
 - **No image building before stage 11.** It's out of scope until then; see
   [FEATURES.md](FEATURES.md#out-of-scope-on-purpose).
 

@@ -1,5 +1,7 @@
 /*
-
+ * Kernel checks behind isolating a command (stage 2): what PID 1 of a new
+ * PID namespace receives, what clone3 does under seccomp, and a fresh /proc.
+ *
  * Run it in a privileged Linux container (needs CAP_SYS_ADMIN for the
  * namespace checks), and once unprivileged (to see seccomp's effect):
  *

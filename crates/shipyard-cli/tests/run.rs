@@ -18,11 +18,11 @@
     reason = "in a test crate, a panic is a test failure with a clear message"
 )]
 
-mod common;
-
 use std::process::Command;
 
-use common::{Run, block, ignore, is_root, killed_by, run, shipyard, shipyard_run_with};
+use shipyard_test_support::{Run, Shipyard, block, ignore, is_root, killed_by, run};
+
+const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -36,7 +36,7 @@ const BAD_INTERPRETER: &str = concat!(
 );
 
 fn shipyard_run(args: &[&str]) -> Run {
-    run(shipyard(&[&["run", "--no-isolation"], args].concat()))
+    run(SHIPYARD.command(&[&["run", "--no-isolation"], args].concat()))
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn root_switches_user_and_drops_its_own_groups() {
 
 /// Runs shipyard with `setup` applied to its process just before it runs.
 fn hostile(args: &[&str], setup: fn() -> std::io::Result<()>) -> Run {
-    run(shipyard_run_with(args, setup))
+    run(SHIPYARD.run_unisolated_with(args, setup))
 }
 
 #[test]
@@ -348,7 +348,7 @@ fn descriptors_above_a_lowered_limit_do_not_reach_the_command() {
 #[test]
 fn environment_values_never_reach_the_logs() {
     // Also a value given without `KEY=`, which looks like a name.
-    let run = run(shipyard(&[
+    let run = run(SHIPYARD.command(&[
         "--log-level",
         "trace",
         "run",
@@ -372,16 +372,10 @@ fn environment_values_never_reach_the_logs() {
 #[test]
 fn hostname_mistakes_are_usage_errors() {
     // Contradictory flags.
-    let both = run(shipyard(&[
-        "run",
-        "--no-isolation",
-        "--hostname",
-        "box",
-        "true",
-    ]));
+    let both = run(SHIPYARD.command(&["run", "--no-isolation", "--hostname", "box", "true"]));
     assert_eq!(both.code, Some(125), "{}", both.stderr);
     // An invalid name; on macOS, no namespaces to give one to.
-    let bad = run(shipyard(&["run", "--hostname", "bad_name", "true"]));
+    let bad = run(SHIPYARD.command(&["run", "--hostname", "bad_name", "true"]));
     assert_eq!(bad.code, Some(125), "{}", bad.stderr);
     assert!(bad.stderr.contains("hostname"), "{}", bad.stderr);
 }

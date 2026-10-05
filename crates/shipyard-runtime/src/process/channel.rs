@@ -7,6 +7,8 @@
 //!   for one byte before setting up, so the parent can finish its own part
 //!   first. The parent keeps its end open until `exec` resolves, which also
 //!   tells the child whether the parent is still alive (see `child.rs`).
+//! - **The status pipe** (container init → parent): the command's raw wait
+//!   status, which the init can't pass on as its own (see `init.rs`).
 //!
 //! Both ends are close-on-exec. If `exec` succeeds, the kernel closes the
 //! child's write end and the parent reads end-of-file. If it fails, the child
@@ -37,6 +39,115 @@ pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd)> {
 pub(crate) fn go_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let (read, write) = cloexec_pipe()?;
     Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+/// Creates the status pipe, returning `(read, write)`: close-on-exec, above
+/// stdio, and both ends non-blocking. Reading it never hangs, and neither
+/// does the init's writing: whatever is in the container can reach the
+/// pipe through `/proc/1/fd` and fill it, and a blocked init would stop
+/// forwarding signals and reaping.
+pub(crate) fn status_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = cloexec_pipe()?;
+    let read = above_stdio(read)?;
+    let write = above_stdio(write)?;
+    set_nonblocking(&read)?;
+    set_nonblocking(&write)?;
+    Ok((read, write))
+}
+
+/// Makes reads from and writes to `pipe` return EAGAIN instead of blocking.
+fn set_nonblocking(pipe: &OwnedFd) -> Result<()> {
+    let flags =
+        fcntl(pipe, FcntlArg::F_GETFL).map_err(|e| Error::sys("reading a pipe's flags", e))?;
+    let flags = nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+    fcntl(pipe, FcntlArg::F_SETFL(flags))
+        .map_err(|e| Error::sys("making a pipe non-blocking", e))?;
+    Ok(())
+}
+
+// The status pipe, from the container's init to shipyard. The init sends a
+// [`StartMark`] once its loop runs, then, when the command has exited, one
+// status record (the raw wait status). Nothing else, ever: anything more or
+// different was written by someone else (see `read_init_report`).
+
+/// Size of a status record: one raw wait status.
+pub(crate) const STATUS_LEN: usize = 4;
+
+/// Size of a complete report: the start mark and the status record.
+const REPORT_LEN: usize = 1 + STATUS_LEN;
+
+/// The init's first byte on the status pipe: it runs, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum StartMark {
+    /// Re-exec'd as a clean process (see `init.rs`).
+    Clean = b'R',
+    /// Still the copy of shipyard: the re-exec failed.
+    Copy = b'C',
+}
+
+impl StartMark {
+    fn from_byte(byte: u8) -> Option<Self> {
+        [Self::Clean, Self::Copy]
+            .into_iter()
+            .find(|mark| *mark as u8 == byte)
+    }
+}
+
+/// Encodes a raw wait status. Runs in the init (Linux), so it only moves
+/// bytes.
+#[cfg(target_os = "linux")]
+pub(crate) fn encode_status(raw: libc::c_int) -> [u8; STATUS_LEN] {
+    raw.to_le_bytes()
+}
+
+/// What the status pipe said, read once the init has exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitReport {
+    /// Nothing: the init never got to its loop.
+    Nothing,
+    /// It started, but sent no status (it was killed first).
+    Started(StartMark),
+    /// It started, and the command ended with this raw wait status.
+    Finished(StartMark, libc::c_int),
+    /// Bytes that aren't the init's: forged or garbled. Not to be trusted.
+    Unexpected,
+}
+
+/// Reads what the init sent, without blocking, and accepts only exactly
+/// what the init sends.
+pub(crate) fn read_init_report(pipe: &OwnedFd) -> InitReport {
+    // Room for one byte more than a full report, to notice extra bytes.
+    let mut buf = [0u8; REPORT_LEN + 1];
+    let mut len = 0;
+    while let Some(free) = buf.get_mut(len..).filter(|free| !free.is_empty()) {
+        match nix::unistd::read(pipe.as_fd(), free) {
+            Ok(0) | Err(Errno::EAGAIN) => break,
+            Ok(n) => len += n,
+            Err(Errno::EINTR) => {}
+            // Unreadable: nothing in it can be trusted either.
+            Err(_) => return InitReport::Unexpected,
+        }
+    }
+    let Some(report) = buf.get(..len) else {
+        return InitReport::Unexpected;
+    };
+    match report {
+        [] => InitReport::Nothing,
+        [mark] => StartMark::from_byte(*mark).map_or(InitReport::Unexpected, InitReport::Started),
+        [mark, record @ ..] if report.len() == REPORT_LEN => {
+            match (
+                StartMark::from_byte(*mark),
+                <[u8; STATUS_LEN]>::try_from(record),
+            ) {
+                (Some(mark), Ok(raw)) => {
+                    InitReport::Finished(mark, libc::c_int::from_le_bytes(raw))
+                }
+                _ => InitReport::Unexpected,
+            }
+        }
+        _ => InitReport::Unexpected,
+    }
 }
 
 /// Tells the child to go ahead. If the child already died, the write fails
@@ -126,11 +237,7 @@ pub(crate) struct ReportReader {
 
 impl ReportReader {
     pub(crate) fn new(pipe: OwnedFd) -> Result<Self> {
-        let flags = fcntl(&pipe, FcntlArg::F_GETFL)
-            .map_err(|e| Error::sys("reading the report pipe's flags", e))?;
-        let flags = nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
-        fcntl(&pipe, FcntlArg::F_SETFL(flags))
-            .map_err(|e| Error::sys("making the report pipe non-blocking", e))?;
+        set_nonblocking(&pipe)?;
         Ok(Self {
             pipe,
             record: [0; RECORD_LEN],
@@ -201,6 +308,35 @@ mod tests {
         assert_eq!(decode(record), None);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn init_reports_parse_strictly() {
+        let report = |bytes: &[u8]| {
+            let (read, write) = status_pipe().unwrap();
+            if !bytes.is_empty() {
+                nix::unistd::write(&write, bytes).unwrap();
+            }
+            read_init_report(&read)
+        };
+        assert_eq!(report(b""), InitReport::Nothing, "and no blocking");
+        assert_eq!(report(b"R"), InitReport::Started(StartMark::Clean));
+        assert_eq!(report(b"C"), InitReport::Started(StartMark::Copy));
+        for raw in [0, 3 << 8, libc::SIGKILL, libc::SIGSEGV | 0x80] {
+            let mut bytes = vec![b'R'];
+            bytes.extend(encode_status(raw));
+            assert_eq!(report(&bytes), InitReport::Finished(StartMark::Clean, raw));
+        }
+        // Forged or garbled: no marker first, a short record, extra bytes.
+        assert_eq!(report(&[0, 0, 0, 0]), InitReport::Unexpected);
+        assert_eq!(report(b"R\x00\x07"), InitReport::Unexpected);
+        assert_eq!(report(b"R\x00\x07\x00\x00\x00"), InitReport::Unexpected);
+        // A full pipe doesn't block the writer.
+        let (_read, write) = status_pipe().unwrap();
+        let chunk = [0u8; 4096];
+        let full = (0..64).any(|_| nix::unistd::write(&write, &chunk) == Err(Errno::EAGAIN));
+        assert!(full, "the write end blocks instead of failing");
+    }
+
     #[test]
     fn go_pipe_ends_are_close_on_exec_and_above_stdio() {
         let (read, write) = go_pipe().unwrap();
@@ -241,10 +377,25 @@ mod tests {
         (ReportReader::new(read).unwrap(), write)
     }
 
+    /// Reads until the result is final. Another test in this process may
+    /// fork at any moment, and the forked child briefly holds a copy of this
+    /// pipe's write end: until it exits, end-of-file is (correctly) not there
+    /// yet, and the report is still pending.
+    fn read_settled(reader: &mut ReportReader) -> Result<Report> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let report = reader.read();
+            if !matches!(report, Ok(Report::Pending)) || std::time::Instant::now() > deadline {
+                return report;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn end_of_file_with_nothing_written_means_running() {
         let (mut reader, _) = reader_with(&[], true);
-        assert_eq!(reader.read().unwrap(), Report::Running);
+        assert_eq!(read_settled(&mut reader).unwrap(), Report::Running);
     }
 
     #[test]
@@ -269,6 +420,6 @@ mod tests {
     #[test]
     fn a_truncated_record_is_a_protocol_error() {
         let (mut reader, _) = reader_with(&[1, 0, 0], true);
-        assert!(reader.read().is_err());
+        assert!(read_settled(&mut reader).is_err());
     }
 }

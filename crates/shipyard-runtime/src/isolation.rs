@@ -8,6 +8,10 @@
 //!
 //! The shape follows the OCI runtime spec's `linux.namespaces` and `hostname`,
 //! so stage 3 can fill it from a `config.json`.
+//!
+//! [`Join`] describes the other direction: a new process entering the
+//! namespaces of one that's already running (`setns(2)`), as `exec` into a
+//! container does.
 
 use std::fmt;
 
@@ -79,6 +83,18 @@ impl Namespace {
             Self::Cgroup => libc::CLONE_NEWCGROUP,
             Self::Time => libc::CLONE_NEWTIME,
         }
+    }
+
+    /// Its position in [`Namespace::ALL`], which is how a forked child names
+    /// it in a failure report.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn index(self) -> u64 {
+        // Every kind is in ALL; the fallback can't happen.
+        Self::ALL
+            .iter()
+            .position(|&kind| kind == self)
+            .and_then(|index| u64::try_from(index).ok())
+            .unwrap_or(u64::MAX)
     }
 
     /// Whether this stage can create it. The others come with the stages that
@@ -155,18 +171,7 @@ impl Isolation {
     /// a mount namespace, a hostname without a UTS namespace, or a hostname
     /// that isn't valid.
     pub fn validate(&self) -> Result<(), IsolationError> {
-        for (index, namespace) in self.namespaces.iter().enumerate() {
-            if self
-                .namespaces
-                .get(..index)
-                .is_some_and(|before| before.contains(namespace))
-            {
-                return Err(IsolationError::Duplicate(*namespace));
-            }
-            if !namespace.is_supported() {
-                return Err(IsolationError::Unsupported(*namespace));
-            }
-        }
+        check_kinds(&self.namespaces)?;
         // The container gets a fresh /proc for its PID namespace. Without its
         // own mount namespace that mount would replace the host's /proc, and
         // every process on the machine would see the container's PIDs.
@@ -181,6 +186,80 @@ impl Isolation {
         }
         Ok(())
     }
+}
+
+/// Which running process's namespaces a command joins, and which of them.
+///
+/// The target is normally a container's init (PID 1 inside, seen from the
+/// host). Start from [`Join::standard`]: like [`Isolation`], it will gain
+/// fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Join {
+    /// The process whose namespaces to join, by its PID as shipyard sees it
+    /// (in shipyard's own PID namespace; on a plain host, the host's PID).
+    pub target: u32,
+    /// The namespaces to join. Each kind at most once.
+    pub namespaces: Vec<Namespace>,
+}
+
+impl Join {
+    /// Joins `target`'s PID, mount, UTS and IPC namespaces: the ones a
+    /// [standard](Isolation::standard) container has.
+    #[must_use]
+    pub fn standard(target: u32) -> Self {
+        Self {
+            target,
+            namespaces: Isolation::standard().namespaces,
+        }
+    }
+
+    /// Whether it joins `namespace`.
+    #[must_use]
+    pub fn has(&self, namespace: Namespace) -> bool {
+        self.namespaces.contains(&namespace)
+    }
+
+    /// Rejects what can't work, before anything starts.
+    ///
+    /// The mount namespace may be joined without the PID namespace (to work
+    /// on the container's files): the process then sees the container's
+    /// `/proc`, whose PIDs aren't its own, so `ps` and `/proc/self` mislead
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// No namespaces, a namespace given twice or not supported yet, or a PID
+    /// namespace without the mount namespace (whose `/proc` shows its PIDs).
+    pub fn validate(&self) -> Result<(), IsolationError> {
+        if self.namespaces.is_empty() {
+            return Err(IsolationError::NothingToJoin);
+        }
+        check_kinds(&self.namespaces)?;
+        // In the container's PID namespace but with the host's /proc, the
+        // process would see the wrong processes: `ps`, `kill $(pidof …)` and
+        // `/proc/self` would all mislead it.
+        if self.has(Namespace::Pid) && !self.has(Namespace::Mount) {
+            return Err(IsolationError::PidNeedsMount);
+        }
+        Ok(())
+    }
+}
+
+/// Each namespace at most once, and only the kinds this stage supports.
+fn check_kinds(namespaces: &[Namespace]) -> Result<(), IsolationError> {
+    for (index, namespace) in namespaces.iter().enumerate() {
+        if namespaces
+            .get(..index)
+            .is_some_and(|before| before.contains(namespace))
+        {
+            return Err(IsolationError::Duplicate(*namespace));
+        }
+        if !namespace.is_supported() {
+            return Err(IsolationError::Unsupported(*namespace));
+        }
+    }
+    Ok(())
 }
 
 /// A hostname as RFC 1123 describes one: dot-separated labels of letters,
@@ -238,14 +317,18 @@ pub enum IsolationError {
     /// A namespace kind a later stage adds.
     #[error("the {0} namespace isn't supported yet")]
     Unsupported(Namespace),
-    /// A PID namespace without a mount namespace: its `/proc` would be
-    /// mounted over the host's.
+    /// A PID namespace without a mount namespace: a new one's `/proc` would
+    /// be mounted over the host's; a joined one would be seen through the
+    /// host's `/proc`.
     #[error("a PID namespace needs a mount namespace too (for its own /proc)")]
     PidNeedsMount,
     /// A hostname was given, but no UTS namespace to set it in: it would
     /// change the host's hostname.
     #[error("setting the hostname needs a UTS namespace")]
     HostnameNeedsUts,
+    /// A [`Join`] with no namespaces to join.
+    #[error("no namespaces to join")]
+    NothingToJoin,
     /// The hostname isn't valid.
     #[error("invalid hostname \"{hostname}\": {reason}")]
     InvalidHostname {
@@ -312,6 +395,32 @@ mod tests {
             hostname: None,
         };
         assert_eq!(mount_only.validate(), Ok(()));
+    }
+
+    #[test]
+    fn joins_are_checked_like_isolations() {
+        assert_eq!(Join::standard(42).validate(), Ok(()));
+        let join = |namespaces: Vec<Namespace>| Join {
+            target: 42,
+            namespaces,
+        };
+        assert_eq!(
+            join(Vec::new()).validate(),
+            Err(IsolationError::NothingToJoin)
+        );
+        assert_eq!(
+            join(vec![Namespace::Uts, Namespace::Uts]).validate(),
+            Err(IsolationError::Duplicate(Namespace::Uts))
+        );
+        assert_eq!(
+            join(vec![Namespace::Network]).validate(),
+            Err(IsolationError::Unsupported(Namespace::Network))
+        );
+        assert_eq!(
+            join(vec![Namespace::Pid, Namespace::Uts]).validate(),
+            Err(IsolationError::PidNeedsMount)
+        );
+        assert_eq!(join(vec![Namespace::Uts]).validate(), Ok(()));
     }
 
     #[test]

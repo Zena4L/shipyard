@@ -29,17 +29,27 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 ## 2. Namespaces — stage 2
 
-- **Creating namespaces:** `clone3` / `unshare` into PID, mount, UTS, IPC, network, user,
-  cgroup and time namespaces.
+- **Creating namespaces:** `clone3` (falling back to `clone`) into new PID, mount, UTS and
+  IPC namespaces. Isolated by default on Linux; `--no-isolation` opts out.
 - **Joining namespaces:** `setns` into a running container. This is the basis of `exec`
   and the UI's Shell.
-- **Per-container identity:** hostname, domain name, and namespaced sysctls.
+- **Per-container identity:** the hostname (`--hostname`).
 - **Own session:** each container is a new session (`setsid`), detached from the host's
   terminal.
 - **Minimal PID 1 init** (tini-like): inside the container's PID namespace, reaps zombies,
-  forwards signals, and exits with the main process's code.
+  forwards signals, and exits with the main process's code. It re-execs itself clean, so
+  it holds none of the engine's command line or environment.
 - **Setup handshake:** a parent/child sync pipe, so the parent can finish setup before the
   child `exec`s the user's program.
+- **Moved to the stages that give them meaning:**
+  - network namespaces: stage 7;
+  - user namespaces: stage 4;
+  - cgroup namespaces: stage 5;
+  - the domain name and namespaced sysctls: stage 3 (from `config.json`);
+  - time namespaces: not planned yet;
+  - `unshare`: dropped, since `clone3` creates them all.
+
+  The reasons are in [the stage 2 notes](stages/02-namespaces.md#outcome).
 
 ## 3. Filesystem isolation and OCI bundles — stage 3
 
@@ -57,12 +67,16 @@ Shipyard has three layers, mirroring how the established tools split up:
   drives the runtime the way Podman drives runc.
 - **User and group names:** `--user nobody` and `--group-add wheel`, resolved from the
   container's own `/etc/passwd` and `/etc/group`.
+- **Domain name and namespaced sysctls:** from `config.json`'s `domainname` and
+  `linux.sysctl`. Only namespaced sysctls are accepted: the IPC ones (`kernel.shm*`,
+  `kernel.msg*`) from this stage, and `net.*` once containers have their own network
+  namespace (stage 7).
 
 ## 4. Users and security — stage 4
 
 - **Rootless:**
-  - user namespaces, with UID/GID maps applied via `newuidmap`/`newgidmap` from
-    `/etc/subuid`
+  - user namespaces (moved here from stage 2), with UID/GID maps applied via
+    `newuidmap`/`newgidmap` from `/etc/subuid`
   - root inside the container maps to an unprivileged user outside
 - **Capabilities:** a minimal default set, plus `--cap-add` / `--cap-drop`.
 - **`no_new_privs`:** setuid binaries can't gain privileges.
@@ -82,6 +96,10 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Change limits on a running container:** `update`.
 - **Pause and resume:** via `cgroup.freeze`.
 - **Rootless cgroups:** delegation through systemd.
+- **Cgroup namespaces** (moved here from stage 2): the container sees its own cgroup as
+  the root.
+- **Joined processes** (`exec`) join the container's cgroup, and a cgroup kill catches
+  anything that escaped the parent-death signal.
 
 ## 6. Images and storage — stage 6
 
@@ -118,6 +136,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 ## 7. Networking — stage 7
 
+- **Network namespaces** (moved here from stage 2): one per container, except in `host`
+  mode.
 - **Network modes:** `none`, `host`, `bridge`.
 - **Bridges and veth pairs:** created over netlink (rtnetlink), with no shelling out to `ip`.
 - **IP address management:** subnet allocation and persisted IP leases.

@@ -2,7 +2,7 @@
 //! `fg`/`bg`, hangup, and signals sent with `kill`.
 //!
 //! Each test starts a fake interactive shell on a pseudo-terminal (see
-//! `pty/mod.rs`), which runs shipyard as a job, and then types keys into the
+//! `shipyard_test_support::pty`), which runs shipyard as a job, and then types keys into the
 //! terminal like a user would.
 //!
 //! **This binary must stay single-threaded.** The fake shell is forked from it
@@ -12,9 +12,12 @@
 //! the standard test harness, which runs tests on threads: `main` below runs
 //! them one by one. Never start a thread here.
 //!
-//! Runs use `--no-isolation`: these test process behaviour that's the same
-//! with or without namespaces, without needing root. `isolation.rs` tests
-//! the namespaces.
+//! Most runs use `--no-isolation`: they test process behaviour that's the
+//! same with or without namespaces, without needing root. The isolated
+//! ones ([`ROOT_TESTS`]: Linux, root) test what a session of its own changes
+//! for the command: it's never in the terminal's foreground group and has no
+//! controlling terminal, so keys, window-size changes and hangups reach it
+//! only through shipyard. `isolation.rs` tests the namespaces themselves.
 
 #![allow(
     clippy::expect_used,
@@ -22,14 +25,22 @@
     reason = "in a test binary, a panic is a test failure with a clear message"
 )]
 
-mod common;
-mod pty;
-
 use std::io::Write as _;
 use std::process::ExitCode;
 
-use common::{child_of, killed_by};
-use pty::{Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped};
+use shipyard_test_support::pty::{
+    Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped,
+};
+use shipyard_test_support::{Shipyard, child_of, killed_by};
+
+const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
+
+/// A fake shell on a new pseudo-terminal, running `script` (see
+/// `shipyard_test_support::pty`).
+fn session(script: fn(&mut Shell)) -> Session {
+    // SAFETY: this binary is single-threaded (see the top of the file).
+    unsafe { Session::start(SHIPYARD.path(), script) }
+}
 
 const CTRL_C: &[u8] = b"\x03";
 const CTRL_BACKSLASH: &[u8] = b"\x1c";
@@ -60,6 +71,24 @@ const TESTS: &[(&str, fn())] = tests![
     kill_to_a_foreground_shipyard,
     term_is_passed_through_on_a_terminal,
     the_command_can_read_the_terminal,
+    window_size_changes_reach_the_command_once,
+];
+
+/// Tests of isolated runs: they need root, and Linux (for namespaces). Like
+/// libtest's `#[ignore = "needs root"]`, they run only with `--ignored` or
+/// `--include-ignored`, as the root passes do.
+const ROOT_TESTS: &[(&str, fn())] = tests![
+    isolated_ctrl_c_is_forwarded_exactly_once,
+    isolated_ctrl_c_ends_shipyard_by_sigint,
+    isolated_ctrl_backslash_quits_the_command,
+    isolated_ctrl_z_stops_only_shipyard,
+    an_isolated_command_that_stops_itself_resumes_with_ctrl_z_and_fg,
+    isolated_command_reads_the_terminal,
+    a_background_isolated_command_still_reads_the_terminal,
+    isolated_window_size_changes_reach_the_command,
+    isolated_command_has_no_controlling_terminal,
+    isolated_hangup_ends_the_command_and_shipyard,
+    an_isolated_command_ignoring_hangup_keeps_running,
 ];
 
 /// libtest options that take a value; their value is skipped so it isn't
@@ -75,9 +104,9 @@ const OPTIONS_WITH_VALUES: &[&str] = &[
 
 /// The tests to run, as libtest would pick them from `args`: names
 /// containing any filter (or equal to one, with `--exact`), minus `--skip`
-/// matches. These tests have no ignored ones, so `--ignored` picks none.
-/// Other libtest options are accepted and ignored, so
-/// `cargo test -- --include-ignored` works.
+/// matches. [`ROOT_TESTS`] count as ignored: `--ignored` picks only them,
+/// `--include-ignored` adds them (on Linux; there's no isolation elsewhere).
+/// Other libtest options are accepted and ignored.
 fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
     let mut filters = Vec::new();
     let mut skips = Vec::new();
@@ -94,6 +123,8 @@ fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
     }
     let exact = args.iter().any(|arg| arg == "--exact");
     let only_ignored = args.iter().any(|arg| arg == "--ignored");
+    let with_ignored = cfg!(target_os = "linux")
+        && (only_ignored || args.iter().any(|arg| arg == "--include-ignored"));
     let matches = |name: &str, pattern: &str| {
         if exact {
             name == pattern
@@ -101,11 +132,12 @@ fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
             name.contains(pattern)
         }
     };
-    TESTS
-        .iter()
+    let ordinary = TESTS.iter().filter(|_| !only_ignored);
+    let root = ROOT_TESTS.iter().filter(|_| with_ignored);
+    ordinary
+        .chain(root)
         .filter(|(name, _)| {
-            !only_ignored
-                && (filters.is_empty() || filters.iter().any(|f| matches(name, f)))
+            (filters.is_empty() || filters.iter().any(|f| matches(name, f)))
                 && !skips.iter().any(|skip| matches(name, skip))
         })
         .collect()
@@ -121,7 +153,7 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    pty::kill_everything_on_alarm();
+    shipyard_test_support::pty::kill_everything_on_alarm();
 
     println!("\nrunning {} tests", selected.len());
     let mut failed = Vec::new();
@@ -151,7 +183,7 @@ fn main() -> ExitCode {
         "\ntest result: {result}. {} passed; {} failed; 0 ignored; 0 measured; {} filtered out\n",
         selected.len() - failed.len(),
         failed.len(),
-        TESTS.len() - selected.len(),
+        TESTS.len() + ROOT_TESTS.len() - selected.len(),
     );
     if failed.is_empty() {
         ExitCode::SUCCESS
@@ -173,6 +205,17 @@ macro_rules! foreground_sh {
     };
 }
 
+/// Starts an isolated `shipyard run sh -c SCRIPT` in the foreground and
+/// waits for it.
+macro_rules! foreground_isolated {
+    ($script:expr) => {
+        |shell: &mut Shell| {
+            let job = shell.spawn(Mode::Foreground, &["run", "sh", "-c", $script]);
+            shell.wait(job);
+        }
+    };
+}
+
 // --- Keys typed at the terminal ---
 
 /// The terminal delivers Ctrl-C to the command itself; shipyard must not
@@ -187,7 +230,7 @@ macro_rules! foreground_sh {
 /// markers the test waits for are split with `""` in the script: `re""ady`
 /// prints `ready`, but the logged arguments never contain `ready`.
 fn ctrl_c_reaches_the_command_exactly_once() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -223,7 +266,7 @@ fn ctrl_c_reaches_the_command_exactly_once() {
 /// When Ctrl-C kills the command, shipyard dies of SIGINT too, so the shell
 /// sees an interrupted job (and stops a loop around it).
 fn ctrl_c_ends_shipyard_by_sigint() {
-    let mut session = Session::start(foreground_sh!("echo ready; exec sleep 100"));
+    let mut session = session(foreground_sh!("echo ready; exec sleep 100"));
     session.job();
     session.expect("ready");
     session.type_keys(CTRL_C);
@@ -234,7 +277,7 @@ fn ctrl_c_ends_shipyard_by_sigint() {
 /// Ctrl-\ sends SIGQUIT to the command; shipyard reports the death as
 /// 128 + 3.
 fn ctrl_backslash_quits_the_command() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -261,7 +304,7 @@ fn ctrl_backslash_quits_the_command() {
 /// Ctrl-Z stops shipyard and the command together; `fg` resumes both, and
 /// the command still owns the terminal.
 fn ctrl_z_stops_both_and_fg_resumes() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -292,7 +335,7 @@ fn ctrl_z_stops_both_and_fg_resumes() {
 
 /// `bg` resumes a stopped job without the terminal; it runs to the end.
 fn bg_resumes_a_stopped_job() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -319,7 +362,7 @@ fn bg_resumes_a_stopped_job() {
 /// A background job that reads the terminal is stopped by SIGTTIN (shipyard
 /// with it, since they share a group) until `fg` gives it the terminal.
 fn a_background_job_reading_the_terminal_waits_for_fg() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Background,
             &[
@@ -347,7 +390,7 @@ fn a_background_job_reading_the_terminal_waits_for_fg() {
 /// A command that stops only itself makes shipyard stop too, so the shell
 /// sees a stopped job instead of a frozen terminal; `fg` resumes both.
 fn a_command_that_stops_itself_stops_shipyard_too() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -374,7 +417,7 @@ fn a_command_that_stops_itself_stops_shipyard_too() {
 
 /// When only shipyard is continued, it continues the command as well.
 fn continuing_shipyard_alone_continues_the_command() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -402,7 +445,7 @@ fn continuing_shipyard_alone_continues_the_command() {
 /// Closing the terminal: the shell sends the job SIGHUP, which ends the
 /// command, and shipyard exits with 128 + 1 instead of lingering.
 fn hangup_ends_the_command_and_shipyard() {
-    let mut session = Session::start(foreground_sh!("echo ready; exec sleep 100"));
+    let mut session = session(foreground_sh!("echo ready; exec sleep 100"));
     session.job();
     session.expect("ready");
     session.hang_up();
@@ -414,7 +457,7 @@ fn hangup_ends_the_command_and_shipyard() {
 
 /// A signal sent to a background shipyard's PID reaches the command.
 fn kill_to_a_background_shipyard_is_forwarded() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Background,
             &[
@@ -441,7 +484,7 @@ fn kill_to_a_background_shipyard_is_forwarded() {
 /// (documented in docs/user/run.md). USR1, sent second, is forwarded on both
 /// and marks the point by which a forwarded INT would have shown up.
 fn kill_to_a_foreground_shipyard() {
-    let mut session = Session::start(foreground_sh!(
+    let mut session = session(foreground_sh!(
         "trap 'echo got-int; kill $!' INT; trap 'echo got-usr1; kill $!; exit 0' USR1; echo ready; \
          while :; do sleep 100 & wait; done"
     ));
@@ -467,7 +510,7 @@ fn kill_to_a_foreground_shipyard() {
 
 /// On a terminal, the host's `TERM` is passed on to the command.
 fn term_is_passed_through_on_a_terminal() {
-    let mut session = Session::start(foreground_sh!("echo \"term=$TERM\""));
+    let mut session = session(foreground_sh!("echo \"term=$TERM\""));
     session.job();
     session.expect(&format!("term={TERM}"));
     assert_eq!(session.status(), Status::Exited(0));
@@ -477,7 +520,7 @@ fn term_is_passed_through_on_a_terminal() {
 /// The command can read the terminal: it's in the foreground group with
 /// shipyard, so reading doesn't stop it.
 fn the_command_can_read_the_terminal() {
-    let mut session = Session::start(foreground_sh!("read x; echo \"got $x\""));
+    let mut session = session(foreground_sh!("read x; echo \"got $x\""));
     session.job();
     session.type_keys(b"hi\n");
     session.expect("got hi");
@@ -489,7 +532,7 @@ fn the_command_can_read_the_terminal() {
 /// killed when `--stop-timeout` runs out. Shipyard mustn't follow it into a
 /// stop: stopped, it couldn't send the SIGKILL.
 fn a_stop_request_still_kills_a_command_that_stops_itself() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -522,7 +565,7 @@ fn a_stop_request_still_kills_a_command_that_stops_itself() {
 /// can't use the terminal at all on macOS, and shipyard would then run
 /// without one), and stays alive until the end so the terminal does too.
 fn without_job_control_shipyard_does_not_stop_itself() {
-    let mut session = Session::start(|shell| {
+    let mut session = session(|shell| {
         let job = shell.spawn_program(
             Mode::Foreground,
             "sh",
@@ -558,5 +601,298 @@ fn without_job_control_shipyard_does_not_stop_itself() {
         "shipyard stopped itself: {state:?}"
     );
     session.go();
+    session.finish();
+}
+
+/// A window-size change reaches the command once: the kernel sends SIGWINCH
+/// to the foreground group, which holds the command, so shipyard must not
+/// pass it on again (as for Ctrl-C).
+fn window_size_changes_reach_the_command_once() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "--debug",
+                "run",
+                "--no-isolation",
+                "sh",
+                "-c",
+                "trap 'stty size; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("sharing shipyard's process group");
+    session.expect("ready");
+    session.resize(40, 100);
+    session.expect("40 100");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(
+        session.count("forwarding a signal"),
+        0,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+// --- Isolated runs (root, Linux) ---
+//
+// The command is in a session of its own: never in the terminal's
+// foreground group, and without a controlling terminal. What the terminal
+// sends shipyard's group (keys, window size, hangup) reaches the command
+// only because shipyard forwards it, once.
+
+/// Ctrl-C reaches the command exactly once, through shipyard: the debug log
+/// shows one forwarded signal (see `ctrl_c_reaches_the_command_exactly_once`
+/// for the markers split with `""`).
+fn isolated_ctrl_c_is_forwarded_exactly_once() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "--debug",
+                "run",
+                "sh",
+                "-c",
+                "trap 'echo got-\"\"int; kill $!' INT; echo re\"\"ady; sleep 5 & wait; echo e\"\"nd",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("giving the command its own process group");
+    session.expect("ready");
+    session.type_keys(CTRL_C);
+    session.expect("got-int");
+    session.expect("end");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(session.count("got-int"), 1, "{}", session.transcript());
+    assert_eq!(
+        session.count("forwarding a signal"),
+        1,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// Ctrl-C kills the command, and shipyard dies of SIGINT too (the init
+/// passes the exact status on), so the shell sees an interrupted job.
+fn isolated_ctrl_c_ends_shipyard_by_sigint() {
+    let mut session = session(foreground_isolated!("echo ready; exec sleep 100"));
+    session.job();
+    session.expect("ready");
+    session.type_keys(CTRL_C);
+    assert_eq!(session.status(), Status::Signaled(libc::SIGINT));
+    session.finish();
+}
+
+/// Ctrl-\\ quits the command (131), forwarded once (see
+/// `isolated_ctrl_c_is_forwarded_exactly_once` for the split markers).
+fn isolated_ctrl_backslash_quits_the_command() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "--debug",
+                "run",
+                "--ulimit",
+                "core=0",
+                "sh",
+                "-c",
+                "echo re\"\"ady; exec sleep 100",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("giving the command its own process group");
+    session.expect("ready");
+    session.type_keys(CTRL_BACKSLASH);
+    assert_eq!(session.status(), Status::Exited(killed_by(libc::SIGQUIT)));
+    assert_eq!(
+        session.count("forwarding a signal"),
+        1,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// Ctrl-Z stops shipyard only. The command isn't in the terminal's group,
+/// so it keeps running, and its output keeps coming. When it finishes while
+/// shipyard is stopped, nothing reaps it until `fg` resumes shipyard, which
+/// then reports the result.
+fn isolated_ctrl_z_stops_only_shipyard() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "run",
+                "sh",
+                "-c",
+                // About 3 s of ticks: time enough for Ctrl-Z to land first.
+                "echo ready; i=0; while [ $i -lt 30 ]; do echo tick$i; i=$((i+1)); sleep 0.1; done; \
+                 echo finished",
+            ],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    session.expect("ready");
+    let init = child_of(shipyard);
+    session.type_keys(CTRL_Z);
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTSTP));
+    wait_until_stopped(shipyard);
+    assert!(
+        !process_state(init).starts_with('T'),
+        "the container was stopped too"
+    );
+    // Still running: its last lines arrive while shipyard is stopped.
+    session.expect("finished");
+    assert!(
+        process_state(shipyard).starts_with('T'),
+        "shipyard was resumed"
+    );
+    session.go();
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// In the foreground, the command reads the terminal. (Reading a terminal
+/// that isn't your controlling one is just reading a file.)
+fn isolated_command_reads_the_terminal() {
+    let mut session = session(foreground_isolated!("read x; echo \"got $x\""));
+    session.job();
+    session.type_keys(b"hi\n");
+    session.expect("got hi");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// A known limitation (docs/user/run.md): in the background, the command
+/// isn't stopped by SIGTTIN when it reads the terminal (only a process whose
+/// controlling terminal it is gets that), so it reads what's typed, competing
+/// with the shell. Without isolation it would stop
+/// (`a_background_job_reading_the_terminal_waits_for_fg`).
+fn a_background_isolated_command_still_reads_the_terminal() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Background,
+            &["run", "sh", "-c", "read x; echo \"got $x\""],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.type_keys(b"x\n");
+    session.expect("got x");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// Window-size changes are forwarded once, and the command sees the new
+/// size through its descriptor: `stty size` asks with `TIOCGWINSZ`, which
+/// works on any terminal descriptor.
+fn isolated_window_size_changes_reach_the_command() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "--debug",
+                "run",
+                "sh",
+                "-c",
+                "trap 'stty size; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("giving the command its own process group");
+    session.expect("ready");
+    session.resize(40, 100);
+    session.expect("40 100");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(
+        session.count("forwarding a signal"),
+        1,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// The command has no controlling terminal: `/dev/tty` can't be opened
+/// (ENXIO), though its descriptors are still the terminal. Programs that
+/// open `/dev/tty` to ask for a password fail (docs/user/run.md).
+fn isolated_command_has_no_controlling_terminal() {
+    let mut session = session(foreground_isolated!(
+        "tty; if (: < /dev/tty) 2>/dev/null; then echo has-c\"\"tty; else echo no-c\"\"tty; fi"
+    ));
+    session.job();
+    session.expect("/dev/pts/");
+    session.expect("no-ctty");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(session.count("has-ctty"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// Closing the terminal: SIGHUP reaches the command only through shipyard,
+/// and shipyard exits with 128 + 1.
+fn isolated_hangup_ends_the_command_and_shipyard() {
+    let mut session = session(foreground_isolated!("echo ready; exec sleep 100"));
+    session.job();
+    session.expect("ready");
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(killed_by(libc::SIGHUP)));
+    session.finish();
+}
+
+/// A command that ignores SIGHUP outlives the terminal (its writes fail,
+/// which this one doesn't mind), and shipyard keeps supervising it to the end.
+fn an_isolated_command_ignoring_hangup_keeps_running() {
+    let mut session = session(foreground_isolated!(
+        "trap '' HUP; echo ready; sleep 1; echo gone 2>/dev/null; exit 5"
+    ));
+    session.job();
+    session.expect("ready");
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(5));
+    session.finish();
+}
+
+/// A command that stops itself doesn't stop shipyard (it isn't in the
+/// terminal's group, so shipyard doesn't follow it), and the terminal seems
+/// to hang. The documented way out: Ctrl-Z stops shipyard, and `fg` resumes
+/// shipyard, which resumes the command (docs/user/run.md).
+fn an_isolated_command_that_stops_itself_resumes_with_ctrl_z_and_fg() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "sh", "-c", "echo ready; kill -STOP $$; echo resumed"],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    session.expect("ready");
+    let command = child_of(child_of(shipyard));
+    wait_until_stopped(command);
+    assert!(
+        !process_state(shipyard).starts_with('T'),
+        "shipyard stopped along with the command"
+    );
+    session.type_keys(CTRL_Z);
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTSTP));
+    session.go();
+    session.expect("resumed");
+    assert_eq!(session.status(), Status::Exited(0));
     session.finish();
 }

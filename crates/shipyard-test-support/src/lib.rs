@@ -1,36 +1,37 @@
-//! Helpers shared by the end-to-end test files.
+//! Helpers for Shipyard's end-to-end tests, shared by every test binary of
+//! `shipyard-cli`: starting the binary in a known state, hostile parents,
+//! timeouts, and (in [`pty`]) a fake interactive shell on a pseudo-terminal.
+//!
+//! A crate rather than a `tests/common` module, so that IDEs index it like any
+//! other code. Dev-only; never published.
 
-// Each test binary uses only part of these.
-#![allow(dead_code, reason = "each test binary uses a different part")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    reason = "test support: a panic is a test failure with a clear message"
+)]
+
+pub mod pty;
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 /// The longest any one shipyard run in a test may take.
-pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
-
-/// `shipyard run ARGS…` like [`shipyard`], with `setup` applied to the
-/// process just before shipyard starts: to start it in a deliberately bad
-/// state (a "hostile parent"). `setup` must only make async-signal-safe
-/// calls, as `pre_exec` requires (like [`block`] and [`ignore`]).
-pub(crate) fn shipyard_run_with(args: &[&str], setup: fn() -> std::io::Result<()>) -> Command {
-    let mut command = shipyard(&[&["run", "--no-isolation"], args].concat());
-    // SAFETY: `setup` only makes async-signal-safe calls (see above).
-    unsafe { command.pre_exec(setup) };
-    command
-}
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The exit code for a death by `signal`.
-pub(crate) fn killed_by(signal: libc::c_int) -> i32 {
+#[must_use]
+pub fn killed_by(signal: libc::c_int) -> i32 {
     128 + signal
 }
 
 /// Blocks `signal` in the calling process. For `pre_exec` hooks: only
 /// async-signal-safe calls.
-pub(crate) fn block(signal: libc::c_int) -> std::io::Result<()> {
+pub fn block(signal: libc::c_int) -> std::io::Result<()> {
     // SAFETY: `sigset_t` operations and `sigprocmask` are async-signal-safe,
     // and `set` is valid storage.
     unsafe {
@@ -46,7 +47,7 @@ pub(crate) fn block(signal: libc::c_int) -> std::io::Result<()> {
 
 /// Ignores `signal` in the calling process, as `nohup` does for SIGHUP. For
 /// `pre_exec` hooks: only async-signal-safe calls.
-pub(crate) fn ignore(signal: libc::c_int) -> std::io::Result<()> {
+pub fn ignore(signal: libc::c_int) -> std::io::Result<()> {
     // SAFETY: `signal` is async-signal-safe.
     if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
         return Err(std::io::Error::last_os_error());
@@ -54,40 +55,96 @@ pub(crate) fn ignore(signal: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A `shipyard` command, started in a new session with no controlling
-/// terminal, so it behaves the same whether the tests run from a terminal or
-/// in CI.
-pub(crate) fn shipyard(args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_shipyard"));
-    command.args(args);
-    // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+/// The `shipyard` binary under test. Each test file names it once:
+///
+/// ```ignore
+/// const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
+/// ```
+///
+/// (`CARGO_BIN_EXE_shipyard` only exists inside the package that builds the
+/// binary, so this crate can't name it itself.)
+#[derive(Debug, Clone, Copy)]
+pub struct Shipyard {
+    path: &'static str,
+}
+
+impl Shipyard {
+    /// The binary at `path`.
+    #[must_use]
+    pub const fn at(path: &'static str) -> Self {
+        Self { path }
     }
-    command
+
+    /// Its path.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        self.path
+    }
+
+    /// `shipyard ARGS…`, started in a new session with no controlling
+    /// terminal, so it behaves the same whether the tests run from a terminal
+    /// or in CI.
+    #[must_use]
+    pub fn command(self, args: &[&str]) -> Command {
+        let mut command = Command::new(self.path);
+        command.args(args);
+        // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    /// `shipyard ARGS…` like [`Shipyard::command`], with `setup` applied to
+    /// the process just before shipyard starts: to start it in a
+    /// deliberately bad state (a "hostile parent"). `setup` must only make
+    /// async-signal-safe calls, as `pre_exec` requires (like [`block`] and
+    /// [`ignore`]).
+    #[must_use]
+    pub fn command_with(self, args: &[&str], setup: fn() -> std::io::Result<()>) -> Command {
+        let mut command = self.command(args);
+        // SAFETY: `setup` only makes async-signal-safe calls (see above).
+        unsafe { command.pre_exec(setup) };
+        command
+    }
+
+    /// `shipyard run --no-isolation ARGS…`, with `setup` applied to the
+    /// process just before shipyard starts: to start it in a deliberately bad
+    /// state (a "hostile parent"). `setup` must only make async-signal-safe
+    /// calls, as `pre_exec` requires (like [`block`] and [`ignore`]).
+    #[must_use]
+    pub fn run_unisolated_with(self, args: &[&str], setup: fn() -> std::io::Result<()>) -> Command {
+        self.command_with(&[&["run", "--no-isolation"], args].concat(), setup)
+    }
 }
 
 /// How long a leftover shipyard gets to stop after SIGTERM before it's
 /// killed: longer than the default `--stop-timeout` (10 s).
-pub(crate) const STOP_GRACE: Duration = Duration::from_secs(15);
+pub const STOP_GRACE: Duration = Duration::from_secs(15);
 /// How long a process gets to disappear once it should be gone.
-pub(crate) const GONE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const GONE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) struct Run {
+/// How a finished shipyard run ended, and what it printed.
+#[derive(Debug)]
+pub struct Run {
     /// The exit code; `None` if shipyard itself was killed by a signal.
-    pub(crate) code: Option<i32>,
-    pub(crate) signal: Option<i32>,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
+    pub code: Option<i32>,
+    /// The signal that killed shipyard itself, if one did.
+    pub signal: Option<i32>,
+    /// Everything shipyard (and the command) wrote to stdout.
+    pub stdout: String,
+    /// Everything shipyard (and the command) wrote to stderr.
+    pub stderr: String,
 }
 
 /// Runs shipyard to completion, killing it if it takes longer than `TIMEOUT`.
-pub(crate) fn run(mut command: Command) -> Run {
+#[must_use]
+pub fn run(mut command: Command) -> Run {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -112,19 +169,23 @@ pub(crate) fn run(mut command: Command) -> Run {
     }
 }
 
-pub(crate) fn is_root() -> bool {
+/// Whether the tests run as root (effective user 0).
+#[must_use]
+pub fn is_root() -> bool {
     // SAFETY: `geteuid` has no preconditions.
     unsafe { libc::geteuid() == 0 }
 }
 
 /// A running shipyard whose stdout is read line by line.
-pub(crate) struct Running {
+#[derive(Debug)]
+pub struct Running {
     shipyard: Child,
     lines: Receiver<String>,
 }
 
 /// Starts `command` (a shipyard), reading its stdout line by line.
-pub(crate) fn start_command(mut command: Command) -> Running {
+#[must_use]
+pub fn start_command(mut command: Command) -> Running {
     command.stdin(Stdio::null()).stdout(Stdio::piped());
     let mut shipyard = command.spawn().expect("starting shipyard");
     let stdout = shipyard.stdout.take().unwrap();
@@ -141,36 +202,31 @@ pub(crate) fn start_command(mut command: Command) -> Running {
 }
 
 impl Running {
-    pub(crate) fn pid(&self) -> libc::pid_t {
+    /// Shipyard's process ID.
+    #[must_use]
+    pub fn pid(&self) -> libc::pid_t {
         libc::pid_t::try_from(self.shipyard.id()).unwrap()
     }
 
     /// The next line the command prints.
-    pub(crate) fn next_line(&self) -> String {
+    #[must_use]
+    pub fn next_line(&self) -> String {
         self.lines
             .recv_timeout(TIMEOUT)
             .expect("the command printed nothing")
     }
 
-    pub(crate) fn signal(&self, signal: libc::c_int) {
+    /// Sends `signal` to shipyard.
+    pub fn signal(&self, signal: libc::c_int) {
         // SAFETY: `pid` is the shipyard process this test started.
         assert_eq!(unsafe { libc::kill(self.pid(), signal) }, 0);
     }
 
     /// Waits for shipyard to exit; returns its exit code and the rest of the
     /// command's output.
-    pub(crate) fn finish(mut self) -> (i32, Vec<String>) {
-        let deadline = Instant::now() + TIMEOUT;
-        let status = loop {
-            if let Some(status) = self.shipyard.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() > deadline {
-                let _ = self.shipyard.kill();
-                panic!("shipyard did not finish within {TIMEOUT:?}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+    #[must_use]
+    pub fn finish(mut self) -> (i32, Vec<String>) {
+        let status = self.wait();
         let mut rest = Vec::new();
         // Lines still in flight; leftover background processes may keep the
         // pipe open, so stop after a quiet second rather than at end-of-file.
@@ -179,6 +235,28 @@ impl Running {
         }
         let code = status.code().expect("shipyard exited normally");
         (code, rest)
+    }
+
+    /// Waits for shipyard to finish and returns how it ended: for checking
+    /// that shipyard itself died by a signal.
+    #[must_use]
+    pub fn finish_status(mut self) -> ExitStatus {
+        self.wait()
+    }
+
+    /// Waits for shipyard to exit, killing it after [`TIMEOUT`].
+    fn wait(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.shipyard.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() > deadline {
+                let _ = self.shipyard.kill();
+                panic!("shipyard did not finish within {TIMEOUT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -205,7 +283,8 @@ impl Drop for Running {
 }
 
 /// Waits up to `GONE_TIMEOUT` for `pid` to be gone (not running, not a zombie).
-pub(crate) fn gone(pid: libc::pid_t) -> bool {
+#[must_use]
+pub fn gone(pid: libc::pid_t) -> bool {
     let deadline = Instant::now() + GONE_TIMEOUT;
     while Instant::now() < deadline {
         // SAFETY: `kill` with signal 0 only checks whether the process exists.
@@ -218,7 +297,8 @@ pub(crate) fn gone(pid: libc::pid_t) -> bool {
 }
 
 /// The PID of `parent`'s child, once it has one (`pgrep -P`).
-pub(crate) fn child_of(parent: libc::pid_t) -> libc::pid_t {
+#[must_use]
+pub fn child_of(parent: libc::pid_t) -> libc::pid_t {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let output = Command::new("pgrep")
