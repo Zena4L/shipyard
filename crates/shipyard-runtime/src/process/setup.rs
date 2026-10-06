@@ -28,7 +28,7 @@ use super::rlimit::{Rlimit, RlimitValue};
 use super::spec::{Names, ProcessSpec, User};
 use nix::mount::MsFlags;
 
-use crate::isolation::{Isolation, Mount, MountFlag, MountKind, Namespace, Root};
+use crate::isolation::{IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root};
 use crate::{Error, Result};
 
 /// The container's setup, as the clean image receives it.
@@ -64,6 +64,18 @@ pub(crate) struct Setup {
     /// The start gate's descriptor (`SpawnOptions::gate`), inherited: wait
     /// for it to be opened for reading before starting the command.
     pub(crate) gate: Option<RawFd>,
+    /// The command's capabilities and `no_new_privs` ([`Isolation::security`]).
+    pub(crate) security: crate::security::Security,
+    /// The user namespace, if there's one.
+    pub(crate) user_namespace: Option<UserNamespaceSetup>,
+}
+
+/// The container's user namespace, as the clean image needs it.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct UserNamespaceSetup {
+    /// Its ID maps ([`Isolation::id_maps`]): the command's IDs must be in
+    /// them.
+    pub(crate) maps: IdMaps,
 }
 
 /// The root filesystem part of the setup ([`Root`], as bytes).
@@ -75,6 +87,12 @@ pub(crate) struct RootSetup {
     readonly: Vec<Vec<u8>>,
     /// Mount `/dev/mqueue`: a new IPC namespace, whose queues it shows.
     pub(crate) mqueue: bool,
+    /// In a user namespace: `/dev`'s nodes and `/sys` are binds of the
+    /// host's (`mknod` and a new `sysfs` are refused there).
+    pub(crate) user_namespace: bool,
+    /// The group `/dev/pts`'s terminals belong to: `tty` (5), unless a user
+    /// namespace leaves it unmapped (the mount would be refused).
+    pub(crate) pts_gid: Option<u32>,
     /// More mounts, in order ([`Root::mounts`]).
     pub(crate) mounts: Vec<MountSetup>,
 }
@@ -136,7 +154,9 @@ impl MountSetup {
 }
 
 impl RootSetup {
-    fn new(root: &Root, mqueue: bool) -> Self {
+    fn new(root: &Root, mqueue: bool, id_maps: Option<&IdMaps>) -> Self {
+        /// The `tty` group in most distributions.
+        const TTY: u32 = 5;
         let bytes = |path: &PathBuf| path.as_os_str().as_bytes().to_vec();
         Self {
             path: bytes(&root.path),
@@ -144,6 +164,11 @@ impl RootSetup {
             masked: root.masked_paths.iter().map(bytes).collect(),
             readonly: root.readonly_paths.iter().map(bytes).collect(),
             mqueue,
+            user_namespace: id_maps.is_some(),
+            pts_gid: match id_maps {
+                Some(maps) => maps.host_gid(TTY).map(|_| TTY),
+                None => Some(TTY),
+            },
             mounts: root.mounts.iter().map(MountSetup::new).collect(),
         }
     }
@@ -236,11 +261,19 @@ impl Setup {
             sysctls: isolation.sysctls.clone(),
             init: isolation.has(Namespace::Pid),
             parent: (!isolation.has(Namespace::Pid)).then(|| nix::unistd::getpid().as_raw()),
-            root: isolation
-                .root
-                .as_ref()
-                .map(|root| RootSetup::new(root, isolation.has(Namespace::Ipc))),
+            root: isolation.root.as_ref().map(|root| {
+                RootSetup::new(
+                    root,
+                    isolation.has(Namespace::Ipc),
+                    isolation.id_maps.as_ref(),
+                )
+            }),
             gate,
+            security: isolation.security.clone(),
+            user_namespace: isolation
+                .id_maps
+                .as_ref()
+                .map(|maps| UserNamespaceSetup { maps: maps.clone() }),
         }
     }
 

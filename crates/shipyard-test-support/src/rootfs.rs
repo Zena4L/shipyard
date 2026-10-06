@@ -89,6 +89,21 @@ impl RootFs {
         }
     }
 
+    /// Gives everything in it to host user `uid` and group `gid`, as a user
+    /// namespace that maps root inside to them needs (`chown -R`, without
+    /// following symlinks).
+    pub fn chown_all(&self, uid: u32, gid: u32) {
+        fn walk(path: &Path, uid: u32, gid: u32) {
+            std::os::unix::fs::lchown(path, Some(uid), Some(gid)).unwrap();
+            if path.is_dir() && !path.is_symlink() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    walk(&entry.unwrap().path(), uid, gid);
+                }
+            }
+        }
+        walk(&self.dir, uid, gid);
+    }
+
     /// Removes the dynamic loader of `/bin/sh`: programs are still there,
     /// but can't start (ENOENT at exec).
     pub fn remove_loader(&self) {

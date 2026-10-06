@@ -11,16 +11,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use shipyard_runtime::container::{self, DEFAULT_ROOT};
+use shipyard_runtime::container;
 use shipyard_runtime::process::{self, Signal};
 
 /// Runs containers from OCI bundles, one lifecycle step per call.
 #[derive(Debug, Parser)]
 #[command(name = "shipyard-runtime", version)]
 struct Cli {
-    /// Directory for the containers' state.
-    #[arg(long, global = true, value_name = "DIR", default_value = DEFAULT_ROOT)]
-    root: PathBuf,
+    /// Directory for the containers' state [default: `/run/shipyard` for root,
+    /// `$XDG_RUNTIME_DIR/shipyard` for anyone else].
+    #[arg(long, global = true, value_name = "DIR")]
+    root: Option<PathBuf>,
 
     /// Also write errors and warnings to FILE (as runc's callers ask for).
     #[arg(long, global = true, value_name = "FILE")]
@@ -100,7 +101,10 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<()> {
-    let root = &cli.root;
+    let root = &match &cli.root {
+        Some(root) => root.clone(),
+        None => container::default_root()?,
+    };
     match &cli.command {
         Command::Create {
             bundle,
@@ -271,9 +275,10 @@ mod tests {
             "c1",
         ])
         .unwrap();
-        assert_eq!(cli.root, Path::new("/r"));
+        assert_eq!(cli.root.as_deref(), Some(Path::new("/r")));
         assert!(matches!(cli.command, Command::Create { ref id, .. } if id == "c1"));
         let cli = Cli::try_parse_from(["shipyard-runtime", "kill", "c1", "KILL"]).unwrap();
+        assert_eq!(cli.root, None, "the default is worked out when it's used");
         assert!(
             matches!(cli.command, Command::Kill { signal, .. } if signal.as_raw() == libc::SIGKILL)
         );

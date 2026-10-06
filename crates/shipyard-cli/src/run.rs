@@ -9,11 +9,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
-use shipyard_runtime::isolation::{Isolation, Root};
+use shipyard_runtime::isolation::{IdMap, IdMaps, Isolation, Namespace, Root, RootlessMaps};
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
 };
+use shipyard_runtime::security::seccomp::Profile;
+use shipyard_runtime::security::{Capabilities, Capability, CapabilitySet, Seccomp, Security};
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
@@ -47,8 +49,9 @@ pub(crate) struct RunArgs {
     stop_timeout: u64,
 
     /// Run without isolation: the command sees the host's processes, mounts,
-    /// hostname and IPC. On Linux, commands are isolated by default (which
-    /// needs root); on macOS they always run like this for now.
+    /// hostname and IPC, as you. On Linux, commands are isolated by default
+    /// (rootless, in a user namespace, without root); on macOS they always
+    /// run like this for now.
     #[arg(long)]
     no_isolation: bool,
 
@@ -74,6 +77,35 @@ pub(crate) struct RunArgs {
     #[arg(long, requires = "rootfs")]
     read_only: bool,
 
+    /// Give the command a capability on top of the default set, like
+    /// `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable
+    /// (Linux).
+    #[arg(long, value_name = "CAP", value_parser = parse_capability, conflicts_with = "no_isolation")]
+    cap_add: Vec<CapabilityArg>,
+
+    /// Take a capability out of the default set; `ALL` for every one.
+    /// Repeatable (Linux).
+    #[arg(long, value_name = "CAP", value_parser = parse_capability, conflicts_with = "no_isolation")]
+    cap_drop: Vec<CapabilityArg>,
+
+    /// A security option: `no-new-privileges=false` lets setuid programs
+    /// inside gain privileges (they can't by default); `seccomp=FILE` filters
+    /// system calls with a profile of your own, `seccomp=unconfined` not at
+    /// all (Docker's profile by default). Repeatable (Linux).
+    #[arg(long, value_name = "OPTION", value_parser = parse_security_opt, conflicts_with = "no_isolation")]
+    security_opt: Vec<SecurityOpt>,
+
+    /// Run in a user namespace: container IDs CONTAINER.. are host IDs
+    /// HOST.., SIZE of them, e.g. 0:100000:65536 (root inside is host user
+    /// 100000). Repeatable (Linux, root only: without root, the maps are
+    /// chosen for you).
+    #[arg(long, value_name = "CONTAINER:HOST:SIZE", value_parser = parse_id_map, conflicts_with = "no_isolation")]
+    uidmap: Vec<IdMap>,
+
+    /// The same for group IDs; the --uidmap ranges if not given (Linux).
+    #[arg(long, value_name = "CONTAINER:HOST:SIZE", value_parser = parse_id_map, requires = "uidmap")]
+    gidmap: Vec<IdMap>,
+
     /// Run the OCI bundle in DIR: its config.json says what to run and how,
     /// so no COMMAND or container options are given (Linux).
     #[arg(
@@ -82,6 +114,7 @@ pub(crate) struct RunArgs {
         conflicts_with_all = [
             "command", "env", "workdir", "user", "group_add", "ulimit",
             "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
+            "cap_add", "cap_drop", "security_opt", "uidmap", "gidmap",
         ],
     )]
     bundle: Option<PathBuf>,
@@ -117,7 +150,7 @@ impl RunArgs {
         if let Some(dir) = &self.bundle {
             return from_bundle(dir, stop);
         }
-        let isolation = self.isolation()?;
+        let (isolation, short_maps) = self.isolation()?;
         let mut user = match self.user {
             Some((name, group)) => {
                 let mut user = User::named(name, group);
@@ -126,6 +159,9 @@ impl RunArgs {
                 user.names.memberships = isolation.is_some();
                 user
             }
+            // Root inside, as Docker and Podman (for a rootless caller, root
+            // inside is the caller); without isolation, the caller.
+            None if isolation.is_some() => User::new(0, 0),
             None => User::current(),
         };
         user.names.additional_groups = dedup(self.group_add);
@@ -142,11 +178,23 @@ impl RunArgs {
         spec.user = user;
         spec.rlimits = last_wins(self.ulimit);
         spec.validate()?;
+        let mut warnings: Vec<String> = short_maps.into_iter().collect();
+        if isolation
+            .as_ref()
+            .and_then(|isolation| isolation.id_maps.as_ref())
+            .is_some_and(IdMaps::maps_host_root)
+        {
+            warnings.push(
+                "--uidmap/--gidmap map host ID 0: a user inside is root on the host's files, \
+                 which a user namespace is meant to prevent"
+                    .to_owned(),
+            );
+        }
         Ok(Invocation {
             spec,
             stop,
             isolation,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 }
@@ -160,6 +208,10 @@ fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
             std::env::consts::OS
         );
     }
+    // Without root, it runs rootless (see `load_bundle_for_caller`).
+    #[cfg(target_os = "linux")]
+    let bundle = shipyard_runtime::oci::load_bundle_for_caller(dir)?;
+    #[cfg(not(target_os = "linux"))]
     let bundle = shipyard_runtime::oci::load_bundle(dir)?;
     Ok(Invocation {
         spec: bundle.spec,
@@ -173,9 +225,11 @@ impl RunArgs {
     /// The isolation for this run: the standard namespaces on Linux unless
     /// `--no-isolation`; none on macOS, where namespaces don't exist (yet:
     /// the VM comes in a later version).
-    fn isolation(&self) -> Result<Option<Isolation>> {
+    /// The isolation for this run, and a warning if a rootless caller's
+    /// user namespace maps fewer IDs than it could.
+    fn isolation(&self) -> Result<(Option<Isolation>, Option<String>)> {
         if self.no_isolation {
-            return Ok(None);
+            return Ok((None, None));
         }
         if !cfg!(target_os = "linux") {
             for (given, flag) in [
@@ -183,6 +237,10 @@ impl RunArgs {
                 (self.domainname.is_some(), "--domainname"),
                 (!self.sysctl.is_empty(), "--sysctl"),
                 (self.rootfs.is_some(), "--rootfs"),
+                (!self.cap_add.is_empty(), "--cap-add"),
+                (!self.cap_drop.is_empty(), "--cap-drop"),
+                (!self.security_opt.is_empty(), "--security-opt"),
+                (!self.uidmap.is_empty(), "--uidmap"),
             ] {
                 if given {
                     bail!(
@@ -192,12 +250,26 @@ impl RunArgs {
                 }
             }
             tracing::debug!("no namespaces on this system; running without isolation");
-            return Ok(None);
+            return Ok((None, None));
         }
         let mut isolation = Isolation::standard();
         isolation.hostname.clone_from(&self.hostname);
         isolation.domainname.clone_from(&self.domainname);
         isolation.sysctls.clone_from(&self.sysctl);
+        isolation.security = self.security()?;
+        // Shipyard refuses to start setuid (`refuse_privileged_start`), so
+        // the real user is the effective one.
+        #[cfg(target_os = "linux")]
+        let (maps, short_maps) = self.user_namespace(
+            User::current().uid == 0,
+            shipyard_runtime::process::rootless_id_maps,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let (maps, short_maps) = (self.id_maps(), None);
+        isolation.id_maps = maps;
+        if isolation.id_maps.is_some() {
+            isolation.namespaces.push(Namespace::User);
+        }
         if let Some(dir) = &self.rootfs {
             // Absolute and without symlinks, as the runtime wants it; and a
             // mistyped path is caught here, with its name.
@@ -208,7 +280,157 @@ impl RunArgs {
             isolation.root = Some(root);
         }
         isolation.validate()?;
-        Ok(Some(isolation))
+        Ok((Some(isolation), short_maps))
+    }
+}
+
+impl RunArgs {
+    /// The user namespace for this run, and why its maps are short if they
+    /// are: for root, the one `--uidmap` asks for (if any); for anyone else,
+    /// always one, with maps chosen for them by `rootless` (their own ID,
+    /// and their `/etc/subuid` ranges when the helpers are there).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux has user namespaces")
+    )]
+    fn user_namespace(
+        &self,
+        root: bool,
+        rootless: impl FnOnce() -> RootlessMaps,
+    ) -> Result<(Option<IdMaps>, Option<String>)> {
+        if root {
+            return Ok((self.id_maps(), None));
+        }
+        if !self.uidmap.is_empty() {
+            bail!(
+                "--uidmap and --gidmap need root: a rootless container's maps are chosen for \
+                 you (your own ID, and your range in /etc/subuid)"
+            );
+        }
+        let rootless = rootless();
+        Ok((Some(rootless.maps), rootless.shortfall))
+    }
+
+    /// The user namespace's maps, if `--uidmap` asks for one: `--gidmap`, or
+    /// the same ranges for groups.
+    fn id_maps(&self) -> Option<IdMaps> {
+        if self.uidmap.is_empty() {
+            return None;
+        }
+        let gids = if self.gidmap.is_empty() {
+            &self.uidmap
+        } else {
+            &self.gidmap
+        };
+        Some(IdMaps {
+            uids: self.uidmap.clone(),
+            gids: gids.clone(),
+        })
+    }
+
+    /// The container's capabilities and `no_new_privs`, from Docker's default
+    /// set and `--cap-drop`, `--cap-add` and `--security-opt`.
+    fn security(&self) -> Result<Security> {
+        let named = |args: &[CapabilityArg]| -> CapabilitySet {
+            args.iter()
+                .filter_map(|arg| match arg {
+                    CapabilityArg::One(capability) => Some(*capability),
+                    CapabilityArg::All => None,
+                })
+                .collect()
+        };
+        let (dropped, added) = (named(&self.cap_drop), named(&self.cap_add));
+        if let Some(both) = dropped
+            .iter()
+            .find(|&capability| added.contains(capability))
+        {
+            bail!("--cap-add and --cap-drop both name {both}");
+        }
+        let mut kept = if self.cap_drop.contains(&CapabilityArg::All) {
+            CapabilitySet::EMPTY
+        } else {
+            CapabilitySet::DOCKER_DEFAULT
+        };
+        for capability in dropped.iter() {
+            kept.remove(capability);
+        }
+        let added = if self.cap_add.contains(&CapabilityArg::All) {
+            CapabilitySet::ALL
+        } else {
+            added
+        };
+        let mut security = Security::standard();
+        security.capabilities = Capabilities::Default { kept, added };
+        for option in &self.security_opt {
+            match option {
+                SecurityOpt::NoNewPrivileges(on) => security.no_new_privileges = *on,
+                SecurityOpt::SeccompUnconfined => security.seccomp = Seccomp::Unconfined,
+                SecurityOpt::SeccompProfile(path) => {
+                    security.seccomp = Seccomp::Profile(Box::new(read_profile(path)?));
+                }
+            }
+        }
+        Ok(security)
+    }
+}
+
+fn parse_id_map(s: &str) -> Result<IdMap, String> {
+    s.parse()
+        .map_err(|err: shipyard_runtime::isolation::IdMapError| err.to_string())
+}
+
+/// `--cap-add` or `--cap-drop`: one capability, or all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityArg {
+    All,
+    One(Capability),
+}
+
+fn parse_capability(s: &str) -> Result<CapabilityArg, String> {
+    if s.eq_ignore_ascii_case("ALL") {
+        return Ok(CapabilityArg::All);
+    }
+    s.parse()
+        .map(CapabilityArg::One)
+        .map_err(|err| format!("{err}"))
+}
+
+/// A seccomp profile file, checked (`--security-opt seccomp=FILE`): a
+/// mistake shows here, naming the file, not when the container starts.
+fn read_profile(path: &Path) -> Result<Profile> {
+    Profile::from_file(path).with_context(|| format!("seccomp profile {}", path.display()))
+}
+
+/// `--security-opt`: Docker's spelling, `KEY=VALUE` or `KEY:VALUE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecurityOpt {
+    NoNewPrivileges(bool),
+    /// `seccomp=unconfined`: no filter.
+    SeccompUnconfined,
+    /// `seccomp=FILE`.
+    SeccompProfile(PathBuf),
+}
+
+fn parse_security_opt(s: &str) -> Result<SecurityOpt, String> {
+    let (key, value) = match s.split_once(['=', ':']) {
+        Some((key, value)) => (key, Some(value)),
+        None => (s, None),
+    };
+    match (key, value) {
+        ("no-new-privileges", None | Some("true")) => Ok(SecurityOpt::NoNewPrivileges(true)),
+        ("no-new-privileges", Some("false")) => Ok(SecurityOpt::NoNewPrivileges(false)),
+        ("no-new-privileges", Some(other)) => Err(format!(
+            "no-new-privileges takes true or false, not \"{other}\""
+        )),
+        ("seccomp", Some("unconfined")) => Ok(SecurityOpt::SeccompUnconfined),
+        ("seccomp", Some(path)) if !path.is_empty() => {
+            Ok(SecurityOpt::SeccompProfile(PathBuf::from(path)))
+        }
+        ("seccomp", _) => Err("seccomp takes a profile file, or unconfined".to_owned()),
+        _ => Err(format!(
+            "unknown security option \"{s}\" (known: no-new-privileges[=true|false], \
+             seccomp=FILE|unconfined)"
+        )),
     }
 }
 
@@ -258,6 +480,8 @@ fn only_namespaces(isolation: &Isolation) -> bool {
         && isolation.hostname.is_none()
         && isolation.domainname.is_none()
         && isolation.sysctls.is_empty()
+        && isolation.security == Security::standard()
+        && isolation.id_maps.is_none()
 }
 
 /// Whether `err` is isolation going wrong (missing privileges, a refusal,
@@ -265,7 +489,10 @@ fn only_namespaces(isolation: &Isolation) -> bool {
 fn is_isolation_failure(err: &shipyard_runtime::Error) -> bool {
     use shipyard_runtime::Error;
     match err {
-        Error::IsolationNeedsRoot | Error::IsolationRefused | Error::InitDidNotStart { .. } => true,
+        Error::IsolationNeedsRoot
+        | Error::IsolationRefused
+        | Error::UserNamespacesRefused { .. }
+        | Error::InitDidNotStart { .. } => true,
         Error::Spawn(spawn) => spawn.kind() == process::SpawnErrorKind::Isolation,
         _ => false,
     }
@@ -468,12 +695,17 @@ mod tests {
     }
 
     #[test]
-    fn no_user_flag_keeps_the_current_user() {
-        let user = spec(&["true"]).user;
-        assert_eq!(
-            (user.uid, user.gid),
-            (User::current().uid, User::current().gid)
-        );
+    fn without_a_user_flag_isolated_runs_are_root_inside() {
+        let ids = |user: User| (user.uid, user.gid);
+        let current = ids(User::current());
+        assert_eq!(ids(spec(&["--no-isolation", "true"]).user), current);
+        // Isolated (on Linux): root inside, whoever runs shipyard.
+        let isolated = if cfg!(target_os = "linux") {
+            (0, 0)
+        } else {
+            current
+        };
+        assert_eq!(ids(spec(&["true"]).user), isolated);
     }
 
     #[test]
@@ -579,6 +811,206 @@ mod tests {
         assert_eq!(stop.timeout, Duration::from_secs(3));
         let default = parse(&["true"]).unwrap().into_invocation().unwrap().stop;
         assert_eq!(default, StopPolicy::default());
+    }
+
+    #[test]
+    fn capability_flags_build_dockers_rule() {
+        let security = |args: &[&str]| parse(args).unwrap().security().unwrap();
+        let rule = |args: &[&str]| match security(args).capabilities {
+            Capabilities::Default { kept, added } => (kept, added),
+            other => panic!("{other:?}"),
+        };
+        let cap = |name: &str| name.parse::<Capability>().unwrap();
+        assert_eq!(
+            rule(&["true"]),
+            (CapabilitySet::DOCKER_DEFAULT, CapabilitySet::EMPTY)
+        );
+        let (kept, added) = rule(&["--cap-drop", "chown", "--cap-add", "CAP_SYS_ADMIN", "true"]);
+        assert!(!kept.contains(cap("CHOWN")) && kept.contains(cap("KILL")));
+        assert_eq!(added.iter().collect::<Vec<_>>(), [cap("SYS_ADMIN")]);
+        assert_eq!(rule(&["--cap-drop", "ALL", "true"]).0, CapabilitySet::EMPTY);
+        assert_eq!(rule(&["--cap-add", "all", "true"]).1, CapabilitySet::ALL);
+        // Dropping everything, then adding one: just that one.
+        let (kept, added) = rule(&["--cap-drop", "ALL", "--cap-add", "KILL", "true"]);
+        assert!(kept.is_empty() && added.contains(cap("KILL")));
+        assert!(security(&["true"]).no_new_privileges);
+        for (option, on) in [
+            ("no-new-privileges", true),
+            ("no-new-privileges=true", true),
+            ("no-new-privileges:false", false),
+            ("no-new-privileges=false", false),
+        ] {
+            assert_eq!(
+                security(&["--security-opt", option, "true"]).no_new_privileges,
+                on,
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_options_choose_the_filter() {
+        let seccomp = |args: &[&str]| parse(args).unwrap().security().map(|s| s.seccomp);
+        assert_eq!(seccomp(&["true"]).unwrap(), Seccomp::Default);
+        assert_eq!(
+            seccomp(&["--security-opt", "seccomp=unconfined", "true"]).unwrap(),
+            Seccomp::Unconfined
+        );
+        let dir = std::env::temp_dir().join(format!("shipyard-seccomp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, json: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, json).unwrap();
+            format!("seccomp={}", path.display())
+        };
+        let good = file(
+            "good.json",
+            r#"{"defaultAction": "SCMP_ACT_ERRNO",
+                "syscalls": [{"names": ["read"], "action": "SCMP_ACT_ALLOW"}]}"#,
+        );
+        let Seccomp::Profile(profile) = seccomp(&["--security-opt", &good, "true"]).unwrap() else {
+            panic!("not a profile");
+        };
+        assert_eq!(profile.syscalls[0].names, ["read"]);
+        // The last one wins, as with Docker.
+        assert_eq!(
+            seccomp(&[
+                "--security-opt",
+                &good,
+                "--security-opt",
+                "seccomp:unconfined",
+                "true"
+            ])
+            .unwrap(),
+            Seccomp::Unconfined
+        );
+        // Mistakes name the file, and what's wrong.
+        for (name, json, wanted) in [
+            (
+                "typo.json",
+                r#"{"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": ["raed"], "action": "SCMP_ACT_ALLOW"}]}"#,
+                "\"raed\" isn't a system call",
+            ),
+            (
+                "field.json",
+                r#"{"defaultAction": "SCMP_ACT_ERRNO", "allowAll": true}"#,
+                "unknown field `allowAll`",
+            ),
+            ("broken.json", "{", "EOF while parsing"),
+        ] {
+            let option = file(name, json);
+            let err = format!(
+                "{:#}",
+                seccomp(&["--security-opt", &option, "true"]).unwrap_err()
+            );
+            assert!(err.contains(name) && err.contains(wanted), "{err}");
+        }
+        let missing = format!(
+            "{:#}",
+            seccomp(&["--security-opt", "seccomp=/no/such.json", "true"]).unwrap_err()
+        );
+        assert!(
+            missing.contains("seccomp profile /no/such.json"),
+            "{missing}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(parse(&["--security-opt", "seccomp=", "true"]).is_err());
+        assert!(parse(&["--security-opt", "seccomp", "true"]).is_err());
+        assert!(
+            parse(&[
+                "--no-isolation",
+                "--security-opt",
+                "seccomp=unconfined",
+                "true"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--bundle", ".", "--security-opt", "seccomp=unconfined"]).is_err());
+    }
+
+    #[test]
+    fn id_map_flags_parse_and_conflict() {
+        assert!(
+            parse(&["--gidmap", "0:1:1", "true"]).is_err(),
+            "--gidmap needs --uidmap"
+        );
+        assert!(parse(&["--uidmap", "0:1", "true"]).is_err());
+        assert!(parse(&["--no-isolation", "--uidmap", "0:1:1", "true"]).is_err());
+        assert!(parse(&["--bundle", ".", "--uidmap", "0:1:1"]).is_err());
+        if !cfg!(target_os = "linux") {
+            let err = parse(&["--uidmap", "0:100000:65536", "true"])
+                .unwrap()
+                .into_invocation()
+                .unwrap_err();
+            assert!(err.to_string().contains("--uidmap needs Linux"), "{err}");
+        }
+    }
+
+    /// Root's user namespace is the one `--uidmap` asks for (if any);
+    /// anyone else always gets one, with maps chosen for them, and may not
+    /// pass `--uidmap`.
+    #[test]
+    fn the_user_namespace_depends_on_who_runs() {
+        let range = |s: &str| s.parse::<IdMap>().unwrap();
+        let chosen = || RootlessMaps {
+            maps: IdMaps::single((1000, 1000)),
+            shortfall: Some("short".to_owned()),
+        };
+        let namespace =
+            |args: &[&str], root: bool| parse(args).unwrap().user_namespace(root, chosen);
+
+        let (maps, short) = namespace(&["--uidmap", "0:100000:65536", "true"], true).unwrap();
+        let maps = maps.unwrap();
+        assert_eq!(maps.uids, [range("0:100000:65536")]);
+        assert_eq!(maps.gids, maps.uids, "--gidmap defaults to --uidmap");
+        assert_eq!(short, None);
+        let args = [
+            "--uidmap",
+            "0:100000:1",
+            "--uidmap",
+            "1:200000:65535",
+            "--gidmap",
+            "0:300000:65536",
+            "true",
+        ];
+        let both = namespace(&args, true).unwrap().0.unwrap();
+        assert_eq!(both.uids.len(), 2);
+        assert_eq!(both.gids, [range("0:300000:65536")]);
+        assert_eq!(namespace(&["true"], true).unwrap(), (None, None), "rootful");
+
+        let (maps, short) = namespace(&["true"], false).unwrap();
+        assert_eq!(maps, Some(IdMaps::single((1000, 1000))), "rootless, always");
+        assert_eq!(short.as_deref(), Some("short"));
+        let err = namespace(&["--uidmap", "0:100000:65536", "true"], false).unwrap_err();
+        assert!(err.to_string().contains("need root"), "{err}");
+    }
+
+    #[test]
+    fn capability_flags_are_checked() {
+        assert!(parse(&["--cap-add", "FLY", "true"]).is_err());
+        assert!(parse(&["--security-opt", "apparmor=x", "true"]).is_err());
+        assert!(parse(&["--security-opt", "no-new-privileges=maybe", "true"]).is_err());
+        for flag in ["--cap-add", "--cap-drop"] {
+            assert!(
+                parse(&["--no-isolation", flag, "KILL", "true"]).is_err(),
+                "{flag}"
+            );
+            assert!(parse(&["--bundle", ".", flag, "KILL"]).is_err(), "{flag}");
+        }
+        let both = parse(&["--cap-add", "KILL", "--cap-drop", "kill", "true"]).unwrap();
+        assert!(
+            both.security()
+                .unwrap_err()
+                .to_string()
+                .contains("both name CAP_KILL")
+        );
+        if !cfg!(target_os = "linux") {
+            let err = parse(&["--cap-add", "KILL", "true"])
+                .unwrap()
+                .into_invocation()
+                .unwrap_err();
+            assert!(err.to_string().contains("--cap-add needs Linux"), "{err}");
+        }
     }
 
     #[test]

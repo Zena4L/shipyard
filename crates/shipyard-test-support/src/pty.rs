@@ -153,7 +153,7 @@ impl Shell {
     /// shell with job control does. In the foreground, the job gets the
     /// terminal.
     pub fn spawn(&mut self, mode: Mode, args: &[&str]) -> Job {
-        self.spawn_program(mode, self.shipyard, args)
+        self.spawn_program(mode, self.shipyard, &crate::for_this_kernel(args))
     }
 
     /// Like [`Shell::spawn`], for any program.

@@ -28,9 +28,13 @@ use nix::unistd::{Gid, Pid, Uid, getpgrp, getpid, setpgid};
 
 use super::channel::encode;
 
+#[cfg(target_os = "linux")]
+use super::failure::NamespaceRootStep;
 use super::failure::{ChildStep, means_not_found};
 use super::plan::{ChildPlan, Credentials, FdSweep};
 use super::signal::MAX_SIGNAL;
+#[cfg(target_os = "linux")]
+use crate::security::{Confinement, SeccompFilter};
 
 /// The child's exit code when setup fails. The parent normally reads the
 /// failure from the report pipe instead; this is only what's left if it can't.
@@ -125,6 +129,10 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     }
     #[cfg(target_os = "linux")]
     if let Some(reexec) = &plan.reexec {
+        // First: a credential change clears the parent-death signal.
+        if reexec.namespace_root {
+            become_namespace_root(setgroups_allowed_here())?;
+        }
         // The init must die with shipyard too: then the kernel kills the
         // whole namespace. The signal survives the exec below.
         die_with_parent(plan)?;
@@ -151,8 +159,19 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
     // Only a permission error is worth retrying (runc does the same): any
     // other error, like a missing directory, won't change with the user.
     let chdir_error = chdir(plan).err();
+    #[cfg(target_os = "linux")]
+    if let Some(confinement) = &plan.confinement {
+        if let Some(filter) = confinement.filter_before_setup() {
+            install_filter(filter)?;
+        }
+        confine_before_switch(confinement)?;
+    }
     if let Some(credentials) = &plan.credentials {
         switch_credentials(credentials)?;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(confinement) = &plan.confinement {
+        confine_after_switch(confinement)?;
     }
     match chdir_error {
         None => {}
@@ -168,6 +187,14 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
     die_with_parent(plan)?;
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
         .map_err(|errno| Failure::at(ChildStep::SignalMask, errno))?;
+    #[cfg(target_os = "linux")]
+    if let Some(filter) = plan
+        .confinement
+        .as_ref()
+        .and_then(Confinement::filter_before_exec)
+    {
+        install_filter(filter)?;
+    }
     Err(exec_first_candidate(plan))
 }
 
@@ -200,7 +227,7 @@ fn reset_signal_dispositions(keep_ignored: &[libc::c_int]) -> Result<(), Failure
 /// Waits for the parent's "go" (see `channel.rs`). End-of-file means the
 /// parent died before sending it: nobody is left to supervise the command,
 /// or to report to, so exit quietly.
-fn wait_for_go(pipe: RawFd) -> Result<(), Failure> {
+pub(super) fn wait_for_go(pipe: RawFd) -> Result<(), Failure> {
     let mut byte = 0u8;
     loop {
         // SAFETY: `read` is async-signal-safe; `byte` is one writable byte.
@@ -456,10 +483,174 @@ fn chdir(plan: &ChildPlan) -> Result<(), Errno> {
 /// in a test binary with other threads running.) This process has one
 /// thread, so the raw call is the whole change.
 fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
-    set_groups(&credentials.groups)?;
+    if let Some(groups) = &credentials.groups {
+        set_groups(groups)?;
+    }
     set_gid(credentials.gid)?;
     set_uid(credentials.uid)?;
     verify_credentials(credentials)
+}
+
+/// A container's command, before the switch of user (TLPI ch. 39; the order
+/// is step 1's probe's): keep capabilities across the switch if the user
+/// isn't root (C3), then drop from the bounding set, which needs
+/// `CAP_SETPCAP` and so root (C1). Raw `prctl`: no C library state.
+#[cfg(target_os = "linux")]
+pub(super) fn confine_before_switch(confinement: &Confinement) -> Result<(), Failure> {
+    if confinement.keep_caps {
+        prctl(libc::PR_SET_KEEPCAPS, 1, 0)
+            .map_err(|errno| Failure::at(ChildStep::KeepCaps, errno))?;
+    }
+    for &capability in &confinement.bounding_drop {
+        prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(capability), 0).map_err(|errno| {
+            Failure::at(ChildStep::BoundingDrop, errno).detail(usize::from(capability))
+        })?;
+    }
+    Ok(())
+}
+
+/// A container's command, after the switch of user: its effective,
+/// permitted and inheritable sets (`capset`), its ambient ones (C4), and
+/// `no_new_privs` (N1). Raw system calls, from data prepared before the fork.
+#[cfg(target_os = "linux")]
+pub(super) fn confine_after_switch(confinement: &Confinement) -> Result<(), Failure> {
+    // `__user_cap_header_struct`: the version, and this process (0).
+    let header: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    // SAFETY: `header` and `capset_data` are the kernel's
+    // `__user_cap_header_struct` and two `__user_cap_data_struct`s (three
+    // `u32`s each), which it only reads.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            header.as_ptr(),
+            confinement.capset_data.as_ptr(),
+        )
+    };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::Capset, errno))?;
+    for &capability in &confinement.ambient {
+        prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::c_ulong::from(libc::PR_CAP_AMBIENT_RAISE.unsigned_abs()),
+            libc::c_ulong::from(capability),
+        )
+        .map_err(|errno| {
+            Failure::at(ChildStep::AmbientRaise, errno).detail(usize::from(capability))
+        })?;
+    }
+    if confinement.no_new_privileges {
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0)
+            .map_err(|errno| Failure::at(ChildStep::NoNewPrivs, errno))?;
+    }
+    Ok(())
+}
+
+/// Installs a seccomp filter on this process (`seccomp(2)`,
+/// `SECCOMP_SET_MODE_FILTER`): from here on, the kernel runs it on every
+/// system call this process and everything it starts makes. Needs
+/// `no_new_privs` or `CAP_SYS_ADMIN` (step 1's probe, S1). The raw system
+/// call, on a program compiled before the fork.
+#[cfg(target_os = "linux")]
+pub(super) fn install_filter(filter: &SeccompFilter) -> Result<(), Failure> {
+    // `Instruction` is the kernel's `struct sock_filter`, field for field.
+    const _: () = assert!(
+        size_of::<crate::security::seccomp::Instruction>() == size_of::<libc::sock_filter>()
+    );
+    let program = libc::sock_fprog {
+        len: filter.len,
+        filter: filter
+            .program
+            .as_ptr()
+            .cast::<libc::sock_filter>()
+            .cast_mut(),
+    };
+    // SAFETY: `program` points at `len` instructions, which the kernel only
+    // reads (and copies) during the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            filter.flags,
+            &raw const program,
+        )
+    };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::Seccomp, errno))
+}
+
+/// `_LINUX_CAPABILITY_VERSION_3`: `capset`'s 64-bit sets, in two halves.
+#[cfg(target_os = "linux")]
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// The raw `prctl` system call with two arguments (no C library state).
+#[cfg(target_os = "linux")]
+fn prctl(option: libc::c_int, arg2: libc::c_ulong, arg3: libc::c_ulong) -> Result<(), Errno> {
+    // SAFETY: `prctl` with integer arguments; the options used here read no
+    // memory.
+    raw_result(unsafe { libc::syscall(libc::SYS_prctl, option, arg2, arg3, 0, 0) })
+}
+
+/// Becomes root of the new user namespace (uid and gid 0 inside, no
+/// supplementary groups), once the parent has written its maps.
+///
+/// Cloned by host root, this process is host uid 0, which the maps usually
+/// leave out: inside, it's the overflow uid (65534). It has every
+/// capability in the namespace, but `execve` recomputes capabilities from
+/// the effective uid, and the clean image would start with none. As uid 0
+/// inside, the exec keeps them all (`capabilities(7)`). Raw system calls, as
+/// in [`switch_credentials`]; the failure's detail names the call.
+///
+/// Without `setgroups` (denied in the namespace: see
+/// [`setgroups_allowed_here`]), the group list stays: the kernel would
+/// refuse the call.
+#[cfg(target_os = "linux")]
+fn become_namespace_root(setgroups: bool) -> Result<(), Failure> {
+    let failed = |call: NamespaceRootStep| {
+        move |errno| Failure::at(ChildStep::NamespaceRoot, errno).detail(call.detail())
+    };
+    if setgroups {
+        // SAFETY: plain integer arguments; no list (size 0, NULL).
+        raw_result(unsafe {
+            libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>())
+        })
+        .map_err(failed(NamespaceRootStep::Groups))?;
+    }
+    // SAFETY: plain integer arguments.
+    raw_result(unsafe { libc::syscall(libc::SYS_setresgid, 0, 0, 0) })
+        .map_err(failed(NamespaceRootStep::Gid))?;
+    // SAFETY: plain integer arguments.
+    raw_result(unsafe { libc::syscall(libc::SYS_setresuid, 0, 0, 0) })
+        .map_err(failed(NamespaceRootStep::Uid))
+}
+
+/// Whether this process's user namespace allows `setgroups`
+/// (`user_namespaces(7)`): its `/proc/self/setgroups` says `deny` when the
+/// map writer denied it (a rootless caller mapping only its own IDs, or
+/// `newgidmap` without a subordinate group range), and when an ancestor
+/// namespace did: a namespace created inside one that denies it can't allow
+/// it (`unshare -U -r`, say). Read, not inferred from the maps. Raw calls,
+/// for after the clone; a kernel without the file (before 3.19) has no such
+/// denial.
+#[cfg(target_os = "linux")]
+fn setgroups_allowed_here() -> bool {
+    // SAFETY: a valid C string; `open` is async-signal-safe.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/setgroups".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return true;
+    }
+    // A failed read leaves it zeroed: allowed, and `setgroups` itself then
+    // says whether it isn't.
+    let mut text = [0u8; 8];
+    // SAFETY: `text` is writable for its length; `read` and `close` are
+    // async-signal-safe.
+    unsafe {
+        libc::read(fd, text.as_mut_ptr().cast(), text.len());
+        libc::close(fd);
+    }
+    !text.starts_with(b"deny")
 }
 
 /// The raw `setgroups` system call (see [`switch_credentials`]).
@@ -526,7 +717,8 @@ fn raw_result(rc: libc::c_long) -> Result<(), Errno> {
 /// asked for.
 fn verify_credentials(credentials: &Credentials) -> Result<(), Failure> {
     let mismatch = || Failure::at(ChildStep::VerifyCredentials, Errno::EPERM);
-    if !ids_match(credentials) || !groups_match(&credentials.groups) {
+    let groups_ok = credentials.groups.as_deref().is_none_or(groups_match);
+    if !ids_match(credentials) || !groups_ok {
         return Err(mismatch());
     }
     // Dropping root must be permanent: getting it back has to fail.

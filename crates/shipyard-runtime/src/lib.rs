@@ -22,9 +22,12 @@ compile_error!("shipyard only supports 64-bit platforms");
 
 pub mod container;
 mod error;
+mod id_map;
 pub mod isolation;
 pub mod oci;
 pub mod process;
+pub mod security;
+mod small_file;
 
 pub use error::{Error, Result};
 

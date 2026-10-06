@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ContainerError, Created, OCI_VERSION, Result, State, Status, validate_id};
 use crate::isolation::Namespace;
-use crate::oci::load_bundle;
+use crate::oci::load_bundle_for_caller;
 use crate::process::spawn::{Placement, SpawnOptions, spawn};
 use crate::process::{ExitStatus, Signal};
 
@@ -44,14 +44,14 @@ const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 fn io(doing: impl Into<String>) -> impl FnOnce(std::io::Error) -> ContainerError {
     let doing = doing.into();
-    move |source| ContainerError::Io { doing, source }
+    move |error| ContainerError::Io { doing, error }
 }
 
 fn errno_io(doing: impl Into<String>) -> impl FnOnce(Errno) -> ContainerError {
     let doing = doing.into();
     move |errno| ContainerError::Io {
         doing,
-        source: std::io::Error::from(errno),
+        error: std::io::Error::from(errno),
     }
 }
 
@@ -83,16 +83,16 @@ struct Record {
 /// # Errors
 ///
 /// A bad ID, a taken one, a bundle that can't be run (or has no PID
-/// namespace), not running as root, or a setup failure (with its message).
+/// namespace), or a setup failure (with its message).
+///
+/// Without root, the container is rootless: a bundle without a user
+/// namespace gets one (with a warning), as `shipyard run --bundle` does.
 pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
     validate_id(id)?;
-    if !nix::unistd::geteuid().is_root() {
-        return Err(ContainerError::NeedsRoot);
-    }
     let bundle =
         std::fs::canonicalize(bundle).map_err(io(format!("the bundle {}", bundle.display())))?;
     // Everything a bundle can get wrong, before anything exists.
-    let loaded = load_bundle(&bundle)?;
+    let loaded = load_bundle_for_caller(&bundle)?;
     if !loaded.isolation.namespaces.contains(&Namespace::Pid) {
         return Err(ContainerError::NoPidNamespace);
     }
@@ -324,6 +324,18 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
     // say. The container gets the caller's stdio; the monitor keeps nothing
     // else but the directory and the answer pipe.
     close_inherited(&[dir.as_raw_fd(), ready.as_raw_fd()]);
+    // An ignored SIGCHLD survives `exec`: a caller that ignores it (`trap ''
+    // CHLD`) would pass it on, and the kernel would then reap the
+    // container's init (and the map helpers) itself, leaving nothing to
+    // wait for: how the container ended would be lost (TLPI §26.3.3). The
+    // container's own processes get the default back anyway (`child.rs`).
+    // SAFETY: installing SIG_DFL runs none of our code in a signal context.
+    let _ = unsafe {
+        nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGCHLD,
+            nix::sys::signal::SigHandler::SigDfl,
+        )
+    };
     let _ = nix::fcntl::fcntl(
         dir,
         nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
@@ -369,7 +381,7 @@ fn spawn_container(
     dir: &OwnedFd,
     bundle: &Path,
 ) -> std::result::Result<(crate::process::spawn::Child, i32), String> {
-    let bundle = load_bundle(bundle).map_err(|err| err.to_string())?;
+    let bundle = load_bundle_for_caller(bundle).map_err(|err| err.to_string())?;
     let gate = nix::fcntl::openat(
         dir,
         FIFO,
@@ -380,7 +392,7 @@ fn spawn_container(
     let options = SpawnOptions {
         new_process_group: false,
         keep_ignored: Vec::new(),
-        placement: Placement::New(bundle.isolation),
+        placement: Placement::New(Box::new(bundle.isolation)),
         gate: Some(gate.as_raw_fd()),
     };
     let mut child = spawn(&bundle.spec, &options, |_| {}).map_err(|err| format!("{err:#}"))?;

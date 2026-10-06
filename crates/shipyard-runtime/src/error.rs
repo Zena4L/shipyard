@@ -67,10 +67,26 @@ pub enum Error {
         reason: String,
     },
 
-    /// Isolating the command in new namespaces needs privileges (root, until
-    /// rootless support with user namespaces arrives).
-    #[error("isolating the command in namespaces needs root (rootless support comes later)")]
+    /// Isolating the command in new namespaces needs privileges: root, or a
+    /// user namespace of the caller's own (rootless).
+    #[error("isolating the command in namespaces needs root, or a user namespace (rootless)")]
     IsolationNeedsRoot,
+
+    /// `newuidmap` or `newgidmap` couldn't write a rootless container's map.
+    #[error("{helper} couldn't map the container's IDs: {message}")]
+    MapHelper {
+        /// Which helper.
+        helper: &'static str,
+        /// What it said, or why it couldn't run.
+        message: String,
+    },
+
+    /// The kernel refused a user namespace to a caller without root.
+    #[error("{reason}")]
+    UserNamespacesRefused {
+        /// Why, from the host's settings.
+        reason: String,
+    },
 
     /// Running as root, the system still refused to create namespaces.
     #[error(
@@ -101,6 +117,36 @@ pub enum Error {
         /// What the init exited with.
         code: u8,
     },
+
+    /// Supplementary groups asked for where `setgroups` is denied: in a user
+    /// namespace that denies it, only the groups a process has stay.
+    #[error(
+        "supplementary group {gid} can't be set: setgroups is denied in the user namespace \
+         shipyard runs in (it was started inside one that denies it, like `unshare -U -r`)"
+    )]
+    GroupsDenied {
+        /// The first group asked for.
+        gid: u32,
+    },
+
+    /// The container's init couldn't supervise its command: a system call
+    /// it needs was refused, so it ended the container.
+    #[error(
+        "the container's init couldn't supervise its command (wait for it, or pass a signal \
+         on), and ended the container: a system call it needs was refused (the init runs \
+         under the container's seccomp profile, which must allow rt_sigtimedwait, wait4 and \
+         kill)"
+    )]
+    InitGaveUp,
+
+    /// The container's init was killed by SIGSYS: its seccomp profile
+    /// killed it over a call it needs.
+    #[error(
+        "the container's init was killed by SIGSYS, and the container with it: the init runs \
+         under the container's seccomp profile, which must allow rt_sigtimedwait, wait4 and \
+         kill"
+    )]
+    InitKilledBySeccomp,
 
     /// Joining a running process's namespaces needs privileges (root, until
     /// rootless support with user namespaces arrives).

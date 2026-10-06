@@ -21,6 +21,7 @@ mod plan;
 mod resolve;
 mod rlimit;
 mod rootfs;
+
 #[cfg(target_os = "linux")]
 mod setup;
 mod signal;
@@ -33,6 +34,8 @@ mod stop;
 mod supervisor;
 #[cfg(target_os = "linux")]
 mod sysctl;
+#[cfg(target_os = "linux")]
+mod user_namespace;
 
 pub use env::{DEFAULT_PATH, Env, EnvError};
 pub use failure::{SpawnError, SpawnErrorKind};
@@ -45,6 +48,10 @@ pub use startup::refuse_privileged_start;
 pub use status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND, ExitStatus};
 pub use stop::{DEFAULT_STOP_TIMEOUT_SECS, StopPolicy, StopSignalError};
 pub use supervisor::Supervisor;
+#[cfg(target_os = "linux")]
+pub(crate) use user_namespace::bundle_user_namespace;
+#[cfg(target_os = "linux")]
+pub use user_namespace::rootless_id_maps;
 
 /// The hidden argument that makes the shipyard binary run as a container's
 /// init (see [`init_entry_point`]).

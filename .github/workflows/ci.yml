@@ -43,8 +43,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        # Rootless containers (stage 4) run as this normal user: Ubuntu restricts
+      # unprivileged user namespaces with AppArmor (since 23.10), and the full
+      # ID map needs newuidmap/newgidmap and a subordinate range for the user.
+      - name: allow rootless containers
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq uidmap
+          me=$(id -un)
+          grep -q "^$me:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$me"
+          grep -q "^$me:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$me"
       - run: cargo clippy --locked --workspace --all-targets
       - run: cargo test --locked --workspace
+        env:
+          # Set up above: here a skipped rootless test is a failure.
+          SHIPYARD_TEST_ROOTLESS: ${{ runner.os == 'Linux' && 'required' || '' }}
 
   # Tests that need root (switching user and groups, namespaces, root
   # filesystems, the OCI runtime) are #[ignore]d in normal runs. Here they run

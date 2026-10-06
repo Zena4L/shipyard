@@ -30,7 +30,7 @@
 //! becomes the command itself.
 
 use std::io::Write as _;
-use std::os::fd::{AsFd, AsRawFd as _, IntoRawFd as _, RawFd};
+use std::os::fd::{AsFd, AsRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -38,13 +38,19 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
 
-use super::channel::{Report, ReportReader, START_MARK, encode_status, report_pipe};
-use super::child::{Failure, SETUP_FAILED, command_main, report_failure, write_record};
+use super::channel::{GAVE_UP_MARK, Report, ReportReader, START_MARK, encode_status, report_pipe};
+use super::child::{
+    Failure, SETUP_FAILED, command_main, report_failure, wait_for_go, write_record,
+};
+use super::failure::UnmappedId;
 use super::failure::{ChildStep, FailureContext, describe};
 use super::plan::ChildPlan;
 use super::setup::{is_sealed_setup, read_setup};
 use super::status::ExitStatus;
 use super::{identity, rootfs, sysctl};
+use crate::isolation::IdMaps;
+use crate::security::seccomp::SeccompError;
+use crate::security::{Confinement, ConfinementError, SeccompFilter};
 
 /// Where the shipyard binary starts as a container's clean image. Does
 /// nothing unless this process was started that way (by `child.rs`, with
@@ -126,7 +132,18 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);
 
+    // The kernel's last capability, read before any mount: `/proc` is still
+    // the host's, and a bundle may mask `/proc/sys` in the container.
+    let last_cap =
+        cap_last_cap().unwrap_or_else(|errno| fail(Failure::at(ChildStep::CapLastCap, errno)));
+    // Whether the user namespace lets the command set its groups, read
+    // before `/proc` is the container's too.
+    let setgroups_allowed = super::user_namespace::setgroups_allowed();
     set_up(&setup).unwrap_or_else(|failure| fail(failure));
+    // A keyring of the container's own, not its caller's: the init joins
+    // it, and the command inherits it.
+    join_session_keyring()
+        .unwrap_or_else(|errno| fail(Failure::at(ChildStep::SessionKeyring, errno)));
     // The command's plan is built here, inside the container: its PATH
     // lookup, credentials and limits. Shipyard built the same plan from the
     // same spec before the clone, so only a corrupt setup fails here.
@@ -138,9 +155,45 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     identity::resolve(&mut spec, Some(Path::new("/etc"))).unwrap_or_else(|err| {
         fail(Failure::at(ChildStep::UserLookup, err.errno).detail(err.which.detail()))
     });
-    let (plan, context) =
-        ChildPlan::for_container_command(&spec, setup.keep_ignored.clone(), setup.parent)
-            .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
+    // In a user namespace, an ID outside its maps doesn't exist: switching
+    // to it would fail with a bare EINVAL.
+    if let Some(maps) = setup
+        .user_namespace
+        .as_ref()
+        .map(|namespace| &namespace.maps)
+    {
+        check_mapped(&spec.user, maps).unwrap_or_else(|failure| fail(failure));
+    }
+    // Where `setgroups` is denied, the command keeps the groups it has; it
+    // can't be given others.
+    if !setgroups_allowed && let Some(&gid) = spec.user.additional_gids.first() {
+        let gid = usize::try_from(gid).unwrap_or(usize::MAX);
+        fail(Failure::at(ChildStep::GroupsDenied, Errno::EPERM).detail(gid));
+    }
+    // What the command may do, for the user it turned out to be, on this
+    // kernel.
+    let confinement = Confinement::new(&setup.security, spec.user.uid, last_cap, kernel_version())
+        .unwrap_or_else(|err| fail(confinement_failure(&err)));
+    let (plan, mut context) = ChildPlan::for_container_command(
+        &spec,
+        setup.keep_ignored.clone(),
+        setup.parent,
+        confinement,
+        setgroups_allowed,
+    )
+    .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
+    context.namespace_root = setup
+        .user_namespace
+        .as_ref()
+        .and_then(|namespace| namespace.maps.host_uid(0));
+    // With an init, its command waits until the init has confined itself
+    // (`confine_self`): nothing in the container runs beside an init that
+    // still has root's power. (Made before the start gate, so a failure is
+    // `create`'s.)
+    let go = setup.init.then(|| {
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .unwrap_or_else(|errno| fail(Failure::at(ChildStep::Handshake, errno)))
+    });
     // With a start gate (`shipyard-runtime create`): everything that can
     // fail before the command has been reported by now. Closing the report
     // pipe says "set up"; then wait for `start`. Nobody reads that pipe
@@ -159,22 +212,13 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         None => (report, None),
     };
 
-    if !setup.init {
+    let Some(go) = go else {
         // No PID namespace, so no init: this process becomes the command.
         // SAFETY: a single-threaded process; `plan` is the command's.
         unsafe { command_main(&plan, report) }
-    }
-    // SAFETY: this process is single-threaded (a fresh image that started
-    // no threads), so the child may run ordinary code; it runs only
-    // `command_main`, which follows the after-fork rules anyway.
-    let command = match unsafe { nix::unistd::fork() } {
-        Ok(nix::unistd::ForkResult::Child) => {
-            // SAFETY: right after `fork`, with every signal still blocked.
-            unsafe { command_main(&plan, report) }
-        }
-        Ok(nix::unistd::ForkResult::Parent { child }) => child.as_raw(),
-        Err(errno) => fail(Failure::at(ChildStep::InitFork, errno)),
     };
+    let command = start_command(&plan, report, go, last_cap)
+        .unwrap_or_else(|errno| fail(Failure::at(ChildStep::InitFork, errno)));
     let (report, exec_failure) = match command_report {
         Some(read) => {
             // Our copy closed first, or the pipe never reaches end-of-file.
@@ -186,6 +230,66 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         None => (report, None),
     };
     become_init(command, status, report, exec_failure)
+}
+
+/// Forks the command, PID 2. It waits on the go pipe (read, write ends)
+/// while this process confines itself (`confine_self`), then goes on with
+/// `plan`. If the init can't confine itself, the command is killed before
+/// it goes on. Returns its PID.
+fn start_command(
+    plan: &ChildPlan,
+    report: RawFd,
+    (go_read, go_write): (OwnedFd, OwnedFd),
+    last_cap: u8,
+) -> Result<libc::pid_t, Errno> {
+    // SAFETY: this process is single-threaded (a fresh image that started
+    // no threads), so the child may run ordinary code; it runs only
+    // `command_main`, which follows the after-fork rules anyway.
+    let command = match unsafe { nix::unistd::fork() }? {
+        nix::unistd::ForkResult::Child => {
+            drop(go_write);
+            if let Err(failure) = wait_for_go(go_read.as_raw_fd()) {
+                report_failure(report, &failure);
+                // SAFETY: a forked child, which must not run the init's
+                // exit handlers.
+                unsafe { libc::_exit(SETUP_FAILED) }
+            }
+            drop(go_read);
+            // SAFETY: right after `fork`, with every signal still blocked.
+            unsafe { command_main(plan, report) }
+        }
+        nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+    };
+    drop(go_read);
+    let filter = plan
+        .confinement
+        .as_ref()
+        .and_then(|confinement| confinement.seccomp.as_ref());
+    let Err(unconfined) = confine_self(last_cap, filter) else {
+        write_record(go_write.as_raw_fd(), &[0]);
+        return Ok(command);
+    };
+    // The command, still waiting for the go byte, never goes on.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(command),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    match unconfined {
+        // An init with every capability must not stay: the reason goes to
+        // the container's stderr (still the init's here).
+        Unconfined::Capabilities => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "shipyard: the container's init couldn't drop its own capabilities; stopping"
+            );
+            std::process::exit(SETUP_FAILED);
+        }
+        // The kernel refused the filter (under x86-64 emulation, or an
+        // action newer than it): the command would meet the same refusal.
+        // Reported as its own failure would be, with the same explanation.
+        Unconfined::Filter(failure) => report_failure(report, &failure),
+    }
+    Ok(command)
 }
 
 /// Where a panic in this process is reported (-1: nowhere, once the report
@@ -377,6 +481,134 @@ fn set_domainname(name: &str) -> nix::Result<()> {
     Errno::result(rc).map(drop)
 }
 
+/// Refuses a command whose user, group or a supplementary group isn't
+/// mapped in the container's user namespace.
+fn check_mapped(user: &super::spec::User, maps: &IdMaps) -> Result<(), Failure> {
+    let unmapped = |which: UnmappedId, id| {
+        Failure::at(ChildStep::UnmappedId, Errno::EINVAL).detail(which.detail(id))
+    };
+    if maps.host_uid(user.uid).is_none() {
+        return Err(unmapped(UnmappedId::User, user.uid));
+    }
+    if maps.host_gid(user.gid).is_none() {
+        return Err(unmapped(UnmappedId::Group, user.gid));
+    }
+    match user
+        .additional_gids
+        .iter()
+        .find(|&&gid| maps.host_gid(gid).is_none())
+    {
+        Some(&gid) => Err(unmapped(UnmappedId::SupplementaryGroup, gid)),
+        None => Ok(()),
+    }
+}
+
+/// Gives the container a session keyring of its own, as runc does
+/// (`keyrings(7)`): a new, empty, anonymous one, which the command inherits
+/// across `fork` and `exec`. Otherwise it would share its caller's, and with
+/// it whatever keys the caller's login session holds (Docker's seccomp
+/// profile refuses the keyring calls, but a bundle without a profile, or
+/// `seccomp=unconfined`, doesn't).
+///
+/// Two refusals leave nothing to share, so the container goes on:
+/// - ENOSYS: a kernel built without keyrings;
+/// - EPERM: an outer seccomp filter refusing `keyctl` (shipyard itself in
+///   a Docker container). The container inherits that filter, and can't
+///   reach the old keyring either (step 8's probe, K4).
+///
+/// # Errors
+///
+/// Any other: EDQUOT when the user already has as many keys as the kernel
+/// allows (K5).
+fn join_session_keyring() -> Result<(), Errno> {
+    // SAFETY: `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`: a NULL name asks
+    // for a new anonymous keyring; the kernel reads nothing through it.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            libc::KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        )
+    };
+    match Errno::result(rc) {
+        Ok(_) | Err(Errno::ENOSYS | Errno::EPERM) => Ok(()),
+        Err(errno) => Err(errno),
+    }
+}
+
+/// `/proc/sys/kernel/cap_last_cap`: the number of this kernel's last
+/// capability (40 on Linux 5.9 and later).
+fn cap_last_cap() -> Result<u8, Errno> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .map_err(|err| super::io_errno(&err))?;
+    text.trim().parse().map_err(|_| Errno::EINVAL)
+}
+
+/// This kernel's `(major, minor)` version, for a seccomp profile's
+/// `minKernel` conditions. `(0, 0)` if `uname` doesn't say: rules that need
+/// a newer kernel are then left out, and a filter can only get stricter.
+fn kernel_version() -> (u32, u32) {
+    nix::sys::utsname::uname()
+        .ok()
+        .and_then(|name| {
+            name.release()
+                .to_str()
+                .and_then(crate::security::seccomp::kernel_version)
+        })
+        .unwrap_or_default()
+}
+
+/// A confinement this kernel can't apply, as a setup failure.
+fn confinement_failure(err: &ConfinementError) -> Failure {
+    match err {
+        ConfinementError::UnknownToKernel(capability) => {
+            Failure::at(ChildStep::CapabilityUnknown, Errno::EINVAL)
+                .detail(usize::from(capability.number()))
+        }
+        ConfinementError::KernelTooNew(last) => {
+            Failure::at(ChildStep::TooManyCapabilities, Errno::ERANGE).detail(usize::from(*last))
+        }
+        ConfinementError::Seccomp(SeccompError::TooLong(len)) => {
+            Failure::at(ChildStep::SeccompCompile, Errno::E2BIG).detail(*len)
+        }
+        ConfinementError::Seccomp(_) => Failure::at(ChildStep::SeccompCompile, Errno::EINVAL),
+    }
+}
+
+/// The init gives up its own power before its command goes on: every
+/// capability but `CAP_KILL` (to signal a command running as another user,
+/// TLPI §20.5), and `no_new_privs`. Without `CAP_SYS_PTRACE`, its
+/// non-dumpable flag then keeps root inside out of `/proc/1` (step 1's
+/// probe, P1). Then `filter`, the container's own seccomp filter, as
+/// Docker's init (tini) runs under it: whatever reaches the init through
+/// the namespace meets the same rules as the command. (Without
+/// `no_new_privs`, installing it would need `CAP_SYS_ADMIN`; the init has
+/// it set by then.)
+///
+/// # Errors
+///
+/// What couldn't be done.
+fn confine_self(last_cap: u8, filter: Option<&SeccompFilter>) -> Result<(), Unconfined> {
+    Confinement::for_init(last_cap)
+        .map_err(|err| confinement_failure(&err))
+        .and_then(|init| {
+            super::child::confine_before_switch(&init)?;
+            super::child::confine_after_switch(&init)
+        })
+        .map_err(|_| Unconfined::Capabilities)?;
+    filter
+        .map_or(Ok(()), super::child::install_filter)
+        .map_err(Unconfined::Filter)
+}
+
+/// Why the init couldn't confine itself.
+enum Unconfined {
+    /// Its capabilities couldn't be dropped.
+    Capabilities,
+    /// The kernel refused the seccomp filter.
+    Filter(Failure),
+}
+
 /// Becomes the container's init, once the command (PID `command`) runs.
 ///
 /// `exec_failure`: the exit code to report for the command if it couldn't
@@ -424,17 +656,32 @@ fn wait_and_forward(command: libc::pid_t, status_pipe: RawFd, exec_failure: Opti
         match signal {
             libc::SIGCHLD => reap(command, status_pipe, exec_failure),
             -1 if Errno::last() == Errno::EINTR => {}
-            // Can't happen with a valid set. Spinning on it would burn a
-            // CPU forever; ending the container is the lesser evil.
-            -1 => std::process::exit(SETUP_FAILED),
+            // Refused (a seccomp profile without `rt_sigtimedwait`), or
+            // impossible with a valid set. Spinning on it would burn a CPU
+            // forever; ending the container is the lesser evil.
+            -1 => give_up(status_pipe),
             // A forwarded signal: on to the command. (Never re-raised here:
-            // PID 1 would drop it.)
-            // SAFETY: `command` is our child.
-            other => unsafe {
-                libc::kill(command, other);
-            },
+            // PID 1 would drop it.) It can't fail but for a seccomp profile
+            // refusing `kill` (the init keeps `CAP_KILL`, and an unreaped
+            // command exists): then no signal would reach the command, and
+            // stopping it would wait for the stop timeout's SIGKILL.
+            other => {
+                // SAFETY: `command` is our child.
+                if unsafe { libc::kill(command, other) } == -1 {
+                    give_up(status_pipe);
+                }
+            }
         }
     }
+}
+
+/// Ends the container when the init can't supervise its command, saying so
+/// on the status pipe: its stderr is /dev/null by now, and its exit code
+/// alone would pass for the command's. The kernel kills whatever is left in
+/// the namespace.
+fn give_up(status_pipe: RawFd) -> ! {
+    write_record(status_pipe, &[GAVE_UP_MARK]);
+    std::process::exit(SETUP_FAILED);
 }
 
 /// Reaps every child that has exited (signals coalesce: one SIGCHLD can
@@ -463,8 +710,14 @@ fn reap(command: libc::pid_t, status_pipe: RawFd, exec_failure: Option<u8>) {
         }
         match pid {
             -1 if Errno::last() == Errno::EINTR => {}
-            // Nothing more right now (0), or no children left (ECHILD).
-            0 | -1 => return,
+            // Nothing more right now.
+            0 => return,
+            // No children left.
+            -1 if Errno::last() == Errno::ECHILD => return,
+            // Refused (a seccomp profile without `wait4`): the command
+            // could never be reaped, and the container would hang. Ending
+            // it is the lesser evil.
+            -1 => give_up(status_pipe),
             // An orphan that ended up with PID 1: reaped, nothing else.
             _ => {}
         }

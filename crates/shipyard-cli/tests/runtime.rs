@@ -12,6 +12,7 @@
     reason = "in a test crate, a panic is a test failure with a clear message"
 )]
 
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use shipyard_test_support::bundle::Bundle;
-use shipyard_test_support::is_root;
+use shipyard_test_support::{Rootless, rootless};
 
 const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
 
@@ -67,12 +68,18 @@ impl Runtime {
 
     /// `create`, with its (and so the container's) output going to files.
     fn create(&self, id: &str, bundle: &Bundle, extra: &[&str]) -> Call {
+        self.create_with(id, bundle, extra, Command::new(RUNTIME))
+    }
+
+    /// `create` like [`Runtime::create`], run by `command` (the runtime,
+    /// set up as a test needs it).
+    fn create_with(&self, id: &str, bundle: &Bundle, extra: &[&str], mut command: Command) -> Call {
         std::fs::create_dir_all(self.output_dir()).unwrap();
         // (An ID with a `/` is refused, but its file name must still work.)
         let name = id.replace('/', "_");
         let out = self.output_dir().join(format!("{name}.out"));
         let err = self.output_dir().join(format!("{name}.err"));
-        let status = Command::new(RUNTIME)
+        let status = command
             .arg("--root")
             .arg(&self.root)
             .args(["create", "--bundle", bundle.arg()])
@@ -109,6 +116,18 @@ impl Runtime {
         self.state(id)
             .and_then(|state| state["status"].as_str().map(str::to_owned))
             .unwrap_or_else(|| "gone".to_owned())
+    }
+
+    /// How container `id` ended, as its monitor recorded it (waiting up to
+    /// 5 s for the record).
+    fn exit_record(&self, id: &str) -> String {
+        let exit = self.root.join(id).join("exit");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !exit.exists() {
+            assert!(Instant::now() < deadline, "no exit recorded for {id}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(exit).unwrap()
     }
 
     /// Waits (up to 10 s) until container `id` is `status`.
@@ -160,15 +179,78 @@ fn alive(pid: i64) -> bool {
 
 // --- As any user ---------------------------------------------------------------
 
+/// Without root, a container is rootless: created (its bundle given a user
+/// namespace, with a warning), started, stopped and deleted, all as the
+/// caller. Root inside is the caller.
 #[test]
-fn creating_needs_root() {
-    if is_root() {
+fn a_rootless_container_lives_its_life() {
+    if !rootless(Rootless::Single) {
         return;
     }
     let runtime = Runtime::new();
-    let call = runtime.create("c1", &Bundle::new(), &[]);
-    assert_eq!(call.code, Some(1), "{}", call.stderr);
-    assert!(call.stderr.contains("needs root"), "{}", call.stderr);
+    let bundle = bundle_running("stat -L -c %u /proc/self; head -1 /proc/self/uid_map");
+    let created = runtime.create("rootless", &bundle, &[]);
+    assert_eq!(created.code, Some(0), "{}", created.stderr);
+    assert!(
+        created.stderr.contains("no user namespace") && created.stderr.contains("added"),
+        "{}",
+        created.stderr
+    );
+    assert_eq!(runtime.call(&["start", "rootless"]).code, Some(0));
+    runtime.wait_for("rootless", "stopped");
+    let out = runtime.output_of("rootless");
+    let words: Vec<&str> = out.split_whitespace().collect();
+    // SAFETY: `getuid` has no preconditions.
+    let me = unsafe { libc::getuid() }.to_string();
+    assert_eq!(words, ["0", "0", me.as_str(), "1"], "{out}");
+    assert_eq!(runtime.call(&["delete", "rootless"]).code, Some(0));
+    assert_eq!(runtime.state("rootless"), None);
+}
+
+/// Without `--root`, a non-root caller's state is in
+/// `$XDG_RUNTIME_DIR/shipyard`; without that, `--root` must be given.
+#[test]
+fn rootless_state_is_in_the_runtime_dir() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let runtime_dir = std::env::temp_dir().join(format!("shipyard-xdg-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let command = |args: &[&str], xdg: Option<&PathBuf>| {
+        let mut command = Command::new(RUNTIME);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        match xdg {
+            Some(dir) => command.env("XDG_RUNTIME_DIR", dir),
+            None => command.env_remove("XDG_RUNTIME_DIR"),
+        };
+        command
+    };
+    let bundle = bundle_running("sleep 300");
+    // Only the status: the container holds `create`'s stderr open while it
+    // lives, so reading it to its end would wait for the container.
+    let created = command(
+        &["create", "--bundle", bundle.arg(), "xdg"],
+        Some(&runtime_dir),
+    )
+    .stderr(Stdio::null())
+    .status()
+    .unwrap();
+    assert!(created.success());
+    assert!(runtime_dir.join("shipyard/xdg/state.json").is_file());
+    let deleted = command(&["delete", "--force", "xdg"], Some(&runtime_dir))
+        .status()
+        .unwrap();
+    assert!(deleted.success());
+    let without = command(&["state", "xdg"], None).output().unwrap();
+    let said = String::from_utf8_lossy(&without.stderr);
+    assert!(
+        !without.status.success() && said.contains("XDG_RUNTIME_DIR"),
+        "{said}"
+    );
+    std::fs::remove_dir_all(&runtime_dir).unwrap();
 }
 
 #[test]
@@ -251,6 +333,25 @@ fn the_lifecycle() {
 }
 
 /// A program that ends by itself: stopped, with its exit recorded.
+/// A caller that ignores SIGCHLD (passed on across `exec`) doesn't blind
+/// the monitor: with it ignored, the kernel would reap the container's init
+/// itself, and how the container ended would be lost.
+#[test]
+#[ignore = "needs root"]
+fn a_caller_ignoring_sigchld_doesnt_lose_the_exit() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("exit 3");
+    let mut command = Command::new(RUNTIME);
+    // SAFETY: `ignore` only calls `sigaction`, as `pre_exec` requires.
+    unsafe { command.pre_exec(|| shipyard_test_support::ignore(libc::SIGCHLD)) };
+    let call = runtime.create_with("ignoring", &bundle, &[], command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.call(&["start", "ignoring"]).code, Some(0));
+    runtime.wait_for("ignoring", "stopped");
+    let recorded = runtime.exit_record("ignoring");
+    assert!(recorded.contains("exit code 3"), "{recorded}");
+}
+
 #[test]
 #[ignore = "needs root"]
 fn a_container_that_exits_is_stopped() {
@@ -259,13 +360,7 @@ fn a_container_that_exits_is_stopped() {
     assert_eq!(runtime.create("exits", &bundle, &[]).code, Some(0));
     assert_eq!(runtime.call(&["start", "exits"]).code, Some(0));
     runtime.wait_for("exits", "stopped");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let exit = runtime.root.join("exits/exit");
-    while !exit.exists() {
-        assert!(Instant::now() < deadline, "no exit recorded");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let recorded = std::fs::read_to_string(exit).unwrap();
+    let recorded = runtime.exit_record("exits");
     assert!(
         recorded.contains("exit code 3"),
         "{recorded}; stderr: {:?}",
@@ -588,6 +683,55 @@ fn a_container_made_again_at_once_is_the_new_one() {
     assert_eq!(runtime.status("again"), "created");
 }
 
+/// A runtime container gets its bundle's capabilities and `noNewPrivileges`,
+/// as `shipyard run --bundle` does: through the monitor and the start gate
+/// too.
+#[test]
+#[ignore = "needs root"]
+fn a_containers_capabilities_are_its_bundles() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "cat /proc/self/status"]);
+    config["process"]["capabilities"] = json!({
+        "bounding": ["CAP_KILL"], "effective": ["CAP_KILL"], "permitted": ["CAP_KILL"]
+    });
+    config["process"]["noNewPrivileges"] = json!(true);
+    bundle.write(&config);
+    assert_eq!(runtime.create("capped", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "capped"]).code, Some(0));
+    runtime.wait_for("capped", "stopped");
+    let status = runtime.output_of("capped");
+    for expected in [
+        "CapEff:\t0000000000000020",
+        "CapBnd:\t0000000000000020",
+        "NoNewPrivs:\t1",
+    ] {
+        assert!(status.contains(expected), "{expected}: {status}");
+    }
+}
+
+/// A bundle's seccomp profile, through the runtime too.
+#[test]
+#[ignore = "needs root"]
+fn a_containers_seccomp_is_its_bundles() {
+    if shipyard_test_support::under_rosetta() {
+        eprintln!("under Rosetta emulation, where no seccomp filter can be installed; skipping");
+        return;
+    }
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "cat /proc/self/status"]);
+    config["linux"]["seccomp"] = json!({"defaultAction": "SCMP_ACT_ALLOW"});
+    bundle.write(&config);
+    assert_eq!(runtime.create("filtered", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "filtered"]).code, Some(0));
+    runtime.wait_for("filtered", "stopped");
+    let status = runtime.output_of("filtered");
+    assert!(status.contains("Seccomp:\t2"), "{status}");
+}
+
 #[test]
 #[ignore = "needs root"]
 fn deleting_a_running_container_needs_force() {
@@ -721,17 +865,8 @@ fn a_program_that_cant_run_says_so_on_the_containers_stderr() {
     assert_eq!(runtime.create("missing", &bundle, &[]).code, Some(0));
     assert_eq!(runtime.call(&["start", "missing"]).code, Some(0));
     runtime.wait_for("missing", "stopped");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let exit = runtime.root.join("missing/exit");
-    while !exit.exists() {
-        assert!(Instant::now() < deadline, "no exit recorded");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        std::fs::read_to_string(exit)
-            .unwrap()
-            .contains("exit code 127")
-    );
+    let recorded = runtime.exit_record("missing");
+    assert!(recorded.contains("exit code 127"), "{recorded}");
     let stderr = std::fs::read_to_string(runtime.output_dir().join("missing.err")).unwrap();
     assert!(
         stderr.contains("no-such-program: command not found"),

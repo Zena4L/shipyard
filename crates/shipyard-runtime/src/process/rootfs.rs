@@ -145,7 +145,7 @@ mod linux {
         // command sets its own umask before it runs.
         umask(Mode::empty());
         let root_fd = bind_root(root.path())?;
-        mount_standard(&root_fd, root.mqueue)?;
+        mount_standard(&root_fd, root)?;
         if !sysctls.is_empty() {
             // Through the `/proc` just mounted in the root filesystem.
             let proc = open_directory(&root_fd, Target::Proc.name())
@@ -194,7 +194,7 @@ mod linux {
     }
 
     /// `/proc`, a read-only `/sys`, and `/dev` with what's in it.
-    fn mount_standard(root: &OwnedFd, mqueue: bool) -> Step {
+    fn mount_standard(root: &OwnedFd, setup: &RootSetup) -> Step {
         let on = target(root, Target::Proc)?;
         mount_on(&on, "proc", "proc", NOSUID_NODEV_NOEXEC, None)
             .map_err(|errno| Failure::at(ChildStep::MountProc, errno))?;
@@ -202,14 +202,18 @@ mod linux {
         // has its own network namespace (stage 7), it lists the host's
         // network devices (probe 7).
         let on = target(root, Target::Sys)?;
-        mount_on(
-            &on,
-            "sysfs",
-            "sysfs",
-            NOSUID_NODEV_NOEXEC | MsFlags::MS_RDONLY,
-            None,
-        )
-        .map_err(|errno| Failure::at(ChildStep::MountSys, errno))?;
+        let sys = if setup.user_namespace {
+            bind_host_sys(root, &on)
+        } else {
+            mount_on(
+                &on,
+                "sysfs",
+                "sysfs",
+                NOSUID_NODEV_NOEXEC | MsFlags::MS_RDONLY,
+                None,
+            )
+        };
+        sys.map_err(|errno| Failure::at(ChildStep::MountSys, errno))?;
         let on = target(root, Target::Dev)?;
         // Not `nodev`: its device nodes must open (probe 10).
         mount_on(
@@ -220,7 +224,46 @@ mod linux {
             Some("mode=755,size=65536k"),
         )
         .map_err(|errno| Failure::at(ChildStep::MountDev, errno))?;
-        fill_dev(root, mqueue)
+        fill_dev(root, setup)
+    }
+
+    /// In a user namespace, `sysfs` can only be mounted with a network
+    /// namespace of the container's own (step 1's probe, U6): the host's
+    /// `/sys` is bound instead, with the mounts below it, and every one made
+    /// read-only, `nosuid`, `nodev` and `noexec`. Restrictions only add: the
+    /// kernel locks a host mount's flags in a user namespace (U9).
+    ///
+    /// The mounts below it are the host's (its cgroup tree, `securityfs`,
+    /// `debugfs`, …), which a fresh `sysfs` doesn't have. They can't be
+    /// unmounted (the kernel locks them with the bind) or left out (it
+    /// refuses a bind that would reveal what they cover), so each is
+    /// covered with an empty, read-only tmpfs.
+    fn bind_host_sys(root: &OwnedFd, on: &OwnedFd) -> nix::Result<()> {
+        let flags = NOSUID_NODEV_NOEXEC | MsFlags::MS_RDONLY;
+        bind(on, Leaf::Directory, Path::new("/sys"), true)?;
+        // Opened again: `on` is the directory under the new mount.
+        let mounted = open_directory(root, Target::Sys.name())?;
+        add_restrictions(&mounted, true, flags, || {
+            on_target(&mounted, Leaf::Directory, |at| remount(at, flags))
+        })?;
+        let mut below = mounts_below(&mounted)?;
+        // Outermost first: covering one hides those inside it.
+        below.sort_by_key(|point| point.components().count());
+        let mut covered: Vec<PathBuf> = Vec::new();
+        for point in below {
+            if covered.iter().any(|outer| point.starts_with(outer)) {
+                continue;
+            }
+            mount(
+                Some("tmpfs"),
+                &point,
+                Some("tmpfs"),
+                flags,
+                Some("size=4k,mode=755"),
+            )?;
+            covered.push(point);
+        }
+        Ok(())
     }
 
     /// Opens `target` in the root filesystem: a directory, never through a
@@ -295,31 +338,39 @@ mod linux {
 
     /// Device nodes, symlinks, `/dev/pts`, `/dev/shm` and `/dev/mqueue`,
     /// made relative to the new tmpfs.
-    fn fill_dev(root: &OwnedFd, mqueue: bool) -> Step {
+    fn fill_dev(root: &OwnedFd, setup: &RootSetup) -> Step {
         // Through the mount just made on it.
         let dev = open_directory(root, "dev").map_err(dev_failure("/dev"))?;
         for (name, major, minor) in DEVICES {
-            mknodat(
-                &dev,
-                name,
-                SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
-                makedev(major, minor),
-            )
-            .map_err(dev_failure(name))?;
+            let made = if setup.user_namespace {
+                bind_host_device(&dev, name)
+            } else {
+                mknodat(
+                    &dev,
+                    name,
+                    SFlag::S_IFCHR,
+                    Mode::from_bits_truncate(0o666),
+                    makedev(major, minor),
+                )
+            };
+            made.map_err(dev_failure(name))?;
         }
         for (name, target) in LINKS {
             symlinkat(target, &dev, name).map_err(dev_failure(name))?;
         }
         // Its own instance of devpts (probe 5): the container's terminals
         // only. `ptmxmode` makes its `ptmx` usable (the `/dev/ptmx` link).
-        // `gid=5` is the `tty` group in most distributions.
+        // Its terminals' group, if any, is `pts_gid` (see `RootSetup`).
+        let pts_options = match setup.pts_gid {
+            Some(gid) => format!("newinstance,ptmxmode=0666,mode=0620,gid={gid}"),
+            None => "newinstance,ptmxmode=0666,mode=0620".to_owned(),
+        };
         mount_in(
             &dev,
             "pts",
             ("devpts", "devpts"),
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-            Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
+            Some(&pts_options),
         )?;
         mount_in(
             &dev,
@@ -330,7 +381,7 @@ mod linux {
         )?;
         // POSIX message queues show the IPC namespace of whoever mounts them
         // (probe 6): only with the container's own.
-        if mqueue {
+        if setup.mqueue {
             mount_in(
                 &dev,
                 "mqueue",
@@ -340,6 +391,20 @@ mod linux {
             )?;
         }
         Ok(())
+    }
+
+    /// In a user namespace, `mknod` is refused, and a node on a file system
+    /// the namespace mounted wouldn't open anyway (U7): the host's
+    /// `/dev/NAME` is bound onto an empty file instead, as runc does without
+    /// root. The bind keeps the host mount's flags, so it opens.
+    fn bind_host_device(dev: &OwnedFd, name: &str) -> nix::Result<()> {
+        let file = openat(
+            dev,
+            name,
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o666),
+        )?;
+        bind(&file, Leaf::File, &Path::new("/dev").join(name), false)
     }
 
     /// Makes the directory `name` in `/dev` (a fresh tmpfs), and mounts

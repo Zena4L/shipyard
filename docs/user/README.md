@@ -6,8 +6,12 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > its own namespaces: its own processes (under a small init), mounts, hostname
 > and IPC, and optionally a root filesystem of its own (`--rootfs`), or a whole
 > container from an [OCI bundle](bundles.md) (`--bundle`); `shipyard-runtime` runs
-> bundles step by step, as an [OCI runtime](runtime.md). It doesn't have its own
-> network yet, and it isn't a security boundary yet. It starts the command the way a
+> bundles step by step, as an [OCI runtime](runtime.md). The command is confined:
+> a minimal set of capabilities, `no_new_privs`, and a seccomp filter. It runs
+> **rootless** for anyone without root, in a user namespace whose root is that user
+> (root can ask for one with `--uidmap`). It doesn't have its own network yet, and
+> it has no resource limits of its own yet (cgroups), so it isn't a hardened
+> boundary yet. It starts the command the way a
 > container runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
 > leaves behind), and reports exactly how it ended. On macOS, commands aren't
@@ -63,11 +67,10 @@ backend: linux-vm (not implemented yet)
 On Linux, containers run directly on the host kernel. On macOS they will run
 inside a lightweight Linux VM that Shipyard manages.
 
-Run a command. On Linux, isolation needs root (running without root comes
-later); add `--no-isolation` to run without namespaces instead:
+Run a command:
 
 ```sh
-sudo shipyard run -e GREETING=hello sh -c 'echo "$GREETING from PID $$"; exit 3'
+shipyard run -e GREETING=hello sh -c 'echo "$GREETING from PID $$"; exit 3'
 echo $?
 ```
 
@@ -76,8 +79,11 @@ hello from PID 2
 3
 ```
 
-PID 2: the command sees only its own processes, under Shipyard's small init
-(PID 1). On macOS, run it without `sudo`; the PID is then an ordinary one.
+PID 2: on Linux the command sees only its own processes, under Shipyard's small
+init (PID 1). Without root, the container is **rootless**: its root is you, in a
+user namespace (see [Running commands](run.md#rootless) for what your
+system needs). On macOS commands aren't isolated yet, so the PID is an ordinary
+one.
 
 See [Running commands](run.md) for everything `run` accepts.
 

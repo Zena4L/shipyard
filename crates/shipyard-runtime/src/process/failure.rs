@@ -15,6 +15,9 @@ use super::rootfs::{DEV_ENTRIES, Target};
 use super::spec::Names;
 use super::status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND};
 use crate::isolation::{MountKind, Root};
+use crate::security::Capability;
+#[cfg(target_os = "linux")]
+use crate::security::{Seccomp, Security};
 
 /// The child's setup steps. The numbers travel over the report pipe, so
 /// they never change; new steps get new numbers, wherever they run.
@@ -58,6 +61,20 @@ pub(crate) enum ChildStep {
     UserLookup = 35,
     Domainname = 36,
     Sysctl = 37,
+    KeepCaps = 38,
+    BoundingDrop = 39,
+    Capset = 40,
+    AmbientRaise = 41,
+    NoNewPrivs = 42,
+    CapLastCap = 43,
+    CapabilityUnknown = 44,
+    TooManyCapabilities = 45,
+    Seccomp = 46,
+    SeccompCompile = 47,
+    NamespaceRoot = 48,
+    UnmappedId = 49,
+    GroupsDenied = 50,
+    SessionKeyring = 51,
 }
 
 impl ChildStep {
@@ -103,6 +120,20 @@ impl ChildStep {
             35 => Self::UserLookup,
             36 => Self::Domainname,
             37 => Self::Sysctl,
+            38 => Self::KeepCaps,
+            39 => Self::BoundingDrop,
+            40 => Self::Capset,
+            41 => Self::AmbientRaise,
+            42 => Self::NoNewPrivs,
+            43 => Self::CapLastCap,
+            44 => Self::CapabilityUnknown,
+            45 => Self::TooManyCapabilities,
+            46 => Self::Seccomp,
+            47 => Self::SeccompCompile,
+            48 => Self::NamespaceRoot,
+            49 => Self::UnmappedId,
+            50 => Self::GroupsDenied,
+            51 => Self::SessionKeyring,
             _ => return None,
         })
     }
@@ -135,6 +166,64 @@ pub(crate) struct FailureContext {
     /// The container's own root filesystem, if it has one: where the
     /// command's paths are, and which paths the setup's details name.
     pub(crate) container_root: Option<Root>,
+    /// When the command's seccomp filter goes on, if it has one: a failure
+    /// after that may be the filter refusing a call.
+    pub(crate) seccomp: Option<FilterStart>,
+    /// In a user namespace: the host user the container's root is. The
+    /// host's permissions apply to it, not to host root.
+    pub(crate) namespace_root: Option<u32>,
+}
+
+/// When a command's seccomp filter goes on (see `child.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "seccomp is Linux's: elsewhere there's never a filter"
+    )
+)]
+pub(crate) enum FilterStart {
+    /// Before the setup: without `no_new_privs`, while root still has
+    /// `CAP_SYS_ADMIN`.
+    BeforeSetup,
+    /// Right before `exec`.
+    BeforeExec,
+}
+
+impl FilterStart {
+    /// When `security`'s filter goes on, if it has one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of(security: &Security) -> Option<Self> {
+        match security.seccomp {
+            Seccomp::Unconfined => None,
+            _ if security.no_new_privileges => Some(Self::BeforeExec),
+            _ => Some(Self::BeforeSetup),
+        }
+    }
+
+    /// Whether `step` runs under the filter.
+    fn covers(self, step: ChildStep) -> bool {
+        match self {
+            Self::BeforeExec => step == ChildStep::Exec,
+            Self::BeforeSetup => matches!(
+                step,
+                ChildStep::KeepCaps
+                    | ChildStep::BoundingDrop
+                    | ChildStep::SetGroups
+                    | ChildStep::SetGid
+                    | ChildStep::SetUid
+                    | ChildStep::VerifyCredentials
+                    | ChildStep::Capset
+                    | ChildStep::AmbientRaise
+                    | ChildStep::NoNewPrivs
+                    | ChildStep::Chdir
+                    | ChildStep::ParentDeathSignal
+                    | ChildStep::SignalMask
+                    | ChildStep::Exec
+            ),
+        }
+    }
 }
 
 /// Errors from `execve` that mean "no program at this path", so a PATH
@@ -223,6 +312,14 @@ impl SpawnError {
         }
     }
 
+    /// The same error, with `note` added to its message.
+    fn noting(self, note: &str) -> Self {
+        Self {
+            message: format!("{} ({note})", self.message),
+            ..self
+        }
+    }
+
     /// Why the command didn't run.
     #[must_use]
     pub fn kind(&self) -> SpawnErrorKind {
@@ -248,6 +345,37 @@ impl SpawnError {
 
 /// Turns the child's report into an explained error.
 pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
+    let error = describe_step(failure, ctx);
+    // EPERM is what a seccomp profile usually answers (Docker's does).
+    let refused_by_filter = failure.errno == Errno::EPERM
+        && ctx.seccomp.is_some_and(|start| start.covers(failure.step));
+    if refused_by_filter {
+        return error.noting("the seccomp profile, in force by then, may have refused it");
+    }
+    // Host root could; the user the container's root really is can't.
+    // (`exec`'s EACCES isn't always about permissions: `describe_exec`
+    // notes it where it is.)
+    if failure.errno == Errno::EACCES && failure.step != ChildStep::Exec {
+        namespace_root_note(error, ctx)
+    } else {
+        error
+    }
+}
+
+/// `error`, noting who the container's root is on the host, in a user
+/// namespace: the host's permissions apply to that user, not to root.
+fn namespace_root_note(error: SpawnError, ctx: &FailureContext) -> SpawnError {
+    match ctx.namespace_root {
+        Some(host) => error.noting(&format!(
+            "in its user namespace, the container's root is host user {host}, and the host's \
+             permissions apply to it"
+        )),
+        None => error,
+    }
+}
+
+/// What failed at `failure`'s step, and why.
+fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
     use SpawnErrorKind::Setup;
     let ChildFailure {
         step,
@@ -280,6 +408,7 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
         }
         ChildStep::MountProc => isolation_setup("mounting /proc for the container", errno, ctx),
         ChildStep::Hostname => isolation_setup("setting the container's hostname", errno, ctx),
+        ChildStep::SessionKeyring => SpawnError::new(Setup, describe_keyring(errno), errno),
         ChildStep::InitFork => {
             isolation_setup("starting the command inside the container", errno, ctx)
         }
@@ -297,6 +426,19 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
             errno,
             ctx,
         ),
+        ChildStep::KeepCaps
+        | ChildStep::BoundingDrop
+        | ChildStep::Capset
+        | ChildStep::AmbientRaise
+        | ChildStep::NoNewPrivs
+        | ChildStep::TooManyCapabilities
+        | ChildStep::CapLastCap
+        | ChildStep::CapabilityUnknown
+        | ChildStep::Seccomp
+        | ChildStep::SeccompCompile
+        | ChildStep::NamespaceRoot
+        | ChildStep::UnmappedId
+        | ChildStep::GroupsDenied => describe_confinement(step, errno, detail),
         ChildStep::BindRoot
         | ChildStep::RootTarget
         | ChildStep::MountSys
@@ -313,6 +455,173 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
         | ChildStep::Domainname
         | ChildStep::Sysctl => describe_container(step, errno, detail, ctx),
     }
+}
+
+/// The command's confinement (stage 4): its capabilities, `no_new_privs` and
+/// seccomp filter. `detail` names the capability, or the filter's length.
+fn describe_confinement(step: ChildStep, errno: Errno, detail: u64) -> SpawnError {
+    let message = match step {
+        ChildStep::KeepCaps => doing("keeping capabilities across the switch of user", errno),
+        ChildStep::BoundingDrop => doing(
+            &format!(
+                "dropping {} from the capability bounding set",
+                capability_name(detail)
+            ),
+            errno,
+        ),
+        ChildStep::Capset => doing("setting the command's capabilities", errno),
+        ChildStep::AmbientRaise => doing(
+            &format!(
+                "raising {} as an ambient capability",
+                capability_name(detail)
+            ),
+            errno,
+        ),
+        ChildStep::NoNewPrivs => doing("setting no_new_privs", errno),
+        ChildStep::CapLastCap => doing(
+            "reading the kernel's last capability (/proc/sys/kernel/cap_last_cap)",
+            errno,
+        ),
+        ChildStep::TooManyCapabilities => format!(
+            "this kernel has {} capabilities: more than the 64 Shipyard can drop",
+            detail.saturating_add(1)
+        ),
+        ChildStep::CapabilityUnknown => format!(
+            "{} isn't a capability this kernel has (it's older than the name)",
+            capability_name(detail)
+        ),
+        ChildStep::SeccompCompile if detail > 0 => format!(
+            "the seccomp filter is {detail} instructions long, more than the kernel's 4096; a \
+             smaller profile is needed"
+        ),
+        ChildStep::SeccompCompile => "the seccomp profile can't be compiled".to_owned(),
+        // EINVAL is the kernel refusing the filter itself: under x86-64
+        // emulation (Rosetta) every filter is refused (step 1's probe, S5);
+        // kernels before 4.14 refuse `SCMP_ACT_LOG` and `SCMP_ACT_KILL_PROCESS`.
+        ChildStep::Seccomp if errno == Errno::EINVAL => format!(
+            "{} (the kernel refused it: under x86-64 emulation, such as Rosetta, no filter can \
+             be installed; `--security-opt seccomp=unconfined` runs without one, as does a \
+             bundle without linux.seccomp)",
+            doing("installing the seccomp filter", errno)
+        ),
+        ChildStep::Seccomp => doing("installing the seccomp filter", errno),
+        ChildStep::NamespaceRoot => doing(NamespaceRootStep::doing(detail), errno),
+        ChildStep::UnmappedId => describe_unmapped(detail),
+        ChildStep::GroupsDenied => format!(
+            "supplementary group {detail} can't be set: the container's user namespace denies \
+             setgroups (a rootless container that maps only your own IDs, which ranges in \
+             /etc/subuid and /etc/subgid with newuidmap installed avoid; or shipyard started \
+             inside a user namespace that denies it)"
+        ),
+        // The other steps are `describe`'s.
+        _ => doing("confining the command", errno),
+    };
+    SpawnError::new(SpawnErrorKind::Setup, message, errno)
+}
+
+/// Which of the command's IDs a [`ChildStep::UnmappedId`] failure is
+/// about: the high 32 bits of its detail (the ID is the low 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum UnmappedId {
+    User = 1,
+    Group = 2,
+    SupplementaryGroup = 3,
+}
+
+impl UnmappedId {
+    /// The failure's detail for `id`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn detail(self, id: u32) -> usize {
+        usize::try_from((u64::from(self as u8) << 32) | u64::from(id)).unwrap_or(usize::MAX)
+    }
+
+    /// Which ID, and the ID, from a failure's detail.
+    fn from_detail(detail: u64) -> (Self, u64) {
+        let which = match detail >> 32 {
+            1 => Self::User,
+            2 => Self::Group,
+            _ => Self::SupplementaryGroup,
+        };
+        (which, detail & u64::from(u32::MAX))
+    }
+}
+
+/// Which call of [`ChildStep::NamespaceRoot`] failed (`setgroups`,
+/// `setresgid`, `setresuid`): its detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux's child makes them")
+)]
+pub(crate) enum NamespaceRootStep {
+    Groups = 1,
+    Gid = 2,
+    Uid = 3,
+}
+
+impl NamespaceRootStep {
+    /// The failure's detail.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn detail(self) -> usize {
+        usize::from(self as u8)
+    }
+
+    /// What it was doing, from a failure's detail.
+    fn doing(detail: u64) -> &'static str {
+        if detail == Self::Groups as u64 {
+            "dropping supplementary groups in the container's user namespace"
+        } else if detail == Self::Gid as u64 {
+            "becoming group 0 in the container's user namespace"
+        } else {
+            "becoming root in the container's user namespace"
+        }
+    }
+}
+
+/// An ID the container's user namespace doesn't map.
+fn describe_unmapped(detail: u64) -> String {
+    let (which, id) = UnmappedId::from_detail(detail);
+    let (what, map) = match which {
+        UnmappedId::User => ("user", "uid"),
+        UnmappedId::Group => ("group", "gid"),
+        UnmappedId::SupplementaryGroup => ("supplementary group", "gid"),
+    };
+    format!(
+        "{what} {id} isn't mapped in the container's user namespace: there it doesn't exist \
+         (its {map} map comes from --{map}map, or for a rootless container from your \
+         /etc/sub{map} range)"
+    )
+}
+
+/// A container's session keyring that couldn't be made.
+fn describe_keyring(errno: Errno) -> String {
+    let doing = doing("giving the container a session keyring of its own", errno);
+    if errno == Errno::EDQUOT {
+        format!(
+            "{doing} (this user has as many keys as the kernel allows: see the sysctls \
+             kernel.keys.maxkeys and maxbytes, or root_maxkeys and root_maxbytes for root)"
+        )
+    } else {
+        doing
+    }
+}
+
+/// What was being done, and the errno's reason.
+fn doing(what: &str, errno: Errno) -> String {
+    format!("{what}: {}", errno.desc())
+}
+
+/// A capability by the number a failure's detail carries.
+fn capability_name(detail: u64) -> String {
+    u8::try_from(detail)
+        .ok()
+        .and_then(Capability::from_number)
+        .map_or_else(
+            || format!("capability {detail}"),
+            |cap| cap.name().to_owned(),
+        )
 }
 
 /// The container's own setup steps, from step 3 on: its root filesystem,
@@ -574,21 +883,25 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
         }
         Errno::EACCES => {
             let resolved = ctx.resolve(candidate);
-            let message = if resolved.is_dir() {
-                format!("{path}: is a directory")
-            } else if !resolved.exists() {
+            if resolved.is_dir() {
+                return SpawnError::new(CannotExecute, format!("{path}: is a directory"), errno);
+            }
+            if on_noexec_mount(&resolved) {
+                let message = format!(
+                    "{path}: permission denied (the file system it's on is mounted noexec, \
+                     which forbids running programs from it)"
+                );
+                return SpawnError::new(CannotExecute, message, errno);
+            }
+            // The rest is about permissions.
+            let message = if resolved.exists() {
+                format!("{path}: permission denied (is it executable?)")
+            } else {
                 // `exists` follows the same path, so this also catches a
                 // file shipyard can see but the command's user can't reach.
                 format!("{path}: permission denied (a directory on the way isn't searchable)")
-            } else if on_noexec_mount(&resolved) {
-                format!(
-                    "{path}: permission denied (the file system it's on is mounted noexec, \
-                     which forbids running programs from it)"
-                )
-            } else {
-                format!("{path}: permission denied (is it executable?)")
             };
-            SpawnError::new(CannotExecute, message, errno)
+            namespace_root_note(SpawnError::new(CannotExecute, message, errno), ctx)
         }
         Errno::ENOEXEC => SpawnError::new(
             CannotExecute,
@@ -655,6 +968,8 @@ mod tests {
             container_root: None,
             names: Names::default(),
             sysctls: Vec::new(),
+            seccomp: None,
+            namespace_root: None,
         }
     }
 
@@ -674,7 +989,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 37, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 51, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -774,6 +1089,154 @@ mod tests {
     fn out_of_range_detail_falls_back_to_the_program() {
         let err = exec(Errno::ENOEXEC, u64::MAX, &ctx("/x", &["/x"]));
         assert!(err.to_string().starts_with("/x:"), "{err}");
+    }
+
+    #[test]
+    fn confinement_failures_say_what_and_why() {
+        let ctx = ctx("/x", &["/x"]);
+        let fail = |step, errno, detail| {
+            describe(
+                ChildFailure {
+                    step,
+                    errno,
+                    detail,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        assert_eq!(
+            fail(ChildStep::BoundingDrop, Errno::EPERM, 21),
+            "dropping CAP_SYS_ADMIN from the capability bounding set: Operation not permitted"
+        );
+        let refused = fail(ChildStep::Seccomp, Errno::EINVAL, 0);
+        assert!(
+            refused.starts_with("installing the seccomp filter: Invalid argument (the kernel")
+                && refused.contains("seccomp=unconfined"),
+            "{refused}"
+        );
+        assert_eq!(
+            fail(ChildStep::Seccomp, Errno::EACCES, 0),
+            "installing the seccomp filter: Permission denied"
+        );
+        assert!(fail(ChildStep::SeccompCompile, Errno::E2BIG, 5000).contains("5000 instructions"));
+        assert_eq!(
+            fail(ChildStep::SeccompCompile, Errno::EINVAL, 0),
+            "the seccomp profile can't be compiled"
+        );
+        assert_eq!(
+            fail(
+                ChildStep::NamespaceRoot,
+                Errno::EPERM,
+                NamespaceRootStep::Uid as u64
+            ),
+            "becoming root in the container's user namespace: Operation not permitted"
+        );
+        #[cfg(target_os = "linux")]
+        for (which, id, wanted) in [
+            (UnmappedId::User, 70000, "user 70000 isn't mapped"),
+            (UnmappedId::Group, 5, "group 5 isn't mapped"),
+            (
+                UnmappedId::SupplementaryGroup,
+                4_000_000_000,
+                "supplementary group 4000000000 isn't mapped",
+            ),
+        ] {
+            let detail = u64::try_from(which.detail(id)).unwrap();
+            let message = fail(ChildStep::UnmappedId, Errno::EINVAL, detail);
+            assert!(message.starts_with(wanted), "{message}");
+        }
+    }
+
+    /// In a user namespace, a permission error names the host user the
+    /// container's root is.
+    #[test]
+    fn permission_errors_in_a_user_namespace_name_the_mapped_root() {
+        let with = |namespace_root, errno| {
+            let ctx = FailureContext {
+                namespace_root,
+                ..ctx("/x", &["/x"])
+            };
+            describe(
+                ChildFailure {
+                    step: ChildStep::BindRoot,
+                    errno,
+                    detail: 0,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        let note = "the container's root is host user 100000";
+        assert!(with(Some(100_000), Errno::EACCES).contains(note));
+        assert!(!with(Some(100_000), Errno::ENOENT).contains(note));
+        assert!(!with(None, Errno::EACCES).contains("host user"));
+
+        // `exec`'s EACCES is noted only where it's about permissions: not
+        // for a directory.
+        let exec_of = |program: &str| {
+            let ctx = FailureContext {
+                namespace_root: Some(100_000),
+                ..ctx(program, &[program])
+            };
+            exec(Errno::EACCES, 0, &ctx).to_string()
+        };
+        let directory = exec_of("/");
+        assert!(directory.ends_with("is a directory"), "{directory}");
+        let unreachable = exec_of("/nonexistent/program");
+        assert!(unreachable.contains(note), "{unreachable}");
+    }
+
+    /// A failure under the filter, with EPERM, may be the filter's refusal:
+    /// the message says so, and only then.
+    #[test]
+    fn failures_under_a_filter_mention_it() {
+        let note = "the seccomp profile, in force by then, may have refused it";
+        let with = |seccomp, step, errno| {
+            let ctx = FailureContext {
+                seccomp,
+                ..ctx("/x", &["/x"])
+            };
+            describe(
+                ChildFailure {
+                    step,
+                    errno,
+                    detail: 21,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        let early = Some(FilterStart::BeforeSetup);
+        let late = Some(FilterStart::BeforeExec);
+        assert!(with(early, ChildStep::BoundingDrop, Errno::EPERM).ends_with(&format!("({note})")));
+        assert!(with(early, ChildStep::SetUid, Errno::EPERM).contains(note));
+        assert!(with(early, ChildStep::Exec, Errno::EPERM).contains(note));
+        assert!(with(late, ChildStep::Exec, Errno::EPERM).contains(note));
+        // Before the filter, without one, or another errno: nothing added.
+        assert!(!with(late, ChildStep::BoundingDrop, Errno::EPERM).contains(note));
+        assert!(!with(None, ChildStep::Exec, Errno::EPERM).contains(note));
+        assert!(!with(early, ChildStep::Exec, Errno::EACCES).contains(note));
+        assert!(!with(early, ChildStep::Seccomp, Errno::EPERM).contains(note));
+    }
+
+    /// A keyring quota failure names the limits to look at.
+    #[test]
+    fn a_keyring_quota_names_the_limits() {
+        let keyring = describe(
+            ChildFailure {
+                step: ChildStep::SessionKeyring,
+                errno: Errno::EDQUOT,
+                detail: 0,
+            },
+            &ctx("/x", &["/x"]),
+        )
+        .to_string();
+        assert!(
+            keyring.starts_with("giving the container a session keyring of its own: ")
+                && keyring.contains("kernel.keys.maxkeys"),
+            "{keyring}"
+        );
     }
 
     #[test]
