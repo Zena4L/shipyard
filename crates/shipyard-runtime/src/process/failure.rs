@@ -15,6 +15,9 @@ use super::rootfs::{DEV_ENTRIES, Target};
 use super::spec::Names;
 use super::status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND};
 use crate::isolation::{MountKind, Root};
+use crate::security::Capability;
+#[cfg(target_os = "linux")]
+use crate::security::{Seccomp, Security};
 
 /// The child's setup steps. The numbers travel over the report pipe, so
 /// they never change; new steps get new numbers, wherever they run.
@@ -58,6 +61,18 @@ pub(crate) enum ChildStep {
     UserLookup = 35,
     Domainname = 36,
     Sysctl = 37,
+    KeepCaps = 38,
+    BoundingDrop = 39,
+    Capset = 40,
+    AmbientRaise = 41,
+    NoNewPrivs = 42,
+    CapLastCap = 43,
+    CapabilityUnknown = 44,
+    TooManyCapabilities = 45,
+    Seccomp = 46,
+    SeccompCompile = 47,
+    NamespaceRoot = 48,
+    UnmappedId = 49,
 }
 
 impl ChildStep {
@@ -103,6 +118,18 @@ impl ChildStep {
             35 => Self::UserLookup,
             36 => Self::Domainname,
             37 => Self::Sysctl,
+            38 => Self::KeepCaps,
+            39 => Self::BoundingDrop,
+            40 => Self::Capset,
+            41 => Self::AmbientRaise,
+            42 => Self::NoNewPrivs,
+            43 => Self::CapLastCap,
+            44 => Self::CapabilityUnknown,
+            45 => Self::TooManyCapabilities,
+            46 => Self::Seccomp,
+            47 => Self::SeccompCompile,
+            48 => Self::NamespaceRoot,
+            49 => Self::UnmappedId,
             _ => return None,
         })
     }
@@ -135,6 +162,60 @@ pub(crate) struct FailureContext {
     /// The container's own root filesystem, if it has one: where the
     /// command's paths are, and which paths the setup's details name.
     pub(crate) container_root: Option<Root>,
+    /// When the command's seccomp filter goes on, if it has one: a failure
+    /// after that may be the filter refusing a call.
+    pub(crate) seccomp: Option<FilterStart>,
+}
+
+/// When a command's seccomp filter goes on (see `child.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "seccomp is Linux's: elsewhere there's never a filter"
+    )
+)]
+pub(crate) enum FilterStart {
+    /// Before the setup: without `no_new_privs`, while root still has
+    /// `CAP_SYS_ADMIN`.
+    BeforeSetup,
+    /// Right before `exec`.
+    BeforeExec,
+}
+
+impl FilterStart {
+    /// When `security`'s filter goes on, if it has one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of(security: &Security) -> Option<Self> {
+        match security.seccomp {
+            Seccomp::Unconfined => None,
+            _ if security.no_new_privileges => Some(Self::BeforeExec),
+            _ => Some(Self::BeforeSetup),
+        }
+    }
+
+    /// Whether `step` runs under the filter.
+    fn covers(self, step: ChildStep) -> bool {
+        match self {
+            Self::BeforeExec => step == ChildStep::Exec,
+            Self::BeforeSetup => matches!(
+                step,
+                ChildStep::KeepCaps
+                    | ChildStep::BoundingDrop
+                    | ChildStep::SetGroups
+                    | ChildStep::SetGid
+                    | ChildStep::SetUid
+                    | ChildStep::Capset
+                    | ChildStep::AmbientRaise
+                    | ChildStep::NoNewPrivs
+                    | ChildStep::Chdir
+                    | ChildStep::ParentDeathSignal
+                    | ChildStep::SignalMask
+                    | ChildStep::Exec
+            ),
+        }
+    }
 }
 
 /// Errors from `execve` that mean "no program at this path", so a PATH
@@ -223,6 +304,14 @@ impl SpawnError {
         }
     }
 
+    /// The same error, with `note` added to its message.
+    fn noting(self, note: &str) -> Self {
+        Self {
+            message: format!("{} ({note})", self.message),
+            ..self
+        }
+    }
+
     /// Why the command didn't run.
     #[must_use]
     pub fn kind(&self) -> SpawnErrorKind {
@@ -248,6 +337,19 @@ impl SpawnError {
 
 /// Turns the child's report into an explained error.
 pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
+    let error = describe_step(failure, ctx);
+    // EPERM is what a seccomp profile usually answers (Docker's does).
+    let refused_by_filter = failure.errno == Errno::EPERM
+        && ctx.seccomp.is_some_and(|start| start.covers(failure.step));
+    if refused_by_filter {
+        error.noting("the seccomp profile, in force by then, may have refused it")
+    } else {
+        error
+    }
+}
+
+/// What failed at `failure`'s step, and why.
+fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
     use SpawnErrorKind::Setup;
     let ChildFailure {
         step,
@@ -297,6 +399,18 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
             errno,
             ctx,
         ),
+        ChildStep::KeepCaps
+        | ChildStep::BoundingDrop
+        | ChildStep::Capset
+        | ChildStep::AmbientRaise
+        | ChildStep::NoNewPrivs
+        | ChildStep::TooManyCapabilities
+        | ChildStep::CapLastCap
+        | ChildStep::CapabilityUnknown
+        | ChildStep::Seccomp
+        | ChildStep::SeccompCompile
+        | ChildStep::NamespaceRoot
+        | ChildStep::UnmappedId => describe_confinement(step, errno, detail),
         ChildStep::BindRoot
         | ChildStep::RootTarget
         | ChildStep::MountSys
@@ -313,6 +427,107 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
         | ChildStep::Domainname
         | ChildStep::Sysctl => describe_container(step, errno, detail, ctx),
     }
+}
+
+/// The command's confinement (stage 4): its capabilities, `no_new_privs` and
+/// seccomp filter. `detail` names the capability, or the filter's length.
+fn describe_confinement(step: ChildStep, errno: Errno, detail: u64) -> SpawnError {
+    let message = match step {
+        ChildStep::KeepCaps => doing("keeping capabilities across the switch of user", errno),
+        ChildStep::BoundingDrop => doing(
+            &format!(
+                "dropping {} from the capability bounding set",
+                capability_name(detail)
+            ),
+            errno,
+        ),
+        ChildStep::Capset => doing("setting the command's capabilities", errno),
+        ChildStep::AmbientRaise => doing(
+            &format!(
+                "raising {} as an ambient capability",
+                capability_name(detail)
+            ),
+            errno,
+        ),
+        ChildStep::NoNewPrivs => doing("setting no_new_privs", errno),
+        ChildStep::CapLastCap => doing(
+            "reading the kernel's last capability (/proc/sys/kernel/cap_last_cap)",
+            errno,
+        ),
+        ChildStep::TooManyCapabilities => format!(
+            "this kernel has {} capabilities: more than the 64 Shipyard can drop",
+            detail.saturating_add(1)
+        ),
+        ChildStep::CapabilityUnknown => format!(
+            "{} isn't a capability this kernel has (it's older than the name)",
+            capability_name(detail)
+        ),
+        ChildStep::SeccompCompile if detail > 0 => format!(
+            "the seccomp filter is {detail} instructions long, more than the kernel's 4096; a \
+             smaller profile is needed"
+        ),
+        ChildStep::SeccompCompile => "the seccomp profile can't be compiled".to_owned(),
+        // EINVAL is the kernel refusing the filter itself: under x86-64
+        // emulation (Rosetta) every filter is refused (step 1's probe, S5);
+        // kernels before 4.14 refuse `SCMP_ACT_LOG` and `SCMP_ACT_KILL_PROCESS`.
+        ChildStep::Seccomp if errno == Errno::EINVAL => format!(
+            "{} (the kernel refused it: under x86-64 emulation, such as Rosetta, no filter can \
+             be installed; `--security-opt seccomp=unconfined` runs without one, as does a \
+             bundle without linux.seccomp)",
+            doing("installing the seccomp filter", errno)
+        ),
+        ChildStep::Seccomp => doing("installing the seccomp filter", errno),
+        ChildStep::NamespaceRoot => doing(
+            match detail {
+                1 => "dropping supplementary groups in the container's user namespace",
+                2 => "becoming group 0 in the container's user namespace",
+                _ => "becoming root in the container's user namespace",
+            },
+            errno,
+        ),
+        ChildStep::UnmappedId => describe_unmapped(detail),
+        // The other steps are `describe`'s.
+        _ => doing("confining the command", errno),
+    };
+    SpawnError::new(SpawnErrorKind::Setup, message, errno)
+}
+
+/// The detail of an [`ChildStep::UnmappedId`] failure: which ID (1 the
+/// user, 2 the group, 3 a supplementary group) in the high 32 bits, the ID
+/// in the low.
+#[must_use]
+pub(crate) fn unmapped_detail(which: u8, id: u32) -> usize {
+    usize::try_from((u64::from(which) << 32) | u64::from(id)).unwrap_or(usize::MAX)
+}
+
+/// An ID the container's user namespace doesn't map.
+fn describe_unmapped(detail: u64) -> String {
+    let id = detail & u64::from(u32::MAX);
+    let (what, flag) = match detail >> 32 {
+        1 => ("user", "--uidmap"),
+        2 => ("group", "--gidmap"),
+        _ => ("supplementary group", "--gidmap"),
+    };
+    format!(
+        "{what} {id} isn't mapped in the container's user namespace: there it doesn't exist \
+         ({flag} says which IDs do)"
+    )
+}
+
+/// What was being done, and the errno's reason.
+fn doing(what: &str, errno: Errno) -> String {
+    format!("{what}: {}", errno.desc())
+}
+
+/// A capability by the number a failure's detail carries.
+fn capability_name(detail: u64) -> String {
+    u8::try_from(detail)
+        .ok()
+        .and_then(Capability::from_number)
+        .map_or_else(
+            || format!("capability {detail}"),
+            |cap| cap.name().to_owned(),
+        )
 }
 
 /// The container's own setup steps, from step 3 on: its root filesystem,
@@ -655,6 +870,7 @@ mod tests {
             container_root: None,
             names: Names::default(),
             sysctls: Vec::new(),
+            seccomp: None,
         }
     }
 
@@ -674,7 +890,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 37, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 49, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -774,6 +990,74 @@ mod tests {
     fn out_of_range_detail_falls_back_to_the_program() {
         let err = exec(Errno::ENOEXEC, u64::MAX, &ctx("/x", &["/x"]));
         assert!(err.to_string().starts_with("/x:"), "{err}");
+    }
+
+    #[test]
+    fn confinement_failures_say_what_and_why() {
+        let ctx = ctx("/x", &["/x"]);
+        let fail = |step, errno, detail| {
+            describe(
+                ChildFailure {
+                    step,
+                    errno,
+                    detail,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        assert_eq!(
+            fail(ChildStep::BoundingDrop, Errno::EPERM, 21),
+            "dropping CAP_SYS_ADMIN from the capability bounding set: Operation not permitted"
+        );
+        let refused = fail(ChildStep::Seccomp, Errno::EINVAL, 0);
+        assert!(
+            refused.starts_with("installing the seccomp filter: Invalid argument (the kernel")
+                && refused.contains("seccomp=unconfined"),
+            "{refused}"
+        );
+        assert_eq!(
+            fail(ChildStep::Seccomp, Errno::EACCES, 0),
+            "installing the seccomp filter: Permission denied"
+        );
+        assert!(fail(ChildStep::SeccompCompile, Errno::E2BIG, 5000).contains("5000 instructions"));
+        assert_eq!(
+            fail(ChildStep::SeccompCompile, Errno::EINVAL, 0),
+            "the seccomp profile can't be compiled"
+        );
+    }
+
+    /// A failure under the filter, with EPERM, may be the filter's refusal:
+    /// the message says so, and only then.
+    #[test]
+    fn failures_under_a_filter_mention_it() {
+        let note = "the seccomp profile, in force by then, may have refused it";
+        let with = |seccomp, step, errno| {
+            let ctx = FailureContext {
+                seccomp,
+                ..ctx("/x", &["/x"])
+            };
+            describe(
+                ChildFailure {
+                    step,
+                    errno,
+                    detail: 21,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        let early = Some(FilterStart::BeforeSetup);
+        let late = Some(FilterStart::BeforeExec);
+        assert!(with(early, ChildStep::BoundingDrop, Errno::EPERM).ends_with(&format!("({note})")));
+        assert!(with(early, ChildStep::SetUid, Errno::EPERM).contains(note));
+        assert!(with(early, ChildStep::Exec, Errno::EPERM).contains(note));
+        assert!(with(late, ChildStep::Exec, Errno::EPERM).contains(note));
+        // Before the filter, without one, or another errno: nothing added.
+        assert!(!with(late, ChildStep::BoundingDrop, Errno::EPERM).contains(note));
+        assert!(!with(None, ChildStep::Exec, Errno::EPERM).contains(note));
+        assert!(!with(early, ChildStep::Exec, Errno::EACCES).contains(note));
+        assert!(!with(early, ChildStep::Seccomp, Errno::EPERM).contains(note));
     }
 
     #[test]

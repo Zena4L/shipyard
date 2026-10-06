@@ -131,12 +131,14 @@ fn a_runc_spec_config_is_refused_with_its_reasons() {
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     for field in [
         "process.terminal",
-        "process.capabilities",
-        "process.noNewPrivileges",
         "linux.namespaces (network)",
         "linux.resources",
     ] {
         assert!(run.stderr.contains(field), "{field}: {}", run.stderr);
+    }
+    // Applied since stage 4, so not among the reasons any more.
+    for applied in ["process.capabilities", "process.noNewPrivileges"] {
+        assert!(!run.stderr.contains(applied), "{applied}: {}", run.stderr);
     }
     assert!(!run.stderr.contains("hint"), "{}", run.stderr);
 }

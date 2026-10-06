@@ -588,6 +588,55 @@ fn a_container_made_again_at_once_is_the_new_one() {
     assert_eq!(runtime.status("again"), "created");
 }
 
+/// A runtime container gets its bundle's capabilities and `noNewPrivileges`,
+/// as `shipyard run --bundle` does: through the monitor and the start gate
+/// too.
+#[test]
+#[ignore = "needs root"]
+fn a_containers_capabilities_are_its_bundles() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "cat /proc/self/status"]);
+    config["process"]["capabilities"] = json!({
+        "bounding": ["CAP_KILL"], "effective": ["CAP_KILL"], "permitted": ["CAP_KILL"]
+    });
+    config["process"]["noNewPrivileges"] = json!(true);
+    bundle.write(&config);
+    assert_eq!(runtime.create("capped", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "capped"]).code, Some(0));
+    runtime.wait_for("capped", "stopped");
+    let status = runtime.output_of("capped");
+    for expected in [
+        "CapEff:\t0000000000000020",
+        "CapBnd:\t0000000000000020",
+        "NoNewPrivs:\t1",
+    ] {
+        assert!(status.contains(expected), "{expected}: {status}");
+    }
+}
+
+/// A bundle's seccomp profile, through the runtime too.
+#[test]
+#[ignore = "needs root"]
+fn a_containers_seccomp_is_its_bundles() {
+    if shipyard_test_support::under_rosetta() {
+        eprintln!("under Rosetta emulation, where no seccomp filter can be installed; skipping");
+        return;
+    }
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "cat /proc/self/status"]);
+    config["linux"]["seccomp"] = json!({"defaultAction": "SCMP_ACT_ALLOW"});
+    bundle.write(&config);
+    assert_eq!(runtime.create("filtered", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "filtered"]).code, Some(0));
+    runtime.wait_for("filtered", "stopped");
+    let status = runtime.output_of("filtered");
+    assert!(status.contains("Seccomp:\t2"), "{status}");
+}
+
 #[test]
 #[ignore = "needs root"]
 fn deleting_a_running_container_needs_force() {

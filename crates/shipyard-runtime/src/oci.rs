@@ -5,12 +5,13 @@
 //! an [`Isolation`]. Shipyard doesn't do everything the spec describes yet,
 //! so the config's fields fall in three groups:
 //!
-//! - **supported**: the process, the root filesystem, the hostname and
-//!   domain name, the PID, mount, UTS and IPC namespaces, masked and
-//!   read-only paths, bind and tmpfs mounts, and the IPC sysctls;
+//! - **supported**: the process, its capabilities, `noNewPrivileges` and
+//!   seccomp profile, the root filesystem, the hostname and domain name, the
+//!   PID, mount, UTS and IPC namespaces, masked and read-only paths, bind and
+//!   tmpfs mounts, and the IPC sysctls;
 //! - **refused**: anything whose absence would leave the container *less
-//!   confined than asked*: capabilities to drop, seccomp, a user or network
-//!   namespace, resource limits, and so on. Running without them would be
+//!   confined than asked*: a user or network namespace, resource limits,
+//!   extra devices, and so on. Running without them would be
 //!   a silent security downgrade, so the bundle is refused, with every such
 //!   field named at once;
 //! - **ignored, with a warning**: what doesn't confine (hooks,
@@ -25,6 +26,9 @@ use serde_json::Value;
 
 use crate::isolation::{Isolation, Mount, MountFlag, MountKind, Namespace, Root};
 use crate::process::{Env, ProcessSpec, Rlimit, RlimitValue, User};
+use crate::security::seccomp::Profile;
+use crate::security::{Capabilities, Capability, CapabilitySet, CapabilitySets, Seccomp, Security};
+use crate::small_file::{SmallFileError, read_small_file};
 
 /// The largest `config.json` read. Real ones are a few kilobytes; a huge
 /// one is a mistake or an attack on memory.
@@ -133,38 +137,18 @@ pub fn load_bundle(dir: &Path) -> Result<Bundle, BundleError> {
     Ok(Bundle { warnings, ..bundle })
 }
 
-/// Reads and parses `config.json`, refusing what isn't a small regular file.
-///
-/// The checks are made on the file as opened, not on its path beforehand: a
-/// FIFO swapped in between would block the read forever. Opened
-/// non-blocking (a FIFO's open would otherwise wait for a writer), and read
-/// with a limit (the file may grow after the check).
+/// Reads and parses `config.json`, refusing what isn't a small regular file
+/// (see `small_file.rs`).
 fn read_config(path: &Path) -> Result<Config, BundleError> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let read = |source| BundleError::Read {
-        path: path.to_owned(),
-        source,
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map_err(read)?;
-    if !file.metadata().map_err(read)?.is_file() {
-        return Err(BundleError::NotAFile {
-            path: path.to_owned(),
-        });
-    }
-    let mut text = Vec::new();
-    file.take(MAX_CONFIG_SIZE + 1)
-        .read_to_end(&mut text)
-        .map_err(read)?;
-    if u64::try_from(text.len()).map_or(true, |len| len > MAX_CONFIG_SIZE) {
-        return Err(BundleError::TooLarge {
-            path: path.to_owned(),
-        });
-    }
+    let path_buf = || path.to_owned();
+    let text = read_small_file(path, MAX_CONFIG_SIZE).map_err(|err| match err {
+        SmallFileError::Io(source) => BundleError::Read {
+            path: path_buf(),
+            source,
+        },
+        SmallFileError::NotAFile => BundleError::NotAFile { path: path_buf() },
+        SmallFileError::TooLarge => BundleError::TooLarge { path: path_buf() },
+    })?;
     serde_json::from_slice(&text).map_err(|err| {
         // serde_json's message ends with the position, which the error
         // already gives.
@@ -221,7 +205,7 @@ struct ProcessConfig {
     #[serde(default)]
     env: Vec<String>,
     cwd: PathBuf,
-    capabilities: Option<Value>,
+    capabilities: Option<CapabilitiesConfig>,
     #[serde(default)]
     rlimits: Vec<RlimitConfig>,
     #[serde(default)]
@@ -233,6 +217,21 @@ struct ProcessConfig {
     io_priority: Option<Value>,
     #[serde(rename = "execCPUAffinity")]
     exec_cpu_affinity: Option<Value>,
+}
+
+/// `process.capabilities`: the five sets, by name (`CAP_KILL`).
+#[derive(Deserialize, Default)]
+struct CapabilitiesConfig {
+    #[serde(default)]
+    bounding: Vec<String>,
+    #[serde(default)]
+    effective: Vec<String>,
+    #[serde(default)]
+    inheritable: Vec<String>,
+    #[serde(default)]
+    permitted: Vec<String>,
+    #[serde(default)]
+    ambient: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -403,10 +402,13 @@ impl Reader<'_> {
         if config.hooks.is_some() {
             self.warn("hooks", "Shipyard doesn't run hooks");
         }
+        let security = self.security(&process)?;
         let spec = self.process(process)?;
-        let linux = config.linux.unwrap_or_default();
+        let mut linux = config.linux.unwrap_or_default();
         let mut isolation = Isolation::standard();
         isolation.namespaces = self.namespaces(&linux.namespaces)?;
+        isolation.security = security;
+        isolation.security.seccomp = self.seccomp(linux.seccomp.take())?;
         isolation.hostname = config.hostname.filter(|name| !name.is_empty());
         isolation.domainname = config.domainname.filter(|name| !name.is_empty());
         isolation.sysctls = self.sysctls(linux.sysctl.as_ref())?;
@@ -442,22 +444,76 @@ impl Reader<'_> {
         })
     }
 
+    /// `process.capabilities`, exactly (an unknown name is an error), and
+    /// `process.noNewPrivileges` (absent: false, as the spec says). Without
+    /// capabilities the process gets none, with a warning: runc would leave
+    /// it root's full set, which a forgotten field shouldn't give.
+    fn security(&mut self, process: &ProcessConfig) -> Result<Security, BundleError> {
+        let capabilities = if let Some(config) = &process.capabilities {
+            let set = |field: &str, names: &[String]| {
+                names
+                    .iter()
+                    .map(|name| {
+                        name.parse::<Capability>().map_err(|err| {
+                            self.invalid(format!("process.capabilities.{field}: {err}"))
+                        })
+                    })
+                    .collect::<Result<CapabilitySet, _>>()
+            };
+            let sets = CapabilitySets {
+                bounding: set("bounding", &config.bounding)?,
+                effective: set("effective", &config.effective)?,
+                permitted: set("permitted", &config.permitted)?,
+                inheritable: set("inheritable", &config.inheritable)?,
+                ambient: set("ambient", &config.ambient)?,
+            };
+            sets.check()
+                .map_err(|why| self.invalid(format!("process.capabilities: {why}")))?;
+            sets
+        } else {
+            self.warnings.push(format!(
+                "{}: there's no process.capabilities, so the process gets no capabilities \
+                 (runc would leave it all of root's)",
+                self.path.display()
+            ));
+            CapabilitySets::default()
+        };
+        let mut security = Security::standard();
+        security.capabilities = Capabilities::Exact(capabilities);
+        security.no_new_privileges = process.no_new_privileges;
+        Ok(security)
+    }
+
+    /// `linux.seccomp`: a profile, checked here so that a mistake shows
+    /// before anything starts. Absent, the process is unfiltered (as the spec
+    /// and runc have it).
+    ///
+    /// Fields Shipyard doesn't know are ignored, with a warning each, as the
+    /// spec requires.
+    fn seccomp(&mut self, config: Option<Value>) -> Result<Seccomp, BundleError> {
+        let Some(config) = config else {
+            return Ok(Seccomp::Unconfined);
+        };
+        let (profile, dropped) = Profile::from_oci(config)
+            .map_err(|err| self.invalid(format!("linux.seccomp: {err}")))?;
+        for field in dropped {
+            self.warn(
+                &format!("linux.seccomp.{field}"),
+                "Shipyard doesn't know it",
+            );
+        }
+        profile
+            .validate()
+            .map_err(|err| self.invalid(format!("linux.seccomp: {err}")))?;
+        Ok(Seccomp::Profile(Box::new(profile)))
+    }
+
     fn process(&mut self, process: ProcessConfig) -> Result<ProcessSpec, BundleError> {
         if process.terminal {
             self.refuse(
                 "process.terminal",
                 "a terminal inside comes in a later version",
             );
-        }
-        if process.capabilities.is_some() {
-            self.refuse(
-                "process.capabilities",
-                "dropping capabilities comes in a later version (without the field, the \
-                 process keeps root's)",
-            );
-        }
-        if process.no_new_privileges {
-            self.refuse("process.noNewPrivileges", "it comes in a later version");
         }
         if process.apparmor_profile.is_some_and(|p| !p.is_empty()) {
             self.refuse("process.apparmorProfile", "AppArmor isn't supported");
@@ -557,9 +613,6 @@ impl Reader<'_> {
                 "linux.uidMappings/gidMappings",
                 "user namespaces come in a later version",
             );
-        }
-        if linux.seccomp.is_some() {
-            self.refuse("linux.seccomp", "seccomp comes in a later version");
         }
         if linux
             .resources
@@ -783,7 +836,8 @@ mod tests {
             "process": {
                 "user": {"uid": 0, "gid": 0},
                 "args": ["sh"],
-                "cwd": "/"
+                "cwd": "/",
+                "capabilities": {"bounding": ["CAP_KILL"]}
             },
             "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}]}
         });
@@ -819,6 +873,7 @@ mod tests {
                 "args": ["sh", "-c", "true"],
                 "env": ["A=1", "PATH=/bin"],
                 "cwd": "/work",
+                "capabilities": {"bounding": ["CAP_KILL"]},
                 "rlimits": [
                     {"type": "RLIMIT_NOFILE", "hard": 2048, "soft": 1024},
                     {"type": "RLIMIT_CORE", "hard": u64::MAX, "soft": u64::MAX}
@@ -866,6 +921,133 @@ mod tests {
         assert_eq!(root.masked_paths, [PathBuf::from("/proc/kcore")]);
         assert_eq!(root.readonly_paths, [PathBuf::from("/proc/sys")]);
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn seccomp_is_the_configs_and_absent_means_none() {
+        let absent = TestBundle::new(&config(&json!({}))).load().unwrap();
+        assert_eq!(absent.isolation.security.seccomp, Seccomp::Unconfined);
+
+        let mut linux = config(&json!({}))["linux"].clone();
+        linux["seccomp"] = json!({
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "syscalls": [{"names": ["read"], "action": "SCMP_ACT_ALLOW", "weight": 1}]
+        });
+        let loaded = TestBundle::new(&config(&json!({"linux": linux})))
+            .load()
+            .unwrap();
+        let Seccomp::Profile(profile) = &loaded.isolation.security.seccomp else {
+            panic!("{:?}", loaded.isolation.security.seccomp);
+        };
+        assert_eq!(profile.syscalls[0].names, ["read"]);
+        // An unknown field is ignored, as the spec says, but named.
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].contains("linux.seccomp.syscalls[0].weight is ignored"),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn a_wrong_seccomp_profile_is_an_error() {
+        for (seccomp, wanted) in [
+            (
+                json!({"defaultAction": "SCMP_ACT_ERRNO",
+                       "syscalls": [{"names": ["raed"], "action": "SCMP_ACT_ALLOW"}]}),
+                "linux.seccomp: syscalls[0]: \"raed\" isn't a system call",
+            ),
+            (
+                json!({"defaultAction": "SCMP_ACT_NOTIFY"}),
+                "linux.seccomp: SCMP_ACT_NOTIFY isn't supported",
+            ),
+            (
+                json!({"syscalls": []}),
+                "linux.seccomp: missing field `defaultAction`",
+            ),
+        ] {
+            let mut linux = config(&json!({}))["linux"].clone();
+            linux["seccomp"] = seccomp;
+            let err = TestBundle::new(&config(&json!({"linux": linux})))
+                .load()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(wanted), "{err}");
+        }
+    }
+
+    #[test]
+    fn capabilities_and_no_new_privileges_are_the_configs() {
+        let mut process = config(&json!({}))["process"].clone();
+        process["capabilities"] = json!({
+            "bounding": ["CAP_KILL", "CAP_CHOWN"],
+            "effective": ["CAP_KILL"],
+            "permitted": ["CAP_KILL"],
+            "ambient": []
+        });
+        process["noNewPrivileges"] = json!(true);
+        let loaded = TestBundle::new(&config(&json!({"process": process})))
+            .load()
+            .unwrap();
+        let security = loaded.isolation.security;
+        assert!(security.no_new_privileges);
+        let Capabilities::Exact(sets) = security.capabilities else {
+            panic!("{security:?}");
+        };
+        let kill: Capability = "CAP_KILL".parse().unwrap();
+        assert!(sets.bounding.contains(kill) && sets.bounding.contains("CHOWN".parse().unwrap()));
+        assert_eq!(sets.effective.iter().collect::<Vec<_>>(), [kill]);
+        assert!(sets.inheritable.is_empty() && sets.ambient.is_empty());
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // Absent noNewPrivileges is false, as the spec says.
+        assert!(
+            !TestBundle::new(&config(&json!({})))
+                .load()
+                .unwrap()
+                .isolation
+                .security
+                .no_new_privileges
+        );
+    }
+
+    #[test]
+    fn absent_capabilities_mean_none_with_a_warning() {
+        let mut process = config(&json!({}))["process"].clone();
+        process.as_object_mut().unwrap().remove("capabilities");
+        let loaded = TestBundle::new(&config(&json!({"process": process})))
+            .load()
+            .unwrap();
+        assert_eq!(
+            loaded.isolation.security.capabilities,
+            Capabilities::Exact(CapabilitySets::default())
+        );
+        let warnings = loaded.warnings.join("\n");
+        assert!(
+            warnings.contains("no capabilities") && warnings.contains("runc"),
+            "{warnings}"
+        );
+    }
+
+    #[test]
+    fn capabilities_the_kernel_couldnt_apply_are_errors() {
+        let mut process = config(&json!({}))["process"].clone();
+        process["capabilities"] = json!({"bounding": ["CAP_KILL"], "ambient": ["CAP_KILL"]});
+        let message = invalid(&config(&json!({"process": process})));
+        assert!(
+            message.contains("process.capabilities: ambient has CAP_KILL"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_capability_is_an_error() {
+        let mut process = config(&json!({}))["process"].clone();
+        process["capabilities"] = json!({"effective": ["CAP_FLY"]});
+        let message = invalid(&config(&json!({"process": process})));
+        assert!(
+            message.contains("process.capabilities.effective") && message.contains("CAP_FLY"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -946,8 +1128,6 @@ mod tests {
         })));
         for expected in [
             "process.terminal",
-            "process.capabilities",
-            "process.noNewPrivileges",
             "process.apparmorProfile",
             "process.selinuxLabel",
             "process.scheduler",
@@ -961,7 +1141,6 @@ mod tests {
             "linux.namespaces (network)",
             "linux.namespaces (uts, path)",
             "linux.uidMappings",
-            "linux.seccomp",
             "linux.resources",
             "linux.devices",
             "linux.mountLabel",

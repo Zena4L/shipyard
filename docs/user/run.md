@@ -82,16 +82,119 @@ network: networking comes in a later version.
   inside the container.
 - **Terminal:** see [On a terminal, isolated](#on-a-terminal-isolated) below.
 - **If Shipyard is killed**, the whole container goes with it.
-- **Not a security boundary yet.** The command runs as root, with all of root's
-  privileges; isolation keeps it from *seeing* and *disturbing* the rest of the
-  system by accident, not from breaking out on purpose. Running untrusted code
-  safely also needs dropped capabilities and seccomp, which come in later
-  versions.
+- **Not a security boundary yet.** The command runs as root, with only a few of
+  root's privileges (see [Capabilities and privileges](#capabilities-and-privileges))
+  and the system calls most programs need (see [System calls](#system-calls-seccomp)),
+  but it's still root on the host's files. Running untrusted code safely also needs
+  user namespaces, which come in a later version.
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
 - **macOS:** commands aren't isolated yet (as with `--no-isolation`);
   `--hostname`, `--domainname`, `--sysctl` and `--rootfs` are errors there.
+
+### Capabilities and privileges
+
+Root's power is split into about forty **capabilities** (`man 7 capabilities`):
+`CAP_CHOWN` to change any file's owner, `CAP_NET_ADMIN` to configure the network,
+`CAP_SYS_ADMIN` for mounting and much else. An isolated command gets only the 14
+Docker gives by default:
+
+`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`, `CAP_KILL`,
+`CAP_SETGID`, `CAP_SETUID`, `CAP_SETPCAP`, `CAP_NET_BIND_SERVICE`, `CAP_NET_RAW`,
+`CAP_SYS_CHROOT`, `CAP_MKNOD`, `CAP_AUDIT_WRITE`, `CAP_SETFCAP`.
+
+That's enough for ordinary programs that start as root (changing file owners,
+switching users, binding ports below 1024), and not enough to mount file systems,
+change the network, load kernel modules or trace other processes. The rest are gone
+for good: not even a setuid-root program inside gets them back.
+
+- **`--cap-add CAP`** adds one (`--cap-add NET_ADMIN`, or `CAP_NET_ADMIN`; `ALL` for
+  every one). **`--cap-drop CAP`** removes one (`--cap-drop ALL` for none). Both are
+  repeatable; naming the same capability in both is an error.
+- **A command run as another user** (`--user 1000`) has no capabilities in effect,
+  except those you add: `--user 1000 --cap-add NET_BIND_SERVICE` lets a web server
+  running as user 1000 listen on port 80 (as Podman does; Docker gives such a user
+  nothing).
+- **`no_new_privs` is on.** Nothing the command runs can gain privileges: a setuid
+  program (`sudo`, `su`, `passwd`) runs with its caller's rights, not root's.
+  `--security-opt no-new-privileges=false` turns it off for an image that needs them.
+  **Docker's default is off**; Shipyard's is on.
+- **Programs with file capabilities don't get them either,** for the same reason:
+  Debian's `ping`, for example, holds `cap_net_raw` instead of being setuid, so a
+  non-root `ping` fails. Give the user the capability itself (`--cap-add NET_RAW`,
+  which a non-root user keeps), or turn `no_new_privs` off.
+- **`--cap-add ALL`** means every capability this kernel has: an older one lacks the
+  newest (Linux 5.9 added `CAP_PERFMON`, `CAP_BPF` and `CAP_CHECKPOINT_RESTORE`).
+  Naming one it lacks is an error.
+- **The small init** (PID 1) gives up every capability but `CAP_KILL` (to pass
+  signals to a command running as another user) once the command runs. Root inside
+  can't look into it (`/proc/1/fd`, its memory) without `--cap-add SYS_PTRACE`.
+
+These apply to isolated commands; with `--no-isolation` the command keeps the
+rights of whoever runs Shipyard, and the flags are errors.
+
+### System calls (seccomp)
+
+A program asks the kernel for everything it does through **system calls** (`read`,
+`openat`, `clone`, …, over 300 of them). Most programs use a few dozen. The rest,
+such as keyrings (`keyctl`), BPF programs (`bpf`), new namespaces (`unshare`) and
+kernel modules, are where many attacks on the kernel start. An isolated command
+runs under a **seccomp filter**: the kernel checks each call against it, and every
+program the command starts stays under it.
+
+- **The default is Docker's profile.** It allows what ordinary programs need, and
+  refuses the rest with "Operation not permitted" (EPERM). Some calls come with a
+  capability, as in Docker: `--cap-add SYS_ADMIN` also allows `mount`, `unshare` and
+  `setns`, `--cap-add SYS_PTRACE` allows `process_vm_readv`, and so on.
+- **`--security-opt seccomp=FILE`** uses a profile of your own, in Docker's JSON
+  format (which includes the OCI format). For example, to refuse `mkdir` with
+  "Not a directory":
+
+  ```json
+  {
+    "defaultAction": "SCMP_ACT_ALLOW",
+    "syscalls": [
+      {"names": ["mkdir", "mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 20}
+    ]
+  }
+  ```
+
+  The file is checked before anything starts. A misspelled call name, an unknown
+  field or an unsupported action is an error that names the file. A call another
+  architecture has (`arch_prctl` on 64-bit Arm) is skipped, so one profile works on
+  both.
+- **`--security-opt seccomp=unconfined`** runs without a filter.
+- **When several rules match a call, the most restrictive one wins** (kill, then
+  trap, then errno, then log, then allow), whatever order they're written in.
+- **Actions:** `SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO` (with `errnoRet`; EPERM if it's
+  left out), `SCMP_ACT_LOG`, `SCMP_ACT_TRAP`, `SCMP_ACT_KILL` (the thread),
+  `SCMP_ACT_KILL_THREAD` and `SCMP_ACT_KILL_PROCESS`. A command killed by the
+  filter exits with 159 (SIGSYS). `SCMP_ACT_TRACE` and `SCMP_ACT_NOTIFY` aren't
+  supported.
+- **32-bit programs are killed.** The filter allows only the machine's own 64-bit
+  calls: a 32-bit program, or the x32 ABI on x86-64, would reach the kernel through
+  other call numbers. Run them with `seccomp=unconfined`.
+- **Under x86-64 emulation** (Rosetta, as in Docker or OrbStack on an Apple-silicon
+  Mac), the kernel refuses every seccomp filter. An isolated run fails there with
+  exit code 125 and a message saying so; add `--security-opt seccomp=unconfined` to
+  run without one. Shipyard never drops the filter on its own.
+- **Arguments are compared as 64-bit numbers.** A negative `int` argument arrives
+  sign-extended: `AT_FDCWD` (-100) is `18446744073709551516`
+  (`0xffffffffffffff9c`), not `4294967196`. libseccomp and Docker behave the same.
+- **`"errnoRet": 0` makes a call look successful without running it:** an `rm`
+  refused this way prints nothing and leaves the file.
+- **What the profile must allow:**
+  - `execve`, since the command is started under the filter. If it's refused,
+    Shipyard says so ("cannot execute: Operation not permitted"), unless `write` is
+    refused too: then the command just exits with 125 and no message.
+  - With `no-new-privileges=false`, the filter goes on before the switch of user
+    and capabilities, so the profile must also allow `prctl`, `capset`, `setgroups`,
+    `setresuid`, `setresgid` and `rt_sigprocmask` (Docker's profile does). A step it
+    refuses fails with "Operation not permitted", followed by "(the seccomp profile,
+    in force by then, may have refused it)".
+- **The file** must be a regular file of at most 1 MiB: a FIFO or a device is
+  refused, not read.
 
 ### On a terminal, isolated
 

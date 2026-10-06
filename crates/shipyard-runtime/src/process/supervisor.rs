@@ -121,7 +121,7 @@ impl Supervisor {
         isolation: Option<&Isolation>,
     ) -> Result<ExitStatus> {
         let placement = isolation.map_or(Placement::Host, |isolation| {
-            Placement::New(isolation.clone())
+            Placement::New(Box::new(isolation.clone()))
         });
         self.run(spec, stop, placement)
     }

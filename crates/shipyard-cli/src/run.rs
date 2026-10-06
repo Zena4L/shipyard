@@ -14,6 +14,8 @@ use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
 };
+use shipyard_runtime::security::seccomp::Profile;
+use shipyard_runtime::security::{Capabilities, Capability, CapabilitySet, Seccomp, Security};
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
@@ -74,6 +76,24 @@ pub(crate) struct RunArgs {
     #[arg(long, requires = "rootfs")]
     read_only: bool,
 
+    /// Give the command a capability on top of the default set, like
+    /// `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable
+    /// (Linux).
+    #[arg(long, value_name = "CAP", value_parser = parse_capability, conflicts_with = "no_isolation")]
+    cap_add: Vec<CapabilityArg>,
+
+    /// Take a capability out of the default set; `ALL` for every one.
+    /// Repeatable (Linux).
+    #[arg(long, value_name = "CAP", value_parser = parse_capability, conflicts_with = "no_isolation")]
+    cap_drop: Vec<CapabilityArg>,
+
+    /// A security option: `no-new-privileges=false` lets setuid programs
+    /// inside gain privileges (they can't by default); `seccomp=FILE` filters
+    /// system calls with a profile of your own, `seccomp=unconfined` not at
+    /// all (Docker's profile by default). Repeatable (Linux).
+    #[arg(long, value_name = "OPTION", value_parser = parse_security_opt, conflicts_with = "no_isolation")]
+    security_opt: Vec<SecurityOpt>,
+
     /// Run the OCI bundle in DIR: its config.json says what to run and how,
     /// so no COMMAND or container options are given (Linux).
     #[arg(
@@ -82,6 +102,7 @@ pub(crate) struct RunArgs {
         conflicts_with_all = [
             "command", "env", "workdir", "user", "group_add", "ulimit",
             "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
+            "cap_add", "cap_drop", "security_opt",
         ],
     )]
     bundle: Option<PathBuf>,
@@ -183,6 +204,9 @@ impl RunArgs {
                 (self.domainname.is_some(), "--domainname"),
                 (!self.sysctl.is_empty(), "--sysctl"),
                 (self.rootfs.is_some(), "--rootfs"),
+                (!self.cap_add.is_empty(), "--cap-add"),
+                (!self.cap_drop.is_empty(), "--cap-drop"),
+                (!self.security_opt.is_empty(), "--security-opt"),
             ] {
                 if given {
                     bail!(
@@ -198,6 +222,7 @@ impl RunArgs {
         isolation.hostname.clone_from(&self.hostname);
         isolation.domainname.clone_from(&self.domainname);
         isolation.sysctls.clone_from(&self.sysctl);
+        isolation.security = self.security()?;
         if let Some(dir) = &self.rootfs {
             // Absolute and without symlinks, as the runtime wants it; and a
             // mistyped path is caught here, with its name.
@@ -209,6 +234,108 @@ impl RunArgs {
         }
         isolation.validate()?;
         Ok(Some(isolation))
+    }
+}
+
+impl RunArgs {
+    /// The container's capabilities and `no_new_privs`, from Docker's default
+    /// set and `--cap-drop`, `--cap-add` and `--security-opt`.
+    fn security(&self) -> Result<Security> {
+        let named = |args: &[CapabilityArg]| -> CapabilitySet {
+            args.iter()
+                .filter_map(|arg| match arg {
+                    CapabilityArg::One(capability) => Some(*capability),
+                    CapabilityArg::All => None,
+                })
+                .collect()
+        };
+        let (dropped, added) = (named(&self.cap_drop), named(&self.cap_add));
+        if let Some(both) = dropped
+            .iter()
+            .find(|&capability| added.contains(capability))
+        {
+            bail!("--cap-add and --cap-drop both name {both}");
+        }
+        let mut kept = if self.cap_drop.contains(&CapabilityArg::All) {
+            CapabilitySet::EMPTY
+        } else {
+            CapabilitySet::DOCKER_DEFAULT
+        };
+        for capability in dropped.iter() {
+            kept.remove(capability);
+        }
+        let added = if self.cap_add.contains(&CapabilityArg::All) {
+            CapabilitySet::ALL
+        } else {
+            added
+        };
+        let mut security = Security::standard();
+        security.capabilities = Capabilities::Default { kept, added };
+        for option in &self.security_opt {
+            match option {
+                SecurityOpt::NoNewPrivileges(on) => security.no_new_privileges = *on,
+                SecurityOpt::SeccompUnconfined => security.seccomp = Seccomp::Unconfined,
+                SecurityOpt::SeccompProfile(path) => {
+                    security.seccomp = Seccomp::Profile(Box::new(read_profile(path)?));
+                }
+            }
+        }
+        Ok(security)
+    }
+}
+
+/// `--cap-add` or `--cap-drop`: one capability, or all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityArg {
+    All,
+    One(Capability),
+}
+
+fn parse_capability(s: &str) -> Result<CapabilityArg, String> {
+    if s.eq_ignore_ascii_case("ALL") {
+        return Ok(CapabilityArg::All);
+    }
+    s.parse()
+        .map(CapabilityArg::One)
+        .map_err(|err| format!("{err}"))
+}
+
+/// A seccomp profile file, checked (`--security-opt seccomp=FILE`): a
+/// mistake shows here, naming the file, not when the container starts.
+fn read_profile(path: &Path) -> Result<Profile> {
+    Profile::from_file(path).with_context(|| format!("seccomp profile {}", path.display()))
+}
+
+/// `--security-opt`: Docker's spelling, `KEY=VALUE` or `KEY:VALUE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecurityOpt {
+    NoNewPrivileges(bool),
+    /// `seccomp=unconfined`: no filter.
+    SeccompUnconfined,
+    /// `seccomp=FILE`.
+    SeccompProfile(PathBuf),
+}
+
+fn parse_security_opt(s: &str) -> Result<SecurityOpt, String> {
+    let (key, value) = match s.split_once(['=', ':']) {
+        Some((key, value)) => (key, Some(value)),
+        None => (s, None),
+    };
+    match (key, value) {
+        ("no-new-privileges", None | Some("true")) => Ok(SecurityOpt::NoNewPrivileges(true)),
+        ("no-new-privileges", Some("false")) => Ok(SecurityOpt::NoNewPrivileges(false)),
+        ("no-new-privileges", Some(other)) => Err(format!(
+            "no-new-privileges takes true or false, not \"{other}\""
+        )),
+        ("seccomp", Some("unconfined")) => Ok(SecurityOpt::SeccompUnconfined),
+        ("seccomp", Some(path)) if !path.is_empty() => {
+            Ok(SecurityOpt::SeccompProfile(PathBuf::from(path)))
+        }
+        ("seccomp", _) => Err("seccomp takes a profile file, or unconfined".to_owned()),
+        _ => Err(format!(
+            "unknown security option \"{s}\" (known: no-new-privileges[=true|false], \
+             seccomp=FILE|unconfined)"
+        )),
     }
 }
 
@@ -258,6 +385,7 @@ fn only_namespaces(isolation: &Isolation) -> bool {
         && isolation.hostname.is_none()
         && isolation.domainname.is_none()
         && isolation.sysctls.is_empty()
+        && isolation.security == Security::standard()
 }
 
 /// Whether `err` is isolation going wrong (missing privileges, a refusal,
@@ -579,6 +707,149 @@ mod tests {
         assert_eq!(stop.timeout, Duration::from_secs(3));
         let default = parse(&["true"]).unwrap().into_invocation().unwrap().stop;
         assert_eq!(default, StopPolicy::default());
+    }
+
+    #[test]
+    fn capability_flags_build_dockers_rule() {
+        let security = |args: &[&str]| parse(args).unwrap().security().unwrap();
+        let rule = |args: &[&str]| match security(args).capabilities {
+            Capabilities::Default { kept, added } => (kept, added),
+            other => panic!("{other:?}"),
+        };
+        let cap = |name: &str| name.parse::<Capability>().unwrap();
+        assert_eq!(
+            rule(&["true"]),
+            (CapabilitySet::DOCKER_DEFAULT, CapabilitySet::EMPTY)
+        );
+        let (kept, added) = rule(&["--cap-drop", "chown", "--cap-add", "CAP_SYS_ADMIN", "true"]);
+        assert!(!kept.contains(cap("CHOWN")) && kept.contains(cap("KILL")));
+        assert_eq!(added.iter().collect::<Vec<_>>(), [cap("SYS_ADMIN")]);
+        assert_eq!(rule(&["--cap-drop", "ALL", "true"]).0, CapabilitySet::EMPTY);
+        assert_eq!(rule(&["--cap-add", "all", "true"]).1, CapabilitySet::ALL);
+        // Dropping everything, then adding one: just that one.
+        let (kept, added) = rule(&["--cap-drop", "ALL", "--cap-add", "KILL", "true"]);
+        assert!(kept.is_empty() && added.contains(cap("KILL")));
+        assert!(security(&["true"]).no_new_privileges);
+        for (option, on) in [
+            ("no-new-privileges", true),
+            ("no-new-privileges=true", true),
+            ("no-new-privileges:false", false),
+            ("no-new-privileges=false", false),
+        ] {
+            assert_eq!(
+                security(&["--security-opt", option, "true"]).no_new_privileges,
+                on,
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_options_choose_the_filter() {
+        let seccomp = |args: &[&str]| parse(args).unwrap().security().map(|s| s.seccomp);
+        assert_eq!(seccomp(&["true"]).unwrap(), Seccomp::Default);
+        assert_eq!(
+            seccomp(&["--security-opt", "seccomp=unconfined", "true"]).unwrap(),
+            Seccomp::Unconfined
+        );
+        let dir = std::env::temp_dir().join(format!("shipyard-seccomp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, json: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, json).unwrap();
+            format!("seccomp={}", path.display())
+        };
+        let good = file(
+            "good.json",
+            r#"{"defaultAction": "SCMP_ACT_ERRNO",
+                "syscalls": [{"names": ["read"], "action": "SCMP_ACT_ALLOW"}]}"#,
+        );
+        let Seccomp::Profile(profile) = seccomp(&["--security-opt", &good, "true"]).unwrap() else {
+            panic!("not a profile");
+        };
+        assert_eq!(profile.syscalls[0].names, ["read"]);
+        // The last one wins, as with Docker.
+        assert_eq!(
+            seccomp(&[
+                "--security-opt",
+                &good,
+                "--security-opt",
+                "seccomp:unconfined",
+                "true"
+            ])
+            .unwrap(),
+            Seccomp::Unconfined
+        );
+        // Mistakes name the file, and what's wrong.
+        for (name, json, wanted) in [
+            (
+                "typo.json",
+                r#"{"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": ["raed"], "action": "SCMP_ACT_ALLOW"}]}"#,
+                "\"raed\" isn't a system call",
+            ),
+            (
+                "field.json",
+                r#"{"defaultAction": "SCMP_ACT_ERRNO", "allowAll": true}"#,
+                "unknown field `allowAll`",
+            ),
+            ("broken.json", "{", "EOF while parsing"),
+        ] {
+            let option = file(name, json);
+            let err = format!(
+                "{:#}",
+                seccomp(&["--security-opt", &option, "true"]).unwrap_err()
+            );
+            assert!(err.contains(name) && err.contains(wanted), "{err}");
+        }
+        let missing = format!(
+            "{:#}",
+            seccomp(&["--security-opt", "seccomp=/no/such.json", "true"]).unwrap_err()
+        );
+        assert!(
+            missing.contains("seccomp profile /no/such.json"),
+            "{missing}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(parse(&["--security-opt", "seccomp=", "true"]).is_err());
+        assert!(parse(&["--security-opt", "seccomp", "true"]).is_err());
+        assert!(
+            parse(&[
+                "--no-isolation",
+                "--security-opt",
+                "seccomp=unconfined",
+                "true"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--bundle", ".", "--security-opt", "seccomp=unconfined"]).is_err());
+    }
+
+    #[test]
+    fn capability_flags_are_checked() {
+        assert!(parse(&["--cap-add", "FLY", "true"]).is_err());
+        assert!(parse(&["--security-opt", "apparmor=x", "true"]).is_err());
+        assert!(parse(&["--security-opt", "no-new-privileges=maybe", "true"]).is_err());
+        for flag in ["--cap-add", "--cap-drop"] {
+            assert!(
+                parse(&["--no-isolation", flag, "KILL", "true"]).is_err(),
+                "{flag}"
+            );
+            assert!(parse(&["--bundle", ".", flag, "KILL"]).is_err(), "{flag}");
+        }
+        let both = parse(&["--cap-add", "KILL", "--cap-drop", "kill", "true"]).unwrap();
+        assert!(
+            both.security()
+                .unwrap_err()
+                .to_string()
+                .contains("both name CAP_KILL")
+        );
+        if !cfg!(target_os = "linux") {
+            let err = parse(&["--cap-add", "KILL", "true"])
+                .unwrap()
+                .into_invocation()
+                .unwrap_err();
+            assert!(err.to_string().contains("--cap-add needs Linux"), "{err}");
+        }
     }
 
     #[test]

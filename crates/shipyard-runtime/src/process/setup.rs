@@ -64,6 +64,8 @@ pub(crate) struct Setup {
     /// The start gate's descriptor (`SpawnOptions::gate`), inherited: wait
     /// for it to be opened for reading before starting the command.
     pub(crate) gate: Option<RawFd>,
+    /// The command's capabilities and `no_new_privs` ([`Isolation::security`]).
+    pub(crate) security: crate::security::Security,
 }
 
 /// The root filesystem part of the setup ([`Root`], as bytes).
@@ -241,6 +243,7 @@ impl Setup {
                 .as_ref()
                 .map(|root| RootSetup::new(root, isolation.has(Namespace::Ipc))),
             gate,
+            security: isolation.security.clone(),
         }
     }
 

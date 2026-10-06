@@ -58,8 +58,8 @@ pub(crate) enum Placement {
     /// Shipyard's own.
     #[default]
     Host,
-    /// New ones (Linux).
-    New(Isolation),
+    /// New ones (Linux). Boxed: an isolation is much larger than a join.
+    New(Box<Isolation>),
     /// A running process's (Linux; see `join.rs`).
     Join(Join),
 }
@@ -167,6 +167,21 @@ pub(crate) fn spawn(
         }
         Launched::Parent(pid) => pid,
     };
+    // The child waits for the go byte, still dumpable and with its first
+    // credentials: the window in which its maps can be written (probe U2).
+    // If they can't, it never runs: killed and reaped here, before anyone
+    // learns its PID.
+    #[cfg(target_os = "linux")]
+    if let Some(maps) = options
+        .placement
+        .isolation()
+        .and_then(|isolation| isolation.id_maps.as_ref())
+        && let Err(err) = write_id_maps(pid, maps)
+    {
+        let _ = nix::sys::signal::kill(pid, NixSignal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(pid, None);
+        return Err(err);
+    }
     started(pid);
     drop(mask);
     drop(report_write);
@@ -367,6 +382,34 @@ unsafe fn launch(
         Ok(ForkResult::Parent { child }) => Ok(Launched::Parent(child)),
         Err(errno) => Err(fork_error(errno)),
     }
+}
+
+/// Writes the user namespace's ID maps for the child `pid`, as host root:
+/// `/proc/PID/uid_map`, then `gid_map`. `setgroups` stays allowed: only an
+/// unprivileged writer has to deny it (step 5).
+///
+/// The kernel takes each map in one `write`, once: a partial write would
+/// leave the rest unwritable, so a short one is an error, not retried.
+#[cfg(target_os = "linux")]
+fn write_id_maps(pid: Pid, maps: &crate::isolation::IdMaps) -> Result<()> {
+    use std::io::Write as _;
+
+    use crate::id_map::render;
+    use crate::isolation::MapKind;
+
+    for (kind, map) in [(MapKind::Uids, &maps.uids), (MapKind::Gids, &maps.gids)] {
+        let contents = render(map);
+        let failed = |errno| Error::sys(format!("writing the container's {kind}"), errno);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/{pid}/{kind}"))
+            .and_then(|mut file| file.write(contents.as_bytes()))
+            .map_err(|err| failed(super::io_errno(&err)))?;
+        if written != contents.len() {
+            return Err(failed(Errno::EIO));
+        }
+    }
+    Ok(())
 }
 
 /// A failed `fork`, explained.

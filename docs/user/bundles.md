@@ -54,6 +54,9 @@ config has no such settings. It needs root, as any isolated run does, and Linux.
 | `process.cwd` | The working directory (absolute). |
 | `process.user` | `uid`, `gid`, `umask` and `additionalGids`, exactly: no groups are added from `/etc/group`. |
 | `process.rlimits` | Resource limits, such as `RLIMIT_NOFILE`. `18446744073709551615` (the largest number) means unlimited. |
+| `process.capabilities` | The five capability sets (`bounding`, `effective`, `permitted`, `inheritable`, `ambient`), exactly, by name (`CAP_KILL`). An unknown name is an error. **Leaving it out means none**, with a warning (`runc` would leave the process every capability root has). For a process running as root, the bounding set is what really limits it: unless `noNewPrivileges` is set, running a program gives root its whole bounding set back (the kernel's rule). |
+| `process.noNewPrivileges` | When `true`, nothing the process runs can gain privileges: setuid programs and file capabilities give nothing. Leaving it out means `false`, as the specification says (unlike `shipyard run`, where it's on by default). |
+| `linux.seccomp` | A seccomp profile, which the process runs under (see [System calls](run.md#system-calls-seccomp) for what's supported). It's checked before anything starts: a misspelled call name or an unsupported action is an error. Fields Shipyard doesn't know are ignored, with a warning for each, as the specification requires. **Leaving it out means no filter**, as with `runc` (unlike `shipyard run`, which applies Docker's profile). |
 | `linux.namespaces` | Which of `pid`, `mount`, `uts` and `ipc` the container gets. `mount` is required (for the root filesystem). Without `pid`, there's no small init, and the command shares the host's process IDs (`shipyard-runtime` requires `pid`). |
 | `linux.maskedPaths`, `linux.readonlyPaths` | Exactly the paths hidden or made read-only (see [Root filesystem](run.md#root-filesystem)). **Leaving them out means none**, not Shipyard's defaults. |
 | `linux.sysctl` | Kernel settings the container owns: the IPC ones (`kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), which need an `ipc` namespace. Any other one would change the host, so it's an error (exit 125), not ignored. Values must be strings. |
@@ -96,9 +99,7 @@ Some fields ask for confinement Shipyard can't provide yet. Running without it w
 leave the container **less confined than the config asks**, so the bundle is refused
 (exit code 125). Every such field is listed at once, so you can fix them all:
 
-- `process.capabilities` and `process.noNewPrivileges: true`;
-- `linux.seccomp`, `process.apparmorProfile`, `process.selinuxLabel`,
-  `linux.mountLabel`;
+- `process.apparmorProfile`, `process.selinuxLabel`, `linux.mountLabel`;
 - `network`, `user`, `cgroup` and `time` namespaces, and joining an existing one (a
   namespace with a `path`);
 - `linux.uidMappings` and `linux.gidMappings`;
@@ -113,11 +114,10 @@ leave the container **less confined than the config asks**, so the bundle is ref
   comes later;
 - mounts of any type but `bind` and `tmpfs`.
 
-A config made by `runc spec` asks for a terminal, a few capabilities,
-`noNewPrivileges`, a device rule under `linux.resources` and a network namespace, so
-it's refused until those arrive. Remove those fields (and set `terminal` to `false`) to
-run it with what Shipyard has now: the process then runs as root with root's full
-privileges, which is what Shipyard does today.
+A config made by `runc spec` asks for a terminal, a device rule under
+`linux.resources` and a network namespace, so it's refused until those arrive. Remove
+those fields (and set `terminal` to `false`) to run it with what Shipyard has now. Its
+capabilities and `noNewPrivileges` are applied.
 
 ## What's ignored
 
@@ -128,7 +128,8 @@ These don't confine the container, so the bundle runs without them, with a warni
 - `process.oomScoreAdj`;
 - `linux.cgroupsPath`;
 - the `cgroup` or `cgroup2` mount at `/sys/fs/cgroup`;
-- access-time mount options (see [Mounts](#mounts)).
+- access-time mount options (see [Mounts](#mounts));
+- fields inside `linux.seccomp` that Shipyard doesn't know (each is named).
 
 `process.consoleSize` is ignored silently: it only applies with a terminal, which is
 refused. Fields the specification doesn't define are ignored silently, as it requires.
@@ -142,6 +143,10 @@ All of these exit with code 125 before anything starts, naming the problem:
 - **The version:** an `ociVersion` other than 1.x.
 - **The process:** none, or `args` empty; a `uid`, `gid` or `additionalGids` entry of
   4294967295, which the kernel reads as "leave unchanged".
+- **Capabilities:** an unknown name, or sets the kernel wouldn't accept: an effective
+  capability that isn't permitted, an inheritable one outside the bounding set, an
+  ambient one not both permitted and inheritable. The message names the rule and the
+  capability.
 - **The root filesystem:** `root.path` missing.
 - **Namespaces:** an unknown type.
 - **Mounts:** a mount source that doesn't exist, or a mount option Shipyard doesn't

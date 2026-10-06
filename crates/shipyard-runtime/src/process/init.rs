@@ -45,6 +45,8 @@ use super::plan::ChildPlan;
 use super::setup::{is_sealed_setup, read_setup};
 use super::status::ExitStatus;
 use super::{identity, rootfs, sysctl};
+use crate::security::seccomp::SeccompError;
+use crate::security::{Confinement, ConfinementError};
 
 /// Where the shipyard binary starts as a container's clean image. Does
 /// nothing unless this process was started that way (by `child.rs`, with
@@ -126,6 +128,10 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);
 
+    // The kernel's last capability, read before any mount: `/proc` is still
+    // the host's, and a bundle may mask `/proc/sys` in the container.
+    let last_cap =
+        cap_last_cap().unwrap_or_else(|errno| fail(Failure::at(ChildStep::CapLastCap, errno)));
     set_up(&setup).unwrap_or_else(|failure| fail(failure));
     // The command's plan is built here, inside the container: its PATH
     // lookup, credentials and limits. Shipyard built the same plan from the
@@ -138,9 +144,17 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     identity::resolve(&mut spec, Some(Path::new("/etc"))).unwrap_or_else(|err| {
         fail(Failure::at(ChildStep::UserLookup, err.errno).detail(err.which.detail()))
     });
-    let (plan, context) =
-        ChildPlan::for_container_command(&spec, setup.keep_ignored.clone(), setup.parent)
-            .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
+    // What the command may do, for the user it turned out to be, on this
+    // kernel.
+    let confinement = Confinement::new(&setup.security, spec.user.uid, last_cap, kernel_version())
+        .unwrap_or_else(|err| fail(confinement_failure(&err)));
+    let (plan, context) = ChildPlan::for_container_command(
+        &spec,
+        setup.keep_ignored.clone(),
+        setup.parent,
+        confinement,
+    )
+    .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
     // With a start gate (`shipyard-runtime create`): everything that can
     // fail before the command has been reported by now. Closing the report
     // pipe says "set up"; then wait for `start`. Nobody reads that pipe
@@ -185,7 +199,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         }
         None => (report, None),
     };
-    become_init(command, status, report, exec_failure)
+    become_init(command, status, report, exec_failure, last_cap)
 }
 
 /// Where a panic in this process is reported (-1: nowhere, once the report
@@ -377,15 +391,89 @@ fn set_domainname(name: &str) -> nix::Result<()> {
     Errno::result(rc).map(drop)
 }
 
+/// `/proc/sys/kernel/cap_last_cap`: the number of this kernel's last
+/// capability (40 on Linux 5.9 and later).
+fn cap_last_cap() -> Result<u8, Errno> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .map_err(|err| super::io_errno(&err))?;
+    text.trim().parse().map_err(|_| Errno::EINVAL)
+}
+
+/// This kernel's `(major, minor)` version, for a seccomp profile's
+/// `minKernel` conditions. `(0, 0)` if `uname` doesn't say: rules that need
+/// a newer kernel are then left out, and a filter can only get stricter.
+fn kernel_version() -> (u32, u32) {
+    nix::sys::utsname::uname()
+        .ok()
+        .and_then(|name| {
+            name.release()
+                .to_str()
+                .and_then(crate::security::seccomp::kernel_version)
+        })
+        .unwrap_or_default()
+}
+
+/// A confinement this kernel can't apply, as a setup failure.
+fn confinement_failure(err: &ConfinementError) -> Failure {
+    match err {
+        ConfinementError::UnknownToKernel(capability) => {
+            Failure::at(ChildStep::CapabilityUnknown, Errno::EINVAL)
+                .detail(usize::from(capability.number()))
+        }
+        ConfinementError::KernelTooNew(last) => {
+            Failure::at(ChildStep::TooManyCapabilities, Errno::ERANGE).detail(usize::from(*last))
+        }
+        ConfinementError::Seccomp(SeccompError::TooLong(len)) => {
+            Failure::at(ChildStep::SeccompCompile, Errno::E2BIG).detail(*len)
+        }
+        ConfinementError::Seccomp(_) => Failure::at(ChildStep::SeccompCompile, Errno::EINVAL),
+    }
+}
+
+/// The init gives up its own power once the command runs: every capability
+/// but `CAP_KILL` (to signal a command running as another user, TLPI
+/// §20.5), and `no_new_privs`. Without `CAP_SYS_PTRACE`, its non-dumpable
+/// flag then keeps root inside out of `/proc/1` (step 1's probe, P1).
+///
+/// An init that can't confine itself must not stay: the command is killed,
+/// the reason goes to the container's stderr (still the init's here), and
+/// the init exits as a setup failure.
+fn confine_self(command: libc::pid_t, last_cap: u8) {
+    let confined = Confinement::for_init(last_cap)
+        .map_err(|err| confinement_failure(&err))
+        .and_then(|init| {
+            super::child::confine_before_switch(&init)?;
+            super::child::confine_after_switch(&init)
+        });
+    if confined.is_err() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(command),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "shipyard: the container's init couldn't drop its own capabilities; stopping"
+        );
+        std::process::exit(SETUP_FAILED);
+    }
+}
+
 /// Becomes the container's init, once the command (PID `command`) runs.
 ///
 /// `exec_failure`: the exit code to report for the command if it couldn't
 /// be executed (see `explain_failure`).
-fn become_init(command: libc::pid_t, status: RawFd, report: RawFd, exec_failure: Option<u8>) -> ! {
+fn become_init(
+    command: libc::pid_t,
+    status: RawFd,
+    report: RawFd,
+    exec_failure: Option<u8>,
+    last_cap: u8,
+) -> ! {
     // The command holds the report pipe now: shipyard sees end-of-file when
     // it execs, or its failure record.
     PANIC_REPORT.store(-1, Ordering::Relaxed);
     let _ = nix::unistd::close(report);
+    confine_self(command, last_cap);
     // stdio: the terminal or pipes it inherited stay with the command, so a
     // reader sees end-of-file when the command closes its end. (Kept as they
     // are if /dev/null can't be opened.)

@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use shipyard_test_support::rootfs::{MARKER, RootFs};
-use shipyard_test_support::{Run, Shipyard, run};
+use shipyard_test_support::{Run, Shipyard, run, under_rosetta};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
@@ -485,8 +485,7 @@ fn a_missing_loader_is_explained() {
     // Under Rosetta (x86-64 emulation on Apple silicon), the kernel hands an
     // x86 program to the emulator, which reports the missing loader itself:
     // the exec succeeds, and there's nothing for shipyard to explain.
-    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
-    if maps.contains("/mnt/rv/[rosetta]") {
+    if under_rosetta() {
         eprintln!("under Rosetta emulation, which runs the program anyway; skipping");
         return;
     }

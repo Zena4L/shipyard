@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 use shipyard_runtime::isolation::{Isolation, Join, Namespace, Root};
 use shipyard_runtime::process::{self, ProcessSpec, StopPolicy, Supervisor};
 use shipyard_test_support::rootfs::{MARKER, RootFs};
-use shipyard_test_support::{Running, Shipyard, child_of, gone, is_root, run, start_command};
+use shipyard_test_support::{
+    Running, Shipyard, child_of, gone, is_root, run, start_command, under_rosetta,
+};
 
 fn main() -> ExitCode {
     process::init_entry_point();
@@ -195,6 +197,17 @@ enum Mode {
     Join(u32),
 }
 
+/// The standard isolation, without a seccomp filter under Rosetta, where the
+/// kernel refuses every one (stage 4's probe, S5; as the test support does
+/// for the CLI).
+fn standard_isolation() -> Isolation {
+    let mut isolation = Isolation::standard();
+    if under_rosetta() {
+        isolation.security.seccomp = shipyard_runtime::security::Seccomp::Unconfined;
+    }
+    isolation
+}
+
 /// Supervises `command` as `mode` says. In join mode it also runs a thread
 /// that keeps starting processes meanwhile, which must all stay on the host,
 /// and checks afterwards that this thread's children are born on the host
@@ -212,13 +225,13 @@ fn serve(mode: Mode, command: &[String]) -> ExitCode {
     };
     let result = match mode {
         Mode::Container { root } => {
-            let mut isolation = Isolation::standard();
+            let mut isolation = standard_isolation();
             isolation.hostname = Some("box".into());
             isolation.root = root.map(Root::new);
             supervisor.supervise(&spec, stop, Some(&isolation))
         }
         Mode::NoPidContainer { churn } => {
-            let mut isolation = Isolation::standard();
+            let mut isolation = standard_isolation();
             isolation.namespaces = vec![Namespace::Uts];
             isolation.hostname = Some("box".into());
             let churner = churn.then(ThreadChurn::start);
@@ -683,8 +696,7 @@ fn without_a_pid_namespace_under_thread_churn() {
     // Rosetta (x86-64 emulation on Apple silicon) deadlocks inside its own
     // handling of `clone` while threads are being created: the emulator,
     // not shipyard (native runs never hang). Skip there.
-    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
-    if maps.contains("/mnt/rv/[rosetta]") {
+    if under_rosetta() {
         eprintln!("under Rosetta emulation, which deadlocks on this stress; skipping");
         return;
     }

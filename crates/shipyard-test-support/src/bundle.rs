@@ -48,10 +48,13 @@ impl Bundle {
     }
 
     /// A config that runs `sh -c 'echo ready'` as root, in new PID, mount,
-    /// UTS and IPC namespaces, on [`Bundle::root`]. Change it and
+    /// UTS and IPC namespaces, on [`Bundle::root`], with the capabilities
+    /// and `noNewPrivileges` `runc spec` writes. Change it and
     /// [`Bundle::write`] it.
     #[must_use]
     pub fn config(&self) -> Value {
+        const RUNC_SPEC_CAPABILITIES: [&str; 3] =
+            ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"];
         json!({
             "ociVersion": "1.2.0",
             "root": {"path": self.root.path()},
@@ -59,7 +62,14 @@ impl Bundle {
                 "user": {"uid": 0, "gid": 0},
                 "args": ["sh", "-c", "echo ready"],
                 "env": ["PATH=/bin"],
-                "cwd": "/"
+                "cwd": "/",
+                // What `runc spec` writes: engines always fill these in.
+                "capabilities": {
+                    "bounding": RUNC_SPEC_CAPABILITIES,
+                    "effective": RUNC_SPEC_CAPABILITIES,
+                    "permitted": RUNC_SPEC_CAPABILITIES
+                },
+                "noNewPrivileges": true
             },
             "linux": {
                 "namespaces": [

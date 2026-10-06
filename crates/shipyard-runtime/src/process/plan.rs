@@ -15,9 +15,13 @@ use nix::unistd::{Gid, Uid, geteuid, getgid, getuid};
 
 use super::env::DEFAULT_PATH;
 use super::failure::FailureContext;
+#[cfg(target_os = "linux")]
+use super::failure::FilterStart;
 use super::rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
 use super::spawn::SpawnOptions;
 use super::spec::{ProcessSpec, SpecError, User};
+#[cfg(target_os = "linux")]
+use crate::security::Confinement;
 use crate::{Error, Result};
 
 /// The default file mode creation mask (Docker and runc use the same).
@@ -54,6 +58,10 @@ pub(crate) struct ChildPlan {
     /// namespace: shipyard's PID, its parent (see `die_with_parent`).
     #[cfg(target_os = "linux")]
     pub(crate) parent: Option<libc::pid_t>,
+    /// A container's command: its capabilities and `no_new_privs`, applied
+    /// around the credential switch (see `child.rs`). `None` otherwise.
+    #[cfg(target_os = "linux")]
+    pub(crate) confinement: Option<Confinement>,
 }
 
 /// The namespaces the child joins (see `join.rs`), in order. The PID
@@ -110,6 +118,10 @@ pub(crate) struct Reexec {
     /// Every other descriptor from 3 up is closed before the exec: these
     /// ranges (for `close_range`), everything but `passed` and `exe`.
     pub(crate) close_ranges: Vec<(u32, u32)>,
+    /// In a new user namespace: become its root (uid and gid 0 inside)
+    /// before the exec, or the exec would leave the clean image without
+    /// capabilities (see `child.rs`).
+    pub(crate) namespace_root: bool,
 }
 
 /// The descriptors an isolated spawn opens for the re-exec (see [`Reexec`]).
@@ -213,7 +225,15 @@ impl ChildPlan {
         #[cfg(target_os = "linux")]
         let (plan, context) = (
             Self {
-                reexec: reexec.map(reexec_plan).transpose()?,
+                reexec: reexec
+                    .map(|fds| {
+                        let in_user_namespace = options
+                            .placement
+                            .isolation()
+                            .is_some_and(|isolation| isolation.id_maps.is_some());
+                        reexec_plan(fds, in_user_namespace)
+                    })
+                    .transpose()?,
                 join,
                 ..plan
             },
@@ -227,6 +247,10 @@ impl ChildPlan {
                     .isolation()
                     .map(|isolation| isolation.sysctls.clone())
                     .unwrap_or_default(),
+                seccomp: options
+                    .placement
+                    .isolation()
+                    .and_then(|isolation| FilterStart::of(&isolation.security)),
                 ..context
             },
         );
@@ -241,9 +265,24 @@ impl ChildPlan {
         spec: &ProcessSpec,
         keep_ignored: Vec<libc::c_int>,
         parent: Option<libc::pid_t>,
+        confinement: Confinement,
     ) -> Result<(Self, FailureContext)> {
         let (plan, context) = Self::for_command(spec, keep_ignored, false, None)?;
-        Ok((Self { parent, ..plan }, context))
+        let seccomp = if confinement.filter_before_setup().is_some() {
+            Some(FilterStart::BeforeSetup)
+        } else {
+            confinement
+                .filter_before_exec()
+                .map(|_| FilterStart::BeforeExec)
+        };
+        Ok((
+            Self {
+                parent,
+                confinement: Some(confinement),
+                ..plan
+            },
+            FailureContext { seccomp, ..context },
+        ))
     }
 
     fn for_command(
@@ -307,6 +346,8 @@ impl ChildPlan {
             join: None,
             #[cfg(target_os = "linux")]
             parent: None,
+            #[cfg(target_os = "linux")]
+            confinement: None,
         };
         let context = FailureContext {
             program: PathBuf::from(program),
@@ -322,6 +363,7 @@ impl ChildPlan {
             container_root: None,
             names: spec.user.names.clone(),
             sysctls: Vec::new(),
+            seccomp: None,
         };
         Ok((plan, context))
     }
@@ -329,7 +371,7 @@ impl ChildPlan {
 
 /// The re-exec plan for the descriptors in `fds`.
 #[cfg(target_os = "linux")]
-fn reexec_plan(fds: ReexecFds) -> Result<Reexec> {
+fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
     let number = |fd: RawFd, field| c_string(fd.to_string().as_bytes(), field);
     let argv = vec![
         // What `ps -f` shows for PID 1 (its name is set too).
@@ -363,6 +405,7 @@ fn reexec_plan(fds: ReexecFds) -> Result<Reexec> {
         env: CStringArray::new(Vec::new()),
         passed,
         close_ranges: ranges_excluding(&kept),
+        namespace_root,
     })
 }
 

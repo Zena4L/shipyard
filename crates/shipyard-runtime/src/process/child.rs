@@ -31,6 +31,8 @@ use super::channel::encode;
 use super::failure::{ChildStep, means_not_found};
 use super::plan::{ChildPlan, Credentials, FdSweep};
 use super::signal::MAX_SIGNAL;
+#[cfg(target_os = "linux")]
+use crate::security::{Confinement, SeccompFilter};
 
 /// The child's exit code when setup fails. The parent normally reads the
 /// failure from the report pipe instead; this is only what's left if it can't.
@@ -125,6 +127,10 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     }
     #[cfg(target_os = "linux")]
     if let Some(reexec) = &plan.reexec {
+        // First: a credential change clears the parent-death signal.
+        if reexec.namespace_root {
+            become_namespace_root()?;
+        }
         // The init must die with shipyard too: then the kernel kills the
         // whole namespace. The signal survives the exec below.
         die_with_parent(plan)?;
@@ -151,8 +157,19 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
     // Only a permission error is worth retrying (runc does the same): any
     // other error, like a missing directory, won't change with the user.
     let chdir_error = chdir(plan).err();
+    #[cfg(target_os = "linux")]
+    if let Some(confinement) = &plan.confinement {
+        if let Some(filter) = confinement.filter_before_setup() {
+            install_filter(filter)?;
+        }
+        confine_before_switch(confinement)?;
+    }
     if let Some(credentials) = &plan.credentials {
         switch_credentials(credentials)?;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(confinement) = &plan.confinement {
+        confine_after_switch(confinement)?;
     }
     match chdir_error {
         None => {}
@@ -168,6 +185,14 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
     die_with_parent(plan)?;
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
         .map_err(|errno| Failure::at(ChildStep::SignalMask, errno))?;
+    #[cfg(target_os = "linux")]
+    if let Some(filter) = plan
+        .confinement
+        .as_ref()
+        .and_then(Confinement::filter_before_exec)
+    {
+        install_filter(filter)?;
+    }
     Err(exec_first_candidate(plan))
 }
 
@@ -460,6 +485,125 @@ fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
     set_gid(credentials.gid)?;
     set_uid(credentials.uid)?;
     verify_credentials(credentials)
+}
+
+/// A container's command, before the switch of user (TLPI ch. 39; the order
+/// is step 1's probe's): keep capabilities across the switch if the user
+/// isn't root (C3), then drop from the bounding set, which needs
+/// `CAP_SETPCAP` and so root (C1). Raw `prctl`: no C library state.
+#[cfg(target_os = "linux")]
+pub(super) fn confine_before_switch(confinement: &Confinement) -> Result<(), Failure> {
+    if confinement.keep_caps {
+        prctl(libc::PR_SET_KEEPCAPS, 1, 0)
+            .map_err(|errno| Failure::at(ChildStep::KeepCaps, errno))?;
+    }
+    for &capability in &confinement.bounding_drop {
+        prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(capability), 0).map_err(|errno| {
+            Failure::at(ChildStep::BoundingDrop, errno).detail(usize::from(capability))
+        })?;
+    }
+    Ok(())
+}
+
+/// A container's command, after the switch of user: its effective,
+/// permitted and inheritable sets (`capset`), its ambient ones (C4), and
+/// `no_new_privs` (N1). Raw system calls, from data prepared before the fork.
+#[cfg(target_os = "linux")]
+pub(super) fn confine_after_switch(confinement: &Confinement) -> Result<(), Failure> {
+    // `__user_cap_header_struct`: the version, and this process (0).
+    let header: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    // SAFETY: `header` and `capset_data` are the kernel's
+    // `__user_cap_header_struct` and two `__user_cap_data_struct`s (three
+    // `u32`s each), which it only reads.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            header.as_ptr(),
+            confinement.capset_data.as_ptr(),
+        )
+    };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::Capset, errno))?;
+    for &capability in &confinement.ambient {
+        prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::c_ulong::from(libc::PR_CAP_AMBIENT_RAISE.unsigned_abs()),
+            libc::c_ulong::from(capability),
+        )
+        .map_err(|errno| {
+            Failure::at(ChildStep::AmbientRaise, errno).detail(usize::from(capability))
+        })?;
+    }
+    if confinement.no_new_privileges {
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0)
+            .map_err(|errno| Failure::at(ChildStep::NoNewPrivs, errno))?;
+    }
+    Ok(())
+}
+
+/// Installs a seccomp filter on this process (`seccomp(2)`,
+/// `SECCOMP_SET_MODE_FILTER`): from here on, the kernel runs it on every
+/// system call this process and everything it starts makes. Needs
+/// `no_new_privs` or `CAP_SYS_ADMIN` (step 1's probe, S1). The raw system
+/// call, on a program compiled before the fork.
+#[cfg(target_os = "linux")]
+fn install_filter(filter: &SeccompFilter) -> Result<(), Failure> {
+    // `Instruction` is the kernel's `struct sock_filter`, field for field.
+    const _: () = assert!(
+        size_of::<crate::security::seccomp::Instruction>() == size_of::<libc::sock_filter>()
+    );
+    let program = libc::sock_fprog {
+        len: filter.len,
+        filter: filter
+            .program
+            .as_ptr()
+            .cast::<libc::sock_filter>()
+            .cast_mut(),
+    };
+    // SAFETY: `program` points at `len` instructions, which the kernel only
+    // reads (and copies) during the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            filter.flags,
+            &raw const program,
+        )
+    };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::Seccomp, errno))
+}
+
+/// `_LINUX_CAPABILITY_VERSION_3`: `capset`'s 64-bit sets, in two halves.
+#[cfg(target_os = "linux")]
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// The raw `prctl` system call with two arguments (no C library state).
+#[cfg(target_os = "linux")]
+fn prctl(option: libc::c_int, arg2: libc::c_ulong, arg3: libc::c_ulong) -> Result<(), Errno> {
+    // SAFETY: `prctl` with integer arguments; the options used here read no
+    // memory.
+    raw_result(unsafe { libc::syscall(libc::SYS_prctl, option, arg2, arg3, 0, 0) })
+}
+
+/// Becomes root of the new user namespace (uid and gid 0 inside, no
+/// supplementary groups), once the parent has written its maps.
+///
+/// Cloned by host root, this process is host uid 0, which the maps usually
+/// leave out: inside, it's the overflow uid (65534). It has every
+/// capability in the namespace, but `execve` recomputes capabilities from
+/// the effective uid, and the clean image would start with none. As uid 0
+/// inside, the exec keeps them all (`capabilities(7)`). Raw system calls, as
+/// in [`switch_credentials`]. The detail says which call failed: 1 groups,
+/// 2 gid, 3 uid.
+#[cfg(target_os = "linux")]
+fn become_namespace_root() -> Result<(), Failure> {
+    let failed = |which: usize| move |errno| Failure::at(ChildStep::NamespaceRoot, errno).detail(which);
+    // SAFETY: plain integer arguments; no list (size 0, NULL).
+    raw_result(unsafe { libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) })
+        .map_err(failed(1))?;
+    // SAFETY: plain integer arguments.
+    raw_result(unsafe { libc::syscall(libc::SYS_setresgid, 0, 0, 0) }).map_err(failed(2))?;
+    // SAFETY: plain integer arguments.
+    raw_result(unsafe { libc::syscall(libc::SYS_setresuid, 0, 0, 0) }).map_err(failed(3))
 }
 
 /// The raw `setgroups` system call (see [`switch_credentials`]).

@@ -380,7 +380,7 @@ fn spawn_container(
     let options = SpawnOptions {
         new_process_group: false,
         keep_ignored: Vec::new(),
-        placement: Placement::New(bundle.isolation),
+        placement: Placement::New(Box::new(bundle.isolation)),
         gate: Some(gate.as_raw_fd()),
     };
     let mut child = spawn(&bundle.spec, &options, |_| {}).map_err(|err| format!("{err:#}"))?;

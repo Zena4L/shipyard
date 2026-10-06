@@ -87,8 +87,10 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   volumes. OrbStack's emulation (Rosetta) lacks `clone3` and `execveat`, so this run also
   exercises both fallbacks. It's slow (the first `apt-get` alone can take many minutes),
   and Rosetta itself can deadlock when a raw `clone` meets threads being created, so the
-  one test that stresses exactly that skips itself there. Treat it as a check of the
-  fallback paths, not of concurrency; CI runs real x86-64:
+  one test that stresses exactly that skips itself there. The kernel also refuses every
+  seccomp filter under emulation, so the test support runs isolated commands there with
+  `--security-opt seccomp=unconfined`, and the filter's own tests skip. Treat it as a
+  check of the fallback paths, not of concurrency or seccomp; CI runs real x86-64:
 
   ```sh
   docker run --rm --privileged --platform linux/amd64 -v "$PWD":/src:ro \

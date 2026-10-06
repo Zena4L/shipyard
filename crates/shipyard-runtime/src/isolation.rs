@@ -16,6 +16,8 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+pub use crate::id_map::{IdMap, IdMapError, IdMaps, MapKind};
+
 /// A kind of Linux namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -99,10 +101,13 @@ impl Namespace {
     }
 
     /// Whether this stage can create it. The others come with the stages that
-    /// give them meaning: network (stage 7), user (rootless, stage 4), cgroup
-    /// (stage 5), time (not planned yet).
+    /// give them meaning: network (stage 7), cgroup (stage 5), time (not
+    /// planned yet).
     fn is_supported(self) -> bool {
-        matches!(self, Self::Pid | Self::Mount | Self::Uts | Self::Ipc)
+        matches!(
+            self,
+            Self::Pid | Self::Mount | Self::Uts | Self::Ipc | Self::User
+        )
     }
 }
 
@@ -141,6 +146,11 @@ pub struct Isolation {
     /// A root filesystem of the container's own. Needs a mount namespace.
     /// `None` keeps the host's (with a fresh `/proc` over the host's).
     pub root: Option<Root>,
+    /// What the command may do: its capabilities, and `no_new_privs`.
+    pub security: crate::security::Security,
+    /// The ID maps of its user namespace: present exactly when
+    /// [`Namespace::User`] is in `namespaces`.
+    pub id_maps: Option<IdMaps>,
 }
 
 impl Isolation {
@@ -159,6 +169,8 @@ impl Isolation {
             domainname: None,
             sysctls: Vec::new(),
             root: None,
+            security: crate::security::Security::standard(),
+            id_maps: None,
         }
     }
 
@@ -187,6 +199,12 @@ impl Isolation {
     /// with paths that aren't absolute.
     pub fn validate(&self) -> Result<(), IsolationError> {
         check_kinds(&self.namespaces)?;
+        match (&self.id_maps, self.has(Namespace::User)) {
+            (Some(maps), true) => maps.validate()?,
+            (None, false) => {}
+            (Some(_), false) => return Err(IsolationError::MapsNeedUser),
+            (None, true) => return Err(IsolationError::UserNeedsMaps),
+        }
         // The container gets a fresh /proc for its PID namespace. Without its
         // own mount namespace that mount would replace the host's /proc, and
         // every process on the machine would see the container's PIDs.
@@ -488,6 +506,9 @@ impl Join {
             return Err(IsolationError::NothingToJoin);
         }
         check_kinds(&self.namespaces)?;
+        if self.has(Namespace::User) {
+            return Err(IsolationError::JoinUser);
+        }
         // In the container's PID namespace but with the host's /proc, the
         // process would see the wrong processes: `ps`, `kill $(pidof …)` and
         // `/proc/self` would all mislead it.
@@ -679,6 +700,18 @@ pub enum IsolationError {
     /// A [`Join`] with no namespaces to join.
     #[error("no namespaces to join")]
     NothingToJoin,
+    /// A user namespace without ID maps.
+    #[error("a user namespace needs ID maps (--uidmap)")]
+    UserNeedsMaps,
+    /// ID maps without a user namespace to apply them to.
+    #[error("ID maps need a user namespace")]
+    MapsNeedUser,
+    /// ID maps the kernel would refuse.
+    #[error(transparent)]
+    IdMap(#[from] IdMapError),
+    /// A [`Join`] of a user namespace.
+    #[error("joining a user namespace isn't supported yet (it comes with exec)")]
+    JoinUser,
     /// The hostname isn't valid.
     #[error("invalid hostname \"{hostname}\": {reason}")]
     InvalidHostname {
@@ -858,12 +891,7 @@ mod tests {
             Err(IsolationError::Duplicate(Namespace::Pid))
         );
 
-        for later in [
-            Namespace::Network,
-            Namespace::User,
-            Namespace::Cgroup,
-            Namespace::Time,
-        ] {
+        for later in [Namespace::Network, Namespace::Cgroup, Namespace::Time] {
             let mut isolation = Isolation::standard();
             isolation.namespaces.push(later);
             assert_eq!(
@@ -881,6 +909,8 @@ mod tests {
             domainname: None,
             sysctls: Vec::new(),
             root: None,
+            security: crate::security::Security::standard(),
+            id_maps: None,
         };
         assert_eq!(isolation.validate(), Err(IsolationError::PidNeedsMount));
         // A mount namespace alone is fine: its /proc still shows the host's
@@ -891,6 +921,8 @@ mod tests {
             domainname: None,
             sysctls: Vec::new(),
             root: None,
+            security: crate::security::Security::standard(),
+            id_maps: None,
         };
         assert_eq!(mount_only.validate(), Ok(()));
     }
@@ -919,6 +951,33 @@ mod tests {
             Err(IsolationError::PidNeedsMount)
         );
         assert_eq!(join(vec![Namespace::Uts]).validate(), Ok(()));
+        assert_eq!(
+            join(vec![Namespace::User, Namespace::Uts]).validate(),
+            Err(IsolationError::JoinUser)
+        );
+    }
+
+    #[test]
+    fn a_user_namespace_comes_with_its_maps() {
+        let maps = IdMaps {
+            uids: vec!["0:100000:65536".parse().unwrap()],
+            gids: vec!["0:100000:65536".parse().unwrap()],
+        };
+        let mut isolation = Isolation::standard();
+        isolation.namespaces.push(Namespace::User);
+        assert_eq!(isolation.validate(), Err(IsolationError::UserNeedsMaps));
+        isolation.id_maps = Some(maps.clone());
+        assert_eq!(isolation.validate(), Ok(()));
+        let mut no_root = maps.clone();
+        no_root.uids = vec!["1:100000:65536".parse().unwrap()];
+        isolation.id_maps = Some(no_root);
+        assert!(matches!(
+            isolation.validate(),
+            Err(IsolationError::IdMap(IdMapError::NoRoot(MapKind::Uids)))
+        ));
+        let mut without_user = Isolation::standard();
+        without_user.id_maps = Some(maps);
+        assert_eq!(without_user.validate(), Err(IsolationError::MapsNeedUser));
     }
 
     #[test]
@@ -929,6 +988,8 @@ mod tests {
             domainname: None,
             sysctls: Vec::new(),
             root: None,
+            security: crate::security::Security::standard(),
+            id_maps: None,
         };
         assert_eq!(isolation.validate(), Err(IsolationError::HostnameNeedsUts));
     }

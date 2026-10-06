@@ -102,7 +102,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Capabilities:** a minimal default set, plus `--cap-add` / `--cap-drop`.
 - **`no_new_privs`:** setuid binaries can't gain privileges.
 - **seccomp:** a default syscall filter compiled to BPF, plus custom profiles.
-- **Device access control:** an eBPF program attached to the cgroup (cgroup v2).
+- **Moved to stage 5:** device access control, an eBPF program attached to the
+  container's cgroup, which exists only from stage 5.
 - *Later:* AppArmor / SELinux labels, Landlock.
 
 ## 5. Resource control — stage 5
@@ -116,6 +117,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Live stats:** CPU, memory, I/O and process count, for `stats`, `top` and the UI.
 - **Change limits on a running container:** `update`.
 - **Pause and resume:** via `cgroup.freeze`.
+- **Device access control** (moved here from stage 4): an eBPF program attached to the
+  container's cgroup (cgroup v2), allowing only the devices it should open.
 - **Rootless cgroups:** delegation through systemd.
 - **Cgroup namespaces** (moved here from stage 2): the container sees its own cgroup as
   the root.

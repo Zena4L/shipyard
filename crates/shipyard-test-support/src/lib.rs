@@ -90,7 +90,7 @@ impl Shipyard {
     #[must_use]
     pub fn command(self, args: &[&str]) -> Command {
         let mut command = Command::new(self.path);
-        command.args(args);
+        command.args(for_this_kernel(args));
         // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
         unsafe {
             command.pre_exec(|| {
@@ -169,6 +169,34 @@ pub fn run(mut command: Command) -> Run {
         signal: output.status.signal(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Whether this test runs under Rosetta, the x86-64 emulator Linux VMs on
+/// Apple silicon use: it shows up in the process's own memory map. Some
+/// tests skip there, where the emulator itself, not Shipyard, gets in the
+/// way.
+#[must_use]
+pub fn under_rosetta() -> bool {
+    std::fs::read_to_string("/proc/self/maps").is_ok_and(|maps| maps.contains("/mnt/rv/[rosetta]"))
+}
+
+/// `shipyard ARGS…`'s arguments, for where the tests run. Under Rosetta the
+/// kernel refuses every seccomp filter (stage 4's probe, S5), so an isolated
+/// `run` gets `--security-opt seccomp=unconfined` right after `run` (after
+/// any global options, like `-D`); a `seccomp=` later in `args` still wins.
+/// The tests of the filter itself skip there.
+#[must_use]
+pub fn for_this_kernel<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let unisolated = args
+        .iter()
+        .any(|arg| *arg == "--no-isolation" || arg.starts_with("--bundle"));
+    match args.iter().position(|arg| *arg == "run") {
+        Some(run) if !unisolated && under_rosetta() => {
+            let (before, after) = args.split_at(run + 1);
+            [before, &["--security-opt", "seccomp=unconfined"], after].concat()
+        }
+        _ => args.to_vec(),
     }
 }
 

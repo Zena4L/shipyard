@@ -30,6 +30,14 @@ fn isolated(args: &[&str]) -> Run {
     run(SHIPYARD.command(&[&["run"], args].concat()))
 }
 
+/// Runs `shipyard run ARGS…` able to look into the container's init
+/// (`/proc/1/fd`, `environ`, `cwd`): root inside can't without
+/// `CAP_SYS_PTRACE` (the init isn't dumpable), and these tests look at what
+/// the init holds, or at what reaching its pipes would do.
+fn inspecting_the_init(args: &[&str]) -> Run {
+    isolated(&[&["--cap-add", "SYS_PTRACE"], args].concat())
+}
+
 /// The namespace IDs (`/proc/self/ns/*` links) of the test process itself.
 fn own_namespaces() -> Vec<String> {
     ["pid", "mnt", "uts", "ipc"]
@@ -122,7 +130,10 @@ fn mounts_made_inside_do_not_reach_the_host() {
     std::fs::create_dir_all(&dir).unwrap();
     let procs_before = mounts_at("/proc");
     // The container mounts its own /proc; also a tmpfs, for good measure.
+    // Mounting needs CAP_SYS_ADMIN, which a container doesn't have by default.
     let run = isolated(&[
+        "--cap-add",
+        "SYS_ADMIN",
         "sh",
         "-c",
         &format!("mount -t tmpfs none {dir} && echo mounted"),
@@ -283,6 +294,10 @@ fn the_init_does_not_hold_leaked_descriptors() {
     let run = run(SHIPYARD.command_with(
         &[
             "run",
+            // To look into the init at all (see `inspecting_the_init`):
+            // without it, every fd reads as "closed".
+            "--cap-add",
+            "SYS_PTRACE",
             "sh",
             "-c",
             "if [ -e /proc/1/fd/60 ]; then echo pinned; else echo closed; fi",
@@ -352,7 +367,14 @@ fn the_init_carries_none_of_shipyards_secrets() {
     );
 
     // The environment is root-only; read it as root.
-    let mut command = SHIPYARD.command(&["run", "sh", "-c", "tr '\\0' '\\n' < /proc/1/environ"]);
+    let mut command = SHIPYARD.command(&[
+        "run",
+        "--cap-add",
+        "SYS_PTRACE",
+        "sh",
+        "-c",
+        "tr '\\0' '\\n' < /proc/1/environ",
+    ]);
     command.env("SHIPYARD_TEST_SECRET", "hunter2-from-the-environment");
     let environ = run(command);
     assert_eq!(environ.code, Some(0), "{}", environ.stderr);
@@ -364,7 +386,7 @@ fn the_init_carries_none_of_shipyards_secrets() {
 #[test]
 #[ignore = "needs root"]
 fn the_init_does_not_hold_stdio() {
-    let run = isolated(&[
+    let run = inspecting_the_init(&[
         "sh",
         "-c",
         "for fd in 0 1 2; do readlink /proc/1/fd/$fd; done",
@@ -390,9 +412,17 @@ fn signals_sent_to_the_init_reach_the_command() {
 
 /// A shell loop that runs `action` (with `$fd` set) for each pipe the
 /// container's init holds: its status pipe, reached through `/proc/1/fd`.
+/// It prints `reached-the-pipe` each time, so a test can tell its forgery
+/// really happened: a container that can't look into the init (no
+/// `CAP_SYS_PTRACE`) would pass these tests without forging anything.
 fn on_the_inits_pipes(action: &str) -> String {
-    format!("for fd in /proc/1/fd/*; do case $(readlink $fd) in pipe:*) {action} ;; esac; done")
+    format!(
+        "for fd in /proc/1/fd/*; do case $(readlink $fd) in pipe:*) {action}\n echo {REACHED} ;; esac; done"
+    )
 }
+
+/// What [`on_the_inits_pipes`] prints when it reaches a pipe.
+const REACHED: &str = "reached-the-pipe";
 
 /// Writes a well-formed status record for "exited 0" to `$fd`.
 const WRITE_EXIT_0: &str = r"printf '\000\000\000\000' > $fd";
@@ -403,11 +433,12 @@ const WRITE_EXIT_0: &str = r"printf '\000\000\000\000' > $fd";
 #[test]
 #[ignore = "needs root"]
 fn a_forged_status_record_is_not_believed() {
-    let run = isolated(&[
+    let run = inspecting_the_init(&[
         "sh",
         "-c",
         &format!("{}; exit 7", on_the_inits_pipes(WRITE_EXIT_0)),
     ]);
+    assert!(run.stdout.contains(REACHED), "no forgery: {}", run.stderr);
     assert_eq!(run.code, Some(7), "{}", run.stderr);
 }
 
@@ -417,7 +448,7 @@ fn a_forged_status_record_is_not_believed() {
 #[ignore = "needs root"]
 fn a_full_status_pipe_does_not_freeze_the_init() {
     let started = Instant::now();
-    let run = isolated(&[
+    let run = inspecting_the_init(&[
         "sh",
         "-c",
         &format!(
@@ -425,6 +456,7 @@ fn a_full_status_pipe_does_not_freeze_the_init() {
             on_the_inits_pipes("head -c 100000 /dev/zero > $fd &")
         ),
     ]);
+    assert!(run.stdout.contains(REACHED), "no flood: {}", run.stderr);
     assert_eq!(run.code, Some(7), "{}", run.stderr);
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -437,7 +469,8 @@ fn a_full_status_pipe_does_not_freeze_the_init() {
 #[test]
 #[ignore = "needs root"]
 fn the_init_does_not_hold_shipyards_working_directory() {
-    let mut command = SHIPYARD.command(&["run", "readlink", "/proc/1/cwd"]);
+    let mut command =
+        SHIPYARD.command(&["run", "--cap-add", "SYS_PTRACE", "readlink", "/proc/1/cwd"]);
     command.current_dir("/tmp");
     let run = run(command);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -577,6 +610,8 @@ fn signals_ignored_at_startup_stay_ignored_inside() {
 fn a_forged_record_cannot_hide_a_kill() {
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--cap-add",
+        "SYS_PTRACE",
         "--stop-timeout",
         "1",
         "sh",
@@ -586,6 +621,7 @@ fn a_forged_record_cannot_hide_a_kill() {
             on_the_inits_pipes(WRITE_EXIT_0)
         ),
     ]));
+    assert_eq!(running.next_line(), REACHED, "no forgery");
     assert_eq!(running.next_line(), "ready");
     running.signal(libc::SIGTERM);
     assert_eq!(running.finish().0, killed_by(libc::SIGKILL));
