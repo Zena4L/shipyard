@@ -23,6 +23,7 @@ use std::ffi::OsStr;
 use std::os::fd::AsRawFd;
 #[cfg(not(target_os = "linux"))]
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use libc::c_int;
@@ -102,14 +103,15 @@ impl Supervisor {
     /// - With `isolation` (Linux), the command starts in new namespaces and a
     ///   session of its own. It's then never in the terminal's process group,
     ///   so signals from the terminal are forwarded like any other, and the
-    ///   shell's job control doesn't extend to it. With a new PID namespace,
-    ///   its PID 1 is an init that re-execs this program's binary: `main`
-    ///   must call [`init_entry_point`](super::init_entry_point) first.
+    ///   shell's job control doesn't extend to it. The container is set up
+    ///   by this program's binary, re-exec'd (with a PID namespace, it then
+    ///   stays as the container's init): `main` must call
+    ///   [`init_entry_point`](super::init_entry_point) first.
     ///
     /// # Errors
     ///
-    /// Invalid input, isolation on macOS or without root, a PID namespace
-    /// without the init entry point, a container init that failed to start
+    /// Invalid input, isolation on macOS, without root or without the init
+    /// entry point, a container init that failed to start
     /// ([`Error::InitDidNotStart`]), or a failure to start the command (see
     /// [`Error::exit_code`]).
     pub fn supervise(
@@ -182,6 +184,7 @@ impl Supervisor {
             }
         );
         let spec = with_terminal_env(spec, terminal.is_some(), std::env::var_os("TERM"));
+        let spec = resolve_names(spec, &placement)?;
         let options = SpawnOptions {
             placement,
             new_process_group: job_terminal.is_none(),
@@ -192,6 +195,7 @@ impl Supervisor {
                 .copied()
                 .filter(|signal| KEEP_IGNORED.contains(signal))
                 .collect(),
+            gate: None,
         };
         let started = |pid: Pid| self.signals.set_child(pid.as_raw());
         let result = spawn(&spec, &options, started).and_then(|mut child| {
@@ -305,11 +309,29 @@ fn check_isolation(isolation: &Isolation) -> Result<()> {
             os: std::env::consts::OS,
         });
     }
-    // The container's init, which a new PID namespace gets, re-execs this
-    // binary (see `init.rs`).
+    // Every isolated run re-execs this binary as the container's clean
+    // image (see `init.rs`).
     #[cfg(target_os = "linux")]
-    if isolation.has(crate::isolation::Namespace::Pid) && !super::has_init_entry_point() {
+    if !super::has_init_entry_point() {
         return Err(Error::NoInitEntryPoint);
+    }
+    if let Some(root) = &isolation.root {
+        // Here, for a clear message: inside, a missing directory would only
+        // be "binding the root filesystem onto itself: No such file".
+        let reason = match std::fs::metadata(&root.path) {
+            Ok(metadata) if metadata.is_dir() => None,
+            Ok(_) => Some("isn't a directory".to_owned()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Some("doesn't exist".to_owned())
+            }
+            Err(err) => Some(err.to_string()),
+        };
+        if let Some(reason) = reason {
+            return Err(Error::RootFilesystem {
+                path: root.path.clone(),
+                reason,
+            });
+        }
     }
     // Creating namespaces needs CAP_SYS_ADMIN. Checked here for a clear
     // message; a clone or mount failing with EPERM says the same thing.
@@ -686,6 +708,28 @@ fn reap_quietly(pid: Pid) {
 
 /// With a terminal, pass the host's `TERM` through (unless the user set one),
 /// so full-screen programs like `top` or `vim` know how to draw.
+/// Resolves user and group names where the command runs: for an isolated
+/// run that's in the container, so the container's init does it (`init.rs`);
+/// for a run on the host, here, in the host's `/etc`. A joined command's
+/// names would need the container's `/etc`, read safely through its root:
+/// not yet, so they're refused.
+fn resolve_names<'a>(
+    spec: Cow<'a, ProcessSpec>,
+    placement: &Placement,
+) -> Result<Cow<'a, ProcessSpec>> {
+    let etc = match placement {
+        Placement::New(_) => return Ok(spec),
+        Placement::Host => Some(Path::new("/etc")),
+        Placement::Join(_) if !spec.user.names.is_empty() => {
+            return Err(Error::NamesWhenJoining);
+        }
+        Placement::Join(_) => None,
+    };
+    let mut spec = spec.into_owned();
+    super::identity::resolve(&mut spec, etc)?;
+    Ok(Cow::Owned(spec))
+}
+
 fn with_terminal_env(
     spec: &ProcessSpec,
     terminal: bool,

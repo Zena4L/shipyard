@@ -3,13 +3,13 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
-use shipyard_runtime::isolation::Isolation;
+use shipyard_runtime::isolation::{Isolation, Root};
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
@@ -25,13 +25,14 @@ pub(crate) struct RunArgs {
     #[arg(short, long, value_name = "DIR", default_value = "/")]
     workdir: PathBuf,
 
-    /// Run as this numeric user and group (group defaults to 0).
-    #[arg(short, long, value_name = "UID[:GID]", value_parser = parse_user)]
-    user: Option<(u32, Option<u32>)>,
+    /// Run as this user and group: names (from the container's /etc/passwd
+    /// and /etc/group) or numbers.
+    #[arg(short, long, value_name = "USER[:GROUP]", value_parser = parse_user)]
+    user: Option<(String, Option<String>)>,
 
-    /// Add a supplementary group (numeric).
-    #[arg(long, value_name = "GID", value_parser = parse_id)]
-    group_add: Vec<u32>,
+    /// Add a supplementary group: a name or a number.
+    #[arg(long, value_name = "GROUP", value_parser = parse_name_or_id)]
+    group_add: Vec<String>,
 
     /// Set a resource limit, e.g. nofile=1024:2048 or core=0.
     #[arg(long, value_name = "NAME=SOFT[:HARD]")]
@@ -55,9 +56,39 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "NAME", conflicts_with = "no_isolation")]
     hostname: Option<String>,
 
+    /// NIS domain name inside the container (Linux).
+    #[arg(long, value_name = "NAME", conflicts_with = "no_isolation")]
+    domainname: Option<String>,
+
+    /// Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824
+    /// (Linux; IPC settings only).
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_sysctl, conflicts_with = "no_isolation")]
+    sysctl: Vec<(String, String)>,
+
+    /// Use DIR as the container's root filesystem: it becomes `/` inside,
+    /// with its own /proc, /sys and /dev (Linux).
+    #[arg(long, value_name = "DIR", conflicts_with = "no_isolation")]
+    rootfs: Option<PathBuf>,
+
+    /// Make the container's root filesystem read-only (with --rootfs).
+    #[arg(long, requires = "rootfs")]
+    read_only: bool,
+
+    /// Run the OCI bundle in DIR: its config.json says what to run and how,
+    /// so no COMMAND or container options are given (Linux).
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = [
+            "command", "env", "workdir", "user", "group_add", "ulimit",
+            "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
+        ],
+    )]
+    bundle: Option<PathBuf>,
+
     /// The command to run, followed by its arguments.
     #[arg(
-        required = true,
+        required_unless_present = "bundle",
         trailing_var_arg = true,
         value_name = "COMMAND",
         value_parser = value_parser!(OsString),
@@ -71,72 +102,114 @@ pub(crate) struct Invocation {
     spec: ProcessSpec,
     stop: StopPolicy,
     isolation: Option<Isolation>,
+    /// What a bundle asks for that's ignored, to show the user.
+    warnings: Vec<String>,
 }
 
 impl RunArgs {
     /// Builds and validates the process spec, stop policy and isolation.
     pub(crate) fn into_invocation(self) -> Result<Invocation> {
-        let isolation = isolation(self.no_isolation, self.hostname)?;
-        let mut user = match self.user {
-            Some((uid, gid)) => User {
-                uid,
-                gid: gid.unwrap_or(0),
-                umask: None,
-                additional_gids: Vec::new(),
-            },
-            None => User::current(),
-        };
-        user.additional_gids = dedup(self.group_add);
-
-        let mut env = Env::new();
-        for entry in &self.env {
-            add_env(&mut env, entry)?;
-        }
-        env.fill_defaults(user.uid);
-
-        let spec = ProcessSpec {
-            args: self.command,
-            env,
-            cwd: self.workdir,
-            user,
-            rlimits: last_wins(self.ulimit),
-        };
-        spec.validate()?;
-
         let stop = StopPolicy {
             signal: self.stop_signal,
             timeout: Duration::from_secs(self.stop_timeout),
         };
         stop.validate()?;
+        if let Some(dir) = &self.bundle {
+            return from_bundle(dir, stop);
+        }
+        let isolation = self.isolation()?;
+        let mut user = match self.user {
+            Some((name, group)) => {
+                let mut user = User::named(name, group);
+                // A container's own /etc/group, as Docker; not the host's,
+                // whose groups an ordinary user couldn't take anyway.
+                user.names.memberships = isolation.is_some();
+                user
+            }
+            None => User::current(),
+        };
+        user.names.additional_groups = dedup(self.group_add);
+
+        let mut env = Env::new();
+        for entry in &self.env {
+            add_env(&mut env, entry)?;
+        }
+        env.fill_default_path();
+
+        let mut spec = ProcessSpec::new(self.command);
+        spec.env = env;
+        spec.cwd = self.workdir;
+        spec.user = user;
+        spec.rlimits = last_wins(self.ulimit);
+        spec.validate()?;
         Ok(Invocation {
             spec,
             stop,
             isolation,
+            warnings: Vec::new(),
         })
     }
 }
 
-/// The isolation for this run: the standard namespaces on Linux unless
-/// `--no-isolation`; none on macOS, where namespaces don't exist (yet: the VM
-/// comes in a later version).
-fn isolation(no_isolation: bool, hostname: Option<String>) -> Result<Option<Isolation>> {
-    if no_isolation {
-        return Ok(None);
-    }
+/// A run of the OCI bundle in `dir`: everything but the stop policy comes
+/// from its `config.json`.
+fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
     if !cfg!(target_os = "linux") {
-        if hostname.is_some() {
-            bail!(
-                "--hostname needs Linux namespaces, which aren't available on {} yet",
-                std::env::consts::OS
-            );
-        }
-        tracing::debug!("no namespaces on this system; running without isolation");
-        return Ok(None);
+        bail!(
+            "--bundle needs Linux namespaces, which aren't available on {} yet",
+            std::env::consts::OS
+        );
     }
-    let mut isolation = Isolation::standard();
-    isolation.hostname = hostname;
-    isolation.validate()?;
-    Ok(Some(isolation))
+    let bundle = shipyard_runtime::oci::load_bundle(dir)?;
+    Ok(Invocation {
+        spec: bundle.spec,
+        stop,
+        isolation: Some(bundle.isolation),
+        warnings: bundle.warnings,
+    })
+}
+
+impl RunArgs {
+    /// The isolation for this run: the standard namespaces on Linux unless
+    /// `--no-isolation`; none on macOS, where namespaces don't exist (yet:
+    /// the VM comes in a later version).
+    fn isolation(&self) -> Result<Option<Isolation>> {
+        if self.no_isolation {
+            return Ok(None);
+        }
+        if !cfg!(target_os = "linux") {
+            for (given, flag) in [
+                (self.hostname.is_some(), "--hostname"),
+                (self.domainname.is_some(), "--domainname"),
+                (!self.sysctl.is_empty(), "--sysctl"),
+                (self.rootfs.is_some(), "--rootfs"),
+            ] {
+                if given {
+                    bail!(
+                        "{flag} needs Linux namespaces, which aren't available on {} yet",
+                        std::env::consts::OS
+                    );
+                }
+            }
+            tracing::debug!("no namespaces on this system; running without isolation");
+            return Ok(None);
+        }
+        let mut isolation = Isolation::standard();
+        isolation.hostname.clone_from(&self.hostname);
+        isolation.domainname.clone_from(&self.domainname);
+        isolation.sysctls.clone_from(&self.sysctl);
+        if let Some(dir) = &self.rootfs {
+            // Absolute and without symlinks, as the runtime wants it; and a
+            // mistyped path is caught here, with its name.
+            let path = std::fs::canonicalize(dir)
+                .with_context(|| format!("--rootfs {}", dir.display()))?;
+            let mut root = Root::new(path);
+            root.read_only = self.read_only;
+            isolation.root = Some(root);
+        }
+        isolation.validate()?;
+        Ok(Some(isolation))
+    }
 }
 
 /// Runs the command under the supervisor and exits the way it did: with its
@@ -147,7 +220,11 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
         spec,
         stop,
         isolation,
+        warnings,
     } = args.into_invocation()?;
+    for warning in &warnings {
+        crate::warning(warning);
+    }
     tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;
     let status = match supervisor.supervise(&spec, stop, isolation.as_ref()) {
@@ -156,8 +233,10 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
             let code = err.exit_code();
             let isolation_failed = is_isolation_failure(&err);
             let exit = crate::report(&anyhow::Error::from(err), code);
-            if isolation_failed {
-                // The runtime can't name the CLI's flag; this is where it's known.
+            // The runtime can't name the CLI's flag; this is where it's known.
+            // Only when it would work: `--no-isolation` can't be combined with
+            // a root filesystem, a hostname, a domain name or sysctls.
+            if isolation_failed && isolation.as_ref().is_some_and(only_namespaces) {
                 crate::hint("--no-isolation runs the command without namespaces");
             }
             return Ok(exit);
@@ -170,6 +249,15 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
         process::die_from(signal);
     }
     Ok(ExitCode::from(status.code()))
+}
+
+/// Whether `isolation` asks for nothing but the namespaces themselves, so
+/// that `--no-isolation` could replace it.
+fn only_namespaces(isolation: &Isolation) -> bool {
+    isolation.root.is_none()
+        && isolation.hostname.is_none()
+        && isolation.domainname.is_none()
+        && isolation.sysctls.is_empty()
 }
 
 /// Whether `err` is isolation going wrong (missing privileges, a refusal,
@@ -216,9 +304,12 @@ fn add_env(env: &mut Env, entry: &OsStr) -> Result<()> {
 }
 
 /// Removes repeated groups, keeping the first occurrence of each.
-fn dedup(gids: Vec<u32>) -> Vec<u32> {
+fn dedup(groups: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
-    gids.into_iter().filter(|gid| seen.insert(*gid)).collect()
+    groups
+        .into_iter()
+        .filter(|group| seen.insert(group.clone()))
+        .collect()
 }
 
 /// A later `--ulimit` for the same resource replaces an earlier one.
@@ -233,25 +324,36 @@ fn last_wins(limits: Vec<Rlimit>) -> Vec<Rlimit> {
     merged
 }
 
-/// Parses `UID` or `UID:GID`, numbers only.
-fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
+/// Parses `USER` or `USER:GROUP`, each a name or a number.
+fn parse_user(s: &str) -> Result<(String, Option<String>), String> {
     match s.split_once(':') {
-        Some((uid, gid)) => Ok((parse_user_id(uid)?, Some(parse_user_id(gid)?))),
-        None => Ok((parse_user_id(s)?, None)),
+        Some((user, group)) => Ok((parse_name_or_id(user)?, Some(parse_name_or_id(group)?))),
+        None => Ok((parse_name_or_id(s)?, None)),
     }
 }
 
-/// Like [`parse_id`], but explains that names aren't accepted yet. (Names need
-/// the container's `/etc/passwd`, which arrives with root filesystems.)
-fn parse_user_id(s: &str) -> Result<u32, String> {
-    let looks_like_name = s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
-    if looks_like_name {
-        return Err(format!(
-            "\"{s}\" is a name; user and group names are not supported yet, \
-             use a numeric UID[:GID]"
-        ));
+/// A user or group: a number (checked as [`parse_id`] does), or a name to
+/// look up in the container's `/etc/passwd` or `/etc/group`.
+fn parse_name_or_id(s: &str) -> Result<String, String> {
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return parse_id(s).map(|_| s.to_owned());
     }
-    parse_id(s)
+    // A sign or a space: a malformed number, more likely than a name.
+    let malformed = s.is_empty()
+        || s.starts_with(['-', '+'])
+        || s.contains(|c: char| c.is_whitespace() || matches!(c, ':' | ',' | '/' | '\0'));
+    if malformed {
+        return Err(format!("\"{s}\" is neither a name nor a number"));
+    }
+    Ok(s.to_owned())
+}
+
+/// `KEY=VALUE`, split at the first `=`. Which keys are allowed is checked
+/// with the rest of the isolation.
+fn parse_sysctl(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .ok_or_else(|| format!("\"{s}\" isn't KEY=VALUE"))
 }
 
 /// A strict numeric user or group ID: digits only, and never `u32::MAX`, which
@@ -322,9 +424,12 @@ mod tests {
 
     #[test]
     fn user_forms() {
-        assert_eq!(parse_user("1000"), Ok((1000, None)));
-        assert_eq!(parse_user("1000:20"), Ok((1000, Some(20))));
-        assert_eq!(parse_user("0:0"), Ok((0, Some(0))));
+        assert_eq!(parse_user("1000"), Ok(("1000".into(), None)));
+        assert_eq!(
+            parse_user("1000:20"),
+            Ok(("1000".into(), Some("20".into())))
+        );
+        assert_eq!(parse_user("0:0"), Ok(("0".into(), Some("0".into()))));
         for bad in [
             "",
             "+5",
@@ -340,19 +445,26 @@ mod tests {
         ] {
             assert!(parse_user(bad).is_err(), "{bad:?} should be rejected");
         }
-        let err = parse_user("nobody").unwrap_err();
-        assert!(err.contains("not supported yet"), "{err}");
-        // Malformed numbers are not names, so they don't get the names hint.
-        for not_a_name in ["-1", "+5", "1.5"] {
-            let err = parse_user(not_a_name).unwrap_err();
-            assert!(!err.contains("not supported yet"), "{not_a_name}: {err}");
+        let named =
+            |user: &str, group: Option<&str>| Ok((user.to_owned(), group.map(str::to_owned)));
+        assert_eq!(parse_user("nobody"), named("nobody", None));
+        assert_eq!(parse_user("alice:staff"), named("alice", Some("staff")));
+        assert_eq!(parse_user("alice:20"), named("alice", Some("20")));
+        for not_a_name in ["a b", "a,b", "a/b"] {
+            assert!(parse_user(not_a_name).is_err(), "{not_a_name}");
         }
     }
 
     #[test]
-    fn user_without_group_gets_gid_0() {
-        let user = spec(&["-u", "1000", "true"]).user;
-        assert_eq!((user.uid, user.gid), (1000, 0));
+    fn user_and_groups_are_resolved_where_the_command_runs() {
+        let user = spec(&["-u", "alice:staff", "--group-add", "wheel", "true"]).user;
+        assert_eq!(user.names.user.as_deref(), Some("alice"));
+        assert_eq!(user.names.group.as_deref(), Some("staff"));
+        assert_eq!(user.names.additional_groups, ["wheel"]);
+        // A container's own /etc/group, never the host's.
+        assert_eq!(user.names.memberships, cfg!(target_os = "linux"));
+        let host = spec(&["--no-isolation", "-u", "alice", "true"]).user;
+        assert!(!host.names.memberships);
     }
 
     #[test]
@@ -376,7 +488,7 @@ mod tests {
             "true",
         ])
         .user;
-        assert_eq!(user.additional_gids, [20, 10]);
+        assert_eq!(user.names.additional_groups, ["20", "10"]);
     }
 
     #[test]
@@ -400,7 +512,8 @@ mod tests {
         assert!(parse(&["--ulimit", "nofile=10:5", "true"]).is_err());
         assert!(parse(&["--stop-signal", "FOO", "true"]).is_err());
         assert!(parse(&["--stop-timeout", "-1", "true"]).is_err());
-        assert!(parse(&["--group-add", "wheel", "true"]).is_err());
+        assert!(parse(&["--group-add", "a:b", "true"]).is_err());
+        assert!(parse(&["--sysctl", "kernel.shmmax", "true"]).is_err());
     }
 
     #[test]
@@ -417,8 +530,8 @@ mod tests {
         let env = spec(&["-e", "A=1", "true"]).env;
         assert_eq!(env.get(OsStr::new("A")), Some(OsStr::new("1")));
         assert!(env.get(OsStr::new("PATH")).is_some());
-        assert!(env.get(OsStr::new("HOME")).is_some());
-        assert_eq!(env.len(), 3, "nothing from the host leaked in: {env:?}");
+        // HOME is set where the command runs, from the user's /etc/passwd.
+        assert_eq!(env.len(), 2, "nothing from the host leaked in: {env:?}");
     }
 
     #[test]
@@ -484,6 +597,54 @@ mod tests {
     }
 
     #[test]
+    fn a_root_filesystem_is_canonical_and_checked() {
+        let isolation = |args: &[&str]| parse(args).unwrap().into_invocation();
+        // Contradictions, whatever the system.
+        assert!(parse(&["--no-isolation", "--rootfs", "/", "true"]).is_err());
+        assert!(parse(&["--read-only", "true"]).is_err(), "needs --rootfs");
+        let missing = isolation(&["--rootfs", "/no/such/dir", "true"]).unwrap_err();
+        assert!(format!("{missing:#}").contains("--rootfs"), "{missing:#}");
+        if cfg!(target_os = "linux") {
+            assert!(
+                format!("{missing:#}").contains("/no/such/dir"),
+                "{missing:#}"
+            );
+            let dir = std::env::temp_dir();
+            let given = dir.join(".").join("");
+            let invocation =
+                isolation(&["--rootfs", given.to_str().unwrap(), "--read-only", "true"]).unwrap();
+            let root = invocation.isolation.unwrap().root.unwrap();
+            assert_eq!(root.path, std::fs::canonicalize(dir).unwrap());
+            assert!(root.read_only);
+        }
+    }
+
+    #[test]
+    fn a_bundle_is_the_whole_description() {
+        assert!(parse(&["--bundle", "/b"]).is_ok(), "no COMMAND needed");
+        for conflicting in [
+            &["--bundle", "/b", "true"][..],
+            &["--bundle", "/b", "-e", "A=1"],
+            &["--bundle", "/b", "-w", "/tmp"],
+            &["--bundle", "/b", "--rootfs", "/r"],
+            &["--bundle", "/b", "--no-isolation"],
+        ] {
+            assert!(parse(conflicting).is_err(), "{conflicting:?}");
+        }
+        assert!(parse(&[]).is_err(), "a COMMAND or a bundle");
+        let missing = parse(&["--bundle", "/no/such/bundle"])
+            .unwrap()
+            .into_invocation()
+            .unwrap_err();
+        let expected = if cfg!(target_os = "linux") {
+            "/no/such/bundle/config.json"
+        } else {
+            "--bundle"
+        };
+        assert!(format!("{missing:#}").contains(expected), "{missing:#}");
+    }
+
+    #[test]
     fn hostname_problems_are_usage_errors() {
         // Both: together they contradict each other.
         assert!(parse(&["--no-isolation", "--hostname", "box", "true"]).is_err());
@@ -503,7 +664,10 @@ mod tests {
 
         #[test]
         fn valid_ids_round_trip(uid in 0..u32::MAX, gid in 0..u32::MAX) {
-            prop_assert_eq!(parse_user(&format!("{uid}:{gid}")), Ok((uid, Some(gid))));
+            prop_assert_eq!(
+                parse_user(&format!("{uid}:{gid}")),
+                Ok((uid.to_string(), Some(gid.to_string())))
+            );
         }
     }
 }

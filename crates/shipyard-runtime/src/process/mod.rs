@@ -11,27 +11,36 @@ mod child;
 mod clone;
 mod env;
 mod failure;
+mod identity;
 #[cfg(target_os = "linux")]
 mod init;
 #[cfg(target_os = "linux")]
 mod join;
 mod plan;
+#[cfg(target_os = "linux")]
+mod resolve;
 mod rlimit;
+mod rootfs;
+#[cfg(target_os = "linux")]
+mod setup;
 mod signal;
 mod signals;
-mod spawn;
+pub(crate) mod spawn;
 mod spec;
 mod startup;
 mod status;
 mod stop;
 mod supervisor;
+#[cfg(target_os = "linux")]
+mod sysctl;
 
 pub use env::{DEFAULT_PATH, Env, EnvError};
 pub use failure::{SpawnError, SpawnErrorKind};
+pub use identity::{LookupError, Which};
 pub use rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
 pub use signal::{Signal, SignalError};
 pub use spawn::die_from;
-pub use spec::{MAX_GROUPS, ProcessSpec, SpecError, User};
+pub use spec::{MAX_GROUPS, Names, ProcessSpec, SpecError, User};
 pub use startup::refuse_privileged_start;
 pub use status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND, ExitStatus};
 pub use stop::{DEFAULT_STOP_TIMEOUT_SECS, StopPolicy, StopSignalError};
@@ -42,20 +51,26 @@ pub use supervisor::Supervisor;
 #[cfg(target_os = "linux")]
 pub(crate) const INIT_ENTRY_ARG: &std::ffi::CStr = c"__shipyard-init";
 
+/// The init's last argument when a SIGPIPE was pending at its re-exec: the
+/// clean image's Rust startup sets SIGPIPE to "ignore", which discards a
+/// pending one, so it's raised again from this (see `init::run`).
+#[cfg(target_os = "linux")]
+pub(crate) const SIGPIPE_PENDING_ARG: &std::ffi::CStr = c"sigpipe";
+
 /// Runs this process as a container's init, if that's what it was started
 /// as; otherwise returns at once. **Call it first thing in `main`** of any
 /// binary that supervises isolated commands.
 ///
-/// With isolation, the container's PID 1 starts as a copy of the
-/// supervising process, then re-execs that same binary (as
-/// `/proc/self/exe`, with a hidden argument) to become a clean process that
-/// carries none of its command line, environment or memory. This is where
-/// that new process takes over; it never returns there.
+/// With isolation, the process cloned into the new namespaces re-execs that
+/// same binary at once (as `/proc/self/exe`, with a hidden argument). The
+/// clean process that starts carries none of the supervisor's command line,
+/// environment or memory: it sets the container up, and becomes its init.
+/// This is where it takes over; it never returns there.
 ///
-/// Isolated runs with a new PID namespace (the ones that get an init) are
-/// refused ([`Error::NoInitEntryPoint`](crate::Error::NoInitEntryPoint))
-/// until it has been called: otherwise the re-exec would run the binary's
-/// own `main` as the container's PID 1.
+/// Isolated runs are refused
+/// ([`Error::NoInitEntryPoint`](crate::Error::NoInitEntryPoint)) until it
+/// has been called: otherwise the re-exec would run the binary's own `main`
+/// inside the container.
 pub fn init_entry_point() {
     #[cfg(target_os = "linux")]
     {
@@ -86,4 +101,12 @@ static INIT_ENTRY_POINT_CALLED: std::sync::atomic::AtomicBool =
 #[cfg(target_os = "linux")]
 pub(crate) fn has_init_entry_point() -> bool {
     INIT_ENTRY_POINT_CALLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The errno behind an I/O error from `std` (EIO if it has none).
+#[cfg(target_os = "linux")]
+pub(crate) fn io_errno(error: &std::io::Error) -> nix::errno::Errno {
+    error
+        .raw_os_error()
+        .map_or(nix::errno::Errno::EIO, nix::errno::Errno::from_raw)
 }

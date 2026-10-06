@@ -22,7 +22,11 @@ pub const MAX_GROUPS: usize = 65_536;
 pub const MAX_GROUPS: usize = 15;
 
 /// A process to start.
+///
+/// Start from [`ProcessSpec::new`] and change fields: it will gain more, so
+/// it can't be written out in full outside this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProcessSpec {
     /// The program and its arguments; `args[0]` is the program.
     pub args: Vec<OsString>,
@@ -36,8 +40,9 @@ pub struct ProcessSpec {
     pub rlimits: Vec<Rlimit>,
 }
 
-/// Who the process runs as.
+/// Who the process runs as. Start from [`User::new`] or [`User::current`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct User {
     /// User ID.
     pub uid: u32,
@@ -48,18 +53,104 @@ pub struct User {
     /// Supplementary groups. When shipyard runs as root these replace root's
     /// own groups entirely, so an empty list means "no extra groups".
     pub additional_gids: Vec<u32>,
+    /// Names to look up where the command runs (the container's
+    /// `/etc/passwd` and `/etc/group`), replacing or adding to the numbers
+    /// above.
+    pub names: Names,
+}
+
+/// User and group names, as `--user` and `--group-add` take them: each a
+/// name, or a number. They're resolved where the command runs, in the
+/// container's own `/etc/passwd` and `/etc/group`, just before it starts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Names {
+    /// The user: replaces [`User::uid`], and [`User::gid`] with the user's
+    /// group unless `group` is given.
+    pub user: Option<String>,
+    /// The primary group: replaces [`User::gid`].
+    pub group: Option<String>,
+    /// More supplementary groups, after [`User::additional_gids`].
+    pub additional_groups: Vec<String>,
+    /// Also add the groups that list the user in `/etc/group` (as Docker
+    /// does for `--user`).
+    pub memberships: bool,
+}
+
+impl Names {
+    /// Whether there's anything to look up by name.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self) -> Result<(), SpecError> {
+        let all = self
+            .user
+            .iter()
+            .chain(&self.group)
+            .chain(&self.additional_groups);
+        for name in all {
+            if name.is_empty() || name.contains([':', ',', '\n', '\0']) {
+                return Err(SpecError::InvalidName(name.clone()));
+            }
+            if name.parse::<u32>() == Ok(u32::MAX) {
+                return Err(SpecError::ReservedId {
+                    what: "user or group",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProcessSpec {
+    /// Runs `args` (`args[0]` is the program) with an empty environment, in
+    /// `/`, as the user shipyard runs as, with no resource limits.
+    #[must_use]
+    pub fn new(args: Vec<OsString>) -> Self {
+        Self {
+            args,
+            env: Env::new(),
+            cwd: PathBuf::from("/"),
+            user: User::current(),
+            rlimits: Vec::new(),
+        }
+    }
 }
 
 impl User {
+    /// User `uid` in group `gid`, with the default umask and no extra groups.
+    #[must_use]
+    pub fn new(uid: u32, gid: u32) -> Self {
+        Self {
+            uid,
+            gid,
+            umask: None,
+            additional_gids: Vec::new(),
+            names: Names::default(),
+        }
+    }
+
+    /// The user (a name or a number) and, optionally, the group, to look
+    /// up where the command runs, with the user's groups from `/etc/group`
+    /// (as `--user USER[:GROUP]` does).
+    #[must_use]
+    pub fn named(user: impl Into<String>, group: Option<String>) -> Self {
+        let mut named = Self::new(0, 0);
+        named.names = Names {
+            user: Some(user.into()),
+            group,
+            additional_groups: Vec::new(),
+            memberships: true,
+        };
+        named
+    }
+
     /// The user shipyard itself is running as, with no extra groups.
     #[must_use]
     pub fn current() -> Self {
-        Self {
-            uid: getuid().as_raw(),
-            gid: getgid().as_raw(),
-            umask: None,
-            additional_gids: Vec::new(),
-        }
+        Self::new(getuid().as_raw(), getgid().as_raw())
     }
 
     fn validate(&self) -> Result<(), SpecError> {
@@ -80,10 +171,12 @@ impl User {
                 max: MAX_GROUPS,
             });
         }
-        match self.umask {
-            Some(mask) if mask > 0o777 => Err(SpecError::UmaskOutOfRange(mask)),
-            _ => Ok(()),
+        if let Some(mask) = self.umask
+            && mask > 0o777
+        {
+            return Err(SpecError::UmaskOutOfRange(mask));
         }
+        self.names.validate()
     }
 }
 
@@ -106,6 +199,10 @@ pub enum SpecError {
     /// The working directory is relative.
     #[error("working directory \"{}\" must be an absolute path", .0.display())]
     CwdNotAbsolute(PathBuf),
+    /// A user or group name that can't be in `/etc/passwd` or `/etc/group`:
+    /// empty, or with `:`, `,`, a newline or a NUL in it.
+    #[error("\"{0}\" isn't a valid user or group name")]
+    InvalidName(String),
     /// A path or string that must become a C string contains a NUL byte.
     #[error("{field} contains a NUL byte")]
     ContainsNul {
@@ -207,6 +304,7 @@ mod tests {
                 gid: 1000,
                 umask: None,
                 additional_gids: vec![10, 20],
+                names: Names::default(),
             },
             rlimits: vec!["nofile=1024:2048".parse().unwrap()],
         }

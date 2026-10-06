@@ -15,7 +15,7 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 | 0 | **Foundation** | Workspace, lints, CI, docs, UI concept | — | done |
 | 1 | **Process lifecycle** *(POSIX: runs natively on macOS)* | `shipyard run -- /bin/sh` spawns, waits, forwards signals, stops gracefully, returns the exit code; reaps and cleans up everything the command started | TLPI 6, 20–22, 24–27, 34 | [done](stages/01-process-lifecycle.md) |
 | 2 | **Namespaces** | PID, mount, UTS and IPC namespaces (`clone3`); own session; a minimal PID-1 init; `setns` to join a running container. The other namespaces moved to stages 4, 5 and 7 | TLPI 26, 28, 34; `namespaces(7)`, `pid_namespaces(7)`, `setns(2)` | [done](stages/02-namespaces.md) |
-| 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names; domain name and namespaced sysctls | TLPI 14, 18; `mount_namespaces(7)`, `pivot_root(2)`; OCI runtime spec | |
+| 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names; domain name and namespaced sysctls | TLPI 8, 14, 18, 44, 55; `mount_namespaces(7)`, `pivot_root(2)`, `mount_setattr(2)`; OCI runtime spec | [done](stages/03-filesystem.md) |
 | 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp, device access control | TLPI 8, 9, 39; `user_namespaces(7)`, `seccomp(2)` | |
 | 5 | **Resource control** | cgroups v2 limits and cgroup namespaces, OOM detection, live stats, pause/resume | TLPI 36; `cgroups(7)` | |
 | 6 | **Images & storage** | Registry pulls, OCI/Docker manifests, safe layer unpacking, content-addressed store, overlayfs, volumes | OCI image & distribution specs; `overlayfs` docs | |
@@ -55,7 +55,8 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
 ## Decisions
 
 - **Daemonless** (Podman-style). There's no long-running daemon. Each container gets a
-  tiny monitor process instead (stage 8), so an idle Shipyard costs nothing.
+  tiny monitor process instead (built in stage 3 for `shipyard-runtime`), so an idle
+  Shipyard costs nothing.
 - **macOS-first, UNIX-only.**
   - The CLI, engine and UI are native on macOS and Linux.
   - Kernel isolation runs on Linux: natively there, and inside a Shipyard-managed VM on
@@ -77,6 +78,21 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
   process-wide state (the `setuid` family). They rely on the 64-bit-only build (stage 1).
 - **Container mounts are recursively slave** of the host's (stage 2): nothing leaks out,
   and host unmounts reach in.
+- **`serde` and `serde_json` for JSON** (stage 3): `config.json` is JSON, and `std` has
+  none. The de-facto standard crates.
+- **The init re-execs first** (stage 3): the cloned child re-executes the binary at once,
+  while it still sees the host's files, and the clean image does all container setup
+  (mounts, `pivot_root`, names) in ordinary Rust. A minimal root filesystem has no
+  loader or libc for the host's binary.
+- **Refuse what would confine less** (stage 3): a bundle field Shipyard can't apply yet,
+  whose absence would leave the container less confined than asked, is refused, never
+  silently ignored. Fields that don't confine are ignored with a warning.
+- **Never reach a container's files, or its state, by path** where the path's meaning can
+  change (stage 3): mount targets are resolved inside the root and mounted through
+  descriptors, mount flags are only ever added (`mount_setattr`), and the runtime's state
+  directory is written through a descriptor.
+- **`shipyard-runtime` requires a `pid` namespace** until cgroups (stage 5) can find
+  every process of a container.
 - **No image building before stage 11.** It's out of scope until then; see
   [FEATURES.md](FEATURES.md#out-of-scope-on-purpose).
 

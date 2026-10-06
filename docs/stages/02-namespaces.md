@@ -20,7 +20,7 @@ the VM (stage 12).
 | A session of its own; the terminal in isolated mode | `child.rs` (`start_session`), `supervisor.rs` | the 11 `ROOT_TESTS` in `tests/terminal.rs` |
 | A minimal init: PID 1, forwarding, reaping, the exact status | `process/init.rs`, `channel.rs` (status pipe), `spawn.rs` (`init_outcome`) | `sigterm_stops_a_command_without_a_handler`, `sigint_ends_the_command_and_shipyard`, `death_by_a_signal_comes_through_the_init`, `the_init_reaps_orphans`, `the_containers_other_processes_end_with_the_command` |
 | The init carries none of shipyard's state | `init.rs` (`reexec`, `entry_point`) | `the_init_carries_none_of_shipyards_secrets`, `the_init_does_not_hold_stdio`, `the_init_does_not_hold_leaked_descriptors`, `an_init_that_cannot_start_is_reported` |
-| Joining a running container (`setns`) | `process/join.rs`, `Supervisor::supervise_joined` | the 15 tests of `crates/shipyard-runtime/tests/join.rs` |
+| Joining a running container (`setns`) | `process/join.rs`, `Supervisor::supervise_joined` | the 15 tests of `crates/shipyard-runtime/tests/join.rs` (`containers.rs` since stage 3) |
 | The setup handshake | `channel.rs` (go pipe), `child.rs` (`wait_for_go`, `die_with_parent`) | `the_container_dies_with_shipyard`, `the_init_survives_a_hostile_parent` |
 | Clear refusals: no root, refused, invalid | `error.rs`, `failure.rs`, `isolation.rs` (`validate`) | `without_root_isolation_is_refused_with_advice`, `only_isolation_failures_suggest_no_isolation`, `joins_are_checked_like_isolations`, unit tests |
 
@@ -272,7 +272,7 @@ init's job.
 | Unit | `crates/shipyard-runtime/src/**` | validation (`Isolation`, `Join`, hostnames, stop signals), clone layout and both paths, the status protocol (`init_reports_parse_strictly`), failure messages and hints, fd ranges, no init without a PID namespace (root) |
 | Isolation | `crates/shipyard-cli/tests/isolation.rs` | 27 root tests and the "needs root" one |
 | Terminal | `crates/shipyard-cli/tests/terminal.rs` | 16 ordinary and 11 `ROOT_TESTS`, picked like ignored tests on Linux |
-| Joining | `crates/shipyard-runtime/tests/join.rs` | `harness = false`; the binary is its own runtime (`container` and `join` modes); 13 root tests, "needs root", and `LinuxOnly` on macOS |
+| Joining | `crates/shipyard-runtime/tests/join.rs` (`containers.rs` since stage 3) | `harness = false`; the binary is its own runtime (`container` and `join` modes); 13 root tests, "needs root", and `LinuxOnly` on macOS |
 | Kernel | `scripts/probes/*.c` | the checks above |
 
 The end-to-end helpers live in `crates/shipyard-test-support` (a dev-only crate), since a

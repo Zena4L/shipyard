@@ -4,10 +4,12 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 
 > **Status: early development.** On Linux, `shipyard run` starts a command in
 > its own namespaces: its own processes (under a small init), mounts, hostname
-> and IPC. It doesn't have its own root filesystem or network yet, and it isn't
-> a security boundary yet. It starts the command the way a container runtime
-> does (clean environment, chosen user, working directory and resource limits),
-> supervises it (passing signals on, stopping it gracefully, cleaning up what it
+> and IPC, and optionally a root filesystem of its own (`--rootfs`), or a whole
+> container from an [OCI bundle](bundles.md) (`--bundle`); `shipyard-runtime` runs
+> bundles step by step, as an [OCI runtime](runtime.md). It doesn't have its own
+> network yet, and it isn't a security boundary yet. It starts the command the way a
+> container runtime does (clean environment, chosen user, working directory and
+> resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
 > leaves behind), and reports exactly how it ended. On macOS, commands aren't
 > isolated yet. These docs describe only what works in the current version, and
 > they are updated with every release.
@@ -17,6 +19,9 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | Page | What it covers |
 |---|---|
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
+| [OCI bundles](bundles.md) | `shipyard run --bundle`: a container described by a `config.json`, what's supported, refused and ignored |
+| [The OCI runtime](runtime.md) | `shipyard-runtime`: `create`, `start`, `state`, `kill` and `delete`, one step at a time, as `runc` |
+| [Runtime reference](runtime-cli.md) | Every `shipyard-runtime` command and flag, generated from the binary itself |
 | [Exit codes](exit-codes.md) | What each exit code means, for scripts that check them |
 | [Command reference](cli.md) | Every command and flag, generated from the CLI itself |
 
@@ -31,10 +36,12 @@ cd shipyard
 cargo build --release
 ```
 
-The binary is `target/release/shipyard`. Copy it somewhere on your `PATH`, for example:
+The binaries are `target/release/shipyard` and `target/release/shipyard-runtime` (the
+[OCI runtime](runtime.md)). Copy them somewhere on your `PATH`, for example:
 
 ```sh
 sudo install -m 0755 target/release/shipyard /usr/local/bin/shipyard
+sudo install -m 0755 target/release/shipyard-runtime /usr/local/bin/shipyard-runtime
 ```
 
 Install it with mode `0755` as shown. Shipyard refuses to run if it is installed

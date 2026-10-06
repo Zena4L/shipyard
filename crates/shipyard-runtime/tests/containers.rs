@@ -1,16 +1,20 @@
-//! Joining a running container's namespaces (`Supervisor::supervise_joined`),
-//! end to end, against real Shipyard containers. Linux; root only, except for
-//! the "needs root" check.
+//! Containers through the runtime's API, end to end: joining a running one
+//! (`Supervisor::supervise_joined`), and isolation without a PID namespace.
+//! Linux; root only, except for the "needs root" check.
 //!
 //! Not on libtest (`harness = false`): this binary is also its own container
 //! runtime. It plays the part the CLI will (stage 8+):
 //!
-//! - `join container CMD…` supervises CMD in a new container (hostname
-//!   `box`); the container's init re-execs this binary, so `main` calls
+//! - `containers container [--rootfs DIR] CMD…` supervises CMD in a new
+//!   container (hostname `box`), with DIR as its root filesystem if given.
+//!   The container is set up by this binary, re-exec'd, so `main` calls
 //!   `init_entry_point` first;
-//! - `join join PID CMD…` supervises CMD inside PID's namespaces.
+//! - `containers container-nopid [--churn] CMD…` does the same without a PID
+//!   namespace (so without an init), optionally while another thread keeps
+//!   starting and ending threads;
+//! - `containers join PID CMD…` supervises CMD inside PID's namespaces.
 //!
-//! Both exit with the command's exit code (128 + N for a signal), or 125 and
+//! Each exits with the command's exit code (128 + N for a signal), or 125 and
 //! the error on stderr. The tests drive them as subprocesses, one supervisor
 //! per process as the runtime requires, and run one at a time.
 
@@ -22,27 +26,60 @@
 
 use std::io::Write as _;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use shipyard_runtime::isolation::{Isolation, Join};
-use shipyard_runtime::process::{self, Env, ProcessSpec, StopPolicy, Supervisor, User};
+use shipyard_runtime::isolation::{Isolation, Join, Namespace, Root};
+use shipyard_runtime::process::{self, ProcessSpec, StopPolicy, Supervisor};
+use shipyard_test_support::rootfs::{MARKER, RootFs};
 use shipyard_test_support::{Running, Shipyard, child_of, gone, is_root, run, start_command};
 
 fn main() -> ExitCode {
     process::init_entry_point();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("container") => return serve(Mode::Container, args.get(1..).unwrap_or_default()),
-        Some("join") => {
-            let Some(target) = args.get(1).and_then(|pid| pid.parse().ok()) else {
-                eprintln!("join: the target must be a PID");
-                return ExitCode::from(2);
-            };
-            return serve(Mode::Join(target), args.get(2..).unwrap_or_default());
-        }
-        _ => {}
+    if let Some(code) = serve_if_asked(&args) {
+        return code;
     }
-    let tests: &[(&str, fn())] = if !cfg!(target_os = "linux") {
+    let tests = tests();
+    if args.iter().any(|arg| arg == "--list") {
+        for (name, _) in tests {
+            println!("{name}: test");
+        }
+        return ExitCode::SUCCESS;
+    }
+    println!("\nrunning {} tests", tests.len());
+    let mut failed = Vec::new();
+    for (name, test) in tests {
+        print!("test {name} ... ");
+        let _ = std::io::stdout().flush();
+        // Last resort against a hang: SIGALRM ends this binary.
+        // SAFETY: `alarm` has no preconditions.
+        unsafe { libc::alarm(90) };
+        let passed = std::panic::catch_unwind(test).is_ok();
+        println!("{}", if passed { "ok" } else { "FAILED" });
+        if !passed {
+            failed.push(*name);
+        }
+    }
+    // SAFETY: as above; 0 cancels it.
+    unsafe { libc::alarm(0) };
+    println!(
+        "\ntest result: {}. {} passed; {} failed",
+        if failed.is_empty() { "ok" } else { "FAILED" },
+        tests.len() - failed.len(),
+        failed.len()
+    );
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The tests this system can run: the root ones as root.
+fn tests() -> &'static [(&'static str, fn())] {
+    if !cfg!(target_os = "linux") {
         &[("joining_needs_linux", joining_needs_linux)]
     } else if is_root() {
         &[
@@ -86,55 +123,74 @@ fn main() -> ExitCode {
                 "with_another_namespaces_proc_joining_is_refused",
                 another_namespaces_proc,
             ),
+            (
+                "the_joined_command_sees_the_containers_root_filesystem",
+                sees_the_containers_root_filesystem,
+            ),
+            (
+                "without_a_pid_namespace_the_command_is_shipyards_child",
+                without_a_pid_namespace_the_command_is_shipyards_child,
+            ),
+            (
+                "without_a_pid_namespace_under_thread_churn",
+                without_a_pid_namespace_under_thread_churn,
+            ),
+            (
+                "an_init_that_cannot_start_is_reported_without_a_pid_namespace",
+                an_init_that_cannot_start_is_reported_without_a_pid_namespace,
+            ),
         ]
     } else {
         &[(
             "without_root_joining_is_refused",
             without_root_joining_is_refused,
         )]
-    };
-    if args.iter().any(|arg| arg == "--list") {
-        for (name, _) in tests {
-            println!("{name}: test");
-        }
-        return ExitCode::SUCCESS;
-    }
-    println!("\nrunning {} tests", tests.len());
-    let mut failed = Vec::new();
-    for (name, test) in tests {
-        print!("test {name} ... ");
-        let _ = std::io::stdout().flush();
-        // Last resort against a hang: SIGALRM ends this binary.
-        // SAFETY: `alarm` has no preconditions.
-        unsafe { libc::alarm(90) };
-        let passed = std::panic::catch_unwind(test).is_ok();
-        println!("{}", if passed { "ok" } else { "FAILED" });
-        if !passed {
-            failed.push(*name);
-        }
-    }
-    // SAFETY: as above; 0 cancels it.
-    unsafe { libc::alarm(0) };
-    println!(
-        "\ntest result: {}. {} passed; {} failed",
-        if failed.is_empty() { "ok" } else { "FAILED" },
-        tests.len() - failed.len(),
-        failed.len()
-    );
-    if failed.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
     }
 }
 
-// --- The two modes ---------------------------------------------------------
+/// Runs one of the serving modes when the arguments ask for one.
+fn serve_if_asked(args: &[String]) -> Option<ExitCode> {
+    let rest = args.get(1..).unwrap_or_default();
+    Some(match args.first().map(String::as_str)? {
+        "container" => match rest {
+            [flag, dir, command @ ..] if flag == "--rootfs" => serve(
+                Mode::Container {
+                    root: Some(dir.into()),
+                },
+                command,
+            ),
+            _ => serve(Mode::Container { root: None }, rest),
+        },
+        "container-nopid" => {
+            let churn = rest.first().is_some_and(|arg| arg == "--churn");
+            let command = if churn {
+                rest.get(1..).unwrap_or_default()
+            } else {
+                rest
+            };
+            serve(Mode::NoPidContainer { churn }, command)
+        }
+        "join" => {
+            let Some(target) = rest.first().and_then(|pid| pid.parse().ok()) else {
+                eprintln!("join: the target must be a PID");
+                return Some(ExitCode::from(2));
+            };
+            serve(Mode::Join(target), rest.get(1..).unwrap_or_default())
+        }
+        _ => return None,
+    })
+}
+
+// --- The modes --------------------------------------------------------------
 
 /// What this binary does when it isn't running the tests.
-#[derive(Clone, Copy)]
 enum Mode {
-    /// Supervise a command in a new container.
-    Container,
+    /// Supervise a command in a new container, with a root filesystem of its
+    /// own if `root` is given.
+    Container { root: Option<std::path::PathBuf> },
+    /// The same without a PID namespace; with `churn`, while another thread
+    /// keeps starting and ending threads.
+    NoPidContainer { churn: bool },
     /// Supervise a command inside this process's namespaces.
     Join(u32),
 }
@@ -144,16 +200,8 @@ enum Mode {
 /// and checks afterwards that this thread's children are born on the host
 /// again.
 fn serve(mode: Mode, command: &[String]) -> ExitCode {
-    let mut env = Env::new();
-    let user = User::current();
-    env.fill_defaults(user.uid);
-    let spec = ProcessSpec {
-        args: command.iter().map(Into::into).collect(),
-        env,
-        cwd: "/".into(),
-        user,
-        rlimits: Vec::new(),
-    };
+    let mut spec = ProcessSpec::new(command.iter().map(Into::into).collect());
+    spec.env.fill_default_path();
     let stop = StopPolicy {
         timeout: Duration::from_secs(5),
         ..StopPolicy::default()
@@ -163,10 +211,22 @@ fn serve(mode: Mode, command: &[String]) -> ExitCode {
         Err(err) => return fail(&err),
     };
     let result = match mode {
-        Mode::Container => {
+        Mode::Container { root } => {
             let mut isolation = Isolation::standard();
             isolation.hostname = Some("box".into());
+            isolation.root = root.map(Root::new);
             supervisor.supervise(&spec, stop, Some(&isolation))
+        }
+        Mode::NoPidContainer { churn } => {
+            let mut isolation = Isolation::standard();
+            isolation.namespaces = vec![Namespace::Uts];
+            isolation.hostname = Some("box".into());
+            let churner = churn.then(ThreadChurn::start);
+            let result = supervisor.supervise(&spec, stop, Some(&isolation));
+            if let Some(churner) = churner {
+                churner.stop();
+            }
+            result
         }
         Mode::Join(target) => {
             #[cfg(target_os = "linux")]
@@ -198,27 +258,27 @@ fn fail(err: &shipyard_runtime::Error) -> ExitCode {
 /// (it's a subreaper), so they can't run a program and report back.
 #[cfg(target_os = "linux")]
 struct HostWatcher {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<Vec<String>>,
 }
 
 #[cfg(target_os = "linux")]
 impl HostWatcher {
     fn start() -> Self {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
         let own = read_link("/proc/self/ns/pid");
         // A child's PID (from `fork`) only names that child in a `/proc` of
         // our own PID namespace. With another one's (one test runs us that
         // way), the same number is some unrelated process: no evidence.
         let proc_is_ours = read_link("/proc/self") == std::process::id().to_string();
         let thread = std::thread::spawn({
-            let done = std::sync::Arc::clone(&done);
+            let done = Arc::clone(&done);
             move || {
                 let mut strays = Vec::new();
                 if !proc_is_ours {
                     return strays;
                 }
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                while !done.load(Ordering::Relaxed) {
                     let parent = std::process::id();
                     // SAFETY: the child only makes async-signal-safe calls
                     // until it's killed.
@@ -259,7 +319,7 @@ impl HostWatcher {
     /// elsewhere and that this thread's children are born on the host again.
     /// Returns the exit code to fail with, if not.
     fn check(self) -> Option<ExitCode> {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.done.store(true, Ordering::Relaxed);
         let strays = self.thread.join().expect("the watcher thread panicked");
         if !strays.is_empty() {
             eprintln!("join: processes another thread started were born elsewhere: {strays:?}");
@@ -270,6 +330,34 @@ impl HostWatcher {
             return Some(ExitCode::from(99));
         }
         None
+    }
+}
+
+/// A thread that keeps starting and ending threads, as busy programs do.
+/// The cloned child of a multi-threaded process inherits whatever glibc
+/// locks another thread held at that moment (stage 2's setxid deadlock).
+struct ThreadChurn {
+    done: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl ThreadChurn {
+    fn start() -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let done = Arc::clone(&done);
+            move || {
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::spawn(|| {}).join().unwrap();
+                }
+            }
+        });
+        Self { done, thread }
+    }
+
+    fn stop(self) {
+        self.done.store(true, Ordering::Relaxed);
+        self.thread.join().unwrap();
     }
 }
 
@@ -295,7 +383,13 @@ struct Container {
 impl Container {
     /// A container running `sh -c SCRIPT`; SCRIPT must print `ready` first.
     fn start(script: &str) -> Self {
-        let running = start_command(me().command(&["container", "sh", "-c", script]));
+        Self::start_with(&[], script)
+    }
+
+    /// The same, with the `container` mode's FLAGS (`--rootfs DIR`).
+    fn start_with(flags: &[&str], script: &str) -> Self {
+        let args = [&["container"], flags, &["sh", "-c", script]].concat();
+        let running = start_command(me().command(&args));
         assert_eq!(running.next_line(), "ready");
         let init = u32::try_from(child_of(running.pid())).unwrap();
         Self { running, init }
@@ -350,6 +444,20 @@ fn sees_the_containers_world() {
         .map(|kind| read_link(&format!("/proc/{}/ns/{kind}", container.init)))
         .collect();
     assert_eq!(joined_namespaces, containers, "the container's namespaces");
+}
+
+/// Joining the mount namespace moves the joined command into the
+/// container's root filesystem (`setns` changes its root and working
+/// directory to the namespace's).
+fn sees_the_containers_root_filesystem() {
+    let root = RootFs::minimal();
+    let container = Container::start_with(&["--rootfs", root.arg()], "echo ready; exec sleep 300");
+    let joined = run(join(
+        &container,
+        "cat /marker; pwd; test -e /etc/passwd || echo no-host",
+    ));
+    assert_eq!(joined.code, Some(0), "{}", joined.stderr);
+    assert_eq!(joined.stdout, format!("{MARKER}/\nno-host\n"));
 }
 
 fn results_come_back() {
@@ -545,6 +653,65 @@ fn another_namespaces_proc() {
         joined.stderr.contains("another PID namespace"),
         "{}",
         joined.stderr
+    );
+}
+
+/// Without a PID namespace there's no init: the clean image sets the
+/// container up and becomes the command, so the process shipyard reaps is
+/// the command itself, and its status comes straight from it.
+fn without_a_pid_namespace_the_command_is_shipyards_child() {
+    let running = start_command(me().command(&[
+        "container-nopid",
+        "sh",
+        "-c",
+        "hostname; echo $PPID; exit 7",
+    ]));
+    assert_eq!(running.next_line(), "box");
+    let parent: u32 = running.next_line().parse().unwrap();
+    assert_eq!(
+        parent,
+        running.pid().cast_unsigned(),
+        "the command's parent is shipyard"
+    );
+    assert_eq!(running.finish().0, 7);
+}
+
+/// Many isolated starts while another thread keeps starting and ending
+/// threads: the raw clone must never leave the child stuck before its
+/// re-exec. Each run has its own deadline (`run`'s timeout).
+fn without_a_pid_namespace_under_thread_churn() {
+    // Rosetta (x86-64 emulation on Apple silicon) deadlocks inside its own
+    // handling of `clone` while threads are being created: the emulator,
+    // not shipyard (native runs never hang). Skip there.
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    if maps.contains("/mnt/rv/[rosetta]") {
+        eprintln!("under Rosetta emulation, which deadlocks on this stress; skipping");
+        return;
+    }
+    for _ in 0..20 {
+        let ran = run(me().command(&["container-nopid", "--churn", "sh", "-c", "exit 7"]));
+        assert_eq!(ran.code, Some(7), "{}", ran.stderr);
+    }
+}
+
+/// Through the dynamic loader, `/proc/self/exe` is the loader, which can't
+/// start as the clean image: the start mark never comes, and that's
+/// reported, without a PID namespace too.
+fn an_init_that_cannot_start_is_reported_without_a_pid_namespace() {
+    let Some(loader) = ["/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-x86-64.so.2"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+    else {
+        return;
+    };
+    let mut command = std::process::Command::new(loader);
+    command.args([me().path(), "container-nopid", "true"]);
+    let ran = run(command);
+    assert_eq!(ran.code, Some(125), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("init failed to start"),
+        "{}",
+        ran.stderr
     );
 }
 

@@ -601,3 +601,77 @@ fn only_isolation_failures_suggest_no_isolation() {
     assert!(run.stderr.contains("/no/such/directory"), "{}", run.stderr);
     assert!(!run.stderr.contains("hint"), "{}", run.stderr);
 }
+
+/// The setup reaches the container's init in a memfd, not a pipe: an
+/// environment past a pipe's 64 KiB buffer arrives whole. (Four variables:
+/// one string over 128 KiB is refused by `execve` itself, `MAX_ARG_STRLEN`.)
+#[test]
+#[ignore = "needs root"]
+fn a_large_environment_reaches_the_command() {
+    let vars: Vec<String> = (0..4)
+        .map(|i| format!("BIG{i}={}", "x".repeat(50 * 1024)))
+        .collect();
+    let mut args = Vec::new();
+    for var in &vars {
+        args.extend(["-e", var.as_str()]);
+    }
+    args.extend([
+        "sh",
+        "-c",
+        "echo $((${#BIG0} + ${#BIG1} + ${#BIG2} + ${#BIG3}))",
+    ]);
+    let run = isolated(&args);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout.trim(), (200 * 1024).to_string());
+}
+
+/// Arguments and environment values that aren't UTF-8 survive the trip
+/// through the init's setup byte for byte.
+#[test]
+#[ignore = "needs root"]
+fn non_utf8_arguments_and_environment_survive() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = SHIPYARD.command(&["run", "-e"]);
+    command.arg(std::ffi::OsStr::from_bytes(b"BYTES=\xff\xfe"));
+    command.args(["sh", "-c", "printf %s \"$1$BYTES\" | od -An -tx1", "sh"]);
+    command.arg(std::ffi::OsStr::from_bytes(b"\xfd"));
+    let run = run(command);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        run.stdout.split_whitespace().collect::<Vec<_>>(),
+        ["fd", "ff", "fe"]
+    );
+}
+
+/// The command doesn't inherit the init's own signal dispositions: Rust's
+/// startup ignores SIGPIPE in the init, but the command gets the default.
+#[test]
+#[ignore = "needs root"]
+fn the_command_does_not_inherit_the_inits_dispositions() {
+    let run = isolated(&["sh", "-c", "grep SigIgn /proc/self/status"]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let mask = run.stdout.trim().trim_start_matches("SigIgn:").trim();
+    let mask = u64::from_str_radix(mask, 16).unwrap();
+    assert_eq!(
+        mask & (1 << (libc::SIGPIPE - 1)),
+        0,
+        "SIGPIPE is ignored: {}",
+        run.stdout
+    );
+}
+
+/// The container init's hidden entry point, started by hand with
+/// descriptors that aren't a sealed setup (stdio here), touches nothing: no
+/// start mark or failure record written to them, just the message.
+#[test]
+fn the_init_entry_point_by_hand_does_nothing() {
+    for fds in [&["0", "1", "2"][..], &["-1", "1", "2"], &[]] {
+        let run = run(SHIPYARD.command(&[&["__shipyard-init"], fds].concat()));
+        assert_eq!(run.code, Some(125), "{fds:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "", "{fds:?}");
+        assert_eq!(
+            run.stderr, "shipyard: this is the container init's internal entry point\n",
+            "{fds:?}"
+        );
+    }
+}

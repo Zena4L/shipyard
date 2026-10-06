@@ -6,9 +6,9 @@
  * namespace checks), and once unprivileged (to see seccomp's effect):
  *
  *   docker run --rm --privileged -v "$PWD/scripts/probes":/p rust:1-bookworm \
- *       sh -c 'gcc -w -o /tmp/probe /p/namespaces.c && /tmp/probe full'
+ *       sh -c 'gcc -Wall -Wextra -o /tmp/probe /p/namespaces.c && /tmp/probe full'
  *   docker run --rm -v "$PWD/scripts/probes":/p rust:1-bookworm \
- *       sh -c 'gcc -w -o /tmp/probe /p/namespaces.c && /tmp/probe'
+ *       sh -c 'gcc -Wall -Wextra -o /tmp/probe /p/namespaces.c && /tmp/probe'
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -76,6 +76,7 @@ static void spike_proc(void) {
 }
 
 int main(int argc, char **argv) {
+    (void)argv; /* any argument (the header says `full`) runs every check */
     /* Unbuffered: a buffer copied by fork would print its lines twice. */
     setvbuf(stdout, NULL, _IONBF, 0);
     system("echo 'propagation of /:' $(awk '$5==\"/\"{print $7}' /proc/self/mountinfo)");

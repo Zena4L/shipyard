@@ -7,7 +7,7 @@
  * Needs CAP_SYS_ADMIN (namespaces), so run it in a privileged container:
  *
  *   docker run --rm --privileged -v "$PWD/scripts/probes":/p rust:1-bookworm \
- *       sh -c 'gcc -w -pthread -o /tmp/join /p/join.c && /tmp/join'
+ *       sh -c 'gcc -Wall -Wextra -pthread -o /tmp/join /p/join.c && /tmp/join'
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -74,7 +74,15 @@ static pid_t start_container(void) {
  * its own namespace can't create threads (clone(CLONE_THREAD): EINVAL). */
 static int pidfd_g;
 static pthread_barrier_t switched;
-static void *fork_from_other_thread(void *arg) {
+/* A thread that does nothing until the process ends. */
+static void *idle_thread(void *unused) {
+    (void)unused;
+    for (;;) pause();
+    return NULL;
+}
+
+static void *fork_from_other_thread(void *unused) {
+    (void)unused;
     char own[64], child[64];
     pthread_barrier_wait(&switched);
     ns_of("/proc/thread-self/ns/pid", own, sizeof own);
@@ -176,7 +184,7 @@ int main(void) {
     /* Switch this thread's pid_for_children. */
     if (setns(pidfd, CLONE_NEWPID)) printf("setns(pidfd, NEWPID): %s\n", strerror(errno));
     pthread_t t2;
-    errno = pthread_create(&t2, NULL, (void *(*)(void *))pause, NULL);
+    errno = pthread_create(&t2, NULL, idle_thread, NULL);
     printf("1b creating a thread while switched: %s\n", errno ? strerror(errno) : "allowed");
     pthread_barrier_wait(&switched);
     pthread_join(t, NULL);
@@ -213,7 +221,7 @@ int main(void) {
            strcmp(now, own_pid_ns) == 0 ? "ours again" : "STILL SWITCHED");
 
     /* 7: a mount-namespace join from a process with another thread running. */
-    pthread_t idle; pthread_create(&idle, NULL, (void *(*)(void *))pause, NULL);
+    pthread_t idle; pthread_create(&idle, NULL, idle_thread, NULL);
     usleep(50000);
     errno = 0;
     int rc = setns(pidfd, CLONE_NEWNS);

@@ -8,9 +8,10 @@ shipyard run [OPTIONS] COMMAND [ARGS...]
 environment and exactly the user, working directory and limits you ask for.
 
 > **Status:** on Linux, `run` isolates the command in its own process IDs, mounts,
-> hostname and IPC (see [Isolation](#isolation)), but it still sees the host's
-> filesystem and network: a separate root filesystem and networking come in later
-> versions. On macOS the command isn't isolated yet.
+> hostname and IPC (see [Isolation](#isolation)). With `--rootfs` it also gets a
+> root filesystem of its own (see [Root filesystem](#root-filesystem)); without it, it
+> sees the host's files. It always shares the host's network: networking comes in a
+> later version. On macOS the command isn't isolated yet.
 
 ## Arguments
 
@@ -42,8 +43,8 @@ its own view of:
 | Hostname | Its own copy; set it with `--hostname`. |
 | IPC | Its own System V IPC objects and POSIX message queues. |
 
-The command still sees the host's files and network for now; a separate root
-filesystem and networking come in later versions.
+Without `--rootfs`, the command sees the host's files. It always sees the host's
+network: networking comes in a later version.
 
 - **Needs root.** Creating namespaces needs root privileges (support for running
   without root comes later). Otherwise `run` stops before starting anything, with
@@ -57,6 +58,19 @@ filesystem and networking come in later versions.
 - **`--hostname NAME`** sets the hostname inside: letters, digits and hyphens in
   dot-separated parts (like `web-1` or `db.internal`), at most 64 characters, no
   part starting or ending with a hyphen. Not with `--no-isolation`.
+- **`--domainname NAME`** sets the NIS domain name inside (what `domainname`
+  prints), with the same rules as the hostname. The host's is unchanged. Not
+  with `--no-isolation`.
+- **`--sysctl KEY=VALUE`** sets a kernel setting for the container, such as
+  `--sysctl kernel.shmmax=1073741824`. Repeatable. Only settings the container
+  owns are allowed: the shared-memory, message-queue and semaphore ones
+  (`kernel.shmmax`, `kernel.shmall`, `kernel.shmmni`, `kernel.shm_rmid_forced`,
+  `kernel.msgmax`, `kernel.msgmnb`, `kernel.msgmni`, `kernel.sem`, and
+  `fs.mqueue.*`). The kernel keeps a separate copy of those for each
+  container, so the host's stay as they are. Any other setting would change
+  the whole machine, so it's refused, including network settings (`net.*`),
+  until containers get networking of their own. Use `--hostname` and
+  `--domainname` for those two. Not with `--no-isolation`.
 - **A small init is PID 1.** The process with PID 1 in a container is special:
   the system ignores any signal it has no handler for. So Shipyard runs its own
   small init as PID 1, and the command as PID 2, where signals work normally.
@@ -68,16 +82,16 @@ filesystem and networking come in later versions.
   inside the container.
 - **Terminal:** see [On a terminal, isolated](#on-a-terminal-isolated) below.
 - **If Shipyard is killed**, the whole container goes with it.
-- **Not a security boundary yet.** The command runs as root on the host's own
-  files; isolation keeps it from *seeing* and *disturbing* the rest of the
+- **Not a security boundary yet.** The command runs as root, with all of root's
+  privileges; isolation keeps it from *seeing* and *disturbing* the rest of the
   system by accident, not from breaking out on purpose. Running untrusted code
-  safely needs a separate root filesystem, dropped capabilities and seccomp,
-  which come in later versions.
+  safely also needs dropped capabilities and seccomp, which come in later
+  versions.
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
-- **macOS:** commands aren't isolated yet (as with `--no-isolation`); `--hostname`
-  is an error there.
+- **macOS:** commands aren't isolated yet (as with `--no-isolation`);
+  `--hostname`, `--domainname`, `--sysctl` and `--rootfs` are errors there.
 
 ### On a terminal, isolated
 
@@ -103,11 +117,90 @@ are still the terminal. So:
 - **Programs that open `/dev/tty` fail.** That's how `sudo`, `ssh` and others ask
   for a password, so they can't prompt. Use `--no-isolation` for those, until
   full terminal support comes in a later version.
+- **With `--rootfs`, the terminal has no name inside.** The container's `/dev/pts`
+  is its own, so your terminal isn't in it: `tty` prints "not a tty", and programs
+  that look the terminal up by name can't find it. Reading and writing it, Ctrl-C
+  and resizing work as above.
 - **Don't run an isolated command that reads the terminal in the background.**
   Nothing stops it from reading (as a background job normally would be), so it
   takes keys you type into your shell.
 
 Use `--no-isolation` for full job control.
+
+## Root filesystem
+
+```sh
+sudo shipyard run --rootfs ./rootfs sh
+```
+
+(To describe a whole container in one file instead, use an OCI bundle: see
+[OCI bundles](bundles.md).)
+
+With `--rootfs DIR`, the directory DIR becomes the container's `/`. The command
+sees only what's in it: nothing of the host's files is reachable from inside. DIR
+must hold the programs you run and everything they need (their libraries, for
+example). Any directory works, such as an unpacked image or a `debootstrap`. Pulling
+images comes in a later version.
+
+The program and the working directory (`-w`) are looked up inside DIR, with the
+container's `PATH`.
+
+Shipyard adds what every container needs:
+
+| Path | What it is |
+|---|---|
+| `/proc` | The container's own processes only. |
+| `/sys` | Read-only. |
+| `/dev` | A fresh, small directory with only `null`, `zero`, `full`, `random`, `urandom` and `tty`, the links `fd`, `stdin`, `stdout`, `stderr` and `ptmx`, and its own `pts` (terminals), `shm` (shared memory) and `mqueue` (message queues). The host's devices aren't there. |
+
+Shipyard creates `/proc`, `/sys` and `/dev` in DIR if they're missing. DIR itself
+is never changed otherwise, and what's mounted inside never shows on the host. If
+something is mounted on DIR's `proc`, `sys` or `dev` on the host (as in a chroot
+set up by hand), the container gets its own in their place and can't reach the
+host's.
+
+**Hidden and read-only paths.** Some kernel files would tell the container about
+the host, or let it change the host's settings, so they're hidden or read-only (the
+same ones as Docker):
+
+- **Hidden** (they read as empty): `/proc/acpi`, `/proc/asound`,
+  `/proc/interrupts`, `/proc/kcore`, `/proc/keys`, `/proc/latency_stats`,
+  `/proc/timer_list`, `/proc/timer_stats`, `/proc/sched_debug`, `/proc/scsi`,
+  `/sys/firmware`, `/sys/devices/virtual/powercap`.
+- **Read-only:** `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys`,
+  `/proc/sysrq-trigger`.
+
+**`--read-only`** makes the root filesystem itself read-only inside: the command
+can't change anything in DIR. `/dev` (including `/dev/shm`) and `/proc` stay as
+they are. The mount's other options, such as `nosuid` or `noexec`, are kept.
+
+**Limits for now:**
+
+- `/sys` shows the host's network devices, until containers get networking of their
+  own.
+- Directories mounted *inside* DIR on the host come along into the container, but
+  `--read-only` doesn't make them read-only.
+- There's no `/etc/hosts`, `/etc/resolv.conf` or `/etc/hostname` from Shipyard
+  yet, and no volumes: only what DIR has.
+
+**Errors** (exit code 125, before the command starts):
+
+- DIR doesn't exist, or isn't a directory.
+- DIR is `/`, the host's own root. Leave out `--rootfs` to share the host's files.
+- DIR's `proc`, `sys` or `dev` is a symbolic link. Shipyard refuses to mount on
+  it, because it could point out of DIR.
+- They're missing and DIR is on a read-only file system, so they can't be
+  created. Create them in DIR.
+
+**If the program doesn't start:**
+
+- **"found, but its interpreter or loader is missing"** (exit code 127): the
+  program is in DIR, but a library it needs, or its `#!` interpreter, isn't. Or the
+  program's path is a symbolic link to an absolute path that's missing inside DIR
+  (Debian's `/usr/bin/awk` → `/etc/alternatives/awk`, say): Shipyard looks the
+  program up on the host to explain the error, where such a link may resolve.
+- **"mounted noexec"** (exit code 126): DIR is on a file system that forbids
+  running programs (on some systems, `/tmp`). Put it somewhere else.
 
 ## Environment
 
@@ -119,7 +212,7 @@ The command does **not** inherit your shell's environment. It gets only:
 | Variable | Default |
 |---|---|
 | `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` |
-| `HOME` | `/root` when running as user 0, otherwise `/` |
+| `HOME` | The user's home directory from `/etc/passwd` (the container's; see [User and groups](#user-and-groups)). If the user has no entry: `/root` for user 0, otherwise `/`. |
 
 Your values always win over the defaults.
 
@@ -153,24 +246,43 @@ The path must be absolute.
 | Option | Meaning |
 |---|---|
 | *(none)* | Run as the user who ran `shipyard`. |
-| `-u UID` | Run as user `UID`, with primary group `0`. |
-| `-u UID:GID` | Run as user `UID`, with primary group `GID`. |
-| `--group-add GID` | Add a supplementary group. Repeatable; duplicates are ignored. |
+| `-u USER` | Run as `USER`: a name such as `postgres`, or a number. |
+| `-u USER:GROUP` | Run as `USER`, with primary group `GROUP` (a name or a number). |
+| `--group-add GROUP` | Add a supplementary group (a name or a number). Repeatable; duplicates are ignored. |
 
-IDs must be numbers. User and group *names* such as `nobody` aren't supported yet,
-because names are looked up in the container's own `/etc/passwd`.
+**Names are looked up in the container's own files**, `/etc/passwd` and
+`/etc/group`: its root filesystem's with `--rootfs`, otherwise the host's. Like
+Docker:
+
+- **A user name** must be in `/etc/passwd`. It gives the user ID, the primary group
+  and the home directory.
+- **A user number** is used as it is. If `/etc/passwd` has an entry for it, that
+  entry's group and home directory are used; otherwise the group is `0`.
+- **A group name** must be in `/etc/group`.
+- **The user's groups:** in a container, the groups that list the user in
+  `/etc/group` are added too, plus any `--group-add`. Not with `--no-isolation`,
+  where `/etc/group` is the host's.
+- **`HOME`** is the user's home directory, unless you set it with `-e HOME=…`.
+
+A name that isn't there stops the run (exit code 125), saying which name and which
+file. So does a name whose ID in the file is `4294967295`, which the kernel would
+read as "leave unchanged". If the files can't be read, only names fail: numbers
+still work, `HOME` falls back to its default, and no groups are added. The files are read directly, not through the system's user database. So on a
+host whose users come from a directory service (LDAP, or macOS's own), only the
+users listed in `/etc/passwd` can be named; numbers always work.
 
 These are rejected:
 
 - **ID `4294967295`.** The kernel reads it as "leave unchanged", so allowing it
   could silently leave the command running as root.
+- **Names with spaces, `:`, `,` or `/`**, or that start with `-` or `+`.
 - **Too many supplementary groups.** The limit is 15 on macOS (the system's 16
   slots include the primary group) and 65536 on Linux.
 
 Switching to another user or group, or adding groups, requires running
 `shipyard` as root. Otherwise it fails before starting, and says what differs:
-for example `-u 501` alone asks for group `0`, so use `-u 501:20` to keep your
-own group.
+for example `-u 501` alone may ask for group `0`, so use `-u 501:20` to keep
+your own group.
 
 When running as root, the command gets **only** the groups you ask for; root's
 own supplementary groups are always dropped.

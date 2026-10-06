@@ -46,6 +46,7 @@ pub(crate) fn go_pipe() -> Result<(OwnedFd, OwnedFd)> {
 /// does the init's writing: whatever is in the container can reach the
 /// pipe through `/proc/1/fd` and fill it, and a blocked init would stop
 /// forwarding signals and reaping.
+#[cfg(target_os = "linux")]
 pub(crate) fn status_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let (read, write) = cloexec_pipe()?;
     let read = above_stdio(read)?;
@@ -65,10 +66,11 @@ fn set_nonblocking(pipe: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-// The status pipe, from the container's init to shipyard. The init sends a
-// [`StartMark`] once its loop runs, then, when the command has exited, one
-// status record (the raw wait status). Nothing else, ever: anything more or
-// different was written by someone else (see `read_init_report`).
+// The status pipe, from the container's clean image to shipyard. It sends
+// [`START_MARK`] as soon as it runs; then, as the init, one status record
+// (the raw wait status) when the command has exited. Nothing else, ever:
+// anything more or different was written by someone else (see
+// `read_init_report`).
 
 /// Size of a status record: one raw wait status.
 pub(crate) const STATUS_LEN: usize = 4;
@@ -76,23 +78,8 @@ pub(crate) const STATUS_LEN: usize = 4;
 /// Size of a complete report: the start mark and the status record.
 const REPORT_LEN: usize = 1 + STATUS_LEN;
 
-/// The init's first byte on the status pipe: it runs, and how.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum StartMark {
-    /// Re-exec'd as a clean process (see `init.rs`).
-    Clean = b'R',
-    /// Still the copy of shipyard: the re-exec failed.
-    Copy = b'C',
-}
-
-impl StartMark {
-    fn from_byte(byte: u8) -> Option<Self> {
-        [Self::Clean, Self::Copy]
-            .into_iter()
-            .find(|mark| *mark as u8 == byte)
-    }
-}
+/// The clean image's first byte on the status pipe: it runs.
+pub(crate) const START_MARK: u8 = b'R';
 
 /// Encodes a raw wait status. Runs in the init (Linux), so it only moves
 /// bytes.
@@ -106,10 +93,11 @@ pub(crate) fn encode_status(raw: libc::c_int) -> [u8; STATUS_LEN] {
 pub(crate) enum InitReport {
     /// Nothing: the init never got to its loop.
     Nothing,
-    /// It started, but sent no status (it was killed first).
-    Started(StartMark),
+    /// It started, but sent no status: there was no init (the command was
+    /// the process shipyard reaped), or the init was killed first.
+    Started,
     /// It started, and the command ended with this raw wait status.
-    Finished(StartMark, libc::c_int),
+    Finished(libc::c_int),
     /// Bytes that aren't the init's: forged or garbled. Not to be trusted.
     Unexpected,
 }
@@ -134,17 +122,11 @@ pub(crate) fn read_init_report(pipe: &OwnedFd) -> InitReport {
     };
     match report {
         [] => InitReport::Nothing,
-        [mark] => StartMark::from_byte(*mark).map_or(InitReport::Unexpected, InitReport::Started),
-        [mark, record @ ..] if report.len() == REPORT_LEN => {
-            match (
-                StartMark::from_byte(*mark),
-                <[u8; STATUS_LEN]>::try_from(record),
-            ) {
-                (Some(mark), Ok(raw)) => {
-                    InitReport::Finished(mark, libc::c_int::from_le_bytes(raw))
-                }
-                _ => InitReport::Unexpected,
-            }
+        [START_MARK] => InitReport::Started,
+        [START_MARK, record @ ..] if report.len() == REPORT_LEN => {
+            <[u8; STATUS_LEN]>::try_from(record).map_or(InitReport::Unexpected, |raw| {
+                InitReport::Finished(libc::c_int::from_le_bytes(raw))
+            })
         }
         _ => InitReport::Unexpected,
     }
@@ -319,12 +301,16 @@ mod tests {
             read_init_report(&read)
         };
         assert_eq!(report(b""), InitReport::Nothing, "and no blocking");
-        assert_eq!(report(b"R"), InitReport::Started(StartMark::Clean));
-        assert_eq!(report(b"C"), InitReport::Started(StartMark::Copy));
+        assert_eq!(report(b"R"), InitReport::Started);
+        assert_eq!(
+            report(b"C"),
+            InitReport::Unexpected,
+            "stage 2's copy mark is gone"
+        );
         for raw in [0, 3 << 8, libc::SIGKILL, libc::SIGSEGV | 0x80] {
             let mut bytes = vec![b'R'];
             bytes.extend(encode_status(raw));
-            assert_eq!(report(&bytes), InitReport::Finished(StartMark::Clean, raw));
+            assert_eq!(report(&bytes), InitReport::Finished(raw));
         }
         // Forged or garbled: no marker first, a short record, extra bytes.
         assert_eq!(report(&[0, 0, 0, 0]), InitReport::Unexpected);

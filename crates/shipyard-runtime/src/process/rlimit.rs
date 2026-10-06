@@ -145,6 +145,23 @@ pub enum RlimitValue {
     Unlimited,
 }
 
+impl RlimitValue {
+    /// A value from an OCI `config.json`, where limits are plain numbers and
+    /// `u64::MAX` (`RLIM_INFINITY` on Linux) means unlimited.
+    ///
+    /// # Errors
+    ///
+    /// [`RlimitError::TooLarge`] for any other value at or above the
+    /// kernel's "infinity" (on macOS, 2^63 and up).
+    pub fn from_oci(value: u64) -> Result<Self, RlimitError> {
+        match value {
+            u64::MAX => Ok(Self::Unlimited),
+            n if n <= MAX_FINITE => Ok(Self::Finite(n)),
+            n => Err(RlimitError::TooLarge(n.to_string())),
+        }
+    }
+}
+
 impl fmt::Display for RlimitValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -309,6 +326,20 @@ mod tests {
 
     use super::RlimitValue::{Finite, Unlimited};
     use super::*;
+
+    #[test]
+    fn oci_values_map_infinity_to_unlimited() {
+        assert_eq!(RlimitValue::from_oci(u64::MAX), Ok(Unlimited));
+        assert_eq!(RlimitValue::from_oci(0), Ok(Finite(0)));
+        assert_eq!(RlimitValue::from_oci(MAX_FINITE), Ok(Finite(MAX_FINITE)));
+        if MAX_FINITE < u64::MAX - 1 {
+            // macOS: infinity is 2^63 - 1, so 2^63 is neither.
+            assert!(matches!(
+                RlimitValue::from_oci(MAX_FINITE + 1),
+                Err(RlimitError::TooLarge(_))
+            ));
+        }
+    }
 
     fn parse(s: &str) -> Result<Rlimit, RlimitError> {
         s.parse()

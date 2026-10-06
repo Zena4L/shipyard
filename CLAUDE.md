@@ -87,10 +87,15 @@ child between `fork` and `exec`. If the parent had other threads, any lock they 
 
 Everything the child needs is prepared before `fork`, in `plan.rs`.
 
-The same rules apply to the container's init (`process/init.rs`) until it re-execs
-itself. It re-execs the running binary, so **every binary that supervises isolated
-commands must call `process::init_entry_point()` first thing in `main`**; isolated
-runs are refused otherwise.
+For an isolated run, the cloned child keeps these rules only until it re-execs the
+running binary (`reexec_into_clean_image`). The clean image (`process/init.rs`) is an
+ordinary single-threaded process that does the container setup in normal Rust; the
+command it forks runs `command_main`, under the rules again. So **every binary that
+supervises isolated commands must call `process::init_entry_point()` first thing in
+`main`**; isolated runs are refused otherwise. A binary that creates containers with
+`container::create` (`shipyard-runtime`) must also call
+`container::monitor_entry_point()` there: the per-container monitor is the same
+binary, re-executed.
 
 The terminal tests (`crates/shipyard-cli/tests/terminal.rs`, `harness = false`)
 fork a fake shell that keeps running Rust code, so that test binary must stay

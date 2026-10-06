@@ -3,6 +3,7 @@
 //! Containers never inherit the host's environment: only what the user asks
 //! for, plus `PATH` and `HOME` defaults. That keeps host secrets out.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
@@ -15,10 +16,24 @@ pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 /// Keys and values are raw bytes (`OsString`), because on Unix neither has to
 /// be UTF-8. Every entry is validated on the way in, so an `Env` can always be
 /// passed to `execve` as is.
-#[derive(Clone, Default, PartialEq, Eq)]
+///
+/// Lookups are by an index from key to position, so building one from an
+/// OCI `config.json` with many entries stays linear.
+#[derive(Clone, Default)]
 pub struct Env {
     vars: Vec<(OsString, OsString)>,
+    /// Where each key is in `vars`.
+    index: HashMap<OsString, usize>,
 }
+
+/// Equal when the variables and their order are: the index follows from them.
+impl PartialEq for Env {
+    fn eq(&self, other: &Self) -> bool {
+        self.vars == other.vars
+    }
+}
+
+impl Eq for Env {}
 
 /// Why an environment variable was rejected. Errors name the variable but
 /// never include its value, which may be a secret.
@@ -64,29 +79,23 @@ impl Env {
     /// Sets `key` to `value`, replacing any earlier value in place.
     pub fn set(&mut self, key: &OsStr, value: &OsStr) -> Result<(), EnvError> {
         validate(key, value)?;
-        match self.vars.iter_mut().find(|(k, _)| k == key) {
-            Some((_, old)) => value.clone_into(old),
-            None => self.vars.push((key.to_owned(), value.to_owned())),
-        }
+        self.insert(key, value);
         Ok(())
     }
 
     /// The value of `key`, if it is set.
     #[must_use]
     pub fn get(&self, key: &OsStr) -> Option<&OsStr> {
-        self.vars
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_os_str())
+        let &position = self.index.get(key)?;
+        self.vars.get(position).map(|(_, value)| value.as_os_str())
     }
 
-    /// Adds `PATH` and `HOME` if they aren't set. The user's values always win.
-    pub fn fill_defaults(&mut self, uid: u32) {
-        let home = if uid == 0 { "/root" } else { "/" };
-        for (key, value) in [("PATH", DEFAULT_PATH), ("HOME", home)] {
-            if self.get(OsStr::new(key)).is_none() {
-                self.vars.push((key.into(), value.into()));
-            }
+    /// Adds [`DEFAULT_PATH`] as `PATH` if it isn't set. (`HOME` is set
+    /// where the command runs, from the user's `/etc/passwd` entry.)
+    pub fn fill_default_path(&mut self) {
+        let path = OsStr::new("PATH");
+        if self.get(path).is_none() {
+            self.insert(path, OsStr::new(DEFAULT_PATH));
         }
     }
 
@@ -107,6 +116,16 @@ impl Env {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.vars.is_empty()
+    }
+
+    /// Sets a validated `key`, in place if it's already there.
+    fn insert(&mut self, key: &OsStr, value: &OsStr) {
+        if let Some((_, old)) = self.index.get(key).and_then(|&at| self.vars.get_mut(at)) {
+            value.clone_into(old);
+        } else {
+            self.index.insert(key.to_owned(), self.vars.len());
+            self.vars.push((key.to_owned(), value.to_owned()));
+        }
     }
 }
 
@@ -191,20 +210,46 @@ mod tests {
         assert_eq!(get(&env, "A"), Some(OsStr::new("3")));
     }
 
+    /// Big environments (an OCI config can list many) are built in linear
+    /// time: each `set` is a lookup, not a scan.
     #[test]
-    fn defaults_never_override_user_values() {
-        let mut env = env_of(&["PATH=/mine"]).unwrap();
-        env.fill_defaults(1000);
-        assert_eq!(get(&env, "PATH"), Some(OsStr::new("/mine")));
-        assert_eq!(get(&env, "HOME"), Some(OsStr::new("/")));
+    fn many_variables_stay_fast() {
+        let mut env = Env::new();
+        let start = std::time::Instant::now();
+        for round in 0..2 {
+            for i in 0..100_000 {
+                let value = format!("{round}");
+                env.set(OsStr::new(&format!("VAR{i}")), OsStr::new(&value))
+                    .unwrap();
+            }
+        }
+        assert_eq!(env.len(), 100_000);
+        assert_eq!(get(&env, "VAR99999"), Some(OsStr::new("1")));
+        // A scan per `set` would take minutes; the index, well under this.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
-    fn home_depends_on_the_user() {
-        let mut root = Env::new();
-        root.fill_defaults(0);
-        assert_eq!(get(&root, "HOME"), Some(OsStr::new("/root")));
-        assert_eq!(get(&root, "PATH"), Some(OsStr::new(DEFAULT_PATH)));
+    fn equality_is_the_variables_in_order() {
+        let a = env_of(&["A=1", "B=2"]).unwrap();
+        let b = env_of(&["A=0", "B=2", "A=1"]).unwrap();
+        assert_eq!(a, b, "same variables, same order");
+        assert_ne!(a, env_of(&["B=2", "A=1"]).unwrap(), "order matters");
+    }
+
+    #[test]
+    fn the_default_path_never_overrides_the_users() {
+        let mut env = env_of(&["PATH=/mine"]).unwrap();
+        env.fill_default_path();
+        assert_eq!(get(&env, "PATH"), Some(OsStr::new("/mine")));
+        let mut empty = Env::new();
+        empty.fill_default_path();
+        assert_eq!(get(&empty, "PATH"), Some(OsStr::new(DEFAULT_PATH)));
+        assert_eq!(get(&empty, "HOME"), None, "set where the command runs");
     }
 
     #[test]

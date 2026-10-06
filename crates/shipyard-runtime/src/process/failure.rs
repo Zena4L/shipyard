@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
 
+use super::identity::{Which, describe as describe_lookup};
 use super::rlimit::{Rlimit, RlimitKind};
+use super::rootfs::{DEV_ENTRIES, Target};
+use super::spec::Names;
 use super::status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND};
+use crate::isolation::{MountKind, Root};
 
 /// The child's setup steps. The numbers travel over the report pipe, so
 /// they never change; new steps get new numbers, wherever they run.
@@ -36,6 +40,24 @@ pub(crate) enum ChildStep {
     Hostname = 17,
     InitFork = 18,
     JoinNamespace = 19,
+    Reexec = 20,
+    ReadSetup = 21,
+    InitPanicked = 22,
+    BindRoot = 23,
+    RootTarget = 24,
+    MountSys = 25,
+    MountDev = 26,
+    PivotRoot = 27,
+    DetachOldRoot = 28,
+    MaskPath = 29,
+    ReadonlyPath = 30,
+    ReadOnlyRoot = 31,
+    MountTarget = 32,
+    Mount = 33,
+    MountRestrict = 34,
+    UserLookup = 35,
+    Domainname = 36,
+    Sysctl = 37,
 }
 
 impl ChildStep {
@@ -63,6 +85,24 @@ impl ChildStep {
             17 => Self::Hostname,
             18 => Self::InitFork,
             19 => Self::JoinNamespace,
+            20 => Self::Reexec,
+            21 => Self::ReadSetup,
+            22 => Self::InitPanicked,
+            23 => Self::BindRoot,
+            24 => Self::RootTarget,
+            25 => Self::MountSys,
+            26 => Self::MountDev,
+            27 => Self::PivotRoot,
+            28 => Self::DetachOldRoot,
+            29 => Self::MaskPath,
+            30 => Self::ReadonlyPath,
+            31 => Self::ReadOnlyRoot,
+            32 => Self::MountTarget,
+            33 => Self::Mount,
+            34 => Self::MountRestrict,
+            35 => Self::UserLookup,
+            36 => Self::Domainname,
+            37 => Self::Sysctl,
             _ => return None,
         })
     }
@@ -88,6 +128,13 @@ pub(crate) struct FailureContext {
     pub(crate) rlimits: Vec<Rlimit>,
     /// Whether shipyard runs as root (as root, an EPERM isn't about privileges).
     pub(crate) root: bool,
+    /// The user and group names, if given: how failures name the user.
+    pub(crate) names: Names,
+    /// The container's sysctls, which failures name by index.
+    pub(crate) sysctls: Vec<(String, String)>,
+    /// The container's own root filesystem, if it has one: where the
+    /// command's paths are, and which paths the setup's details name.
+    pub(crate) container_root: Option<Root>,
 }
 
 /// Errors from `execve` that mean "no program at this path", so a PATH
@@ -101,10 +148,41 @@ pub(crate) const fn means_not_found(errno: Errno) -> bool {
 }
 
 impl FailureContext {
-    /// Where the child found `path`: relative paths are relative to the
-    /// command's working directory (always absolute, see `ProcessSpec`).
+    /// Where the child found `path`, as shipyard sees it: relative paths are
+    /// relative to the command's working directory (always absolute, see
+    /// `ProcessSpec`), and with a root filesystem of its own, inside that.
+    /// (For hints only: an absolute symlink inside the root filesystem would
+    /// be followed on the host here.)
     fn resolve(&self, path: &Path) -> PathBuf {
-        self.cwd.join(path)
+        let inside = self.cwd.join(path);
+        match &self.container_root {
+            Some(root) => root.path.join(inside.strip_prefix("/").unwrap_or(&inside)),
+            None => inside,
+        }
+    }
+
+    /// The user, as given: by name if there is one, else by number.
+    fn user_label(&self) -> String {
+        self.names
+            .user
+            .clone()
+            .unwrap_or_else(|| self.uid.to_string())
+    }
+
+    /// The primary group, as given: by name if there is one, else by number.
+    fn group_label(&self) -> String {
+        self.names
+            .group
+            .clone()
+            .unwrap_or_else(|| self.gid.to_string())
+    }
+
+    /// "the root filesystem DIR", for messages.
+    fn root_filesystem(&self) -> String {
+        match &self.container_root {
+            Some(root) => format!("the root filesystem {}", root.path.display()),
+            None => "the root filesystem".to_owned(),
+        }
     }
 }
 
@@ -185,8 +263,8 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
         ChildStep::Rlimit => SpawnError::new(Setup, describe_rlimit(errno, detail, ctx), errno),
         ChildStep::Chdir => setup(format!("changing directory to {}", ctx.cwd.display())),
         ChildStep::SetGroups => setup("setting supplementary groups".into()),
-        ChildStep::SetGid => setup(format!("switching to group {}", ctx.gid)),
-        ChildStep::SetUid => setup(format!("switching to user {}", ctx.uid)),
+        ChildStep::SetGid => setup(format!("switching to group {}", ctx.group_label())),
+        ChildStep::SetUid => setup(format!("switching to user {}", ctx.user_label())),
         ChildStep::VerifyCredentials => setup(
             "the user and groups did not change as expected; \
              refusing to run with leftover privileges"
@@ -206,7 +284,183 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
             isolation_setup("starting the command inside the container", errno, ctx)
         }
         ChildStep::JoinNamespace => join_setup(errno, detail, ctx),
+        ChildStep::Reexec => isolation_setup(
+            "starting the container's init (re-executing shipyard's own binary)",
+            errno,
+            ctx,
+        ),
+        ChildStep::ReadSetup => {
+            isolation_setup("the container's init reading its setup", errno, ctx)
+        }
+        ChildStep::InitPanicked => isolation_setup(
+            "the container's init failed unexpectedly (a bug in shipyard; its message is above)",
+            errno,
+            ctx,
+        ),
+        ChildStep::BindRoot
+        | ChildStep::RootTarget
+        | ChildStep::MountSys
+        | ChildStep::MountDev
+        | ChildStep::PivotRoot
+        | ChildStep::DetachOldRoot
+        | ChildStep::MaskPath
+        | ChildStep::ReadonlyPath
+        | ChildStep::ReadOnlyRoot
+        | ChildStep::MountTarget
+        | ChildStep::Mount
+        | ChildStep::MountRestrict
+        | ChildStep::UserLookup
+        | ChildStep::Domainname
+        | ChildStep::Sysctl => describe_container(step, errno, detail, ctx),
     }
+}
+
+/// The container's own setup steps, from step 3 on: its root filesystem,
+/// mounts, names, domain name and sysctls.
+fn describe_container(
+    step: ChildStep,
+    errno: Errno,
+    detail: u64,
+    ctx: &FailureContext,
+) -> SpawnError {
+    match step {
+        ChildStep::BindRoot => isolation_setup(
+            &format!("binding {} onto itself", ctx.root_filesystem()),
+            errno,
+            ctx,
+        ),
+        ChildStep::RootTarget => describe_root_target(errno, detail),
+        ChildStep::MountSys => isolation_setup("mounting /sys for the container", errno, ctx),
+        ChildStep::MountDev => {
+            let entry = usize::try_from(detail)
+                .ok()
+                .and_then(|index| DEV_ENTRIES.get(index).copied())
+                .unwrap_or("/dev");
+            isolation_setup(&format!("setting up {entry} in the container"), errno, ctx)
+        }
+        ChildStep::PivotRoot => isolation_setup(
+            &format!("switching to {} (pivot_root)", ctx.root_filesystem()),
+            errno,
+            ctx,
+        ),
+        ChildStep::DetachOldRoot => isolation_setup(
+            "detaching the host's file system from the container",
+            errno,
+            ctx,
+        ),
+        ChildStep::MaskPath => {
+            let path = container_path(ctx, detail, |root| &root.masked_paths);
+            isolation_setup(&format!("masking {path} in the container"), errno, ctx)
+        }
+        ChildStep::ReadonlyPath => {
+            let path = container_path(ctx, detail, |root| &root.readonly_paths);
+            isolation_setup(
+                &format!("making {path} read-only in the container"),
+                errno,
+                ctx,
+            )
+        }
+        ChildStep::ReadOnlyRoot => isolation_setup(
+            "making the container's root filesystem read-only",
+            errno,
+            ctx,
+        ),
+        ChildStep::MountTarget | ChildStep::Mount | ChildStep::MountRestrict => {
+            describe_mount(step, errno, detail, ctx)
+        }
+        ChildStep::UserLookup => {
+            let which = Which::from_detail(detail);
+            let name = which.name(&ctx.names).unwrap_or("?");
+            let message = describe_lookup(which, name, errno, "the container's /etc");
+            SpawnError::new(SpawnErrorKind::Setup, message, errno)
+        }
+        ChildStep::Domainname => isolation_setup("setting the container's domain name", errno, ctx),
+        ChildStep::Sysctl => {
+            let sysctl = usize::try_from(detail)
+                .ok()
+                .and_then(|index| ctx.sysctls.get(index))
+                .map_or_else(
+                    || "a sysctl".to_owned(),
+                    |(key, value)| format!("{key}={value}"),
+                );
+            isolation_setup(&format!("setting sysctl {sysctl}"), errno, ctx)
+        }
+        // The other steps are `describe`'s.
+        _ => isolation_setup("setting up the container", errno, ctx),
+    }
+}
+
+/// One of the container's own mounts (`detail`: its index) failed.
+fn describe_mount(step: ChildStep, errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
+    let mount = ctx
+        .container_root
+        .as_ref()
+        .zip(usize::try_from(detail).ok())
+        .and_then(|(root, index)| root.mounts.get(index));
+    let Some(mount) = mount else {
+        return isolation_setup("setting up one of the container's mounts", errno, ctx);
+    };
+    let destination = mount.destination.display();
+    let what = match &mount.kind {
+        MountKind::Bind { source, .. } => format!("{}", source.display()),
+        _ => "a tmpfs".to_owned(),
+    };
+    let doing = match (step, errno) {
+        (ChildStep::MountTarget, Errno::ENOTDIR | Errno::EISDIR) => format!(
+            "making the mount point {destination} in the root filesystem \
+             (a file and a directory don't match: the source and what's there)"
+        ),
+        (ChildStep::MountTarget, Errno::EXDEV) => {
+            return SpawnError::new(
+                SpawnErrorKind::Setup,
+                format!(
+                    "the mount point {destination} leads into /proc or /sys (through a \
+                     symbolic link in the root filesystem), where mounts aren't allowed"
+                ),
+                errno,
+            );
+        }
+        (ChildStep::MountTarget, Errno::ELOOP) => format!(
+            "making the mount point {destination} in the root filesystem (too many symbolic links)"
+        ),
+        (ChildStep::MountTarget, _) => {
+            format!("making the mount point {destination} in the root filesystem")
+        }
+        (ChildStep::Mount, Errno::ENOENT) => {
+            format!("mounting {what} at {destination} (it doesn't exist)")
+        }
+        (ChildStep::Mount, _) => format!("mounting {what} at {destination}"),
+        _ => format!("restricting the mount at {destination} (read-only, nosuid, …)"),
+    };
+    isolation_setup(&doing, errno, ctx)
+}
+
+/// One of the root filesystem's mount targets (`detail`: a
+/// `rootfs::Target`) couldn't be used.
+fn describe_root_target(errno: Errno, detail: u64) -> SpawnError {
+    let name = Target::from_detail(detail).map_or("a mount point", Target::name);
+    let message = match errno {
+        Errno::ELOOP => format!(
+            "the root filesystem's /{name} is a symbolic link: refusing to mount on it \
+             (it could point out of the root filesystem)"
+        ),
+        Errno::ENOTDIR => format!("the root filesystem's /{name} isn't a directory"),
+        Errno::EROFS => format!(
+            "the root filesystem has no /{name} directory, and it's on a read-only file \
+             system: create /{name} in it"
+        ),
+        _ => format!("preparing /{name} in the root filesystem: {}", errno.desc()),
+    };
+    SpawnError::new(SpawnErrorKind::Isolation, message, errno)
+}
+
+/// The masked or read-only path a failure's detail names.
+fn container_path(ctx: &FailureContext, detail: u64, list: impl Fn(&Root) -> &[PathBuf]) -> String {
+    ctx.container_root
+        .as_ref()
+        .zip(usize::try_from(detail).ok())
+        .and_then(|(root, index)| list(root).get(index))
+        .map_or_else(|| "a path".to_owned(), |path| path.display().to_string())
 }
 
 /// Joining one of a running container's namespaces failed; `detail` says
@@ -220,22 +474,37 @@ fn join_setup(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
         None => format!("joining the container's namespaces: {}", errno.desc()),
     };
     if errno == Errno::EPERM {
-        message.push_str(&permission_hint(ctx.root, "joining a container", ""));
+        message.push_str(&permission_hint(ctx.root, "joining a container"));
     }
     SpawnError::new(SpawnErrorKind::Isolation, message, errno)
 }
 
 /// Why a namespace step got EPERM: missing root, or, as root, the system's
-/// refusal (a container without privileges, or a security policy).
-/// `opt_out` is appended: how to do without the feature.
-fn permission_hint(root: bool, needing_root: &str, opt_out: &str) -> String {
+/// refusal (a container without privileges, or a security policy). How to
+/// do without isolation is the caller's to say (`shipyard run` adds a hint
+/// where `--no-isolation` would work).
+fn permission_hint(root: bool, needing_root: &str) -> String {
     if root {
-        format!(
-            " (the system refused it: inside a container without privileges, \
-             or under a security policy{opt_out})"
-        )
+        " (the system refused it: inside a container without privileges, \
+         or under a security policy)"
+            .to_owned()
     } else {
-        format!(" ({needing_root} needs root{opt_out})")
+        format!(" ({needing_root} needs root)")
+    }
+}
+
+/// Whether `path` is on a mount that forbids running programs (probe 14:
+/// for example a root filesystem under a hardened host's `/tmp`).
+fn on_noexec_mount(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        nix::sys::statvfs::statvfs(path)
+            .is_ok_and(|stat| stat.flags().contains(nix::sys::statvfs::FsFlags::ST_NOEXEC))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -244,11 +513,7 @@ fn permission_hint(root: bool, needing_root: &str, opt_out: &str) -> String {
 fn isolation_setup(doing: &str, errno: Errno, ctx: &FailureContext) -> SpawnError {
     let mut message = format!("{doing}: {}", errno.desc());
     if errno == Errno::EPERM {
-        message.push_str(&permission_hint(
-            ctx.root,
-            "isolation",
-            "; or run without isolation",
-        ));
+        message.push_str(&permission_hint(ctx.root, "isolation"));
     }
     SpawnError::new(SpawnErrorKind::Isolation, message, errno)
 }
@@ -315,6 +580,11 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
                 // `exists` follows the same path, so this also catches a
                 // file shipyard can see but the command's user can't reach.
                 format!("{path}: permission denied (a directory on the way isn't searchable)")
+            } else if on_noexec_mount(&resolved) {
+                format!(
+                    "{path}: permission denied (the file system it's on is mounted noexec, \
+                     which forbids running programs from it)"
+                )
             } else {
                 format!("{path}: permission denied (is it executable?)")
             };
@@ -382,6 +652,9 @@ mod tests {
             gid: 1000,
             rlimits: vec!["nofile=10:20".parse().unwrap()],
             root: false,
+            container_root: None,
+            names: Names::default(),
+            sysctls: Vec::new(),
         }
     }
 
@@ -401,7 +674,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 19, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 37, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -536,6 +809,9 @@ mod tests {
         // As root, an EPERM can't mean "needs root".
         let as_root = FailureContext {
             root: true,
+            container_root: None,
+            names: Names::default(),
+            sysctls: Vec::new(),
             ..ctx.clone()
         };
         let limit = describe(
@@ -559,7 +835,7 @@ mod tests {
         assert_eq!(
             proc.to_string(),
             "mounting /proc for the container: Operation not permitted \
-             (isolation needs root; or run without isolation)"
+             (isolation needs root)"
         );
         assert!(
             !fail(ChildStep::Hostname, Errno::EINVAL, 0)
@@ -569,6 +845,9 @@ mod tests {
         // As root, EPERM isn't about being root.
         let as_root = FailureContext {
             root: true,
+            container_root: None,
+            names: Names::default(),
+            sysctls: Vec::new(),
             ..ctx.clone()
         };
         let refused = describe(

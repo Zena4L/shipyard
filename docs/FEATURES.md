@@ -53,24 +53,45 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 ## 3. Filesystem isolation and OCI bundles — stage 3
 
-- **Root switch:** `pivot_root` (never `chroot`), then detach the old root.
-- **Mount propagation:** controlled so mounts never leak between host and container.
+- **Root filesystem** (`--rootfs DIR`, or a bundle's `root.path`): `pivot_root` (never
+  `chroot`) after a recursive bind, then the old root detached. Mount targets are never
+  followed through symlinks out of the root, and host mounts already on them are
+  detached first.
+- **Mount propagation:** the container's `/` is a slave, as with runc: its mounts never
+  reach the host; the host's unmounts still reach the container, so they don't keep host
+  devices busy.
 - **Standard mounts:**
   - `/proc`
   - `/sys`, read-only
   - `/dev` as tmpfs with only the minimal device nodes
   - `/dev/pts`, `/dev/shm`, `/dev/mqueue`
-- **Masked and read-only paths:** e.g. `/proc/kcore`, `/proc/keys`.
-- **Optional read-only root filesystem.**
-- **OCI bundles:** read an OCI `config.json` plus root filesystem, and implement the OCI
-  runtime commands `create / start / kill / delete / state`. From here on, the engine
+- **Masked and read-only paths:** e.g. `/proc/kcore`, `/proc/keys`; from a bundle,
+  exactly the ones it lists. Read-only covers the mounts below a path too.
+- **Optional read-only root filesystem** (`--read-only`, `root.readonly`).
+- **OCI bundles** (`shipyard run --bundle DIR`): `config.json` plus a root filesystem.
+  Bind and tmpfs mounts, rlimits, user, environment, hostname, domain name and sysctls.
+  Fields that would leave the container less confined than asked are refused, all at
+  once; harmless ones are ignored with a warning.
+- **The OCI runtime** (`shipyard-runtime`): `create / start / state / kill / delete`,
+  runc's command line, a monitor per container (no daemon). From here on, the engine
   drives the runtime the way Podman drives runc.
 - **User and group names:** `--user nobody` and `--group-add wheel`, resolved from the
-  container's own `/etc/passwd` and `/etc/group`.
-- **Domain name and namespaced sysctls:** from `config.json`'s `domainname` and
-  `linux.sysctl`. Only namespaced sysctls are accepted: the IPC ones (`kernel.shm*`,
-  `kernel.msg*`) from this stage, and `net.*` once containers have their own network
-  namespace (stage 7).
+  container's own `/etc/passwd` and `/etc/group`, with Docker's supplementary groups and
+  `HOME`.
+- **Domain name and namespaced sysctls:** `--domainname`, `--sysctl`, and `config.json`'s
+  `domainname` and `linux.sysctl`. Only namespaced sysctls are accepted: the IPC ones
+  (`kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`) from this stage, and
+  `net.*` once containers have their own network namespace (stage 7).
+- **Moved to the stages that give them meaning:**
+  - a terminal inside (`process.terminal`, `--console-socket`): stage 8;
+  - names for commands run in an existing container (`exec`): with `exec`, stage 8;
+  - hooks, `oomScoreAdj`, cgroup mounts and `linux.resources`: stage 5 (cgroups);
+  - bundles without a `pid` namespace in `shipyard-runtime`, `kill STOP`, `pause` and
+    `resume`: stage 5 (cgroups find and freeze every process);
+  - capabilities, `noNewPrivileges`, seccomp, user namespaces: stage 4;
+  - `/sys` without the host's network devices: stage 7.
+
+  The reasons are in [the stage 3 notes](stages/03-filesystem.md).
 
 ## 4. Users and security — stage 4
 
