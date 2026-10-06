@@ -331,12 +331,13 @@ pub enum SeccompError {
     #[error("the built-in profile can't be read: {0}")]
     BuiltIn(String),
     /// Where in the profile.
-    #[error("syscalls[{index}]: {source}")]
+    #[error("syscalls[{index}]: {error}")]
     InRule {
         /// The rule's index in `syscalls`.
         index: usize,
-        /// What's wrong with it.
-        source: Box<SeccompError>,
+        /// What's wrong with it. (Not the error's `source()`: the message
+        /// already says it, and a cause would be printed twice.)
+        error: Box<SeccompError>,
     },
 }
 
@@ -422,9 +423,9 @@ impl Profile {
         }
         self.flag_bits()?;
         for (index, rule) in self.syscalls.iter().enumerate() {
-            check_rule(rule).map_err(|source| SeccompError::InRule {
+            check_rule(rule).map_err(|error| SeccompError::InRule {
                 index,
-                source: Box::new(source),
+                error: Box::new(error),
             })?;
         }
         Ok(())
@@ -567,6 +568,18 @@ mod tests {
         );
         let err = rule(r#"{"name": "opne", "action": "SCMP_ACT_ALLOW"}"#).unwrap_err();
         assert!(err.contains("\"opne\""), "{err}");
+    }
+
+    /// The rule's error is in the message, not also its cause: a caller
+    /// printing the whole chain (the CLI does) would say it twice.
+    #[test]
+    fn a_rules_error_is_said_once() {
+        let err = SeccompError::InRule {
+            index: 0,
+            error: Box::new(SeccompError::UnknownSystemCall("wirte".into())),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+        assert_eq!(err.to_string().matches("wirte").count(), 1);
     }
 
     #[test]

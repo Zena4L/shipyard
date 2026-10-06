@@ -13,11 +13,14 @@
 //! them one by one. Never start a thread here.
 //!
 //! Most runs use `--no-isolation`: they test process behaviour that's the
-//! same with or without namespaces, without needing root. The isolated
-//! ones ([`ROOT_TESTS`]: Linux, root) test what a session of its own changes
-//! for the command: it's never in the terminal's foreground group and has no
-//! controlling terminal, so keys, window-size changes and hangups reach it
-//! only through shipyard. `isolation.rs` tests the namespaces themselves.
+//! same with or without namespaces. The isolated ones ([`ISOLATED_TESTS`],
+//! Linux) test what a session of its own changes for the command: it's
+//! never in the terminal's foreground group and has no controlling
+//! terminal, so keys, window-size changes and hangups reach it only through
+//! shipyard. They run as root (the root passes, with `--include-ignored`),
+//! and as a normal user too wherever rootless containers work: then the
+//! container is rootless, in a user namespace. `isolation.rs` tests the
+//! namespaces themselves.
 
 #![allow(
     clippy::expect_used,
@@ -33,7 +36,7 @@ use shipyard_test_support::pty::{
     Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped,
 };
 use shipyard_test_support::rootfs::RootFs;
-use shipyard_test_support::{Shipyard, child_of, killed_by};
+use shipyard_test_support::{Shipyard, child_of, is_root, killed_by};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
@@ -77,10 +80,11 @@ const TESTS: &[(&str, fn())] = tests![
     window_size_changes_reach_the_command_once,
 ];
 
-/// Tests of isolated runs: they need root, and Linux (for namespaces). Like
-/// libtest's `#[ignore = "needs root"]`, they run only with `--ignored` or
-/// `--include-ignored`, as the root passes do.
-const ROOT_TESTS: &[(&str, fn())] = tests![
+/// Tests of isolated runs (Linux, for namespaces). As root, like libtest's
+/// `#[ignore = "needs root"]`, they run only with `--ignored` or
+/// `--include-ignored`, as the root passes do. As a normal user, they run
+/// whenever rootless containers work here (see [`select`]).
+const ISOLATED_TESTS: &[(&str, fn())] = tests![
     isolated_ctrl_c_is_forwarded_exactly_once,
     isolated_ctrl_c_ends_shipyard_by_sigint,
     isolated_ctrl_backslash_quits_the_command,
@@ -111,10 +115,11 @@ const OPTIONS_WITH_VALUES: &[&str] = &[
 
 /// The tests to run, as libtest would pick them from `args`: names
 /// containing any filter (or equal to one, with `--exact`), minus `--skip`
-/// matches. [`ROOT_TESTS`] count as ignored: `--ignored` picks only them,
-/// `--include-ignored` adds them (on Linux; there's no isolation elsewhere).
-/// Other libtest options are accepted and ignored.
-fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
+/// matches. [`ISOLATED_TESTS`] count as ignored: `--ignored` picks only
+/// them, `--include-ignored` adds them (on Linux; there's no isolation
+/// elsewhere), and so does `rootless` (a normal user who can run rootless
+/// containers here). Other libtest options are accepted and ignored.
+fn select(args: &[String], rootless: bool) -> Vec<&'static (&'static str, fn())> {
     let mut filters = Vec::new();
     let mut skips = Vec::new();
     let mut rest = args.iter();
@@ -131,7 +136,7 @@ fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
     let exact = args.iter().any(|arg| arg == "--exact");
     let only_ignored = args.iter().any(|arg| arg == "--ignored");
     let with_ignored = cfg!(target_os = "linux")
-        && (only_ignored || args.iter().any(|arg| arg == "--include-ignored"));
+        && (only_ignored || rootless || args.iter().any(|arg| arg == "--include-ignored"));
     let matches = |name: &str, pattern: &str| {
         if exact {
             name == pattern
@@ -140,9 +145,9 @@ fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
         }
     };
     let ordinary = TESTS.iter().filter(|_| !only_ignored);
-    let root = ROOT_TESTS.iter().filter(|_| with_ignored);
+    let isolated = ISOLATED_TESTS.iter().filter(|_| with_ignored);
     ordinary
-        .chain(root)
+        .chain(isolated)
         .filter(|(name, _)| {
             (filters.is_empty() || filters.iter().any(|f| matches(name, f)))
                 && !skips.iter().any(|skip| matches(name, skip))
@@ -153,7 +158,13 @@ fn select(args: &[String]) -> Vec<&'static (&'static str, fn())> {
 /// Runs the selected tests in order, printing results the way libtest does.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let selected = select(&args);
+    // Whether rootless containers work here (as a normal user): asked once,
+    // before any fake shell is forked. (`rootless` runs `unshare`, a child
+    // process: no thread here.)
+    let rootless = cfg!(target_os = "linux")
+        && !is_root()
+        && shipyard_test_support::rootless(shipyard_test_support::Rootless::Single);
+    let selected = select(&args, rootless);
     if args.iter().any(|arg| arg == "--list") {
         for (name, _) in &selected {
             println!("{name}: test");
@@ -190,7 +201,7 @@ fn main() -> ExitCode {
         "\ntest result: {result}. {} passed; {} failed; 0 ignored; 0 measured; {} filtered out\n",
         selected.len() - failed.len(),
         failed.len(),
-        TESTS.len() + ROOT_TESTS.len() - selected.len(),
+        TESTS.len() + ISOLATED_TESTS.len() - selected.len(),
     );
     if failed.is_empty() {
         ExitCode::SUCCESS

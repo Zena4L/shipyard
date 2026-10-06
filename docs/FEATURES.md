@@ -95,13 +95,26 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 ## 4. Users and security — stage 4
 
-- **Rootless:**
-  - user namespaces (moved here from stage 2), with UID/GID maps applied via
-    `newuidmap`/`newgidmap` from `/etc/subuid`
-  - root inside the container maps to an unprivileged user outside
-- **Capabilities:** a minimal default set, plus `--cap-add` / `--cap-drop`.
-- **`no_new_privs`:** setuid binaries can't gain privileges.
-- **seccomp:** a default syscall filter compiled to BPF, plus custom profiles.
+- **User namespaces** (moved here from stage 2): `--uidmap`/`--gidmap` for root, and
+  a bundle's `user` namespace with its mappings.
+- **Rootless** (`run`, bundles and `shipyard-runtime`), for anyone without root:
+  - root inside the container is the caller; IDs from 1 up are the caller's
+    `/etc/subuid` and `/etc/subgid` ranges, mapped via `newuidmap`/`newgidmap`;
+  - without the helpers or a range, only the caller's own ID, with a warning;
+  - a bundle without a `user` namespace gets one; the runtime keeps its state in
+    `$XDG_RUNTIME_DIR/shipyard`;
+  - user namespaces refused by the host (AppArmor, `unprivileged_userns_clone`,
+    `max_user_namespaces`) are explained.
+- **Capabilities:** Docker's 14 by default, plus `--cap-add` / `--cap-drop`; a bundle's
+  five sets exactly.
+- **`no_new_privs`:** on by default; setuid binaries and file capabilities can't gain
+  privileges.
+- **seccomp:** Docker's profile by default, compiled to BPF in Rust; custom profiles
+  (`--security-opt seccomp=FILE`, a bundle's `linux.seccomp`) and `unconfined`.
+- **The init confines itself:** only `CAP_KILL`, `no_new_privs` and the container's
+  seccomp filter, before the command goes on.
+- **A session keyring per container,** as runc gives: the caller's keys stay out of
+  reach.
 - **Moved to stage 5:** device access control, an eBPF program attached to the
   container's cgroup, which exists only from stage 5.
 - *Later:* AppArmor / SELinux labels, Landlock.

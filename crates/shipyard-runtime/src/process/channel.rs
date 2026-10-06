@@ -68,9 +68,9 @@ fn set_nonblocking(pipe: &OwnedFd) -> Result<()> {
 
 // The status pipe, from the container's clean image to shipyard. It sends
 // [`START_MARK`] as soon as it runs; then, as the init, one status record
-// (the raw wait status) when the command has exited. Nothing else, ever:
-// anything more or different was written by someone else (see
-// `read_init_report`).
+// (the raw wait status) when the command has exited, or [`GAVE_UP_MARK`] if
+// it can't wait for it. Nothing else, ever: anything more or different was
+// written by someone else (see `read_init_report`).
 
 /// Size of a status record: one raw wait status.
 pub(crate) const STATUS_LEN: usize = 4;
@@ -80,6 +80,11 @@ const REPORT_LEN: usize = 1 + STATUS_LEN;
 
 /// The clean image's first byte on the status pipe: it runs.
 pub(crate) const START_MARK: u8 = b'R';
+
+/// The init's last byte on the status pipe when a system call its loop needs
+/// fails (a seccomp profile that refuses it): it can't wait for the command,
+/// so it ends the container.
+pub(crate) const GAVE_UP_MARK: u8 = b'X';
 
 /// Encodes a raw wait status. Runs in the init (Linux), so it only moves
 /// bytes.
@@ -98,6 +103,8 @@ pub(crate) enum InitReport {
     Started,
     /// It started, and the command ended with this raw wait status.
     Finished(libc::c_int),
+    /// It started, then couldn't wait for the command and gave up.
+    GaveUp,
     /// Bytes that aren't the init's: forged or garbled. Not to be trusted.
     Unexpected,
 }
@@ -123,6 +130,7 @@ pub(crate) fn read_init_report(pipe: &OwnedFd) -> InitReport {
     match report {
         [] => InitReport::Nothing,
         [START_MARK] => InitReport::Started,
+        [START_MARK, GAVE_UP_MARK] => InitReport::GaveUp,
         [START_MARK, record @ ..] if report.len() == REPORT_LEN => {
             <[u8; STATUS_LEN]>::try_from(record).map_or(InitReport::Unexpected, |raw| {
                 InitReport::Finished(libc::c_int::from_le_bytes(raw))
@@ -302,6 +310,8 @@ mod tests {
         };
         assert_eq!(report(b""), InitReport::Nothing, "and no blocking");
         assert_eq!(report(b"R"), InitReport::Started);
+        assert_eq!(report(b"RX"), InitReport::GaveUp);
+        assert_eq!(report(b"RXX"), InitReport::Unexpected);
         assert_eq!(
             report(b"C"),
             InitReport::Unexpected,

@@ -1,10 +1,10 @@
 //! End-to-end tests of isolation: `shipyard run` starting the command in new
 //! PID, mount, UTS and IPC namespaces (Linux).
 //!
-//! Creating namespaces needs root, so most tests are `#[ignore]`d in a normal
-//! run. CI's `root` job and the root pass of `scripts/test-linux.sh` run them
-//! with `-- --include-ignored`. As a normal user, the tests check the clear
-//! "needs root" error instead.
+//! Most tests here run rootful, so they're `#[ignore]`d in a normal run. CI's
+//! `root` job and the root pass of `scripts/test-linux.sh` run them with
+//! `-- --include-ignored`. As a normal user, an isolated run is rootless
+//! (`rootless.rs` tests that in depth).
 //!
 //! The other test files use `--no-isolation`: they test process behaviour
 //! that's the same with or without namespaces.
@@ -20,7 +20,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
 use shipyard_test_support::{
-    Run, Shipyard, block, child_of, gone, ignore, is_root, killed_by, run, start_command,
+    Run, Shipyard, block, child_of, gone, ignore, killed_by, run, start_command,
 };
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
@@ -54,15 +54,19 @@ fn own_namespaces() -> Vec<String> {
 /// A script printing the command's namespace IDs, one per line.
 const PRINT_NAMESPACES: &str = "for n in pid mnt uts ipc; do readlink /proc/self/ns/$n; done";
 
+/// Without root, an isolated run is rootless: in a user namespace whose
+/// root is the caller.
 #[test]
-fn without_root_isolation_is_refused_with_advice() {
-    if is_root() {
+fn without_root_isolation_is_rootless() {
+    if !shipyard_test_support::rootless(shipyard_test_support::Rootless::Single) {
         return;
     }
-    let run = isolated(&["true"]);
-    assert_eq!(run.code, Some(125), "{}", run.stderr);
-    assert!(run.stderr.contains("needs root"), "{}", run.stderr);
-    assert!(run.stderr.contains("--no-isolation"), "{}", run.stderr);
+    let run = isolated(&["sh", "-c", "head -1 /proc/self/uid_map; id -u"]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    // SAFETY: `getuid` has no preconditions.
+    let me = unsafe { libc::getuid() }.to_string();
+    let words: Vec<&str> = run.stdout.split_whitespace().collect();
+    assert_eq!(&words[..], ["0", me.as_str(), "1", "0"], "{}", run.stdout);
 }
 
 #[test]

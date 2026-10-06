@@ -16,7 +16,7 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-pub use crate::id_map::{IdMap, IdMapError, IdMaps, MapKind};
+pub use crate::id_map::{IdMap, IdMapError, IdMaps, MapKind, RootlessMaps};
 
 /// A kind of Linux namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

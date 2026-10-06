@@ -42,19 +42,21 @@ its own view of:
 | Mounts | Mounts made inside stay inside; the host never sees them. Mounts the host makes or removes later do reach the container, so a disk unmounted on the host isn't kept busy by it. |
 | Hostname | Its own copy; set it with `--hostname`. |
 | IPC | Its own System V IPC objects and POSIX message queues. |
+| Keyring | A new, empty session keyring (`man 7 keyrings`), as runc gives each container: the keys your login session holds stay out of its reach. |
 
 Without `--rootfs`, the command sees the host's files. It always sees the host's
 network: networking comes in a later version.
 
-- **Needs root.** Creating namespaces needs root privileges (support for running
-  without root comes later). Otherwise `run` stops before starting anything, with
-  exit code 125 and a message saying so.
-- **Refused by the system.** Even as root, namespaces can be refused, for example
-  inside a container started without privileges, or by a security policy
-  (seccomp, AppArmor, SELinux). `run` then exits with 125 and says the system
-  refused; use `--no-isolation` there.
-- **`--no-isolation`** runs the command without namespaces: it shares the host's
-  processes, mounts, hostname and IPC, and doesn't need root.
+- **Root or not.** Run as root, the container is rootful. Run as anyone else, it's
+  **rootless**: it gets a user namespace of its own (see [Rootless](#rootless)).
+- **The command is root inside** unless `--user` says otherwise, as with Docker.
+  For a rootless container, root inside is you on the host.
+- **Refused by the system.** Namespaces can be refused, for example inside a
+  container started without privileges, or by a security policy (seccomp,
+  AppArmor, SELinux). `run` then exits with 125 and says why; use `--no-isolation`
+  there.
+- **`--no-isolation`** runs the command without namespaces, as you: it shares the
+  host's processes, mounts, hostname and IPC.
 - **`--hostname NAME`** sets the hostname inside: letters, digits and hyphens in
   dot-separated parts (like `web-1` or `db.internal`), at most 64 characters, no
   part starting or ending with a hyphen. Not with `--no-isolation`.
@@ -82,11 +84,13 @@ network: networking comes in a later version.
   inside the container.
 - **Terminal:** see [On a terminal, isolated](#on-a-terminal-isolated) below.
 - **If Shipyard is killed**, the whole container goes with it.
-- **Not a security boundary yet.** The command runs as root, with only a few of
+- **Not a hardened boundary yet.** The command runs as root, with only a few of
   root's privileges (see [Capabilities and privileges](#capabilities-and-privileges))
-  and the system calls most programs need (see [System calls](#system-calls-seccomp)),
-  but it's still root on the host's files. Running untrusted code safely also needs
-  user namespaces, which come in a later version.
+  and the system calls most programs need (see [System calls](#system-calls-seccomp)).
+  In a rootful container it's still root on the host's files, unless `--uidmap`
+  (see [User namespaces](#user-namespaces)) makes root inside an ordinary user
+  outside; in a rootless one it's you (see [Rootless](#rootless)). The container
+  shares the host's network and has no resource limits of its own yet.
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
@@ -118,7 +122,9 @@ for good: not even a setuid-root program inside gets them back.
   nothing).
 - **`no_new_privs` is on.** Nothing the command runs can gain privileges: a setuid
   program (`sudo`, `su`, `passwd`) runs with its caller's rights, not root's.
-  `--security-opt no-new-privileges=false` turns it off for an image that needs them.
+  `--security-opt no-new-privileges=false` turns it off for an image that needs them
+  (`no-new-privileges` alone, or `=true`, keeps it on; Docker's older `:` in place of
+  `=` works too, for `seccomp:` as well).
   **Docker's default is off**; Shipyard's is on.
 - **Programs with file capabilities don't get them either,** for the same reason:
   Debian's `ping`, for example, holds `cap_net_raw` instead of being setuid, so a
@@ -128,8 +134,9 @@ for good: not even a setuid-root program inside gets them back.
   newest (Linux 5.9 added `CAP_PERFMON`, `CAP_BPF` and `CAP_CHECKPOINT_RESTORE`).
   Naming one it lacks is an error.
 - **The small init** (PID 1) gives up every capability but `CAP_KILL` (to pass
-  signals to a command running as another user) once the command runs. Root inside
-  can't look into it (`/proc/1/fd`, its memory) without `--cap-add SYS_PTRACE`.
+  signals to a command running as another user) before the command goes on, and
+  runs under the container's seccomp filter too (see below). Root inside can't
+  look into it (`/proc/1/fd`, its memory) without `--cap-add SYS_PTRACE`.
 
 These apply to isolated commands; with `--no-isolation` the command keeps the
 rights of whoever runs Shipyard, and the flags are errors.
@@ -179,12 +186,22 @@ program the command starts stays under it.
   Mac), the kernel refuses every seccomp filter. An isolated run fails there with
   exit code 125 and a message saying so; add `--security-opt seccomp=unconfined` to
   run without one. Shipyard never drops the filter on its own.
+- **Kernels before 4.14** refuse `SCMP_ACT_LOG` and `SCMP_ACT_KILL_PROCESS`: a
+  profile that uses them fails the same way ("the kernel refused it").
 - **Arguments are compared as 64-bit numbers.** A negative `int` argument arrives
   sign-extended: `AT_FDCWD` (-100) is `18446744073709551516`
   (`0xffffffffffffff9c`), not `4294967196`. libseccomp and Docker behave the same.
 - **`"errnoRet": 0` makes a call look successful without running it:** an `rm`
   refused this way prints nothing and leaves the file.
+- **The init runs under it too,** as Docker's init does: whatever reaches PID 1
+  from inside the container meets the same rules.
 - **What the profile must allow:**
+  - what the init does: `rt_sigtimedwait`, `wait4` and `kill` among others (Docker's
+    profile allows them). If one is refused, the init can't supervise the command,
+    and the container ends with exit code 125: "the container's init couldn't
+    supervise its command" (refused with an error, at once or at the first signal
+    to pass on), or "the container's init was killed by SIGSYS" (refused with a
+    kill or a trap).
   - `execve`, since the command is started under the filter. If it's refused,
     Shipyard says so ("cannot execute: Operation not permitted"), unless `write` is
     refused too: then the command just exits with 125 and no message.
@@ -195,6 +212,137 @@ program the command starts stays under it.
     in force by then, may have refused it)".
 - **The file** must be a regular file of at most 1 MiB: a FIFO or a device is
   refused, not read.
+
+### User namespaces
+
+A **user namespace** gives the container user and group IDs of its own. Inside, the
+command can be root (uid 0) while on the host it's an ordinary user with no
+privileges, so a command that breaks out of the container is nobody special.
+Capabilities inside apply only to what the container owns.
+
+```sh
+sudo shipyard run --uidmap 0:100000:65536 sh -c 'id; cat /proc/self/uid_map'
+# uid=0(root) gid=0(root) groups=0(root)
+#          0     100000      65536
+```
+
+- **`--uidmap CONTAINER:HOST:SIZE`** maps `SIZE` user IDs from `CONTAINER` inside to
+  `HOST` outside: here root inside is host user 100000, user 1000 is 101000, and so
+  on up to 65535. It's repeatable, for several ranges.
+- **`--gidmap`** does the same for group IDs. Without it, the group IDs are mapped
+  like the user IDs.
+- **Container ID 0 must be mapped,** for both users and groups: the container is set
+  up as root inside. Ranges can't overlap, inside or outside.
+- **An ID outside the maps doesn't exist inside.** `--user`, its group and every
+  `--group-add` must be mapped, or the run fails with "user 70000 isn't mapped in the
+  container's user namespace" (exit 125). Files on the host owned by unmapped IDs
+  show up as `nobody` (65534) inside.
+- **What the command creates on the host belongs to the mapped IDs:** a file root
+  inside writes into a bind-mounted directory is owned by 100000 on the host.
+- **Root inside can't read or change the host's root-owned files,** even with its
+  capabilities: they only reach files whose owner is mapped. `cat /etc/shadow` fails
+  with "Permission denied" (without a root filesystem, the container sees the host's
+  files).
+- **The root filesystem must belong to the mapped IDs**, or root inside can read it
+  (where its permissions let anyone) but not change it. Give it to the range before
+  running:
+
+  ```sh
+  sudo chown -R 100000:100000 rootfs
+  sudo shipyard run --uidmap 0:100000:65536 --rootfs rootfs sh
+  ```
+
+- **`/dev` and `/sys` are the host's, bound in.** A user namespace can't create
+  device nodes, so `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`,
+  `/dev/urandom` and `/dev/tty` are binds of the host's own. `/sys` is the host's,
+  read-only, until containers get their own network (a later version). What the host
+  mounted inside it (its cgroup tree, for one) is covered by an empty directory, as
+  in a container without a user namespace. `/dev/pts` belongs to the `tty` group (5)
+  only if group 5 is mapped. With `--cap-add SYS_ADMIN`, root inside can unmount
+  those covers, and then reads (never writes) what they hid, such as the host's
+  cgroup tree.
+- **Don't map host ID 0.** `--uidmap 0:0:65536` works, but root inside is then root
+  on the host's files, which is what a user namespace is for preventing: Shipyard
+  warns.
+- **The mapped users need the host's permissions:** to run Shipyard's own binary
+  (the container's setup starts from it) and to reach the root filesystem (every
+  directory above it). A root filesystem under `/root` (mode 700), for example, fails
+  with "Permission denied (in its user namespace, the container's root is host user
+  100000, …)".
+- **Shipyard itself in a user namespace** (inside another container, say) can only
+  map host IDs that its own namespace has (`/proc/self/uid_map`); others fail with
+  "writing the container's uid_map … Operation not permitted".
+- **`/proc` must be Shipyard's own PID namespace's** (after `unshare -p -f`, mount a
+  new one with `--mount-proc`): the maps are written through it.
+- **`--uidmap` and `--gidmap` are root's.** Without root, the maps are chosen for
+  you (see [Rootless](#rootless)).
+- **macOS:** like the other isolation flags, `--uidmap` is an error there.
+
+### Rootless
+
+Run `shipyard run` without root and the container is **rootless**: it gets a user
+namespace (see [User namespaces](#user-namespaces)) whose root is you. Inside, the
+command is root over the container: its processes, mounts, hostname and files you
+own. On the host it's still you, with no more rights than you have.
+
+```sh
+shipyard run sh -c 'id; cat /proc/self/uid_map'
+# uid=0(root) gid=0(root) groups=0(root)
+#          0       1000          1
+#          1     100000      65536
+```
+
+- **Your subordinate IDs, from 1 up.** Root inside is your own ID; IDs from 1 up
+  inside are your **subordinate IDs**, which `/etc/subuid` and `/etc/subgid` give
+  you (`subuid(5)`): usually 65536 of them, so IDs 0 to 65536 exist inside. Mapping them takes the setuid helpers `newuidmap` and
+  `newgidmap` (the `uidmap` package), found on `PATH`. Most distributions give new
+  users a range; otherwise an administrator can:
+
+  ```sh
+  sudo apt-get install uidmap                                     # or your distribution's
+  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 alice
+  ```
+
+  A file `--user 1000` creates is then owned by host user 100999 (the range's
+  1000th ID): yours to remove, not root's.
+- **Otherwise, only root inside.** Without the helpers or a range, or with ranges
+  the kernel would refuse (one overlapping your own ID, say), only your own ID is
+  mapped (as root inside), and `run` warns, saying what's missing. Then:
+  - `--user` other than 0 fails ("user 1000 isn't mapped…");
+  - `--group-add` fails ("supplementary group 0 can't be set…"), and programs that
+    change their groups can't: the kernel denies `setgroups` there;
+  - the command keeps your supplementary groups on the host. Inside they show as
+    `nogroup` (65534), but the host still counts them: a file only your `docker`
+    group may open stays open to it. With the full map, the command has no
+    supplementary groups.
+- **When `newuidmap` or `newgidmap` fails,** `run` shows what it said. They must be
+  setuid root (a copy, or one on a `nosuid` mount, isn't), and `/etc/subuid` and
+  `/etc/subgid` must give you the IDs. A helper that hangs (`/etc` on a hung network
+  file system) is stopped after 10 seconds.
+- **Your root filesystem is root's inside:** a `--rootfs` directory you own is
+  writable by root inside, with no `chown` needed. What `--user 1000` creates there
+  belongs to a subordinate ID (100999) on the host, which you can't remove directly.
+  Remove it as root inside instead:
+  `shipyard run --rootfs rootfs rm -rf /path/inside`.
+- **The maps are chosen for you:** `--uidmap` and `--gidmap` are for root.
+- **Limits can only go down:** `--ulimit` can't raise a hard limit above yours
+  (that needs root on the host, which root inside isn't); it fails with
+  "Operation not permitted (raising a hard limit needs root)".
+- **Inside another user namespace** that denies `setgroups` (Shipyard started under
+  `unshare -U -r`, say), Shipyard is root there and runs containers as root does,
+  but `--group-add` fails the same way.
+- **When user namespaces are off,** `run` says which setting stops them:
+  - Ubuntu (23.10 and later) restricts them with AppArmor:
+    `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, or an AppArmor
+    profile for shipyard, allows them;
+  - older Debian kernels have `kernel.unprivileged_userns_clone=0`;
+  - `user.max_user_namespaces=0` disables them entirely.
+
+  `--no-isolation` runs without namespaces there.
+- **Bundles too:** `shipyard run --bundle` and `shipyard-runtime` run rootless as well
+  (see [Rootless bundles](bundles.md#rootless-bundles)).
+- **Not rootless yet:** networking of its own and resource limits come in later
+  versions.
 
 ### On a terminal, isolated
 
@@ -233,7 +381,7 @@ Use `--no-isolation` for full job control.
 ## Root filesystem
 
 ```sh
-sudo shipyard run --rootfs ./rootfs sh
+shipyard run --rootfs ./rootfs sh
 ```
 
 (To describe a whole container in one file instead, use an OCI bundle: see
@@ -348,7 +496,7 @@ The path must be absolute.
 
 | Option | Meaning |
 |---|---|
-| *(none)* | Run as the user who ran `shipyard`. |
+| *(none)* | Isolated: root (`0:0`) inside the container, as Docker (in a rootless container, that's you). With `--no-isolation`, and on macOS: the user who ran `shipyard`. |
 | `-u USER` | Run as `USER`: a name such as `postgres`, or a number. |
 | `-u USER:GROUP` | Run as `USER`, with primary group `GROUP` (a name or a number). |
 | `--group-add GROUP` | Add a supplementary group (a name or a number). Repeatable; duplicates are ignored. |
@@ -362,8 +510,8 @@ Docker:
 - **A user number** is used as it is. If `/etc/passwd` has an entry for it, that
   entry's group and home directory are used; otherwise the group is `0`.
 - **A group name** must be in `/etc/group`.
-- **The user's groups:** in a container, the groups that list the user in
-  `/etc/group` are added too, plus any `--group-add`. Not with `--no-isolation`,
+- **The user's groups:** with `-u`, in a container, the groups that list the user
+  in `/etc/group` are added too, plus any `--group-add`. Not with `--no-isolation`,
   where `/etc/group` is the host's.
 - **`HOME`** is the user's home directory, unless you set it with `-e HOME=…`.
 
@@ -382,10 +530,11 @@ These are rejected:
 - **Too many supplementary groups.** The limit is 15 on macOS (the system's 16
   slots include the primary group) and 65536 on Linux.
 
-Switching to another user or group, or adding groups, requires running
-`shipyard` as root. Otherwise it fails before starting, and says what differs:
-for example `-u 501` alone may ask for group `0`, so use `-u 501:20` to keep
-your own group.
+In a container, any user can switch: inside a rootless container, the user
+namespace makes that possible (see [Rootless](#rootless)). With `--no-isolation`,
+switching to another user or group, or adding groups, requires running `shipyard`
+as root. Otherwise it fails before starting, and says what differs: for example
+`-u 501` alone may ask for group `0`, so use `-u 501:20` to keep your own group.
 
 When running as root, the command gets **only** the groups you ask for; root's
 own supplementary groups are always dropped.

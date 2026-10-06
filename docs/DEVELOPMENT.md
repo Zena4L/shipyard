@@ -21,8 +21,10 @@ cargo deny check                           # licenses & advisories (cargo instal
 # Regenerate docs/user/cli.md after changing any command or flag
 UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference
 
-# API docs (also checked in CI with warnings as errors)
+# API docs (also checked in CI with warnings as errors, private items included)
 cargo doc --workspace --no-deps --open
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items \
+  --target x86_64-unknown-linux-gnu        # as CI checks them
 
 # On macOS: type-check the Linux-only code without leaving the Mac
 cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu
@@ -31,7 +33,11 @@ cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu
 CI runs, on every push and PR:
 
 - fmt;
-- clippy and tests on Linux and macOS;
+- clippy and tests on Linux and macOS. On Linux, the job first allows rootless
+  containers (lifts Ubuntu's AppArmor restriction on user namespaces, installs
+  `uidmap`, gives the runner a subordinate range), and runs the tests with
+  `SHIPYARD_TEST_ROOTLESS=required`, so a rootless test that can't run fails instead
+  of skipping;
 - the tests again as root on Linux and macOS (see below);
 - clippy for `x86_64-unknown-linux-musl`;
 - the docs build (warnings as errors);
@@ -49,6 +55,11 @@ cargo test -p shipyard-cli --test terminal              # all of them
 cargo test -p shipyard-cli --test terminal ctrl_z       # by name
 ```
 
+The isolated ones run as root, and as a normal user wherever rootless containers
+work there (a user namespace of one's own, the single-ID map: the fake shell clears the
+environment, so it finds no `newuidmap`). As a normal user elsewhere they're skipped,
+unless `SHIPYARD_TEST_ROOTLESS=required` makes that a failure.
+
 They don't use the standard test harness (`harness = false`): the fake shell
 keeps running Rust code after `fork`, which is only safe in a single-threaded
 process, and the standard harness runs tests on threads. So **never start a
@@ -56,11 +67,15 @@ thread in that test binary.**
 
 ### Running the Linux tests in a container
 
-`scripts/test-linux.sh` runs what CI runs on Linux, in a `rust:1-bookworm`
-container (Docker, OrbStack or any compatible engine):
+`scripts/test-linux.sh` runs what CI runs on Linux, in a container (Docker, OrbStack
+or any compatible engine). The image is `rust:1-bookworm` plus what the
+user-namespace tests need (`scripts/test-image/Dockerfile`: the `uidmap` package, and a
+`tester` user with subordinate IDs in `/etc/subuid`). The script builds it the first
+time, which needs network, and again only when the Dockerfile changes. The steps:
 
 1. clippy with warnings as errors;
-2. the whole test suite as a normal user;
+2. the whole test suite as a normal user (`tester`): the rootless tests and the
+   isolated terminal tests run here;
 3. the suite again with the root-only tests, run as root (as the CI `root` job
    does). Before it, `/` is made a shared mount, as on systemd
    hosts, so a mount namespace that leaks mounts would be caught.

@@ -38,7 +38,7 @@ use super::spawn::{Child, Placement, SpawnOptions, spawn};
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
 use super::stop::StopPolicy;
-use crate::isolation::{Isolation, Join};
+use crate::isolation::{Isolation, Join, Namespace};
 use crate::{Error, Result};
 
 /// When to first warn that a command killed with SIGKILL still hasn't exited, and how
@@ -333,9 +333,10 @@ fn check_isolation(isolation: &Isolation) -> Result<()> {
             });
         }
     }
-    // Creating namespaces needs CAP_SYS_ADMIN. Checked here for a clear
-    // message; a clone or mount failing with EPERM says the same thing.
-    if !nix::unistd::geteuid().is_root() {
+    // Creating namespaces needs CAP_SYS_ADMIN: root has it, and anyone has
+    // it inside a user namespace of their own (rootless). Checked here for a
+    // clear message; a clone or mount failing with EPERM says the same.
+    if !nix::unistd::geteuid().is_root() && !isolation.has(Namespace::User) {
         return Err(Error::IsolationNeedsRoot);
     }
     Ok(())

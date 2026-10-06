@@ -24,7 +24,7 @@
 //! is someone else's process.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -40,9 +40,62 @@ pub use elsewhere::{create, delete, kill, monitor_entry_point, start, state};
 #[cfg(target_os = "linux")]
 pub use lifecycle::{create, delete, kill, monitor_entry_point, start, state};
 
-/// Where the state directories go unless told otherwise (runc's is
+/// Where root's state directories go unless told otherwise (runc's is
 /// `/run/runc`).
 pub const DEFAULT_ROOT: &str = "/run/shipyard";
+
+/// Where this caller's state directories go unless told otherwise:
+/// [`DEFAULT_ROOT`] for root; for anyone else `$XDG_RUNTIME_DIR/shipyard`
+/// (as runc and Podman do), a per-user directory the login session creates
+/// and cleans. Without it there's no safe place to guess (a `/tmp` path
+/// invites races), so the caller must say.
+///
+/// # Errors
+///
+/// Not root, and `XDG_RUNTIME_DIR` isn't set, isn't absolute, isn't a
+/// directory, or isn't the caller's. Anywhere but Linux,
+/// [`ContainerError::LinuxOnly`], as every call is: that's the problem to
+/// report, not a missing directory.
+pub fn default_root() -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    if cfg!(not(target_os = "linux")) {
+        return Err(ContainerError::LinuxOnly);
+    }
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let owner = runtime_dir
+        .as_ref()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .filter(std::fs::Metadata::is_dir)
+        .map(|meta| meta.uid());
+    let me = nix::unistd::geteuid();
+    choose_root(me.is_root(), runtime_dir.as_deref(), owner, me.as_raw())
+}
+
+/// [`default_root`]'s decision: `owner` is the uid owning `runtime_dir`,
+/// if it's a directory.
+fn choose_root(
+    root: bool,
+    runtime_dir: Option<&Path>,
+    owner: Option<u32>,
+    me: u32,
+) -> Result<PathBuf> {
+    if root {
+        return Ok(PathBuf::from(DEFAULT_ROOT));
+    }
+    let problem = match (runtime_dir, owner) {
+        (None, _) => "XDG_RUNTIME_DIR isn't set".to_owned(),
+        (Some(dir), _) if !dir.is_absolute() => {
+            format!("XDG_RUNTIME_DIR ({}) isn't an absolute path", dir.display())
+        }
+        (Some(dir), None) => format!("XDG_RUNTIME_DIR ({}) isn't a directory", dir.display()),
+        (Some(dir), Some(owner)) if owner != me => format!(
+            "XDG_RUNTIME_DIR ({}) belongs to user {owner}, not you",
+            dir.display()
+        ),
+        (Some(dir), Some(_)) => return Ok(dir.join("shipyard")),
+    };
+    Err(ContainerError::NoStateRoot(problem))
+}
 
 /// The version of the OCI runtime spec the state follows.
 pub const OCI_VERSION: &str = "1.2.0";
@@ -141,6 +194,12 @@ pub enum ContainerError {
          container's processes can't all be found or stopped until cgroups arrive)"
     )]
     NoPidNamespace,
+    /// No default directory for a non-root caller's state.
+    #[error(
+        "no directory for the containers' state: {0} (a login session sets it); give one \
+         with --root"
+    )]
+    NoStateRoot(String),
     /// `kill` with SIGSTOP: it can't be caught, so it would stop the
     /// container's init, which then passes nothing on, instead of its
     /// program.
@@ -167,9 +226,6 @@ pub enum ContainerError {
         std::env::consts::OS
     )]
     LinuxOnly,
-    /// Creating containers needs root (as running isolated does).
-    #[error("creating containers needs root (rootless support comes later)")]
-    NeedsRoot,
     /// The bundle can't be run.
     #[error(transparent)]
     Bundle(#[from] BundleError),
@@ -177,12 +233,13 @@ pub enum ContainerError {
     #[error("{0}")]
     Setup(String),
     /// A file or system call in the state directory failed.
-    #[error("{doing}: {source}")]
+    #[error("{doing}: {error}")]
     Io {
         /// What was being done.
         doing: String,
-        /// Why it failed.
-        source: std::io::Error,
+        /// Why it failed. (Not the error's `source()`: the message already
+        /// says it, and a cause would be printed twice.)
+        error: std::io::Error,
     },
 }
 
@@ -209,8 +266,52 @@ pub fn validate_id(id: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn roots_state_is_in_run_and_others_in_their_runtime_dir() {
+        let dir = || Some(Path::new("/run/user/1000"));
+        assert_eq!(
+            choose_root(true, None, None, 0).unwrap(),
+            Path::new(DEFAULT_ROOT)
+        );
+        assert_eq!(
+            choose_root(false, dir(), Some(1000), 1000).unwrap(),
+            Path::new("/run/user/1000/shipyard")
+        );
+        for (runtime_dir, owner, wanted) in [
+            (None, None, "isn't set"),
+            (
+                Some(Path::new("run/user/1000")),
+                Some(1000),
+                "isn't an absolute path",
+            ),
+            (dir(), None, "isn't a directory"),
+            (dir(), Some(0), "belongs to user 0, not you"),
+        ] {
+            let err = choose_root(false, runtime_dir, owner, 1000)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(wanted) && err.contains("--root"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reason is in the message, not also its cause: printed as a chain
+    /// (the CLI does), it would appear twice.
+    #[test]
+    fn an_io_error_is_said_once() {
+        let err = ContainerError::Io {
+            doing: "reading x".into(),
+            error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
 
     #[test]
     fn ids_are_checked() {

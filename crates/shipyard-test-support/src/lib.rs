@@ -200,11 +200,118 @@ pub fn for_this_kernel<'a>(args: &[&'a str]) -> Vec<&'a str> {
     }
 }
 
+/// What a rootless test needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rootless {
+    /// A user namespace of the caller's own: the single-ID map.
+    Single,
+    /// The full map too: `newuidmap`/`newgidmap` and the caller's range in
+    /// `/etc/subuid` and `/etc/subgid`.
+    Full,
+}
+
+/// Whether a rootless test can run here: as a normal user, where user
+/// namespaces are allowed (and for [`Rootless::Full`], the helpers and a
+/// subordinate range are there). When not, it says why on stderr, and the
+/// test should return; with `SHIPYARD_TEST_ROOTLESS=required` (CI, where
+/// it's set up), it fails instead: there a skip would hide a breakage.
+#[must_use]
+pub fn rootless(needs: Rootless) -> bool {
+    let Some(why) = rootless_unavailable(needs) else {
+        return true;
+    };
+    assert!(
+        std::env::var("SHIPYARD_TEST_ROOTLESS").as_deref() != Ok("required"),
+        "rootless tests are required here (SHIPYARD_TEST_ROOTLESS), but {why}"
+    );
+    eprintln!("skipping: {why}");
+    false
+}
+
+fn rootless_unavailable(needs: Rootless) -> Option<String> {
+    if is_root() {
+        return Some("running as root (rootless tests run as a normal user)".to_owned());
+    }
+    let userns = Command::new("unshare")
+        .args(["--user", "true"])
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !userns.is_ok_and(|status| status.success()) {
+        return Some("this user can't create a user namespace here (`unshare --user`)".to_owned());
+    }
+    if needs == Rootless::Single {
+        return None;
+    }
+    let on_path = |helper| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|dir| dir.join(helper).is_file())
+    };
+    if !on_path("newuidmap") || !on_path("newgidmap") {
+        return Some("newuidmap and newgidmap aren't on PATH (the uidmap package)".to_owned());
+    }
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let name = Command::new("id")
+        .arg("-un")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let listed = std::fs::read_to_string(file).is_ok_and(|text| {
+            text.lines().any(|line| {
+                let owner = line.split(':').next().unwrap_or_default();
+                owner == uid || (!name.is_empty() && owner == name)
+            })
+        });
+        if !listed {
+            return Some(format!("this user has no range in {file}"));
+        }
+    }
+    None
+}
+
 /// Whether the tests run as root (effective user 0).
 #[must_use]
 pub fn is_root() -> bool {
     // SAFETY: `geteuid` has no preconditions.
     unsafe { libc::geteuid() == 0 }
+}
+
+/// This process's session keyring serial (`keyrings(7)`), or -1 if it
+/// can't be read.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn session_keyring() -> i64 {
+    // SAFETY: `keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0)`:
+    // integer arguments only, and 0 asks the kernel not to create one.
+    unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            libc::KEYCTL_GET_KEYRING_ID,
+            libc::KEY_SPEC_SESSION_KEYRING,
+            0,
+        )
+    }
+}
+
+/// A command that prints its own session keyring serial, as
+/// [`session_keyring`] reads it: `python3` (in the test image and on CI's
+/// Ubuntu), since few systems have the `keyctl` tool. It needs a seccomp
+/// profile that allows `keyctl` (Docker's refuses it).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn print_session_keyring() -> [&'static str; 3] {
+    // The numbers are this architecture's, known only once compiled.
+    static SCRIPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "import ctypes; c = ctypes.c_long; \
+             print(ctypes.CDLL(None).syscall(c({}), c({}), c({}), c(0)))",
+            libc::SYS_keyctl,
+            libc::KEYCTL_GET_KEYRING_ID,
+            libc::KEY_SPEC_SESSION_KEYRING,
+        )
+    });
+    ["python3", "-c", SCRIPT.as_str()]
 }
 
 /// A running shipyard whose stdout is read line by line.

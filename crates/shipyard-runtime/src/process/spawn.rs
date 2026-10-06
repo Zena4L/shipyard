@@ -18,7 +18,7 @@ use super::channel::status_pipe;
 use super::channel::{
     InitReport, Report, ReportReader, go_pipe, read_init_report, report_pipe, send_go,
 };
-use super::child::child_main;
+use super::child::{SETUP_FAILED, child_main};
 use super::failure::{FailureContext, describe};
 #[cfg(target_os = "linux")]
 use super::plan::ReexecFds;
@@ -93,12 +93,21 @@ pub(crate) struct Child {
     /// The parent's end of the go pipe, held open until `exec` resolves: the
     /// child checks it to know the parent is alive (see `channel.rs`).
     go: Option<OwnedFd>,
-    /// Isolated: where the container's clean image says it started, and, as
-    /// the init, sends the command's exit status (the init itself is the
-    /// process we reap).
-    status: Option<OwnedFd>,
+    /// Isolated: what the container's clean image says.
+    status: Option<StatusPipe>,
     context: FailureContext,
     reaped: bool,
+}
+
+/// Where an isolated container's clean image says it started, and, as the
+/// init, sends the command's exit status (the init itself is the process
+/// we reap).
+#[derive(Debug)]
+struct StatusPipe {
+    pipe: OwnedFd,
+    /// There's an init (a PID namespace): otherwise the clean image became
+    /// the command, and how it ended is the command's.
+    has_init: bool,
 }
 
 /// Starts the process `spec` describes and returns without waiting.
@@ -121,6 +130,17 @@ pub(crate) fn spawn(
         read: go_read.as_raw_fd(),
         parent_end: go_write.as_raw_fd(),
     };
+    // The maps go to `/proc/PID`, as our `/proc` numbers the child. Another
+    // PID namespace's `/proc` would give the same number to another process.
+    #[cfg(target_os = "linux")]
+    if options
+        .placement
+        .isolation()
+        .is_some_and(|isolation| isolation.id_maps.is_some())
+        && !super::proc_is_ours()
+    {
+        return Err(Error::ForeignProc);
+    }
     #[cfg(target_os = "linux")]
     let isolated = options
         .placement
@@ -176,7 +196,7 @@ pub(crate) fn spawn(
         .placement
         .isolation()
         .and_then(|isolation| isolation.id_maps.as_ref())
-        && let Err(err) = write_id_maps(pid, maps)
+        && let Err(err) = super::user_namespace::write_maps(pid, maps)
     {
         let _ = nix::sys::signal::kill(pid, NixSignal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
@@ -189,7 +209,13 @@ pub(crate) fn spawn(
     // Only the clean image writes to it; with our copy closed, it reads as
     // empty once that process is gone.
     #[cfg(target_os = "linux")]
-    let status = isolated.map(|files| files.status_read);
+    let status = isolated.map(|files| StatusPipe {
+        pipe: files.status_read,
+        has_init: options
+            .placement
+            .isolation()
+            .is_some_and(|isolation| isolation.has(crate::isolation::Namespace::Pid)),
+    });
     #[cfg(not(target_os = "linux"))]
     let status = None;
     let group = if options.placement.has_own_session() {
@@ -219,14 +245,15 @@ pub(crate) fn spawn(
 }
 
 /// The command's result, from what the container's init sent (`report`)
-/// and how the init itself ended (`init`).
+/// and how the init itself ended (`init`); `has_init` says whether there
+/// was one.
 ///
 /// The init's own exit code always mirrors the command's (128 + N for a
 /// signal), so a status record is only believed when it agrees with it:
 /// anything in the container that can reach the pipe could forge one. The
 /// record adds what the exit code can't say, whether the command died by a
 /// signal.
-fn init_outcome(report: InitReport, init: ExitStatus) -> Result<ExitStatus> {
+fn init_outcome(report: InitReport, init: ExitStatus, has_init: bool) -> Result<ExitStatus> {
     match report {
         InitReport::Finished(raw) => {
             let command =
@@ -240,10 +267,22 @@ fn init_outcome(report: InitReport, init: ExitStatus) -> Result<ExitStatus> {
             }
             Ok(command.unwrap_or(init))
         }
+        // The init exits as a setup failure when it gives up; with any
+        // other code the mark wasn't its (see `Unexpected`).
+        InitReport::GaveUp if is_setup_failure(init) => Err(Error::InitGaveUp),
+        // An init killed by SIGSYS: its seccomp filter (the container's)
+        // refused a call it needs with a kill. (The command's own SIGSYS
+        // comes as a status record, and as the init's exit code 159.)
+        InitReport::Started
+            if has_init
+                && matches!(init, ExitStatus::Signaled { signal, .. } if signal.as_raw() == libc::SIGSYS) =>
+        {
+            Err(Error::InitKilledBySeccomp)
+        }
         // No init (the process reaped *was* the command), or an init killed
         // before the command ended (the stop timeout's SIGKILL).
         InitReport::Started => Ok(init),
-        InitReport::Unexpected => {
+        InitReport::GaveUp | InitReport::Unexpected => {
             tracing::warn!(
                 "unexpected data on the container's status pipe (written from inside the \
                  container?); using the init's own exit status"
@@ -258,6 +297,11 @@ fn init_outcome(report: InitReport, init: ExitStatus) -> Result<ExitStatus> {
             _ => Ok(init),
         },
     }
+}
+
+/// Whether `status` is a setup failure's exit (125).
+fn is_setup_failure(status: ExitStatus) -> bool {
+    matches!(status, ExitStatus::Exited(code) if libc::c_int::from(code) == SETUP_FAILED)
 }
 
 /// What an isolated spawn opens for the cloned child, which re-execs the
@@ -356,6 +400,13 @@ unsafe fn launch(
             // Root and still refused: a container without privileges, or a
             // security policy.
             Err(Errno::EPERM) if nix::unistd::geteuid().is_root() => Err(Error::IsolationRefused),
+            // Without root, the user namespace is what the kernel refused:
+            // the others are its own.
+            Err(Errno::EPERM) if isolation.has(crate::isolation::Namespace::User) => {
+                Err(Error::UserNamespacesRefused {
+                    reason: super::user_namespace::userns_refusal(),
+                })
+            }
             Err(Errno::EPERM) => Err(Error::IsolationNeedsRoot),
             // The kernel's limit on namespaces is reached (or set to 0).
             Err(Errno::ENOSPC) => Err(Error::sys(
@@ -382,34 +433,6 @@ unsafe fn launch(
         Ok(ForkResult::Parent { child }) => Ok(Launched::Parent(child)),
         Err(errno) => Err(fork_error(errno)),
     }
-}
-
-/// Writes the user namespace's ID maps for the child `pid`, as host root:
-/// `/proc/PID/uid_map`, then `gid_map`. `setgroups` stays allowed: only an
-/// unprivileged writer has to deny it (step 5).
-///
-/// The kernel takes each map in one `write`, once: a partial write would
-/// leave the rest unwritable, so a short one is an error, not retried.
-#[cfg(target_os = "linux")]
-fn write_id_maps(pid: Pid, maps: &crate::isolation::IdMaps) -> Result<()> {
-    use std::io::Write as _;
-
-    use crate::id_map::render;
-    use crate::isolation::MapKind;
-
-    for (kind, map) in [(MapKind::Uids, &maps.uids), (MapKind::Gids, &maps.gids)] {
-        let contents = render(map);
-        let failed = |errno| Error::sys(format!("writing the container's {kind}"), errno);
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .open(format!("/proc/{pid}/{kind}"))
-            .and_then(|mut file| file.write(contents.as_bytes()))
-            .map_err(|err| failed(super::io_errno(&err)))?;
-        if written != contents.len() {
-            return Err(failed(Errno::EIO));
-        }
-    }
-    Ok(())
 }
 
 /// A failed `fork`, explained.
@@ -526,7 +549,7 @@ impl Child {
         })?;
         self.reaped = true;
         let status = match self.status.take() {
-            Some(pipe) => init_outcome(read_init_report(&pipe), reaped)?,
+            Some(status) => init_outcome(read_init_report(&status.pipe), reaped, status.has_init)?,
             None => reaped,
         };
         tracing::debug!(pid = self.pid.as_raw(), %status, "exited");
@@ -660,6 +683,38 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    /// "Gave up" is believed only with the init's setup-failure exit code:
+    /// with any other, something else wrote it.
+    #[test]
+    fn an_init_that_gave_up_is_an_error() {
+        assert!(matches!(
+            init_outcome(InitReport::GaveUp, ExitStatus::Exited(125), true),
+            Err(Error::InitGaveUp)
+        ));
+        assert_eq!(
+            init_outcome(InitReport::GaveUp, ExitStatus::Exited(0), true).unwrap(),
+            ExitStatus::Exited(0)
+        );
+    }
+
+    /// An init killed by SIGSYS was killed by its filter; without an init,
+    /// the process reaped is the command, whose SIGSYS is its own.
+    #[test]
+    fn an_init_killed_by_sigsys_is_an_error() {
+        let sigsys = ExitStatus::Signaled {
+            signal: Signal::from_raw(libc::SIGSYS).unwrap(),
+            core_dumped: false,
+        };
+        assert!(matches!(
+            init_outcome(InitReport::Started, sigsys, true),
+            Err(Error::InitKilledBySeccomp)
+        ));
+        assert_eq!(
+            init_outcome(InitReport::Started, sigsys, false).unwrap(),
+            sigsys
+        );
+    }
 
     #[test]
     fn stop_peeks_see_only_a_current_stop_and_consume_nothing() {

@@ -502,6 +502,130 @@ fn a_profile_of_ones_own() {
     assert_eq!(run.code, Some(killed_by(libc::SIGSYS)), "{}", run.stderr);
 }
 
+/// The init runs under the container's own filter too (as Docker's init
+/// does): whatever reaches it through the namespace meets the same rules.
+/// Unconfined, neither has one.
+#[test]
+#[ignore = "needs root"]
+fn the_init_runs_under_the_containers_filter() {
+    if !filters_work_here() {
+        return;
+    }
+    let show = "grep '^Seccomp:' /proc/1/status";
+    let filtered = shipyard_run(&[], show);
+    assert_eq!(
+        field(&filtered.stdout, "Seccomp"),
+        FILTERED,
+        "{}",
+        filtered.stderr
+    );
+    let off = shipyard_run(&["--security-opt", "seccomp=unconfined"], show);
+    assert_eq!(field(&off.stdout, "Seccomp"), 0, "{}", off.stderr);
+}
+
+/// A profile that refuses the init's `wait4` ends the container instead of
+/// leaving it hung on a command nobody can reap.
+#[test]
+#[ignore = "needs root"]
+fn a_profile_refusing_the_inits_wait_ends_the_container() {
+    if !filters_work_here() {
+        return;
+    }
+    let profile = ProfileFile::new(&json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [{"names": ["wait4", "waitid"], "action": "SCMP_ACT_ERRNO"}]
+    }));
+    let run = run_args(&["--security-opt", &profile.option(), "true"]);
+    assert_eq!(run.code, Some(125), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("couldn't supervise its command") && run.stderr.contains("wait4"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// A profile that kills on a call the init makes kills the init: said as
+/// such, not passed off as the command's SIGSYS (159).
+#[test]
+#[ignore = "needs root"]
+fn a_profile_killing_the_init_says_so() {
+    if !filters_work_here() {
+        return;
+    }
+    for action in ["SCMP_ACT_KILL_PROCESS", "SCMP_ACT_TRAP"] {
+        let profile = ProfileFile::new(&json!({
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "syscalls": [{"names": ["rt_sigtimedwait"], "action": action}]
+        }));
+        let run = run_args(&["--security-opt", &profile.option(), "sleep", "1"]);
+        assert_eq!(run.code, Some(125), "{action}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("init was killed by SIGSYS"),
+            "{action}: {}",
+            run.stderr
+        );
+    }
+}
+
+/// A profile that refuses `kill` leaves the init unable to pass signals on:
+/// it ends the container at the first one, rather than leaving SIGTERM
+/// unanswered until the stop timeout's SIGKILL.
+#[test]
+#[ignore = "needs root"]
+fn a_profile_refusing_the_inits_kill_ends_the_container() {
+    if !filters_work_here() {
+        return;
+    }
+    let profile = ProfileFile::new(&json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [{"names": ["kill"], "action": "SCMP_ACT_ERRNO"}]
+    }));
+    let running = start_command(SHIPYARD.command(&[
+        "run",
+        "--security-opt",
+        &profile.option(),
+        "sh",
+        "-c",
+        "echo ready; sleep 60",
+    ]));
+    assert_eq!(running.next_line(), "ready");
+    let started = std::time::Instant::now();
+    running.signal(libc::SIGTERM);
+    let (code, _) = running.finish();
+    assert_eq!(code, 125);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// The serial of the session keyring a command run with `args` has (and,
+/// isolated, a profile that allows `keyctl`).
+fn keyring_of_a_command(args: &[&str]) -> i64 {
+    let unconfined: &[&str] = if args.contains(&"--no-isolation") {
+        &[]
+    } else {
+        &["--security-opt", "seccomp=unconfined"]
+    };
+    let print = shipyard_test_support::print_session_keyring();
+    let run = run_args(&[args, unconfined, &print].concat());
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    run.stdout.trim().parse().unwrap()
+}
+
+/// Each container gets a session keyring of its own (runc's default): not
+/// its caller's, whose keys it would otherwise reach, nor another
+/// container's.
+#[test]
+#[ignore = "needs root"]
+fn a_container_has_its_own_session_keyring() {
+    let first = keyring_of_a_command(&[]);
+    let second = keyring_of_a_command(&[]);
+    assert!(first > 0, "{first}");
+    assert_ne!(first, shipyard_test_support::session_keyring());
+    assert_ne!(first, second);
+    // Without isolation the command is an ordinary process: the caller's.
+    let unisolated = keyring_of_a_command(&["--no-isolation"]);
+    assert_eq!(unisolated, shipyard_test_support::session_keyring());
+}
+
 /// Without `no_new_privs` the filter goes on first, while the process still
 /// has `CAP_SYS_ADMIN`, and the switch of user and capabilities run under it.
 #[test]

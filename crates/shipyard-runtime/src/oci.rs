@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::isolation::{Isolation, Mount, MountFlag, MountKind, Namespace, Root};
+use crate::isolation::{IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root};
 use crate::process::{Env, ProcessSpec, Rlimit, RlimitValue, User};
 use crate::security::seccomp::Profile;
 use crate::security::{Capabilities, Capability, CapabilitySet, CapabilitySets, Seccomp, Security};
@@ -53,12 +53,13 @@ pub struct Bundle {
 #[non_exhaustive]
 pub enum BundleError {
     /// `config.json` couldn't be read.
-    #[error("reading {}: {source}", path.display())]
+    #[error("reading {}: {error}", path.display())]
     Read {
         /// The file.
         path: PathBuf,
-        /// What went wrong.
-        source: std::io::Error,
+        /// What went wrong. (Not the error's `source()`: the message
+        /// already says it, and a cause would be printed twice.)
+        error: std::io::Error,
     },
     /// `config.json` isn't a regular file (a FIFO would block the read).
     #[error("{} isn't a regular file", path.display())]
@@ -137,14 +138,30 @@ pub fn load_bundle(dir: &Path) -> Result<Bundle, BundleError> {
     Ok(Bundle { warnings, ..bundle })
 }
 
+/// [`load_bundle`], as this caller runs it: without root, rootless, in a
+/// user namespace, added if the bundle has none (with a warning). Every
+/// runner loads bundles this way (`shipyard run --bundle`, and both
+/// processes of `shipyard-runtime create`), so they run the same container.
+///
+/// # Errors
+///
+/// As [`load_bundle`].
+#[cfg(target_os = "linux")]
+pub fn load_bundle_for_caller(dir: &Path) -> Result<Bundle, BundleError> {
+    let mut bundle = load_bundle(dir)?;
+    let added = crate::process::bundle_user_namespace(&mut bundle.isolation);
+    bundle.warnings.extend(added);
+    Ok(bundle)
+}
+
 /// Reads and parses `config.json`, refusing what isn't a small regular file
 /// (see `small_file.rs`).
 fn read_config(path: &Path) -> Result<Config, BundleError> {
     let path_buf = || path.to_owned();
     let text = read_small_file(path, MAX_CONFIG_SIZE).map_err(|err| match err {
-        SmallFileError::Io(source) => BundleError::Read {
+        SmallFileError::Io(error) => BundleError::Read {
             path: path_buf(),
-            source,
+            error,
         },
         SmallFileError::NotAFile => BundleError::NotAFile { path: path_buf() },
         SmallFileError::TooLarge => BundleError::TooLarge { path: path_buf() },
@@ -279,6 +296,26 @@ struct LinuxConfig {
     time_offsets: Option<Value>,
 }
 
+/// One entry of `linux.uidMappings` or `linux.gidMappings`.
+#[derive(Deserialize)]
+struct MappingConfig {
+    #[serde(rename = "containerID")]
+    container: u32,
+    #[serde(rename = "hostID")]
+    host: u32,
+    size: u32,
+}
+
+impl From<MappingConfig> for IdMap {
+    fn from(mapping: MappingConfig) -> Self {
+        Self {
+            container: mapping.container,
+            host: mapping.host,
+            size: mapping.size,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct NamespaceConfig {
     #[serde(rename = "type")]
@@ -407,6 +444,7 @@ impl Reader<'_> {
         let mut linux = config.linux.unwrap_or_default();
         let mut isolation = Isolation::standard();
         isolation.namespaces = self.namespaces(&linux.namespaces)?;
+        isolation.id_maps = self.id_maps(&linux, isolation.has(Namespace::User))?;
         isolation.security = security;
         isolation.security.seccomp = self.seccomp(linux.seccomp.take())?;
         isolation.hostname = config.hostname.filter(|name| !name.is_empty());
@@ -574,7 +612,8 @@ impl Reader<'_> {
                 "mount" => namespaces.push(Namespace::Mount),
                 "uts" => namespaces.push(Namespace::Uts),
                 "ipc" => namespaces.push(Namespace::Ipc),
-                later @ ("network" | "user" | "cgroup" | "time") => self.refuse(
+                "user" => namespaces.push(Namespace::User),
+                later @ ("network" | "cgroup" | "time") => self.refuse(
                     &format!("linux.namespaces ({later})"),
                     "this namespace comes in a later version",
                 ),
@@ -586,6 +625,55 @@ impl Reader<'_> {
             }
         }
         Ok(namespaces)
+    }
+
+    /// `linux.uidMappings` and `linux.gidMappings`, which a `user` namespace
+    /// needs and nothing else may have. Each entry is
+    /// `{containerID, hostID, size}`; other fields are ignored, as the spec
+    /// says. The maps are checked as the kernel would.
+    fn id_maps(&mut self, linux: &LinuxConfig, user: bool) -> Result<Option<IdMaps>, BundleError> {
+        let given = !linux.uid_mappings.is_empty() || !linux.gid_mappings.is_empty();
+        if !user && !given {
+            return Ok(None);
+        }
+        if !user {
+            return Err(self.invalid(
+                "linux.uidMappings/gidMappings need a user namespace in linux.namespaces",
+            ));
+        }
+        if !given {
+            return Err(
+                self.invalid("a user namespace needs linux.uidMappings and linux.gidMappings")
+            );
+        }
+        let maps = IdMaps {
+            uids: self.mappings("linux.uidMappings", &linux.uid_mappings)?,
+            gids: self.mappings("linux.gidMappings", &linux.gid_mappings)?,
+        };
+        maps.validate()
+            .map_err(|err| self.invalid(format!("linux.uidMappings/gidMappings: {err}")))?;
+        if maps.maps_host_root() {
+            self.warnings.push(format!(
+                "{}: linux.uidMappings/gidMappings map host ID 0: a user inside is root on the \
+                 host's files, which a user namespace is meant to prevent",
+                self.path.display()
+            ));
+        }
+        Ok(Some(maps))
+    }
+
+    /// One of the two mapping lists, each entry read on its own so an error
+    /// names it.
+    fn mappings(&self, field: &str, entries: &[Value]) -> Result<Vec<IdMap>, BundleError> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                MappingConfig::deserialize(entry)
+                    .map(IdMap::from)
+                    .map_err(|err| self.invalid(format!("{field}[{index}]: {err}")))
+            })
+            .collect()
     }
 
     /// `root.path`: relative to the bundle, and made canonical.
@@ -607,12 +695,6 @@ impl Reader<'_> {
                 "linux.rootfsPropagation",
                 &format!("\"{other}\" would let the container's mounts reach the host"),
             ),
-        }
-        if !linux.uid_mappings.is_empty() || !linux.gid_mappings.is_empty() {
-            self.refuse(
-                "linux.uidMappings/gidMappings",
-                "user namespaces come in a later version",
-            );
         }
         if linux
             .resources
@@ -924,6 +1006,101 @@ mod tests {
     }
 
     #[test]
+    fn a_user_namespace_and_its_mappings_are_the_configs() {
+        let mut linux = config(&json!({}))["linux"].clone();
+        linux["namespaces"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "user"}));
+        linux["uidMappings"] = json!([
+            {"containerID": 0, "hostID": 1000, "size": 1, "comment": "ignored"},
+            {"containerID": 1, "hostID": 100_000, "size": 65536}
+        ]);
+        linux["gidMappings"] = json!([{"containerID": 0, "hostID": 1000, "size": 1}]);
+        let loaded = TestBundle::new(&config(&json!({"linux": linux})))
+            .load()
+            .unwrap();
+        assert!(loaded.isolation.has(Namespace::User));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let maps = loaded.isolation.id_maps.unwrap();
+        assert_eq!(maps.uids.len(), 2);
+        assert_eq!(maps.uids[1].host, 100_000);
+        assert_eq!(maps.gids.len(), 1);
+    }
+
+    /// Mappings that include host root are allowed (as root), but warned
+    /// about, as `--uidmap` is.
+    #[test]
+    fn mapping_host_root_warns() {
+        let mut linux = config(&json!({}))["linux"].clone();
+        linux["namespaces"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "user"}));
+        let all = json!([{"containerID": 0, "hostID": 0, "size": 65536}]);
+        linux["uidMappings"] = all.clone();
+        linux["gidMappings"] = all;
+        let loaded = TestBundle::new(&config(&json!({"linux": linux})))
+            .load()
+            .unwrap();
+        assert!(
+            loaded.warnings.iter().any(|w| w.contains("map host ID 0")),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn user_namespaces_and_mappings_must_agree_and_be_valid() {
+        let with = |namespaces: serde_json::Value, extra: serde_json::Value| {
+            let mut linux = config(&json!({}))["linux"].clone();
+            linux["namespaces"] = namespaces;
+            for (key, value) in extra.as_object().unwrap() {
+                linux[key] = value.clone();
+            }
+            TestBundle::new(&config(&json!({"linux": linux})))
+                .load()
+                .unwrap_err()
+                .to_string()
+        };
+        let standard = json!([{"type": "pid"}, {"type": "mount"}]);
+        let with_user = json!([{"type": "pid"}, {"type": "mount"}, {"type": "user"}]);
+        let one = json!([{"containerID": 0, "hostID": 1000, "size": 1}]);
+        for (namespaces, extra, wanted) in [
+            (
+                with_user.clone(),
+                json!({}),
+                "a user namespace needs linux.uidMappings and linux.gidMappings",
+            ),
+            (
+                standard,
+                json!({"uidMappings": one.clone(), "gidMappings": one.clone()}),
+                "need a user namespace",
+            ),
+            (
+                with_user.clone(),
+                json!({"uidMappings": [{"containerID": 0, "hostID": -1, "size": 1}],
+                       "gidMappings": one.clone()}),
+                "linux.uidMappings[0]:",
+            ),
+            (
+                with_user.clone(),
+                json!({"uidMappings": [{"containerID": 1, "hostID": 1000, "size": 1}],
+                       "gidMappings": one.clone()}),
+                "linux.uidMappings/gidMappings: the uid_map must map ID 0",
+            ),
+            (
+                json!([{"type": "pid"}, {"type": "mount"}, {"type": "user", "path": "/proc/1/ns/user"}]),
+                json!({}),
+                "linux.namespaces (user, path)",
+            ),
+        ] {
+            let err = with(namespaces, extra);
+            assert!(err.contains(wanted), "{wanted}: {err}");
+        }
+    }
+
+    #[test]
     fn seccomp_is_the_configs_and_absent_means_none() {
         let absent = TestBundle::new(&config(&json!({}))).load().unwrap();
         assert_eq!(absent.isolation.security.seccomp, Seccomp::Unconfined);
@@ -1109,7 +1286,6 @@ mod tests {
                     {"type": "pid"}, {"type": "mount"}, {"type": "network"},
                     {"type": "uts", "path": "/proc/1/ns/uts"}
                 ],
-                "uidMappings": [{"containerID": 0, "hostID": 1000, "size": 1}],
                 "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"},
                 "resources": {"devices": [{"allow": false, "access": "rwm"}]},
                 "devices": [{"path": "/dev/fuse", "type": "c", "major": 10, "minor": 229}],
@@ -1140,7 +1316,6 @@ mod tests {
             "linux.timeOffsets",
             "linux.namespaces (network)",
             "linux.namespaces (uts, path)",
-            "linux.uidMappings",
             "linux.resources",
             "linux.devices",
             "linux.mountLabel",
@@ -1308,7 +1483,11 @@ mod tests {
         let bundle = TestBundle::new(&json!({}));
         let path = bundle.dir.join("config.json");
         std::fs::remove_file(&path).unwrap();
-        assert!(matches!(bundle.load(), Err(BundleError::Read { .. })));
+        let err = bundle.load().unwrap_err();
+        assert!(matches!(err, BundleError::Read { .. }));
+        // The reason is in the message, not also its cause: printed as a
+        // chain (the CLI does), it would appear twice.
+        assert!(std::error::Error::source(&err).is_none());
         // A FIFO: reading it would wait for a writer forever.
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap();
         assert!(matches!(bundle.load(), Err(BundleError::NotAFile { .. })));

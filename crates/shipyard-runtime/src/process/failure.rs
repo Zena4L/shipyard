@@ -73,6 +73,8 @@ pub(crate) enum ChildStep {
     SeccompCompile = 47,
     NamespaceRoot = 48,
     UnmappedId = 49,
+    GroupsDenied = 50,
+    SessionKeyring = 51,
 }
 
 impl ChildStep {
@@ -130,6 +132,8 @@ impl ChildStep {
             47 => Self::SeccompCompile,
             48 => Self::NamespaceRoot,
             49 => Self::UnmappedId,
+            50 => Self::GroupsDenied,
+            51 => Self::SessionKeyring,
             _ => return None,
         })
     }
@@ -165,6 +169,9 @@ pub(crate) struct FailureContext {
     /// When the command's seccomp filter goes on, if it has one: a failure
     /// after that may be the filter refusing a call.
     pub(crate) seccomp: Option<FilterStart>,
+    /// In a user namespace: the host user the container's root is. The
+    /// host's permissions apply to it, not to host root.
+    pub(crate) namespace_root: Option<u32>,
 }
 
 /// When a command's seccomp filter goes on (see `child.rs`).
@@ -206,6 +213,7 @@ impl FilterStart {
                     | ChildStep::SetGroups
                     | ChildStep::SetGid
                     | ChildStep::SetUid
+                    | ChildStep::VerifyCredentials
                     | ChildStep::Capset
                     | ChildStep::AmbientRaise
                     | ChildStep::NoNewPrivs
@@ -342,9 +350,27 @@ pub(crate) fn describe(failure: ChildFailure, ctx: &FailureContext) -> SpawnErro
     let refused_by_filter = failure.errno == Errno::EPERM
         && ctx.seccomp.is_some_and(|start| start.covers(failure.step));
     if refused_by_filter {
-        error.noting("the seccomp profile, in force by then, may have refused it")
+        return error.noting("the seccomp profile, in force by then, may have refused it");
+    }
+    // Host root could; the user the container's root really is can't.
+    // (`exec`'s EACCES isn't always about permissions: `describe_exec`
+    // notes it where it is.)
+    if failure.errno == Errno::EACCES && failure.step != ChildStep::Exec {
+        namespace_root_note(error, ctx)
     } else {
         error
+    }
+}
+
+/// `error`, noting who the container's root is on the host, in a user
+/// namespace: the host's permissions apply to that user, not to root.
+fn namespace_root_note(error: SpawnError, ctx: &FailureContext) -> SpawnError {
+    match ctx.namespace_root {
+        Some(host) => error.noting(&format!(
+            "in its user namespace, the container's root is host user {host}, and the host's \
+             permissions apply to it"
+        )),
+        None => error,
     }
 }
 
@@ -382,6 +408,7 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         }
         ChildStep::MountProc => isolation_setup("mounting /proc for the container", errno, ctx),
         ChildStep::Hostname => isolation_setup("setting the container's hostname", errno, ctx),
+        ChildStep::SessionKeyring => SpawnError::new(Setup, describe_keyring(errno), errno),
         ChildStep::InitFork => {
             isolation_setup("starting the command inside the container", errno, ctx)
         }
@@ -410,7 +437,8 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::Seccomp
         | ChildStep::SeccompCompile
         | ChildStep::NamespaceRoot
-        | ChildStep::UnmappedId => describe_confinement(step, errno, detail),
+        | ChildStep::UnmappedId
+        | ChildStep::GroupsDenied => describe_confinement(step, errno, detail),
         ChildStep::BindRoot
         | ChildStep::RootTarget
         | ChildStep::MountSys
@@ -477,41 +505,107 @@ fn describe_confinement(step: ChildStep, errno: Errno, detail: u64) -> SpawnErro
             doing("installing the seccomp filter", errno)
         ),
         ChildStep::Seccomp => doing("installing the seccomp filter", errno),
-        ChildStep::NamespaceRoot => doing(
-            match detail {
-                1 => "dropping supplementary groups in the container's user namespace",
-                2 => "becoming group 0 in the container's user namespace",
-                _ => "becoming root in the container's user namespace",
-            },
-            errno,
-        ),
+        ChildStep::NamespaceRoot => doing(NamespaceRootStep::doing(detail), errno),
         ChildStep::UnmappedId => describe_unmapped(detail),
+        ChildStep::GroupsDenied => format!(
+            "supplementary group {detail} can't be set: the container's user namespace denies \
+             setgroups (a rootless container that maps only your own IDs, which ranges in \
+             /etc/subuid and /etc/subgid with newuidmap installed avoid; or shipyard started \
+             inside a user namespace that denies it)"
+        ),
         // The other steps are `describe`'s.
         _ => doing("confining the command", errno),
     };
     SpawnError::new(SpawnErrorKind::Setup, message, errno)
 }
 
-/// The detail of an [`ChildStep::UnmappedId`] failure: which ID (1 the
-/// user, 2 the group, 3 a supplementary group) in the high 32 bits, the ID
-/// in the low.
-#[must_use]
-pub(crate) fn unmapped_detail(which: u8, id: u32) -> usize {
-    usize::try_from((u64::from(which) << 32) | u64::from(id)).unwrap_or(usize::MAX)
+/// Which of the command's IDs a [`ChildStep::UnmappedId`] failure is
+/// about: the high 32 bits of its detail (the ID is the low 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum UnmappedId {
+    User = 1,
+    Group = 2,
+    SupplementaryGroup = 3,
+}
+
+impl UnmappedId {
+    /// The failure's detail for `id`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn detail(self, id: u32) -> usize {
+        usize::try_from((u64::from(self as u8) << 32) | u64::from(id)).unwrap_or(usize::MAX)
+    }
+
+    /// Which ID, and the ID, from a failure's detail.
+    fn from_detail(detail: u64) -> (Self, u64) {
+        let which = match detail >> 32 {
+            1 => Self::User,
+            2 => Self::Group,
+            _ => Self::SupplementaryGroup,
+        };
+        (which, detail & u64::from(u32::MAX))
+    }
+}
+
+/// Which call of [`ChildStep::NamespaceRoot`] failed (`setgroups`,
+/// `setresgid`, `setresuid`): its detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux's child makes them")
+)]
+pub(crate) enum NamespaceRootStep {
+    Groups = 1,
+    Gid = 2,
+    Uid = 3,
+}
+
+impl NamespaceRootStep {
+    /// The failure's detail.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn detail(self) -> usize {
+        usize::from(self as u8)
+    }
+
+    /// What it was doing, from a failure's detail.
+    fn doing(detail: u64) -> &'static str {
+        if detail == Self::Groups as u64 {
+            "dropping supplementary groups in the container's user namespace"
+        } else if detail == Self::Gid as u64 {
+            "becoming group 0 in the container's user namespace"
+        } else {
+            "becoming root in the container's user namespace"
+        }
+    }
 }
 
 /// An ID the container's user namespace doesn't map.
 fn describe_unmapped(detail: u64) -> String {
-    let id = detail & u64::from(u32::MAX);
-    let (what, flag) = match detail >> 32 {
-        1 => ("user", "--uidmap"),
-        2 => ("group", "--gidmap"),
-        _ => ("supplementary group", "--gidmap"),
+    let (which, id) = UnmappedId::from_detail(detail);
+    let (what, map) = match which {
+        UnmappedId::User => ("user", "uid"),
+        UnmappedId::Group => ("group", "gid"),
+        UnmappedId::SupplementaryGroup => ("supplementary group", "gid"),
     };
     format!(
         "{what} {id} isn't mapped in the container's user namespace: there it doesn't exist \
-         ({flag} says which IDs do)"
+         (its {map} map comes from --{map}map, or for a rootless container from your \
+         /etc/sub{map} range)"
     )
+}
+
+/// A container's session keyring that couldn't be made.
+fn describe_keyring(errno: Errno) -> String {
+    let doing = doing("giving the container a session keyring of its own", errno);
+    if errno == Errno::EDQUOT {
+        format!(
+            "{doing} (this user has as many keys as the kernel allows: see the sysctls \
+             kernel.keys.maxkeys and maxbytes, or root_maxkeys and root_maxbytes for root)"
+        )
+    } else {
+        doing
+    }
 }
 
 /// What was being done, and the errno's reason.
@@ -789,21 +883,25 @@ fn describe_exec(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError 
         }
         Errno::EACCES => {
             let resolved = ctx.resolve(candidate);
-            let message = if resolved.is_dir() {
-                format!("{path}: is a directory")
-            } else if !resolved.exists() {
+            if resolved.is_dir() {
+                return SpawnError::new(CannotExecute, format!("{path}: is a directory"), errno);
+            }
+            if on_noexec_mount(&resolved) {
+                let message = format!(
+                    "{path}: permission denied (the file system it's on is mounted noexec, \
+                     which forbids running programs from it)"
+                );
+                return SpawnError::new(CannotExecute, message, errno);
+            }
+            // The rest is about permissions.
+            let message = if resolved.exists() {
+                format!("{path}: permission denied (is it executable?)")
+            } else {
                 // `exists` follows the same path, so this also catches a
                 // file shipyard can see but the command's user can't reach.
                 format!("{path}: permission denied (a directory on the way isn't searchable)")
-            } else if on_noexec_mount(&resolved) {
-                format!(
-                    "{path}: permission denied (the file system it's on is mounted noexec, \
-                     which forbids running programs from it)"
-                )
-            } else {
-                format!("{path}: permission denied (is it executable?)")
             };
-            SpawnError::new(CannotExecute, message, errno)
+            namespace_root_note(SpawnError::new(CannotExecute, message, errno), ctx)
         }
         Errno::ENOEXEC => SpawnError::new(
             CannotExecute,
@@ -871,6 +969,7 @@ mod tests {
             names: Names::default(),
             sysctls: Vec::new(),
             seccomp: None,
+            namespace_root: None,
         }
     }
 
@@ -890,7 +989,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 49, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 51, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -1025,6 +1124,67 @@ mod tests {
             fail(ChildStep::SeccompCompile, Errno::EINVAL, 0),
             "the seccomp profile can't be compiled"
         );
+        assert_eq!(
+            fail(
+                ChildStep::NamespaceRoot,
+                Errno::EPERM,
+                NamespaceRootStep::Uid as u64
+            ),
+            "becoming root in the container's user namespace: Operation not permitted"
+        );
+        #[cfg(target_os = "linux")]
+        for (which, id, wanted) in [
+            (UnmappedId::User, 70000, "user 70000 isn't mapped"),
+            (UnmappedId::Group, 5, "group 5 isn't mapped"),
+            (
+                UnmappedId::SupplementaryGroup,
+                4_000_000_000,
+                "supplementary group 4000000000 isn't mapped",
+            ),
+        ] {
+            let detail = u64::try_from(which.detail(id)).unwrap();
+            let message = fail(ChildStep::UnmappedId, Errno::EINVAL, detail);
+            assert!(message.starts_with(wanted), "{message}");
+        }
+    }
+
+    /// In a user namespace, a permission error names the host user the
+    /// container's root is.
+    #[test]
+    fn permission_errors_in_a_user_namespace_name_the_mapped_root() {
+        let with = |namespace_root, errno| {
+            let ctx = FailureContext {
+                namespace_root,
+                ..ctx("/x", &["/x"])
+            };
+            describe(
+                ChildFailure {
+                    step: ChildStep::BindRoot,
+                    errno,
+                    detail: 0,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        let note = "the container's root is host user 100000";
+        assert!(with(Some(100_000), Errno::EACCES).contains(note));
+        assert!(!with(Some(100_000), Errno::ENOENT).contains(note));
+        assert!(!with(None, Errno::EACCES).contains("host user"));
+
+        // `exec`'s EACCES is noted only where it's about permissions: not
+        // for a directory.
+        let exec_of = |program: &str| {
+            let ctx = FailureContext {
+                namespace_root: Some(100_000),
+                ..ctx(program, &[program])
+            };
+            exec(Errno::EACCES, 0, &ctx).to_string()
+        };
+        let directory = exec_of("/");
+        assert!(directory.ends_with("is a directory"), "{directory}");
+        let unreachable = exec_of("/nonexistent/program");
+        assert!(unreachable.contains(note), "{unreachable}");
     }
 
     /// A failure under the filter, with EPERM, may be the filter's refusal:
@@ -1058,6 +1218,25 @@ mod tests {
         assert!(!with(None, ChildStep::Exec, Errno::EPERM).contains(note));
         assert!(!with(early, ChildStep::Exec, Errno::EACCES).contains(note));
         assert!(!with(early, ChildStep::Seccomp, Errno::EPERM).contains(note));
+    }
+
+    /// A keyring quota failure names the limits to look at.
+    #[test]
+    fn a_keyring_quota_names_the_limits() {
+        let keyring = describe(
+            ChildFailure {
+                step: ChildStep::SessionKeyring,
+                errno: Errno::EDQUOT,
+                detail: 0,
+            },
+            &ctx("/x", &["/x"]),
+        )
+        .to_string();
+        assert!(
+            keyring.starts_with("giving the container a session keyring of its own: ")
+                && keyring.contains("kernel.keys.maxkeys"),
+            "{keyring}"
+        );
     }
 
     #[test]

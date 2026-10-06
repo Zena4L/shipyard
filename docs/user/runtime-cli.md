@@ -30,9 +30,7 @@ Runs containers from OCI bundles, one lifecycle step per call
 
 ###### **Options:**
 
-* `--root <DIR>` — Directory for the containers' state
-
-  Default value: `/run/shipyard`
+* `--root <DIR>` — Directory for the containers' state [default: `/run/shipyard` for root, `$XDG_RUNTIME_DIR/shipyard` for anyone else]
 * `--log <FILE>` — Also write errors and warnings to FILE (as runc's callers ask for)
 * `--log-format <FORMAT>` — The log file's format: text or json
 

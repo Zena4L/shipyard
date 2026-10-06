@@ -6,11 +6,11 @@ describes and `runc` implements. Container engines and the OCI conformance tests
 a runtime this way, and you can too:
 
 ```sh
-sudo shipyard-runtime create --bundle ./mybundle web   # set up, not running yet
-sudo shipyard-runtime state web                        # "status": "created"
-sudo shipyard-runtime start web                        # its program runs
-sudo shipyard-runtime kill web TERM                    # ask it to stop
-sudo shipyard-runtime delete web                       # remove it once stopped
+shipyard-runtime create --bundle ./mybundle web   # set up, not running yet
+shipyard-runtime state web                        # "status": "created"
+shipyard-runtime start web                        # its program runs
+shipyard-runtime kill web TERM                    # ask it to stop
+shipyard-runtime delete web                       # remove it once stopped
 ```
 
 The bundle is the same as for `shipyard run --bundle`; see [OCI bundles](bundles.md)
@@ -18,8 +18,11 @@ for what its `config.json` may contain, with one more requirement: a `pid` names
 Without one, the runtime couldn't find or stop all of the container's processes (that
 needs cgroups, which come later), so `create` refuses the bundle. What the bundle asks
 for that is ignored is said on stderr (`shipyard-runtime: warning: …`) and in the
-`--log`. Like any isolated run, it needs root and Linux. On macOS, `shipyard-runtime`
-says so and exits.
+`--log`. It needs Linux: on macOS, `shipyard-runtime` says so and exits.
+
+**Without root, containers are rootless**, as with `shipyard run`: the bundle runs in
+a user namespace (added if it has none, with a warning). See
+[Rootless bundles](bundles.md#rootless-bundles).
 
 ## The commands
 
@@ -31,9 +34,15 @@ says so and exits.
 | `kill ID [SIGNAL]` | Sends a signal (default `TERM`; a name like `KILL` or `SIGKILL`, or a number) to a *created* or *running* container. Not `STOP` (see below). |
 | `delete [--force] ID` | Removes a *stopped* container. A *created* one is killed first. A *running* one only with `--force`, which kills it first. |
 
-Every command takes `--root DIR`: where the containers' state is kept (default
-`/run/shipyard`). `--log FILE` and `--log-format text|json` also write errors and
-warnings to FILE, as `runc`'s callers expect.
+Every command takes `--root DIR`: where the containers' state is kept. The default is
+`/run/shipyard` for root, and `$XDG_RUNTIME_DIR/shipyard` for anyone else (as with
+runc and Podman: a directory of yours that your login session creates, and removes when
+you log out). Without `XDG_RUNTIME_DIR` (after `su`, say), or with one that isn't an
+absolute path to a directory of yours, give `--root`: the command says so rather than
+guess a place. So `sudo shipyard-runtime …` and
+`shipyard-runtime …` keep separate state: each sees only its own containers ("no
+container with ID …" from the other). `--log FILE` and `--log-format text|json` also
+write errors and warnings to FILE, as `runc`'s callers expect.
 
 A command that fails prints `shipyard-runtime: …` and exits with code 1. A command
 line it can't parse (an unknown option, a missing ID, a signal it doesn't know)
@@ -83,7 +92,7 @@ The container's **standard input, output and error are `create`'s**. Redirect th
 when you create it:
 
 ```sh
-sudo shipyard-runtime create --bundle ./mybundle web > web.log 2>&1
+shipyard-runtime create --bundle ./mybundle web > web.log 2>&1
 ```
 
 **Created from a terminal, a container keeps that terminal.** Its program writes to
@@ -101,7 +110,7 @@ container stops with exit code 127.
 
 ## The state directory
 
-Each container has a directory `ROOT/ID` (only root can read it):
+Each container has a directory `ROOT/ID` (only its owner can read it):
 
 | File | What it is |
 |---|---|
@@ -120,7 +129,7 @@ A container deleted and created again at once is the new one: the old container'
 monitor writes nothing into the new one's directory.
 
 **The state root must be yours alone:** a real directory (not a symbolic link), owned
-by the user running the command (root, for `create`), that nobody else can write to.
+by the user running the command, that nobody else can write to.
 Otherwise every command refuses it, since another user could plant files where the
 runtime reads and deletes.
 

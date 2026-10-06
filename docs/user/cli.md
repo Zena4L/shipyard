@@ -57,7 +57,7 @@ Run a command in a container: on Linux, isolated in namespaces, optionally with 
 * `--stop-timeout <SECONDS>` — Seconds to wait after the stop signal before killing the command
 
   Default value: `10`
-* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname and IPC. On Linux, commands are isolated by default (which needs root); on macOS they always run like this for now
+* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname and IPC, as you. On Linux, commands are isolated by default (rootless, in a user namespace, without root); on macOS they always run like this for now
 * `--hostname <NAME>` — Hostname inside the container (Linux)
 * `--domainname <NAME>` — NIS domain name inside the container (Linux)
 * `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux; IPC settings only)
@@ -66,6 +66,8 @@ Run a command in a container: on Linux, isolated in namespaces, optionally with 
 * `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
 * `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
 * `--security-opt <OPTION>` — A security option: `no-new-privileges=false` lets setuid programs inside gain privileges (they can't by default); `seccomp=FILE` filters system calls with a profile of your own, `seccomp=unconfined` not at all (Docker's profile by default). Repeatable (Linux)
+* `--uidmap <CONTAINER:HOST:SIZE>` — Run in a user namespace: container IDs CONTAINER.. are host IDs HOST.., SIZE of them, e.g. 0:100000:65536 (root inside is host user 100000). Repeatable (Linux, root only: without root, the maps are chosen for you)
+* `--gidmap <CONTAINER:HOST:SIZE>` — The same for group IDs; the --uidmap ranges if not given (Linux)
 * `--bundle <DIR>` — Run the OCI bundle in DIR: its config.json says what to run and how, so no COMMAND or container options are given (Linux)
 
 

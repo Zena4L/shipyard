@@ -15,9 +15,11 @@
 # capabilities, so it sees what an unprivileged user would. For development
 # only: never run untrusted code this way.
 #
-# Nothing is installed in the container: the image has what the tests use
-# (`setpriv` and `useradd` from util-linux, `pgrep` and `ps` from procps), so
-# the run needs no network. `--init` gives the container a PID 1 that reaps
+# The image is `rust:1-bookworm` plus what the user-namespace tests need
+# (scripts/test-image/Dockerfile: `newuidmap`, and a `tester` user with
+# subordinate IDs). It's built the first time, which needs network, and again
+# only when the Dockerfile changes (its tag is the file's hash); after that,
+# runs need no network. `--init` gives the container a PID 1 that reaps
 # orphans: the terminal tests kill processes and wait for them to be gone,
 # and a PID 1 that never reaps (a plain `timeout`, say) leaves them zombies.
 #
@@ -27,8 +29,18 @@
 #   docker volume rm shipyard-linux-target shipyard-linux-cargo shipyard-linux-rustup
 set -euo pipefail
 
-image=rust:1-bookworm
 repo=$(cd "$(dirname "$0")/.." && pwd)
+dockerfile="$repo/scripts/test-image/Dockerfile"
+if command -v sha256sum >/dev/null; then
+    hash=$(sha256sum "$dockerfile")
+else
+    hash=$(shasum -a 256 "$dockerfile")
+fi
+image="shipyard-test:${hash:0:12}"
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo "building the test image $image (once; needs network)" >&2
+    docker build --quiet --tag "$image" - <"$dockerfile" >/dev/null
+fi
 
 mode=test
 case "${1:-}" in
@@ -45,8 +57,7 @@ esac
 read -r -d '' inside <<'EOF' || true
 set -euo pipefail
 
-# A normal user for the main run.
-id tester >/dev/null 2>&1 || useradd --create-home tester
+# `tester`, the image's normal user, owns the build volumes.
 chown -R tester /target /usr/local/cargo /usr/local/rustup
 
 # Drops to `tester` (all its IDs, no capabilities: what an ordinary user

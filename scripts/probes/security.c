@@ -1,7 +1,7 @@
 /*
  * Kernel checks behind a container's confinement (stage 4): capabilities,
- * no_new_privs, seccomp, user namespaces, and what root without capabilities
- * can still reach. Each line of output answers one question;
+ * no_new_privs, seccomp, user namespaces, what root without capabilities
+ * can still reach, and session keyrings. Each line of output answers one question;
  * docs/stages/04-security.md records the results.
  *
  * Every check runs in a forked child, so the credentials, capabilities and
@@ -25,6 +25,7 @@
 #include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/filter.h>
+#include <linux/keyctl.h>
 #include <linux/seccomp.h>
 #include <sched.h>
 #include <stddef.h>
@@ -354,6 +355,93 @@ static void check_userns(void) {
     waitpid(c, NULL, 0);
 }
 
+/* --- Session keyrings (keyrings(7), keyctl(2)) ---------------------------------- */
+
+/* This process's session keyring serial (without creating one), or -errno. */
+static long session_keyring(void) {
+    long id = syscall(SYS_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0);
+    return id < 0 ? -errno : id;
+}
+
+/* A new anonymous session keyring for this process: its serial, or -errno. */
+static long join_new_session_keyring(void) {
+    long id = syscall(SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, NULL);
+    return id < 0 ? -errno : id;
+}
+
+static void print_keyring(const char *label, long id) {
+    if (id < 0) printf("%s %s\n", label, strerror(-id));
+    else printf("%s %ld\n", label, id);
+}
+
+static void check_keyring_join(void) {
+    long before = session_keyring();
+    long joined = join_new_session_keyring();
+    print_keyring("K1 session keyring before:", before);
+    print_keyring("K1 after KEYCTL_JOIN_SESSION_KEYRING(NULL):", joined);
+    printf("K1 a new one: %s\n", joined > 0 && joined != before ? "yes" : "NO");
+    printf("K2 after fork and exec, the child's:\n");
+    pid_t child = fork();
+    if (child == 0) {
+        execl("/proc/self/exe", "security", "keyring", "K2", (char *)NULL);
+        _exit(127);
+    }
+    waitpid(child, NULL, 0);
+}
+
+static void check_keyring_in_userns(void) {
+    if (become(NOBODY)) die("become");
+    long before = session_keyring();
+    if (unshare(CLONE_NEWUSER)) { printf("K3 unshare: %s\n", strerror(errno)); return; }
+    long joined = join_new_session_keyring();
+    print_keyring("K3 uid 65534 in a new user namespace (no maps), before:", before);
+    print_keyring("K3 joins a new one:", joined);
+}
+
+/* `keyctl` refused with EPERM, as Docker's profile does. */
+static int refuse_keyctl(void) {
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_keyctl, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog = { sizeof f / sizeof *f, f };
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return -1;
+    return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+}
+
+static void check_keyring_under_seccomp(void) {
+    if (refuse_keyctl()) { printf("K4 the filter: %s\n", strerror(errno)); return; }
+    print_keyring("K4 under a filter refusing keyctl, joining:", join_new_session_keyring());
+    print_keyring("K4 reading the inherited one:", session_keyring());
+}
+
+/* An ID nothing else uses: the quota K5 fills is per user, kernel-wide (not
+ * per container), and `nobody` is shared with real services on a host. The
+ * kernel frees the keys some seconds after the probe exits (its garbage
+ * collector), so a second run straight after finds the quota still full. */
+#define QUOTA_USER 3999999999u
+
+static void check_keyring_quota(void) {
+    if (become(QUOTA_USER)) die("become");
+    long own = join_new_session_keyring();
+    if (own == -EDQUOT) { printf("K5 the quota is still full from a run moments ago: wait a minute\n"); return; }
+    if (own < 0) { print_keyring("K5 joining:", own); return; }
+    int added = 0;
+    long rc;
+    char name[32];
+    for (;;) {
+        snprintf(name, sizeof name, "k%d", added);
+        rc = syscall(SYS_add_key, "user", name, "x", 1, KEY_SPEC_SESSION_KEYRING);
+        if (rc < 0) break;
+        added++;
+        if (added > 100000) break;
+    }
+    printf("K5 uid %u adds keys until: %s, after %d\n", QUOTA_USER, rc < 0 ? strerror(errno) : "no limit?!", added);
+    print_keyring("K5 then joining a new session keyring:", join_new_session_keyring());
+}
+
 /* --- What root without CAP_SYS_PTRACE can reach --------------------------------- */
 
 static void check_proc1(void) {
@@ -418,6 +506,10 @@ static int show_main(const char *label) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc >= 3 && strcmp(argv[1], "show") == 0) return show_main(argv[2]);
+    if (argc >= 3 && strcmp(argv[1], "keyring") == 0) {
+        print_keyring("   child's session keyring:", session_keyring());
+        return 0;
+    }
     /* Run setuid (the copy, by anyone), it only ever reports: otherwise any
      * user could run the root-only checks through a leftover copy. */
     if (getuid() != geteuid() || getgid() != getegid()) {
@@ -451,6 +543,10 @@ int main(int argc, char **argv) {
     in_child(check_seccomp_report);
     in_child(check_userns);
     in_child(check_proc1);
+    in_child(check_keyring_join);
+    in_child(check_keyring_in_userns);
+    in_child(check_keyring_under_seccomp);
+    in_child(check_keyring_quota);
     if (chdir("/") || umount2(scratch, MNT_DETACH) || rmdir(scratch)) die("removing the scratch directory");
     printf("scratch files removed: %s\n", access(scratch, F_OK) ? "yes" : "NO");
     return 0;

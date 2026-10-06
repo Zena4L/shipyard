@@ -11,7 +11,7 @@
 //!
 //! Profiles say what to allow in JSON (Docker's format, a superset of OCI's
 //! `linux.seccomp`, in [`Profile`]). Shipyard compiles them to BPF itself
-//! ([`compile`]), with no C library: names become this architecture's numbers
+//! ([`compile()`]), with no C library: names become this architecture's numbers
 //! (`syscalls.rs`, generated from the libc crate and the kernel's tables).
 
 mod bpf;

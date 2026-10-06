@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
-use shipyard_runtime::isolation::{Isolation, Root};
+use shipyard_runtime::isolation::{IdMap, IdMaps, Isolation, Namespace, Root, RootlessMaps};
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
@@ -49,8 +49,9 @@ pub(crate) struct RunArgs {
     stop_timeout: u64,
 
     /// Run without isolation: the command sees the host's processes, mounts,
-    /// hostname and IPC. On Linux, commands are isolated by default (which
-    /// needs root); on macOS they always run like this for now.
+    /// hostname and IPC, as you. On Linux, commands are isolated by default
+    /// (rootless, in a user namespace, without root); on macOS they always
+    /// run like this for now.
     #[arg(long)]
     no_isolation: bool,
 
@@ -94,6 +95,17 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "OPTION", value_parser = parse_security_opt, conflicts_with = "no_isolation")]
     security_opt: Vec<SecurityOpt>,
 
+    /// Run in a user namespace: container IDs CONTAINER.. are host IDs
+    /// HOST.., SIZE of them, e.g. 0:100000:65536 (root inside is host user
+    /// 100000). Repeatable (Linux, root only: without root, the maps are
+    /// chosen for you).
+    #[arg(long, value_name = "CONTAINER:HOST:SIZE", value_parser = parse_id_map, conflicts_with = "no_isolation")]
+    uidmap: Vec<IdMap>,
+
+    /// The same for group IDs; the --uidmap ranges if not given (Linux).
+    #[arg(long, value_name = "CONTAINER:HOST:SIZE", value_parser = parse_id_map, requires = "uidmap")]
+    gidmap: Vec<IdMap>,
+
     /// Run the OCI bundle in DIR: its config.json says what to run and how,
     /// so no COMMAND or container options are given (Linux).
     #[arg(
@@ -102,7 +114,7 @@ pub(crate) struct RunArgs {
         conflicts_with_all = [
             "command", "env", "workdir", "user", "group_add", "ulimit",
             "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
-            "cap_add", "cap_drop", "security_opt",
+            "cap_add", "cap_drop", "security_opt", "uidmap", "gidmap",
         ],
     )]
     bundle: Option<PathBuf>,
@@ -138,7 +150,7 @@ impl RunArgs {
         if let Some(dir) = &self.bundle {
             return from_bundle(dir, stop);
         }
-        let isolation = self.isolation()?;
+        let (isolation, short_maps) = self.isolation()?;
         let mut user = match self.user {
             Some((name, group)) => {
                 let mut user = User::named(name, group);
@@ -147,6 +159,9 @@ impl RunArgs {
                 user.names.memberships = isolation.is_some();
                 user
             }
+            // Root inside, as Docker and Podman (for a rootless caller, root
+            // inside is the caller); without isolation, the caller.
+            None if isolation.is_some() => User::new(0, 0),
             None => User::current(),
         };
         user.names.additional_groups = dedup(self.group_add);
@@ -163,11 +178,23 @@ impl RunArgs {
         spec.user = user;
         spec.rlimits = last_wins(self.ulimit);
         spec.validate()?;
+        let mut warnings: Vec<String> = short_maps.into_iter().collect();
+        if isolation
+            .as_ref()
+            .and_then(|isolation| isolation.id_maps.as_ref())
+            .is_some_and(IdMaps::maps_host_root)
+        {
+            warnings.push(
+                "--uidmap/--gidmap map host ID 0: a user inside is root on the host's files, \
+                 which a user namespace is meant to prevent"
+                    .to_owned(),
+            );
+        }
         Ok(Invocation {
             spec,
             stop,
             isolation,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 }
@@ -181,6 +208,10 @@ fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
             std::env::consts::OS
         );
     }
+    // Without root, it runs rootless (see `load_bundle_for_caller`).
+    #[cfg(target_os = "linux")]
+    let bundle = shipyard_runtime::oci::load_bundle_for_caller(dir)?;
+    #[cfg(not(target_os = "linux"))]
     let bundle = shipyard_runtime::oci::load_bundle(dir)?;
     Ok(Invocation {
         spec: bundle.spec,
@@ -194,9 +225,11 @@ impl RunArgs {
     /// The isolation for this run: the standard namespaces on Linux unless
     /// `--no-isolation`; none on macOS, where namespaces don't exist (yet:
     /// the VM comes in a later version).
-    fn isolation(&self) -> Result<Option<Isolation>> {
+    /// The isolation for this run, and a warning if a rootless caller's
+    /// user namespace maps fewer IDs than it could.
+    fn isolation(&self) -> Result<(Option<Isolation>, Option<String>)> {
         if self.no_isolation {
-            return Ok(None);
+            return Ok((None, None));
         }
         if !cfg!(target_os = "linux") {
             for (given, flag) in [
@@ -207,6 +240,7 @@ impl RunArgs {
                 (!self.cap_add.is_empty(), "--cap-add"),
                 (!self.cap_drop.is_empty(), "--cap-drop"),
                 (!self.security_opt.is_empty(), "--security-opt"),
+                (!self.uidmap.is_empty(), "--uidmap"),
             ] {
                 if given {
                     bail!(
@@ -216,13 +250,26 @@ impl RunArgs {
                 }
             }
             tracing::debug!("no namespaces on this system; running without isolation");
-            return Ok(None);
+            return Ok((None, None));
         }
         let mut isolation = Isolation::standard();
         isolation.hostname.clone_from(&self.hostname);
         isolation.domainname.clone_from(&self.domainname);
         isolation.sysctls.clone_from(&self.sysctl);
         isolation.security = self.security()?;
+        // Shipyard refuses to start setuid (`refuse_privileged_start`), so
+        // the real user is the effective one.
+        #[cfg(target_os = "linux")]
+        let (maps, short_maps) = self.user_namespace(
+            User::current().uid == 0,
+            shipyard_runtime::process::rootless_id_maps,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let (maps, short_maps) = (self.id_maps(), None);
+        isolation.id_maps = maps;
+        if isolation.id_maps.is_some() {
+            isolation.namespaces.push(Namespace::User);
+        }
         if let Some(dir) = &self.rootfs {
             // Absolute and without symlinks, as the runtime wants it; and a
             // mistyped path is caught here, with its name.
@@ -233,11 +280,54 @@ impl RunArgs {
             isolation.root = Some(root);
         }
         isolation.validate()?;
-        Ok(Some(isolation))
+        Ok((Some(isolation), short_maps))
     }
 }
 
 impl RunArgs {
+    /// The user namespace for this run, and why its maps are short if they
+    /// are: for root, the one `--uidmap` asks for (if any); for anyone else,
+    /// always one, with maps chosen for them by `rootless` (their own ID,
+    /// and their `/etc/subuid` ranges when the helpers are there).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux has user namespaces")
+    )]
+    fn user_namespace(
+        &self,
+        root: bool,
+        rootless: impl FnOnce() -> RootlessMaps,
+    ) -> Result<(Option<IdMaps>, Option<String>)> {
+        if root {
+            return Ok((self.id_maps(), None));
+        }
+        if !self.uidmap.is_empty() {
+            bail!(
+                "--uidmap and --gidmap need root: a rootless container's maps are chosen for \
+                 you (your own ID, and your range in /etc/subuid)"
+            );
+        }
+        let rootless = rootless();
+        Ok((Some(rootless.maps), rootless.shortfall))
+    }
+
+    /// The user namespace's maps, if `--uidmap` asks for one: `--gidmap`, or
+    /// the same ranges for groups.
+    fn id_maps(&self) -> Option<IdMaps> {
+        if self.uidmap.is_empty() {
+            return None;
+        }
+        let gids = if self.gidmap.is_empty() {
+            &self.uidmap
+        } else {
+            &self.gidmap
+        };
+        Some(IdMaps {
+            uids: self.uidmap.clone(),
+            gids: gids.clone(),
+        })
+    }
+
     /// The container's capabilities and `no_new_privs`, from Docker's default
     /// set and `--cap-drop`, `--cap-add` and `--security-opt`.
     fn security(&self) -> Result<Security> {
@@ -282,6 +372,11 @@ impl RunArgs {
         }
         Ok(security)
     }
+}
+
+fn parse_id_map(s: &str) -> Result<IdMap, String> {
+    s.parse()
+        .map_err(|err: shipyard_runtime::isolation::IdMapError| err.to_string())
 }
 
 /// `--cap-add` or `--cap-drop`: one capability, or all of them.
@@ -386,6 +481,7 @@ fn only_namespaces(isolation: &Isolation) -> bool {
         && isolation.domainname.is_none()
         && isolation.sysctls.is_empty()
         && isolation.security == Security::standard()
+        && isolation.id_maps.is_none()
 }
 
 /// Whether `err` is isolation going wrong (missing privileges, a refusal,
@@ -393,7 +489,10 @@ fn only_namespaces(isolation: &Isolation) -> bool {
 fn is_isolation_failure(err: &shipyard_runtime::Error) -> bool {
     use shipyard_runtime::Error;
     match err {
-        Error::IsolationNeedsRoot | Error::IsolationRefused | Error::InitDidNotStart { .. } => true,
+        Error::IsolationNeedsRoot
+        | Error::IsolationRefused
+        | Error::UserNamespacesRefused { .. }
+        | Error::InitDidNotStart { .. } => true,
         Error::Spawn(spawn) => spawn.kind() == process::SpawnErrorKind::Isolation,
         _ => false,
     }
@@ -596,12 +695,17 @@ mod tests {
     }
 
     #[test]
-    fn no_user_flag_keeps_the_current_user() {
-        let user = spec(&["true"]).user;
-        assert_eq!(
-            (user.uid, user.gid),
-            (User::current().uid, User::current().gid)
-        );
+    fn without_a_user_flag_isolated_runs_are_root_inside() {
+        let ids = |user: User| (user.uid, user.gid);
+        let current = ids(User::current());
+        assert_eq!(ids(spec(&["--no-isolation", "true"]).user), current);
+        // Isolated (on Linux): root inside, whoever runs shipyard.
+        let isolated = if cfg!(target_os = "linux") {
+            (0, 0)
+        } else {
+            current
+        };
+        assert_eq!(ids(spec(&["true"]).user), isolated);
     }
 
     #[test]
@@ -822,6 +926,63 @@ mod tests {
             .is_err()
         );
         assert!(parse(&["--bundle", ".", "--security-opt", "seccomp=unconfined"]).is_err());
+    }
+
+    #[test]
+    fn id_map_flags_parse_and_conflict() {
+        assert!(
+            parse(&["--gidmap", "0:1:1", "true"]).is_err(),
+            "--gidmap needs --uidmap"
+        );
+        assert!(parse(&["--uidmap", "0:1", "true"]).is_err());
+        assert!(parse(&["--no-isolation", "--uidmap", "0:1:1", "true"]).is_err());
+        assert!(parse(&["--bundle", ".", "--uidmap", "0:1:1"]).is_err());
+        if !cfg!(target_os = "linux") {
+            let err = parse(&["--uidmap", "0:100000:65536", "true"])
+                .unwrap()
+                .into_invocation()
+                .unwrap_err();
+            assert!(err.to_string().contains("--uidmap needs Linux"), "{err}");
+        }
+    }
+
+    /// Root's user namespace is the one `--uidmap` asks for (if any);
+    /// anyone else always gets one, with maps chosen for them, and may not
+    /// pass `--uidmap`.
+    #[test]
+    fn the_user_namespace_depends_on_who_runs() {
+        let range = |s: &str| s.parse::<IdMap>().unwrap();
+        let chosen = || RootlessMaps {
+            maps: IdMaps::single((1000, 1000)),
+            shortfall: Some("short".to_owned()),
+        };
+        let namespace =
+            |args: &[&str], root: bool| parse(args).unwrap().user_namespace(root, chosen);
+
+        let (maps, short) = namespace(&["--uidmap", "0:100000:65536", "true"], true).unwrap();
+        let maps = maps.unwrap();
+        assert_eq!(maps.uids, [range("0:100000:65536")]);
+        assert_eq!(maps.gids, maps.uids, "--gidmap defaults to --uidmap");
+        assert_eq!(short, None);
+        let args = [
+            "--uidmap",
+            "0:100000:1",
+            "--uidmap",
+            "1:200000:65535",
+            "--gidmap",
+            "0:300000:65536",
+            "true",
+        ];
+        let both = namespace(&args, true).unwrap().0.unwrap();
+        assert_eq!(both.uids.len(), 2);
+        assert_eq!(both.gids, [range("0:300000:65536")]);
+        assert_eq!(namespace(&["true"], true).unwrap(), (None, None), "rootful");
+
+        let (maps, short) = namespace(&["true"], false).unwrap();
+        assert_eq!(maps, Some(IdMaps::single((1000, 1000))), "rootless, always");
+        assert_eq!(short.as_deref(), Some("short"));
+        let err = namespace(&["--uidmap", "0:100000:65536", "true"], false).unwrap_err();
+        assert!(err.to_string().contains("need root"), "{err}");
     }
 
     #[test]

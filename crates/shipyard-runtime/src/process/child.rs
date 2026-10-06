@@ -28,6 +28,8 @@ use nix::unistd::{Gid, Pid, Uid, getpgrp, getpid, setpgid};
 
 use super::channel::encode;
 
+#[cfg(target_os = "linux")]
+use super::failure::NamespaceRootStep;
 use super::failure::{ChildStep, means_not_found};
 use super::plan::{ChildPlan, Credentials, FdSweep};
 use super::signal::MAX_SIGNAL;
@@ -129,7 +131,7 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     if let Some(reexec) = &plan.reexec {
         // First: a credential change clears the parent-death signal.
         if reexec.namespace_root {
-            become_namespace_root()?;
+            become_namespace_root(setgroups_allowed_here())?;
         }
         // The init must die with shipyard too: then the kernel kills the
         // whole namespace. The signal survives the exec below.
@@ -225,7 +227,7 @@ fn reset_signal_dispositions(keep_ignored: &[libc::c_int]) -> Result<(), Failure
 /// Waits for the parent's "go" (see `channel.rs`). End-of-file means the
 /// parent died before sending it: nobody is left to supervise the command,
 /// or to report to, so exit quietly.
-fn wait_for_go(pipe: RawFd) -> Result<(), Failure> {
+pub(super) fn wait_for_go(pipe: RawFd) -> Result<(), Failure> {
     let mut byte = 0u8;
     loop {
         // SAFETY: `read` is async-signal-safe; `byte` is one writable byte.
@@ -481,7 +483,9 @@ fn chdir(plan: &ChildPlan) -> Result<(), Errno> {
 /// in a test binary with other threads running.) This process has one
 /// thread, so the raw call is the whole change.
 fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
-    set_groups(&credentials.groups)?;
+    if let Some(groups) = &credentials.groups {
+        set_groups(groups)?;
+    }
     set_gid(credentials.gid)?;
     set_uid(credentials.uid)?;
     verify_credentials(credentials)
@@ -546,7 +550,7 @@ pub(super) fn confine_after_switch(confinement: &Confinement) -> Result<(), Fail
 /// `no_new_privs` or `CAP_SYS_ADMIN` (step 1's probe, S1). The raw system
 /// call, on a program compiled before the fork.
 #[cfg(target_os = "linux")]
-fn install_filter(filter: &SeccompFilter) -> Result<(), Failure> {
+pub(super) fn install_filter(filter: &SeccompFilter) -> Result<(), Failure> {
     // `Instruction` is the kernel's `struct sock_filter`, field for field.
     const _: () = assert!(
         size_of::<crate::security::seccomp::Instruction>() == size_of::<libc::sock_filter>()
@@ -592,18 +596,61 @@ fn prctl(option: libc::c_int, arg2: libc::c_ulong, arg3: libc::c_ulong) -> Resul
 /// capability in the namespace, but `execve` recomputes capabilities from
 /// the effective uid, and the clean image would start with none. As uid 0
 /// inside, the exec keeps them all (`capabilities(7)`). Raw system calls, as
-/// in [`switch_credentials`]. The detail says which call failed: 1 groups,
-/// 2 gid, 3 uid.
+/// in [`switch_credentials`]; the failure's detail names the call.
+///
+/// Without `setgroups` (denied in the namespace: see
+/// [`setgroups_allowed_here`]), the group list stays: the kernel would
+/// refuse the call.
 #[cfg(target_os = "linux")]
-fn become_namespace_root() -> Result<(), Failure> {
-    let failed = |which: usize| move |errno| Failure::at(ChildStep::NamespaceRoot, errno).detail(which);
-    // SAFETY: plain integer arguments; no list (size 0, NULL).
-    raw_result(unsafe { libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) })
-        .map_err(failed(1))?;
+fn become_namespace_root(setgroups: bool) -> Result<(), Failure> {
+    let failed = |call: NamespaceRootStep| {
+        move |errno| Failure::at(ChildStep::NamespaceRoot, errno).detail(call.detail())
+    };
+    if setgroups {
+        // SAFETY: plain integer arguments; no list (size 0, NULL).
+        raw_result(unsafe {
+            libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>())
+        })
+        .map_err(failed(NamespaceRootStep::Groups))?;
+    }
     // SAFETY: plain integer arguments.
-    raw_result(unsafe { libc::syscall(libc::SYS_setresgid, 0, 0, 0) }).map_err(failed(2))?;
+    raw_result(unsafe { libc::syscall(libc::SYS_setresgid, 0, 0, 0) })
+        .map_err(failed(NamespaceRootStep::Gid))?;
     // SAFETY: plain integer arguments.
-    raw_result(unsafe { libc::syscall(libc::SYS_setresuid, 0, 0, 0) }).map_err(failed(3))
+    raw_result(unsafe { libc::syscall(libc::SYS_setresuid, 0, 0, 0) })
+        .map_err(failed(NamespaceRootStep::Uid))
+}
+
+/// Whether this process's user namespace allows `setgroups`
+/// (`user_namespaces(7)`): its `/proc/self/setgroups` says `deny` when the
+/// map writer denied it (a rootless caller mapping only its own IDs, or
+/// `newgidmap` without a subordinate group range), and when an ancestor
+/// namespace did: a namespace created inside one that denies it can't allow
+/// it (`unshare -U -r`, say). Read, not inferred from the maps. Raw calls,
+/// for after the clone; a kernel without the file (before 3.19) has no such
+/// denial.
+#[cfg(target_os = "linux")]
+fn setgroups_allowed_here() -> bool {
+    // SAFETY: a valid C string; `open` is async-signal-safe.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/setgroups".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return true;
+    }
+    // A failed read leaves it zeroed: allowed, and `setgroups` itself then
+    // says whether it isn't.
+    let mut text = [0u8; 8];
+    // SAFETY: `text` is writable for its length; `read` and `close` are
+    // async-signal-safe.
+    unsafe {
+        libc::read(fd, text.as_mut_ptr().cast(), text.len());
+        libc::close(fd);
+    }
+    !text.starts_with(b"deny")
 }
 
 /// The raw `setgroups` system call (see [`switch_credentials`]).
@@ -670,7 +717,8 @@ fn raw_result(rc: libc::c_long) -> Result<(), Errno> {
 /// asked for.
 fn verify_credentials(credentials: &Credentials) -> Result<(), Failure> {
     let mismatch = || Failure::at(ChildStep::VerifyCredentials, Errno::EPERM);
-    if !ids_match(credentials) || !groups_match(&credentials.groups) {
+    let groups_ok = credentials.groups.as_deref().is_none_or(groups_match);
+    if !ids_match(credentials) || !groups_ok {
         return Err(mismatch());
     }
     // Dropping root must be permanent: getting it back has to fail.

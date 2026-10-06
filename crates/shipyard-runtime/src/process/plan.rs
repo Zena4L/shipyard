@@ -21,6 +21,8 @@ use super::rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
 use super::spawn::SpawnOptions;
 use super::spec::{ProcessSpec, SpecError, User};
 #[cfg(target_os = "linux")]
+use super::user_namespace::setgroups_allowed;
+#[cfg(target_os = "linux")]
 use crate::security::Confinement;
 use crate::{Error, Result};
 
@@ -145,8 +147,39 @@ pub(crate) struct Credentials {
     pub(crate) uid: Uid,
     pub(crate) gid: Gid,
     /// In the layout `setgroups` needs on this platform (see [`group_list`]).
-    /// Raw `gid_t`s, since that's what `setgroups` reads.
-    pub(crate) groups: Vec<libc::gid_t>,
+    /// Raw `gid_t`s, since that's what `setgroups` reads. `None`: leave the
+    /// list as it is (in a user namespace that denies `setgroups`).
+    pub(crate) groups: Option<Vec<libc::gid_t>>,
+}
+
+/// Whether a plan switches the command's user and groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux isolates, and has user namespaces")
+)]
+pub(crate) enum UserSwitch {
+    /// Not at all: an isolated run's parent-side plan, whose child re-execs
+    /// (the command's credentials are worked out inside the container).
+    None,
+    /// User, group and supplementary groups (as root).
+    Full,
+    /// User and group, but not the supplementary groups: a user namespace
+    /// that denies `setgroups`. None may be asked for.
+    WithoutGroups,
+}
+
+#[cfg(target_os = "linux")]
+impl UserSwitch {
+    /// The whole switch where the user namespace allows `setgroups`, and
+    /// without the groups where it denies it.
+    fn as_namespace_allows(setgroups_allowed: bool) -> Self {
+        if setgroups_allowed {
+            Self::Full
+        } else {
+            Self::WithoutGroups
+        }
+    }
 }
 
 /// The C type of a resource number: glibc declares its own enum type.
@@ -216,22 +249,35 @@ impl ChildPlan {
         reexec: Option<ReexecFds>,
         #[cfg(target_os = "linux")] join: Option<JoinSetup>,
     ) -> Result<(Self, FailureContext)> {
+        // An isolated run's child re-execs; the command's credentials are
+        // worked out inside, where its user is.
+        #[cfg(target_os = "linux")]
+        let switch = if options.placement.isolation().is_some() {
+            UserSwitch::None
+        } else {
+            // Shipyard may itself run in a user namespace that denies
+            // `setgroups` (started inside `unshare -U -r`, say).
+            UserSwitch::as_namespace_allows(setgroups_allowed())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let switch = UserSwitch::Full;
         let (plan, context) = Self::for_command(
             spec,
             options.keep_ignored.clone(),
             options.new_process_group,
             Some(handshake),
+            switch,
         )?;
         #[cfg(target_os = "linux")]
         let (plan, context) = (
             Self {
                 reexec: reexec
                     .map(|fds| {
-                        let in_user_namespace = options
+                        let namespace_root = options
                             .placement
                             .isolation()
                             .is_some_and(|isolation| isolation.id_maps.is_some());
-                        reexec_plan(fds, in_user_namespace)
+                        reexec_plan(fds, namespace_root)
                     })
                     .transpose()?,
                 join,
@@ -251,6 +297,11 @@ impl ChildPlan {
                     .placement
                     .isolation()
                     .and_then(|isolation| FilterStart::of(&isolation.security)),
+                namespace_root: options
+                    .placement
+                    .isolation()
+                    .and_then(|isolation| isolation.id_maps.as_ref())
+                    .and_then(|maps| maps.host_uid(0)),
                 ..context
             },
         );
@@ -260,14 +311,18 @@ impl ChildPlan {
     /// The plan for the command a container's clean init starts: no
     /// handshake, no namespaces (it's already inside them). `parent` is
     /// shipyard's PID when the command will be its child (no PID namespace).
+    /// Without `setgroups_allowed` (a user namespace that denies it), the
+    /// command keeps the group list it has, and may not ask for others.
     #[cfg(target_os = "linux")]
     pub(crate) fn for_container_command(
         spec: &ProcessSpec,
         keep_ignored: Vec<libc::c_int>,
         parent: Option<libc::pid_t>,
         confinement: Confinement,
+        setgroups_allowed: bool,
     ) -> Result<(Self, FailureContext)> {
-        let (plan, context) = Self::for_command(spec, keep_ignored, false, None)?;
+        let switch = UserSwitch::as_namespace_allows(setgroups_allowed);
+        let (plan, context) = Self::for_command(spec, keep_ignored, false, None, switch)?;
         let seccomp = if confinement.filter_before_setup().is_some() {
             Some(FilterStart::BeforeSetup)
         } else {
@@ -290,9 +345,25 @@ impl ChildPlan {
         keep_ignored: Vec<libc::c_int>,
         new_process_group: bool,
         handshake: Option<Handshake>,
+        switch: UserSwitch,
     ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
-        let credentials = credentials_for(&spec.user)?;
+        let credentials = match switch {
+            UserSwitch::None => None,
+            UserSwitch::Full => credentials_for(&spec.user)?,
+            UserSwitch::WithoutGroups => {
+                // First what the caller may do at all: without root, adding
+                // groups needs root before it needs `setgroups`.
+                let credentials = credentials_for(&spec.user)?;
+                if let Some(&gid) = spec.user.additional_gids.first() {
+                    return Err(Error::GroupsDenied { gid });
+                }
+                credentials.map(|credentials| Credentials {
+                    groups: None,
+                    ..credentials
+                })
+            }
+        };
 
         let program = spec.args.first().ok_or(SpecError::EmptyArgs)?;
         let path_var = spec
@@ -364,6 +435,7 @@ impl ChildPlan {
             names: spec.user.names.clone(),
             sysctls: Vec::new(),
             seccomp: None,
+            namespace_root: None,
         };
         Ok((plan, context))
     }
@@ -470,7 +542,7 @@ fn credentials_for(user: &User) -> Result<Option<Credentials>> {
         return Ok(Some(Credentials {
             uid: Uid::from_raw(user.uid),
             gid: Gid::from_raw(user.gid),
-            groups: group_list(user.gid, &user.additional_gids),
+            groups: Some(group_list(user.gid, &user.additional_gids)),
         }));
     }
     let (my_uid, my_gid) = (getuid().as_raw(), getgid().as_raw());

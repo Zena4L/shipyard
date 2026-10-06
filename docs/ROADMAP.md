@@ -16,7 +16,7 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 | 1 | **Process lifecycle** *(POSIX: runs natively on macOS)* | `shipyard run -- /bin/sh` spawns, waits, forwards signals, stops gracefully, returns the exit code; reaps and cleans up everything the command started | TLPI 6, 20–22, 24–27, 34 | [done](stages/01-process-lifecycle.md) |
 | 2 | **Namespaces** | PID, mount, UTS and IPC namespaces (`clone3`); own session; a minimal PID-1 init; `setns` to join a running container. The other namespaces moved to stages 4, 5 and 7 | TLPI 26, 28, 34; `namespaces(7)`, `pid_namespaces(7)`, `setns(2)` | [done](stages/02-namespaces.md) |
 | 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names; domain name and namespaced sysctls | TLPI 8, 14, 18, 44, 55; `mount_namespaces(7)`, `pivot_root(2)`, `mount_setattr(2)`; OCI runtime spec | [done](stages/03-filesystem.md) |
-| 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp. Device access control moved to stage 5, with cgroups | TLPI 8, 9, 39; `user_namespaces(7)`, `capabilities(7)`, `seccomp(2)` | [in progress](stages/04-security.md) |
+| 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp. Device access control moved to stage 5, with cgroups | TLPI 8, 9, 39; `user_namespaces(7)`, `capabilities(7)`, `seccomp(2)` | [done](stages/04-security.md) |
 | 5 | **Resource control** | cgroups v2 limits and cgroup namespaces, OOM detection, live stats, pause/resume, device access control (eBPF) | TLPI 36; `cgroups(7)` | |
 | 6 | **Images & storage** | Registry pulls, OCI/Docker manifests, safe layer unpacking, content-addressed store, overlayfs, volumes | OCI image & distribution specs; `overlayfs` docs | |
 | 7 | **Networking** | Network namespaces, bridge + veth over netlink, IPAM, NAT, published ports, rootless networking, embedded DNS | TLPI 56–61; `netlink(7)`, `network_namespaces(7)` | |
@@ -93,6 +93,17 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
   directory is written through a descriptor.
 - **`shipyard-runtime` requires a `pid` namespace** until cgroups (stage 5) can find
   every process of a container.
+- **Rootless is automatic** (stage 4): a non-root caller's isolated run, bundle or
+  `shipyard-runtime` container gets a user namespace whose root is the caller: the full
+  map through `newuidmap`/`newgidmap` and `/etc/subuid`, else the caller's own ID with a
+  warning. Root keeps rootful containers, confined the same way.
+- **seccomp is compiled by Shipyard itself, in Rust** (stage 4): profiles become classic
+  BPF with no C library; Docker's profile is the default for `shipyard run`.
+- **The init confines itself before its command goes on** (stage 4): only `CAP_KILL`,
+  `no_new_privs` and the container's own seccomp filter, as Docker's init runs under it;
+  every way a profile can break the init ends the container visibly.
+- **Read the kernel's state; don't infer it** (stage 4): what can't be applied as asked
+  (supplementary groups where `setgroups` is denied) is refused, never silently dropped.
 - **No image building before stage 11.** It's out of scope until then; see
   [FEATURES.md](FEATURES.md#out-of-scope-on-purpose).
 

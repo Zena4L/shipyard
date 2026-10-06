@@ -9,6 +9,12 @@
 //!
 //! The maps are written once, by the parent, into `/proc/PID/uid_map` and
 //! `gid_map` (see `process/spawn.rs`), as lines of `container host size`.
+//!
+//! Root may write any map. Anyone else may write only one line, mapping
+//! their own ID, and only after denying `setgroups` (step 1's probe, U3).
+//! More IDs come from the setuid helpers `newuidmap` and `newgidmap`, which
+//! give a user the subordinate ranges root granted them in `/etc/subuid` and
+//! `/etc/subgid` (`subuid(5)`): how a rootless container gets 65536 IDs.
 
 use std::fmt;
 #[cfg(any(target_os = "linux", test))]
@@ -71,7 +77,11 @@ impl FromStr for IdMap {
         let malformed = || IdMapError::Malformed(s.to_owned());
         let mut parts = s.split(':');
         let mut next = || -> Result<u32, IdMapError> {
-            parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())
+            parts
+                .next()
+                .ok_or_else(malformed)?
+                .parse()
+                .map_err(|_| malformed())
         };
         let map = Self {
             container: next()?,
@@ -92,6 +102,16 @@ pub struct IdMaps {
     pub uids: Vec<IdMap>,
     /// Group IDs.
     pub gids: Vec<IdMap>,
+}
+
+/// A rootless caller's maps, and why they're short if they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootlessMaps {
+    /// The maps.
+    pub maps: IdMaps,
+    /// Why only the caller's own ID is mapped, and how to get the full
+    /// range: for the user to see. `None` with the full maps.
+    pub shortfall: Option<String>,
 }
 
 /// Which of the two maps.
@@ -118,14 +138,29 @@ impl IdMaps {
     ///
     /// # Errors
     ///
-    /// An empty map or one with more than [`MAX_RANGES`] ranges, an empty
+    /// An empty map or one with more than the kernel's 340 ranges, an empty
     /// range, a range past the last ID, overlapping ranges (inside or
     /// outside), or no container uid or gid 0.
     pub fn validate(&self) -> Result<(), IdMapError> {
-        for (which, map) in [(MapKind::Uids, &self.uids), (MapKind::Gids, &self.gids)] {
-            validate_map(which, map)?;
+        for (kind, map) in self.each() {
+            validate_map(kind, map)?;
         }
         Ok(())
+    }
+
+    /// Whether either map includes host ID 0: root inside, or some user
+    /// inside, is then root (or group root) on the host's files, which a
+    /// user namespace is usually there to prevent.
+    #[must_use]
+    pub fn maps_host_root(&self) -> bool {
+        self.each()
+            .iter()
+            .any(|(_, map)| map.iter().any(|range| range.outside().contains(&0)))
+    }
+
+    /// Both maps, with which each is.
+    pub(crate) fn each(&self) -> [(MapKind, &[IdMap]); 2] {
+        [(MapKind::Uids, &self.uids), (MapKind::Gids, &self.gids)]
     }
 
     /// The host uid of container uid `id`, if it's mapped.
@@ -141,37 +176,105 @@ impl IdMaps {
     }
 }
 
+impl IdMaps {
+    /// A rootless caller's full maps: container 0 is the caller's own ID,
+    /// then each subordinate range, in order, from container ID 1 (as
+    /// Podman maps them). A range is cut short at the last container ID;
+    /// ranges past it, or past the kernel's limit on ranges, are left out.
+    /// The host side isn't checked here: [`IdMaps::validate`] does.
+    #[must_use]
+    pub fn rootless(
+        (uid, gid): (u32, u32),
+        subuids: &[(u32, u32)],
+        subgids: &[(u32, u32)],
+    ) -> Self {
+        let map = |own: u32, ranges: &[(u32, u32)]| {
+            let mut map = vec![IdMap {
+                container: 0,
+                host: own,
+                size: 1,
+            }];
+            let mut next: u32 = 1;
+            for &(start, count) in ranges.iter().take(MAX_RANGES - 1) {
+                // Container IDs end at 2³²−2: (uid_t)-1 is "no ID".
+                let size = count.min(u32::MAX - next);
+                if size == 0 {
+                    break;
+                }
+                map.push(IdMap {
+                    container: next,
+                    host: start,
+                    size,
+                });
+                next += size;
+            }
+            map
+        };
+        Self {
+            uids: map(uid, subuids),
+            gids: map(gid, subgids),
+        }
+    }
+
+    /// The one-ID maps a process may write for itself: container 0 is
+    /// `uid` and `gid`, nothing else.
+    #[must_use]
+    pub fn single((uid, gid): (u32, u32)) -> Self {
+        Self::rootless((uid, gid), &[], &[])
+    }
+}
+
+/// The subordinate ranges `/etc/subuid` (or `/etc/subgid`) gives the user
+/// named `name` with ID `id`: lines `name-or-id:start:count`, in order.
+/// Lines that don't parse, and empty ranges, are skipped (as shadow-utils
+/// does).
+#[cfg(any(target_os = "linux", test))]
+#[must_use]
+pub(crate) fn subordinate_ranges(text: &str, name: Option<&str>, id: u32) -> Vec<(u32, u32)> {
+    let id = id.to_string();
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().split(':');
+            let owner = fields.next()?;
+            let start = fields.next()?.parse().ok()?;
+            let count = fields.next()?.parse().ok()?;
+            let ours = owner == id || name == Some(owner);
+            (ours && fields.next().is_none() && count > 0).then_some((start, count))
+        })
+        .collect()
+}
+
 fn host_id(map: &[IdMap], id: u32) -> Option<u32> {
     map.iter().find_map(|range| range.host_id(id))
 }
 
-fn validate_map(which: MapKind, map: &[IdMap]) -> Result<(), IdMapError> {
+fn validate_map(kind: MapKind, map: &[IdMap]) -> Result<(), IdMapError> {
     if map.is_empty() {
-        return Err(IdMapError::Empty(which));
+        return Err(IdMapError::Empty(kind));
     }
     if map.len() > MAX_RANGES {
-        return Err(IdMapError::TooManyRanges(which, map.len()));
+        return Err(IdMapError::TooManyRanges(kind, map.len()));
     }
     let last = u64::from(u32::MAX);
     for (index, range) in map.iter().enumerate() {
         if range.size == 0 {
-            return Err(IdMapError::EmptyRange(which, *range));
+            return Err(IdMapError::EmptyRange(kind, *range));
         }
         // The kernel's last ID is 2³²−2: 2³²−1 is (uid_t)-1, "no ID".
         if range.inside().end > last || range.outside().end > last {
-            return Err(IdMapError::PastTheEnd(which, *range));
+            return Err(IdMapError::PastTheEnd(kind, *range));
         }
         for earlier in &map[..index] {
             if overlap(earlier.inside(), range.inside()) {
-                return Err(IdMapError::OverlapInside(which, *earlier, *range));
+                return Err(IdMapError::OverlapInside(kind, *earlier, *range));
             }
             if overlap(earlier.outside(), range.outside()) {
-                return Err(IdMapError::OverlapOutside(which, *earlier, *range));
+                return Err(IdMapError::OverlapOutside(kind, *earlier, *range));
             }
         }
     }
     if host_id(map, 0).is_none() {
-        return Err(IdMapError::NoRoot(which));
+        return Err(IdMapError::NoRoot(kind));
     }
     Ok(())
 }
@@ -188,7 +291,11 @@ pub(crate) fn render(map: &[IdMap]) -> String {
     let mut contents = String::new();
     for range in map {
         // Writing to a `String` can't fail.
-        let _ = writeln!(contents, "{} {} {}", range.container, range.host, range.size);
+        let _ = writeln!(
+            contents,
+            "{} {} {}",
+            range.container, range.host, range.size
+        );
     }
     contents
 }
@@ -204,7 +311,7 @@ pub enum IdMapError {
     #[error("the {0} is empty")]
     Empty(MapKind),
     /// More ranges than the kernel takes.
-    #[error("the {0} has {1} ranges, more than the kernel's 340")]
+    #[error("the {0} has {1} ranges, more than the kernel's {MAX_RANGES}")]
     TooManyRanges(MapKind, usize),
     /// A range of no IDs.
     #[error("the {0} range {1} is empty")]
@@ -250,7 +357,14 @@ mod tests {
             }
         );
         assert_eq!(map("0:100000:65536").to_string(), "0:100000:65536");
-        for bad in ["", "0:100000", "0:100000:65536:1", "a:b:c", "-1:0:1", "0:1:4294967296"] {
+        for bad in [
+            "",
+            "0:100000",
+            "0:100000:65536:1",
+            "a:b:c",
+            "-1:0:1",
+            "0:1:4294967296",
+        ] {
             assert_eq!(
                 bad.parse::<IdMap>(),
                 Err(IdMapError::Malformed(bad.to_owned())),
@@ -297,6 +411,82 @@ mod tests {
         let mut both = maps(&["0:100000:65536"]);
         both.gids = vec![map("1:100000:65536")];
         assert_eq!(both.validate(), Err(IdMapError::NoRoot(MapKind::Gids)));
+    }
+
+    #[test]
+    fn host_root_in_a_map_is_noticed() {
+        assert!(!maps(&["0:100000:65536"]).maps_host_root());
+        assert!(maps(&["0:0:65536"]).maps_host_root());
+        assert!(maps(&["0:1000:1", "1:0:1"]).maps_host_root());
+        let mut gids_only = maps(&["0:100000:65536"]);
+        gids_only.gids = vec![map("0:0:1")];
+        assert!(gids_only.maps_host_root());
+    }
+
+    #[test]
+    fn subordinate_ranges_are_found_by_name_or_number() {
+        let file = "alice:100000:65536\n\
+                    1001:200000:65536\n\
+                    alice:300000:1000\n\
+                    # a comment\n\
+                    bob:400000:65536\n\
+                    alice:x:1\n\
+                    alice:500000:0\n\
+                    alice:1:2:3\n";
+        assert_eq!(
+            subordinate_ranges(file, Some("alice"), 1000),
+            [(100_000, 65536), (300_000, 1000)]
+        );
+        assert_eq!(subordinate_ranges(file, None, 1001), [(200_000, 65536)]);
+        assert_eq!(subordinate_ranges(file, Some("carol"), 1002), []);
+        assert_eq!(subordinate_ranges("", Some("alice"), 1000), []);
+    }
+
+    #[test]
+    fn rootless_maps_put_the_caller_at_0_then_the_ranges() {
+        let maps = IdMaps::rootless(
+            (1000, 1000),
+            &[(100_000, 65536), (300_000, 1000)],
+            &[(100_000, 65536)],
+        );
+        assert_eq!(
+            maps.uids,
+            [
+                map("0:1000:1"),
+                map("1:100000:65536"),
+                map("65537:300000:1000")
+            ]
+        );
+        assert_eq!(maps.gids, [map("0:1000:1"), map("1:100000:65536")]);
+        maps.validate().unwrap();
+        assert_eq!(maps.host_uid(1000), Some(100_999));
+        let single = IdMaps::single((1000, 1001));
+        assert_eq!(single.uids, [map("0:1000:1")]);
+        assert_eq!(single.gids, [map("0:1001:1")]);
+        single.validate().unwrap();
+    }
+
+    #[test]
+    fn rootless_maps_stop_before_overflowing() {
+        let huge = [(100_000, u32::MAX - 10), (200_000, 100)];
+        let maps = IdMaps::rootless((1000, 1000), &huge, &[]);
+        assert_eq!(
+            maps.uids.len(),
+            3,
+            "the second range is cut short, not dropped"
+        );
+        assert_eq!(maps.uids[2], map("4294967286:200000:9"));
+        let whole = IdMaps::rootless((1000, 1000), &[(100_000, u32::MAX)], &[]);
+        assert_eq!(
+            whole.uids[1].size,
+            u32::MAX - 1,
+            "cut at the last container ID"
+        );
+        let many: Vec<(u32, u32)> = (0..400).map(|i| (100_000 + i * 10, 10)).collect();
+        assert_eq!(
+            IdMaps::rootless((1000, 1000), &many, &[]).uids.len(),
+            MAX_RANGES
+        );
     }
 
     #[test]
