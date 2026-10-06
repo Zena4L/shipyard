@@ -8,14 +8,22 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish.workspace = true
+# `cargo run` runs `shipyard`; the runtime needs `--bin shipyard-runtime`.
+default-run = "shipyard"
 
 [[bin]]
 name = "shipyard"
 path = "src/main.rs"
 
+# The OCI runtime command line (create, start, state, kill, delete).
+[[bin]]
+name = "shipyard-runtime"
+path = "src/bin/shipyard-runtime.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 shipyard-runtime.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

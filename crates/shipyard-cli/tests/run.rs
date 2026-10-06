@@ -113,11 +113,30 @@ fn the_environment_is_exactly_what_was_asked_for() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let mut lines: Vec<&str> = run.stdout.lines().collect();
     lines.sort_unstable();
-    let home = if is_root() { "HOME=/root" } else { "HOME=/" };
+    let home = format!("HOME={}", expected_home());
     let path = format!("PATH={DEFAULT_PATH}");
-    let mut expected = vec!["A=1", "EMPTY=", home, &path];
+    let mut expected = vec!["A=1", "EMPTY=", &home, &path];
     expected.sort_unstable();
     assert_eq!(lines, expected);
+}
+
+/// `HOME` as shipyard sets it: the current user's home directory in
+/// `/etc/passwd`, or `/root` for root and `/` for others without an entry.
+fn expected_home() -> String {
+    let uid = nix::unistd::getuid().as_raw().to_string();
+    std::fs::read_to_string("/etc/passwd")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.starts_with(['#', '+', '-']))
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .find(|fields| fields.get(2) == Some(&uid.as_str()))
+        .and_then(|fields| {
+            fields
+                .get(5)
+                .filter(|home| !home.is_empty())
+                .map(|home| (*home).to_owned())
+        })
+        .unwrap_or_else(|| if is_root() { "/root" } else { "/" }.to_owned())
 }
 
 #[test]

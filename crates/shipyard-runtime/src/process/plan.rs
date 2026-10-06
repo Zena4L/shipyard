@@ -40,14 +40,20 @@ pub(crate) struct ChildPlan {
     /// Signals that stay ignored in the command; every other one is reset to
     /// its default (see `SpawnOptions::keep_ignored`).
     pub(crate) keep_ignored: Vec<libc::c_int>,
-    /// The setup handshake (see `channel.rs`).
-    pub(crate) handshake: Handshake,
-    /// The container setup to do inside new namespaces, if isolated.
+    /// The setup handshake with shipyard (see `channel.rs`). `None` for the
+    /// command a container's init starts, which has no handshake.
+    pub(crate) handshake: Option<Handshake>,
+    /// Isolated: how the cloned child re-execs into the container's clean
+    /// image, which does the rest (see `init.rs`).
     #[cfg(target_os = "linux")]
-    pub(crate) container: Option<ContainerSetup>,
+    pub(crate) reexec: Option<Reexec>,
     /// The namespaces to join, if joining a running process's.
     #[cfg(target_os = "linux")]
     pub(crate) join: Option<JoinSetup>,
+    /// The command a container's clean image becomes without a PID
+    /// namespace: shipyard's PID, its parent (see `die_with_parent`).
+    #[cfg(target_os = "linux")]
+    pub(crate) parent: Option<libc::pid_t>,
 }
 
 /// The namespaces the child joins (see `join.rs`), in order. The PID
@@ -81,48 +87,44 @@ pub(crate) struct Handshake {
     pub(crate) parent_end: RawFd,
 }
 
-/// What the child sets up in its new namespaces, before switching user.
+/// What the cloned child needs to re-exec into the container's clean image
+/// (see `init.rs`): built here, so the child only makes system calls.
 #[cfg(target_os = "linux")]
-pub(crate) struct ContainerSetup {
-    /// Remount `/` recursively private: in a new mount namespace, first.
-    pub(crate) private_mounts: bool,
-    /// Mount a fresh `/proc` for the new PID namespace.
-    pub(crate) mount_proc: bool,
-    pub(crate) hostname: Option<CString>,
-    /// The container's init, with a new PID namespace (see `init.rs`).
-    /// Without one, nothing needs it: the command is started directly.
-    pub(crate) init: Option<InitSetup>,
-}
-
-/// What the container's init needs (see `init.rs`).
-#[cfg(target_os = "linux")]
-pub(crate) struct InitSetup {
-    /// Where the init sends the command's raw wait status.
-    pub(crate) status_write: RawFd,
-    /// The shipyard binary, opened before the clone, which the init re-execs
-    /// as a clean process.
+pub(crate) struct Reexec {
+    /// The shipyard binary, opened before the clone.
     pub(crate) exe: RawFd,
     /// `/proc/self/fd/<exe>`: the same binary as a path, for when `execveat`
-    /// isn't available (inside, `/proc` is the container's own, which shows
-    /// the init's descriptors).
+    /// isn't available.
     pub(crate) exe_path: CString,
-    /// The re-exec'd init's arguments: the hidden entry point, the status
-    /// pipe's descriptor and the command's PID (always 2; checked).
+    /// The clean image's arguments: the hidden entry point and the passed
+    /// descriptors' numbers.
     pub(crate) argv: CStringArray,
-    /// The re-exec'd init's environment: empty.
+    /// The same, plus [`SIGPIPE_PENDING_ARG`](super::SIGPIPE_PENDING_ARG):
+    /// used when a SIGPIPE is pending at the exec.
+    pub(crate) argv_sigpipe: CStringArray,
+    /// Its environment: empty.
     pub(crate) env: CStringArray,
+    /// The descriptors the clean image inherits (setup, status, report):
+    /// their close-on-exec flag is cleared just before the exec.
+    pub(crate) passed: Vec<RawFd>,
+    /// Every other descriptor from 3 up is closed before the exec: these
+    /// ranges (for `close_range`), everything but `passed` and `exe`.
+    pub(crate) close_ranges: Vec<(u32, u32)>,
 }
 
-/// The descriptors only a spawn with a container init has: see
-/// [`InitSetup`].
+/// The descriptors an isolated spawn opens for the re-exec (see [`Reexec`]).
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(
     not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux container init reads them")
+    allow(dead_code, reason = "only Linux isolates")
 )]
-pub(crate) struct InitFds {
-    pub(crate) status_write: RawFd,
+pub(crate) struct ReexecFds {
+    pub(crate) setup: RawFd,
+    pub(crate) status: RawFd,
+    pub(crate) report: RawFd,
     pub(crate) exe: RawFd,
+    /// The start gate (`SpawnOptions::gate`), passed on too.
+    pub(crate) gate: Option<RawFd>,
 }
 
 /// The user and groups to switch to.
@@ -197,10 +199,58 @@ impl ChildPlan {
         handshake: Handshake,
         #[cfg_attr(
             not(target_os = "linux"),
-            allow(unused_variables, reason = "only Linux has the container init")
+            allow(unused_variables, reason = "only Linux isolates")
         )]
-        init_fds: Option<InitFds>,
+        reexec: Option<ReexecFds>,
         #[cfg(target_os = "linux")] join: Option<JoinSetup>,
+    ) -> Result<(Self, FailureContext)> {
+        let (plan, context) = Self::for_command(
+            spec,
+            options.keep_ignored.clone(),
+            options.new_process_group,
+            Some(handshake),
+        )?;
+        #[cfg(target_os = "linux")]
+        let (plan, context) = (
+            Self {
+                reexec: reexec.map(reexec_plan).transpose()?,
+                join,
+                ..plan
+            },
+            FailureContext {
+                container_root: options
+                    .placement
+                    .isolation()
+                    .and_then(|isolation| isolation.root.clone()),
+                sysctls: options
+                    .placement
+                    .isolation()
+                    .map(|isolation| isolation.sysctls.clone())
+                    .unwrap_or_default(),
+                ..context
+            },
+        );
+        Ok((plan, context))
+    }
+
+    /// The plan for the command a container's clean init starts: no
+    /// handshake, no namespaces (it's already inside them). `parent` is
+    /// shipyard's PID when the command will be its child (no PID namespace).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn for_container_command(
+        spec: &ProcessSpec,
+        keep_ignored: Vec<libc::c_int>,
+        parent: Option<libc::pid_t>,
+    ) -> Result<(Self, FailureContext)> {
+        let (plan, context) = Self::for_command(spec, keep_ignored, false, None)?;
+        Ok((Self { parent, ..plan }, context))
+    }
+
+    fn for_command(
+        spec: &ProcessSpec,
+        keep_ignored: Vec<libc::c_int>,
+        new_process_group: bool,
+        handshake: Option<Handshake>,
     ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
         let credentials = credentials_for(&spec.user)?;
@@ -248,18 +298,15 @@ impl ChildPlan {
                 .map(raw_limit)
                 .collect::<Result<_, _>>()?,
             inherited_fds: inherited_fds(),
-            new_process_group: options.new_process_group,
-            keep_ignored: options.keep_ignored.clone(),
+            new_process_group,
+            keep_ignored,
             handshake,
             #[cfg(target_os = "linux")]
-            // `spawn` opens the init's descriptors exactly when it needs one.
-            container: options
-                .placement
-                .isolation()
-                .map(|isolation| container_setup(isolation, init_fds))
-                .transpose()?,
+            reexec: None,
             #[cfg(target_os = "linux")]
-            join,
+            join: None,
+            #[cfg(target_os = "linux")]
+            parent: None,
         };
         let context = FailureContext {
             program: PathBuf::from(program),
@@ -272,50 +319,73 @@ impl ChildPlan {
             gid: spec.user.gid,
             rlimits: spec.rlimits.clone(),
             root: geteuid().is_root(),
+            container_root: None,
+            names: spec.user.names.clone(),
+            sysctls: Vec::new(),
         };
         Ok((plan, context))
     }
 }
 
-/// The setup steps an isolation needs. `validate` already guaranteed that a
-/// PID namespace comes with a mount namespace, and a hostname with a UTS one.
+/// The re-exec plan for the descriptors in `fds`.
 #[cfg(target_os = "linux")]
-fn container_setup(
-    isolation: &crate::isolation::Isolation,
-    init_fds: Option<InitFds>,
-) -> Result<ContainerSetup> {
-    use crate::isolation::Namespace;
-    isolation.validate()?;
-    Ok(ContainerSetup {
-        private_mounts: isolation.has(Namespace::Mount),
-        mount_proc: isolation.has(Namespace::Pid) && isolation.has(Namespace::Mount),
-        hostname: isolation
-            .hostname
-            .as_deref()
-            .map(|name| c_string(name.as_bytes(), "the hostname"))
-            .transpose()?,
-        init: init_fds.map(init_setup).transpose()?,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn init_setup(fds: InitFds) -> Result<InitSetup> {
-    Ok(InitSetup {
-        status_write: fds.status_write,
+fn reexec_plan(fds: ReexecFds) -> Result<Reexec> {
+    let number = |fd: RawFd, field| c_string(fd.to_string().as_bytes(), field);
+    let argv = vec![
+        // What `ps -f` shows for PID 1 (its name is set too).
+        c"shipyard-init".to_owned(),
+        CString::from(super::INIT_ENTRY_ARG),
+        number(fds.setup, "the setup")?,
+        number(fds.status, "the status pipe")?,
+        number(fds.report, "the report pipe")?,
+    ];
+    let passed: Vec<RawFd> = [fds.setup, fds.status, fds.report]
+        .into_iter()
+        .chain(fds.gate)
+        .collect();
+    let kept: Vec<u32> = passed
+        .iter()
+        .chain([&fds.exe])
+        .filter_map(|&fd| u32::try_from(fd).ok())
+        .collect();
+    Ok(Reexec {
         exe: fds.exe,
         exe_path: c_string(
             format!("/proc/self/fd/{}", fds.exe).as_bytes(),
             "the binary",
         )?,
-        argv: CStringArray::new(vec![
-            // What `ps -f` shows for PID 1 (its name is set too).
-            c"shipyard-init".to_owned(),
-            CString::from(super::INIT_ENTRY_ARG),
-            c_string(fds.status_write.to_string().as_bytes(), "the status pipe")?,
-            c"2".to_owned(),
-        ]),
+        argv: CStringArray::new(argv.clone()),
+        argv_sigpipe: CStringArray::new(
+            argv.into_iter()
+                .chain([CString::from(super::SIGPIPE_PENDING_ARG)])
+                .collect(),
+        ),
         env: CStringArray::new(Vec::new()),
+        passed,
+        close_ranges: ranges_excluding(&kept),
     })
+}
+
+/// The descriptor ranges from 3 to the maximum that leave out `kept`, for
+/// `close_range`.
+#[cfg(any(target_os = "linux", test))]
+fn ranges_excluding(kept: &[u32]) -> Vec<(u32, u32)> {
+    let mut kept: Vec<u32> = kept.iter().copied().filter(|&fd| fd >= 3).collect();
+    kept.sort_unstable();
+    kept.dedup();
+    let mut ranges = Vec::new();
+    let mut first = 3_u32;
+    for fd in kept {
+        if fd > first {
+            ranges.push((first, fd - 1));
+        }
+        match fd.checked_add(1) {
+            Some(next) => first = next,
+            None => return ranges,
+        }
+    }
+    ranges.push((first, u32::MAX));
+    ranges
 }
 
 fn c_string(bytes: &[u8], field: &'static str) -> Result<CString, SpecError> {
@@ -552,6 +622,19 @@ fn sweep_bound() -> RawFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_leave_out_only_the_kept_descriptors() {
+        assert_eq!(ranges_excluding(&[5, 10]), [(3, 4), (6, 9), (11, u32::MAX)]);
+        // Next to each other, next to fd 3, unsorted, repeated: no empty
+        // ranges, and stdio (below 3) is never in one.
+        assert_eq!(ranges_excluding(&[4, 3, 4, 1]), [(5, u32::MAX)]);
+        assert_eq!(ranges_excluding(&[]), [(3, u32::MAX)]);
+        assert_eq!(
+            ranges_excluding(&[4, u32::MAX]),
+            [(3, 3), (5, u32::MAX - 1)]
+        );
+    }
 
     fn candidates(program: &str, path: &str) -> Vec<String> {
         exec_candidates(OsStr::new(program), OsStr::new(path))

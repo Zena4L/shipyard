@@ -5,8 +5,12 @@ Docker / Podman / OrbStack with a small, clean interface.
 
 > **Status:** early development. `shipyard run` starts and supervises a command
 > (clean environment, user, limits, signals, cleanup) and, on Linux, isolates it
-> in its own namespaces (process IDs under a small init, mounts, hostname, IPC);
-> there's no separate filesystem or network yet. See [Running commands](docs/user/run.md). The project is being
+> in its own namespaces (process IDs under a small init, mounts, hostname, IPC),
+> optionally with a root filesystem of its own (`--rootfs`) or from an
+> [OCI bundle](docs/user/bundles.md) (`--bundle`). `shipyard-runtime` is an
+> [OCI runtime](docs/user/runtime.md) (`create`, `start`, `state`, `kill`,
+> `delete`). There's no separate network yet, and isolation isn't a security
+> boundary yet. See [Running commands](docs/user/run.md). The project is being
 > built step by step, from first principles, using
 > [*The Linux Programming Interface*](https://man7.org/tlpi/) as the primary
 > reference. See the [roadmap](docs/ROADMAP.md).
@@ -24,7 +28,7 @@ Docker / Podman / OrbStack with a small, clean interface.
 
 ```
 crates/
-  shipyard-cli/       # `shipyard` binary: argument parsing, UX, output
+  shipyard-cli/       # the `shipyard` and `shipyard-runtime` binaries: arguments, UX, output
   shipyard-runtime/   # low-level Linux primitives: processes, namespaces, mounts, cgroups
 docs/
   user/               # user-facing docs, published to the website

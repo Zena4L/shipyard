@@ -51,6 +51,18 @@ impl Failure {
             detail: 0,
         }
     }
+
+    /// The same failure, saying which one of several (a path, a mount).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux sets up containers")
+    )]
+    pub(super) fn detail(self, detail: usize) -> Self {
+        Self {
+            detail: u64::try_from(detail).unwrap_or(u64::MAX),
+            ..self
+        }
+    }
 }
 
 /// If anything unwinds (it shouldn't: see the lints above), exit instead of
@@ -89,16 +101,20 @@ pub(crate) unsafe fn child_main(plan: &ChildPlan, report: RawFd) -> ! {
 /// Runs the setup steps in order, then tries each exec candidate. Only
 /// returns on failure.
 ///
-/// Isolated with a new PID namespace, this process is its PID 1: after the
-/// namespace setup it becomes the container's init, which starts the
-/// command (PID 2) and runs the rest of the steps there (see `init.rs`).
+/// Isolated, this process re-execs at once into the container's clean
+/// image, which sets the container up and starts the command (see
+/// `init.rs`).
 fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
-    // Our copy of the parent's end of the go pipe: closed at once, so that
-    // the pipe reports when the *parent's* copy closes.
-    // SAFETY: `close` is async-signal-safe; the descriptor is ours.
-    unsafe { libc::close(plan.handshake.parent_end) };
+    if let Some(handshake) = &plan.handshake {
+        // Our copy of the parent's end of the go pipe: closed at once, so
+        // that the pipe reports when the *parent's* copy closes.
+        // SAFETY: `close` is async-signal-safe; the descriptor is ours.
+        unsafe { libc::close(handshake.parent_end) };
+    }
     reset_signal_dispositions(&plan.keep_ignored)?;
-    wait_for_go(plan.handshake.read)?;
+    if let Some(handshake) = &plan.handshake {
+        wait_for_go(handshake.read)?;
+    }
     #[cfg(target_os = "linux")]
     if let Some(join) = &plan.join {
         // Already in the container's PID namespace (see `join.rs`).
@@ -108,17 +124,11 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
         return prepare_and_exec(plan);
     }
     #[cfg(target_os = "linux")]
-    if let Some(container) = &plan.container {
-        set_up_container(container)?;
-        if let Some(init) = &container.init {
-            // The init must die with shipyard too: then the kernel kills the
-            // whole namespace. It never switches user, so nothing clears this.
-            die_with_parent(plan)?;
-            return super::init::run(plan, init);
-        }
-        // No PID namespace, so no init: this process becomes the command.
-        // (It already leads a session of its own.)
-        return prepare_and_exec(plan);
+    if let Some(reexec) = &plan.reexec {
+        // The init must die with shipyard too: then the kernel kills the
+        // whole namespace. The signal survives the exec below.
+        die_with_parent(plan)?;
+        return Err(reexec_into_clean_image(plan, reexec));
     }
     if plan.new_process_group {
         // Its own group, so the supervisor can signal everything the command
@@ -235,71 +245,83 @@ fn join_namespaces(join: &super::plan::JoinSetup) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Inside the new namespaces: a session of its own (no controlling
-/// terminal, its own process group), mounts that don't propagate to the
-/// host, a `/proc` for the new PID namespace, and the hostname.
+/// Re-execs the shipyard binary as the container's clean image, which sets
+/// the container up and starts the command (see `init.rs`). Only returns on
+/// failure.
+///
+/// First every descriptor but the ones passed on is closed: anything
+/// leaked by shipyard's own parent would otherwise be held by the
+/// container's PID 1 for its whole life.
 #[cfg(target_os = "linux")]
-fn set_up_container(container: &super::plan::ContainerSetup) -> Result<(), Failure> {
-    start_session()?;
-    if container.private_mounts {
-        // First, before any mount: on hosts where `/` is shared (systemd),
-        // a mount made here would otherwise appear on the host too. Slave,
-        // not private (as runc does): nothing propagates out, but the
-        // host's unmounts still propagate in, so a device unmounted on the
-        // host isn't kept busy by the container's copy of the mount.
-        mount(
-            None,
-            c"/",
-            None,
-            libc::MS_REC | libc::MS_SLAVE,
-            ChildStep::MountPrivate,
-        )?;
-    }
-    if container.mount_proc {
-        // Mounted by this process, so it shows the new PID namespace.
-        mount(
-            Some(c"proc"),
-            c"/proc",
-            Some(c"proc"),
-            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            ChildStep::MountProc,
-        )?;
-    }
-    if let Some(hostname) = &container.hostname {
-        let name = hostname.as_bytes();
-        // SAFETY: `name` is valid for its length; `sethostname` only reads it.
-        if unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) } == -1 {
-            return Err(Failure::at(ChildStep::Hostname, Errno::last()));
+fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Failure {
+    let closed = reexec.close_ranges.iter().all(|&(first, last)| {
+        // SAFETY: `close_range` only closes descriptors; the arguments are
+        // plain integers.
+        unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) == 0 }
+    });
+    if !closed {
+        // No `close_range` (before Linux 5.9, or seccomp): the plan's list.
+        let keep = |fd: RawFd| reexec.passed.contains(&fd) || fd == reexec.exe;
+        let close = |fd: RawFd| {
+            if !keep(fd) {
+                // SAFETY: `close` is async-signal-safe; a descriptor that
+                // isn't open just gives EBADF.
+                unsafe { libc::close(fd) };
+            }
+        };
+        match &plan.inherited_fds {
+            FdSweep::Listed(fds) => fds.iter().copied().for_each(close),
+            FdSweep::Below(bound) => (3..*bound).for_each(close),
         }
     }
-    Ok(())
+    for &fd in &reexec.passed {
+        // SAFETY: `fcntl` is async-signal-safe; clearing close-on-exec only
+        // lets the descriptor survive the exec.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
+            return Failure::at(ChildStep::Reexec, Errno::last());
+        }
+    }
+    // A pending SIGPIPE survives the exec, but the clean image's Rust
+    // startup then ignores SIGPIPE, which discards it: say so, and the clean
+    // image raises it again.
+    let argv = if sigpipe_pending() {
+        &reexec.argv_sigpipe
+    } else {
+        &reexec.argv
+    };
+    // SAFETY: `execveat` and `execve` are async-signal-safe system calls.
+    // Every pointer passed is a NUL-terminated string or a null-terminated
+    // array of them, prepared before the fork and alive until the exec (or
+    // its failure).
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            reexec.exe,
+            c"".as_ptr(),
+            argv.as_ptr(),
+            reexec.env.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        );
+        // No `execveat` (before Linux 3.19, seccomp, some emulators): the
+        // same file through `/proc`, which is still the host's here.
+        libc::execve(reexec.exe_path.as_ptr(), argv.as_ptr(), reexec.env.as_ptr());
+    }
+    Failure::at(ChildStep::Reexec, Errno::last())
 }
 
-/// `mount(2)` with C strings that need no allocation.
 #[cfg(target_os = "linux")]
-fn mount(
-    source: Option<&std::ffi::CStr>,
-    target: &std::ffi::CStr,
-    fstype: Option<&std::ffi::CStr>,
-    flags: libc::c_ulong,
-    step: ChildStep,
-) -> Result<(), Failure> {
-    let or_null = |s: Option<&std::ffi::CStr>| s.map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
-    // SAFETY: every pointer is NULL or a NUL-terminated string that outlives
-    // the call; no data argument.
-    let rc = unsafe {
-        libc::mount(
-            or_null(source),
-            target.as_ptr(),
-            or_null(fstype),
-            flags,
-            std::ptr::null(),
-        )
-    };
-    if rc == -1 {
-        return Err(Failure::at(step, Errno::last()));
+/// Whether a SIGPIPE is pending for this process (blocked, as every signal
+/// is here).
+fn sigpipe_pending() -> bool {
+    // SAFETY: `sigemptyset` initializes the set before `sigpending` fills
+    // it and `sigismember` reads it; all three are async-signal-safe and
+    // touch only this stack variable.
+    unsafe {
+        let mut pending = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&raw mut pending);
+        libc::sigpending(&raw mut pending) == 0
+            && libc::sigismember(&raw const pending, libc::SIGPIPE) == 1
     }
-    Ok(())
 }
 
 /// Makes this process the leader of a new process group.
@@ -563,13 +585,29 @@ fn groups_match(expected: &[libc::gid_t]) -> bool {
 fn die_with_parent(plan: &ChildPlan) -> Result<(), Failure> {
     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
         .map_err(|errno| Failure::at(ChildStep::ParentDeathSignal, errno))?;
+    let Some(handshake) = &plan.handshake else {
+        // The command a container's clean image starts has no handshake.
+        // Without a PID namespace it's shipyard's child (the clean image
+        // became it), and the credential change cleared the signal set
+        // before the re-exec: shipyard may have died in between. Same
+        // namespace, so `getppid` tells. With one, its parent is the init,
+        // and if that dies the kernel ends the whole namespace.
+        if plan
+            .parent
+            .is_some_and(|parent| nix::unistd::getppid().as_raw() != parent)
+        {
+            // SAFETY: see `ExitOnUnwind::drop`. Nobody is left to report to.
+            unsafe { libc::_exit(SETUP_FAILED) }
+        }
+        return Ok(());
+    };
     // The parent may have died before the call above: then the signal will
     // never come, so check by hand. Not with `getppid`: inside a new PID
     // namespace it returns 0. Instead, the parent holds its end of the go
     // pipe open until `exec`; once every writer is gone, the pipe reports a
     // hang-up.
     let mut watch = libc::pollfd {
-        fd: plan.handshake.read,
+        fd: handshake.read,
         events: libc::POLLIN,
         revents: 0,
     };
@@ -609,9 +647,28 @@ fn exec_first_candidate(plan: &ChildPlan) -> Failure {
     denied.unwrap_or(not_found)
 }
 
+/// Starts the command a container's clean init forks (or becomes, without
+/// a PID namespace): puts back the signal dispositions the init's own
+/// startup changed (Rust ignores SIGPIPE), then sets the command up and
+/// `exec`s it. Never returns; a failure goes to `report`.
+///
+/// # Safety
+///
+/// After `fork` in the clean init (a single-threaded process), or in that
+/// process itself: `plan` must be the command's, built before the fork.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn command_main(plan: &ChildPlan, report: RawFd) -> ! {
+    let _guard = ExitOnUnwind;
+    let Err(failure) =
+        reset_signal_dispositions(&plan.keep_ignored).and_then(|()| prepare_and_exec(plan));
+    report_failure(report, &failure);
+    // SAFETY: see `ExitOnUnwind::drop`.
+    unsafe { libc::_exit(SETUP_FAILED) }
+}
+
 /// Writes the failure record. Best effort: if the write fails there is no one
 /// to tell, and the parent falls back to the exit status.
-fn report_failure(report: RawFd, failure: &Failure) {
+pub(super) fn report_failure(report: RawFd, failure: &Failure) {
     write_record(
         report,
         &encode(failure.step, failure.errno as i32, failure.detail),

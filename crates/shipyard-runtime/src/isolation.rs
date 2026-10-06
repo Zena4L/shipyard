@@ -14,6 +14,7 @@
 //! container does.
 
 use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 /// A kind of Linux namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,6 +131,16 @@ pub struct Isolation {
     /// The hostname inside the container. Needs a UTS namespace. `None` keeps
     /// the host's (which the new UTS namespace starts with a copy of).
     pub hostname: Option<String>,
+    /// The NIS domain name inside the container (`domainname`). Needs a UTS
+    /// namespace. `None` keeps the host's.
+    pub domainname: Option<String>,
+    /// Kernel settings for the container (`sysctl(8)` names, such as
+    /// `kernel.shmmax`), in order. Only the ones a container owns: see
+    /// [`validate_sysctl`].
+    pub sysctls: Vec<(String, String)>,
+    /// A root filesystem of the container's own. Needs a mount namespace.
+    /// `None` keeps the host's (with a fresh `/proc` over the host's).
+    pub root: Option<Root>,
 }
 
 impl Isolation {
@@ -145,6 +156,9 @@ impl Isolation {
                 Namespace::Ipc,
             ],
             hostname: None,
+            domainname: None,
+            sysctls: Vec::new(),
+            root: None,
         }
     }
 
@@ -168,8 +182,9 @@ impl Isolation {
     /// # Errors
     ///
     /// A namespace given twice or not supported yet, a PID namespace without
-    /// a mount namespace, a hostname without a UTS namespace, or a hostname
-    /// that isn't valid.
+    /// a mount namespace, a hostname without a UTS namespace, a hostname
+    /// that isn't valid, or a root filesystem without a mount namespace or
+    /// with paths that aren't absolute.
     pub fn validate(&self) -> Result<(), IsolationError> {
         check_kinds(&self.namespaces)?;
         // The container gets a fresh /proc for its PID namespace. Without its
@@ -184,8 +199,245 @@ impl Isolation {
             }
             validate_hostname(hostname)?;
         }
+        if let Some(domainname) = &self.domainname {
+            if !self.has(Namespace::Uts) {
+                return Err(IsolationError::DomainnameNeedsUts);
+            }
+            validate_hostname(domainname).map_err(|err| match err {
+                IsolationError::InvalidHostname { reason, .. } => {
+                    IsolationError::InvalidDomainname {
+                        domainname: domainname.clone(),
+                        reason,
+                    }
+                }
+                other => other,
+            })?;
+        }
+        for (key, value) in &self.sysctls {
+            validate_sysctl(key, value, self.has(Namespace::Ipc))?;
+        }
+        if let Some(root) = &self.root {
+            // Without its own mount namespace, the pivot would move the
+            // host's processes into the container's root.
+            if !self.has(Namespace::Mount) {
+                return Err(IsolationError::RootNeedsMount);
+            }
+            root.validate()?;
+        }
         Ok(())
     }
+}
+
+/// The paths a container's `/proc` and `/sys` hide (Docker's defaults):
+/// kernel memory, keys, timers and hardware details that would leak
+/// information about the host or let the container disturb it.
+pub const DEFAULT_MASKED_PATHS: [&str; 12] = [
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/sys/firmware",
+    "/sys/devices/virtual/powercap",
+];
+
+/// The paths a container's `/proc` keeps read-only (Docker's defaults): the
+/// kernel settings and interfaces that are the host's, not the container's.
+pub const DEFAULT_READONLY_PATHS: [&str; 5] = [
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+];
+
+/// A root filesystem of the container's own: a directory on the host that
+/// becomes the container's `/` (`pivot_root(2)`), with a fresh `/proc`, a
+/// read-only `/sys` and a minimal `/dev` mounted in it.
+///
+/// Start from [`Root::new`], which fills in the default masked and
+/// read-only paths. The shape follows the OCI runtime spec's `root`,
+/// `linux.maskedPaths` and `linux.readonlyPaths`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Root {
+    /// The directory on the host. Absolute.
+    pub path: PathBuf,
+    /// Make `/` read-only inside (`/dev`, `/proc` and the other mounts on it
+    /// stay as they are).
+    pub read_only: bool,
+    /// Paths inside the container hidden from it: a file reads as empty, a
+    /// directory as empty and read-only. Missing ones are skipped.
+    pub masked_paths: Vec<PathBuf>,
+    /// Paths inside the container made read-only. Missing ones are skipped.
+    pub readonly_paths: Vec<PathBuf>,
+    /// More mounts, in order, after `/proc`, `/sys` and `/dev`.
+    pub mounts: Vec<Mount>,
+}
+
+/// A mount in the container: a host directory or file bound in, or a fresh
+/// tmpfs. The shape follows the OCI runtime spec's `mounts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Mount {
+    /// Where it appears inside the container. Absolute, and not in `/proc`
+    /// or `/sys` (the kernel's interfaces), nor `/dev` itself.
+    pub destination: PathBuf,
+    /// What's mounted.
+    pub kind: MountKind,
+    /// Restrictions on it.
+    pub flags: Vec<MountFlag>,
+    /// File-system options, such as a tmpfs's `size=64m`: comma-separated,
+    /// as `mount(8)`'s `-o`.
+    pub data: Option<String>,
+}
+
+/// What a [`Mount`] mounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MountKind {
+    /// A host directory or file, seen at the destination too (`MS_BIND`).
+    Bind {
+        /// The host path. Absolute.
+        source: PathBuf,
+        /// With the mounts below it (`rbind`), rather than the source's own
+        /// mount only.
+        recursive: bool,
+    },
+    /// A fresh, empty file system in memory.
+    Tmpfs,
+}
+
+/// A restriction on a [`Mount`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MountFlag {
+    /// Nothing can be written (with `rbind`, the mounts below it too).
+    ReadOnly,
+    /// Set-user-ID and set-group-ID bits are ignored.
+    NoSuid,
+    /// Device nodes can't be opened.
+    NoDev,
+    /// Programs can't be run from it.
+    NoExec,
+}
+
+impl Mount {
+    /// The host path `source` bound at `destination`, recursively, with no
+    /// restrictions.
+    #[must_use]
+    pub fn bind(source: impl Into<PathBuf>, destination: impl Into<PathBuf>) -> Self {
+        Self {
+            destination: destination.into(),
+            kind: MountKind::Bind {
+                source: source.into(),
+                recursive: true,
+            },
+            flags: Vec::new(),
+            data: None,
+        }
+    }
+
+    /// A tmpfs at `destination`, with no restrictions.
+    #[must_use]
+    pub fn tmpfs(destination: impl Into<PathBuf>) -> Self {
+        Self {
+            destination: destination.into(),
+            kind: MountKind::Tmpfs,
+            flags: Vec::new(),
+            data: None,
+        }
+    }
+
+    /// Whether it has `flag`.
+    #[must_use]
+    pub fn has(&self, flag: MountFlag) -> bool {
+        self.flags.contains(&flag)
+    }
+
+    fn validate(&self) -> Result<(), IsolationError> {
+        let invalid = |reason| IsolationError::InvalidMount {
+            destination: self.destination.clone(),
+            reason,
+        };
+        if !is_plain_absolute(&self.destination) {
+            return Err(invalid("the destination must be absolute, without . or .."));
+        }
+        // The kernel's own interfaces: a mount there could hide or replace
+        // what the container must not change (runc's /proc CVEs).
+        if ["/proc", "/sys"]
+            .iter()
+            .any(|kernel| self.destination.starts_with(kernel))
+            || self.destination == Path::new("/dev")
+            || self.destination.parent().is_none()
+        {
+            return Err(invalid("it can't be /, /dev, or in /proc or /sys"));
+        }
+        if let MountKind::Bind { source, .. } = &self.kind
+            && !is_plain_absolute(source)
+        {
+            return Err(invalid("the source must be absolute, without . or .."));
+        }
+        if self.data.as_ref().is_some_and(|data| data.contains('\0')) {
+            return Err(invalid("its options contain a NUL byte"));
+        }
+        Ok(())
+    }
+}
+
+impl Root {
+    /// `path` as the root, writable, with the default masked and read-only
+    /// paths ([`DEFAULT_MASKED_PATHS`], [`DEFAULT_READONLY_PATHS`]).
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            read_only: false,
+            masked_paths: DEFAULT_MASKED_PATHS.map(PathBuf::from).to_vec(),
+            readonly_paths: DEFAULT_READONLY_PATHS.map(PathBuf::from).to_vec(),
+            mounts: Vec::new(),
+        }
+    }
+
+    /// Rejects paths that don't say exactly what they mean: relative ones,
+    /// and ones with `.` or `..` in them.
+    fn validate(&self) -> Result<(), IsolationError> {
+        if !is_plain_absolute(&self.path) {
+            return Err(IsolationError::InvalidRootPath(self.path.clone()));
+        }
+        // The host's own root can't be switched to: a bind stacked on `/` is
+        // never reached by a lookup of `/`, so `pivot_root` would get the
+        // current root (EBUSY). Sharing the host's files is "no root".
+        if self.path.parent().is_none() {
+            return Err(IsolationError::RootIsHostRoot);
+        }
+        let inside = self.masked_paths.iter().chain(&self.readonly_paths);
+        if let Some(path) = inside.into_iter().find(|path| !is_plain_absolute(path)) {
+            return Err(IsolationError::InvalidContainerPath(path.clone()));
+        }
+        self.mounts.iter().try_for_each(Mount::validate)
+    }
+}
+
+/// Absolute, and made only of names: no `.` or `..` (which `Path` would keep
+/// or resolve differently from the kernel once symlinks are involved), and
+/// no NUL byte (which no system call can take).
+fn is_plain_absolute(path: &Path) -> bool {
+    !path.as_os_str().as_encoded_bytes().contains(&0)
+        && path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+        && !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(|&b| b == b'/')
+            .any(|part| part == b".")
 }
 
 /// Which running process's namespaces a command joins, and which of them.
@@ -262,6 +514,62 @@ fn check_kinds(namespaces: &[Namespace]) -> Result<(), IsolationError> {
     Ok(())
 }
 
+/// The sysctls of a container's IPC namespace: the kernel keeps a copy of
+/// each per namespace, so setting one changes only the container's.
+pub const IPC_SYSCTLS: [&str; 8] = [
+    "kernel.msgmax",
+    "kernel.msgmnb",
+    "kernel.msgmni",
+    "kernel.sem",
+    "kernel.shmall",
+    "kernel.shmmax",
+    "kernel.shmmni",
+    "kernel.shm_rmid_forced",
+];
+
+/// Accepts only the sysctls a container owns: [`IPC_SYSCTLS`] and
+/// `fs.mqueue.*`, with an IPC namespace (`has_ipc`). Any other one isn't
+/// namespaced, so setting it from the container would change the host.
+///
+/// # Errors
+///
+/// [`IsolationError::Sysctl`], saying why.
+pub fn validate_sysctl(key: &str, value: &str, has_ipc: bool) -> Result<(), IsolationError> {
+    let refuse = |reason| {
+        Err(IsolationError::Sysctl {
+            key: key.to_owned(),
+            reason,
+        })
+    };
+    let well_formed = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
+        && key.split('.').all(|part| !part.is_empty());
+    if !well_formed {
+        return refuse("not a sysctl name (lowercase letters, digits, _ and dots)");
+    }
+    if value.contains(['\0', '\n']) {
+        return refuse("its value contains a NUL or a newline");
+    }
+    if key.starts_with("net.") {
+        return refuse(
+            "network settings need the container's own network namespace, which comes in \
+             a later version (now it would change the host's)",
+        );
+    }
+    if key == "kernel.hostname" || key == "kernel.domainname" {
+        return refuse("set the hostname or domain name with their own settings");
+    }
+    if !(IPC_SYSCTLS.contains(&key) || key.starts_with("fs.mqueue.")) {
+        return refuse("it isn't namespaced: setting it would change the host");
+    }
+    if !has_ipc {
+        return refuse("it needs an IPC namespace");
+    }
+    Ok(())
+}
+
 /// A hostname as RFC 1123 describes one: dot-separated labels of letters,
 /// digits and hyphens, each 1–63 characters and not starting or ending with a
 /// hyphen; at most [`MAX_HOSTNAME_LEN`] bytes in all.
@@ -326,6 +634,48 @@ pub enum IsolationError {
     /// change the host's hostname.
     #[error("setting the hostname needs a UTS namespace")]
     HostnameNeedsUts,
+    /// A root filesystem without a mount namespace to switch it in.
+    #[error("a root filesystem needs a mount namespace")]
+    RootNeedsMount,
+    /// The root filesystem is the host's own `/`.
+    #[error(
+        "the root filesystem can't be the host's own / (without a root filesystem, the \
+         container shares the host's files)"
+    )]
+    RootIsHostRoot,
+    /// The root filesystem's path isn't absolute, or has `.` or `..` in it.
+    #[error("the root filesystem's path must be absolute, without . or .. (got {})", .0.display())]
+    InvalidRootPath(PathBuf),
+    /// A masked or read-only path isn't absolute, or has `.` or `..` in it.
+    #[error("paths inside the container must be absolute, without . or .. (got {})", .0.display())]
+    InvalidContainerPath(PathBuf),
+    /// A [`Mount`] that can't be used.
+    #[error("the mount at {}: {reason}", destination.display())]
+    InvalidMount {
+        /// Where it was to appear.
+        destination: PathBuf,
+        /// What's wrong with it.
+        reason: &'static str,
+    },
+    /// A domain name was given, but no UTS namespace to set it in.
+    #[error("setting the domain name needs a UTS namespace")]
+    DomainnameNeedsUts,
+    /// The domain name isn't valid (the same rules as a hostname's).
+    #[error("invalid domain name \"{domainname}\": {reason}")]
+    InvalidDomainname {
+        /// The domain name given.
+        domainname: String,
+        /// What's wrong with it.
+        reason: &'static str,
+    },
+    /// A sysctl the container can't set.
+    #[error("sysctl {key}: {reason}")]
+    Sysctl {
+        /// Its name.
+        key: String,
+        /// Why not.
+        reason: &'static str,
+    },
     /// A [`Join`] with no namespaces to join.
     #[error("no namespaces to join")]
     NothingToJoin,
@@ -342,6 +692,148 @@ pub enum IsolationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_needs_a_mount_namespace_and_plain_absolute_paths() {
+        let mut isolation = Isolation::standard();
+        isolation.root = Some(Root::new("/srv/root"));
+        assert_eq!(isolation.validate(), Ok(()));
+
+        let mut host_root = isolation.clone();
+        host_root.root = Some(Root::new("/"));
+        assert_eq!(host_root.validate(), Err(IsolationError::RootIsHostRoot));
+
+        let mut no_mount = isolation.clone();
+        no_mount.namespaces = vec![Namespace::Uts];
+        assert_eq!(no_mount.validate(), Err(IsolationError::RootNeedsMount));
+
+        for bad in [
+            "srv/root",
+            "/srv/../etc",
+            "/srv/./root",
+            "./root",
+            "",
+            "/srv/\0root",
+        ] {
+            let mut relative = isolation.clone();
+            relative.root = Some(Root::new(bad));
+            assert_eq!(
+                relative.validate(),
+                Err(IsolationError::InvalidRootPath(bad.into())),
+                "{bad:?}"
+            );
+        }
+        for bad in ["proc/kcore", "/proc/../etc/shadow", "/proc/./kcore"] {
+            let mut masked = isolation.clone();
+            if let Some(root) = &mut masked.root {
+                root.masked_paths.push(bad.into());
+            }
+            assert_eq!(
+                masked.validate(),
+                Err(IsolationError::InvalidContainerPath(bad.into())),
+                "{bad:?}"
+            );
+            let mut readonly = isolation.clone();
+            if let Some(root) = &mut readonly.root {
+                root.readonly_paths.push(bad.into());
+            }
+            assert_eq!(
+                readonly.validate(),
+                Err(IsolationError::InvalidContainerPath(bad.into())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_containers_own_sysctls_are_allowed() {
+        assert_eq!(validate_sysctl("kernel.shmmax", "1048576", true), Ok(()));
+        assert_eq!(validate_sysctl("fs.mqueue.msg_max", "20", true), Ok(()));
+        for (key, value, has_ipc) in [
+            ("kernel.shmmax", "1", false),
+            ("net.ipv4.ip_forward", "1", true),
+            ("kernel.hostname", "x", true),
+            ("vm.swappiness", "1", true),
+            ("kernel..shmmax", "1", true),
+            ("../../etc", "1", true),
+            ("kernel.shmmax", "1\n2", true),
+            ("", "1", true),
+        ] {
+            assert!(
+                matches!(
+                    validate_sysctl(key, value, has_ipc),
+                    Err(IsolationError::Sysctl { .. })
+                ),
+                "{key}={value:?} with IPC {has_ipc}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_domain_name_needs_a_uts_namespace() {
+        let mut isolation = Isolation::standard();
+        isolation.domainname = Some("example.com".into());
+        assert_eq!(isolation.validate(), Ok(()));
+        isolation.domainname = Some("bad_name".into());
+        assert!(matches!(
+            isolation.validate(),
+            Err(IsolationError::InvalidDomainname { .. })
+        ));
+        isolation.domainname = Some("example.com".into());
+        isolation.namespaces.retain(|&kind| kind != Namespace::Uts);
+        assert_eq!(
+            isolation.validate(),
+            Err(IsolationError::DomainnameNeedsUts)
+        );
+    }
+
+    #[test]
+    fn mounts_are_checked() {
+        let with = |mount: Mount| {
+            let mut isolation = Isolation::standard();
+            let mut root = Root::new("/r");
+            root.mounts.push(mount);
+            isolation.root = Some(root);
+            isolation.validate()
+        };
+        assert_eq!(with(Mount::bind("/srv/data", "/data")), Ok(()));
+        assert_eq!(with(Mount::tmpfs("/dev/cache")), Ok(()));
+        for destination in [
+            "/proc/x",
+            "/proc",
+            "/sys/kernel",
+            "/dev",
+            "/",
+            "data",
+            "/a/../b",
+        ] {
+            assert!(
+                matches!(
+                    with(Mount::tmpfs(destination)),
+                    Err(IsolationError::InvalidMount { .. })
+                ),
+                "{destination}"
+            );
+        }
+        assert!(matches!(
+            with(Mount::bind("relative", "/data")),
+            Err(IsolationError::InvalidMount { .. })
+        ));
+        let mut nul = Mount::tmpfs("/t");
+        nul.data = Some("size=1\0m".into());
+        assert!(matches!(
+            with(nul),
+            Err(IsolationError::InvalidMount { .. })
+        ));
+    }
+
+    #[test]
+    fn a_new_root_has_the_default_paths() {
+        let root = Root::new("/r");
+        assert!(!root.read_only);
+        assert!(root.masked_paths.contains(&PathBuf::from("/proc/kcore")));
+        assert!(root.readonly_paths.contains(&PathBuf::from("/proc/sys")));
+    }
 
     #[test]
     fn the_standard_isolation_is_valid() {
@@ -386,6 +878,9 @@ mod tests {
         let isolation = Isolation {
             namespaces: vec![Namespace::Pid, Namespace::Uts],
             hostname: None,
+            domainname: None,
+            sysctls: Vec::new(),
+            root: None,
         };
         assert_eq!(isolation.validate(), Err(IsolationError::PidNeedsMount));
         // A mount namespace alone is fine: its /proc still shows the host's
@@ -393,6 +888,9 @@ mod tests {
         let mount_only = Isolation {
             namespaces: vec![Namespace::Mount],
             hostname: None,
+            domainname: None,
+            sysctls: Vec::new(),
+            root: None,
         };
         assert_eq!(mount_only.validate(), Ok(()));
     }
@@ -428,6 +926,9 @@ mod tests {
         let isolation = Isolation {
             namespaces: vec![Namespace::Pid, Namespace::Mount],
             hostname: Some("box".into()),
+            domainname: None,
+            sysctls: Vec::new(),
+            root: None,
         };
         assert_eq!(isolation.validate(), Err(IsolationError::HostnameNeedsUts));
     }

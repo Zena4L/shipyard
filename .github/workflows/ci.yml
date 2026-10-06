@@ -46,9 +46,9 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets
       - run: cargo test --locked --workspace
 
-  # Tests that need root (switching user and groups) are #[ignore]d in normal
-  # runs. Here they run as root through a cargo runner, so cargo itself (and
-  # the build) never does. Both platforms: Linux and macOS switch credentials
+  # Tests that need root (switching user and groups, namespaces, root
+  # filesystems, the OCI runtime) are #[ignore]d in normal runs. Here they run
+  # as root through a cargo runner, so cargo itself (and the build) never does. Both platforms: Linux and macOS switch credentials
   # differently (setresuid vs setuid, and macOS's group list layout).
   root:
     name: test as root (${{ matrix.os }})
@@ -66,6 +66,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: echo "${{ matrix.runner_var }}=sudo -E" >> "$GITHUB_ENV"
+      # What the container tests rely on, in the log: the root-filesystem
+      # fixtures copy host programs with the libraries `ldd` lists, and the
+      # mount tests want `/` shared (as on a systemd host) to catch leaks.
+      - name: host facts for the container tests
+        if: runner.os == 'Linux'
+        run: |
+          uname -r
+          ldd --version | head -1
+          findmnt -no PROPAGATION /
       - run: cargo test --locked --workspace -- --include-ignored
 
   # musl (static, Alpine-style builds) has different libc types and wrappers;

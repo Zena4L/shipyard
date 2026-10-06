@@ -28,12 +28,15 @@
 use std::io::Write as _;
 use std::process::ExitCode;
 
+use shipyard_test_support::bundle::Bundle;
 use shipyard_test_support::pty::{
     Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped,
 };
+use shipyard_test_support::rootfs::RootFs;
 use shipyard_test_support::{Shipyard, child_of, killed_by};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
+const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
 
 /// A fake shell on a new pseudo-terminal, running `script` (see
 /// `shipyard_test_support::pty`).
@@ -89,6 +92,10 @@ const ROOT_TESTS: &[(&str, fn())] = tests![
     isolated_command_has_no_controlling_terminal,
     isolated_hangup_ends_the_command_and_shipyard,
     an_isolated_command_ignoring_hangup_keeps_running,
+    with_a_root_filesystem_ctrl_c_is_forwarded_exactly_once,
+    with_a_root_filesystem_window_size_changes_reach_the_command,
+    a_root_filesystem_has_its_own_terminals,
+    a_container_created_from_a_terminal_keeps_it,
 ];
 
 /// libtest options that take a value; their value is skipped so it isn't
@@ -894,5 +901,181 @@ fn an_isolated_command_that_stops_itself_resumes_with_ctrl_z_and_fg() {
     session.go();
     session.expect("resumed");
     assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+// --- With a root filesystem (root, Linux) ---
+
+/// Where the `--rootfs` tests' root filesystem is. A session's script runs
+/// in the forked fake shell and can't capture a variable, so the path
+/// travels in the environment, which the fork inherits.
+const ROOTFS_VAR: &str = "SHIPYARD_TEST_ROOTFS";
+
+/// A root filesystem for one test, named in [`ROOTFS_VAR`] until dropped.
+fn rootfs() -> RootFs {
+    let root = RootFs::minimal();
+    // SAFETY: this test binary is single-threaded (see the module docs), so
+    // nothing reads the environment concurrently.
+    unsafe { std::env::set_var(ROOTFS_VAR, root.arg()) };
+    root
+}
+
+/// `shipyard ARGS…` with `--rootfs` (from [`ROOTFS_VAR`]) after `run`, in
+/// the foreground, waited for.
+fn foreground_in_rootfs(shell: &mut Shell, before_run: &[&str], script: &str) {
+    let path = std::env::var(ROOTFS_VAR).expect("the test sets the root filesystem");
+    let args = [before_run, &["run", "--rootfs", &path, "sh", "-c", script]].concat();
+    let job = shell.spawn(Mode::Foreground, &args);
+    shell.wait(job);
+}
+
+/// As [`isolated_ctrl_c_is_forwarded_exactly_once`], in a root filesystem:
+/// its own `/dev` changes nothing about how Ctrl-C arrives.
+fn with_a_root_filesystem_ctrl_c_is_forwarded_exactly_once() {
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        foreground_in_rootfs(
+            shell,
+            &["--debug"],
+            "trap 'echo got-\"\"int; kill $!' INT; echo re\"\"ady; sleep 5 & wait; echo e\"\"nd",
+        );
+    });
+    session.job();
+    session.expect("ready");
+    session.type_keys(CTRL_C);
+    session.expect("got-int");
+    session.expect("end");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(session.count("got-int"), 1, "{}", session.transcript());
+    assert_eq!(
+        session.count("forwarding a signal"),
+        1,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// As [`isolated_window_size_changes_reach_the_command`], in a root
+/// filesystem: the size is the terminal's, set on the descriptor the
+/// command holds, wherever its `/dev` is.
+fn with_a_root_filesystem_window_size_changes_reach_the_command() {
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        foreground_in_rootfs(
+            shell,
+            &["--debug"],
+            "trap 'stty size; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
+        );
+    });
+    session.job();
+    session.expect("ready");
+    session.resize(40, 100);
+    session.expect("40 100");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// A root filesystem's `/dev/pts` is its own: the terminal the command was
+/// given (the host's) isn't in it, so `tty` can't name it. The command
+/// still writes to it.
+fn a_root_filesystem_has_its_own_terminals() {
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        foreground_in_rootfs(shell, &[], "tty; echo wr\"\"ote");
+    });
+    session.job();
+    session.expect("not a tty");
+    session.expect("wrote");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+// --- The OCI runtime (root, Linux) ---
+
+/// Where [`a_container_created_from_a_terminal_keeps_it`] keeps its bundle
+/// and its state root, for the forked shell (as [`ROOTFS_VAR`]).
+const BUNDLE_VAR: &str = "SHIPYARD_TEST_BUNDLE";
+const STATE_ROOT_VAR: &str = "SHIPYARD_TEST_STATE_ROOT";
+
+/// The container [`a_container_created_from_a_terminal_keeps_it`] makes.
+const ON_A_TTY: &str = "on-a-tty";
+
+/// A state root, its containers deleted and itself removed when dropped,
+/// so a failed test leaves no container running.
+struct StateRoot(std::path::PathBuf);
+
+impl Drop for StateRoot {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(RUNTIME)
+            .arg("--root")
+            .arg(&self.0)
+            .args(["delete", "--force", ON_A_TTY])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The container's standard streams are `create`'s, here the terminal: it
+/// keeps writing to it, and reading it, after `create` and `start` have
+/// returned and the shell has the terminal back (runtime.md says to
+/// redirect). `delete --force` ends it.
+fn a_container_created_from_a_terminal_keeps_it() {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!([
+        "sh",
+        "-c",
+        "echo hel\"\"lo; read line; echo \"got $line\"; sleep 30"
+    ]);
+    bundle.write(&config);
+    let state =
+        StateRoot(std::env::temp_dir().join(format!("shipyard-tty-{}", std::process::id())));
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe {
+        std::env::set_var(BUNDLE_VAR, bundle.arg());
+        std::env::set_var(STATE_ROOT_VAR, &state.0);
+    }
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let runtime = |shell: &mut Shell, args: &[&str]| {
+            let args = [&["--root", root.as_str()], args].concat();
+            let job = shell.spawn_program(Mode::Foreground, RUNTIME, &args);
+            shell.wait(job);
+        };
+        runtime(shell, &["create", "--bundle", &bundle, ON_A_TTY]);
+        runtime(shell, &["start", ON_A_TTY]);
+        shell.await_go();
+        runtime(shell, &["delete", "--force", ON_A_TTY]);
+    });
+    session.job();
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "create\n{}",
+        session.transcript()
+    );
+    session.job();
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "start\n{}",
+        session.transcript()
+    );
+    session.expect("hello");
+    session.type_keys(b"typed\n");
+    session.expect("got typed");
+    session.go();
+    session.job();
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "delete\n{}",
+        session.transcript()
+    );
     session.finish();
 }

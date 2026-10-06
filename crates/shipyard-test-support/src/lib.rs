@@ -1,6 +1,7 @@
 //! Helpers for Shipyard's end-to-end tests, shared by every test binary of
 //! `shipyard-cli`: starting the binary in a known state, hostile parents,
-//! timeouts, and (in [`pty`]) a fake interactive shell on a pseudo-terminal.
+//! timeouts, (in [`pty`]) a fake interactive shell on a pseudo-terminal, and
+//! (in [`rootfs`]) a tiny root filesystem.
 //!
 //! A crate rather than a `tests/common` module, so that IDEs index it like any
 //! other code. Dev-only; never published.
@@ -12,7 +13,9 @@
     reason = "test support: a panic is a test failure with a clear message"
 )]
 
+pub mod bundle;
 pub mod pty;
+pub mod rootfs;
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::{CommandExt, ExitStatusExt};

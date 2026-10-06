@@ -61,13 +61,14 @@ container (Docker, OrbStack or any compatible engine):
 
 1. clippy with warnings as errors;
 2. the whole test suite as a normal user;
-3. the suite again with the root-only tests, run as root through `sudo` (as the
-   CI `root` job does). Before it, `/` is made a shared mount, as on systemd
+3. the suite again with the root-only tests, run as root (as the CI `root` job
+   does). Before it, `/` is made a shared mount, as on systemd
    hosts, so a mount namespace that leaks mounts would be caught.
 
 ```sh
 scripts/test-linux.sh            # everything; exits non-zero on any failure
-scripts/test-linux.sh --shell    # a shell in the same container, to debug
+scripts/test-linux.sh --shell        # a shell in the same container, to debug
+scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
 ```
 
 The container is **privileged**, because creating namespaces and mounting

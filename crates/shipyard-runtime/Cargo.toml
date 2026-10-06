@@ -12,6 +12,8 @@ publish.workspace = true
 [dependencies]
 libc.workspace = true
 nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -19,12 +21,12 @@ tracing.workspace = true
 proptest.workspace = true
 shipyard-test-support.workspace = true
 
-# Joining running containers, end to end (Linux; root). Not on libtest: the
+# Containers and joining them, end to end (Linux; root). Not on libtest: the
 # binary is also the container runtime its tests drive, and its `main` must
-# call `init_entry_point` first. See tests/join.rs.
+# call `init_entry_point` first. See tests/containers.rs.
 [[test]]
-name = "join"
-path = "tests/join.rs"
+name = "containers"
+path = "tests/containers.rs"
 harness = false
 
 [lints]

@@ -53,8 +53,8 @@ impl LogLevel {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a command in a container: on Linux, isolated in namespaces (no separate filesystem yet).
-    Run(run::RunArgs),
+    /// Run a command in a container: on Linux, isolated in namespaces, optionally with its own root filesystem.
+    Run(Box<run::RunArgs>),
     /// Show how this host will run containers.
     Doctor,
 }
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     init_tracing(cli.log_level, cli.debug);
 
     let result = match cli.command {
-        Command::Run(args) => run::run(args),
+        Command::Run(args) => run::run(*args),
         Command::Doctor => doctor(),
     };
     result.unwrap_or_else(|err| fail(&err))
@@ -93,6 +93,12 @@ fn main() -> ExitCode {
 /// Reports an error from shipyard itself and returns exit code 125.
 fn fail(err: &anyhow::Error) -> ExitCode {
     report(err, EXIT_ENGINE_ERROR)
+}
+
+/// Prints a warning: something asked for that Shipyard goes on without.
+fn warning(text: &str) {
+    // Not `eprintln!`: it panics if stderr is a closed pipe.
+    let _ = writeln!(std::io::stderr().lock(), "shipyard: warning: {text}");
 }
 
 /// Prints a hint after an error: what the user can do about it.

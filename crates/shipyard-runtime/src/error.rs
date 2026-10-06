@@ -42,19 +42,41 @@ pub enum Error {
     #[error(transparent)]
     StopSignal(#[from] StopSignalError),
 
+    /// An OCI bundle can't be run: its `config.json` is missing, malformed,
+    /// or asks for what Shipyard can't do yet.
+    #[error(transparent)]
+    Bundle(#[from] crate::oci::BundleError),
+
+    /// A user or group name couldn't be resolved.
+    #[error(transparent)]
+    Lookup(#[from] crate::process::LookupError),
+
+    /// User or group names were given for a command joining a container:
+    /// they'd have to be read from the container's files, which isn't
+    /// supported yet.
+    #[error("user and group names can't be used when joining a container yet; give numbers")]
+    NamesWhenJoining,
+
+    /// The container's root filesystem can't be used: the directory is
+    /// missing, or isn't a directory.
+    #[error("the root filesystem {}: {reason}", path.display())]
+    RootFilesystem {
+        /// The directory given.
+        path: std::path::PathBuf,
+        /// What's wrong with it.
+        reason: String,
+    },
+
     /// Isolating the command in new namespaces needs privileges (root, until
     /// rootless support with user namespaces arrives).
-    #[error(
-        "isolating the command in namespaces needs root (rootless support comes later); \
-         run as root, or without isolation"
-    )]
+    #[error("isolating the command in namespaces needs root (rootless support comes later)")]
     IsolationNeedsRoot,
 
     /// Running as root, the system still refused to create namespaces.
     #[error(
         "the system refused to create namespaces: shipyard may be running inside a \
          container without privileges, or under a security policy (seccomp, AppArmor, \
-         SELinux); run it with privileges, or without isolation"
+         SELinux); run it with privileges"
     )]
     IsolationRefused,
 
