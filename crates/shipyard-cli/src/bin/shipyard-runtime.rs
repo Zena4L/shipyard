@@ -2,17 +2,31 @@
 //!
 //! A container's life in separate calls: `create` sets it up from a bundle
 //! and holds it before its program runs; `start` lets it run; `state`
-//! reports it as JSON; `kill` signals it; `delete` removes it. Engines and
-//! the OCI conformance suite drive a runtime this way. The work is in
+//! reports it as JSON; `kill` signals it; `delete` removes it. Its cgroup
+//! gives the rest: `pause` and `resume`, `update`, `ps`, `events`. Engines
+//! and the OCI conformance suite drive a runtime this way. The work is in
 //! `shipyard_runtime::container`.
+
+#[path = "../limits.rs"]
+#[allow(
+    dead_code,
+    reason = "shared with `shipyard`, which uses what `update` doesn't"
+)]
+mod limits;
+#[path = "../runtime_commands.rs"]
+mod runtime_commands;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use shipyard_runtime::container;
 use shipyard_runtime::process::{self, Signal};
+
+use crate::limits::LimitArgs;
+use crate::runtime_commands::{PsFormat, parse_interval};
 
 /// Runs containers from OCI bundles, one lifecycle step per call.
 #[derive(Debug, Parser)]
@@ -69,11 +83,57 @@ enum Command {
     },
     /// Send a signal to a container (default TERM).
     Kill {
+        /// Signal every process in the container's cgroup, not only its
+        /// init.
+        #[arg(short, long)]
+        all: bool,
         /// The container's ID.
         id: String,
         /// A name (TERM, SIGKILL) or a number.
         #[arg(default_value = "TERM")]
         signal: Signal,
+    },
+    /// Freeze a created or running container's processes.
+    Pause {
+        /// The container's ID.
+        id: String,
+    },
+    /// Thaw a paused container.
+    Resume {
+        /// The container's ID.
+        id: String,
+    },
+    /// List the processes in a container's cgroup, by host PID.
+    Ps {
+        /// table, or json (an array of PIDs).
+        #[arg(long, value_enum, default_value = "table")]
+        format: PsFormat,
+        /// The container's ID.
+        id: String,
+    },
+    /// Print a container's resource use as JSON lines, and OOM kills, until
+    /// it stops.
+    Events {
+        /// Print once and exit.
+        #[arg(long)]
+        stats: bool,
+        /// How often (such as 5s or 500ms).
+        #[arg(long, value_name = "DURATION", default_value = "5s", value_parser = parse_interval)]
+        interval: Duration,
+        /// The container's ID.
+        id: String,
+    },
+    /// Change a container's resource limits (created, running or paused).
+    Update {
+        /// Read the limits from FILE, a linux.resources JSON object (- for
+        /// stdin), instead of flags.
+        #[arg(short, long, value_name = "FILE", conflicts_with = "limits")]
+        resources: Option<PathBuf>,
+        /// The limits to change.
+        #[command(flatten)]
+        limits: Box<LimitArgs>,
+        /// The container's ID.
+        id: String,
     },
     /// Remove a stopped (or created) container.
     Delete {
@@ -124,18 +184,66 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             {
                 // `create` fails, so nothing is left (as runc does): a
                 // caller told "failed" would otherwise find the ID taken.
-                let _ = container::delete(root, id, true);
+                // Its `poststop` hooks' failures, or why it couldn't be
+                // removed, are said too: the caller must know what's left.
+                match container::delete(root, id, true) {
+                    Ok(warnings) => {
+                        for warning in &warnings {
+                            report(cli, Level::Warning, warning);
+                        }
+                    }
+                    Err(left) => report(
+                        cli,
+                        Level::Warning,
+                        &format!("container {id} couldn't be removed: {left}"),
+                    ),
+                }
                 return Err(err);
             }
         }
-        Command::Start { id } => container::start(root, id)?,
+        Command::Start { id } => {
+            for warning in container::start(root, id)? {
+                report(cli, Level::Warning, &warning);
+            }
+        }
         Command::State { id } => {
             let state = container::state(root, id)?;
             let json = serde_json::to_string_pretty(&state)?;
             writeln!(std::io::stdout().lock(), "{json}")?;
         }
-        Command::Kill { id, signal } => container::kill(root, id, *signal)?,
-        Command::Delete { force, id } => container::delete(root, id, *force)?,
+        Command::Kill {
+            all: false,
+            id,
+            signal,
+        } => container::kill(root, id, *signal)?,
+        Command::Kill {
+            all: true,
+            id,
+            signal,
+        } => container::kill_all(root, id, *signal)?,
+        Command::Pause { id } => container::pause(root, id)?,
+        Command::Resume { id } => container::resume(root, id)?,
+        Command::Ps { format, id } => runtime_commands::ps(root, id, *format)?,
+        Command::Events {
+            stats,
+            interval,
+            id,
+        } => runtime_commands::events(root, id, *stats, *interval)?,
+        Command::Update {
+            resources,
+            limits,
+            id,
+        } => {
+            let skipped = runtime_commands::update(root, id, resources.as_deref(), limits)?;
+            for warning in skipped {
+                report(cli, Level::Warning, &warning);
+            }
+        }
+        Command::Delete { force, id } => {
+            for warning in container::delete(root, id, *force)? {
+                report(cli, Level::Warning, &warning);
+            }
+        }
     }
     Ok(())
 }

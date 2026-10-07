@@ -484,3 +484,21 @@ fn a_bundles_unmapped_user_is_refused() {
         run.stderr
     );
 }
+
+/// Rootless, the command's OOM score can only go up: lowering it needs
+/// `CAP_SYS_RESOURCE`, which says so.
+#[test]
+fn a_rootless_command_can_only_raise_its_oom_score() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let raised = ok(&["--oom-score-adj", "1000"], "cat /proc/self/oom_score_adj");
+    assert_eq!(raised, "1000\n");
+    let lowered = shipyard_run(&["--oom-score-adj", "-1000"], "true");
+    assert_eq!(lowered.code, Some(125), "{}", lowered.stderr);
+    assert!(
+        lowered.stderr.contains("CAP_SYS_RESOURCE"),
+        "{}",
+        lowered.stderr
+    );
+}

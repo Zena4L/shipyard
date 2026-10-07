@@ -43,6 +43,7 @@ its own view of:
 | Hostname | Its own copy; set it with `--hostname`. |
 | IPC | Its own System V IPC objects and POSIX message queues. |
 | Keyring | A new, empty session keyring (`man 7 keyrings`), as runc gives each container: the keys your login session holds stay out of its reach. |
+| Cgroup | Run as root, a **cgroup** of its own (see [Cgroup](#cgroup) below). |
 
 Without `--rootfs`, the command sees the host's files. It always sees the host's
 network: networking comes in a later version.
@@ -83,6 +84,7 @@ network: networking comes in a later version.
   line or environment, so `-e` values passed to Shipyard can't be read from it
   inside the container.
 - **Terminal:** see [On a terminal, isolated](#on-a-terminal-isolated) below.
+- **Cgroup:** see [Cgroup](#cgroup) below.
 - **If Shipyard is killed**, the whole container goes with it.
 - **Not a hardened boundary yet.** The command runs as root, with only a few of
   root's privileges (see [Capabilities and privileges](#capabilities-and-privileges))
@@ -90,12 +92,45 @@ network: networking comes in a later version.
   In a rootful container it's still root on the host's files, unless `--uidmap`
   (see [User namespaces](#user-namespaces)) makes root inside an ordinary user
   outside; in a rootless one it's you (see [Rootless](#rootless)). The container
-  shares the host's network and has no resource limits of its own yet.
+  shares the host's network, and uses as much memory and CPU as it likes unless
+  you set limits (see [Memory, CPU and I/O limits](#memory-cpu-and-io-limits)).
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
 - **macOS:** commands aren't isolated yet (as with `--no-isolation`);
   `--hostname`, `--domainname`, `--sysctl` and `--rootfs` are errors there.
+
+### Cgroup
+
+A **cgroup** (control group, `man 7 cgroups`) is a group of processes the kernel
+can count, limit, freeze or kill together. Each isolated container gets one of its
+own, named after the `shipyard` process's PID:
+
+- **as root,** `/sys/fs/cgroup/shipyard/run/PID`;
+- **rootless,** in the part of the tree delegated to you: `shipyard/run/PID` below
+  the highest cgroup above your own that you own. With systemd that's your user
+  manager's, `/sys/fs/cgroup/user.slice/user-UID.slice/user@UID.service`, which any
+  process it started is in: a desktop terminal, or a command run with
+  `systemd-run --user --scope`.
+
+- **Every process of the container is in it,** from its very first instruction:
+  the container starts there. Shipyard itself isn't.
+- **Inside, it's the whole tree.** `/proc/self/cgroup` says `0::/`, and
+  `/sys/fs/cgroup` shows only the container's own cgroup, read-only: the host's
+  tree, and other containers', are out of sight.
+- **It goes with the container.** When the run ends, anything left in it is
+  killed and it's removed. If Shipyard itself was killed (`kill -9`), the empty
+  cgroup it leaves is removed by the next isolated `shipyard run` (by the same user).
+- **It holds the limits** you set (see
+  [Memory, CPU and I/O limits](#memory-cpu-and-io-limits)).
+- **Not made** where the system has no cgroup v2 tree at `/sys/fs/cgroup` (cgroup
+  v1 only), where it can't be written (a container started without privileges), or,
+  rootless, where nothing is delegated to you. An SSH login, for one, puts your shell
+  in a session scope that's root's. The run goes on without one (its cgroup
+  namespace's root is then Shipyard's own cgroup; `/sys/fs/cgroup` is the host's tree
+  without `--rootfs`, and empty with one), unless it asks for limits: then it's refused
+  (exit 125), saying why, and for an SSH login how: run it under your user manager,
+  `systemd-run --user --scope shipyard run …`.
 
 ### Capabilities and privileges
 
@@ -257,10 +292,11 @@ sudo shipyard run --uidmap 0:100000:65536 sh -c 'id; cat /proc/self/uid_map'
   `/dev/urandom` and `/dev/tty` are binds of the host's own. `/sys` is the host's,
   read-only, until containers get their own network (a later version). What the host
   mounted inside it (its cgroup tree, for one) is covered by an empty directory, as
-  in a container without a user namespace. `/dev/pts` belongs to the `tty` group (5)
-  only if group 5 is mapped. With `--cap-add SYS_ADMIN`, root inside can unmount
-  those covers, and then reads (never writes) what they hid, such as the host's
-  cgroup tree.
+  in a container without a user namespace; `/sys/fs/cgroup` then shows the
+  container's own cgroup (see [Cgroup](#cgroup)). `/dev/pts` belongs to the `tty`
+  group (5) only if group 5 is mapped. With `--cap-add SYS_ADMIN`, root inside can
+  unmount those covers, and then reads (never writes) what they hid, such as the
+  host's cgroup tree.
 - **Don't map host ID 0.** `--uidmap 0:0:65536` works, but root inside is then root
   on the host's files, which is what a user namespace is for preventing: Shipyard
   warns.
@@ -341,8 +377,9 @@ shipyard run sh -c 'id; cat /proc/self/uid_map'
   `--no-isolation` runs without namespaces there.
 - **Bundles too:** `shipyard run --bundle` and `shipyard-runtime` run rootless as well
   (see [Rootless bundles](bundles.md#rootless-bundles)).
-- **Not rootless yet:** networking of its own and resource limits come in later
-  versions.
+- **A cgroup and limits** where a cgroup subtree is delegated to you (see
+  [Cgroup](#cgroup)).
+- **Not rootless yet:** networking of its own comes in a later version.
 
 ### On a terminal, isolated
 
@@ -539,7 +576,21 @@ as root. Otherwise it fails before starting, and says what differs: for example
 When running as root, the command gets **only** the groups you ask for; root's
 own supplementary groups are always dropped.
 
-## Resource limits
+## The OOM score (`--oom-score-adj`)
+
+```sh
+shipyard run --oom-score-adj 500 my-batch-job
+```
+
+`--oom-score-adj N` (-1000 to 1000) sets how willing the kernel's OOM killer is to
+pick the command when memory runs out: higher is likelier, -1000 never. It's the
+command's `/proc/self/oom_score_adj` (and, isolated, its init's), with or without
+isolation, set by Shipyard before the command starts. Lowering it needs root
+(`CAP_SYS_RESOURCE`): run as root it works, a user namespace (`--uidmap`) included;
+rootless, it can only go up, and a lower value is refused, saying so. Linux only: on
+macOS it's an error.
+
+## Process limits (`--ulimit`)
 
 ```sh
 shipyard run --ulimit nofile=1024:2048 --ulimit core=0 my-server
@@ -584,6 +635,131 @@ an unlimited soft limit, and the command then gets the most the system allows
 per process (`sysctl kern.maxfilesperproc`). On Linux, `unlimited` is refused before
 anything starts (exit 125), because the kernel caps `nofile` at `fs.nr_open`;
 use a number instead.
+
+## Memory, CPU and I/O limits
+
+```sh
+sudo shipyard run --memory 512m --cpus 1.5 --pids-limit 200 my-server
+```
+
+Docker's flags, with the same meaning. They're written into the container's own
+cgroup (see [Cgroup](#cgroup)) before anything runs there, so the whole container, its
+init included, stays within them. Linux only, as root or rootless where a cgroup
+subtree is delegated to you (see [Cgroup](#cgroup)): a run that asks for a limit and
+can't have a cgroup of its own is refused (exit 125), never run without it. Rootless,
+only the controllers delegated to you can be used: systemd delegates `cpu`, `memory`
+and `pids` by default, so `--cpuset-*` and the I/O flags are refused ("it wasn't
+delegated to this user") unless `systemctl edit user@.service` adds them
+(`Delegate=cpu cpuset io memory pids`).
+
+| Flag | Limits | cgroup v2 file |
+|---|---|---|
+| `-m`, `--memory SIZE` | The most memory (`512m`, `2g`; at least 6 MiB). Past it, the kernel reclaims, then its OOM killer kills a process. | `memory.max` |
+| `--memory-reservation SIZE` | Memory kept for the container when the host runs short. | `memory.low` |
+| `--memory-swap SIZE` | Memory **plus** swap (needs `--memory`, except `-1`); `-1` for unlimited swap. | `memory.swap.max` |
+| `--cpus N` | N CPUs' worth of time (`1.5`) in every 100 ms. | `cpu.max` |
+| `--cpu-period µs`, `--cpu-quota µs` | The same in raw terms (a quota of `-1` or `0`: none). Not with `--cpus`. | `cpu.max` |
+| `-c`, `--cpu-shares N` | A share of the CPU against other containers (1024 is the default share). | `cpu.weight` |
+| `--cpuset-cpus LIST`, `--cpuset-mems LIST` | Which CPUs and memory nodes (`0-3`, `0,2`). | `cpuset.cpus`, `cpuset.mems` |
+| `--pids-limit N` | The most processes and threads, the init included (`-1` or `0`: none). | `pids.max` |
+| `--blkio-weight N` | A share of disk time (10–1000). | `io.weight` |
+| `--device-read-bps`, `--device-write-bps DEVICE:RATE` | Bytes per second from or to a block device (`/dev/sda:10mb`). Repeatable. | `io.max` |
+| `--device-read-iops`, `--device-write-iops DEVICE:RATE` | Operations per second. Repeatable. | `io.max` |
+
+- **Swap, as Docker:** with `--memory` and no `--memory-swap`, the container may swap as
+  much as its memory (512 MiB of memory, 512 MiB of swap). `--memory-swap` equal to
+  `--memory` means no swap. Where the kernel doesn't account swap, that default is
+  skipped with a warning, and an explicit `--memory-swap` is refused.
+- **Out of memory:** the kernel's OOM killer kills one process, as with Docker. If it's
+  the command, the run ends with 137 and the warning
+  "the command was killed: out of memory". If it's another process,
+  the command goes on, and Shipyard says one was killed. (A command Shipyard killed
+  itself, after `--stop-timeout`, isn't blamed on the OOM killer.)
+- **0 means "not set"** for every flag, as with Docker: `--memory 0`, `--cpus 0`,
+  `--memory-swap 0` (Docker's default swap) and so on.
+- **The init counts:** it's one of the container's processes. With `--pids-limit 1` it
+  can't start the command, and the run fails, saying the limit is 1.
+- **Controllers:** a limit needs its cgroup controller (memory, cpu, cpuset, pids, io).
+  Shipyard turns on the ones it needs, from the cgroup root down, as runc does; one the
+  kernel doesn't have is refused, naming it. Some files exist only on some kernels:
+  `io.weight` comes from the kernel's I/O cost controller (`CONFIG_BLK_CGROUP_IOCOST`),
+  so `--blkio-weight` is refused
+  ("the container's cgroup has no io.weight: this kernel doesn't have it, …") without
+  them.
+  A cgroup that holds processes never hands a controller down (the kernel would then
+  refuse to place anything below it): inside a container whose processes sit in its
+  cgroup namespace's root (a plain `docker run`), limits are refused, saying so. Move
+  those processes into a child cgroup first, as docker-in-docker setups do.
+- **CPUs and memory nodes** must exist and be allowed to the cgroup tree; the kernel
+  refuses others ("Invalid argument").
+- **I/O limits take whole disks** (`/dev/sda`, not `/dev/sda1`); a partition is refused,
+  saying so.
+- **Checked before anything starts:** a value the kernel wouldn't take is an error
+  (exit 125).
+- **Not with `--no-isolation`** (there's no cgroup) **or `--bundle`** (its
+  `linux.resources` say). On macOS, they're errors.
+
+## Devices
+
+```sh
+shipyard run --device /dev/fuse --rootfs ./root my-fuse-tool
+shipyard run --device /dev/sdb:/dev/xvdc:r --rootfs ./root sh
+shipyard run --device-cgroup-rule 'c 189:* rwm' --rootfs ./root lsusb
+```
+
+An isolated command may use only certain devices, whatever its capabilities and
+permissions: Shipyard attaches a small program to its cgroup (see
+[Cgroup](#cgroup)), and the kernel asks that program about every device node the
+container opens or makes (`mknod`). A device it refuses fails with "Operation not
+permitted".
+
+**By default** (Docker's list, which is runc's), the container may use `/dev/null`,
+`zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, its own terminals (`/dev/pts/*`)
+and `/dev/net/tun`. It may make a node of any device with `mknod` (root has the
+capability by default), but can't open one it made. Without `--rootfs` the container sees the host's `/dev`, and
+the same rules apply: `/dev/sda` is there, but it can't be opened.
+
+- **`--device HOST[:CONTAINER][:PERMS]`** gives the container a device of the host's,
+  at `CONTAINER` in it (its own path if you leave it out), for `PERMS`: any of `r`
+  (read), `w` (write) and `m` (make a node of it), `rwm` if you leave them out.
+  - The host path is followed through symbolic links (`/dev/disk/by-id/…`).
+  - A directory gives every device below it (`--device /dev/dri`), at the same places
+    below `CONTAINER`.
+  - The node keeps the host's permissions and owner.
+  - A `CONTAINER` path outside `/dev` (a fresh, empty file system for each container)
+    is made in the root filesystem's own directory, and stays there after the
+    container, as a mount's missing destination does.
+  - Without `--rootfs`, the device is used where it is on the host: giving it another
+    path is an error (exit 125).
+- **`--device-cgroup-rule 'TYPE MAJOR:MINOR ACCESS'`** lets the container use a whole
+  kind of device, without making a node: `TYPE` is `c` (character), `b` (block) or `a`
+  (both), `MAJOR` and `MINOR` are numbers or `*` (any), and `ACCESS` is from `rwm`. For
+  a device whose nodes come and go (USB, say), with its nodes bound in another way.
+
+Both are repeatable, need Linux, and can't be used with `--no-isolation` or
+`--bundle` (a bundle has its own fields: see [OCI bundles](bundles.md)). Later
+`--device-cgroup-rule`s and `--device`s add to what's allowed; nothing they say can
+take a default away. A container has at most 256 rules, the dozen defaults and one per
+`--device` node included.
+
+**Rootless:** loading the program needs a capability (`CAP_BPF`) a rootless user
+doesn't have on most kernels. Where it's refused, or where the container has no cgroup
+of its own, a rootless container runs without it. It still can't make device nodes
+(its user namespace can't), and the host's nodes it's given keep the host's
+permissions, so it can use only what your user can. If you asked for `--device` or
+`--device-cgroup-rule` there, a warning says the rules can't be enforced.
+`--device` itself still works rootless: the host's node is bound into the container.
+
+**Only with a cgroup:** the program is attached to the container's cgroup, so a
+container without one (on a cgroup v1 host, say: see [Cgroup](#cgroup)) has no
+device control at all, as it has no limits. Where you asked for `--device` or
+`--device-cgroup-rule`, a warning says so.
+
+As root, a kernel that refuses the program (one without `CONFIG_BPF_SYSCALL` or
+`CONFIG_CGROUP_BPF`, which the message names) makes the run fail (exit 125) rather than
+run without it. On kernels before 5.11, where a program's memory counts against the
+locked-memory limit (`ulimit -l`), root lifts that limit for the load, and puts it back:
+the container gets yours.
 
 ## Inherited state
 
@@ -698,7 +874,8 @@ Signals can be given as:
 When the command exits, Shipyard cleans up what it left behind:
 
 - **Isolated** (Linux): when the command exits, the container's init exits and
-  the system kills everything else left in the container.
+  the system kills everything else left in the container. Its cgroup, if it has
+  one, is removed (see [Cgroup](#cgroup)).
 - **Without a terminal** (CI, services, scripts), and always when isolated: the
   command runs in its own process group, and anything still running in that
   group is killed.

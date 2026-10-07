@@ -9,6 +9,20 @@ use crate::process::{EXIT_ENGINE_ERROR, SpawnError, SpecError, StopSignalError};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Limits were asked for, and the container can't have a cgroup to hold
+    /// them.
+    #[cfg(target_os = "linux")]
+    #[error("resource limits need a cgroup of the container's own, and it can't have one: {why}")]
+    LimitsNeedACgroup {
+        /// Why not.
+        why: std::borrow::Cow<'static, str>,
+    },
+
+    /// The container's cgroup couldn't be made, filled or removed.
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Cgroup(#[from] crate::cgroup::CgroupError),
+
     /// The feature needs Linux kernel support this host doesn't have.
     #[error("{feature} requires a Linux kernel (current host: {os})")]
     LinuxOnly {
@@ -200,6 +214,10 @@ pub enum Error {
     /// The command was started but never got to run.
     #[error(transparent)]
     Spawn(#[from] SpawnError),
+
+    /// A hook failed while the container was set up: it doesn't run.
+    #[error(transparent)]
+    Hook(#[from] crate::hooks::HookError),
 
     /// A system call failed in shipyard itself. `op` says what we were doing;
     /// the errno is the error's source, so full-chain printing shows both once.

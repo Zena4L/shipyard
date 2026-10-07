@@ -114,7 +114,8 @@ pub(crate) struct Reexec {
     pub(crate) argv_sigpipe: CStringArray,
     /// Its environment: empty.
     pub(crate) env: CStringArray,
-    /// The descriptors the clean image inherits (setup, status, report):
+    /// The descriptors the clean image inherits (setup, status, report, and
+    /// the gate and hooks pipe if there are):
     /// their close-on-exec flag is cleared just before the exec.
     pub(crate) passed: Vec<RawFd>,
     /// Every other descriptor from 3 up is closed before the exec: these
@@ -139,6 +140,9 @@ pub(crate) struct ReexecFds {
     pub(crate) exe: RawFd,
     /// The start gate (`SpawnOptions::gate`), passed on too.
     pub(crate) gate: Option<RawFd>,
+    /// The hooks pipe's read end, if the setup stops for hooks: passed on
+    /// too.
+    pub(crate) hooks: Option<RawFd>,
 }
 
 /// The user and groups to switch to.
@@ -302,6 +306,21 @@ impl ChildPlan {
                     .isolation()
                     .and_then(|isolation| isolation.id_maps.as_ref())
                     .and_then(|maps| maps.host_uid(0)),
+                pids_max: options
+                    .placement
+                    .isolation()
+                    .and_then(|isolation| isolation.resources.pids_max),
+                hooks: options
+                    .placement
+                    .isolation()
+                    .and_then(|isolation| isolation.hooks.as_ref())
+                    .map(|container| container.hooks.clone())
+                    .unwrap_or_default(),
+                devices: options
+                    .placement
+                    .isolation()
+                    .map(|isolation| isolation.devices.nodes.clone())
+                    .unwrap_or_default(),
                 ..context
             },
         );
@@ -436,6 +455,9 @@ impl ChildPlan {
             sysctls: Vec::new(),
             seccomp: None,
             namespace_root: None,
+            pids_max: None,
+            hooks: crate::hooks::Hooks::default(),
+            devices: Vec::new(),
         };
         Ok((plan, context))
     }
@@ -456,6 +478,7 @@ fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
     let passed: Vec<RawFd> = [fds.setup, fds.status, fds.report]
         .into_iter()
         .chain(fds.gate)
+        .chain(fds.hooks)
         .collect();
     let kept: Vec<u32> = passed
         .iter()

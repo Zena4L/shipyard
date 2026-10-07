@@ -100,6 +100,10 @@ const ISOLATED_TESTS: &[(&str, fn())] = tests![
     with_a_root_filesystem_window_size_changes_reach_the_command,
     a_root_filesystem_has_its_own_terminals,
     a_container_created_from_a_terminal_keeps_it,
+    ctrl_c_during_a_hook_ends_the_run,
+    ctrl_z_and_fg_with_limits,
+    an_oom_kill_on_a_terminal,
+    pause_on_a_terminal,
 ];
 
 /// libtest options that take a value; their value is skipped so it isn't
@@ -1088,5 +1092,286 @@ fn a_container_created_from_a_terminal_keeps_it() {
         "delete\n{}",
         session.transcript()
     );
+    session.finish();
+}
+
+// --- Stage 5: cgroups, hooks and the terminal -------------------------------------
+
+const HOOK_MARK_VAR: &str = "SHIPYARD_TEST_HOOK_MARK";
+
+/// Whether a container can have a cgroup of its own here (root, or a
+/// delegated subtree): what limits and `pause` need. Says why not when not.
+fn cgroups_here() -> bool {
+    #[cfg(target_os = "linux")]
+    let delegated = shipyard_test_support::delegated_cgroup().is_some();
+    // (These tests run only on Linux: see `ISOLATED_TESTS`.)
+    #[cfg(not(target_os = "linux"))]
+    let delegated = false;
+    let here = is_root() || delegated;
+    if !here {
+        eprintln!("skipping: no cgroup of a container's own here");
+    }
+    here
+}
+
+/// The cgroup of process `pid`, as a directory of the tree (from its
+/// `/proc/PID/cgroup`, which shows it from this process's cgroup namespace,
+/// even for a process in its own).
+fn cgroup_of(pid: libc::pid_t) -> std::path::PathBuf {
+    let line = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let relative = line.trim().strip_prefix("0::/").unwrap_or_default();
+    std::path::Path::new("/sys/fs/cgroup").join(relative)
+}
+
+/// The children of `parent`, from `/proc`.
+fn children_of(parent: libc::pid_t) -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|&pid: &libc::pid_t| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.split_whitespace().nth(1))
+                    == Some(&parent.to_string())
+            })
+        })
+        .collect()
+}
+
+/// Waits (up to 10 s) for `done`.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A bundle's `createRuntime` hook that never ends holds `run --bundle` up.
+/// Ctrl-C reaches the hook as it does shipyard: the hook is in shipyard's
+/// process group, the terminal's foreground one. The hook fails, the run
+/// ends naming it (125), and nothing of the container is left: not its
+/// init, not its cgroup.
+fn ctrl_c_during_a_hook_ends_the_run() {
+    let bundle = Bundle::new();
+    let mark = std::env::temp_dir().join(format!("shipyard-tty-hook-{}", std::process::id()));
+    let _ = std::fs::remove_file(&mark);
+    let mut config = bundle.config();
+    config["hooks"] = serde_json::json!({"createRuntime": [{
+        "path": "/bin/sh",
+        "args": ["sh", "-c", format!("echo $$ > {}; exec sleep 300", mark.display())]
+    }]});
+    bundle.write(&config);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe {
+        std::env::set_var(BUNDLE_VAR, bundle.arg());
+        std::env::set_var(HOOK_MARK_VAR, &mark);
+    }
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let job = shell.spawn(Mode::Foreground, &["run", "--bundle", &bundle]);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    eventually("the hook running", || mark.exists());
+    let init = children_of(shipyard)
+        .into_iter()
+        .find(|&pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() == "shipyard-init")
+        })
+        .expect("the container's init, waiting for the hook");
+    let cgroup = cgroup_of(init);
+    session.type_keys(CTRL_C);
+    assert_eq!(
+        session.status(),
+        Status::Exited(125),
+        "{}",
+        session.transcript()
+    );
+    session.expect("createRuntime hook");
+    let _ = std::fs::remove_file(&mark);
+    assert!(
+        !process_state(init).starts_with(['R', 'S', 'D', 'T']),
+        "the init is left"
+    );
+    assert!(!cgroup.exists(), "{} is left", cgroup.display());
+    session.finish();
+}
+
+/// Ctrl-Z stops shipyard (the isolated command, in a session of its own,
+/// goes on), and the run's cgroup and limits stay through the stop; `fg`
+/// resumes shipyard, which reports the end, and the cgroup goes with the run.
+fn ctrl_z_and_fg_with_limits() {
+    if !cgroups_here() {
+        return;
+    }
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "run",
+                "--memory",
+                "64m",
+                "--pids-limit",
+                "40",
+                "sh",
+                "-c",
+                "echo ready; sleep 2; echo done",
+            ],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    session.expect("ready");
+    let cgroup = cgroup_of(child_of(shipyard));
+    let limit = |file: &str| std::fs::read_to_string(cgroup.join(file)).unwrap_or_default();
+    assert_eq!(limit("memory.max").trim(), "67108864");
+    assert_eq!(limit("pids.max").trim(), "40");
+    session.type_keys(CTRL_Z);
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTSTP));
+    wait_until_stopped(shipyard);
+    assert_eq!(
+        limit("memory.max").trim(),
+        "67108864",
+        "the limit through the stop"
+    );
+    session.expect("done");
+    session.go();
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    assert!(!cgroup.exists(), "{} is left", cgroup.display());
+    session.finish();
+}
+
+/// A command the OOM killer ends in the foreground: the terminal says so,
+/// the shell gets 137, and the terminal still works (the next job reads it).
+fn an_oom_kill_on_a_terminal() {
+    if !cgroups_here() {
+        return;
+    }
+    let mut session = session(|shell| {
+        // `tail` keeps the last line, and /dev/zero has no end of line: it
+        // grows until the limit.
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "run",
+                "--memory",
+                "32m",
+                "--memory-swap",
+                "32m",
+                "tail",
+                "/dev/zero",
+            ],
+        );
+        shell.wait(job);
+        shell.await_go();
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "sh", "-c", "read x; echo \"got $x\""],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    assert_eq!(
+        session.status(),
+        Status::Exited(137),
+        "{}",
+        session.transcript()
+    );
+    session.expect("shipyard: warning: the command was killed: out of memory");
+    session.go();
+    session.job();
+    session.type_keys(b"after\n");
+    session.expect("got after");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// A runtime container created from a terminal, echoing what it reads:
+/// paused, what's typed waits (frozen, it reads nothing); resumed, it reads
+/// and echoes it. `kill --all` ends it.
+fn pause_on_a_terminal() {
+    if !cgroups_here() {
+        return;
+    }
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!([
+        "sh",
+        "-c",
+        "echo re\"\"ady; while read line; do echo \"got $line\"; done"
+    ]);
+    bundle.write(&config);
+    let state =
+        StateRoot(std::env::temp_dir().join(format!("shipyard-tty-pause-{}", std::process::id())));
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe {
+        std::env::set_var(BUNDLE_VAR, bundle.arg());
+        std::env::set_var(STATE_ROOT_VAR, &state.0);
+    }
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let runtime = |shell: &mut Shell, args: &[&str]| {
+            let args = [&["--root", root.as_str()], args].concat();
+            let job = shell.spawn_program(Mode::Foreground, RUNTIME, &args);
+            shell.wait(job);
+        };
+        runtime(shell, &["create", "--bundle", &bundle, ON_A_TTY]);
+        runtime(shell, &["start", ON_A_TTY]);
+        shell.await_go();
+        runtime(shell, &["pause", ON_A_TTY]);
+        shell.await_go();
+        runtime(shell, &["state", ON_A_TTY]);
+        shell.await_go();
+        runtime(shell, &["resume", ON_A_TTY]);
+        shell.await_go();
+        runtime(shell, &["kill", "--all", ON_A_TTY, "KILL"]);
+        runtime(shell, &["delete", "--force", ON_A_TTY]);
+    });
+    let ok = |session: &mut Session, what: &str| {
+        session.job();
+        assert_eq!(
+            session.status(),
+            Status::Exited(0),
+            "{what}\n{}",
+            session.transcript()
+        );
+    };
+    ok(&mut session, "create");
+    ok(&mut session, "start");
+    session.expect("ready");
+    session.type_keys(b"one\n");
+    session.expect("got one");
+    session.go();
+    ok(&mut session, "pause");
+    session.type_keys(b"two\n");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    session.go();
+    ok(&mut session, "state");
+    // Everything printed before the state was read with it: no echo.
+    session.expect("\"paused\"");
+    assert_eq!(
+        session.count("got two"),
+        0,
+        "a paused container read\n{}",
+        session.transcript()
+    );
+    session.go();
+    ok(&mut session, "resume");
+    session.expect("got two");
+    session.go();
+    ok(&mut session, "kill --all");
+    ok(&mut session, "delete");
     session.finish();
 }

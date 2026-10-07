@@ -115,8 +115,9 @@ fn bad_json_says_where() {
     assert!(run.stderr.contains("line 3"), "{}", run.stderr);
 }
 
-/// What `runc spec` writes asks for confinement Shipyard can't give yet: the
-/// bundle is refused, naming each field, before anything starts.
+/// What `runc spec` writes asks for what Shipyard can't give yet (a
+/// terminal, a network namespace): the bundle is refused, naming each field,
+/// before anything starts. Its device rule is applied.
 #[test]
 fn a_runc_spec_config_is_refused_with_its_reasons() {
     let bundle = Bundle::new();
@@ -129,15 +130,16 @@ fn a_runc_spec_config_is_refused_with_its_reasons() {
     config["linux"]["resources"] = json!({"devices": [{"allow": false, "access": "rwm"}]});
     let run = run_bundle(&bundle, &config);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
-    for field in [
-        "process.terminal",
-        "linux.namespaces (network)",
-        "linux.resources",
-    ] {
+    for field in ["process.terminal", "linux.namespaces (network)"] {
         assert!(run.stderr.contains(field), "{field}: {}", run.stderr);
     }
-    // Applied since stage 4, so not among the reasons any more.
-    for applied in ["process.capabilities", "process.noNewPrivileges"] {
+    // Applied since stage 4 (and the device rules since stage 5), so not
+    // among the reasons any more.
+    for applied in [
+        "process.capabilities",
+        "process.noNewPrivileges",
+        "linux.resources",
+    ] {
         assert!(!run.stderr.contains(applied), "{applied}: {}", run.stderr);
     }
     assert!(!run.stderr.contains("hint"), "{}", run.stderr);
@@ -443,7 +445,9 @@ fn a_destination_through_a_symlink_stays_inside() {
 fn ignored_fields_are_warned_about() {
     let bundle = Bundle::new();
     let mut config = running(&bundle, "echo ran");
-    config["hooks"] = json!({"prestart": [{"path": "/bin/true"}]});
+    config["mounts"] = json!([
+        {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["relatime"]}
+    ]);
     let run = run_bundle(&bundle, &config);
     assert_eq!(
         (run.code, run.stdout.as_str()),
@@ -452,7 +456,96 @@ fn ignored_fields_are_warned_about() {
         run.stderr
     );
     assert!(
-        run.stderr.contains("warning") && run.stderr.contains("hooks"),
+        run.stderr.contains("warning") && run.stderr.contains("relatime"),
+        "{}",
+        run.stderr
+    );
+}
+
+// --- Hooks ------------------------------------------------------------------------
+
+/// A run is a container's whole life, as `runc run`: every phase's hooks
+/// run, in order, with the state the spec says, the run named `run-PID`.
+/// `startContainer` ran before the program, inside its root.
+#[test]
+#[ignore = "needs root"]
+fn a_run_runs_every_hook() {
+    let bundle = Bundle::new();
+    let log = std::env::temp_dir().join(format!("shipyard-run-hooks-{}", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let mut config = running(&bundle, "cat /tmp/hooks");
+    config["hooks"] = bundle.recording_hooks(&log);
+    let run = run_bundle(&bundle, &config);
+    let lines = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        Bundle::checked_start_container(&run.stdout).starts_with('{'),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(r#""status":"created""#),
+        "{}",
+        run.stdout
+    );
+    let lines: Vec<&str> = lines.lines().collect();
+    let phases: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "prestart",
+            "createRuntime",
+            "createContainer",
+            "poststart",
+            "poststop"
+        ],
+        "{lines:?}"
+    );
+    let id = lines[0].split(' ').nth(1).unwrap();
+    assert!(id.starts_with("id=run-"), "{id}");
+    assert!(lines.iter().all(|line| line.contains(id)), "{lines:?}");
+    assert!(lines[1].ends_with(" mounted"), "{lines:?}");
+    assert!(lines[3].contains("status=running pid="), "{lines:?}");
+    assert!(lines[4].contains("status=stopped pid= "), "{lines:?}");
+}
+
+/// A hook failing before the program is the run's failure (125), naming
+/// it; the program never runs.
+#[test]
+#[ignore = "needs root"]
+fn a_failing_hook_fails_the_run() {
+    let bundle = Bundle::new();
+    for phase in ["prestart", "createContainer", "startContainer"] {
+        let mut config = running(&bundle, "echo ran");
+        config["hooks"] = json!({phase: [{"path": "/bin/sh", "args": ["sh", "-c", "exit 3"]}]});
+        let run = run_bundle(&bundle, &config);
+        assert_eq!(
+            (run.code, run.stdout.as_str()),
+            (Some(125), ""),
+            "{phase}: {}",
+            run.stderr
+        );
+        let expected = format!("the {phase} hook /bin/sh (hooks.{phase}[0]) exited with code 3");
+        assert!(run.stderr.contains(&expected), "{phase}: {}", run.stderr);
+    }
+}
+
+/// Hooks that can't run as given are the bundle's errors, before anything
+/// runs (as any user).
+#[test]
+fn hooks_that_cant_run_are_refused() {
+    let bundle = Bundle::new();
+    let mut config = running(&bundle, "echo ran");
+    config["hooks"] = json!({"poststop": [{"path": "relative/hook"}]});
+    let run = run_bundle(&bundle, &config);
+    assert_eq!(run.code, Some(125), "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("hooks.poststop[0]: relative/hook isn't an absolute path"),
         "{}",
         run.stderr
     );

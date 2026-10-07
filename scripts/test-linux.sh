@@ -60,13 +60,60 @@ set -euo pipefail
 # `tester`, the image's normal user, owns the build volumes.
 chown -R tester /target /usr/local/cargo /usr/local/rustup
 
+# cgroups, as a systemd host has them (stage 5):
+# - this container's cgroup namespace root holds our processes, so it can't
+#   hand controllers to children (the kernel's "no internal processes" rule):
+#   move them into a leaf, as docker-in-docker does, then enable the
+#   controllers, each it has;
+# - `tester` gets a subtree of its own, as systemd's Delegate= gives each user
+#   `user@UID.service` (here `user.slice/tester`): the directories and their
+#   cgroup.procs, cgroup.subtree_control and cgroup.threads are tester's, and
+#   its shells start inside (`user.slice/tester/session`). Like systemd's
+#   default (Delegate=pids memory cpu), only those three controllers reach it:
+#   `user.slice`, root's, hands down nothing else.
+#
+# Only at the root of this container's own cgroup namespace (`0::/`): with
+# Docker's `--cgroupns=host`, /sys/fs/cgroup would be the host's (or the VM's)
+# real root, which this must never rearrange. There, the cgroup tests find no
+# delegation and skip.
+cgroup=/sys/fs/cgroup
+if [ "$(cat /proc/self/cgroup)" = "0::/" ] && [ -w "$cgroup/cgroup.subtree_control" ]; then
+    mkdir -p "$cgroup/init"
+    # A few passes (processes started meanwhile), but never forever: one
+    # that can't move must fail the run, not hang it.
+    for _ in 1 2 3 4 5; do
+        [ -z "$(cat "$cgroup/cgroup.procs")" ] && break
+        while read -r pid; do
+            echo "$pid" >"$cgroup/init/cgroup.procs" 2>/dev/null || true
+        done <"$cgroup/cgroup.procs"
+    done
+    if [ -n "$(cat "$cgroup/cgroup.procs")" ]; then
+        echo "test-linux.sh: can't move these processes out of the cgroup root: $(cat "$cgroup/cgroup.procs")" >&2
+        exit 1
+    fi
+    mkdir -p "$cgroup/user.slice/tester/session"
+    for controller in $(cat "$cgroup/cgroup.controllers"); do
+        echo "+$controller" >"$cgroup/cgroup.subtree_control"
+    done
+    echo "+cpu +memory +pids" >"$cgroup/user.slice/cgroup.subtree_control"
+    echo "+cpu +memory +pids" >"$cgroup/user.slice/tester/cgroup.subtree_control"
+    for dir in user.slice/tester user.slice/tester/session; do
+        chown tester "$cgroup/$dir" "$cgroup/$dir/cgroup.procs" \
+            "$cgroup/$dir/cgroup.subtree_control" "$cgroup/$dir/cgroup.threads"
+    done
+fi
+
 # Drops to `tester` (all its IDs, no capabilities: what an ordinary user
-# has), keeping the toolchain's environment.
-as_tester() {
-    setpriv --reuid tester --regid tester --init-groups \
+# has), keeping the toolchain's environment, in its delegated cgroup.
+as_tester() (
+    if [ -w "$cgroup/user.slice/tester/session/cgroup.procs" ]; then
+        echo "$BASHPID" >"$cgroup/user.slice/tester/session/cgroup.procs"
+    fi
+    exec setpriv --reuid tester --regid tester --init-groups \
         env HOME=/home/tester "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" \
+        SHIPYARD_TEST_DELEGATED=required \
         "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" "$@"
-}
+)
 
 # Becomes the root pass's environment:
 # - `/` shared, like a systemd host, where a mount namespace that isn't made

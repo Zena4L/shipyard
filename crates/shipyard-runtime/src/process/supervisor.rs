@@ -38,6 +38,7 @@ use super::spawn::{Child, Placement, SpawnOptions, spawn};
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
 use super::stop::StopPolicy;
+use crate::hooks::{ContainerHooks, Phase};
 use crate::isolation::{Isolation, Join, Namespace};
 use crate::{Error, Result};
 
@@ -185,6 +186,14 @@ impl Supervisor {
         );
         let spec = with_terminal_env(spec, terminal.is_some(), std::env::var_os("TERM"));
         let spec = resolve_names(spec, &placement)?;
+        #[cfg(target_os = "linux")]
+        let cgroup = make_run_cgroup(&placement)?;
+        #[cfg(target_os = "linux")]
+        let hooks = placement
+            .isolation()
+            .and_then(|isolation| isolation.hooks.clone());
+        #[cfg(not(target_os = "linux"))]
+        let hooks = None;
         let options = SpawnOptions {
             placement,
             new_process_group: job_terminal.is_none(),
@@ -196,31 +205,59 @@ impl Supervisor {
                 .filter(|signal| KEEP_IGNORED.contains(signal))
                 .collect(),
             gate: None,
+            #[cfg(target_os = "linux")]
+            cgroup: cgroup.as_ref().map(|run| run.cgroup().clone()),
         };
         let started = |pid: Pid| self.signals.set_child(pid.as_raw());
+        // Whether shipyard itself killed the command (its stop timeout): then
+        // a SIGKILL isn't the OOM killer's.
+        #[cfg_attr(
+            not(target_os = "linux"),
+            allow(unused_assignments, reason = "only Linux reports OOM kills")
+        )]
+        let mut killed_by_us = false;
         let result = spawn(&spec, &options, started).and_then(|mut child| {
-            let result = self.watch(&mut child, stop, job_terminal, own_session);
+            let result = self.watch(&mut child, stop, job_terminal, own_session, hooks.as_ref());
             if result.is_err() {
                 // Never leave the command running unsupervised.
                 child.kill_all();
                 reap_killed(&mut child);
             }
-            result
+            result.map(|ended| {
+                killed_by_us = ended.killed_by_us;
+                ended.status
+            })
         });
         #[cfg(target_os = "linux")]
         kill_leftovers(&mut self.inherited);
+        #[cfg(target_os = "linux")]
+        if let Some(run) = cgroup {
+            if let Ok(status) = &result {
+                report_oom(run.cgroup(), *status, killed_by_us);
+            }
+            if let Err(err) = run.cgroup().remove(CGROUP_REMOVAL) {
+                tracing::warn!("{err}");
+            }
+        }
         self.signals.clear_child();
+        // The container is gone, whether it ran or its setup failed: as the
+        // spec has it, `poststop` follows either way.
+        if let Some(hooks) = &hooks {
+            run_warning(hooks, Phase::Poststop, None);
+        }
         result
     }
 
     /// The event loop. Returns once the command has exited and been reaped.
+    /// Runs `hooks`' `poststart` once the command's `exec` resolved.
     fn watch(
         &mut self,
         child: &mut Child,
         stop: StopPolicy,
         terminal: Option<&Terminal>,
         own_session: bool,
-    ) -> Result<ExitStatus> {
+        hooks: Option<&ContainerHooks>,
+    ) -> Result<Ended> {
         let mut timers = StopTimers::default();
         loop {
             self.wait_for_event(child, timers.next_wake())?;
@@ -243,9 +280,20 @@ impl Supervisor {
             timers.tick(child, stop, Instant::now());
             // The exec report comes before reaping: a failed exec must be
             // reported as such, not as an ordinary exit.
+            let resolving = child.report_fd().is_some();
             child.check_exec()?;
+            if resolving
+                && child.report_fd().is_none()
+                && let Some(hooks) = hooks
+            {
+                // The command runs: failures are only warnings now.
+                run_warning(hooks, Phase::Poststart, Some(child.pid().as_raw()));
+            }
             if let Some(status) = reap_children(child, &mut self.inherited)? {
-                return Ok(status);
+                return Ok(Ended {
+                    status,
+                    killed_by_us: timers.killed_at.is_some(),
+                });
             }
             if terminal.is_some() {
                 follow_stops(child, &self.signals, continued, timers.requested);
@@ -508,6 +556,13 @@ impl Terminal {
     fn foreground(&self) -> bool {
         false
     }
+}
+
+/// How the command ended.
+struct Ended {
+    status: ExitStatus,
+    /// Shipyard killed it: the stop timeout ran out.
+    killed_by_us: bool,
 }
 
 /// The graceful-stop sequence: stop signal, then SIGKILL after the timeout,
@@ -855,6 +910,113 @@ fn children_by_scanning_proc() -> Vec<libc::pid_t> {
         .collect()
 }
 
+/// How long the end of a run waits for its cgroup to empty: a killed
+/// process goes at once, unless it's stuck in the kernel.
+#[cfg(target_os = "linux")]
+const CGROUP_REMOVAL: Duration = Duration::from_secs(5);
+
+/// The cgroup an isolated run gets: `run/<shipyard's pid>`, made here and
+/// held (locked) until the run ends, with the run's limits written in before
+/// anything runs in it. Below this process's part of the tree: root's, or a
+/// user's delegated subtree.
+///
+/// Without limits, `None` where none can be made (no delegation, cgroup v1, a
+/// read-only tree): the run goes on without one. With limits, that's an
+/// error: they'd be silently missing. So is real root failing to claim one
+/// in a tree it found.
+#[cfg(target_os = "linux")]
+fn make_run_cgroup(placement: &Placement) -> Result<Option<crate::cgroup::RunCgroup>> {
+    use crate::cgroup;
+    let Some(isolation) = placement.isolation() else {
+        return Ok(None);
+    };
+    let resources = &isolation.resources;
+    let limited = !resources.is_empty();
+    let tree = match cgroup::Tree::find() {
+        Ok(tree) => tree,
+        Err(why) if limited => {
+            return Err(Error::LimitsNeedACgroup {
+                why: why.to_string().into(),
+            });
+        }
+        Err(why) => {
+            tracing::debug!("running without a cgroup of its own: {why}");
+            warn_devices_without_cgroup(isolation, &why);
+            return Ok(None);
+        }
+    };
+    // Runs killed before they could clean up left theirs.
+    tree.sweep_stale_runs();
+    let run = match tree.claim_run(std::process::id()) {
+        Ok(run) => run,
+        Err(err) if limited => {
+            return Err(Error::LimitsNeedACgroup {
+                why: err.to_string().into(),
+            });
+        }
+        // Root on a tree it can use always gets one: a claim that fails
+        // there (`run/<pid>` taken, a cgroup holding processes in the way)
+        // is a fault, and going on would drop the device rules unwarned.
+        Err(err) if cgroup::is_host_root() => return Err(err.into()),
+        Err(err) => {
+            tracing::debug!("running without a cgroup of its own: {err}");
+            warn_devices_without_cgroup(isolation, &err);
+            return Ok(None);
+        }
+    };
+    // Limits, then the device program, before anything runs in it.
+    let confined = run.cgroup().limit(resources).and_then(|skipped| {
+        let devices = cgroup::enforce_devices(run.cgroup(), &isolation.devices)?;
+        Ok(skipped.into_iter().chain(devices))
+    });
+    match confined {
+        Ok(warnings) => {
+            for warning in warnings {
+                tracing::warn!("{warning}");
+            }
+            Ok(Some(run))
+        }
+        Err(err) => {
+            let _ = run.cgroup().remove(CGROUP_REMOVAL);
+            Err(err.into())
+        }
+    }
+}
+
+/// Warns that `isolation`'s device rules, if asked for, can't be enforced:
+/// the container has no cgroup, for `why`.
+#[cfg(target_os = "linux")]
+fn warn_devices_without_cgroup(isolation: &Isolation, why: &impl std::fmt::Display) {
+    if let Some(warning) = crate::cgroup::devices_without_cgroup(&isolation.devices, why) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// Runs `hooks`' `phase` (for the init `pid`), each failure a warning.
+fn run_warning(hooks: &ContainerHooks, phase: Phase, pid: Option<i32>) {
+    for warning in hooks.run_all(phase, pid) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// Says whether the OOM killer struck in the container: the command itself
+/// (it died of SIGKILL, a kill was counted, and shipyard didn't send it), or
+/// another process in it.
+#[cfg(target_os = "linux")]
+fn report_oom(cgroup: &crate::cgroup::Cgroup, status: ExitStatus, killed_by_us: bool) {
+    let kills = cgroup.oom_kills();
+    if kills == 0 {
+        return;
+    }
+    if status.killed_by_sigkill() && !killed_by_us {
+        tracing::warn!("the command was killed: out of memory");
+    } else if kills == 1 {
+        tracing::warn!("a process in the container was killed: out of memory");
+    } else {
+        tracing::warn!("{kills} processes in the container were killed: out of memory");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1101,7 @@ mod tests {
             cwd: "/".into(),
             user: crate::process::User::current(),
             rlimits: Vec::new(),
+            oom_score_adj: None,
         };
         let term = |spec: &ProcessSpec, terminal, host: Option<&str>| {
             with_terminal_env(spec, terminal, host.map(Into::into))

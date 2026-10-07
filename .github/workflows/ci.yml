@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        # Rootless containers (stage 4) run as this normal user: Ubuntu restricts
+      # Rootless containers (stage 4) run as this normal user: Ubuntu restricts
       # unprivileged user namespaces with AppArmor (since 23.10), and the full
       # ID map needs newuidmap/newgidmap and a subordinate range for the user.
       - name: allow rootless containers
@@ -57,16 +57,38 @@ jobs:
           me=$(id -un)
           grep -q "^$me:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$me"
           grep -q "^$me:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$me"
+      # Rootless cgroups (stage 5) need a cgroup delegated to this user, as
+      # systemd's user manager (user@UID.service) is: start it (lingering),
+      # and run the tests in a scope inside it.
+      - name: a delegated cgroup (the user's systemd manager)
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          bus="/run/user/$(id -u)/bus"
+          for _ in $(seq 50); do [ -S "$bus" ] && break; sleep 0.2; done
+          [ -S "$bus" ]
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" >> "$GITHUB_ENV"
       - run: cargo clippy --locked --workspace --all-targets
-      - run: cargo test --locked --workspace
+      - name: cargo test
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            systemd-run --user --scope --quiet cargo test --locked --workspace
+          else
+            cargo test --locked --workspace
+          fi
         env:
-          # Set up above: here a skipped rootless test is a failure.
+          # Set up above: here a skipped rootless test, or a run without a
+          # delegated cgroup, is a failure.
           SHIPYARD_TEST_ROOTLESS: ${{ runner.os == 'Linux' && 'required' || '' }}
+          SHIPYARD_TEST_DELEGATED: ${{ runner.os == 'Linux' && 'required' || '' }}
 
   # Tests that need root (switching user and groups, namespaces, root
-  # filesystems, the OCI runtime) are #[ignore]d in normal runs. Here they run
-  # as root through a cargo runner, so cargo itself (and the build) never does. Both platforms: Linux and macOS switch credentials
-  # differently (setresuid vs setuid, and macOS's group list layout).
+  # filesystems, the OCI runtime, cgroups, device programs) are #[ignore]d in
+  # normal runs. Here they run as root through a cargo runner, so cargo itself
+  # (and the build) never does. Both platforms: Linux and macOS switch
+  # credentials differently (setresuid vs setuid, and macOS's group list
+  # layout).
   root:
     name: test as root (${{ matrix.os }})
     strategy:

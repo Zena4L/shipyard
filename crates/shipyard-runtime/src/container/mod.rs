@@ -1,5 +1,7 @@
 //! The OCI runtime lifecycle: `create`, `start`, `state`, `kill` and
-//! `delete`, as runc implements them, each a separate call. Containers need
+//! `delete`, as runc implements them, each a separate call; and the calls on
+//! a container's cgroup: `pause`, `resume`, `update`, `ps`, `stats` and
+//! `kill --all`. Containers need
 //! Linux: elsewhere every call is [`ContainerError::LinuxOnly`]. The
 //! implementation is in `lifecycle.rs`.
 //!
@@ -15,7 +17,8 @@
 //! user's program hasn't run.
 //!
 //! **The state directory** is `ROOT/ID` (mode 0700): `state.json` (the
-//! bundle, the init's PID and start time), `exec.fifo` (until started), and
+//! bundle, the monitor's and the init's PIDs and start times, the
+//! annotations, the hooks, and the cgroup), `exec.fifo` (until started), and
 //! `exit` (once it ended). Every call takes an exclusive `flock` on the
 //! directory while it reads and changes it.
 //!
@@ -26,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::oci::BundleError;
 
@@ -36,9 +39,15 @@ mod elsewhere;
 mod lifecycle;
 
 #[cfg(not(target_os = "linux"))]
-pub use elsewhere::{create, delete, kill, monitor_entry_point, start, state};
+pub use elsewhere::{
+    create, delete, kill, kill_all, memory_limit, monitor_entry_point, pause, ps, resume, start,
+    state, stats, update,
+};
 #[cfg(target_os = "linux")]
-pub use lifecycle::{create, delete, kill, monitor_entry_point, start, state};
+pub use lifecycle::{
+    create, delete, kill, kill_all, memory_limit, monitor_entry_point, pause, ps, resume, start,
+    state, stats, update,
+};
 
 /// Where root's state directories go unless told otherwise (runc's is
 /// `/run/runc`).
@@ -112,7 +121,7 @@ pub struct Created {
 }
 
 /// Where a container is in its life (OCI's `status`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Status {
@@ -122,6 +131,8 @@ pub enum Status {
     Created,
     /// Its program runs.
     Running,
+    /// Its processes are frozen (`pause`), until `resume`.
+    Paused,
     /// It has ended.
     Stopped,
 }
@@ -132,13 +143,14 @@ impl std::fmt::Display for Status {
             Self::Creating => "creating",
             Self::Created => "created",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Stopped => "stopped",
         })
     }
 }
 
 /// A container's state, as OCI's `state` prints it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct State {
@@ -148,13 +160,13 @@ pub struct State {
     pub id: String,
     /// Where it is in its life.
     pub status: Status,
-    /// Its init's PID, while it's created or running.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Its init's PID, while it's created, running or paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
     /// The bundle it was created from (absolute).
     pub bundle: PathBuf,
     /// Its config's annotations.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
 }
 
@@ -186,14 +198,28 @@ pub enum ContainerError {
         /// Where it must be for that.
         wanted: &'static str,
     },
-    /// The bundle has no PID namespace. Without one, the container's
-    /// processes can't all be found, signalled or cleaned up (that needs
-    /// cgroups), and nobody is left to explain a program that can't run.
+    /// The bundle has no PID namespace, and the container can't have a
+    /// cgroup either (the reason given): then nothing can find, signal or
+    /// clean up all its processes.
     #[error(
-        "the bundle has no pid namespace: shipyard-runtime needs one (without it, the \
-         container's processes can't all be found or stopped until cgroups arrive)"
+        "the bundle has no pid namespace, and without one its processes can only all be found \
+         and stopped through a cgroup of its own, which it can't have here: {0}"
     )]
-    NoPidNamespace,
+    NoPidNamespace(String),
+    /// The bundle asks for limits, and the container can't have a cgroup to
+    /// hold them (the reason given).
+    #[error(
+        "the bundle asks for resource limits (linux.resources), which need a cgroup of the \
+         container's own, and it can't have one here: {0}"
+    )]
+    LimitsNeedACgroup(String),
+    /// A command that works on the container's cgroup (pause, update, ps,
+    /// `kill --all`, events), for a container that has none.
+    #[error(
+        "container {0} has no cgroup of its own (made where none could be: no delegated \
+         subtree, or cgroup v1), which this needs"
+    )]
+    NeedsCgroup(String),
     /// No default directory for a non-root caller's state.
     #[error(
         "no directory for the containers' state: {0} (a login session sets it); give one \
@@ -205,12 +231,12 @@ pub enum ContainerError {
     /// program.
     #[error(
         "SIGSTOP would stop container {0}'s init, not its program; send TSTP to stop the \
-         program (pausing a whole container comes with cgroups)"
+         program, or pause the whole container"
     )]
     StopSignal(String),
     /// Another call has held the container's lock too long (stopped, or
     /// stuck on a hung file system).
-    #[error("container {0} is busy: another call has held its lock for over 10 seconds")]
+    #[error("container {0} is busy: another call has held its lock for over 15 seconds")]
     Busy(String),
     /// The state root could be changed by someone else.
     #[error("refusing the state root {}: {reason}", path.display())]
@@ -229,6 +255,10 @@ pub enum ContainerError {
     /// The bundle can't be run.
     #[error(transparent)]
     Bundle(#[from] BundleError),
+    /// Its cgroup couldn't be made, limited, frozen, signalled or removed.
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Cgroup(#[from] crate::cgroup::CgroupError),
     /// Setting the container up failed (the monitor's message).
     #[error("{0}")]
     Setup(String),

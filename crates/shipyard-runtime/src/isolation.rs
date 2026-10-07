@@ -16,6 +16,8 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 pub use crate::id_map::{IdMap, IdMapError, IdMaps, MapKind, RootlessMaps};
 
 /// A kind of Linux namespace.
@@ -101,12 +103,11 @@ impl Namespace {
     }
 
     /// Whether this stage can create it. The others come with the stages that
-    /// give them meaning: network (stage 7), cgroup (stage 5), time (not
-    /// planned yet).
+    /// give them meaning: network (stage 7), time (not planned yet).
     fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::Pid | Self::Mount | Self::Uts | Self::Ipc | Self::User
+            Self::Pid | Self::Mount | Self::Uts | Self::Ipc | Self::User | Self::Cgroup
         )
     }
 }
@@ -151,11 +152,56 @@ pub struct Isolation {
     /// The ID maps of its user namespace: present exactly when
     /// [`Namespace::User`] is in `namespaces`.
     pub id_maps: Option<IdMaps>,
+    /// A `cgroup2` mount at `/sys/fs/cgroup`, showing the container's own
+    /// cgroup (with a cgroup namespace). Made only when the container has a
+    /// cgroup of its own: otherwise it would show shipyard's.
+    pub cgroup_mount: Option<CgroupMount>,
+    /// What the container may use: its cgroup's limits (none by default).
+    pub resources: crate::resources::Resources,
+    /// The bundle's hooks, with the container their state names (none by
+    /// default). Run at create (`prestart`, `createRuntime`,
+    /// `createContainer`, `startContainer`) by the spawn, and after it
+    /// (`poststart`, `poststop`) by whoever runs the container.
+    pub hooks: Option<crate::hooks::ContainerHooks>,
+    /// Which devices it may use, and the nodes made in its `/dev` (Docker's
+    /// defaults to begin with): enforced by its cgroup's device program.
+    pub devices: crate::devices::Devices,
+}
+
+/// The container's view of its cgroup at `/sys/fs/cgroup` (always `nosuid`,
+/// `nodev` and `noexec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CgroupMount {
+    /// Read-only, as Docker mounts it for containers that aren't privileged:
+    /// the container sees its usage and limits, and can't change them.
+    pub read_only: bool,
+}
+
+impl CgroupMount {
+    /// A read-only view.
+    #[must_use]
+    pub fn read_only() -> Self {
+        Self { read_only: true }
+    }
+
+    /// The flags to mount it with.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mount_flags(self) -> nix::mount::MsFlags {
+        use nix::mount::MsFlags;
+        let restricted = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        if self.read_only {
+            restricted | MsFlags::MS_RDONLY
+        } else {
+            restricted
+        }
+    }
 }
 
 impl Isolation {
-    /// The standard set: new PID, mount, UTS and IPC namespaces, and the
-    /// host's hostname.
+    /// The standard set: new PID, mount, UTS, IPC and cgroup namespaces, the
+    /// host's hostname, Docker's confinement, and a read-only view of the
+    /// container's cgroup.
     #[must_use]
     pub fn standard() -> Self {
         Self {
@@ -164,6 +210,7 @@ impl Isolation {
                 Namespace::Mount,
                 Namespace::Uts,
                 Namespace::Ipc,
+                Namespace::Cgroup,
             ],
             hostname: None,
             domainname: None,
@@ -171,14 +218,22 @@ impl Isolation {
             root: None,
             security: crate::security::Security::standard(),
             id_maps: None,
+            cgroup_mount: Some(CgroupMount::read_only()),
+            resources: crate::resources::Resources::default(),
+            hooks: None,
+            devices: crate::devices::Devices::docker_default(),
         }
     }
 
-    /// The `CLONE_NEW*` flags for all its namespaces together.
+    /// The `CLONE_NEW*` flags for its namespaces, the ones made at the clone.
+    /// Not the cgroup namespace: the clean image makes that one itself, once
+    /// it's in its cgroup, so the namespace's root is the container's cgroup
+    /// whichever way it got there (see `init.rs`).
     #[cfg(target_os = "linux")]
     pub(crate) fn clone_flags(&self) -> libc::c_int {
         self.namespaces
             .iter()
+            .filter(|&&namespace| namespace != Namespace::Cgroup)
             .fold(0, |flags, namespace| flags | namespace.clone_flag())
     }
 
@@ -211,6 +266,18 @@ impl Isolation {
         if self.has(Namespace::Pid) && !self.has(Namespace::Mount) {
             return Err(IsolationError::PidNeedsMount);
         }
+        self.devices.validate()?;
+        // Nodes are made in the container's own `/dev`: without a root
+        // filesystem, `/dev` is the host's.
+        if !self.devices.nodes.is_empty() && self.root.is_none() {
+            return Err(IsolationError::DeviceNodesNeedRoot);
+        }
+        if let Some(container) = &self.hooks {
+            container
+                .hooks
+                .check()
+                .map_err(IsolationError::InvalidHook)?;
+        }
         if let Some(hostname) = &self.hostname {
             if !self.has(Namespace::Uts) {
                 return Err(IsolationError::HostnameNeedsUts);
@@ -239,6 +306,12 @@ impl Isolation {
             // host's processes into the container's root.
             if !self.has(Namespace::Mount) {
                 return Err(IsolationError::RootNeedsMount);
+            }
+            // A root filesystem gets a fresh /proc, and only root of the user
+            // namespace that owns the PID namespace may mount one: in a user
+            // namespace, the host's PID namespace isn't its own.
+            if self.has(Namespace::User) && !self.has(Namespace::Pid) {
+                return Err(IsolationError::UserRootNeedsPid);
             }
             root.validate()?;
         }
@@ -474,8 +547,7 @@ pub struct Join {
 }
 
 impl Join {
-    /// Joins `target`'s PID, mount, UTS and IPC namespaces: the ones a
-    /// [standard](Isolation::standard) container has.
+    /// Joins every namespace a [standard](Isolation::standard) container has.
     #[must_use]
     pub fn standard(target: u32) -> Self {
         Self {
@@ -651,6 +723,14 @@ pub enum IsolationError {
     /// host's `/proc`.
     #[error("a PID namespace needs a mount namespace too (for its own /proc)")]
     PidNeedsMount,
+    /// A root filesystem in a user namespace, without a PID namespace: its
+    /// `/proc` can't be mounted (only root of the user namespace owning the
+    /// PID namespace may mount one, and the host's isn't).
+    #[error(
+        "a root filesystem in a user namespace needs a PID namespace too: its /proc can only be \
+         mounted by the root of a PID namespace's own user namespace"
+    )]
+    UserRootNeedsPid,
     /// A hostname was given, but no UTS namespace to set it in: it would
     /// change the host's hostname.
     #[error("setting the hostname needs a UTS namespace")]
@@ -697,6 +777,18 @@ pub enum IsolationError {
         /// Why not.
         reason: &'static str,
     },
+    /// Device rules or nodes that can't be used.
+    #[error(transparent)]
+    Devices(#[from] crate::devices::DeviceError),
+    /// Device nodes asked for without a root filesystem to make them in.
+    #[error(
+        "device nodes can only be made in a root filesystem of the container's own (without \
+         one, /dev is the host's)"
+    )]
+    DeviceNodesNeedRoot,
+    /// A hook that can't run as given (`hooks.PHASE[N]: why`).
+    #[error("{0}")]
+    InvalidHook(String),
     /// A [`Join`] with no namespaces to join.
     #[error("no namespaces to join")]
     NothingToJoin,
@@ -891,7 +983,7 @@ mod tests {
             Err(IsolationError::Duplicate(Namespace::Pid))
         );
 
-        for later in [Namespace::Network, Namespace::Cgroup, Namespace::Time] {
+        for later in [Namespace::Network, Namespace::Time] {
             let mut isolation = Isolation::standard();
             isolation.namespaces.push(later);
             assert_eq!(
@@ -911,6 +1003,10 @@ mod tests {
             root: None,
             security: crate::security::Security::standard(),
             id_maps: None,
+            cgroup_mount: None,
+            resources: crate::resources::Resources::default(),
+            hooks: None,
+            devices: crate::devices::Devices::docker_default(),
         };
         assert_eq!(isolation.validate(), Err(IsolationError::PidNeedsMount));
         // A mount namespace alone is fine: its /proc still shows the host's
@@ -923,8 +1019,29 @@ mod tests {
             root: None,
             security: crate::security::Security::standard(),
             id_maps: None,
+            cgroup_mount: None,
+            resources: crate::resources::Resources::default(),
+            hooks: None,
+            devices: crate::devices::Devices::docker_default(),
         };
         assert_eq!(mount_only.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_root_filesystem_in_a_user_namespace_needs_a_pid_namespace() {
+        let mut isolation = Isolation::standard();
+        isolation.namespaces = vec![Namespace::Mount, Namespace::User];
+        isolation.id_maps = Some(crate::id_map::IdMaps::single((1000, 1000)));
+        isolation.root = Some(Root::new(PathBuf::from("/srv/root")));
+        assert_eq!(isolation.validate(), Err(IsolationError::UserRootNeedsPid));
+        // Without a root filesystem, no /proc is mounted: the host's stays.
+        isolation.root = None;
+        assert_eq!(isolation.validate(), Ok(()));
+        // As root, without a user namespace, the host's PID namespace is root's.
+        isolation.namespaces = vec![Namespace::Mount];
+        isolation.id_maps = None;
+        isolation.root = Some(Root::new(PathBuf::from("/srv/root")));
+        assert_eq!(isolation.validate(), Ok(()));
     }
 
     #[test]
@@ -981,6 +1098,25 @@ mod tests {
     }
 
     #[test]
+    fn hooks_are_checked() {
+        let mut hooks = crate::hooks::Hooks::default();
+        hooks.poststop.push(crate::hooks::Hook::new("relative"));
+        let mut isolation = Isolation::standard();
+        isolation.hooks = Some(crate::hooks::ContainerHooks::new(
+            hooks,
+            "c1",
+            "/b",
+            std::collections::BTreeMap::new(),
+        ));
+        assert_eq!(
+            isolation.validate(),
+            Err(IsolationError::InvalidHook(
+                "hooks.poststop[0]: relative isn't an absolute path".into()
+            ))
+        );
+    }
+
+    #[test]
     fn a_hostname_needs_a_uts_namespace() {
         let isolation = Isolation {
             namespaces: vec![Namespace::Pid, Namespace::Mount],
@@ -990,6 +1126,10 @@ mod tests {
             root: None,
             security: crate::security::Security::standard(),
             id_maps: None,
+            cgroup_mount: None,
+            resources: crate::resources::Resources::default(),
+            hooks: None,
+            devices: crate::devices::Devices::docker_default(),
         };
         assert_eq!(isolation.validate(), Err(IsolationError::HostnameNeedsUts));
     }

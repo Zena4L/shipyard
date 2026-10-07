@@ -12,6 +12,7 @@
     reason = "in a test crate, a panic is a test failure with a clear message"
 )]
 
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use shipyard_test_support::bundle::Bundle;
-use shipyard_test_support::{Rootless, rootless};
+use shipyard_test_support::{Rootless, delegated_cgroup, rootless, under_rosetta};
 
 const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
 
@@ -166,6 +167,20 @@ fn bundle_running(script: &str) -> Bundle {
     bundle
 }
 
+/// Container `id`'s cgroup, which root's containers get (cgroup v2).
+fn cgroup_of(id: &str) -> PathBuf {
+    PathBuf::from("/sys/fs/cgroup/shipyard/runtime").join(id)
+}
+
+/// The processes in the cgroup at `path` (none if it's gone).
+fn cgroup_procs(path: &std::path::Path) -> Vec<i64> {
+    std::fs::read_to_string(path.join("cgroup.procs"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.parse().ok())
+        .collect()
+}
+
 fn alive(pid: i64) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         !stat
@@ -205,6 +220,148 @@ fn a_rootless_container_lives_its_life() {
     assert_eq!(words, ["0", "0", me.as_str(), "1"], "{out}");
     assert_eq!(runtime.call(&["delete", "rootless"]).code, Some(0));
     assert_eq!(runtime.state("rootless"), None);
+}
+
+/// A rootless container's hooks run as the caller, every phase, and the
+/// runtime's see the container's mounts as root's do (the caller owns its
+/// user namespace).
+#[test]
+fn a_rootless_containers_hooks_run() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let (config, log) = hooked(&runtime, &bundle, "cat /tmp/hooks");
+    bundle.write(&config);
+    let call = runtime.create("hooked", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.call(&["start", "hooked"]).code, Some(0));
+    runtime.wait_for("hooked", "stopped");
+    let _ = Bundle::checked_start_container(&runtime.output_of("hooked"));
+    assert_eq!(runtime.call(&["delete", "hooked"]).code, Some(0));
+    let phases: Vec<String> = lines_of(&log)
+        .iter()
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "prestart",
+            "createRuntime",
+            "createContainer",
+            "poststart",
+            "poststop"
+        ]
+    );
+    assert!(
+        lines_of(&log)[1].ends_with(" mounted"),
+        "{:?}",
+        lines_of(&log)
+    );
+    // Written by the caller.
+    // SAFETY: `getuid` has no preconditions.
+    assert_eq!(std::fs::metadata(&log).unwrap().uid(), unsafe {
+        libc::getuid()
+    });
+}
+
+/// A rootless container's cgroup follows delegation: where the user was
+/// delegated a subtree, the container is placed there (with its limits, its
+/// cgroup namespace and mount), and the cgroup goes at its end. Where nothing
+/// is delegated, the cgroup mount is left out, with a warning, and the
+/// container still runs. Without a `pid` namespace, a rootless container's
+/// `/proc` can't be mounted: refused, saying so.
+#[test]
+fn a_rootless_containers_cgroup_follows_delegation() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["namespaces"] = json!([{"type": "mount"}, {"type": "cgroup"}]);
+    bundle.write(&config);
+    let refused = runtime.create("pidless", &bundle, &[]);
+    assert_eq!(refused.code, Some(1));
+    assert!(
+        refused.stderr.contains("needs a PID namespace too"),
+        "{}",
+        refused.stderr
+    );
+    config["linux"]["namespaces"] = json!([{"type": "pid"}, {"type": "mount"}, {"type": "cgroup"}]);
+    config["mounts"] = json!([{
+        "destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup", "options": ["ro"]
+    }]);
+    config["process"]["args"] =
+        json!(["sh", "-c", "cat /proc/self/cgroup /sys/fs/cgroup/pids.max"]);
+    let Some(base) = delegated_cgroup() else {
+        bundle.write(&config);
+        let created = runtime.create("ungrouped", &bundle, &[]);
+        assert_eq!(created.code, Some(0), "{}", created.stderr);
+        assert!(
+            created
+                .stderr
+                .contains("the cgroup mount at /sys/fs/cgroup is left out"),
+            "{}",
+            created.stderr
+        );
+        return;
+    };
+    config["linux"]["resources"] = json!({"pids": {"limit": 40}});
+    bundle.write(&config);
+    let created = runtime.create("grouped", &bundle, &[]);
+    assert_eq!(created.code, Some(0), "{}", created.stderr);
+    assert!(!created.stderr.contains("left out"), "{}", created.stderr);
+    let cgroup = base.join("shipyard/runtime/grouped");
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(runtime.root.join("grouped/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["cgroup"], cgroup.to_str().unwrap());
+    assert_eq!(runtime.call(&["start", "grouped"]).code, Some(0));
+    let ended = runtime.exit_record("grouped");
+    assert!(ended.contains("exit code 0"), "{ended}");
+    assert_eq!(runtime.output_of("grouped"), "0::/\n40\n");
+    assert!(!cgroup.exists(), "{} is left", cgroup.display());
+    assert_eq!(runtime.call(&["delete", "grouped"]).code, Some(0));
+}
+
+/// A rootless container's cgroup commands follow delegation: with a
+/// delegated subtree, pause, resume, update, ps and events work on it; without
+/// one, they're refused, saying why.
+#[test]
+fn rootless_cgroup_commands_follow_delegation() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let runtime = Runtime::new();
+    let bundle = bundle_running("exec sleep 300");
+    let created = runtime.create("tended", &bundle, &[]);
+    assert_eq!(created.code, Some(0), "{}", created.stderr);
+    assert_eq!(runtime.call(&["start", "tended"]).code, Some(0));
+    let Some(base) = delegated_cgroup() else {
+        let refused = runtime.call(&["pause", "tended"]);
+        assert_eq!(refused.code, Some(1));
+        assert!(
+            refused.stderr.contains("has no cgroup of its own"),
+            "{}",
+            refused.stderr
+        );
+        return;
+    };
+    assert_eq!(runtime.call(&["pause", "tended"]).code, Some(0));
+    assert_eq!(runtime.status("tended"), "paused");
+    assert_eq!(runtime.call(&["resume", "tended"]).code, Some(0));
+    let call = runtime.call(&["update", "--pids-limit", "20", "tended"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let pids_max = base.join("shipyard/runtime/tended/pids.max");
+    assert_eq!(std::fs::read_to_string(pids_max).unwrap(), "20\n");
+    let ps = runtime.call(&["ps", "--format", "json", "tended"]);
+    let pids: Vec<i64> = serde_json::from_str(&ps.stdout).unwrap();
+    assert!(!pids.is_empty(), "{}", ps.stderr);
+    let stats = runtime.call(&["events", "--stats", "tended"]);
+    let event: Value = serde_json::from_str(stats.stdout.trim()).unwrap();
+    assert_eq!(event["data"]["pids"]["limit"], 20);
 }
 
 /// Without `--root`, a non-root caller's state is in
@@ -446,20 +603,644 @@ fn a_failed_create_leaves_nothing() {
     assert!(!runtime.root.join("broken").exists());
 }
 
-/// Without a PID namespace, the runtime couldn't find or stop all the
-/// container's processes: refused before anything exists.
+/// Root's container is born into a cgroup of its own, recorded in its
+/// state; the cgroup goes when the container ends, before its end is
+/// recorded.
 #[test]
 #[ignore = "needs root"]
-fn a_bundle_without_a_pid_namespace_is_refused() {
+fn a_container_has_a_cgroup_for_its_life() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("exec sleep 300");
+    let call = runtime.create("grouped", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let cgroup = cgroup_of("grouped");
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(runtime.root.join("grouped/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["cgroup"], cgroup.to_str().unwrap());
+    let pid = runtime.state("grouped").unwrap()["pid"].as_i64().unwrap();
+    assert_eq!(cgroup_procs(&cgroup), [pid], "the init, at the gate");
+
+    assert_eq!(runtime.call(&["start", "grouped"]).code, Some(0));
+    assert_eq!(runtime.call(&["kill", "grouped", "KILL"]).code, Some(0));
+    let _ = runtime.exit_record("grouped");
+    assert!(!cgroup.exists(), "{} is left", cgroup.display());
+    assert_eq!(runtime.call(&["delete", "grouped"]).code, Some(0));
+}
+
+/// Without a PID namespace, the init's death doesn't end the rest: the
+/// cgroup does. A process the init left behind is killed by `delete
+/// --force`, and the cgroup goes.
+#[test]
+#[ignore = "needs root"]
+fn a_bundle_without_a_pid_namespace_is_ended_by_its_cgroup() {
     let runtime = Runtime::new();
     let bundle = Bundle::new();
     let mut config = bundle.config();
     config["linux"]["namespaces"] = json!([{"type": "mount"}]);
+    config["process"]["args"] = json!(["sh", "-c", "sleep 300 & echo $!; exec sleep 301"]);
     bundle.write(&config);
     let call = runtime.create("flat", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.call(&["start", "flat"]).code, Some(0));
+    let left: i64 = eventually("the background PID", || {
+        runtime.output_of("flat").trim().parse().ok()
+    });
+    assert!(cgroup_procs(&cgroup_of("flat")).contains(&left));
+
+    let call = runtime.call(&["delete", "--force", "flat"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert!(!alive(left), "the process the init left behind lives on");
+    assert!(!cgroup_of("flat").exists());
+}
+
+/// A bundle's cgroup namespace and mount: the container sees its own
+/// cgroup, read-only, as its config asks.
+#[test]
+#[ignore = "needs root"]
+fn a_bundles_cgroup_mount_is_its_own_cgroup() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["namespaces"] = json!([{"type": "pid"}, {"type": "mount"}, {"type": "cgroup"}]);
+    config["mounts"] = json!([{
+        "destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup",
+        "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]
+    }]);
+    config["process"]["args"] = json!([
+        "sh",
+        "-c",
+        "cat /proc/self/cgroup; stat -f -c %T /sys/fs/cgroup; mkdir /sys/fs/cgroup/x 2>&1"
+    ]);
+    bundle.write(&config);
+    let call = runtime.create("viewed", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert!(call.stderr.is_empty(), "no warning: {}", call.stderr);
+    assert_eq!(runtime.call(&["start", "viewed"]).code, Some(0));
+    let _ = runtime.exit_record("viewed");
+    let out = runtime.output_of("viewed");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[..2], ["0::/", "cgroup2fs"], "{out}");
+    assert!(lines[2].contains("Read-only file system"), "{out}");
+}
+
+/// A bundle's `linux.resources` are written into its cgroup before
+/// anything runs there.
+#[test]
+#[ignore = "needs root"]
+fn a_bundles_limits_are_its_cgroups() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["resources"] = json!({"pids": {"limit": 32}, "memory": {"limit": 67_108_864}});
+    bundle.write(&config);
+    let call = runtime.create("limited", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let read = |file: &str| std::fs::read_to_string(cgroup_of("limited").join(file)).unwrap();
+    assert_eq!(read("pids.max"), "32\n");
+    assert_eq!(read("memory.max"), "67108864\n");
+}
+
+/// A limit file the kernel doesn't have is said to be missing (written
+/// without `O_CREAT`: with it, cgroupfs answers EACCES, "Permission denied",
+/// which hid that), and nothing is left behind.
+#[test]
+#[ignore = "needs root"]
+fn a_missing_limit_file_is_named() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["resources"] = json!({"unified": {"memory.bogus": "1"}});
+    bundle.write(&config);
+    let call = runtime.create("bogus", &bundle, &[]);
     assert_eq!(call.code, Some(1));
-    assert!(call.stderr.contains("no pid namespace"), "{}", call.stderr);
-    assert!(!runtime.root.join("flat").exists());
+    assert!(
+        call.stderr.contains("has no memory.bogus"),
+        "{}",
+        call.stderr
+    );
+    assert!(!cgroup_of("bogus").exists());
+    assert!(!runtime.root.join("bogus").exists());
+}
+
+/// Killed by the OOM killer: the exit record says so.
+#[test]
+#[ignore = "needs root"]
+fn an_oom_kill_is_recorded() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    // 32 MiB, no swap (memory plus swap is the memory alone).
+    config["linux"]["resources"] = json!({"memory": {"limit": 33_554_432, "swap": 33_554_432}});
+    config["process"]["args"] = json!(["sh", "-c", "x=$(head -c 200m /dev/urandom)"]);
+    bundle.write(&config);
+    assert_eq!(runtime.create("hungry", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "hungry"]).code, Some(0));
+    let ended = runtime.exit_record("hungry");
+    assert!(ended.contains("(out of memory)"), "{ended}");
+}
+
+/// A SIGKILL from `kill` is the container's end, not the OOM killer's,
+/// though it struck earlier (a process of the container's, which went on).
+#[test]
+#[ignore = "needs root"]
+fn a_kill_after_an_oom_kill_is_a_kill() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["resources"] = json!({"memory": {"limit": 33_554_432, "swap": 33_554_432}});
+    let script = "sh -c 'x=$(head -c 200m /dev/urandom)'; echo survived; sleep 30";
+    config["process"]["args"] = json!(["sh", "-c", script]);
+    bundle.write(&config);
+    assert_eq!(runtime.create("survivor", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "survivor"]).code, Some(0));
+    eventually("the OOM kill", || {
+        runtime
+            .output_of("survivor")
+            .contains("survived")
+            .then_some(())
+    });
+    assert_eq!(runtime.call(&["kill", "survivor", "KILL"]).code, Some(0));
+    let ended = runtime.exit_record("survivor");
+    assert!(!ended.contains("out of memory"), "{ended}");
+}
+
+/// `linux.cgroupsPath` places the cgroup: absolute below the root,
+/// relative below `shipyard/runtime/`. It must be a new one.
+#[test]
+#[ignore = "needs root"]
+fn a_cgroups_path_is_honored() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    let parent = format!("shipyard-test-{}", std::process::id());
+    for (id, cgroups_path, place) in [
+        (
+            "placed",
+            format!("/{parent}/placed"),
+            format!("{parent}/placed"),
+        ),
+        (
+            "nested",
+            format!("{parent}/nested"),
+            format!("shipyard/runtime/{parent}/nested"),
+        ),
+    ] {
+        config["linux"]["cgroupsPath"] = json!(cgroups_path);
+        bundle.write(&config);
+        let call = runtime.create(id, &bundle, &[]);
+        assert_eq!(call.code, Some(0), "{cgroups_path}: {}", call.stderr);
+        let cgroup = PathBuf::from("/sys/fs/cgroup").join(&place);
+        let pid = runtime.state(id).unwrap()["pid"].as_i64().unwrap();
+        assert_eq!(cgroup_procs(&cgroup), [pid], "{place}");
+        // A parent that isn't Shipyard's own gets only what limits need:
+        // none here.
+        let parent_subtree =
+            std::fs::read_to_string(cgroup.parent().unwrap().join("cgroup.subtree_control"))
+                .unwrap();
+        if !place.starts_with("shipyard/") {
+            assert_eq!(parent_subtree.trim(), "", "{place}'s parent");
+        }
+        assert_eq!(runtime.call(&["delete", id]).code, Some(0));
+        assert!(!cgroup.exists(), "{place} is left");
+        let _ = std::fs::remove_dir(cgroup.parent().unwrap());
+    }
+    // An existing cgroup (this test's own) is never taken over.
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let own = own.trim().trim_start_matches("0::");
+    if own != "/" {
+        config["linux"]["cgroupsPath"] = json!(own);
+        bundle.write(&config);
+        let call = runtime.create("taken", &bundle, &[]);
+        assert_eq!(call.code, Some(1));
+        assert!(call.stderr.contains("exists already"), "{}", call.stderr);
+        assert!(!runtime.root.join("taken").exists());
+    }
+}
+
+/// A container whose cgroup is gone (removed when it ended), and made again
+/// at its path by another container's `cgroupsPath`, doesn't take the new
+/// one with it when it's deleted.
+#[test]
+#[ignore = "needs root"]
+fn a_cgroup_made_again_is_left_to_its_owner() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "true"]);
+    let parent = format!("shipyard-test-reused-{}", std::process::id());
+    config["linux"]["cgroupsPath"] = json!(format!("/{parent}/shared"));
+    bundle.write(&config);
+    assert_eq!(runtime.create("first", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "first"]).code, Some(0));
+    runtime.wait_for("first", "stopped");
+    config["process"]["args"] = json!(["sleep", "30"]);
+    bundle.write(&config);
+    let second = runtime.create("second", &bundle, &[]);
+    assert_eq!(second.code, Some(0), "{}", second.stderr);
+    let delete = runtime.call(&["delete", "first"]);
+    assert_eq!(delete.code, Some(0), "{}", delete.stderr);
+    let cgroup = PathBuf::from("/sys/fs/cgroup").join(&parent).join("shared");
+    let pid = runtime.state("second").unwrap()["pid"].as_i64().unwrap();
+    assert_eq!(cgroup_procs(&cgroup), [pid], "the second's cgroup");
+    assert_eq!(runtime.status("second"), "created");
+    assert_eq!(runtime.call(&["delete", "--force", "second"]).code, Some(0));
+    let _ = std::fs::remove_dir(cgroup.parent().unwrap());
+}
+
+/// A cgroup that holds processes (another container's, say) takes no
+/// container below it, with limits or without: the container would be under
+/// its limits, devices, freezing and kill. And it never hands a controller
+/// down: even a threaded one (`pids`) would make the kernel refuse every
+/// placement below it from then on.
+#[test]
+#[ignore = "needs root"]
+fn a_busy_cgroup_takes_no_container_below_it() {
+    let busy = PathBuf::from(format!(
+        "/sys/fs/cgroup/shipyard-busy-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&busy).unwrap();
+    let mut sleeper = Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(busy.join("cgroup.procs"), sleeper.id().to_string()).unwrap();
+    let subtree = || std::fs::read_to_string(busy.join("cgroup.subtree_control")).unwrap();
+
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    let name = busy.file_name().unwrap().to_str().unwrap().to_owned();
+    config["linux"]["cgroupsPath"] = json!(format!("/{name}/limited"));
+    config["linux"]["resources"] = json!({"pids": {"limit": 16}});
+    bundle.write(&config);
+    let limited = runtime.create("limited", &bundle, &[]);
+    let limited_subtree = subtree();
+
+    config["linux"]["cgroupsPath"] = json!(format!("/{name}/plain"));
+    config["linux"]["resources"] = json!({});
+    bundle.write(&config);
+    let plain = runtime.create("plain", &bundle, &[]);
+    let plain_subtree = subtree();
+    drop(runtime);
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let _ = std::fs::remove_dir(busy.join("limited"));
+    let _ = std::fs::remove_dir(busy.join("plain"));
+    let _ = std::fs::remove_dir(&busy);
+
+    for refused in [&limited, &plain] {
+        assert_eq!(refused.code, Some(1));
+        assert!(
+            refused.stderr.contains("holds processes"),
+            "{}",
+            refused.stderr
+        );
+    }
+    assert_eq!(limited_subtree.trim(), "", "nothing handed down");
+    assert_eq!(plain_subtree.trim(), "", "nothing handed down");
+}
+
+/// A rootless container made from a delegated session (a desktop
+/// terminal) is deleted from one without delegation (an SSH login): the
+/// record's base says where its cgroup is, and the kernel lets its user
+/// remove it from anywhere. Needs `test-linux.sh`'s `tester` and its
+/// delegated `user.slice/tester`; skips elsewhere.
+#[test]
+#[ignore = "needs root"]
+fn a_rootless_container_is_deleted_from_another_session() {
+    let session = PathBuf::from("/sys/fs/cgroup/user.slice/tester/session");
+    let uid = Command::new("id").args(["-u", "tester"]).output().ok();
+    let uid = uid
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    let (Some(uid), true) = (uid, session.exists()) else {
+        eprintln!("skipping: needs test-linux.sh's tester and its delegated cgroup");
+        return;
+    };
+    // An SSH login's session scope: a cgroup root owns.
+    let undelegated = PathBuf::from(format!(
+        "/sys/fs/cgroup/shipyard-ssh-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&undelegated).unwrap();
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(&runtime.root).unwrap();
+    let tester: u32 = uid.parse().unwrap();
+    std::os::unix::fs::chown(&runtime.root, Some(tester), Some(tester)).unwrap();
+    // As `tester`, started in `cgroup` (moved there before dropping root).
+    let as_tester_in = |cgroup: &std::path::Path| {
+        let procs = std::ffi::CString::new(
+            cgroup
+                .join("cgroup.procs")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        let mut command = Command::new("setpriv");
+        command
+            .args(["--reuid", &uid, "--regid", &uid, "--clear-groups"])
+            .arg(RUNTIME);
+        // SAFETY: open, write and close are async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let written = libc::write(fd, b"0".as_ptr().cast(), 1);
+                let error = std::io::Error::last_os_error();
+                libc::close(fd);
+                if written == 1 { Ok(()) } else { Err(error) }
+            });
+        }
+        command
+    };
+    let bundle = Bundle::new();
+    // Root inside is `tester` outside: the root filesystem is theirs.
+    bundle.root.chown_all(tester, tester);
+    let created = runtime.create_with("travelled", &bundle, &[], as_tester_in(&session));
+    let cgroup = PathBuf::from("/sys/fs/cgroup/user.slice/tester/shipyard/runtime/travelled");
+    let made = cgroup.exists();
+    let deleted = as_tester_in(&undelegated)
+        .arg("--root")
+        .arg(&runtime.root)
+        .args(["delete", "--force", "travelled"])
+        .output()
+        .unwrap();
+    let left = cgroup.exists();
+    let _ = std::fs::remove_dir(&undelegated);
+    assert_eq!(created.code, Some(0), "{}", created.stderr);
+    assert!(made, "{} wasn't made", cgroup.display());
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!left, "{} is left", cgroup.display());
+}
+
+/// Pause freezes every process of the container; resume lets it go on.
+/// While paused, `start` and a second `pause` are refused, and SIGKILL still
+/// ends it.
+#[test]
+#[ignore = "needs root"]
+fn pause_and_resume() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("while :; do echo tick; sleep 0.05; done");
+    assert_eq!(runtime.create("frozen", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "frozen"]).code, Some(0));
+    let ticks = || runtime.output_of("frozen").lines().count();
+    eventually("ticks", || (ticks() > 2).then_some(()));
+    let paused = runtime.call(&["pause", "frozen"]);
+    assert_eq!(paused.code, Some(0), "{}", paused.stderr);
+    assert_eq!(runtime.status("frozen"), "paused");
+    let before = ticks();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(ticks(), before, "nothing runs while paused");
+    for refused in [&["pause", "frozen"][..], &["start", "frozen"]] {
+        let call = runtime.call(refused);
+        assert_eq!(call.code, Some(1), "{refused:?}");
+        assert!(call.stderr.contains("is paused"), "{}", call.stderr);
+    }
+    assert_eq!(runtime.call(&["resume", "frozen"]).code, Some(0));
+    assert_eq!(runtime.status("frozen"), "running");
+    eventually("ticks again", || (ticks() > before + 2).then_some(()));
+    // SIGKILL ends a paused container at once.
+    assert_eq!(runtime.call(&["pause", "frozen"]).code, Some(0));
+    assert_eq!(runtime.call(&["kill", "frozen", "KILL"]).code, Some(0));
+    runtime.wait_for("frozen", "stopped");
+    assert_eq!(runtime.call(&["resume", "frozen"]).code, Some(1));
+}
+
+/// As with runc, a created container may be paused: resumed, it's created
+/// again, and starts.
+#[test]
+#[ignore = "needs root"]
+fn a_created_container_pauses() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("echo ran");
+    assert_eq!(runtime.create("waiting", &bundle, &[]).code, Some(0));
+    let paused = runtime.call(&["pause", "waiting"]);
+    assert_eq!(paused.code, Some(0), "{}", paused.stderr);
+    assert_eq!(runtime.status("waiting"), "paused");
+    assert_eq!(runtime.call(&["resume", "waiting"]).code, Some(0));
+    assert_eq!(runtime.status("waiting"), "created");
+    assert_eq!(runtime.call(&["start", "waiting"]).code, Some(0));
+    runtime.wait_for("waiting", "stopped");
+    assert_eq!(runtime.output_of("waiting"), "ran\n");
+}
+
+/// `delete --force` ends a paused container and removes its cgroup.
+#[test]
+#[ignore = "needs root"]
+fn a_paused_container_is_deleted_by_force() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("exec sleep 300");
+    assert_eq!(runtime.create("still", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "still"]).code, Some(0));
+    assert_eq!(runtime.call(&["pause", "still"]).code, Some(0));
+    let call = runtime.call(&["delete", "still"]);
+    assert_eq!(call.code, Some(1), "not without --force");
+    let call = runtime.call(&["delete", "--force", "still"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert!(!cgroup_of("still").exists());
+}
+
+/// `kill --all` signals every process in the cgroup; without it, only the
+/// init (which passes it on to the command).
+#[test]
+#[ignore = "needs root"]
+fn kill_all_reaches_every_process() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running(
+        "trap 'echo command-got' USR1; \
+         sh -c 'trap \"echo child-got\" USR1; while :; do sleep 0.05; done' & \
+         echo ready; while :; do sleep 0.05; done",
+    );
+    assert_eq!(runtime.create("everyone", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "everyone"]).code, Some(0));
+    eventually("ready", || {
+        runtime
+            .output_of("everyone")
+            .contains("ready")
+            .then_some(())
+    });
+    assert_eq!(runtime.call(&["kill", "everyone", "USR1"]).code, Some(0));
+    eventually("the command's", || {
+        runtime
+            .output_of("everyone")
+            .contains("command-got")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!runtime.output_of("everyone").contains("child-got"));
+    let call = runtime.call(&["kill", "--all", "everyone", "USR1"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    eventually("the child's", || {
+        runtime
+            .output_of("everyone")
+            .contains("child-got")
+            .then_some(())
+    });
+}
+
+/// `update` changes a running container's limits, from flags or a
+/// `linux.resources` file; a stopped one is refused.
+#[test]
+#[ignore = "needs root"]
+fn update_changes_limits_live() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("exec sleep 300");
+    assert_eq!(runtime.create("growing", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "growing"]).code, Some(0));
+    let read = |file: &str| std::fs::read_to_string(cgroup_of("growing").join(file)).unwrap();
+    let call = runtime.call(&["update", "--memory", "64m", "--pids-limit", "40", "growing"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(
+        (read("memory.max"), read("pids.max")),
+        ("67108864\n".into(), "40\n".into())
+    );
+    assert_eq!(
+        read("memory.swap.max"),
+        "max\n",
+        "no Docker default swap in an update"
+    );
+    // Memory plus swap alone: counted from the memory limit now (64 MiB).
+    let call = runtime.call(&["update", "--memory-swap", "96m", "growing"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(read("memory.swap.max"), "33554432\n");
+    assert_eq!(read("memory.max"), "67108864\n");
+    let file = runtime.root.with_extension("resources.json");
+    std::fs::write(&file, r#"{"pids": {"limit": 30}}"#).unwrap();
+    let call = runtime.call(&["update", "--resources", file.to_str().unwrap(), "growing"]);
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(read("pids.max"), "30\n");
+    assert_eq!(read("memory.max"), "67108864\n", "the rest stays");
+    assert_eq!(
+        runtime.call(&["update", "growing"]).code,
+        Some(1),
+        "nothing given"
+    );
+    assert_eq!(runtime.call(&["kill", "growing", "KILL"]).code, Some(0));
+    runtime.wait_for("growing", "stopped");
+    let call = runtime.call(&["update", "--pids-limit", "10", "growing"]);
+    assert_eq!(call.code, Some(1));
+    assert!(call.stderr.contains("is stopped"), "{}", call.stderr);
+}
+
+/// `ps` lists the container's processes by host PID: its init and the
+/// command.
+#[test]
+#[ignore = "needs root"]
+fn ps_lists_the_containers_processes() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("exec sleep 300");
+    assert_eq!(runtime.create("listed", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "listed"]).code, Some(0));
+    let init = runtime.state("listed").unwrap()["pid"].as_i64().unwrap();
+    let json = eventually("two processes", || {
+        let call = runtime.call(&["ps", "--format", "json", "listed"]);
+        let pids: Vec<i64> = serde_json::from_str(&call.stdout).ok()?;
+        (pids.len() == 2).then_some(pids)
+    });
+    assert!(json.contains(&init), "{json:?}");
+    let table = runtime.call(&["ps", "listed"]).stdout;
+    assert!(table.starts_with("     PID      UID  COMMAND"), "{table}");
+    assert!(table.contains("sleep 300"), "{table}");
+}
+
+/// `events --stats`: the container's use once, as runc's JSON.
+#[test]
+#[ignore = "needs root"]
+fn events_stats_are_runcs_json() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; exec sleep 300");
+    assert_eq!(runtime.create("measured", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "measured"]).code, Some(0));
+    std::thread::sleep(Duration::from_millis(300));
+    let call = runtime.call(&["events", "--stats", "measured"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let event: Value = serde_json::from_str(call.stdout.trim()).unwrap();
+    assert_eq!(
+        (event["type"].as_str(), event["id"].as_str()),
+        (Some("stats"), Some("measured"))
+    );
+    let data = &event["data"];
+    assert!(
+        data["cpu"]["usage"]["total"].as_u64().unwrap() > 0,
+        "{data}"
+    );
+    assert!(
+        data["memory"]["usage"]["usage"].as_u64().unwrap() > 0,
+        "{data}"
+    );
+    assert_eq!(data["pids"]["current"].as_u64(), Some(2), "{data}");
+}
+
+/// `events` streams the use, and an `oom` line when the OOM killer kills a
+/// process in the container; it ends with the container.
+#[test]
+#[ignore = "needs root"]
+fn events_report_an_oom_kill() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["resources"] = json!({"memory": {"limit": 33_554_432, "swap": 33_554_432}});
+    config["process"]["args"] = json!([
+        "sh",
+        "-c",
+        "sleep 0.5; sh -c 'x=$(head -c 200m /dev/urandom)'; exec sleep 300"
+    ]);
+    bundle.write(&config);
+    assert_eq!(runtime.create("watched", &bundle, &[]).code, Some(0));
+    let mut events = Command::new(RUNTIME)
+        .arg("--root")
+        .arg(&runtime.root)
+        .args(["events", "--interval", "100ms", "watched"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(events.stdout.take().unwrap()));
+    // Its first tick counts the OOM kills so far: started after it, or a
+    // kill that comes first (a slow `events` on a busy machine) is counted
+    // as one from before, and never reported.
+    assert!(matches!(lines.next(), Some(Ok(_))), "no first tick");
+    assert_eq!(runtime.call(&["start", "watched"]).code, Some(0));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_oom = false;
+    while Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["type"] == "oom" {
+            saw_oom = true;
+            break;
+        }
+    }
+    assert!(saw_oom, "no oom event");
+    // Deleted, not only stopped, between two ticks: the stream still just
+    // ends.
+    assert_eq!(
+        runtime.call(&["delete", "--force", "watched"]).code,
+        Some(0)
+    );
+    let status = events.wait().unwrap();
+    assert!(status.success(), "events ends with the container: {status}");
+}
+
+/// A bundle's `process.oomScoreAdj` is the command's.
+#[test]
+#[ignore = "needs root"]
+fn the_oom_score_adjustment_is_the_bundles() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["oomScoreAdj"] = json!(500);
+    config["process"]["args"] = json!(["cat", "/proc/self/oom_score_adj"]);
+    bundle.write(&config);
+    assert_eq!(runtime.create("scored", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "scored"]).code, Some(0));
+    let _ = runtime.exit_record("scored");
+    assert_eq!(runtime.output_of("scored"), "500\n");
 }
 
 /// What a bundle asks for that is ignored is said, as by `shipyard run
@@ -470,14 +1251,16 @@ fn warnings_and_errors_reach_stderr_and_the_log() {
     let runtime = Runtime::new();
     let bundle = Bundle::new();
     let mut config = bundle.config();
-    config["hooks"] = json!({"prestart": [{"path": "/bin/true"}]});
+    config["mounts"] = json!([
+        {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["relatime"]}
+    ]);
     bundle.write(&config);
     let log = runtime.root.with_extension("log");
     let log_flags = ["--log", log.to_str().unwrap(), "--log-format", "json"];
     let call = runtime.create("warned", &bundle, &log_flags);
     assert_eq!(call.code, Some(0), "{}", call.stderr);
     assert!(
-        call.stderr.contains("shipyard-runtime: warning: ") && call.stderr.contains("hooks"),
+        call.stderr.contains("shipyard-runtime: warning: ") && call.stderr.contains("relatime"),
         "{}",
         call.stderr
     );
@@ -494,9 +1277,386 @@ fn warnings_and_errors_reach_stderr_and_the_log() {
     // fails says only why).
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(lines[0]["level"], "warning");
-    assert!(lines[0]["msg"].as_str().unwrap().contains("hooks"));
+    assert!(lines[0]["msg"].as_str().unwrap().contains("relatime"));
     assert_eq!(lines[1]["level"], "error");
     assert!(lines[1]["msg"].as_str().unwrap().contains("exists"));
+}
+
+// --- Hooks ------------------------------------------------------------------------
+
+/// `bundle`'s config, running `sh -c SCRIPT`, with
+/// [`Bundle::recording_hooks`] logging to `runtime`'s hooks log (emptied),
+/// whose path comes along.
+fn hooked(runtime: &Runtime, bundle: &Bundle, script: &str) -> (Value, PathBuf) {
+    let log = runtime.root.with_extension("hooks");
+    let _ = std::fs::remove_file(&log);
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", script]);
+    config["hooks"] = bundle.recording_hooks(&log);
+    (config, log)
+}
+
+/// The lines of `log` (none if there's none yet).
+fn lines_of(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every phase runs when and where the spec says, with the state it says:
+/// `prestart` and `createRuntime` from the runtime, once the container's
+/// mounts are made but before its root is switched; `createContainer` in
+/// the container's namespaces; `startContainer` inside its root, before the
+/// program; `poststart` once it was let go; `poststop` once it's deleted.
+#[test]
+#[ignore = "needs root"]
+fn hooks_run_at_their_phases() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let (config, log) = hooked(&runtime, &bundle, "cat /tmp/hooks");
+    bundle.write(&config);
+    let call = runtime.create("hooked", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let pid = runtime.state("hooked").unwrap()["pid"].as_i64().unwrap();
+    let uts = |pid: &str| std::fs::read_link(format!("/proc/{pid}/ns/uts")).unwrap();
+    assert_ne!(
+        uts(&pid.to_string()),
+        uts("self"),
+        "a UTS namespace of its own"
+    );
+    // Ours, which `create` passed on: not the 0 the setup works with.
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let umask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))
+        .unwrap()
+        .trim();
+    let creating = format!("id=hooked status=creating pid={pid}");
+    // Inside the container's namespaces, the PID is the one seen there.
+    let inside = "id=hooked status=creating pid=1";
+    assert_eq!(
+        lines_of(&log),
+        [
+            format!("prestart {creating} "),
+            format!("createRuntime {creating} mounted"),
+            format!(
+                "createContainer {inside} uts={} umask={umask}",
+                uts(&pid.to_string()).display()
+            ),
+        ]
+    );
+    assert_eq!(runtime.call(&["start", "hooked"]).code, Some(0));
+    runtime.wait_for("hooked", "stopped");
+    let out = runtime.output_of("hooked");
+    let state = Bundle::checked_start_container(&out);
+    assert!(state.contains(r#""status":"created""#), "{out}");
+    assert!(state.contains(r#""pid":1,"#), "the PID inside: {out}");
+    assert_eq!(
+        lines_of(&log)[3],
+        format!("poststart id=hooked status=running pid={pid} ")
+    );
+    assert_eq!(runtime.call(&["delete", "hooked"]).code, Some(0));
+    assert_eq!(lines_of(&log)[4], "poststop id=hooked status=stopped pid= ");
+    assert_eq!(lines_of(&log).len(), 5);
+}
+
+/// A hook that fails while the container is set up fails `create`, naming
+/// it; nothing is left, and `poststop` still runs (the spec's "continue at
+/// destroy"). The runtime's own, and the one inside.
+#[test]
+#[ignore = "needs root"]
+fn a_failing_create_hook_fails_create() {
+    let runtime = Runtime::new();
+    for (phase, expected) in [
+        (
+            "createRuntime",
+            "the createRuntime hook /bin/sh (hooks.createRuntime[0]) exited with code 3",
+        ),
+        (
+            "createContainer",
+            "the createContainer hook /bin/sh (hooks.createContainer[0]) exited with code 3",
+        ),
+    ] {
+        let bundle = Bundle::new();
+        let (mut config, log) = hooked(&runtime, &bundle, "echo ran");
+        config["hooks"][phase] = json!([{"path": "/bin/sh", "args": ["sh", "-c", "exit 3"]}]);
+        bundle.write(&config);
+        let call = runtime.create("failing", &bundle, &[]);
+        assert_eq!(call.code, Some(1), "{phase}: {}", call.stderr);
+        assert!(call.stderr.contains(expected), "{phase}: {}", call.stderr);
+        assert!(!runtime.root.join("failing").exists(), "{phase}");
+        assert!(!cgroup_of("failing").exists(), "{phase}");
+        assert_eq!(runtime.output_of("failing"), "", "{phase}: nothing ran");
+        let lines = lines_of(&log);
+        assert!(
+            lines.last().unwrap().starts_with("poststop "),
+            "{phase}: {lines:?}"
+        );
+    }
+}
+
+/// A hook past its timeout is killed, and fails its phase: here `create`,
+/// at once rather than after the hook's 30 s.
+#[test]
+#[ignore = "needs root"]
+fn a_hook_past_its_timeout_fails() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["hooks"] = json!({"createRuntime": [
+        {"path": "/bin/sh", "args": ["sh", "-c", "sleep 30"], "timeout": 1}
+    ]});
+    bundle.write(&config);
+    let started = Instant::now();
+    let call = runtime.create("slow", &bundle, &[]);
+    assert_eq!(call.code, Some(1), "{}", call.stderr);
+    assert!(
+        call.stderr
+            .contains("didn't finish within its timeout (1 s)"),
+        "{}",
+        call.stderr
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!runtime.root.join("slow").exists());
+}
+
+/// `startContainer` fails after `start` has let the container go: the
+/// container ends without running its program (125), saying why on its
+/// stderr. `poststart` and `poststop` failing are only warnings.
+#[test]
+#[ignore = "needs root"]
+fn failures_after_create_end_or_warn() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("echo ran");
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "echo ran"]);
+    let fail =
+        |code: i32| json!([{"path": "/bin/sh", "args": ["sh", "-c", format!("exit {code}")]}]);
+    config["hooks"] = json!({"startContainer": fail(4)});
+    bundle.write(&config);
+    assert_eq!(runtime.create("unstarted", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "unstarted"]).code, Some(0));
+    let ended = runtime.exit_record("unstarted");
+    assert!(ended.contains("exit code 125"), "{ended}");
+    assert_eq!(runtime.output_of("unstarted"), "", "the program never ran");
+    let err = std::fs::read_to_string(runtime.output_dir().join("unstarted.err")).unwrap();
+    assert!(
+        err.contains(
+            "the startContainer hook /bin/sh (hooks.startContainer[0]) exited with code 4"
+        ),
+        "{err}"
+    );
+    config["hooks"] = json!({"poststart": fail(5), "poststop": fail(6)});
+    bundle.write(&config);
+    assert_eq!(runtime.create("warned", &bundle, &[]).code, Some(0));
+    let start = runtime.call(&["start", "warned"]);
+    assert_eq!(start.code, Some(0), "{}", start.stderr);
+    assert!(
+        start.stderr.contains("warning: the poststart hook"),
+        "{}",
+        start.stderr
+    );
+    runtime.wait_for("warned", "stopped");
+    assert_eq!(runtime.output_of("warned"), "ran\n");
+    let delete = runtime.call(&["delete", "warned"]);
+    assert_eq!(delete.code, Some(0), "{}", delete.stderr);
+    assert!(
+        delete.stderr.contains("warning: the poststop hook"),
+        "{}",
+        delete.stderr
+    );
+    assert!(
+        delete.stderr.contains("exited with code 6"),
+        "{}",
+        delete.stderr
+    );
+}
+
+/// Hooks run what `create` read: a bundle changed afterwards changes
+/// nothing. And a hook may ask for the container's state (its lock is free).
+#[test]
+#[ignore = "needs root"]
+fn hooks_are_what_create_read() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running("echo ran");
+    let out = runtime.root.with_extension("state");
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "echo ran"]);
+    let ask = format!(
+        "{RUNTIME} --root {} state asked > {}",
+        runtime.root.display(),
+        out.display()
+    );
+    config["hooks"] = json!({"poststart": [{"path": "/bin/sh", "args": ["sh", "-c", ask]}]});
+    bundle.write(&config);
+    assert_eq!(runtime.create("asked", &bundle, &[]).code, Some(0));
+    config["hooks"] = json!({"poststart": [{"path": "/bin/sh", "args": ["sh", "-c", "exit 1"]}]});
+    bundle.write(&config);
+    let start = runtime.call(&["start", "asked"]);
+    assert_eq!((start.code, start.stderr.as_str()), (Some(0), ""));
+    let state: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(state["id"], "asked");
+}
+
+/// `poststart` runs while the program does: `start` has let the init go by
+/// then, so a hook may wait for what the program does.
+#[test]
+#[ignore = "needs root"]
+fn poststart_runs_while_the_program_does() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let out = runtime.output_dir().join("going.out");
+    let wait = format!(
+        "for i in $(seq 50); do grep -q ran {} && exit 0; sleep 0.1; done; exit 1",
+        out.display()
+    );
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "echo ran; sleep 30"]);
+    config["hooks"] = json!({"poststart": [
+        {"path": "/bin/sh", "args": ["sh", "-c", wait], "timeout": 10}
+    ]});
+    bundle.write(&config);
+    assert_eq!(runtime.create("going", &bundle, &[]).code, Some(0));
+    let start = runtime.call(&["start", "going"]);
+    assert_eq!((start.code, start.stderr.as_str()), (Some(0), ""));
+}
+
+/// Deleting a container whose setup is held up in a hook (`createRuntime`,
+/// run by its monitor) stops the hook too, before `poststop` runs: cleanup
+/// never races setup. And `poststop` runs once, though `create` fails too.
+#[test]
+#[ignore = "needs root"]
+fn deleting_during_a_hook_stops_it() {
+    use std::os::unix::process::CommandExt as _;
+
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let (mut config, log) = hooked(&runtime, &bundle, "echo ran");
+    let pid_file = runtime.root.with_extension("hook-pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let hang = format!("echo $$ > {}; exec sleep 300", pid_file.display());
+    config["hooks"]["createRuntime"] = json!([{"path": "/bin/sh", "args": ["sh", "-c", hang]}]);
+    bundle.write(&config);
+    let mut create = Command::new(RUNTIME)
+        .arg("--root")
+        .arg(&runtime.root)
+        .args(["create", "--bundle", bundle.arg(), "held"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let hook: i64 = eventually("the hook running", || {
+        std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
+    });
+    let _ = std::fs::remove_file(&pid_file);
+    assert_eq!(runtime.status("held"), "creating");
+    let call = runtime.call(&["delete", "held"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    eventually("the hook gone", || (!alive(hook)).then_some(()));
+    assert_ne!(create.wait().unwrap().code(), Some(0));
+    let lines = lines_of(&log);
+    let poststops = lines
+        .iter()
+        .filter(|line| line.starts_with("poststop "))
+        .count();
+    assert_eq!(poststops, 1, "{lines:?}");
+}
+
+/// A hook gets its standard input, output and error, and nothing else of
+/// whoever runs it (the monitor's answer pipe, say); it runs in the bundle,
+/// as with runc, or at `/` inside the container.
+#[test]
+#[ignore = "needs root"]
+fn hooks_get_only_their_stdio_and_run_in_the_bundle() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let seen = runtime.root.with_extension("seen");
+    let _ = std::fs::remove_dir_all(&seen);
+    std::fs::create_dir_all(&seen).unwrap();
+    // `ls` lists its own descriptors, with what they are: the three it was
+    // given, and the one it reads the list from.
+    let look = |dir: &str| {
+        json!([{
+            "path": "/bin/sh",
+            "args": ["sh", "-c", format!("ls -l /proc/self/fd > {dir}/$0.fds; pwd > {dir}/$0.cwd"), "PHASE"],
+            "env": ["PATH=/usr/bin:/bin"]
+        }])
+    };
+    let host = seen.display().to_string();
+    let mut hooks = json!({});
+    for phase in [
+        "prestart",
+        "createRuntime",
+        "createContainer",
+        "poststart",
+        "poststop",
+    ] {
+        let mut hook = look(&host);
+        hook[0]["args"][3] = json!(phase);
+        hooks[phase] = hook;
+    }
+    hooks["startContainer"] = look("/tmp");
+    hooks["startContainer"][0]["args"][3] = json!("startContainer");
+    let mut config = bundle.config();
+    config["hooks"] = hooks;
+    bundle.write(&config);
+    assert_eq!(runtime.create("looked", &bundle, &[]).code, Some(0));
+    assert_eq!(runtime.call(&["start", "looked"]).code, Some(0));
+    runtime.wait_for("looked", "stopped");
+    assert_eq!(runtime.call(&["delete", "looked"]).code, Some(0));
+    let bundle_dir = std::fs::canonicalize(bundle.path()).unwrap();
+    let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+    // The descriptors' numbers. Rosetta, the x86-64 emulator, keeps the
+    // binary of each program it runs open, and they pile up down a chain of
+    // `exec`s (checked: shipyard's, `sh`'s, `ls`'s): not Shipyard's to close,
+    // so under it those are left out. A leaked pipe still shows.
+    let fds = |listed: String| {
+        listed
+            .lines()
+            .filter_map(|line| {
+                let (left, target) = line.split_once(" -> ")?;
+                let program = std::fs::metadata(target).is_ok_and(|meta| {
+                    meta.is_file()
+                        && std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0
+                });
+                (!(under_rosetta() && program)).then(|| left.rsplit(' ').next().unwrap_or(""))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for phase in [
+        "prestart",
+        "createRuntime",
+        "createContainer",
+        "poststart",
+        "poststop",
+    ] {
+        assert_eq!(
+            fds(read(seen.join(format!("{phase}.fds")))),
+            "0 1 2 3",
+            "{phase}"
+        );
+        assert_eq!(
+            read(seen.join(format!("{phase}.cwd"))).trim(),
+            bundle_dir.to_str().unwrap(),
+            "{phase}"
+        );
+    }
+    let inside = |name: &str| {
+        read(
+            bundle
+                .root
+                .host_path(&format!("/tmp/startContainer.{name}")),
+        )
+    };
+    assert_eq!(fds(inside("fds")), "0 1 2 3");
+    assert_eq!(inside("cwd").trim(), "/");
+    let _ = std::fs::remove_dir_all(&seen);
 }
 
 /// The parent of process `pid`, from `/proc/PID/stat`.
@@ -524,38 +1684,20 @@ fn eventually<T>(what: &str, mut found: impl FnMut() -> Option<T>) -> T {
 }
 
 /// A setup that never finishes can still be deleted: `delete` stops it
-/// through its monitor, and the container dies with the monitor.
+/// through its monitor, and the container dies with the monitor. (The setup
+/// is held up by a `createRuntime` hook that doesn't end, which the monitor
+/// waits for, with the init stopped before `pivot_root`.)
 #[test]
 #[ignore = "needs root"]
 fn deleting_a_container_whose_setup_hangs() {
-    let runtime = Runtime::new();
-    let bundle = bundle_running("sleep 300");
-    let (mut create, monitor, init) = (0..20)
-        .find_map(|_| hang_a_setup(&runtime, &bundle))
-        .expect("the monitor won the race for the lock every time");
-    let call = runtime.call(&["delete", "hung"]);
-    assert_eq!(call.code, Some(0), "{}", call.stderr);
-    assert_eq!(runtime.status("hung"), "gone");
-    eventually("the monitor and the init gone", || {
-        (!alive(i64::from(monitor)) && !alive(i64::from(init))).then_some(())
-    });
-    // `create` learns its monitor died, and fails.
-    assert_ne!(create.wait().unwrap().code(), Some(0));
-}
-
-/// Starts `create` for container `hung` and makes its setup hang: the
-/// monitor records the init under the container's lock, so the test takes
-/// the lock as soon as the monitor is recorded (`create` writes that under
-/// the lock too, just before it lets go), waits for the init, stops the
-/// monitor, and lets go. Returns `create`, the monitor and the init.
-///
-/// The monitor can win the race for the lock (a setup takes milliseconds):
-/// then the attempt is undone, and `None`.
-fn hang_a_setup(runtime: &Runtime, bundle: &Bundle) -> Option<(std::process::Child, i32, i32)> {
     use std::os::unix::process::CommandExt as _;
 
-    use nix::sys::signal::{Signal, kill};
-    let create = Command::new(RUNTIME)
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["hooks"] = json!({"createRuntime": [{"path": "/bin/sleep", "args": ["sleep", "300"]}]});
+    bundle.write(&config);
+    let mut create = Command::new(RUNTIME)
         .arg("--root")
         .arg(&runtime.root)
         .args(["create", "--bundle", bundle.arg(), "hung"])
@@ -565,35 +1707,32 @@ fn hang_a_setup(runtime: &Runtime, bundle: &Bundle) -> Option<(std::process::Chi
         .process_group(0)
         .spawn()
         .unwrap();
-    let dir = runtime.root.join("hung");
     let monitor = eventually("the monitor recorded", || {
-        let record: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("state.json")).ok()?).ok()?;
+        let state = std::fs::read(runtime.root.join("hung").join("state.json")).ok()?;
+        let record: Value = serde_json::from_slice(&state).ok()?;
         i32::try_from(record["monitor"][0].as_i64()?).ok()
     });
-    let lock = nix::fcntl::Flock::lock(
-        std::fs::File::open(&dir).unwrap(),
-        nix::fcntl::FlockArg::LockExclusive,
-    )
-    .unwrap();
-    let init = eventually("the init spawned", || {
+    // The monitor's children are the init and the hook: the init is the one
+    // that says what it is.
+    let init = eventually("the init waiting", || {
         std::fs::read_dir("/proc")
             .unwrap()
             .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
-            .find(|&pid| parent_of(pid) == Some(monitor))
+            .filter(|&pid| parent_of(pid) == Some(monitor))
+            .find(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|comm| comm.trim() == "shipyard-init")
+            })
     });
-    let monitor_pid = nix::unistd::Pid::from_raw(monitor);
-    kill(monitor_pid, Signal::SIGSTOP).unwrap();
-    drop(lock);
-    if runtime.status("hung") == "creating" {
-        return Some((create, monitor, init));
-    }
-    // Lost: the init was recorded first. Undo, for another try.
-    kill(monitor_pid, Signal::SIGCONT).unwrap();
-    let mut create = create;
-    let _ = create.wait();
-    let _ = runtime.call(&["delete", "--force", "hung"]);
-    None
+    assert_eq!(runtime.status("hung"), "creating");
+    let call = runtime.call(&["delete", "hung"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.status("hung"), "gone");
+    eventually("the monitor and the init gone", || {
+        (!alive(i64::from(monitor)) && !alive(i64::from(init))).then_some(())
+    });
+    // `create` learns its monitor died, and fails.
+    assert_ne!(create.wait().unwrap().code(), Some(0));
 }
 
 /// A `start` that dies after opening the gate, before reading it, starts
@@ -623,7 +1762,8 @@ fn a_start_that_dies_at_the_gate_starts_nothing() {
     assert_eq!(call.code, Some(0), "{}", call.stderr);
     runtime.wait_for("gated", "stopped");
     assert_eq!(runtime.output_of("gated"), "ran\n");
-    let ended = std::fs::read_to_string(runtime.root.join("gated").join("exit")).unwrap();
+    // `stopped` comes with the init's end; the record a little after it.
+    let ended = runtime.exit_record("gated");
     assert!(ended.contains("exit code 0"), "{ended}");
 }
 
@@ -681,6 +1821,9 @@ fn a_container_made_again_at_once_is_the_new_one() {
         (!alive(i64::from(old_monitor.as_raw()))).then_some(())
     });
     assert_eq!(runtime.status("again"), "created");
+    // The old monitor didn't take the new container's cgroup (same path).
+    let pid = runtime.state("again").unwrap()["pid"].as_i64().unwrap();
+    assert_eq!(cgroup_procs(&cgroup_of("again")), [pid]);
 }
 
 /// A runtime container gets its bundle's capabilities and `noNewPrivileges`,

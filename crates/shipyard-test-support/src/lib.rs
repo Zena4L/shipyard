@@ -277,6 +277,58 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The cgroup subtree this (non-root) process was delegated, as Shipyard
+/// finds it: the highest cgroup above its own that it owns, with that
+/// cgroup's `cgroup.procs` and `cgroup.subtree_control` writable. `None`
+/// where nothing is delegated (or for root, which manages the whole tree).
+/// Worked out here independently of Shipyard's own code, so tests check it.
+///
+/// With `SHIPYARD_TEST_DELEGATED=required` (CI and `test-linux.sh`, where
+/// it's set up), a normal user without one fails instead: there the
+/// no-delegation branch would hide a breakage.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn delegated_cgroup() -> Option<std::path::PathBuf> {
+    let found = find_delegated_cgroup();
+    assert!(
+        found.is_some()
+            || is_root()
+            || std::env::var("SHIPYARD_TEST_DELEGATED").as_deref() != Ok("required"),
+        "a delegated cgroup is required here (SHIPYARD_TEST_DELEGATED), but this process's \
+         isn't: {}",
+        std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default()
+    );
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn find_delegated_cgroup() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    if is_root() {
+        return None;
+    }
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let own = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let mut found = None;
+    for cgroup in std::path::Path::new(own.trim()).ancestors() {
+        let dir = root.join(cgroup.strip_prefix("/").ok()?);
+        if std::fs::metadata(&dir).map(|m| m.uid()).ok() != Some(uid) {
+            break;
+        }
+        found = Some(dir);
+    }
+    let base = found?;
+    let writable = |file: &str| {
+        let path = std::ffi::CString::new(base.join(file).into_os_string().into_encoded_bytes());
+        // SAFETY: `access` reads a NUL-terminated path.
+        path.is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0)
+    };
+    (writable("cgroup.procs") && writable("cgroup.subtree_control")).then_some(base)
+}
+
 /// This process's session keyring serial (`keyrings(7)`), or -1 if it
 /// can't be read.
 #[cfg(target_os = "linux")]

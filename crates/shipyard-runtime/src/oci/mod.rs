@@ -7,24 +7,32 @@
 //!
 //! - **supported**: the process, its capabilities, `noNewPrivileges` and
 //!   seccomp profile, the root filesystem, the hostname and domain name, the
-//!   PID, mount, UTS and IPC namespaces, masked and read-only paths, bind and
-//!   tmpfs mounts, and the IPC sysctls;
+//!   PID, mount, UTS, IPC, user and cgroup namespaces, masked and read-only
+//!   paths, bind and tmpfs mounts, the cgroup mount, the IPC sysctls, and
+//!   `linux.resources` and `cgroupsPath` (`resources.rs`), and the hooks
+//!   (`hooks.rs`);
 //! - **refused**: anything whose absence would leave the container *less
-//!   confined than asked*: a user or network namespace, resource limits,
-//!   extra devices, and so on. Running without them would be
+//!   confined than asked*: a network namespace, device rules, limits cgroup
+//!   v2 can't apply, extra devices, and so on. Running without them would be
 //!   a silent security downgrade, so the bundle is refused, with every such
 //!   field named at once;
-//! - **ignored, with a warning**: what doesn't confine (hooks,
-//!   `oomScoreAdj`, the cgroup mount), until the stages that add them.
+//! - **ignored, with a warning**: what doesn't confine, and what can't
+//!   matter here (a seccomp field from a newer spec, a mount's `atime`
+//!   option, the cgroup mount without a cgroup namespace).
 //!
 //! Fields the spec doesn't define are ignored, as the spec requires.
+
+mod resources;
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::isolation::{IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root};
+use crate::devices::{DeviceKind, DeviceNode};
+use crate::isolation::{
+    CgroupMount, IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root,
+};
 use crate::process::{Env, ProcessSpec, Rlimit, RlimitValue, User};
 use crate::security::seccomp::Profile;
 use crate::security::{Capabilities, Capability, CapabilitySet, CapabilitySets, Seccomp, Security};
@@ -46,6 +54,14 @@ pub struct Bundle {
     pub warnings: Vec<String>,
     /// The config's `annotations`: free-form keys and values for tools.
     pub annotations: std::collections::BTreeMap<String, String>,
+    /// Its hooks, checked (absolute paths, timeouts above 0). They run only
+    /// once given to the isolation with the container's ID
+    /// ([`Isolation::hooks`]): their state names it.
+    pub hooks: crate::hooks::Hooks,
+    /// Where the container's cgroup goes, below the cgroup root
+    /// (`linux.cgroupsPath`), if the config says: honored by
+    /// `shipyard-runtime`; a `shipyard run`'s cgroup is always its own.
+    pub cgroups_path: Option<PathBuf>,
 }
 
 /// Why a bundle can't be run.
@@ -124,6 +140,7 @@ pub fn load_bundle(dir: &Path) -> Result<Bundle, BundleError> {
         path: &path,
         refused: Vec::new(),
         warnings: Vec::new(),
+        cgroup_mount: None,
     };
     let bundle = reader.bundle(config)?;
     let Reader {
@@ -139,8 +156,9 @@ pub fn load_bundle(dir: &Path) -> Result<Bundle, BundleError> {
 }
 
 /// [`load_bundle`], as this caller runs it: without root, rootless, in a
-/// user namespace, added if the bundle has none (with a warning). Every
-/// runner loads bundles this way (`shipyard run --bundle`, and both
+/// user namespace, added if the bundle has none (with a warning); without a
+/// cgroup of its own (nothing delegated, no cgroup v2), no cgroup mount (with
+/// a warning). Every runner loads bundles this way (`shipyard run --bundle`, and both
 /// processes of `shipyard-runtime create`), so they run the same container.
 ///
 /// # Errors
@@ -151,6 +169,15 @@ pub fn load_bundle_for_caller(dir: &Path) -> Result<Bundle, BundleError> {
     let mut bundle = load_bundle(dir)?;
     let added = crate::process::bundle_user_namespace(&mut bundle.isolation);
     bundle.warnings.extend(added);
+    if bundle.isolation.cgroup_mount.is_some()
+        && let Err(why) = crate::cgroup::Tree::find()
+    {
+        bundle.isolation.cgroup_mount = None;
+        bundle.warnings.push(format!(
+            "the cgroup mount at /sys/fs/cgroup is left out: the container can't have a cgroup \
+             of its own here: {why}"
+        ));
+    }
     Ok(bundle)
 }
 
@@ -166,21 +193,59 @@ fn read_config(path: &Path) -> Result<Config, BundleError> {
         SmallFileError::NotAFile => BundleError::NotAFile { path: path_buf() },
         SmallFileError::TooLarge => BundleError::TooLarge { path: path_buf() },
     })?;
-    serde_json::from_slice(&text).map_err(|err| {
-        // serde_json's message ends with the position, which the error
-        // already gives.
-        let message = err.to_string();
-        let position = format!(" at line {} column {}", err.line(), err.column());
-        BundleError::Json {
-            path: path.to_owned(),
-            line: err.line(),
-            column: err.column(),
-            message: message
-                .strip_suffix(&position)
-                .unwrap_or(&message)
-                .to_owned(),
-        }
-    })
+    serde_json::from_slice(&text).map_err(|err| json_error(path, &err))
+}
+
+/// serde's error for the JSON file at `path`, without the position its
+/// message ends with (the error gives it).
+fn json_error(path: &Path, err: &serde_json::Error) -> BundleError {
+    let message = err.to_string();
+    let position = format!(" at line {} column {}", err.line(), err.column());
+    BundleError::Json {
+        path: path.to_owned(),
+        line: err.line(),
+        column: err.column(),
+        message: message
+            .strip_suffix(&position)
+            .unwrap_or(&message)
+            .to_owned(),
+    }
+}
+
+/// A `linux.resources` object on its own (what `shipyard-runtime update
+/// --resources` reads), checked as a bundle's: the same mapping, the same
+/// refusals. `source` names it in errors.
+///
+/// # Errors
+///
+/// Not JSON, a value that can't work, or a field that can't be applied.
+pub fn resources_from_json(
+    text: &str,
+    source: &Path,
+) -> Result<crate::resources::Resources, BundleError> {
+    let value: Value = serde_json::from_str(text).map_err(|err| json_error(source, &err))?;
+    let mut reader = Reader {
+        dir: source.parent().unwrap_or(Path::new(".")),
+        path: source,
+        refused: Vec::new(),
+        warnings: Vec::new(),
+        cgroup_mount: None,
+    };
+    let (resources, rules) = reader.resources(Some(&value))?;
+    if !rules.is_empty() {
+        reader.refuse(
+            "linux.resources.devices",
+            "update doesn't change device rules (runc's doesn't either)",
+        );
+    }
+    if reader.refused.is_empty() {
+        Ok(resources)
+    } else {
+        Err(BundleError::Unsupported {
+            path: source.to_owned(),
+            fields: reader.refused,
+        })
+    }
 }
 
 // --- The parts of the config Shipyard knows ----------------------------------
@@ -198,7 +263,8 @@ struct Config {
     domainname: Option<String>,
     #[serde(default)]
     mounts: Vec<MountConfig>,
-    hooks: Option<Value>,
+    #[serde(default)]
+    hooks: crate::hooks::Hooks,
     linux: Option<LinuxConfig>,
     #[serde(default)]
     annotations: std::collections::BTreeMap<String, String>,
@@ -229,7 +295,7 @@ struct ProcessConfig {
     no_new_privileges: bool,
     apparmor_profile: Option<String>,
     selinux_label: Option<String>,
-    oom_score_adj: Option<Value>,
+    oom_score_adj: Option<i64>,
     scheduler: Option<Value>,
     io_priority: Option<Value>,
     #[serde(rename = "execCPUAffinity")]
@@ -284,7 +350,7 @@ struct LinuxConfig {
     seccomp: Option<Value>,
     resources: Option<Value>,
     #[serde(default)]
-    devices: Vec<Value>,
+    devices: Vec<DeviceConfig>,
     mount_label: Option<String>,
     sysctl: Option<serde_json::Map<String, Value>>,
     cgroups_path: Option<String>,
@@ -294,6 +360,22 @@ struct LinuxConfig {
     /// Device names to move in: a name with `{}` still asks for its device.
     net_devices: Option<serde_json::Map<String, Value>>,
     time_offsets: Option<Value>,
+}
+
+/// One of `linux.devices`: a node to make in the container.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceConfig {
+    path: PathBuf,
+    /// `c` (or `u`, the same), `b`, or `p` (a FIFO).
+    #[serde(rename = "type")]
+    kind: String,
+    /// Required for a device (not a FIFO).
+    major: Option<i64>,
+    minor: Option<i64>,
+    file_mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
 }
 
 /// One entry of `linux.uidMappings` or `linux.gidMappings`.
@@ -391,6 +473,8 @@ struct Reader<'a> {
     path: &'a Path,
     refused: Vec<String>,
     warnings: Vec<String>,
+    /// The cgroup mount the config lists, if any (see `mounts`).
+    cgroup_mount: Option<CgroupMount>,
 }
 
 impl Reader<'_> {
@@ -403,6 +487,46 @@ impl Reader<'_> {
 
     fn refuse(&mut self, field: &str, why: &str) {
         self.refused.push(format!("{field}: {why}"));
+    }
+
+    /// `linux.devices` as nodes. A FIFO (`p`) is refused: Shipyard makes
+    /// device nodes only.
+    fn device_nodes(&mut self, devices: &[DeviceConfig]) -> Result<Vec<DeviceNode>, BundleError> {
+        let mut nodes = Vec::new();
+        for (index, device) in devices.iter().enumerate() {
+            let field = format!("linux.devices[{index}]");
+            let kind = match device.kind.as_str() {
+                "c" | "u" => DeviceKind::Char,
+                "b" => DeviceKind::Block,
+                "p" => {
+                    self.refuse(
+                        &format!("linux.devices ({}, a FIFO)", device.path.display()),
+                        "only device nodes are made",
+                    );
+                    continue;
+                }
+                other => {
+                    return Err(self.invalid(format!("{field}: type {other:?} isn't c, u, b or p")));
+                }
+            };
+            let number = |n: Option<i64>, name: &str| {
+                let n =
+                    n.ok_or_else(|| self.invalid(format!("{field}: a device needs its {name}")))?;
+                u32::try_from(n)
+                    .map_err(|_| self.invalid(format!("{field}: {name} {n} isn't a device number")))
+            };
+            let mut node = DeviceNode::new(
+                device.path.clone(),
+                kind,
+                number(device.major, "major")?,
+                number(device.minor, "minor")?,
+            );
+            node.mode = device.file_mode.unwrap_or(node.mode) & 0o7777;
+            node.uid = device.uid.unwrap_or(0);
+            node.gid = device.gid.unwrap_or(0);
+            nodes.push(node);
+        }
+        Ok(nodes)
     }
 
     /// Refuses each of `fields` (name, value) that asks for anything (see
@@ -436,9 +560,8 @@ impl Reader<'_> {
             .root
             .ok_or_else(|| self.invalid("there's no root filesystem (root.path)"))?;
         let annotations = config.annotations;
-        if config.hooks.is_some() {
-            self.warn("hooks", "Shipyard doesn't run hooks");
-        }
+        let hooks = config.hooks;
+        hooks.check().map_err(|why| self.invalid(why))?;
         let security = self.security(&process)?;
         let spec = self.process(process)?;
         let mut linux = config.linux.unwrap_or_default();
@@ -458,6 +581,24 @@ impl Reader<'_> {
         self.linux(&linux);
         root.mounts = self.mounts(config.mounts)?;
         isolation.root = Some(root);
+        let (resources, rules) = self.resources(linux.resources.as_ref())?;
+        isolation.resources = resources;
+        // The bundle's rules, then runc's own list, as runc builds them.
+        isolation.devices =
+            crate::devices::Devices::bundle(rules, self.device_nodes(&linux.devices)?);
+        let cgroups_path = self.cgroups_path(linux.cgroups_path.as_deref())?;
+        // Only what the config lists: no cgroup mount unless it asks. And
+        // only with a cgroup namespace: outside one, a `cgroup2` mount shows
+        // the host's whole tree (runc binds the container's own cgroup
+        // instead).
+        isolation.cgroup_mount = self.cgroup_mount;
+        if isolation.cgroup_mount.is_some() && !isolation.has(Namespace::Cgroup) {
+            self.warn(
+                "the cgroup mount at /sys/fs/cgroup",
+                "it needs a cgroup namespace, or it would show the host's whole cgroup tree",
+            );
+            isolation.cgroup_mount = None;
+        }
         // What's refused is reported first (by `load_bundle`): a container
         // missing what was refused may not validate, and the list is what
         // the user has to fix.
@@ -467,6 +608,8 @@ impl Reader<'_> {
                 isolation,
                 warnings: Vec::new(),
                 annotations,
+                hooks,
+                cgroups_path,
             });
         }
         isolation
@@ -479,6 +622,8 @@ impl Reader<'_> {
             isolation,
             warnings: Vec::new(),
             annotations: annotations.clone(),
+            hooks,
+            cgroups_path,
         })
     }
 
@@ -559,9 +704,6 @@ impl Reader<'_> {
         if process.selinux_label.is_some_and(|l| !l.is_empty()) {
             self.refuse("process.selinuxLabel", "SELinux isn't supported");
         }
-        if process.oom_score_adj.is_some() {
-            self.warn("process.oomScoreAdj", "it comes in a later version");
-        }
         self.refuse_if_asked(&[
             ("process.scheduler", &process.scheduler),
             ("process.ioPriority", &process.io_priority),
@@ -592,6 +734,11 @@ impl Reader<'_> {
             })
             .collect::<Result<_, _>>()
             .map_err(|err| self.invalid(format!("process.rlimits: {err}")))?;
+        // Checked with the rest of the spec (-1000 to 1000); a number too
+        // large for that is out of range the same way.
+        spec.oom_score_adj = process
+            .oom_score_adj
+            .map(|adj| i32::try_from(adj).unwrap_or(i32::MAX));
         Ok(spec)
     }
 
@@ -613,7 +760,8 @@ impl Reader<'_> {
                 "uts" => namespaces.push(Namespace::Uts),
                 "ipc" => namespaces.push(Namespace::Ipc),
                 "user" => namespaces.push(Namespace::User),
-                later @ ("network" | "cgroup" | "time") => self.refuse(
+                "cgroup" => namespaces.push(Namespace::Cgroup),
+                later @ ("network" | "time") => self.refuse(
                     &format!("linux.namespaces ({later})"),
                     "this namespace comes in a later version",
                 ),
@@ -697,16 +845,6 @@ impl Reader<'_> {
             ),
         }
         if linux
-            .resources
-            .as_ref()
-            .is_some_and(|resources| !asks_nothing(resources))
-        {
-            self.refuse("linux.resources", "resource limits come in a later version");
-        }
-        if !linux.devices.is_empty() {
-            self.refuse("linux.devices", "extra devices come in a later version");
-        }
-        if linux
             .mount_label
             .as_ref()
             .is_some_and(|label| !label.is_empty())
@@ -725,13 +863,6 @@ impl Reader<'_> {
             .is_some_and(|devices| !devices.is_empty())
         {
             self.refuse("linux.netDevices", "networking comes in a later version");
-        }
-        if linux
-            .cgroups_path
-            .as_ref()
-            .is_some_and(|path| !path.is_empty())
-        {
-            self.warn("linux.cgroupsPath", "cgroups come in a later version");
         }
     }
 
@@ -763,7 +894,12 @@ impl Reader<'_> {
                 continue;
             }
             if destination == "/sys/fs/cgroup" && ["cgroup", "cgroup2"].contains(&kind) {
-                self.warn("the cgroup mount", "cgroups come in a later version");
+                // The container's own cgroup (v2 only: `cgroup` means it
+                // too), `nosuid`, `nodev` and `noexec` whatever the options
+                // say. Mounted only if the container has a cgroup of its own.
+                self.cgroup_mount = Some(CgroupMount {
+                    read_only: entry.options.iter().any(|option| option == "ro"),
+                });
                 continue;
             }
             let is_bind = kind == "bind"
@@ -879,6 +1015,7 @@ mod tests {
 
     use super::*;
     use crate::process::RlimitKind;
+    use crate::resources::{CpuMax, IoMax, Limit};
 
     /// A bundle in a temporary directory: `rootfs/` and a `config.json`.
     struct TestBundle {
@@ -1287,8 +1424,8 @@ mod tests {
                     {"type": "uts", "path": "/proc/1/ns/uts"}
                 ],
                 "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"},
-                "resources": {"devices": [{"allow": false, "access": "rwm"}]},
-                "devices": [{"path": "/dev/fuse", "type": "c", "major": 10, "minor": 229}],
+                "resources": {"hugepageLimits": [{"pageSize": "2MB", "limit": 1}]},
+                "devices": [{"path": "/dev/pipe", "type": "p"}],
                 "mountLabel": "m",
                 "rootfsPropagation": "shared",
                 "intelRdt": {"closID": "c"},
@@ -1331,9 +1468,8 @@ mod tests {
     }
 
     #[test]
-    fn what_doesnt_confine_is_ignored_with_a_warning() {
+    fn what_asks_for_nothing_passes_quietly() {
         let loaded = TestBundle::new(&config(&json!({
-            "hooks": {"prestart": []},
             "process": {
                 "user": {"uid": 0, "gid": 0},
                 "args": ["sh"],
@@ -1346,24 +1482,379 @@ mod tests {
                 "cgroupsPath": "/machine/c1",
                 "personality": {}
             },
-            "mounts": [
-                {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup"},
-                {"destination": "/sys/fs/cgroup", "type": "cgroup2", "source": "cgroup"}
-            ],
             "annotations": {"anything": "goes"},
             "aFieldFromTheFuture": true
         })))
         .load()
         .unwrap();
         let warnings = loaded.warnings.join("\n");
-        for ignored in [
-            "hooks",
-            "process.oomScoreAdj",
-            "cgroup",
-            "linux.cgroupsPath",
+        // linux.cgroupsPath isn't ignored: it's the runtime's (see below).
+        assert_eq!(loaded.cgroups_path, Some(PathBuf::from("machine/c1")));
+        assert_eq!(loaded.spec.oom_score_adj, Some(100));
+        // Only the missing capabilities are worth a word.
+        assert_eq!(loaded.warnings.len(), 1, "{warnings}");
+        assert!(warnings.contains("process.capabilities"), "{warnings}");
+    }
+
+    #[test]
+    fn devices_are_read_as_runc_builds_them() {
+        use crate::devices::{Access, DeviceKind};
+        let loaded = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [{"type": "pid"}, {"type": "mount"}],
+                "resources": {"devices": [
+                    {"allow": false, "access": "rwm"},
+                    {"allow": true, "type": "b", "major": 8, "minor": -1, "access": "r"}
+                ]},
+                "devices": [{"path": "/dev/fuse", "type": "c", "major": 10, "minor": 229,
+                             "fileMode": 8630, "uid": 1, "gid": 2}]
+            }
+        })))
+        .load()
+        .unwrap();
+        let devices = &loaded.isolation.devices;
+        assert!(devices.asked);
+        let node = &devices.nodes[0];
+        // 8630 is 0o20666: the spec's fileMode carries the type bits too.
+        assert_eq!((node.mode, node.uid, node.gid), (0o666, 1, 2));
+        assert!(devices.allows(DeviceKind::Block, 8, 3, Access::READ));
+        assert!(!devices.allows(DeviceKind::Block, 8, 3, Access::WRITE));
+        assert!(
+            devices.allows(DeviceKind::Char, 1, 3, Access::ALL),
+            "Shipyard's /dev"
+        );
+        // Its node gets no rule of its own, as with runc: its rules say.
+        assert!(!devices.allows(DeviceKind::Char, 10, 229, Access::READ));
+        assert!(!devices.allows(DeviceKind::Char, 1, 11, Access::READ));
+        // A bundle without either may use only runc's own list.
+        let plain = TestBundle::new(&config(&json!({}))).load().unwrap();
+        assert!(!plain.isolation.devices.asked);
+        assert!(
+            plain
+                .isolation
+                .devices
+                .allows(DeviceKind::Block, 8, 0, Access::MKNOD),
+            "mknod, as runc allows"
+        );
+    }
+
+    #[test]
+    fn devices_that_cant_be_used_are_named() {
+        let with = |linux: Value| {
+            let mut linux = linux;
+            linux["namespaces"] = json!([{"type": "pid"}, {"type": "mount"}]);
+            TestBundle::new(&config(&json!({"linux": linux})))
+                .load()
+                .unwrap_err()
+                .to_string()
+        };
+        let err = with(json!({"devices": [{"path": "/dev/p", "type": "p"}]}));
+        assert!(err.contains("linux.devices (/dev/p, a FIFO)"), "{err}");
+        let err =
+            with(json!({"devices": [{"path": "/dev/x", "type": "x", "major": 1, "minor": 1}]}));
+        assert!(err.contains("linux.devices[0]: type \"x\""), "{err}");
+        let err = with(json!({"devices": [{"path": "/dev/x", "type": "c", "major": 1}]}));
+        assert!(
+            err.contains("linux.devices[0]: a device needs its minor"),
+            "{err}"
+        );
+        let err =
+            with(json!({"devices": [{"path": "dev/x", "type": "c", "major": 1, "minor": 1}]}));
+        assert!(err.contains("absolute"), "{err}");
+        let err = with(json!({"resources": {"devices": [{"allow": true, "access": "rwx"}]}}));
+        assert!(err.contains("linux.resources.devices[0]"), "{err}");
+        let err = with(json!({"resources": {"devices": [{"allow": true, "major": -2}]}}));
+        assert!(err.contains("major -2"), "{err}");
+        // `update -r` changes limits, never device rules.
+        let err = resources_from_json(
+            r#"{"devices": [{"allow": true, "access": "r"}], "pids": {"limit": 5}}"#,
+            Path::new("-"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("linux.resources.devices"), "{err}");
+    }
+
+    #[test]
+    fn hooks_are_read_and_checked() {
+        let with = |hooks: Value| TestBundle::new(&config(&json!({"hooks": hooks}))).load();
+        let loaded = with(json!({
+            "prestart": [{"path": "/usr/bin/gpu-hook", "args": ["gpu-hook", "prestart"]}],
+            "createContainer": [{"path": "/bin/c", "env": ["A=1"], "timeout": 10}],
+            "poststop": [{"path": "/bin/cleanup"}],
+            "aPhaseFromTheFuture": [{"path": "/bin/x"}]
+        }))
+        .unwrap();
+        assert_eq!(loaded.hooks.prestart[0].args, ["gpu-hook", "prestart"]);
+        assert_eq!(loaded.hooks.create_container[0].timeout, Some(10));
+        assert_eq!(loaded.hooks.poststop.len(), 1);
+        assert!(
+            loaded.warnings.iter().all(|w| !w.contains("hooks")),
+            "{:?}",
+            loaded.warnings
+        );
+        // Given to the isolation only by whoever names the container.
+        assert!(loaded.isolation.hooks.is_none());
+        for (hooks, expected) in [
+            (json!({"poststart": [{"path": "hook"}]}), "absolute"),
+            (
+                json!({"poststart": [{"path": "/h", "timeout": 0}]}),
+                "above 0",
+            ),
+            (
+                json!({"poststart": [{"path": "/h", "env": ["X"]}]}),
+                "KEY=VALUE",
+            ),
+            (
+                json!({"poststart": [{"path": "/h", "timeout": -1}]}),
+                "invalid value",
+            ),
+            (
+                json!({"poststart": [{"args": ["x"]}]}),
+                "missing field `path`",
+            ),
         ] {
-            assert!(warnings.contains(ignored), "{ignored}: {warnings}");
+            let err = with(hooks).unwrap_err().to_string();
+            assert!(err.contains(expected), "{expected}: {err}");
         }
+    }
+
+    #[test]
+    fn the_cgroup_namespace_and_mount_are_the_configs() {
+        let with = |mounts: Value| {
+            TestBundle::new(&config(&json!({
+                "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}, {"type": "cgroup"}]},
+                "mounts": mounts
+            })))
+            .load()
+            .unwrap()
+        };
+        let loaded = with(json!([
+            {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup",
+             "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]}
+        ]));
+        assert!(loaded.isolation.namespaces.contains(&Namespace::Cgroup));
+        assert_eq!(
+            loaded.isolation.cgroup_mount,
+            Some(CgroupMount { read_only: true })
+        );
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let writable = with(json!([
+            {"destination": "/sys/fs/cgroup", "type": "cgroup2", "source": "cgroup2"}
+        ]));
+        assert_eq!(
+            writable.isolation.cgroup_mount,
+            Some(CgroupMount { read_only: false })
+        );
+        // Not listed, not mounted (`shipyard run`'s standard has one).
+        assert_eq!(with(json!([])).isolation.cgroup_mount, None);
+        // Listed without a cgroup namespace: left out, as it would show the
+        // host's whole tree.
+        let outside = TestBundle::new(&config(&json!({
+            "mounts": [{"destination": "/sys/fs/cgroup", "type": "cgroup2", "source": "cgroup2"}]
+        })))
+        .load()
+        .unwrap();
+        assert_eq!(outside.isolation.cgroup_mount, None);
+        assert!(
+            outside
+                .warnings
+                .join("\n")
+                .contains("needs a cgroup namespace"),
+            "{:?}",
+            outside.warnings
+        );
+        // Joining one is still refused.
+        let fields = refused(&config(&json!({
+            "linux": {"namespaces": [{"type": "pid"}, {"type": "cgroup", "path": "/proc/1/ns/cgroup"}]}
+        })));
+        assert_eq!(fields.len(), 1);
+        assert!(
+            fields[0].starts_with("linux.namespaces (cgroup, path)"),
+            "{fields:?}"
+        );
+    }
+
+    #[test]
+    fn linux_resources_become_cgroup_limits_as_runc_reads_them() {
+        let loaded = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [{"type": "pid"}, {"type": "mount"}],
+                "resources": {
+                    "devices": [],
+                    "memory": {"limit": 536_870_912, "reservation": 268_435_456,
+                               "swap": 805_306_368, "disableOOMKiller": false},
+                    "cpu": {"shares": 512, "quota": 50000, "period": 100_000,
+                            "cpus": "0-1", "mems": "", "burst": 0},
+                    "pids": {"limit": 64},
+                    "blockIO": {
+                        "weight": 500,
+                        "throttleReadBpsDevice": [{"major": 8, "minor": 0, "rate": 1_048_576}],
+                        "throttleWriteIOPSDevice": [
+                            {"major": 8, "minor": 0, "rate": 100},
+                            {"major": 8, "minor": 16, "rate": 0}
+                        ]
+                    },
+                    "unified": {"memory.high": "400M"}
+                }
+            }
+        })))
+        .load()
+        .unwrap();
+        let limits = &loaded.isolation.resources;
+        assert_eq!(limits.memory_max, Some(512 << 20));
+        assert_eq!(limits.memory_low, Some(256 << 20));
+        // Memory plus swap, as the spec says: 768 MiB total is 256 MiB swap.
+        assert_eq!(limits.swap_max, Some(Limit::Value(256 << 20)));
+        assert!(!limits.swap_is_default);
+        assert_eq!(limits.cpu_weight, crate::resources::weight_from_shares(512));
+        assert_eq!(
+            limits.cpu_max,
+            Some(CpuMax {
+                quota: Some(50_000),
+                period: 100_000
+            })
+        );
+        assert_eq!(limits.cpuset_cpus.as_deref(), Some("0-1"));
+        assert_eq!(limits.cpuset_mems, None, "an empty list is no list");
+        assert_eq!(limits.pids_max, Some(64));
+        // Both of 8:0's limits on one line; a rate of 0 is no limit.
+        let mut io = IoMax::device(8, 0);
+        (io.rbps, io.wiops) = (Some(1_048_576), Some(100));
+        assert_eq!(limits.io_max, [io]);
+        assert_eq!(
+            limits.unified.get("memory.high").map(String::as_str),
+            Some("400M")
+        );
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        // -1 and 0 are "no limit" and "not set", as runc reads them.
+        let unset = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [{"type": "pid"}, {"type": "mount"}],
+                "resources": {"memory": {"limit": -1, "swap": -1}, "cpu": {"quota": -1},
+                              "pids": {"limit": -1}}
+            }
+        })))
+        .load()
+        .unwrap();
+        let limits = &unset.isolation.resources;
+        assert_eq!(
+            (
+                limits.memory_max,
+                limits.swap_max,
+                limits.cpu_max,
+                limits.pids_max
+            ),
+            (None, Some(Limit::Max), None, None)
+        );
+
+        // What engines write for "the default" asks for nothing.
+        for memory in [
+            json!({"kernel": -1, "kernelTCP": -1}),
+            json!({"swappiness": -1}),
+            json!({"swappiness": u64::MAX}),
+            json!({"swappiness": null}),
+        ] {
+            let loaded = TestBundle::new(&config(&json!({
+                "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}],
+                          "resources": {"memory": memory}}
+            })))
+            .load();
+            assert!(loaded.is_ok(), "{memory}: {loaded:?}");
+        }
+    }
+
+    #[test]
+    fn limits_cgroup_v2_cant_apply_are_refused() {
+        let fields = refused(&config(&json!({
+            "linux": {
+                "namespaces": [{"type": "pid"}, {"type": "mount"}],
+                "resources": {
+                    "memory": {"kernel": 1_048_576, "kernelTCP": 0, "swappiness": 60,
+                               "disableOOMKiller": true},
+                    "cpu": {"realtimeRuntime": 950_000, "burst": 1000, "idle": 1},
+                    "blockIO": {"leafWeight": 300, "weightDevice": [{"major": 8, "minor": 0, "weight": 50}]},
+                    "hugepageLimits": [{"pageSize": "2MB", "limit": 1}],
+                    "network": {"classID": 1},
+                    "rdma": {"mlx5_1": {"hcaHandles": 3}}
+                }
+            }
+        })));
+        for expected in [
+            "linux.resources.memory.kernel:",
+            "linux.resources.memory.swappiness",
+            "linux.resources.memory.disableOOMKiller",
+            "linux.resources.cpu.realtimeRuntime",
+            "linux.resources.cpu.burst",
+            "linux.resources.cpu.idle",
+            "linux.resources.blockIO.leafWeight",
+            "linux.resources.blockIO.weightDevice",
+            "linux.resources.hugepageLimits",
+            "linux.resources.network",
+            "linux.resources.rdma",
+        ] {
+            assert!(
+                fields.iter().any(|field| field.starts_with(expected)),
+                "{expected} not in {fields:#?}"
+            );
+        }
+        assert!(
+            !fields.iter().any(|field| field.contains("kernelTCP")),
+            "0 asks for nothing: {fields:#?}"
+        );
+        // Values the kernel wouldn't take are errors, naming the field.
+        for (resources, expected) in [
+            (json!({"memory": {"limit": 1024}}), "at least"),
+            (
+                json!({"memory": {"limit": -5}}),
+                "linux.resources.memory.limit",
+            ),
+            (
+                json!({"memory": {"limit": 536_870_912, "swap": 1024}}),
+                "can't be less",
+            ),
+            (json!({"cpu": {"cpus": "3-1"}}), "isn't a list"),
+            (json!({"blockIO": {"weight": 5}}), "between 10 and 1000"),
+            (json!({"unified": {"cgroup.procs": "1"}}), "cgroup.procs"),
+            (json!({"pids": {"limit": "lots"}}), "linux.resources"),
+        ] {
+            let err = invalid(&config(&json!({
+                "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}], "resources": resources}
+            })));
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_cgroups_path_is_a_place_below_the_root() {
+        let path = |cgroups_path: &str| {
+            TestBundle::new(&config(&json!({
+                "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}],
+                          "cgroupsPath": cgroups_path}
+            })))
+            .load()
+            .unwrap()
+            .cgroups_path
+        };
+        assert_eq!(path("/default/web-1"), Some(PathBuf::from("default/web-1")));
+        // Relative: below Shipyard's own place for runtime containers.
+        assert_eq!(
+            path("pods/web-1"),
+            Some(PathBuf::from("shipyard/runtime/pods/web-1"))
+        );
+        assert_eq!(path(""), None);
+        for bad in ["/", "/a/../b", "../escape", "./here", "/shipyard/run/4321"] {
+            let err = invalid(&config(&json!({
+                "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}], "cgroupsPath": bad}
+            })));
+            assert!(err.contains("linux.cgroupsPath"), "{bad}: {err}");
+        }
+        let fields = refused(&config(&json!({
+            "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}],
+                      "cgroupsPath": "system.slice:docker:web-1"}
+        })));
+        assert!(fields[0].contains("systemd"), "{fields:?}");
     }
 
     #[test]

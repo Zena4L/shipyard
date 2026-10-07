@@ -398,3 +398,12 @@ fn hostname_mistakes_are_usage_errors() {
     assert_eq!(bad.code, Some(125), "{}", bad.stderr);
     assert!(bad.stderr.contains("hostname"), "{}", bad.stderr);
 }
+
+/// Without isolation too, the command gets its OOM score adjustment.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oom_score_adjustment_reaches_the_command() {
+    let run = shipyard_run(&["--oom-score-adj", "900", "cat", "/proc/self/oom_score_adj"]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "900\n");
+}

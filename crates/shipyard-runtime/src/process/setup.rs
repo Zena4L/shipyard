@@ -28,7 +28,10 @@ use super::rlimit::{Rlimit, RlimitValue};
 use super::spec::{Names, ProcessSpec, User};
 use nix::mount::MsFlags;
 
-use crate::isolation::{IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root};
+use crate::hooks::Hook;
+use crate::isolation::{
+    CgroupMount, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root,
+};
 use crate::{Error, Result};
 
 /// The container's setup, as the clean image receives it.
@@ -44,6 +47,7 @@ pub(crate) struct Setup {
     names: NamesSetup,
     /// `(name, soft, hard)`; `None` is unlimited.
     rlimits: Vec<(String, Option<u64>, Option<u64>)>,
+    oom_score_adj: Option<i32>,
     /// Signals the command keeps ignoring (see `SpawnOptions::keep_ignored`).
     pub(crate) keep_ignored: Vec<libc::c_int>,
     /// Change `/`'s propagation first: a new mount namespace.
@@ -68,6 +72,32 @@ pub(crate) struct Setup {
     pub(crate) security: crate::security::Security,
     /// The user namespace, if there's one.
     pub(crate) user_namespace: Option<UserNamespaceSetup>,
+    /// Its cgroup namespace and mount.
+    pub(crate) cgroup: CgroupSetup,
+    /// Hooks to stop for while setting up, if there are any.
+    pub(crate) hooks: Option<HooksSetup>,
+}
+
+/// The hooks part of the setup: where to wait for the runtime's, and the
+/// clean image's own.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct HooksSetup {
+    /// The hooks pipe's read end (see `channel.rs`), inherited.
+    pub(crate) pipe: RawFd,
+    /// Run before `pivot_root`, once the runtime's are done.
+    pub(crate) create_container: Vec<Hook>,
+    /// Run before the command, after the start gate.
+    pub(crate) start_container: Vec<Hook>,
+}
+
+/// The container's view of its cgroup, as the clean image makes it.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct CgroupSetup {
+    /// Make a cgroup namespace (the clean image is in its cgroup by then).
+    pub(crate) namespace: bool,
+    /// Mount the container's cgroup at `/sys/fs/cgroup`: only when it has a
+    /// cgroup of its own, and a mount namespace to mount it in.
+    pub(crate) mount: Option<CgroupMount>,
 }
 
 /// The container's user namespace, as the clean image needs it.
@@ -95,6 +125,51 @@ pub(crate) struct RootSetup {
     pub(crate) pts_gid: Option<u32>,
     /// More mounts, in order ([`Root::mounts`]).
     pub(crate) mounts: Vec<MountSetup>,
+    /// Device nodes to make, in order (`Isolation::devices`).
+    pub(crate) devices: Vec<DeviceSetup>,
+}
+
+/// A device node to make ([`DeviceNode`](crate::devices::DeviceNode)), its
+/// path as bytes.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct DeviceSetup {
+    path: Vec<u8>,
+    /// Where it is on the host, for a bind; `None`: at `path`.
+    source: Option<Vec<u8>>,
+    pub(crate) block: bool,
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+impl DeviceSetup {
+    fn new(node: &crate::devices::DeviceNode) -> Self {
+        Self {
+            path: node.path.as_os_str().as_bytes().to_vec(),
+            source: node
+                .source
+                .as_ref()
+                .map(|source| source.as_os_str().as_bytes().to_vec()),
+            block: node.kind == crate::devices::DeviceKind::Block,
+            major: node.major,
+            minor: node.minor,
+            mode: node.mode,
+            uid: node.uid,
+            gid: node.gid,
+        }
+    }
+
+    /// Where, inside the container.
+    pub(crate) fn path(&self) -> &Path {
+        as_path(&self.path)
+    }
+
+    /// Where it is on the host: what a user namespace binds in.
+    pub(crate) fn source(&self) -> &Path {
+        as_path(self.source.as_deref().unwrap_or(&self.path))
+    }
 }
 
 /// One of [`Root::mounts`], as bytes.
@@ -154,7 +229,12 @@ impl MountSetup {
 }
 
 impl RootSetup {
-    fn new(root: &Root, mqueue: bool, id_maps: Option<&IdMaps>) -> Self {
+    fn new(
+        root: &Root,
+        mqueue: bool,
+        id_maps: Option<&IdMaps>,
+        devices: &[crate::devices::DeviceNode],
+    ) -> Self {
         /// The `tty` group in most distributions.
         const TTY: u32 = 5;
         let bytes = |path: &PathBuf| path.as_os_str().as_bytes().to_vec();
@@ -170,6 +250,7 @@ impl RootSetup {
                 None => Some(TTY),
             },
             mounts: root.mounts.iter().map(MountSetup::new).collect(),
+            devices: devices.iter().map(DeviceSetup::new).collect(),
         }
     }
 
@@ -225,12 +306,16 @@ fn as_path(bytes: &[u8]) -> &Path {
 }
 
 impl Setup {
-    /// The setup for running `spec` isolated as `isolation` says.
+    /// The setup for running `spec` isolated as `isolation` says, in a
+    /// cgroup of its own if `own_cgroup`, stopping for hooks on `hooks_pipe`
+    /// if it's given.
     pub(crate) fn new(
         spec: &ProcessSpec,
         keep_ignored: &[libc::c_int],
         isolation: &Isolation,
         gate: Option<RawFd>,
+        own_cgroup: bool,
+        hooks_pipe: Option<RawFd>,
     ) -> Self {
         let bytes = |s: &OsStr| s.as_bytes().to_vec();
         Self {
@@ -242,6 +327,7 @@ impl Setup {
             umask: spec.user.umask,
             additional_gids: spec.user.additional_gids.clone(),
             names: NamesSetup::from(&spec.user.names),
+            oom_score_adj: spec.oom_score_adj,
             rlimits: spec
                 .rlimits
                 .iter()
@@ -266,6 +352,7 @@ impl Setup {
                     root,
                     isolation.has(Namespace::Ipc),
                     isolation.id_maps.as_ref(),
+                    &isolation.devices.nodes,
                 )
             }),
             gate,
@@ -274,6 +361,24 @@ impl Setup {
                 .id_maps
                 .as_ref()
                 .map(|maps| UserNamespaceSetup { maps: maps.clone() }),
+            cgroup: CgroupSetup {
+                namespace: isolation.has(Namespace::Cgroup),
+                mount: isolation
+                    .cgroup_mount
+                    .filter(|_| own_cgroup && isolation.has(Namespace::Mount)),
+            },
+            hooks: hooks_pipe.map(|pipe| {
+                let hooks = isolation
+                    .hooks
+                    .as_ref()
+                    .map(|container| container.hooks.clone())
+                    .unwrap_or_default();
+                HooksSetup {
+                    pipe,
+                    create_container: hooks.create_container,
+                    start_container: hooks.start_container,
+                }
+            }),
         }
     }
 
@@ -314,6 +419,7 @@ impl Setup {
                 names: Names::from(&self.names),
             },
             rlimits,
+            oom_score_adj: self.oom_score_adj,
         })
     }
 
@@ -423,13 +529,23 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            oom_score_adj: None,
         };
         let mut isolation = Isolation::standard();
         isolation.hostname = Some("box".into());
         let mut root = Root::new(PathBuf::from(OsString::from_vec(b"/srv/\xffroot".to_vec())));
         root.read_only = true;
         isolation.root = Some(root.clone());
-        let setup = Setup::new(&spec, &[libc::SIGHUP], &isolation, Some(7));
+        let mut hooks = crate::hooks::Hooks::default();
+        hooks.start_container.push(Hook::new("/bin/start"));
+        hooks.poststop.push(Hook::new("/bin/runtime-only"));
+        isolation.hooks = Some(crate::hooks::ContainerHooks::new(
+            hooks,
+            "c1",
+            "/b",
+            std::collections::BTreeMap::new(),
+        ));
+        let setup = Setup::new(&spec, &[libc::SIGHUP], &isolation, Some(7), true, Some(9));
         let fd = setup.to_memfd().unwrap();
         // Sealed: no more writes.
         assert!(nix::unistd::write(&fd, b"x").is_err());
@@ -441,6 +557,10 @@ mod tests {
         assert_eq!(back.hostname.as_deref(), Some("box"));
         assert!(back.init && back.mount_proc && back.private_mounts);
         assert_eq!(back.gate, Some(7));
+        let back_hooks = back.hooks.unwrap();
+        assert_eq!(back_hooks.pipe, 9);
+        assert!(back_hooks.create_container.is_empty());
+        assert_eq!(back_hooks.start_container, [Hook::new("/bin/start")]);
         let back_root = back.root.unwrap();
         assert_eq!(back_root.path(), root.path);
         assert!(back_root.read_only && back_root.mqueue);

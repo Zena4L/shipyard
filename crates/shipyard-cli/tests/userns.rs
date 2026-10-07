@@ -310,7 +310,9 @@ fn mapping_host_root_warns() {
 }
 
 /// What the host mounted inside `/sys` (its cgroup tree, among others)
-/// stays out: covered, as a fresh `sysfs` has nothing there.
+/// stays out: covered, as a fresh `sysfs` has nothing there. At
+/// `/sys/fs/cgroup`, the container's own cgroup goes on top of the cover:
+/// not the host's tree, which holds `shipyard/`.
 #[test]
 #[ignore = "needs root"]
 fn the_hosts_mounts_in_sys_stay_out() {
@@ -318,7 +320,7 @@ fn the_hosts_mounts_in_sys_stay_out() {
     root.chown_all(100_000, 100_000);
     let out = ok(
         &["--uidmap", MAP, "--rootfs", root.arg()],
-        "ls -A /sys/fs/cgroup | wc -l; ls /sys",
+        "ls -d /sys/fs/cgroup/shipyard 2>/dev/null | wc -l; ls /sys",
     );
     let mut lines = out.lines();
     assert_eq!(lines.next(), Some("0"), "{out}");
@@ -393,4 +395,26 @@ fn a_bundles_user_namespace_as_root() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let words: Vec<&str> = run.stdout.split_whitespace().collect();
     assert_eq!(words, ["0", "100000", "65536"], "{}", run.stdout);
+}
+
+/// Root's container in a user namespace can have its OOM score lowered:
+/// shipyard sets it with its own privileges, which the container's root
+/// lacks (`CAP_SYS_RESOURCE` in the host's user namespace).
+#[test]
+#[ignore = "needs root"]
+fn the_oom_score_is_lowered_from_outside() {
+    let root = RootFs::minimal();
+    root.chown_all(100_000, 100_000);
+    let out = ok(
+        &[
+            "--uidmap",
+            MAP,
+            "--rootfs",
+            root.arg(),
+            "--oom-score-adj",
+            "-500",
+        ],
+        "cat /proc/self/oom_score_adj",
+    );
+    assert_eq!(out, "-500\n");
 }

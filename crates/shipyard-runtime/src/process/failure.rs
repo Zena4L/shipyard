@@ -14,6 +14,7 @@ use super::rlimit::{Rlimit, RlimitKind};
 use super::rootfs::{DEV_ENTRIES, Target};
 use super::spec::Names;
 use super::status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND};
+use crate::hooks::{HookError, Phase};
 use crate::isolation::{MountKind, Root};
 use crate::security::Capability;
 #[cfg(target_os = "linux")]
@@ -75,6 +76,17 @@ pub(crate) enum ChildStep {
     UnmappedId = 49,
     GroupsDenied = 50,
     SessionKeyring = 51,
+    CgroupNamespace = 52,
+    MountCgroup = 53,
+    /// Not a failure: the clean image stopped before `pivot_root` for the
+    /// runtime's hooks (`prestart`, `createRuntime`), and waits.
+    AtHooks = 54,
+    CreateContainerHook = 55,
+    StartContainerHook = 56,
+    DeviceNode = 57,
+    /// The runner of the `startContainer` hooks (a child of the init)
+    /// couldn't drop the init's capabilities before running them.
+    HookRunnerCapabilities = 58,
 }
 
 impl ChildStep {
@@ -134,6 +146,13 @@ impl ChildStep {
             49 => Self::UnmappedId,
             50 => Self::GroupsDenied,
             51 => Self::SessionKeyring,
+            52 => Self::CgroupNamespace,
+            53 => Self::MountCgroup,
+            54 => Self::AtHooks,
+            55 => Self::CreateContainerHook,
+            56 => Self::StartContainerHook,
+            57 => Self::DeviceNode,
+            58 => Self::HookRunnerCapabilities,
             _ => return None,
         })
     }
@@ -172,6 +191,13 @@ pub(crate) struct FailureContext {
     /// In a user namespace: the host user the container's root is. The
     /// host's permissions apply to it, not to host root.
     pub(crate) namespace_root: Option<u32>,
+    /// The container's process limit (`pids.max`), if it has one: what an
+    /// EAGAIN from a fork inside it most likely hit.
+    pub(crate) pids_max: Option<u64>,
+    /// The container's hooks, which a hook's failure names by place.
+    pub(crate) hooks: crate::hooks::Hooks,
+    /// The device nodes made in it, which a failure names by place.
+    pub(crate) devices: Vec<crate::devices::DeviceNode>,
 }
 
 /// When a command's seccomp filter goes on (see `child.rs`).
@@ -409,8 +435,18 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         ChildStep::MountProc => isolation_setup("mounting /proc for the container", errno, ctx),
         ChildStep::Hostname => isolation_setup("setting the container's hostname", errno, ctx),
         ChildStep::SessionKeyring => SpawnError::new(Setup, describe_keyring(errno), errno),
+        ChildStep::CgroupNamespace => {
+            isolation_setup("giving the container a cgroup namespace", errno, ctx)
+        }
         ChildStep::InitFork => {
-            isolation_setup("starting the command inside the container", errno, ctx)
+            let doing = match (errno, ctx.pids_max) {
+                (Errno::EAGAIN, Some(limit)) => format!(
+                    "starting the command inside the container (its process limit is {limit}, \
+                     its init included)"
+                ),
+                _ => "starting the command inside the container".to_owned(),
+            };
+            isolation_setup(&doing, errno, ctx)
         }
         ChildStep::JoinNamespace => join_setup(errno, detail, ctx),
         ChildStep::Reexec => isolation_setup(
@@ -442,6 +478,7 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         ChildStep::BindRoot
         | ChildStep::RootTarget
         | ChildStep::MountSys
+        | ChildStep::MountCgroup
         | ChildStep::MountDev
         | ChildStep::PivotRoot
         | ChildStep::DetachOldRoot
@@ -454,7 +491,72 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::UserLookup
         | ChildStep::Domainname
         | ChildStep::Sysctl => describe_container(step, errno, detail, ctx),
+        ChildStep::DeviceNode => describe_device(errno, detail, ctx),
+        ChildStep::CreateContainerHook
+        | ChildStep::StartContainerHook
+        | ChildStep::HookRunnerCapabilities => describe_hook(failure, ctx),
+        // Never a failure (see `ReportReader`); said plainly if it ever
+        // shows up as one.
+        ChildStep::AtHooks => isolation_setup(
+            "the container's init stopped for hooks at the wrong time",
+            errno,
+            ctx,
+        ),
     }
+}
+
+/// A device node that couldn't be made (`detail`: which).
+fn describe_device(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
+    let node = usize::try_from(detail)
+        .ok()
+        .and_then(|index| ctx.devices.get(index));
+    let name = node.map_or_else(
+        || "a device node".to_owned(),
+        |node| format!("the device {node}"),
+    );
+    let why = match errno {
+        Errno::ENODEV => {
+            "the host's node at that path is another device (in a user namespace, the host's \
+             node is bound into the container: it must be the same)"
+                .to_owned()
+        }
+        Errno::ENOENT if ctx.namespace_root.is_some() => {
+            "there's no such node on the host to bind (in a user namespace, the host's node is \
+             bound into the container)"
+                .to_owned()
+        }
+        Errno::EEXIST => "something else is at that path already".to_owned(),
+        Errno::EXDEV => "the path leads into /proc or /sys".to_owned(),
+        other => other.desc().to_owned(),
+    };
+    SpawnError::new(
+        SpawnErrorKind::Isolation,
+        format!("making {name} in the container: {why}"),
+        errno,
+    )
+}
+
+/// A hook the container's init ran that failed, or the runner of the
+/// `startContainer` hooks that couldn't drop its capabilities: the container
+/// can't start.
+fn describe_hook(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
+    let phase = match failure.step {
+        ChildStep::CreateContainerHook => Phase::CreateContainer,
+        ChildStep::StartContainerHook => Phase::StartContainer,
+        _ => {
+            return isolation_setup(
+                "dropping the init's capabilities to run the startContainer hooks",
+                failure.errno,
+                ctx,
+            );
+        }
+    };
+    let message = HookError::from_record(phase, ctx.hooks.of(phase), failure.errno, failure.detail)
+        .map_or_else(
+            || format!("a {phase} hook failed (its report makes no sense)"),
+            |err| err.to_string(),
+        );
+    SpawnError::new(SpawnErrorKind::Setup, message, failure.errno)
 }
 
 /// The command's confinement (stage 4): its capabilities, `no_new_privs` and
@@ -640,6 +742,11 @@ fn describe_container(
         ),
         ChildStep::RootTarget => describe_root_target(errno, detail),
         ChildStep::MountSys => isolation_setup("mounting /sys for the container", errno, ctx),
+        ChildStep::MountCgroup => isolation_setup(
+            "mounting the container's cgroup at /sys/fs/cgroup",
+            errno,
+            ctx,
+        ),
         ChildStep::MountDev => {
             let entry = usize::try_from(detail)
                 .ok()
@@ -970,6 +1077,9 @@ mod tests {
             sysctls: Vec::new(),
             seccomp: None,
             namespace_root: None,
+            pids_max: None,
+            hooks: crate::hooks::Hooks::default(),
+            devices: Vec::new(),
         }
     }
 
@@ -989,7 +1099,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 51, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 58, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }

@@ -86,6 +86,23 @@ scripts/test-linux.sh --shell        # a shell in the same container, to debug
 scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
 ```
 
+**cgroups** (stage 5) are set up first, as on a systemd host: the container's cgroup
+namespace root can't hand controllers to children while it holds processes (the
+kernel's "no internal processes" rule), so the script moves its processes into a leaf
+(`/sys/fs/cgroup/init`), as docker-in-docker does, and enables every controller. And
+`tester` gets a delegated subtree (`/sys/fs/cgroup/user.slice/tester`, its normal-user
+pass and `--shell` starting in `user.slice/tester/session`), as systemd's `Delegate=`
+gives each user `user@UID.service`, with systemd's default controllers only (`cpu
+memory pids`). Rootless containers' cgroups go there. Only this container's cgroups are
+touched.
+
+CI's normal-user tests run the same way, against systemd's real delegation: the job
+starts the runner user's systemd manager (`loginctl enable-linger`) and runs
+`cargo test` in a scope inside it (`systemd-run --user --scope`).
+`SHIPYARD_TEST_DELEGATED=required` (set there and in `test-linux.sh`'s normal-user
+pass) makes a test fail, rather than take its no-delegation branch, if the delegated
+cgroup is missing.
+
 The container is **privileged**, because creating namespaces and mounting
 (stage 2 on) need `CAP_SYS_ADMIN` and Docker's default seccomp profile blocks
 them. The normal-user pass still has no capabilities, so it checks what an
@@ -112,8 +129,15 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
     -v shipyard-amd64-target:/target -v shipyard-amd64-cargo:/usr/local/cargo \
     -v shipyard-amd64-rustup:/usr/local/rustup -e CARGO_TARGET_DIR=/target -w /src \
     rust:1-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq procps >/dev/null \
+      && cg=/sys/fs/cgroup && mkdir -p $cg/init \
+      && for p in $(cat $cg/cgroup.procs); do echo $p > $cg/init/cgroup.procs 2>/dev/null || true; done \
+      && for c in $(cat $cg/cgroup.controllers); do echo +$c > $cg/cgroup.subtree_control || true; done \
       && mount --make-rshared / && cargo test --workspace -- --include-ignored'
   ```
+
+  The cgroup lines do what `scripts/test-linux.sh` does: Docker leaves the container's
+  processes in its cgroup namespace's root, which then can't hand controllers down
+  (cgroup v2's no-internal-processes rule), so Shipyard refuses limits there.
 - **Kernel probes:** `scripts/probes/*.c` check the kernel behaviour a stage relies on,
   before it's built on. Each file's header says how to run it, usually in the privileged
   container. The stage notes record the results.
@@ -121,6 +145,25 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   never the working tree. Build it in its **own** cargo target volume (for example
   `shipyard-mutation-target`). Cargo decides what to rebuild by timestamps, so a mutated
   build in the shared volume can be reused by the next normal run.
+
+### Reclaiming Docker space
+
+The target volumes above are cargo build output and grow without bound; the mutation and
+review volumes especially, since each run is a fresh scratch copy built in its own cache.
+They hold only regenerable artifacts (the repository is mounted read-only), so they are
+always safe to remove. `scripts/clean-docker.sh` does it, least to most:
+
+```sh
+scripts/clean-docker.sh                # scratch only: the mutation + review volumes
+scripts/clean-docker.sh --phase        # also the amd64/ci targets (keeps shipyard-linux-* + toolchains)
+scripts/clean-docker.sh --images       # also the shipyard-test image and dangling images
+scripts/clean-docker.sh --all          # every shipyard-* volume and image (full rebuild next run)
+scripts/clean-docker.sh --dry-run      # show what a level would remove, remove nothing
+```
+
+The default keeps the everyday `shipyard-linux-*` caches and the pinned toolchains, so the
+next `test-linux.sh` stays fast. Run the default after a mutation or review session;
+`--phase` between stages. Only `shipyard-*` volumes and `shipyard-test:*` images are touched.
 
 ### Tests that need root
 

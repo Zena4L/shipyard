@@ -13,11 +13,11 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, sigpr
 use nix::sys::signal::{Signal as NixSignal, sigaction};
 use nix::unistd::{ForkResult, Pid, fork, getpgrp, setpgid};
 
-#[cfg(target_os = "linux")]
-use super::channel::status_pipe;
 use super::channel::{
     InitReport, Report, ReportReader, go_pipe, read_init_report, report_pipe, send_go,
 };
+#[cfg(target_os = "linux")]
+use super::channel::{hooks_pipe, status_pipe};
 use super::child::{SETUP_FAILED, child_main};
 use super::failure::{FailureContext, describe};
 #[cfg(target_os = "linux")]
@@ -50,6 +50,10 @@ pub(crate) struct SpawnOptions {
         allow(dead_code, reason = "only Linux isolates")
     )]
     pub(crate) gate: Option<RawFd>,
+    /// Isolated: the cgroup the container starts in (made by the caller,
+    /// who removes it once the container is gone).
+    #[cfg(target_os = "linux")]
+    pub(crate) cgroup: Option<crate::cgroup::Cgroup>,
 }
 
 /// Which namespaces the command starts in.
@@ -95,8 +99,90 @@ pub(crate) struct Child {
     go: Option<OwnedFd>,
     /// Isolated: what the container's clean image says.
     status: Option<StatusPipe>,
+    /// Isolated, with hooks to run while it's set up: until the clean image
+    /// stops for them.
+    #[cfg(target_os = "linux")]
+    hooks: Option<PendingHooks>,
     context: FailureContext,
     reaped: bool,
+}
+
+/// The runtime's hooks at create (`prestart`, `createRuntime`), and the pipe
+/// the clean image waits on until they're done (see `channel.rs`).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PendingHooks {
+    container: crate::hooks::ContainerHooks,
+    pipe: OwnedFd,
+}
+
+/// What the parent does while the child waits for the go byte: it's still
+/// dumpable, with its first credentials, and has run none of the command's
+/// code. In order:
+///
+/// - into the container's cgroup, if the clone didn't place it (`in_cgroup`
+///   false: the `clone` fallback);
+/// - its user namespace's maps (probe U2);
+/// - `spec`'s OOM score adjustment, with shipyard's privileges.
+///
+/// If any fails, the child never runs: it's killed and reaped here, before
+/// anyone learns its PID.
+#[cfg(target_os = "linux")]
+fn before_go(pid: Pid, spec: &ProcessSpec, options: &SpawnOptions, in_cgroup: bool) -> Result<()> {
+    // A container's cgroup the clone couldn't place it in (its fallback).
+    let placed = match &options.cgroup {
+        Some(cgroup) if !in_cgroup && options.placement.isolation().is_some() => {
+            cgroup.add(pid).map_err(Error::from)
+        }
+        _ => Ok(()),
+    };
+    let mapped = placed.and_then(|()| {
+        match options
+            .placement
+            .isolation()
+            .and_then(|isolation| isolation.id_maps.as_ref())
+        {
+            Some(maps) => super::user_namespace::write_maps(pid, maps),
+            None => Ok(()),
+        }
+    });
+    let ready = mapped.and_then(|()| match spec.oom_score_adj {
+        Some(adj) => set_oom_score_adj(pid, adj),
+        None => Ok(()),
+    });
+    if ready.is_err() {
+        let _ = nix::sys::signal::kill(pid, NixSignal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(pid, None);
+    }
+    ready
+}
+
+/// Writes the child's OOM score adjustment, from here: shipyard's own
+/// privileges apply, not the child's. Lowering it needs `CAP_SYS_RESOURCE` in
+/// the host's user namespace, which a child in a user namespace never has,
+/// root's container included; set by a process that has it, the value also
+/// becomes the lowest the child may set (`oom_score_adj_min`). Whatever the
+/// child starts inherits it (its init's command too).
+#[cfg(target_os = "linux")]
+fn set_oom_score_adj(pid: Pid, adj: i32) -> Result<()> {
+    use std::io::Write as _;
+    let path = format!("/proc/{pid}/oom_score_adj");
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(adj.to_string().as_bytes()));
+    written.map_err(|err| {
+        let errno = err.raw_os_error().map_or(Errno::EIO, Errno::from_raw);
+        let hint = if errno == Errno::EACCES {
+            " (lowering it needs root: CAP_SYS_RESOURCE; without it, it can only be raised)"
+        } else {
+            ""
+        };
+        Error::sys(
+            format!("setting the OOM score adjustment to {adj}{hint}"),
+            errno,
+        )
+    })
 }
 
 /// Where an isolated container's clean image says it started, and, as the
@@ -158,6 +244,13 @@ pub(crate) fn spawn(
         Placement::Join(join) => Some(super::join::Joining::open(join)?),
         Placement::Host | Placement::New(_) => None,
     };
+    // The container's cgroup, open, for the clone (before the plan, which
+    // lists every descriptor the child must not keep).
+    #[cfg(target_os = "linux")]
+    let cgroup_dir = match (&options.cgroup, options.placement.isolation()) {
+        (Some(cgroup), Some(_)) => Some(cgroup.open_dir()?),
+        _ => None,
+    };
     // Last, so its list of open descriptors includes the pipes above.
     let (plan, context) = ChildPlan::new(
         spec,
@@ -173,11 +266,13 @@ pub(crate) fn spawn(
     let mask = BlockAllSignals::new()?;
     // SAFETY: the child branch only runs `child_main`, which is written to be
     // safe after `fork` (no allocation, locks or panics; see child.rs).
-    let pid = match unsafe {
+    let (pid, in_cgroup) = match unsafe {
         launch(
             options,
             #[cfg(target_os = "linux")]
             joining.as_ref(),
+            #[cfg(target_os = "linux")]
+            cgroup_dir.as_ref().map(AsRawFd::as_raw_fd),
         )
     }? {
         Launched::Child => {
@@ -185,37 +280,18 @@ pub(crate) fn spawn(
             // signals blocked; `plan` and the pipes were prepared above.
             unsafe { child_main(&plan, report_write.as_raw_fd()) }
         }
-        Launched::Parent(pid) => pid,
+        Launched::Parent { pid, in_cgroup } => (pid, in_cgroup),
     };
-    // The child waits for the go byte, still dumpable and with its first
-    // credentials: the window in which its maps can be written (probe U2).
-    // If they can't, it never runs: killed and reaped here, before anyone
-    // learns its PID.
     #[cfg(target_os = "linux")]
-    if let Some(maps) = options
-        .placement
-        .isolation()
-        .and_then(|isolation| isolation.id_maps.as_ref())
-        && let Err(err) = super::user_namespace::write_maps(pid, maps)
-    {
-        let _ = nix::sys::signal::kill(pid, NixSignal::SIGKILL);
-        let _ = nix::sys::wait::waitpid(pid, None);
-        return Err(err);
-    }
+    before_go(pid, spec, options, in_cgroup)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = in_cgroup;
     started(pid);
     drop(mask);
     drop(report_write);
     drop(go_read);
-    // Only the clean image writes to it; with our copy closed, it reads as
-    // empty once that process is gone.
     #[cfg(target_os = "linux")]
-    let status = isolated.map(|files| StatusPipe {
-        pipe: files.status_read,
-        has_init: options
-            .placement
-            .isolation()
-            .is_some_and(|isolation| isolation.has(crate::isolation::Namespace::Pid)),
-    });
+    let (status, hooks) = isolated.map(|files| files.parent_ends(options)).unzip();
     #[cfg(not(target_os = "linux"))]
     let status = None;
     let group = if options.placement.has_own_session() {
@@ -239,6 +315,8 @@ pub(crate) fn spawn(
         report: Some(report),
         go: Some(go_write),
         status,
+        #[cfg(target_os = "linux")]
+        hooks: hooks.flatten(),
         context,
         reaped: false,
     })
@@ -319,6 +397,8 @@ struct CleanImageFiles {
     setup: OwnedFd,
     /// The start gate, if any (`SpawnOptions::gate`).
     gate: Option<RawFd>,
+    /// The hooks pipe (read, write), if the setup stops for hooks.
+    hooks: Option<(OwnedFd, OwnedFd)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -329,14 +409,49 @@ impl CleanImageFiles {
         // hostname with a UTS one).
         isolation.validate()?;
         let (status_read, status_write) = status_pipe()?;
+        let hooks = isolation
+            .hooks
+            .as_ref()
+            .is_some_and(|container| container.hooks.during_setup())
+            .then(hooks_pipe)
+            .transpose()?;
         Ok(Self {
             status_read,
             status_write,
             exe: open_own_binary()?,
-            setup: super::setup::Setup::new(spec, &options.keep_ignored, isolation, options.gate)
-                .to_memfd()?,
+            setup: super::setup::Setup::new(
+                spec,
+                &options.keep_ignored,
+                isolation,
+                options.gate,
+                options.cgroup.is_some(),
+                hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
+            )
+            .to_memfd()?,
             gate: options.gate,
+            hooks,
         })
+    }
+
+    /// What the parent keeps once the child exists: the status pipe's read
+    /// end (only the clean image writes to it; with our copy closed, it
+    /// reads as empty once that process is gone), and the hooks to run when
+    /// the clean image stops for them, with the hooks pipe's write end. The
+    /// rest (the read end among them: the clean image's alone by now) is
+    /// closed.
+    fn parent_ends(self, options: &SpawnOptions) -> (StatusPipe, Option<PendingHooks>) {
+        let status = StatusPipe {
+            pipe: self.status_read,
+            has_init: options
+                .placement
+                .isolation()
+                .is_some_and(|isolation| isolation.has(crate::isolation::Namespace::Pid)),
+        };
+        let hooks = self.hooks.and_then(|(_, pipe)| {
+            let container = options.placement.isolation()?.hooks.clone()?;
+            Some(PendingHooks { container, pipe })
+        });
+        (status, hooks)
     }
 
     /// The descriptor numbers the child passes on, with the report pipe's
@@ -348,6 +463,7 @@ impl CleanImageFiles {
             report,
             exe: self.exe.as_raw_fd(),
             gate: self.gate,
+            hooks: self.hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
         }
     }
 }
@@ -368,11 +484,16 @@ fn open_own_binary() -> Result<OwnedFd> {
 /// Which side of the `fork` or `clone` this is.
 enum Launched {
     Child,
-    Parent(Pid),
+    Parent {
+        pid: Pid,
+        /// Started in the cgroup asked for (`clone3`'s `CLONE_INTO_CGROUP`).
+        in_cgroup: bool,
+    },
 }
 
-/// Starts the child: with `clone` into new namespaces if isolated, with
-/// `fork` otherwise.
+/// Starts the child: with `clone` into new namespaces if isolated (in the
+/// cgroup whose directory is `cgroup`, where `clone3` can), with `fork`
+/// otherwise.
 ///
 /// # Safety
 ///
@@ -380,13 +501,17 @@ enum Launched {
 unsafe fn launch(
     options: &SpawnOptions,
     #[cfg(target_os = "linux")] joining: Option<&super::join::Joining>,
+    #[cfg(target_os = "linux")] cgroup: Option<RawFd>,
 ) -> Result<Launched> {
     #[cfg(target_os = "linux")]
     if let Some(joining) = joining {
         // SAFETY: the caller's contract.
         return match unsafe { joining.fork() }? {
             ForkResult::Child => Ok(Launched::Child),
-            ForkResult::Parent { child } => Ok(Launched::Parent(child)),
+            ForkResult::Parent { child } => Ok(Launched::Parent {
+                pid: child,
+                in_cgroup: false,
+            }),
         };
     }
     #[cfg(target_os = "linux")]
@@ -394,9 +519,9 @@ unsafe fn launch(
         use super::clone::{Cloned, clone_process};
         // SAFETY: the caller's contract; the flags are namespace flags only
         // (`Isolation::validate` refuses CLONE_NEWTIME).
-        return match unsafe { clone_process(isolation.clone_flags()) } {
+        return match unsafe { clone_process(isolation.clone_flags(), cgroup) } {
             Ok(Cloned::Child) => Ok(Launched::Child),
-            Ok(Cloned::Parent(pid)) => Ok(Launched::Parent(pid)),
+            Ok(Cloned::Parent { pid, in_cgroup }) => Ok(Launched::Parent { pid, in_cgroup }),
             // Root and still refused: a container without privileges, or a
             // security policy.
             Err(Errno::EPERM) if nix::unistd::geteuid().is_root() => Err(Error::IsolationRefused),
@@ -414,6 +539,20 @@ unsafe fn launch(
                  namespaces is reached (see /proc/sys/user/max_*_namespaces)",
                 Errno::ENOSPC,
             )),
+            // `CLONE_INTO_CGROUP`'s own refusals: a cgroup that can't take
+            // processes (a threaded or "domain invalid" one; one whose
+            // parent holds processes) or one being removed.
+            Err(errno @ (Errno::EBUSY | Errno::EOPNOTSUPP | Errno::ENODEV))
+                if let Some(cgroup) = &options.cgroup =>
+            {
+                Err(Error::sys(
+                    format!(
+                        "starting the command in its cgroup {} (clone3)",
+                        cgroup.path().display()
+                    ),
+                    errno,
+                ))
+            }
             Err(errno) => Err(Error::sys(
                 "starting the command in new namespaces (clone)",
                 errno,
@@ -430,7 +569,10 @@ unsafe fn launch(
     // SAFETY: the caller's contract.
     match unsafe { fork() } {
         Ok(ForkResult::Child) => Ok(Launched::Child),
-        Ok(ForkResult::Parent { child }) => Ok(Launched::Parent(child)),
+        Ok(ForkResult::Parent { child }) => Ok(Launched::Parent {
+            pid: child,
+            in_cgroup: false,
+        }),
         Err(errno) => Err(fork_error(errno)),
     }
 }
@@ -464,19 +606,54 @@ impl Child {
         let Some(report) = self.report.as_mut() else {
             return Ok(());
         };
-        match report.read()? {
-            Report::Pending => Ok(()),
-            Report::Running => {
-                self.report = None;
-                self.go = None;
-                Ok(())
-            }
-            Report::Failed(failure) => {
-                self.report = None;
-                self.go = None;
-                Err(describe(failure, &self.context).into())
-            }
-        }
+        let resolved = match report.read()? {
+            Report::Pending => return Ok(()),
+            // Not resolved, unless a hook failed.
+            Report::AtHooks => match self.run_create_hooks() {
+                Ok(()) => return Ok(()),
+                Err(err) => Err(err),
+            },
+            Report::Running => Ok(()),
+            Report::Failed(failure) => Err(describe(failure, &self.context).into()),
+        };
+        self.report = None;
+        self.go = None;
+        resolved
+    }
+
+    /// The clean image stopped for hooks: runs `prestart`, then
+    /// `createRuntime`, with the container's state, and lets it go on by
+    /// writing that state into the hooks pipe. If one fails, the pipe is
+    /// closed unwritten, and the clean image gives up.
+    #[cfg(target_os = "linux")]
+    fn run_create_hooks(&mut self) -> Result<()> {
+        use crate::hooks::Phase;
+        // It only stops when there's a pipe to wait on: anything else is a
+        // forged record.
+        let PendingHooks { container, pipe } = self.hooks.take().ok_or_else(|| {
+            Error::sys(
+                "the container stopped for hooks it doesn't have",
+                Errno::EPROTO,
+            )
+        })?;
+        let pid = Some(self.pid.as_raw());
+        container.run(Phase::Prestart, pid)?;
+        container.run(Phase::CreateRuntime, pid)?;
+        let state = crate::hooks::state_json(&container.state(Phase::CreateContainer, pid));
+        // Blocking is fine: the clean image reads it all, or dies (EPIPE).
+        // Dropped then: end-of-file says it's all there.
+        let _ = std::io::Write::write_all(&mut std::fs::File::from(pipe), &state);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the same signature as Linux's, where containers have hooks"
+    )]
+    fn run_create_hooks(&mut self) -> Result<()> {
+        Ok(())
     }
 
     /// Sends `signal` to the command. Safe from PID reuse: an unreaped child

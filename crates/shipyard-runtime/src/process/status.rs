@@ -52,6 +52,32 @@ impl ExitStatus {
         None
     }
 
+    /// The raw status `waitpid` would give for it: [`from_wait_status`]'s
+    /// inverse (the layout Linux and macOS share: the exit code in the
+    /// second byte, or the signal in the low 7 bits, with 0x80 for a core
+    /// dump).
+    ///
+    /// [`from_wait_status`]: Self::from_wait_status
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only a container's init sends one")
+    )]
+    pub(crate) fn wait_status(self) -> libc::c_int {
+        match self {
+            Self::Exited(code) => libc::c_int::from(code) << 8,
+            Self::Signaled {
+                signal,
+                core_dumped,
+            } => signal.as_raw() | if core_dumped { 0x80 } else { 0 },
+        }
+    }
+
+    /// Whether SIGKILL ended it: what the kernel's OOM killer sends.
+    #[must_use]
+    pub fn killed_by_sigkill(self) -> bool {
+        matches!(self, Self::Signaled { signal, .. } if signal.as_raw() == libc::SIGKILL)
+    }
+
     /// The code a shell would report: the exit code, or `128 + signal`.
     ///
     /// Signals never exceed 64 on Linux or macOS, so `128 + signal` always
@@ -128,6 +154,14 @@ mod tests {
             ExitStatus::from_wait_status(0x7f | (libc::SIGSTOP << 8)),
             None
         );
+    }
+
+    #[test]
+    fn wait_statuses_round_trip() {
+        for raw in [0, 3 << 8, 255 << 8, libc::SIGKILL, libc::SIGSEGV | 0x80] {
+            let status = ExitStatus::from_wait_status(raw).unwrap();
+            assert_eq!(status.wait_status(), raw);
+        }
     }
 
     #[test]
