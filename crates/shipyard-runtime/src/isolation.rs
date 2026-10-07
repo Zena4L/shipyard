@@ -547,8 +547,7 @@ pub struct Join {
 }
 
 impl Join {
-    /// Joins `target`'s PID, mount, UTS and IPC namespaces: the ones a
-    /// [standard](Isolation::standard) container has.
+    /// Joins every namespace a [standard](Isolation::standard) container has.
     #[must_use]
     pub fn standard(target: u32) -> Self {
         Self {

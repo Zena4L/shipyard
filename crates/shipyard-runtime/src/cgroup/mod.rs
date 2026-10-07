@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 /// Where the cgroup v2 tree is mounted.
 pub const ROOT: &str = "/sys/fs/cgroup";
 
-/// Below the root, where `shipyard run`'s containers go (`<pid>`).
+/// Below the base ([`ROOT`] for root, the delegated subtree for anyone else),
+/// where `shipyard run`'s containers go (`<pid>`).
 pub const RUN_PARENT: &str = "shipyard/run";
 
-/// Below the root, where `shipyard-runtime`'s containers go (`<id>`, or a
+/// Below the base, where `shipyard-runtime`'s containers go (`<id>`, or a
 /// bundle's relative `linux.cgroupsPath`).
 pub const RUNTIME_PARENT: &str = "shipyard/runtime";
 

@@ -16,7 +16,8 @@ use shipyard_runtime::resources::{self, CpuMax, IoLimit, Limit, Resources};
 #[group(id = "limits", multiple = true)]
 pub(crate) struct LimitArgs {
     /// The most memory the container may use (such as 512m or 2g); past it,
-    /// the kernel's OOM killer stops a process (Linux, root).
+    /// the kernel's OOM killer stops a process (Linux; rootless where a cgroup
+    /// subtree is delegated).
     #[arg(short, long, value_name = "SIZE", value_parser = parse_size)]
     memory: Option<u64>,
 
@@ -25,7 +26,7 @@ pub(crate) struct LimitArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     memory_reservation: Option<u64>,
 
-    /// Memory plus swap (needs --memory): -1 for unlimited swap. Without it,
+    /// Memory plus swap (needs --memory, except -1): -1 for unlimited swap. Without it,
     /// the container may swap as much as --memory, as with Docker.
     #[arg(long, value_name = "SIZE", value_parser = parse_swap_total, allow_hyphen_values = true)]
     memory_swap: Option<i64>,

@@ -56,7 +56,7 @@ pub(crate) enum Cloned {
 }
 
 /// Starts a child, like `fork`, with the `CLONE_*` `flags` (namespace flags),
-/// in the cgroup whose directory is `cgroup` (open, not `O_PATH`) if given.
+/// in the cgroup whose directory is open as `cgroup`, if given.
 ///
 /// Tries `clone3` first, where the child starts in its cgroup (the probe's
 /// G3). Falls back to `clone` when `clone3` isn't available:

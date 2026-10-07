@@ -146,6 +146,25 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   `shipyard-mutation-target`). Cargo decides what to rebuild by timestamps, so a mutated
   build in the shared volume can be reused by the next normal run.
 
+### Reclaiming Docker space
+
+The target volumes above are cargo build output and grow without bound; the mutation and
+review volumes especially, since each run is a fresh scratch copy built in its own cache.
+They hold only regenerable artifacts (the repository is mounted read-only), so they are
+always safe to remove. `scripts/clean-docker.sh` does it, least to most:
+
+```sh
+scripts/clean-docker.sh                # scratch only: the mutation + review volumes
+scripts/clean-docker.sh --phase        # also the amd64/ci targets (keeps shipyard-linux-* + toolchains)
+scripts/clean-docker.sh --images       # also the shipyard-test image and dangling images
+scripts/clean-docker.sh --all          # every shipyard-* volume and image (full rebuild next run)
+scripts/clean-docker.sh --dry-run      # show what a level would remove, remove nothing
+```
+
+The default keeps the everyday `shipyard-linux-*` caches and the pinned toolchains, so the
+next `test-linux.sh` stays fast. Run the default after a mutation or review session;
+`--phase` between stages. Only `shipyard-*` volumes and `shipyard-test:*` images are touched.
+
 ### Tests that need root
 
 Tests that switch user or groups are marked `#[ignore]`, so a normal

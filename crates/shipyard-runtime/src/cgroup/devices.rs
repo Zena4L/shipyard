@@ -121,7 +121,8 @@ pub(crate) fn enforce_devices(
         Ok(()) => Ok(None),
         Err(CgroupError::Devices { errno, .. }) if !is_host_root() => {
             let why = if errno == Errno::EPERM {
-                "loading a device program needs CAP_BPF in the host's user namespace".to_owned()
+                "loading a device program needs CAP_BPF and CAP_NET_ADMIN (or CAP_SYS_ADMIN) in the \
+                 host's user namespace".to_owned()
             } else {
                 format!("the kernel refused the device program: {}", errno.desc())
             };
@@ -133,14 +134,22 @@ pub(crate) fn enforce_devices(
 
 /// The warning for `devices` that can't be enforced, because of `why`: only
 /// if they were asked for (the defaults going without is how a rootless
-/// container is).
+/// container is, and a container with no cgroup).
 pub(crate) fn unenforced_devices(devices: &Devices, why: &str) -> Option<String> {
-    devices.asked.then(|| {
-        format!(
-            "the device rules can't be enforced here ({why}); the container can still use only \
-             what your user can"
-        )
-    })
+    unenforced_warning(devices, why, is_host_root())
+}
+
+/// [`unenforced_devices`]' warning, for a caller that is real root (`root`)
+/// or not: what still limits the container differs.
+fn unenforced_warning(devices: &Devices, why: &str, root: bool) -> Option<String> {
+    let left = if root {
+        "nothing but its capabilities limits which devices the container can use"
+    } else {
+        "the container can still use only what your user can"
+    };
+    devices
+        .asked
+        .then(|| format!("the device rules can't be enforced here ({why}); {left}"))
 }
 
 /// The warning for `devices` when the container has no cgroup, for `why`
@@ -269,6 +278,24 @@ fn load_program(attr: &mut ProgramLoad) -> Result<OwnedFd, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only rules asked for are warned about, and the warning says what still
+    /// limits the container: the user's own rights, or for root nothing but
+    /// its capabilities.
+    #[test]
+    fn the_unenforced_warning_says_what_still_limits() {
+        let mut devices = Devices::docker_default();
+        assert_eq!(unenforced_warning(&devices, "why", false), None);
+        devices.asked = true;
+        let rootless = unenforced_warning(&devices, "why", false).unwrap();
+        assert!(rootless.ends_with("only what your user can"), "{rootless}");
+        let root = unenforced_warning(&devices, "why", true).unwrap();
+        assert!(
+            root.contains("(why)")
+                && root.ends_with("its capabilities limits which devices the container can use"),
+            "{root}"
+        );
+    }
 
     /// The structs are the kernel's prefixes: these offsets are its
     /// (`include/uapi/linux/bpf.h`).

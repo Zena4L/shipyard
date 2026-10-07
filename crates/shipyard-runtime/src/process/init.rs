@@ -497,7 +497,8 @@ fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, F
 
 /// Stops for the runtime's hooks: says so on the `report` pipe, then waits
 /// on the hooks pipe for the container's state (`prestart` and
-/// `createRuntime` ran), and runs `createContainer` with it, here: in the
+/// `createRuntime` ran), and runs `createContainer` with it (its PID now
+/// the init's own, in the container's PID namespace), here: in the
 /// container's namespaces, before the root is switched. End-of-file with no
 /// state means a runtime hook failed (the runtime says which): exit, as a
 /// setup that failed.
@@ -513,8 +514,12 @@ fn stop_for_hooks(report: RawFd, hooks: &HooksSetup) -> Result<State, Failure> {
     if state.is_empty() {
         std::process::exit(SETUP_FAILED);
     }
-    let state: State = serde_json::from_slice(&state)
+    let mut state: State = serde_json::from_slice(&state)
         .map_err(|_| Failure::at(ChildStep::Handshake, Errno::EPROTO))?;
+    // The hooks from here on run in the container's namespaces, so their
+    // state has the init's PID as the container sees it (1, with a PID
+    // namespace of its own), as the spec says, not the host's.
+    state.pid = i32::try_from(std::process::id()).ok();
     hooks::run(Phase::CreateContainer, &hooks.create_container, &state)
         .map_err(|err| hook_failure(ChildStep::CreateContainerHook, &err))?;
     Ok(state)

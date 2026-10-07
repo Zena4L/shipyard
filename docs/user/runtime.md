@@ -95,8 +95,8 @@ create ──► created ──start──► running ──(it exits, or kill)�
 }
 ```
 
-- **`status`** is one of `creating`, `created`, `running` and `stopped`.
-- **`pid`** is the container's init, while it's created or running. A PID the system
+- **`status`** is one of `creating`, `created`, `running`, `paused` and `stopped`.
+- **`pid`** is the container's init, while it's created, running or paused. A PID the system
   has since given to another process is never reported as the container's: Shipyard
   checks that it's still the same process.
 
@@ -166,7 +166,7 @@ Each container has a directory `ROOT/ID` (only its owner can read it):
 Commands on the same container take turns: each locks the directory while it reads
 and changes it. `create` holds the lock only while it fills the directory in, not while
 the container is set up. Meanwhile `state` says `creating`, and `delete` can remove a
-container whose setup hangs: it stops the setup too. A command that waits more than 10
+container whose setup hangs: it stops the setup too. A command that waits more than 15
 seconds for the lock (another one stopped while holding it, say) gives up: `container
 ID is busy`.
 
@@ -194,8 +194,8 @@ most 255 characters.
 - **A paused container** takes `kill` (`KILL` ends it at once; other signals wait until
   `resume`) and `delete --force`; `start` and a second `pause` are refused.
 - **The commands that use the cgroup** (`pause`, `resume`, `update`, `ps`, `events`,
-  `kill --all`) need the container to have one: rootless without a delegated subtree,
-  they're refused, saying so.
+  `kill --all`) need the container to have one: where it has none (rootless without a
+  delegated subtree, cgroup v1, a read-only tree), they're refused, saying so.
 - **`startContainer` hooks run after `start` returns,** in the container, before its
   program: `poststart` may run while they still do. A failing `startContainer` hook
   doesn't fail `start`; the container ends with exit code 125 instead, the hook's

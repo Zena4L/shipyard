@@ -24,7 +24,7 @@ warned about since stage 3, run at all six of their phases.
 | A cgroup per container, born into it (`CLONE_INTO_CGROUP`, else `cgroup.procs`), its own cgroup namespace and a read-only `cgroup2` mount, removed at the end | `cgroup/tree.rs` (`Tree::find`, `create`, `claim_run`, `sweep_stale_runs`), `cgroup/manage.rs` (`Cgroup`, `RunCgroup`, `remove`), `process/clone.rs`, `spawn.rs` (`before_go`), `init.rs`, `rootfs.rs` | `cgroups.rs`'s `a_run_*_has_its_own_cgroup`, `a_finished_run_leaves_no_cgroup`, `the_next_run_sweeps_cgroups_of_dead_runs`; `runtime.rs`'s `a_container_has_a_cgroup_for_its_life` |
 | Limits: memory, swap (Docker's rule), CPU (`--cpus`, shares, quota, cpuset), pids, block I/O (weight, rates) | `resources.rs`, `cgroup/manage.rs` (`enable`, `apply`, `limit`), the CLI's `limits.rs` | `limits_are_in_the_containers_cgroup`, `swap_follows_dockers_rule`, `the_process_limit_holds`; unit tests |
 | OCI `linux.resources` (with `unified`) and `linux.cgroupsPath` | `oci/resources.rs`, `oci/mod.rs`, `container/lifecycle.rs` (`limited_cgroup`) | `a_bundles_limits_are_its_cgroups`, `a_cgroups_path_is_honored`, `a_busy_cgroup_takes_no_container_below_it`; OCI unit tests |
-| OOM reporting: `shipyard run`'s "killed: out of memory", the runtime's exit record | `process/supervisor.rs`, `lifecycle.rs` (the monitor) | `the_oom_killer_is_reported`, `shipyards_own_kill_is_not_an_oom_kill`, `an_oom_kill_is_recorded`, `a_kill_after_an_oom_kill_is_a_kill` |
+| OOM reporting: `shipyard run`'s "the command was killed: out of memory", the runtime's exit record | `process/supervisor.rs`, `lifecycle.rs` (the monitor) | `the_oom_killer_is_reported`, `shipyards_own_kill_is_not_an_oom_kill`, `an_oom_kill_is_recorded`, `a_kill_after_an_oom_kill_is_a_kill` |
 | Rootless cgroups, in the delegated subtree | `cgroup/tree.rs` (`choose_base`, `NoTree`), `Record.cgroup_base` | `rootless_cgroups_follow_delegation`, `an_undelegated_controller_is_named`, `a_rootless_containers_cgroup_follows_delegation`, `a_rootless_container_is_deleted_from_another_session` |
 | The runtime's `pause`, `resume`, `update`, `ps`, `events [--stats]`, `kill --all` | `lifecycle.rs`, `cgroup/stats.rs`, the CLI's `runtime_commands.rs` | `pause_and_resume`, `a_created_container_pauses`, `kill_all_reaches_every_process`, `update_changes_limits_live`, `ps_lists_the_containers_processes`, `events_stats_are_runcs_json`, `events_report_an_oom_kill`, `rootless_cgroup_commands_follow_delegation` |
 | `oomScoreAdj` and `--oom-score-adj` | `process/spawn.rs` (`before_go`) | `the_oom_score_adjustment_is_the_bundles`, `the_oom_score_is_lowered_from_outside` |
@@ -127,9 +127,9 @@ later calls (lifecycle.rs, under the state directory's lock)
 - **Bundles** (`oci/resources.rs`): `linux.resources` as runc reads it. Swap is memory
   plus swap, `-1` no limit, `0` not set; shares and block I/O weights are converted to
   v2's ranges; OCI's "defaults" (`memory.kernel: -1`, `swappiness: -1`) are accepted.
-  What cgroup v2 can't apply is refused by name: kernel memory, swappiness,
-  `disableOOMKiller`, real-time CPU, `burst` and `idle`, leaf and per-device weights,
-  huge pages, `network`, `rdma`. `unified` keys must be a controller's file: no `/`, and
+  Refused by name: what cgroup v2 can't apply (kernel memory, swappiness,
+  `disableOOMKiller`, real-time CPU, leaf weights, `network`), and what Shipyard doesn't
+  support yet (`burst`, `idle`, per-device weights, huge pages, `rdma`). `unified` keys must be a controller's file: no `/`, and
   no `cgroup.*` (`cgroup.procs` or `cgroup.kill` would move or kill, not limit).
   `update -r` reads the same object (`oci::resources_from_json`), without device rules.
 - **The init counts against `pids.max`:** with a limit of 1 it can't start the command,
@@ -158,11 +158,11 @@ later calls (lifecycle.rs, under the state directory's lock)
   (`RunCgroup`). The sweep removes only what it can lock, and checks that the locked
   directory is still the one at the path; `claim_run` retries if not.
 - **The record is the truth, but checked** (`Record`): the cgroup's path, its base and
-  its inode (step 8), written into `state.json` right after `mkdir`, before the limits and
-  device program (step 8), so a `create` killed half-way leaves a cgroup `delete` can
+  its inode, written into `state.json` right after `mkdir`, before the limits and device
+  program (both from step 8), so a `create` killed half-way leaves a cgroup `delete` can
   find. `Cgroup::recorded(path, base)` accepts only a container cgroup below the base,
-  never the root, shipyard's parents, `.`/`..`, or the caller's own cgroup or one above
-  it; a directory with a different inode is someone else's and counts as gone.
+  never the root, shipyard's parents, `.`/`..`, the caller's own cgroup or one above it,
+  or a base this user doesn't own; a directory with a different inode is someone else's and counts as gone.
 - **Limits are written while the cgroup is empty,** before anything runs (`Cgroup::limit`
   = `enable` + `apply`). Every write goes through `write_file` (never `O_CREAT`), so a
   missing file is ENOENT and named (`NoSuchLimit`, `NoSwapAccounting`), not EACCES. A
@@ -177,18 +177,22 @@ later calls (lifecycle.rs, under the state directory's lock)
   (`signal_member`). `freeze` waits for `cgroup.events`, and writes `0` back if the
   freeze doesn't land in time. `update --memory-swap` alone counts from the current
   memory limit (`container::memory_limit`).
-- **`oom_score_adj` is written by Shipyard from outside,** before the go byte: lowering it
-  needs `CAP_SYS_RESOURCE` in the host's user namespace, which no process in a user
-  namespace has.
+- **`oom_score_adj` is written by Shipyard from outside,** before the go byte: going below a
+  process's floor (`oom_score_adj_min`, normally 0) needs `CAP_SYS_RESOURCE` in the
+  host's user namespace, which no process in a user namespace has.
 - **Hooks** (`hooks.rs`, cross-platform): plain `fork` + `exec`, exactly the hook's `args`
   and `env`, the state on stdin (written non-blocking against the deadline), the bundle as
   the working directory, only stdio inherited; a `timeout` enforced by polling, then
-  SIGKILL. The init stops before `pivot_root` with an `AtHooks` report record (step 54)
-  and waits on the hooks pipe while the parent runs `prestart` and `createRuntime`;
-  `createContainer` runs in the init (step 55); `startContainer` runs in a child of the
-  init that confines itself first (step 56; step 58 if it can't). `create` records the
-  hooks, and the monitor, `start` and `delete` run that copy. `start` and `delete` let go
-  of the lock before theirs.
+  SIGKILL. The init stops before `pivot_root` with an `AtHooks` report record (`ChildStep`
+  54) and waits on the hooks pipe while the parent runs `prestart` and `createRuntime`;
+  `createContainer` runs in the init (its failure: `CreateContainerHook`, 55);
+  `startContainer` runs in a child of the init that confines itself first
+  (`StartContainerHook`, 56; `HookRunnerCapabilities`, 58, if it can't). Those two get
+  the init's PID as the container sees it (1), the others the host's, as the spec says.
+  `create` records the hooks, and the monitor, `start` and `delete` run that copy.
+  `start` and `delete` let go of the lock before theirs. Failures of `poststart` and
+  `poststop` are warnings, as spec 1.2 says (Shipyard's `ociVersion`; 1.3 makes a
+  `poststart` failure stop the container).
 - **How hooks see the container:** a hook outside it reaches it through `/proc/PID/root`
   before the pivot. The init isn't dumpable, but rootless, its memory belongs to the
   container's user namespace, whose owner (the caller) has every capability in it, so
@@ -207,13 +211,15 @@ later calls (lifecycle.rs, under the state directory's lock)
 - **Device policy** (`cgroup/devices.rs`): real root (euid 0 with the identity uid map)
   fails closed on any refusal, lifting `RLIMIT_MEMLOCK` once on EPERM for kernels before
   5.11; anyone else goes without, warning only if rules were asked for. A refused load is
-  retried with the verifier's log, whose last lines go into the error.
+  retried with the verifier's log, whose last lines go into the error. All of this needs
+  the container's cgroup: with none (v1, a read-only tree), root's container has no device
+  control either, warned about only if rules were asked for, and the warning says that
+  only its capabilities limit it (rootless: only the user's rights).
 
 **Considered and not done, with the reason:**
 
 - **The systemd driver (D-Bus):** a new dependency and a daemon to talk to; delegation
   gives the same placement.
-- **`memory.oom.group`:** Docker and runc let the OOM killer take one process.
 - **A process group per hook** (to kill what a timed-out hook left behind): it would take
   the hook out of the terminal's foreground group, and Ctrl-C would no longer reach it.
 - **libbpf or `bpftool`:** C, and the program is a dozen instructions per rule; our own
@@ -239,7 +245,7 @@ docker-in-docker does. A host's real root cgroup is exempt from that rule.
 | # | Behaviour | Result | Consequence |
 |---|---|---|---|
 | G1 | `/sys/fs/cgroup`'s file system; `/proc/self/cgroup`; the controllers | `cgroup2`; `0::/`; `cpuset cpu io memory pids` | v2 is detected with `statfs`; a v2 line is `0::PATH` |
-| G2 | "no internal processes": a cgroup holding a process, enabling a controller for its children | `memory` (a domain controller): EBUSY with a child present, EOPNOTSUPP after `pids` was enabled; `pids` (threaded): allowed. Moving the process into a child whose parent hands down a domain controller: EOPNOTSUPP (the child is "domain invalid"). With the process in the child first: ok | The order is fixed: make the leaf, move the process into it, then enable controllers above it |
+| G2 | "no internal processes": a cgroup holding a process, enabling a controller for its children | `memory` (a domain controller): EBUSY while the cgroup holds a process, EOPNOTSUPP after `pids` was enabled; `pids` (threaded): allowed. Moving the process into a child whose parent hands down a domain controller: EOPNOTSUPP (the child is "domain invalid"). With the process in the child first: ok | The order is fixed: make the leaf, move the process into it, then enable controllers above it |
 | G3 | `clone3` with `CLONE_INTO_CGROUP` | the child starts in the target cgroup | A container's first process is born in its cgroup: nothing runs outside it, not even for an instant |
 | G3 | without `clone3` (x86-64 emulation: ENOSYS), the parent writes the child's PID to `cgroup.procs` before letting it go | the child is there before it does anything | The fallback fits the existing go-byte window |
 
@@ -248,11 +254,11 @@ docker-in-docker does. A host's real root cgroup is exempt from that rule.
 | # | Behaviour | Result | Consequence |
 |---|---|---|---|
 | G4 | `memory.max` 32 MiB, `memory.swap.max` 0, a process touching 128 MiB | killed by SIGKILL; `memory.events`: `oom 1`, `oom_kill 1` | An OOM kill is a SIGKILL plus `oom_kill` going up: that's how Shipyard tells "out of memory" from any other SIGKILL |
-| G4 | `memory.oom.group` 1 | the process over the limit *and* an idle one in the same cgroup are killed | The whole container goes together when one process runs out |
+| G4 | `memory.oom.group` 1 | the process over the limit *and* an idle one in the same cgroup are killed | Available, not used: Shipyard lets the OOM killer take one process, as Docker and runc do |
 | G5 | `pids.max` 5 | a process there forks 4 children (5 with itself), then EAGAIN; `pids.events` `max 1` | A fork bomb is stopped at the limit |
 | G6 | `cpu.max` "10000 100000" (10% of one CPU), 0.5 s of busy loop | `nr_throttled 6`, `usage_usec` about 60,000 | Quota and period map straight to Docker's `--cpus` |
 | G6 | `cpu.weight` 50; `cpuset.cpus` "0" | both accepted; `cpuset.cpus.effective` 0 | — |
-| G7 | `io.max` for a real disk (`MAJ:MIN rbps=… wiops=…`); for a device that doesn't exist; `io.weight` | accepted and read back with every key (`wbps=max …`); ENODEV; **`io.weight` doesn't exist here** (it needs the BFQ scheduler or `io.cost`) | `io.max` needs real device numbers, checked when given; a weight can't be promised everywhere: refused clearly where the file is missing |
+| G7 | `io.max` for a real disk (`MAJ:MIN rbps=… wiops=…`); for a device that doesn't exist; `io.weight` | accepted and read back with every key (`wbps=max …`); ENODEV; **`io.weight` doesn't exist here** (it comes from the iocost controller, `CONFIG_BLK_CGROUP_IOCOST`, which this kernel lacks; BFQ has its own file, `io.bfq.weight`) | `io.max` needs real device numbers, checked when given; a weight can't be promised everywhere: refused clearly where the file is missing |
 
 **Control:**
 
@@ -274,8 +280,8 @@ docker-in-docker does. A host's real root cgroup is exempt from that rule.
 | # | Behaviour | Result | Consequence |
 |---|---|---|---|
 | G12 | a `BPF_PROG_TYPE_CGROUP_DEVICE` program (allow only char 1:3), loaded and attached by root | `/dev/null` opens; `/dev/zero` EPERM | Seven instructions are enough: the device program is small, generated from the rules |
-| G12 | loading it as `nobody` | EPERM | Unprivileged eBPF stays off |
-| G12 | as root of a user namespace, and attaching it to a cgroup delegated to that user | worked in the probe's setup (Linux 7.0) | Not relied on: in step 7, `tester`'s load was refused (EPERM: `CAP_BPF` is the host user namespace's), so rootless tries and goes without |
+| G12 | loading it as `nobody` | EPERM | A device program needs `CAP_BPF` and `CAP_NET_ADMIN` (or `CAP_SYS_ADMIN`) in the host's user namespace, whatever `unprivileged_bpf_disabled` says |
+| G12 | as root of a user namespace, and attaching it to a cgroup delegated to that user | worked in the probe's setup (OrbStack's Linux 7.0) | Not what mainline does (it checks the host's user namespace, unless a BPF token, 6.9+, delegates it), and not relied on: in step 7, `tester`'s load was refused (EPERM), so rootless tries and goes without |
 
 **Under x86-64 emulation** every result is the same (the full outputs diffed), except
 `clone3`, which doesn't exist there (ENOSYS): the `cgroup.procs` fallback is what runs.
@@ -286,7 +292,7 @@ The device program loads and attaches under emulation, unlike seccomp.
 process in a cgroup namespace can't move out of it; a missing cgroup file opened with
 `O_CREAT` fails with EACCES, without it ENOENT; `io.max` takes whole disks (a partition:
 ENODEV); a file of a controller that isn't handed down is simply missing; cgroupfs doesn't
-reuse inode numbers; a user namespace without its own PID namespace can't mount `/proc`
+reuse inode numbers (64-bit inode numbers, since about Linux 5.5); a user namespace without its own PID namespace can't mount `/proc`
 (only the owner of a PID namespace may).
 
 ## macOS and Linux differences
@@ -311,7 +317,7 @@ reuse inode numbers; a user namespace without its own PID namespace can't mount 
 | `create` killed while it sets limits: a cgroup nobody recorded | recorded right after `mkdir` | by the code's order |
 | An old monitor removing the next same-ID container's cgroup | removal only under the lock, while the state directory still exists | `a_container_made_again_at_once_is_the_new_one` |
 | The sweep removing a live run's cgroup (another PID namespace) | runs hold an `flock`; the sweep removes only what it locks | `the_next_run_sweeps_cgroups_of_dead_runs` |
-| A run claiming a cgroup a sweep just removed | `lock_dir` checks the locked directory is still at the path; `claim` retries | 45 `userns.rs` runs in a row |
+| A run claiming a cgroup a sweep just removed | `lock_dir` checks the locked directory is still at the path; `claim_run` retries | 45 `userns.rs` runs in a row |
 | Real root running without its cgroup (so without its device rules) after a failed claim | an error | by the code |
 | `+pids` on a cgroup with processes breaking every later move (EOPNOTSUPP) | never written there (`holds_processes`) | `a_busy_cgroup_takes_no_container_below_it` |
 | `cgroupsPath` parents under `system.slice` given every controller | only what limits need | `a_cgroups_path_is_honored` |
@@ -338,6 +344,7 @@ reuse inode numbers; a user namespace without its own PID namespace can't mount 
 | The monitor running a container without its hooks or cgroup | it refuses (`container_setup`) | `deleting_a_container_whose_setup_hangs` |
 | The monitor trusting a bundle edited after `create` | `create`'s checks again when there's no cgroup | by the code |
 | Hooks inheriting the monitor's answer pipe | close-on-exec; only stdio | `hooks_get_only_their_stdio_and_run_in_the_bundle` |
+| In-container hooks told the host's PID (meaningless inside) | the init's own PID in their state | `hooks_run_at_their_phases` |
 | A hook that never reads its stdin holding the runtime past its timeout | non-blocking writes against the deadline | unit test |
 | A program over the verifier's complexity limit (E2BIG) | stateless passes, fields reloaded | `the_verifier_accepts_the_programs` |
 | "unreachable insn" | passes stop at a rule covering everything | the property test's reachability check |
@@ -349,13 +356,15 @@ reuse inode numbers; a user namespace without its own PID namespace can't mount 
 ## Known limitations (by design, for stage 5)
 
 - **cgroup v2 only;** on v1 a container runs without a cgroup: no limits, pause, stats or
-  device control.
+  device control. That holds for root too: without a cgroup, a rootful container's
+  devices are limited only by its capabilities (Docker's include `CAP_MKNOD`).
 - **Rootless needs delegation** (systemd's `user@UID.service`), and gets the controllers it
   delegates (`cpu memory pids` by default). A rootless container ends with the user
   manager, at the last logout without lingering.
 - **Rootless device control** depends on the kernel letting the user load the program;
   where it doesn't, the container can still use only what the user can.
-- **`io.weight`** needs the BFQ scheduler or `io.cost`; refused where the file is missing.
+- **`io.weight`** comes from the iocost controller; refused where the file is missing.
+  BFQ's own weight (`io.bfq.weight`, 1–1000), which runc falls back to, isn't used yet.
 - **A writable cgroup mount** (a bundle without `ro`) lets root inside change its own
   limits, as with runc.
 - **`unified`** can write any controller file, as with runc.
@@ -364,8 +373,6 @@ reuse inode numbers; a user namespace without its own PID namespace can't mount 
   hooks the init runs count against the container's `pids.max`; `startContainer` has
   less power than with runc (only `CAP_KILL`).
 - **Device rules don't change with `update`** (runc's don't either).
-- **`/dev/pts` above 255:** terminals are allowed as `c 136:*`; without a root filesystem,
-  a host with more than 256 terminals open numbers the rest under majors 137–143.
 - **Recorded residuals:**
   - `freeze`'s wait for the kernel survived mutation: every test process freezes at once;
   - `ps`'s table reads `/proc/PID` after the lock is let go, so a PID reused in between
@@ -384,7 +391,7 @@ reuse inode numbers; a user namespace without its own PID namespace can't mount 
 |---|---|
 | 8 (`exec`) | Placing joined processes in the container's cgroup. |
 | 9 (named containers) | `shipyard stats`, `top`, `pause`, `update`. |
-| 14 (hardening) | Removing the device program from inside needs `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`, neither a default; fuzzing the OCI resources reader; the OCI conformance suite. |
+| 14 (hardening) | Removing the device program from inside needs `CAP_SYS_ADMIN` (to get its descriptor by ID; before 5.8 `CAP_NET_ADMIN` too), not a default; BFQ's `io.bfq.weight` as `--blkio-weight`'s fallback, as runc does; fuzzing the OCI resources reader; the OCI conformance suite. |
 
 **Resolved from stage 4:** device access control (eBPF on the cgroup), and the cgroup
 namespace.
@@ -400,7 +407,8 @@ when the container has a cgroup.
 | Unit | `crates/shipyard-runtime/src/**`, `crates/shipyard-cli/src/**` | `Resources` (validation, sizes, CPUs, shares, weights, swap, the files and their order, `unified` keys); the cgroup parsers, `choose_base`, `handing_down`, the recorded-path guard, the sweep's choice; `Stats` and `io.stat`; OCI resources, `cgroupsPath`, hooks and devices (every refusal); hooks (argv, env, stdin, timeouts, a 1 MiB state, records); the device rules, the assembler, the interpreter's strictness, **the property test** (random rules and requests against `Devices::allows`, nothing out of reach), the longest program; the `bpf_attr` layouts; every new failure message; each CLI flag and Docker's rules |
 | Cgroups | `crates/shipyard-cli/tests/cgroups.rs` | 12 root tests and 2 as any user: a run's cgroup with and without a root filesystem and in a user namespace, gone after, the sweep, limits, swap, OOM, pids, rootless delegation, an undelegated controller, no delegation, a partition, shipyard's own kill |
 | Runtime | `crates/shipyard-cli/tests/runtime.rs` | adds: a container's cgroup for its life, no `pid` namespace, a bundle's cgroup mount and limits, a missing limit file, OOM in the exit record, kill after OOM, `cgroupsPath` (honoured, made again, below a busy cgroup), cross-session delete, pause/resume (created too), `delete --force` when paused, `kill --all`, `update`, `ps`, `events`, the OOM score, every hook phase and failure, `poststart` with the program running, delete during a hook, hooks' descriptors |
-| Bundles | `crates/shipyard-cli/tests/bundle.rs` | `run --bundle`'s hooks (`a_run_runs_every_hook`) |
+| Bundles | `crates/shipyard-cli/tests/bundle.rs` | `run --bundle`'s hooks (`a_run_runs_every_hook`, `a_failing_hook_fails_the_run`, `hooks_that_cant_run_are_refused`) |
+| Others | `userns.rs`, `rootless.rs`, `run.rs` | the OOM score: lowered from outside (`the_oom_score_is_lowered_from_outside`), only raised rootless (`a_rootless_command_can_only_raise_its_oom_score`), without isolation (`the_oom_score_adjustment_reaches_the_command`) |
 | Devices | `crates/shipyard-cli/tests/devices.rs` | 6 root tests and 2 as any user: the defaults, `--device` (and `:r`, a directory), `--device-cgroup-rule`, a bundle's rules and nodes through `run --bundle` and the runtime, an allow rule enforced, rootless |
 | Terminal | `crates/shipyard-cli/tests/terminal.rs` | 4 new `ISOLATED_TESTS` (root and rootless): Ctrl-C during a hook, Ctrl-Z and `fg` with limits, an OOM kill, pause |
 | Kernel | `scripts/probes/cgroups.c` | the checks above |
@@ -475,7 +483,8 @@ devices and the CLI), every finding checked in the code or reproduced before it 
   - found on the way: **a limit could break every later run** (`+pids` on a busy root:
     `holds_processes`); **a run could claim a just-swept cgroup** (`lock_dir`'s check);
   - review: `resources::positive` for "zero or negative is no limit"; `Cgroup::limit`;
-    `cgroup::REQUIREMENTS`; `block_device` never falls back to `0:0`;
+    one wording of "needs root and cgroup v2" (later replaced by step 4's `NoTree`);
+    `block_device` never falls back to `0:0`;
   - worst case: **every "missing file" check was dead code** (`O_CREAT`: `write_file`);
     Docker's zeros; **shipyard's own kill blamed on OOM**; `cgroupsPath` parents under
     systemd's slices; a `cgroupsPath` inside `run/`; OCI's "default" values; partitions.
@@ -515,7 +524,7 @@ devices and the CLI), every finding checked in the code or reproduced before it 
 - **Step 8 (terminals, CI, docs, the full review):** four terminal tests; CI read through
   and pushed; every user page checked against the code. The review:
   - **`start` held the exec FIFO through `poststart`,** so the program waited for every
-    hook (the high one);
+    hook (the most serious finding);
   - **cgroup identity:** a cgroup made again at a container's path; a `cgroupsPath` below
     a busy cgroup; the early record; real root's failed claim;
   - **a kill blamed on OOM** after an earlier OOM kill (the `killed` marker);
@@ -528,7 +537,27 @@ devices and the CLI), every finding checked in the code or reproduced before it 
     without on any refusal; an existing node's mode and owner; `--device DIR` on one file
     system; `--no-isolation`'s hint; a device rate of 0; `--memory-swap -1`.
 - **Step 9:** these notes rewritten, the book's chapters 20–23, and chapters 1–19
-  rechecked against the code.
+  rechecked against the code; the user pages and a few doc comments corrected on the way.
+  Its worst-case review checked the kernel facts against the kernel's source and docs,
+  every quoted message against the code, and every "Try it" for what it would do on a
+  reader's own machine:
+  - **in-container hooks got the host's PID** (the spec says the PID seen inside): fixed,
+    tested, mutation-checked;
+  - **the "no device control" warning told root "only what your user can"**: it says
+    "nothing but its capabilities" now; and "real root fails closed" holds only where it
+    has a cgroup, now said everywhere;
+  - **kernel facts corrected:** `io.weight` is iocost's (BFQ's is `io.bfq.weight`); device
+    programs need `CAP_BPF` and `CAP_NET_ADMIN`; `O_PATH` works for
+    `CLONE_INTO_CGROUP` (checked); the `oom_score_adj` floor; `BPF_F_ALLOW_MULTI`'s
+    meaning; terminals above 255 stay major 136; hooks' working directory and environment
+    are Shipyard's choices, not runc's;
+  - **the book's examples bound the host's `/usr` read-write and never unmounted it,** so
+    a later chapter's `chown -R` (or a clean-up `rm -rf /lab`) would have reached the
+    host's `/usr`: every bind is read-only now, every chapter cleans up, and the README
+    says the examples are for the throwaway test container only;
+  - **a book agent wrote two bytes to `/dev/loop0`,** the OrbStack VM's own disk, while
+    trying an example: they fell in btrfs's unused first 64 KiB and were put back
+    (checked with `od` and `blkid`); examples only open loop devices now.
 
 **Lessons worth keeping:**
 

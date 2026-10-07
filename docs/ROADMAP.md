@@ -106,11 +106,13 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
   (supplementary groups where `setgroups` is denied) is refused, never silently dropped.
 - **Containers' cgroups are written directly** (stage 5): cgroupfs, v2 only, below
   `shipyard/` for root and inside systemd's delegated subtree for anyone else; a limit
-  that can't be applied is refused, never dropped.
+  that can't be applied is refused, never dropped (except Docker's implicit swap
+  default, skipped with a warning where swap isn't accounted).
 - **A cgroup, like a PID, is pinned before it's trusted** (stage 5): a lock for a live
   run, the recorded inode for a container, pidfds for its processes.
 - **Device control is Shipyard's own eBPF** (stage 5): runc's default list, compiled by
-  Shipyard; real root fails closed, rootless goes without where the kernel refuses.
+  Shipyard; real root fails closed where it has a cgroup, rootless goes without where
+  the kernel refuses.
 - **No image building before stage 11.** It's out of scope until then; see
   [FEATURES.md](FEATURES.md#out-of-scope-on-purpose).
 

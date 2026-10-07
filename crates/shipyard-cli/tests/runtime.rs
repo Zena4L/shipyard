@@ -1334,13 +1334,15 @@ fn hooks_run_at_their_phases() {
         .unwrap()
         .trim();
     let creating = format!("id=hooked status=creating pid={pid}");
+    // Inside the container's namespaces, the PID is the one seen there.
+    let inside = "id=hooked status=creating pid=1";
     assert_eq!(
         lines_of(&log),
         [
             format!("prestart {creating} "),
             format!("createRuntime {creating} mounted"),
             format!(
-                "createContainer {creating} uts={} umask={umask}",
+                "createContainer {inside} uts={} umask={umask}",
                 uts(&pid.to_string()).display()
             ),
         ]
@@ -1350,6 +1352,7 @@ fn hooks_run_at_their_phases() {
     let out = runtime.output_of("hooked");
     let state = Bundle::checked_start_container(&out);
     assert!(state.contains(r#""status":"created""#), "{out}");
+    assert!(state.contains(r#""pid":1,"#), "the PID inside: {out}");
     assert_eq!(
         lines_of(&log)[3],
         format!("poststart id=hooked status=running pid={pid} ")

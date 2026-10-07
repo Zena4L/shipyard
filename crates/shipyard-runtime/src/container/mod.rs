@@ -160,7 +160,7 @@ pub struct State {
     pub id: String,
     /// Where it is in its life.
     pub status: Status,
-    /// Its init's PID, while it's created or running.
+    /// Its init's PID, while it's created, running or paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
     /// The bundle it was created from (absolute).

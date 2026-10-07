@@ -195,9 +195,9 @@ Change a container's resource limits (created, running or paused)
 ###### **Options:**
 
 * `-r`, `--resources <FILE>` — Read the limits from FILE, a linux.resources JSON object (- for stdin), instead of flags
-* `-m`, `--memory <SIZE>` — The most memory the container may use (such as 512m or 2g); past it, the kernel's OOM killer stops a process (Linux, root)
+* `-m`, `--memory <SIZE>` — The most memory the container may use (such as 512m or 2g); past it, the kernel's OOM killer stops a process (Linux; rootless where a cgroup subtree is delegated)
 * `--memory-reservation <SIZE>` — Memory kept for the container when the host runs short (cgroup v2's memory.low)
-* `--memory-swap <SIZE>` — Memory plus swap (needs --memory): -1 for unlimited swap. Without it, the container may swap as much as --memory, as with Docker
+* `--memory-swap <SIZE>` — Memory plus swap (needs --memory, except -1): -1 for unlimited swap. Without it, the container may swap as much as --memory, as with Docker
 * `--cpus <NUMBER>` — How many CPUs' worth of time the container may use (such as 1.5)
 * `--cpu-period <MICROSECONDS>` — The CPU period, in microseconds (1000 to 1000000; default 100000)
 * `--cpu-quota <MICROSECONDS>` — CPU time per period, in microseconds (-1 or 0 for no limit)

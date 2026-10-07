@@ -65,9 +65,9 @@ the container's whole life, as with `runc run`: all of its [hooks](#hooks) run, 
 | `linux.uidMappings`, `linux.gidMappings` | The user namespace's ID maps: `{"containerID": 0, "hostID": 100000, "size": 65536}` entries, checked as `--uidmap` is (ID 0 mapped, no overlaps; see [User namespaces](run.md#user-namespaces)). They need a `user` namespace, and it needs them. Other fields in an entry are ignored. Mappings that include host ID 0 work (as root), with a warning: a user inside is then root on the host's files. |
 | `linux.maskedPaths`, `linux.readonlyPaths` | Exactly the paths hidden or made read-only (see [Root filesystem](run.md#root-filesystem)). **Leaving them out means none**, not Shipyard's defaults. |
 | `linux.sysctl` | Kernel settings the container owns: the IPC ones (`kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), which need an `ipc` namespace. Any other one would change the host, so it's an error (exit 125), not ignored. Values must be strings. |
-| `linux.resources` | The container's limits, as `runc` reads them: `memory` (`limit`, `reservation`, `swap` as memory **plus** swap; `-1` is no limit, `0` not set), `cpu` (`shares`, `quota`, `period`, `cpus`, `mems`), `pids.limit`, `blockIO` (`weight`, and the four `throttle…Device` lists), and `unified` (other files of the controllers, such as `"memory.high": "400M"`, written last). cgroup v1's units are converted to v2's (shares to `cpu.weight`, block I/O weights to `io.weight`). Run as root only (see [Cgroups](#cgroups)); what cgroup v2 can't apply is refused (see [What's refused](#whats-refused)). |
-| `linux.cgroupsPath` | Where [`shipyard-runtime`](runtime.md) puts the container's cgroup: an absolute path is below `/sys/fs/cgroup`, a relative one below `/sys/fs/cgroup/shipyard/runtime/`. It must not exist yet (no joining another container's cgroup), nor be below a cgroup that holds processes (another container's, say: it would share that one's limits, freezing and kill), and `.` and `..` aren't allowed, nor a place inside `shipyard/run/` (`shipyard run`'s). Its parents get only the controllers the limits need. systemd's `slice:prefix:name` form is refused. `shipyard run --bundle` ignores it, with a warning: each run's cgroup is its own. |
-| `linux.resources.devices` | Device rules, as `runc` reads them: `{"allow": false, "access": "rwm"}` entries with an optional `type` (`a` for both, the default, `c` or `b`), `major` and `minor` (missing or `-1`: any) and `access` (any of `rwm`; all three if missing). Later rules win, for each of read, write and mknod. Shipyard adds `runc`'s list after them: `mknod` of any device, and `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `/dev/pts/*` and `/dev/net/tun`. **A bundle may use only those, and what its rules allow**, as with `runc`: a `linux.devices` node needs a rule of its own here to be opened. See [Devices](run.md#devices). |
+| `linux.resources` | The container's limits, as `runc` reads them: `memory` (`limit`, `reservation`, `swap` as memory **plus** swap; `-1` is no limit, `0` not set), `cpu` (`shares`, `quota`, `period`, `cpus`, `mems`), `pids.limit`, `blockIO` (`weight`, and the four `throttle…Device` lists), and `unified` (other files of the controllers, such as `"memory.high": "400M"`, written last). cgroup v1's units are converted to v2's (shares to `cpu.weight`, block I/O weights to `io.weight`). It needs a cgroup of the container's own: root's, or rootless in your delegated subtree (see [Cgroups](#cgroups)); what cgroup v2 can't apply is refused (see [What's refused](#whats-refused)). |
+| `linux.cgroupsPath` | Where [`shipyard-runtime`](runtime.md) puts the container's cgroup: an absolute path is below `/sys/fs/cgroup` as root (below your delegated subtree, rootless), a relative one below `/sys/fs/cgroup/shipyard/runtime/`. It must not exist yet (no joining another container's cgroup), nor be below a cgroup that holds processes (another container's, say: it would share that one's limits, freezing and kill), and `.` and `..` aren't allowed, nor a place inside `shipyard/run/` (`shipyard run`'s). Its parents get only the controllers the limits need. systemd's `slice:prefix:name` form is refused. `shipyard run --bundle` ignores it, with a warning: each run's cgroup is its own. |
+| `linux.resources.devices` | Device rules, as `runc` reads them: `{"allow": false, "access": "rwm"}` entries with an optional `type` (`a` for both, the default, `c` or `b`), `major` and `minor` (missing or `-1`: any) and `access` (any of `rwm`; all three if missing). Later rules win, for each of read, write and mknod. Shipyard adds `runc`'s list after them: `mknod` of any device, and `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `/dev/pts/*` and `/dev/net/tun`. **A bundle may use only those, and what its rules allow**, as with `runc`: a `linux.devices` node needs a rule of its own here to be opened. At most 256 rules, runc's list included. See [Devices](run.md#devices). |
 | `linux.devices` | Device nodes made in the container (outside `/dev`, in the root filesystem's own directory, where they stay): `path`, `type` (`c`, `u` (the same), or `b`), `major`, `minor`, `fileMode` (`0666` if missing), `uid` and `gid` (0 if missing). In a user namespace, where nodes can't be made, the host's node at the same path is bound in instead: it must be there, and be the same device. FIFOs (`p`) are refused. |
 | `mounts` | See below. |
 | `hooks` | Programs run at points of the container's life. See [Hooks](#hooks). |
@@ -114,7 +114,7 @@ Too many containers for one user can run into the kernel's key quota
   ignored. It's cgroup v2 either way. Without `ro`, root in the container can change
   its cgroup's settings. It's left out, with a warning:
   - without a `cgroup` namespace, where it would show the host's whole cgroup tree;
-  - when the container has no cgroup of its own (rootless, or no cgroup v2; see
+  - when the container has no cgroup of its own (rootless without delegation, or no cgroup v2; see
     [Cgroups](#cgroups)).
 
 ## Cgroups
@@ -165,18 +165,22 @@ Each hook gets:
 - **its own `args` and `env`, exactly.** `args` works like `execv`'s arguments: the
   first is the program's own name (`argv[0]`); none means just the path. `env` is
   the hook's whole environment (`KEY=VALUE` entries): nothing is inherited, not even
-  `PATH`.
+  `PATH`. (The specification doesn't say; `runc` passes its own environment when `env`
+  is missing.)
 - **the container's state on its standard input,** the JSON `shipyard-runtime state`
   prints, with that phase's `status`. `pid` is the container's init's process ID as
-  seen from outside (from the `prestart` hooks on), and `id` is the container's ID
+  the hook sees it, as the specification says: from outside for the hooks that run
+  outside (from `prestart` on), and the container's own (1, with a `pid` namespace) for
+  `createContainer` and `startContainer`; and `id` is the container's ID
   (`run-PID` for `shipyard run --bundle`, after shipyard's own process ID).
 - **Shipyard's standard output and error,** or the container's for `createContainer`
   and `startContainer`, and no other open file.
 - **For `createContainer` and `startContainer`, the container's device rules:** they
   run in its cgroup. A hook that opens a device (a GPU's, say) needs it allowed in
   `linux.resources.devices`, as the toolkits that write such hooks add it.
-- **The bundle as its working directory,** as with `runc`, so relative paths in its
-  arguments mean the bundle's files. `startContainer` runs at `/` inside the container
+- **The bundle as its working directory,** so relative paths in its arguments mean the
+  bundle's files. (The specification doesn't say; `runc` leaves each phase wherever its
+  own process happens to be.) `startContainer` runs at `/` inside the container
   (and any hook runs at `/` if the bundle directory is gone by then).
 
 The hooks of a phase run one after the other, in order. A hook fails if it exits with
@@ -186,8 +190,8 @@ without a `timeout` that never ends stops its phase for good, as with `runc`.
 
 A failure in a phase up to `startContainer` means the container doesn't run:
 
-- **`prestart`, `createRuntime`, `createContainer`:** the run, or `create`, fails
-  with exit code 125, naming the hook (`the createRuntime hook /usr/local/bin/setup-net
+- **`prestart`, `createRuntime`, `createContainer`:** `shipyard run --bundle` fails
+  with exit code 125 (`shipyard-runtime create` with 1), naming the hook (`the createRuntime hook /usr/local/bin/setup-net
   (hooks.createRuntime[0]) exited with code 1`). The rest of that phase doesn't run,
   nor do later phases, except `poststop`: the container is destroyed, and its
   `poststop` hooks run, as the specification says.
@@ -196,7 +200,8 @@ A failure in a phase up to `startContainer` means the container doesn't run:
   running its program, the hook's failure goes to the container's standard error, and
   the container's exit is recorded as code 125.
 
-A failing `poststart` or `poststop` hook is only a warning: the rest of its phase
+A failing `poststart` or `poststop` hook is only a warning, as specification 1.2 says
+(1.3 makes a failing `poststart` stop the container): the rest of its phase
 runs, and so does the container.
 
 **Hooks run with Shipyard's privileges:** as root, a bundle's hooks run as root on the
@@ -238,7 +243,7 @@ Without root, a bundle runs **rootless**, as `shipyard run` does (see
 
 Some fields ask for confinement Shipyard can't provide yet. Running without it would
 leave the container **less confined than the config asks**, so the bundle is refused
-(exit code 125). Every such field is listed at once, so you can fix them all:
+(exit code 125; `shipyard-runtime`: 1). Every such field is listed at once, so you can fix them all:
 
 - `process.apparmorProfile`, `process.selinuxLabel`, `linux.mountLabel`;
 - `network` and `time` namespaces, and joining an existing one (a namespace with
@@ -285,7 +290,8 @@ refused. Fields the specification doesn't define are ignored silently, as it req
 
 ## Errors
 
-All of these exit with code 125 before anything starts, naming the problem:
+All of these exit with code 125 (`shipyard-runtime`: 1) before anything starts, naming
+the problem:
 
 - **`config.json`:** missing, not a regular file, larger than 4 MiB, or not valid JSON
   (with the line and column).

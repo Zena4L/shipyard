@@ -104,8 +104,8 @@ pub enum CgroupError {
         /// The kernel's answer.
         errno: Errno,
     },
-    /// A limit whose file this kernel doesn't have (`io.weight` needs the
-    /// BFQ scheduler or `io.cost`, say).
+    /// A limit whose file this kernel doesn't have (`io.weight` comes only
+    /// from the iocost controller, say).
     #[error(
         "the container's cgroup has no {file}: this kernel doesn't have it, or its controller \
          isn't one Shipyard hands down; that limit can't be set here"
@@ -291,8 +291,9 @@ impl Cgroup {
         &self.base
     }
 
-    /// Its directory, open, for `clone3`'s `CLONE_INTO_CGROUP`. (Not
-    /// `O_PATH`: the kernel takes only a directory opened for reading.)
+    /// Its directory, open, for `clone3`'s `CLONE_INTO_CGROUP`. (Any
+    /// descriptor of it would do, `O_PATH` too: the kernel checks that the
+    /// caller may write its `cgroup.procs`, not how it was opened.)
     pub(crate) fn open_dir(&self) -> Result<OwnedFd, CgroupError> {
         open_dir(&self.path).map_err(|errno| self.error("opening the cgroup", errno))
     }

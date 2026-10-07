@@ -286,7 +286,7 @@ mod tests {
         let own = Path::new("/user.slice/user-0.slice/session-2.scope");
         assert_eq!(
             choose_base(own, 0, owner, |_| false),
-            Err(NoTree::NotWritable(PathBuf::from("/sys/fs/cgroup/")))
+            Err(NoTree::NotWritable(PathBuf::from("/sys/fs/cgroup")))
         );
         // An owner that can't be read is no delegation (root needs none).
         assert!(matches!(

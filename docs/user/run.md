@@ -126,9 +126,10 @@ own, named after the `shipyard` process's PID:
 - **Not made** where the system has no cgroup v2 tree at `/sys/fs/cgroup` (cgroup
   v1 only), where it can't be written (a container started without privileges), or,
   rootless, where nothing is delegated to you. An SSH login, for one, puts your shell
-  in a session scope that's root's. The run goes on without one (the container then
-  sees its parent's cgroup), unless it asks for limits: then it's refused (exit 125),
-  saying why, and for an SSH login how: run it under your user manager,
+  in a session scope that's root's. The run goes on without one (its cgroup
+  namespace's root is then Shipyard's own cgroup; `/sys/fs/cgroup` is the host's tree
+  without `--rootfs`, and empty with one), unless it asks for limits: then it's refused
+  (exit 125), saying why, and for an SSH login how: run it under your user manager,
   `systemd-run --user --scope shipyard run …`.
 
 ### Capabilities and privileges
@@ -655,7 +656,7 @@ delegated to this user") unless `systemctl edit user@.service` adds them
 |---|---|---|
 | `-m`, `--memory SIZE` | The most memory (`512m`, `2g`; at least 6 MiB). Past it, the kernel reclaims, then its OOM killer kills a process. | `memory.max` |
 | `--memory-reservation SIZE` | Memory kept for the container when the host runs short. | `memory.low` |
-| `--memory-swap SIZE` | Memory **plus** swap (needs `--memory`); `-1` for unlimited swap. | `memory.swap.max` |
+| `--memory-swap SIZE` | Memory **plus** swap (needs `--memory`, except `-1`); `-1` for unlimited swap. | `memory.swap.max` |
 | `--cpus N` | N CPUs' worth of time (`1.5`) in every 100 ms. | `cpu.max` |
 | `--cpu-period µs`, `--cpu-quota µs` | The same in raw terms (a quota of `-1` or `0`: none). Not with `--cpus`. | `cpu.max` |
 | `-c`, `--cpu-shares N` | A share of the CPU against other containers (1024 is the default share). | `cpu.weight` |
@@ -681,8 +682,10 @@ delegated to this user") unless `systemctl edit user@.service` adds them
 - **Controllers:** a limit needs its cgroup controller (memory, cpu, cpuset, pids, io).
   Shipyard turns on the ones it needs, from the cgroup root down, as runc does; one the
   kernel doesn't have is refused, naming it. Some files exist only on some kernels:
-  `io.weight` needs the BFQ I/O scheduler or `io.cost`, so `--blkio-weight` is refused
-  ("this kernel has no io.weight") without them.
+  `io.weight` comes from the kernel's I/O cost controller (`CONFIG_BLK_CGROUP_IOCOST`),
+  so `--blkio-weight` is refused
+  ("the container's cgroup has no io.weight: this kernel doesn't have it, …") without
+  them.
   A cgroup that holds processes never hands a controller down (the kernel would then
   refuse to place anything below it): inside a container whose processes sit in its
   cgroup namespace's root (a plain `docker run`), limits are refused, saying so. Move
@@ -736,7 +739,8 @@ the same rules apply: `/dev/sda` is there, but it can't be opened.
 Both are repeatable, need Linux, and can't be used with `--no-isolation` or
 `--bundle` (a bundle has its own fields: see [OCI bundles](bundles.md)). Later
 `--device-cgroup-rule`s and `--device`s add to what's allowed; nothing they say can
-take a default away.
+take a default away. A container has at most 256 rules, the dozen defaults and one per
+`--device` node included.
 
 **Rootless:** loading the program needs a capability (`CAP_BPF`) a rootless user
 doesn't have on most kernels. Where it's refused, or where the container has no cgroup
