@@ -101,11 +101,12 @@ mod linux {
     use nix::unistd::{fchdir, pivot_root, symlinkat};
 
     use super::{DEV_ENTRIES, Target};
+    use crate::isolation::CgroupMount;
     use crate::process::child::Failure;
     use crate::process::failure::ChildStep;
     use crate::process::io_errno;
     use crate::process::resolve::{Leaf, resolve_in_root};
-    use crate::process::setup::{MountSetup, RootSetup};
+    use crate::process::setup::{DeviceSetup, MountSetup, RootSetup};
     use crate::process::sysctl;
 
     type Step<T = ()> = Result<T, Failure>;
@@ -139,13 +140,20 @@ mod linux {
     ];
 
     /// Switches this process (and so the container) to `root`, setting
-    /// `sysctls` on the way (before `/proc/sys` becomes read-only).
-    pub(crate) fn enter(root: &RootSetup, sysctls: &[(String, String)]) -> Step {
-        // Device nodes and directories get exactly the modes given here. The
-        // command sets its own umask before it runs.
-        umask(Mode::empty());
+    /// `sysctls` on the way (before `/proc/sys` becomes read-only), and
+    /// calling `before_pivot` once every mount is made, before the switch
+    /// (the hooks' moment: `init.rs`). Returns what `before_pivot` did.
+    pub(crate) fn enter<T>(
+        root: &RootSetup,
+        sysctls: &[(String, String)],
+        cgroup: Option<CgroupMount>,
+        before_pivot: impl FnOnce() -> Step<T>,
+    ) -> Step<T> {
+        // Device nodes and directories get exactly the modes given here.
+        // Whatever runs in between (hooks), and after, gets the umask back.
+        let umask_before = umask(Mode::empty());
         let root_fd = bind_root(root.path())?;
-        mount_standard(&root_fd, root)?;
+        mount_standard(&root_fd, root, cgroup)?;
         if !sysctls.is_empty() {
             // Through the `/proc` just mounted in the root filesystem.
             let proc = open_directory(&root_fd, Target::Proc.name())
@@ -156,6 +164,13 @@ mod linux {
             add_mount(&root_fd, mount)
                 .map_err(|(step, errno)| Failure::at(step, errno).detail(index))?;
         }
+        for (index, device) in root.devices.iter().enumerate() {
+            make_device(&root_fd, device, root.user_namespace)
+                .map_err(|errno| Failure::at(ChildStep::DeviceNode, errno).detail(index))?;
+        }
+        umask(umask_before);
+        let before = before_pivot()?;
+        umask(Mode::empty());
         pivot(&root_fd)?;
         for (index, path) in root.masked().enumerate() {
             mask(path).map_err(|errno| Failure::at(ChildStep::MaskPath, errno).detail(index))?;
@@ -168,7 +183,8 @@ mod linux {
             remount(Path::new("/"), MsFlags::MS_RDONLY)
                 .map_err(|errno| Failure::at(ChildStep::ReadOnlyRoot, errno))?;
         }
-        Ok(())
+        umask(umask_before);
+        Ok(before)
     }
 
     /// Binds the root filesystem onto itself, recursively: `pivot_root`
@@ -193,8 +209,9 @@ mod linux {
         .map_err(fail)
     }
 
-    /// `/proc`, a read-only `/sys`, and `/dev` with what's in it.
-    fn mount_standard(root: &OwnedFd, setup: &RootSetup) -> Step {
+    /// `/proc`, a read-only `/sys` (with the container's cgroup at
+    /// `/sys/fs/cgroup`, if asked), and `/dev` with what's in it.
+    fn mount_standard(root: &OwnedFd, setup: &RootSetup, cgroup: Option<CgroupMount>) -> Step {
         let on = target(root, Target::Proc)?;
         mount_on(&on, "proc", "proc", NOSUID_NODEV_NOEXEC, None)
             .map_err(|errno| Failure::at(ChildStep::MountProc, errno))?;
@@ -214,6 +231,10 @@ mod linux {
             )
         };
         sys.map_err(|errno| Failure::at(ChildStep::MountSys, errno))?;
+        if let Some(cgroup) = cgroup {
+            mount_cgroup(root, cgroup)
+                .map_err(|errno| Failure::at(ChildStep::MountCgroup, errno))?;
+        }
         let on = target(root, Target::Dev)?;
         // Not `nodev`: its device nodes must open (probe 10).
         mount_on(
@@ -305,6 +326,18 @@ mod linux {
             }
         }
         Err(fail(Errno::EBUSY))
+    }
+
+    /// The container's own cgroup at `<root>/sys/fs/cgroup`: `cgroup2`,
+    /// mounted from inside its cgroup namespace, so it shows that cgroup as
+    /// the root (the probe's G10). Here, before the pivot, with `/sys` just
+    /// mounted: `add_mount` refuses targets in `/sys`. In a user namespace
+    /// it goes on top of the empty cover `bind_host_sys` put there.
+    fn mount_cgroup(root: &OwnedFd, cgroup: CgroupMount) -> nix::Result<()> {
+        let sys = open_directory(root, "sys")?;
+        let fs = open_directory(&sys, "fs")?;
+        let on = open_directory(&fs, "cgroup")?;
+        mount_on(&on, "cgroup2", "cgroup2", cgroup.mount_flags(), None)
     }
 
     /// Opens the directory `name` in `dir` as a place to mount on: the
@@ -485,6 +518,94 @@ mod linux {
             on_target(&mounted, leaf, |at| remount(at, restrictions))
         })
         .map_err(restrict)
+    }
+
+    /// Makes the device node `device` in the root filesystem: with `mknod`,
+    /// owned as it says; in a user namespace, where `mknod` is refused, the
+    /// host's node bound in instead.
+    fn make_device(root: &OwnedFd, device: &DeviceSetup, user_namespace: bool) -> nix::Result<()> {
+        if user_namespace {
+            bind_host_device_node(root, device)
+        } else {
+            mknod_device(root, device)
+        }
+    }
+
+    /// The node's file type and device number.
+    fn device_identity(device: &DeviceSetup) -> (SFlag, u64) {
+        let kind = if device.block {
+            SFlag::S_IFBLK
+        } else {
+            SFlag::S_IFCHR
+        };
+        (
+            kind,
+            makedev(u64::from(device.major), u64::from(device.minor)),
+        )
+    }
+
+    /// Whether `stat` is the device `device` names.
+    fn is_device(stat: &nix::sys::stat::FileStat, device: &DeviceSetup) -> bool {
+        let (kind, number) = device_identity(device);
+        stat.st_mode & SFlag::S_IFMT.bits() == kind.bits() && stat.st_rdev == number
+    }
+
+    /// Binds the host's node (`source`, which must be that very device:
+    /// ENODEV otherwise) onto an empty file at the node's path. Before the
+    /// pivot, the host's tree is still there.
+    fn bind_host_device_node(root: &OwnedFd, device: &DeviceSetup) -> nix::Result<()> {
+        let source = device.source();
+        if !is_device(&nix::sys::stat::stat(source)?, device) {
+            return Err(Errno::ENODEV);
+        }
+        let target = resolve_in_root(root, device.path(), Leaf::File)?;
+        if on_kernel_interface(&target) {
+            return Err(Errno::EXDEV);
+        }
+        bind(&target, Leaf::File, source, false)
+    }
+
+    /// `mknod`s the node in its directory, resolved inside the root, and
+    /// gives it its owner. One already there is fine if it's the same device,
+    /// and gets the mode and owner asked for.
+    fn mknod_device(root: &OwnedFd, device: &DeviceSetup) -> nix::Result<()> {
+        let path = device.path();
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(Errno::EINVAL);
+        };
+        let dir = resolve_in_root(root, parent, Leaf::Directory)?;
+        if on_kernel_interface(&dir) {
+            return Err(Errno::EXDEV);
+        }
+        let (kind, number) = device_identity(device);
+        let mode = Mode::from_bits_truncate(device.mode);
+        match mknodat(&dir, name, kind, mode, number) {
+            // The same device there already (a persistent root filesystem's,
+            // Shipyard's own `/dev/null`): it gets the mode and owner asked
+            // for, as a new one would. (Checked a device, not a link, so the
+            // mode can follow it: `fchmodat` takes no "don't follow" before
+            // Linux 6.6.)
+            Err(Errno::EEXIST) => {
+                let there = fstatat(&dir, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
+                if !is_device(&there, device) {
+                    return Err(Errno::EEXIST);
+                }
+                nix::sys::stat::fchmodat(
+                    &dir,
+                    name,
+                    mode,
+                    nix::sys::stat::FchmodatFlags::FollowSymlink,
+                )?;
+            }
+            made => made?,
+        }
+        nix::unistd::fchownat(
+            &dir,
+            name,
+            Some(nix::unistd::Uid::from_raw(device.uid)),
+            Some(nix::unistd::Gid::from_raw(device.gid)),
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
     }
 
     /// Whether what's open at `target` is in a `proc` or `sysfs` file

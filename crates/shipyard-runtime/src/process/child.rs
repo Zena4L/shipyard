@@ -67,6 +67,25 @@ impl Failure {
             ..self
         }
     }
+
+    /// The same failure, with a detail of its own encoding (a hook's: see
+    /// `HookError::to_record`).
+    #[cfg(target_os = "linux")]
+    pub(super) fn raw_detail(self, detail: u64) -> Self {
+        Self { detail, ..self }
+    }
+}
+
+/// A failure another process reported, to report on in turn.
+#[cfg(target_os = "linux")]
+impl From<super::failure::ChildFailure> for Failure {
+    fn from(failure: super::failure::ChildFailure) -> Self {
+        Self {
+            step: failure.step,
+            errno: failure.errno,
+            detail: failure.detail,
+        }
+    }
 }
 
 /// If anything unwinds (it shouldn't: see the lints above), exit instead of

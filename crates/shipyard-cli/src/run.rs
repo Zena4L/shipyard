@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
+use shipyard_runtime::hooks::ContainerHooks;
 use shipyard_runtime::isolation::{IdMap, IdMaps, Isolation, Namespace, Root, RootlessMaps};
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
@@ -16,6 +17,8 @@ use shipyard_runtime::process::{
 };
 use shipyard_runtime::security::seccomp::Profile;
 use shipyard_runtime::security::{Capabilities, Capability, CapabilitySet, Seccomp, Security};
+
+use crate::limits::LimitArgs;
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
@@ -40,6 +43,33 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "NAME=SOFT[:HARD]")]
     ulimit: Vec<Rlimit>,
 
+    /// The command's OOM score adjustment, -1000 to 1000: how willing the
+    /// kernel's OOM killer is to pick it (lowering it needs root).
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    oom_score_adj: Option<i32>,
+
+    /// Give the container the host's device HOST (a directory: every device
+    /// below it), at CONTAINER inside (HOST's own path if not given), for
+    /// PERMS, from rwm (all three if not given). Repeatable (Linux).
+    #[arg(
+        long,
+        value_name = "HOST[:CONTAINER][:PERMS]",
+        value_parser = crate::devices::parse_device,
+        conflicts_with = "no_isolation"
+    )]
+    device: Vec<crate::devices::DeviceArg>,
+
+    /// Let the container use a kind of device: "TYPE MAJOR:MINOR ACCESS",
+    /// such as "c 1:3 rwm" or "b *:* r" (a for any type, * for any number).
+    /// Repeatable (Linux).
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_parser = crate::devices::parse_rule,
+        conflicts_with = "no_isolation"
+    )]
+    device_cgroup_rule: Vec<shipyard_runtime::devices::DeviceRule>,
+
     /// Signal sent to stop the command.
     #[arg(long, value_name = "SIGNAL", default_value = "SIGTERM")]
     stop_signal: Signal,
@@ -52,7 +82,7 @@ pub(crate) struct RunArgs {
     /// hostname and IPC, as you. On Linux, commands are isolated by default
     /// (rootless, in a user namespace, without root); on macOS they always
     /// run like this for now.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "limits")]
     no_isolation: bool,
 
     /// Hostname inside the container (Linux).
@@ -112,12 +142,17 @@ pub(crate) struct RunArgs {
         long,
         value_name = "DIR",
         conflicts_with_all = [
-            "command", "env", "workdir", "user", "group_add", "ulimit",
+            "command", "env", "workdir", "user", "group_add", "ulimit", "oom_score_adj",
             "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
-            "cap_add", "cap_drop", "security_opt", "uidmap", "gidmap",
+            "cap_add", "cap_drop", "security_opt", "uidmap", "gidmap", "limits", "device",
+            "device_cgroup_rule",
         ],
     )]
     bundle: Option<PathBuf>,
+
+    /// Memory, CPU, process and I/O limits.
+    #[command(flatten)]
+    limits: LimitArgs,
 
     /// The command to run, followed by its arguments.
     #[arg(
@@ -177,6 +212,13 @@ impl RunArgs {
         spec.cwd = self.workdir;
         spec.user = user;
         spec.rlimits = last_wins(self.ulimit);
+        if self.oom_score_adj.is_some() && !cfg!(target_os = "linux") {
+            bail!(
+                "--oom-score-adj needs Linux's OOM killer, which {} doesn't have",
+                std::env::consts::OS
+            );
+        }
+        spec.oom_score_adj = self.oom_score_adj;
         spec.validate()?;
         let mut warnings: Vec<String> = short_maps.into_iter().collect();
         if isolation
@@ -213,20 +255,48 @@ fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
     let bundle = shipyard_runtime::oci::load_bundle_for_caller(dir)?;
     #[cfg(not(target_os = "linux"))]
     let bundle = shipyard_runtime::oci::load_bundle(dir)?;
+    let mut warnings = bundle.warnings;
+    if let Some(path) = &bundle.cgroups_path {
+        warnings.push(format!(
+            "linux.cgroupsPath ({}) is ignored by shipyard run: each run's cgroup is its own \
+             (shipyard-runtime honors it)",
+            path.display()
+        ));
+    }
+    let mut isolation = bundle.isolation;
+    if !bundle.hooks.is_empty() {
+        // Their state names the run as its cgroup does (`run/<pid>`), and
+        // the bundle by its absolute path, as `shipyard-runtime` records it.
+        let dir =
+            std::fs::canonicalize(dir).with_context(|| format!("the bundle {}", dir.display()))?;
+        // The hooks' state is JSON, which only takes UTF-8.
+        if dir.to_str().is_none() {
+            bail!(
+                "the bundle {}: a bundle with hooks needs a path that is UTF-8 (its hooks get \
+                 it in JSON)",
+                dir.display()
+            );
+        }
+        isolation.hooks = Some(ContainerHooks::new(
+            bundle.hooks,
+            format!("run-{}", std::process::id()),
+            dir,
+            bundle.annotations,
+        ));
+    }
     Ok(Invocation {
         spec: bundle.spec,
         stop,
-        isolation: Some(bundle.isolation),
-        warnings: bundle.warnings,
+        isolation: Some(isolation),
+        warnings,
     })
 }
 
 impl RunArgs {
-    /// The isolation for this run: the standard namespaces on Linux unless
-    /// `--no-isolation`; none on macOS, where namespaces don't exist (yet:
-    /// the VM comes in a later version).
-    /// The isolation for this run, and a warning if a rootless caller's
-    /// user namespace maps fewer IDs than it could.
+    /// The isolation for this run (the standard namespaces on Linux unless
+    /// `--no-isolation`; none on macOS, where namespaces don't exist yet:
+    /// the VM comes in a later version), and a warning if a rootless
+    /// caller's user namespace maps fewer IDs than it could.
     fn isolation(&self) -> Result<(Option<Isolation>, Option<String>)> {
         if self.no_isolation {
             return Ok((None, None));
@@ -241,6 +311,8 @@ impl RunArgs {
                 (!self.cap_drop.is_empty(), "--cap-drop"),
                 (!self.security_opt.is_empty(), "--security-opt"),
                 (!self.uidmap.is_empty(), "--uidmap"),
+                (!self.device.is_empty(), "--device"),
+                (!self.device_cgroup_rule.is_empty(), "--device-cgroup-rule"),
             ] {
                 if given {
                     bail!(
@@ -248,6 +320,12 @@ impl RunArgs {
                         std::env::consts::OS
                     );
                 }
+            }
+            if let Some(flag) = self.limits.first_given() {
+                bail!(
+                    "{flag} needs Linux cgroups, which aren't available on {} yet",
+                    std::env::consts::OS
+                );
             }
             tracing::debug!("no namespaces on this system; running without isolation");
             return Ok((None, None));
@@ -257,6 +335,7 @@ impl RunArgs {
         isolation.domainname.clone_from(&self.domainname);
         isolation.sysctls.clone_from(&self.sysctl);
         isolation.security = self.security()?;
+        isolation.resources = self.limits.resources()?;
         // Shipyard refuses to start setuid (`refuse_privileged_start`), so
         // the real user is the effective one.
         #[cfg(target_os = "linux")]
@@ -279,6 +358,13 @@ impl RunArgs {
             root.read_only = self.read_only;
             isolation.root = Some(root);
         }
+        #[cfg(target_os = "linux")]
+        crate::devices::add(
+            &mut isolation.devices,
+            &self.device,
+            &self.device_cgroup_rule,
+            isolation.root.is_some(),
+        )?;
         isolation.validate()?;
         Ok((Some(isolation), short_maps))
     }
@@ -474,7 +560,8 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
 }
 
 /// Whether `isolation` asks for nothing but the namespaces themselves, so
-/// that `--no-isolation` could replace it.
+/// that `--no-isolation` could replace it: no limits or device flags
+/// either, which need the container's cgroup.
 fn only_namespaces(isolation: &Isolation) -> bool {
     isolation.root.is_none()
         && isolation.hostname.is_none()
@@ -482,6 +569,8 @@ fn only_namespaces(isolation: &Isolation) -> bool {
         && isolation.sysctls.is_empty()
         && isolation.security == Security::standard()
         && isolation.id_maps.is_none()
+        && isolation.resources.is_empty()
+        && !isolation.devices.asked
 }
 
 /// Whether `err` is isolation going wrong (missing privileges, a refusal,
@@ -946,6 +1035,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_oom_score_adjustment_is_checked() {
+        if !cfg!(target_os = "linux") {
+            let err = parse(&["--oom-score-adj", "5", "true"])
+                .unwrap()
+                .into_invocation()
+                .unwrap_err();
+            assert!(err.to_string().contains("needs Linux"), "{err}");
+            return;
+        }
+        assert_eq!(
+            spec(&["--oom-score-adj", "-500", "true"]).oom_score_adj,
+            Some(-500)
+        );
+        let err = parse(&["--oom-score-adj", "1001", "true"])
+            .unwrap()
+            .into_invocation()
+            .unwrap_err();
+        assert!(err.to_string().contains("between -1000 and 1000"), "{err}");
+        assert!(parse(&["--bundle", ".", "--oom-score-adj", "5"]).is_err());
+    }
+
+    #[test]
+    fn limit_flags_need_a_container() {
+        for limit in [
+            &["--memory", "64m"][..],
+            &["--pids-limit", "5"],
+            &["--cpus", "1"],
+        ] {
+            let args = [&["--no-isolation"], limit, &["true"]].concat();
+            assert!(parse(&args).is_err(), "{args:?}");
+            let args = [&["--bundle", "."], limit].concat();
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        let limited = parse(&["-m", "64m", "-c", "512", "true"]).unwrap();
+        assert_eq!(limited.command, ["true"], "-m and -c are ours");
+        if !cfg!(target_os = "linux") {
+            let err = limited.into_invocation().unwrap_err();
+            assert!(
+                err.to_string().contains("--memory needs Linux cgroups"),
+                "{err}"
+            );
+        }
+    }
+
     /// Root's user namespace is the one `--uidmap` asks for (if any);
     /// anyone else always gets one, with maps chosen for them, and may not
     /// pass `--uidmap`.
@@ -1011,6 +1145,20 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("--cap-add needs Linux"), "{err}");
         }
+    }
+
+    /// `--no-isolation` is suggested only where it could replace what was
+    /// asked: never for limits or device flags, which it can't be combined
+    /// with.
+    #[test]
+    fn no_isolation_replaces_only_bare_namespaces() {
+        assert!(only_namespaces(&Isolation::standard()));
+        let mut limited = Isolation::standard();
+        limited.resources.pids_max = Some(1);
+        assert!(!only_namespaces(&limited));
+        let mut devices = Isolation::standard();
+        devices.devices.asked = true;
+        assert!(!only_namespaces(&devices));
     }
 
     #[test]

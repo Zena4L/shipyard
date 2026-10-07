@@ -38,6 +38,10 @@ pub struct ProcessSpec {
     pub user: User,
     /// Resource limits, at most one per kind.
     pub rlimits: Vec<Rlimit>,
+    /// Its OOM score adjustment (`/proc/PID/oom_score_adj`, -1000 to 1000):
+    /// how willing the kernel's OOM killer is to pick it. `None` keeps the
+    /// inherited one.
+    pub oom_score_adj: Option<i32>,
 }
 
 /// Who the process runs as. Start from [`User::new`] or [`User::current`].
@@ -115,6 +119,7 @@ impl ProcessSpec {
             cwd: PathBuf::from("/"),
             user: User::current(),
             rlimits: Vec::new(),
+            oom_score_adj: None,
         }
     }
 }
@@ -187,6 +192,9 @@ pub enum SpecError {
     /// `args` is empty, so there is nothing to run.
     #[error("no command given")]
     EmptyArgs,
+    /// An OOM score adjustment outside the kernel's range.
+    #[error("the OOM score adjustment must be between -1000 and 1000 (got {0})")]
+    OomScoreAdjOutOfRange(i32),
     /// `args[0]` is an empty string.
     #[error("the command name is empty")]
     EmptyProgram,
@@ -248,6 +256,11 @@ impl ProcessSpec {
         self.validate_args()?;
         self.validate_cwd()?;
         self.user.validate()?;
+        if let Some(adj) = self.oom_score_adj
+            && !(-1000..=1000).contains(&adj)
+        {
+            return Err(SpecError::OomScoreAdjOutOfRange(adj));
+        }
         validate_rlimits(&self.rlimits)
     }
 
@@ -307,6 +320,7 @@ mod tests {
                 names: Names::default(),
             },
             rlimits: vec!["nofile=1024:2048".parse().unwrap()],
+            oom_score_adj: None,
         }
     }
 
@@ -314,6 +328,21 @@ mod tests {
         let mut spec = valid();
         change(&mut spec);
         spec.validate().expect_err("spec should be rejected")
+    }
+
+    #[test]
+    fn the_oom_score_adjustment_is_in_the_kernels_range() {
+        for ok in [-1000, 0, 500, 1000] {
+            let mut spec = valid();
+            spec.oom_score_adj = Some(ok);
+            assert_eq!(spec.validate(), Ok(()), "{ok}");
+        }
+        for bad in [-1001, 1001, i32::MAX] {
+            assert_eq!(
+                rejects(|s| s.oom_score_adj = Some(bad)),
+                SpecError::OomScoreAdjOutOfRange(bad)
+            );
+        }
     }
 
     #[test]

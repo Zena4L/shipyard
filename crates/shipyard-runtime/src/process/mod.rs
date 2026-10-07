@@ -41,6 +41,9 @@ pub use env::{DEFAULT_PATH, Env, EnvError};
 pub use failure::{SpawnError, SpawnErrorKind};
 pub use identity::{LookupError, Which};
 pub use rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
+#[cfg(target_os = "linux")]
+pub(crate) use signal::discard_pending;
+pub(crate) use signal::is_pending;
 pub use signal::{Signal, SignalError};
 pub use spawn::die_from;
 pub use spec::{MAX_GROUPS, Names, ProcessSpec, SpecError, User};

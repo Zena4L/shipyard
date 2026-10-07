@@ -1,5 +1,5 @@
 //! The lifecycle on Linux (see the module above): the state directory, the
-//! monitor, and the five calls.
+//! monitor, and the calls.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -18,6 +18,8 @@ use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 
 use super::{ContainerError, Created, OCI_VERSION, Result, State, Status, validate_id};
+use crate::cgroup;
+use crate::hooks::{ContainerHooks, Phase};
 use crate::isolation::Namespace;
 use crate::oci::load_bundle_for_caller;
 use crate::process::spawn::{Placement, SpawnOptions, spawn};
@@ -29,6 +31,10 @@ const MONITOR_ARG: &str = "__shipyard-monitor";
 const STATE_FILE: &str = "state.json";
 const FIFO: &str = "exec.fifo";
 const EXIT_FILE: &str = "exit";
+/// Left by a call that sends SIGKILL (`kill`, `kill --all`, `delete`): the
+/// container's end is theirs, not the OOM killer's, even if it struck
+/// earlier (a process it killed, and the container went on).
+const KILLED_FILE: &str = "killed";
 
 /// How long `start` waits for the init's answer at the gate, and `delete`
 /// for a killed container to stop.
@@ -39,8 +45,9 @@ const WAIT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long a call waits for the lock: longer than any call holds it
-/// (`delete` waits up to [`WAIT`] with it).
-const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// (`delete` waits up to [`WAIT`] for the stop, then up to [`WAIT`] for the
+/// cgroup to empty, with it).
+const LOCK_WAIT: Duration = Duration::from_secs(15);
 
 fn io(doing: impl Into<String>) -> impl FnOnce(std::io::Error) -> ContainerError {
     let doing = doing.into();
@@ -67,6 +74,44 @@ struct Record {
     /// since boot, `/proc/PID/stat` field 22).
     init: Option<(i32, u64)>,
     annotations: BTreeMap<String, String>,
+    /// The container's cgroup, if it has one (made by `create`, removed by
+    /// the monitor at the end, or by `delete`).
+    #[serde(default)]
+    cgroup: Option<PathBuf>,
+    /// The base of the part of the cgroup tree it was made in (root's, or
+    /// the user's delegated subtree): what [`cgroup::Cgroup::recorded`]
+    /// checks it against. Records from before rootless cgroups have none:
+    /// theirs were root's.
+    #[serde(default)]
+    cgroup_base: Option<PathBuf>,
+    /// The bundle's hooks, as `create` read them, with what their state
+    /// says: the monitor runs `create`'s, `start` `poststart`, `delete`
+    /// `poststop`, whatever the bundle says by then.
+    #[serde(default)]
+    hooks: Option<ContainerHooks>,
+    /// Its cgroup directory's inode, when made: a directory at that path
+    /// with another (the container's own removed, and another's made there:
+    /// a `cgroupsPath` naming it) isn't this container's, and is left alone.
+    #[serde(default)]
+    cgroup_inode: Option<u64>,
+}
+
+impl Record {
+    /// Its cgroup, if it has one and it's a container's own.
+    fn container_cgroup(&self) -> Option<std::result::Result<cgroup::Cgroup, cgroup::CgroupError>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = self.cgroup.clone()?;
+        if let Some(inode) = self.cgroup_inode
+            && std::fs::metadata(&path).is_ok_and(|now| now.ino() != inode)
+        {
+            return None;
+        }
+        let base = self
+            .cgroup_base
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(cgroup::ROOT));
+        Some(cgroup::Cgroup::recorded(path, base))
+    }
 }
 
 // --- create -------------------------------------------------------------------
@@ -93,10 +138,29 @@ pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
         std::fs::canonicalize(bundle).map_err(io(format!("the bundle {}", bundle.display())))?;
     // Everything a bundle can get wrong, before anything exists.
     let loaded = load_bundle_for_caller(&bundle)?;
-    if !loaded.isolation.namespaces.contains(&Namespace::Pid) {
-        return Err(ContainerError::NoPidNamespace);
+    // The container gets a cgroup below this process's part of the tree
+    // (root's, or the user's delegated subtree). Without a PID namespace,
+    // it's what finds and kills every process of the container, so then
+    // it's needed.
+    let tree = cgroup::Tree::find();
+    if let Err(why) = &tree {
+        without_cgroup(&loaded.isolation, &why.to_string())?;
     }
-    let (annotations, warnings) = (loaded.annotations, loaded.warnings);
+    let hooks = (!loaded.hooks.is_empty())
+        .then(|| ContainerHooks::new(loaded.hooks, id, &bundle, loaded.annotations.clone()));
+    let (annotations, mut warnings) = (loaded.annotations, loaded.warnings);
+    if let (Err(why), Some(_)) = (&tree, &loaded.cgroups_path) {
+        warnings.push(format!(
+            "linux.cgroupsPath is ignored: the container can't have a cgroup of its own here: \
+             {why}"
+        ));
+    }
+    if let Err(why) = &tree {
+        warnings.extend(cgroup::devices_without_cgroup(
+            &loaded.isolation.devices,
+            why,
+        ));
+    }
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -111,12 +175,6 @@ pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
         }
         Err(err) => return Err(io(format!("making {}", dir.display()))(err)),
     }
-    let record = Record {
-        bundle,
-        monitor: None,
-        init: None,
-        annotations,
-    };
     let dir_fd = match open_directory(&dir) {
         Ok(fd) => fd,
         Err(err) => {
@@ -124,21 +182,127 @@ pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
             return Err(err);
         }
     };
-    let result = start_monitor(id, &dir_fd, record);
-    if result.is_err() {
-        remove_own(&dir, &dir_fd);
+    let mut record = Record {
+        bundle,
+        monitor: None,
+        init: None,
+        annotations,
+        cgroup: None,
+        cgroup_base: None,
+        hooks: hooks.clone(),
+        cgroup_inode: None,
+    };
+    let cgroup = if let Ok(tree) = &tree {
+        let path = loaded
+            .cgroups_path
+            .unwrap_or_else(|| cgroup::runtime_cgroup(id));
+        match limited_cgroup(tree, &path, &loaded.isolation, (id, &dir_fd), &mut record) {
+            Ok((cgroup, warning)) => {
+                warnings.extend(warning);
+                Some(cgroup)
+            }
+            Err(err) => {
+                remove_own(&dir, &dir_fd, None);
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+    match start_monitor(id, &dir_fd, record) {
+        Ok(pid) => Ok(Created { pid, warnings }),
+        Err(err) => {
+            // As the spec has it: a create that fails is a container
+            // destroyed, and `poststop` follows. Not if a `delete` got here
+            // first (killing a setup that hung, say): it destroyed the
+            // container, and ran them.
+            let removed = remove_own(&dir, &dir_fd, cgroup.as_ref());
+            let warnings = hooks
+                .filter(|_| removed)
+                .map(|hooks| hooks.run_all(Phase::Poststop, None))
+                .unwrap_or_default();
+            Err(with_warnings(err, &warnings))
+        }
     }
-    result.map(|pid| Created { pid, warnings })
 }
 
-/// Removes the state directory at `dir` if it's still the one open at
-/// `fd`: a `delete` may have removed it meanwhile, and a `create` made
-/// another container's at the same path.
-fn remove_own(dir: &Path, fd: &OwnedFd) {
-    if let Ok(_lock) = lock_at(fd)
-        && same_directory(fd, dir)
+/// `err`, with `warnings` (hooks that failed after it) added as lines of its
+/// own: the caller gets no `Created` to carry them.
+fn with_warnings(err: ContainerError, warnings: &[String]) -> ContainerError {
+    if warnings.is_empty() {
+        return err;
+    }
+    let lines: Vec<String> = warnings
+        .iter()
+        .map(|warning| format!("warning: {warning}"))
+        .collect();
+    ContainerError::Setup(format!("{err}\n{}", lines.join("\n")))
+}
+
+/// Makes the container's cgroup at `path` (below `tree`'s base) with
+/// `isolation`'s limits written in and its device program attached, before
+/// anything runs in it; removed again if they can't be. Returns it, and a
+/// warning if its device rules can't be enforced.
+///
+/// It's put in `record`, written to container `id`'s state directory (open
+/// at `dir`), as soon as it's made: the limits and the device program take a while, and a
+/// `create` killed meanwhile must leave a cgroup `delete` can find.
+fn limited_cgroup(
+    tree: &cgroup::Tree,
+    path: &Path,
+    isolation: &crate::isolation::Isolation,
+    (id, dir): (&str, &OwnedFd),
+    record: &mut Record,
+) -> Result<(cgroup::Cgroup, Option<String>)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let made = tree.create(path)?;
+    record.cgroup = Some(made.path().to_path_buf());
+    record.cgroup_base = Some(made.base().to_path_buf());
+    record.cgroup_inode = std::fs::metadata(made.path()).ok().map(|meta| meta.ino());
+    let recorded = lock_at(dir)
+        .map_err(locking(id))
+        .and_then(|_lock| write_record_at(dir, record));
+    // Nothing is skipped: a bundle's swap limit is never a default.
+    let confined = recorded.and_then(|()| {
+        made.limit(&isolation.resources)?;
+        Ok(cgroup::enforce_devices(&made, &isolation.devices)?)
+    });
+    match confined {
+        Ok(warning) => Ok((made, warning)),
+        Err(err) => {
+            let _ = made.remove(WAIT);
+            Err(err)
+        }
+    }
+}
+
+/// Removes the state directory at `dir`, and the container's `cgroup`,
+/// if the directory is still the one open at `fd`: a `delete` may have
+/// removed both meanwhile, and a `create` made another container's at the
+/// same paths. Says whether it was still there to remove.
+fn remove_own(dir: &Path, fd: &OwnedFd, cgroup: Option<&cgroup::Cgroup>) -> bool {
+    let Ok(_lock) = lock_at(fd) else {
+        return false;
+    };
+    if !same_directory(fd, dir) {
+        return false;
+    }
+    if let Some(cgroup) = cgroup {
+        let _ = cgroup.remove(WAIT);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    true
+}
+
+/// Removes the container's `cgroup` if its state directory, open at `dir`,
+/// is still there. Its path is the ID's: once `delete` has removed the
+/// directory (and the cgroup, under the same lock), a `create` may have made
+/// a newer container with this ID, and the path would be that one's cgroup.
+fn remove_cgroup_at(dir: &OwnedFd, cgroup: &cgroup::Cgroup) {
+    if let Ok(_lock) = lock_at(dir)
+        && nix::sys::stat::fstat(dir).is_ok_and(|stat| stat.st_nlink > 0)
     {
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = cgroup.remove(WAIT);
     }
 }
 
@@ -336,19 +500,43 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
             nix::sys::signal::SigHandler::SigDfl,
         )
     };
-    let _ = nix::fcntl::fcntl(
-        dir,
-        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-    );
+    // Neither is the container's or its hooks'.
+    for fd in [dir.as_fd(), ready.as_fd()] {
+        let _ = nix::fcntl::fcntl(
+            fd,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        );
+    }
     let answer = |answer: &Answer| {
         let mut line = serde_json::to_vec(answer).unwrap_or_default();
         line.push(b'\n');
         // One write: well under the pipe's buffer, so it lands whole.
         let _ = nix::unistd::write(&ready, &line);
     };
-    let (mut child, pid) = match spawn_container(dir, bundle) {
+    // `create` wrote it while holding the lock, so it's there once the lock
+    // is free. Without it, or with a cgroup that doesn't check out, the
+    // container would run without its cgroup (and limits) or its hooks:
+    // better not at all.
+    let (cgroup, hooks) = match container_setup(dir) {
+        Ok(setup) => setup,
+        Err(err) => {
+            answer(&Answer::Failed(format!(
+                "reading the container's state: {err}"
+            )));
+            std::process::exit(1);
+        }
+    };
+    // The cgroup goes with the container: the monitor removes it, killing
+    // whatever is left.
+    let remove_cgroup = || {
+        if let Some(cgroup) = &cgroup {
+            remove_cgroup_at(dir, cgroup);
+        }
+    };
+    let (mut child, pid) = match spawn_container(dir, bundle, cgroup.clone(), hooks) {
         Ok(created) => created,
         Err(message) => {
+            remove_cgroup();
             answer(&Answer::Failed(message));
             std::process::exit(1);
         }
@@ -356,6 +544,7 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
     if let Err(err) = record_init(dir, pid) {
         child.kill_all();
         let _ = child.reap();
+        remove_cgroup();
         answer(&Answer::Failed(err.to_string()));
         std::process::exit(1);
     }
@@ -365,7 +554,17 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
     // it, so a reader sees end-of-file when the container closes it.
     null_stdio();
     let status = child.reap();
+    // Read before the cgroup goes: whether the OOM killer struck, and the
+    // SIGKILL wasn't someone's `kill`.
+    let killed =
+        nix::sys::stat::fstatat(dir, KILLED_FILE, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW).is_ok();
+    let out_of_memory = !killed && cgroup.as_ref().is_some_and(|cgroup| cgroup.oom_kills() > 0);
+    // Before "stopped" is recorded: a stopped container has nothing left.
+    remove_cgroup();
     let ended = match status {
+        Ok(status) if out_of_memory && status.killed_by_sigkill() => {
+            format!("{} (out of memory)", describe_exit(status))
+        }
         Ok(status) => describe_exit(status),
         Err(err) => format!("unknown ({err})"),
     };
@@ -375,13 +574,45 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
     std::process::exit(0);
 }
 
-/// Spawns the container held at the start gate, and waits until it's set
-/// up. A failure is the message for `create`.
+/// What the monitor needs from `state.json` in the state directory open at
+/// `dir`: the container's cgroup, if it has one, and its hooks.
+fn container_setup(dir: &OwnedFd) -> Result<(Option<cgroup::Cgroup>, Option<ContainerHooks>)> {
+    let _lock = lock_at(dir).map_err(errno_io("locking the state directory"))?;
+    let record = read_record_at(dir)?
+        .ok_or_else(|| ContainerError::Setup("the container was deleted".into()))?;
+    let cgroup = record.container_cgroup().transpose()?;
+    Ok((cgroup, record.hooks))
+}
+
+/// Refuses `isolation` for a container without a cgroup (for the reason
+/// `why`), if it needs one: without a PID namespace, nothing else can find
+/// all its processes; and limits need one to be written in.
+fn without_cgroup(isolation: &crate::isolation::Isolation, why: &str) -> Result<()> {
+    if !isolation.namespaces.contains(&Namespace::Pid) {
+        return Err(ContainerError::NoPidNamespace(why.to_owned()));
+    }
+    if !isolation.resources.is_empty() {
+        return Err(ContainerError::LimitsNeedACgroup(why.to_owned()));
+    }
+    Ok(())
+}
+
+/// Spawns the container held at the start gate (running `create`'s hooks,
+/// as `hooks` lists them, on the way), and waits until it's set up. A
+/// failure is the message for `create`.
 fn spawn_container(
     dir: &OwnedFd,
     bundle: &Path,
+    cgroup: Option<cgroup::Cgroup>,
+    hooks: Option<ContainerHooks>,
 ) -> std::result::Result<(crate::process::spawn::Child, i32), String> {
-    let bundle = load_bundle_for_caller(bundle).map_err(|err| err.to_string())?;
+    let mut bundle = load_bundle_for_caller(bundle).map_err(|err| err.to_string())?;
+    // Read again, it may have changed since `create` checked it.
+    if cgroup.is_none() {
+        without_cgroup(&bundle.isolation, "none could be made when it was created")
+            .map_err(|err| err.to_string())?;
+    }
+    bundle.isolation.hooks = hooks;
     let gate = nix::fcntl::openat(
         dir,
         FIFO,
@@ -394,6 +625,7 @@ fn spawn_container(
         keep_ignored: Vec::new(),
         placement: Placement::New(Box::new(bundle.isolation)),
         gate: Some(gate.as_raw_fd()),
+        cgroup,
     };
     let mut child = spawn(&bundle.spec, &options, |_| {}).map_err(|err| format!("{err:#}"))?;
     drop(gate);
@@ -468,19 +700,28 @@ fn null_stdio() {
 
 // --- start, state, kill, delete -----------------------------------------------
 
-/// Lets container `id`, created and waiting, run its program.
+/// Lets container `id`, created and waiting, run its program, then runs
+/// its `poststart` hooks. Returns their failures, as warnings: the
+/// container runs anyway, as the spec says.
+///
+/// Its `startContainer` hooks run in it once it's let go, before its
+/// program: a failure there ends it (see its exit record), and isn't this
+/// call's.
 ///
 /// # Errors
 ///
 /// No such container, one that isn't created (already started, or
 /// stopped), or an init that doesn't answer at the gate.
-pub fn start(root: &Path, id: &str) -> Result<()> {
+pub fn start(root: &Path, id: &str) -> Result<Vec<String>> {
     let dir = existing(root, id)?;
-    let _lock = lock(&dir)?;
+    let lock = lock(&dir)?;
     let status = status_of(&dir)?;
     if status != Status::Created {
         return Err(wrong(id, status, "start", "created"));
     }
+    // Read before the container is let go: once it is, `start` must not
+    // fail.
+    let record = read_record(&dir)?;
     let fifo = nix::fcntl::open(
         &dir.join(FIFO),
         OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
@@ -501,7 +742,20 @@ pub fn start(root: &Path, id: &str) -> Result<()> {
             "container {id}'s init didn't answer at the start gate"
         )));
     }
-    std::fs::remove_file(dir.join(FIFO)).map_err(io("removing the exec FIFO"))
+    // Closed at once: the init goes on only once no reader is left (see
+    // `wait_at_gate`), and `poststart` below must not hold the program back.
+    drop(fifo);
+    // It's started: from here on, problems are only warnings.
+    let mut warnings = Vec::new();
+    if let Err(err) = std::fs::remove_file(dir.join(FIFO)) {
+        warnings.push(format!("removing the exec FIFO: {err}"));
+    }
+    // Not under the lock: a hook may well ask for the container's state.
+    drop(lock);
+    if let Some((hooks, pid)) = record.and_then(|record| Some((record.hooks?, record.init?.0))) {
+        warnings.extend(hooks.run_all(Phase::Poststart, Some(pid)));
+    }
+    Ok(warnings)
 }
 
 /// Container `id`'s state.
@@ -514,7 +768,7 @@ pub fn state(root: &Path, id: &str) -> Result<State> {
     let _lock = lock(&dir)?;
     let record = read_record(&dir)?;
     let status = status_of(&dir)?;
-    let live = matches!(status, Status::Created | Status::Running);
+    let live = LIVE.contains(&status);
     Ok(State {
         oci_version: OCI_VERSION.to_owned(),
         id: id.to_owned(),
@@ -534,46 +788,205 @@ pub fn state(root: &Path, id: &str) -> Result<State> {
 
 /// Sends `signal` to container `id`'s init, which passes it on to the
 /// program. While the container is only created, signals other than
-/// SIGKILL wait until it starts.
+/// SIGKILL wait until it starts; while it's paused, until it's resumed
+/// (SIGKILL ends it at once).
 ///
 /// # Errors
 ///
-/// No such container, one that isn't created or running, or SIGSTOP (see
-/// [`ContainerError::StopSignal`]).
+/// No such container, one that isn't created, running or paused, or SIGSTOP
+/// (see [`ContainerError::StopSignal`]).
 pub fn kill(root: &Path, id: &str, signal: Signal) -> Result<()> {
-    if signal.as_raw() == libc::SIGSTOP {
-        return Err(ContainerError::StopSignal(id.to_owned()));
-    }
+    refuse_stop(id, signal)?;
     let dir = existing(root, id)?;
     let _lock = lock(&dir)?;
     let status = status_of(&dir)?;
-    if !matches!(status, Status::Created | Status::Running) {
-        return Err(wrong(id, status, "kill", "created or running"));
+    if !LIVE.contains(&status) {
+        return Err(wrong(id, status, "kill", LIVE_WANTED));
     }
     let (pid, started) = read_record(&dir)?
         .and_then(|r| r.init)
         .ok_or_else(|| ContainerError::NotFound(id.to_owned()))?;
+    mark_if_killing(&dir, signal.as_raw());
     signal_process(pid, started, signal.as_raw())
         .map_err(errno_io(format!("signalling container {id}")))
 }
 
-/// Removes container `id`. A created one is killed first (as runc does); a
-/// running one only with `force`.
+/// Sends `signal` to every process in container `id`'s cgroup (runc's
+/// `kill --all`), as [`kill`] sends it to the init.
+///
+/// # Errors
+///
+/// As [`kill`], and for a container without a cgroup.
+pub fn kill_all(root: &Path, id: &str, signal: Signal) -> Result<()> {
+    refuse_stop(id, signal)?;
+    with_cgroup(root, id, "kill", &LIVE, LIVE_WANTED, |cgroup| {
+        mark_if_killing(&root.join(id), signal.as_raw());
+        cgroup.signal_all(signal.as_raw());
+        Ok(())
+    })
+}
+
+/// Leaves [`KILLED_FILE`] in the state directory `dir` before `signal` is
+/// sent, if it's SIGKILL. Best effort: without it, an OOM kill earlier in
+/// the container's life is all a later SIGKILL could be blamed on.
+fn mark_if_killing(dir: &Path, signal: i32) {
+    if signal == libc::SIGKILL {
+        let _ = std::fs::write(dir.join(KILLED_FILE), "");
+    }
+}
+
+/// SIGSTOP can't be caught or passed on: it would stop the init, not the
+/// program (see [`ContainerError::StopSignal`]).
+fn refuse_stop(id: &str, signal: Signal) -> Result<()> {
+    if signal.as_raw() == libc::SIGSTOP {
+        return Err(ContainerError::StopSignal(id.to_owned()));
+    }
+    Ok(())
+}
+
+/// Freezes container `id`'s processes (`cgroup.freeze`): a created or
+/// running one becomes paused (and `resume` brings it back to where it
+/// was).
+///
+/// # Errors
+///
+/// No such container, one that isn't created or running, one without a
+/// cgroup, or a freeze that didn't happen in time.
+pub fn pause(root: &Path, id: &str) -> Result<()> {
+    // As runc: a created container may be paused too.
+    let pausable = [Status::Created, Status::Running];
+    with_cgroup(
+        root,
+        id,
+        "pause",
+        &pausable,
+        "created or running",
+        |cgroup| Ok(cgroup.freeze(true, WAIT)?),
+    )
+}
+
+/// Thaws a paused container `id`: it runs again.
+///
+/// # Errors
+///
+/// No such container, one that isn't paused, or a thaw that didn't happen
+/// in time.
+pub fn resume(root: &Path, id: &str) -> Result<()> {
+    with_cgroup(root, id, "resume", &[Status::Paused], "paused", |cgroup| {
+        Ok(cgroup.freeze(false, WAIT)?)
+    })
+}
+
+/// Changes container `id`'s limits to `resources` (what's given; the rest
+/// stays as it is). Returns what was skipped, to warn about.
+///
+/// # Errors
+///
+/// No such container, a stopped one, one without a cgroup, or a limit the
+/// kernel refused.
+pub fn update(
+    root: &Path,
+    id: &str,
+    resources: &crate::resources::Resources,
+) -> Result<Vec<String>> {
+    with_cgroup(root, id, "update", &LIVE, LIVE_WANTED, |cgroup| {
+        Ok(cgroup.limit(resources)?)
+    })
+}
+
+/// Container `id`'s memory limit (`memory.max`), if it has one: what
+/// `update --memory-swap` alone counts from.
+///
+/// # Errors
+///
+/// As [`update`].
+pub fn memory_limit(root: &Path, id: &str) -> Result<Option<u64>> {
+    with_cgroup(root, id, "update", &LIVE, LIVE_WANTED, |cgroup| {
+        Ok(Some(cgroup.stats().memory.usage.limit).filter(|&limit| limit != u64::MAX))
+    })
+}
+
+/// The processes in container `id`'s cgroup, by host PID.
+///
+/// # Errors
+///
+/// No such container, a stopped one, or one without a cgroup.
+pub fn ps(root: &Path, id: &str) -> Result<Vec<i32>> {
+    with_cgroup(root, id, "ps", &LIVE, LIVE_WANTED, |cgroup| {
+        Ok(cgroup
+            .pids()
+            .into_iter()
+            .map(nix::unistd::Pid::as_raw)
+            .collect())
+    })
+}
+
+/// What container `id` has used, and how many of its processes the OOM
+/// killer has killed so far.
+///
+/// # Errors
+///
+/// No such container, a stopped one, or one without a cgroup.
+pub fn stats(root: &Path, id: &str) -> Result<(crate::cgroup::Stats, u64)> {
+    with_cgroup(root, id, "events", &LIVE, LIVE_WANTED, |cgroup| {
+        Ok((cgroup.stats(), cgroup.oom_kills()))
+    })
+}
+
+/// A container that has processes: created, running or paused.
+const LIVE: [Status; 3] = [Status::Created, Status::Running, Status::Paused];
+/// [`LIVE`], as an error says it.
+const LIVE_WANTED: &str = "created, running or paused";
+
+/// Runs `act` on container `id`'s cgroup, holding the container's lock (so a
+/// `delete` can't remove it meanwhile), if the container is in one of the
+/// `allowed` states (`wanted` says which, for `action`'s error).
+fn with_cgroup<T>(
+    root: &Path,
+    id: &str,
+    action: &'static str,
+    allowed: &[Status],
+    wanted: &'static str,
+    act: impl FnOnce(&cgroup::Cgroup) -> Result<T>,
+) -> Result<T> {
+    let dir = existing(root, id)?;
+    let _lock = lock(&dir)?;
+    let status = status_of(&dir)?;
+    if !allowed.contains(&status) {
+        return Err(wrong(id, status, action, wanted));
+    }
+    act(&cgroup_of(id, read_record(&dir)?.as_ref())?)
+}
+
+/// Container `id`'s cgroup, from its `record`.
+fn cgroup_of(id: &str, record: Option<&Record>) -> Result<cgroup::Cgroup> {
+    match record.and_then(Record::container_cgroup) {
+        Some(Ok(cgroup)) => Ok(cgroup),
+        Some(Err(err)) => Err(err.into()),
+        None => Err(ContainerError::NeedsCgroup(id.to_owned())),
+    }
+}
+
+/// Removes container `id`, then runs its `poststop` hooks. A created one is
+/// killed first (as runc does); a running one only with `force`. Returns
+/// the hooks' failures, as warnings: the container is gone anyway.
 ///
 /// # Errors
 ///
 /// No such container, a running one without `force`, or one that won't
 /// stop.
-pub fn delete(root: &Path, id: &str, force: bool) -> Result<()> {
+pub fn delete(root: &Path, id: &str, force: bool) -> Result<Vec<String>> {
     let dir = existing(root, id)?;
-    let _lock = lock(&dir)?;
+    let lock = lock(&dir)?;
     let status = status_of(&dir)?;
     match status {
-        Status::Running if !force => {
+        Status::Running | Status::Paused if !force => {
             return Err(wrong(id, status, "delete", "stopped (or --force)"));
         }
-        Status::Created | Status::Running => {
+        // A paused one too: SIGKILL ends a frozen process (G8).
+        Status::Created | Status::Running | Status::Paused => {
             if let Some((pid, started)) = read_record(&dir)?.and_then(|r| r.init) {
+                mark_if_killing(&dir, libc::SIGKILL);
                 let _ = signal_process(pid, started, libc::SIGKILL);
             }
             let deadline = Instant::now() + WAIT;
@@ -586,14 +999,43 @@ pub fn delete(root: &Path, id: &str, force: bool) -> Result<()> {
         }
         Status::Creating => {
             // A setup that hangs never answers: stop it through its monitor
-            // (the init dies with it, by its parent-death signal).
-            if let Some((pid, started)) = read_record(&dir)?.and_then(|r| r.monitor) {
-                let _ = signal_process(pid, started, libc::SIGKILL);
+            // (the init dies with it, by its parent-death signal), and the
+            // hooks it runs (`prestart`, `createRuntime`) with it: they're
+            // in its process group (it leads its own session), and must not
+            // go on past the `poststop` hooks below.
+            if let Some((pid, started)) = read_record(&dir)?.and_then(|r| r.monitor)
+                && signal_process(pid, started, libc::SIGKILL).is_ok()
+            {
+                // A group's ID isn't given to a new process while the group
+                // has members: this can't reach anyone else.
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
             }
         }
         Status::Stopped => {}
     }
-    std::fs::remove_dir_all(&dir).map_err(io(format!("removing {}", dir.display())))
+    // The monitor removes the cgroup at the container's end; if it died
+    // first, this does, killing whatever is left (without a PID namespace,
+    // the init's death doesn't take the rest along).
+    // One that's gone already (with the user manager it was below, at a
+    // logout) is nothing to remove: its base may be gone too.
+    let record = read_record(&dir)?;
+    if let Some(recorded) = record
+        .as_ref()
+        .filter(|record| record.cgroup.as_ref().is_some_and(|path| path.exists()))
+        .and_then(Record::container_cgroup)
+    {
+        recorded.and_then(|cgroup| cgroup.remove(WAIT))?;
+    }
+    std::fs::remove_dir_all(&dir).map_err(io(format!("removing {}", dir.display())))?;
+    // Not under the lock (a hook may ask for the state: it's gone now).
+    drop(lock);
+    Ok(record
+        .and_then(|record| record.hooks)
+        .map(|hooks| hooks.run_all(Phase::Poststop, None))
+        .unwrap_or_default())
 }
 
 // --- The state directory -------------------------------------------------------
@@ -731,15 +1173,21 @@ fn wrong(id: &str, status: Status, action: &'static str, wanted: &'static str) -
 /// Where the container is: stopped once it ended (its exit recorded, or its
 /// init gone or replaced), created while the gate is there, running after.
 fn status_of(dir: &Path) -> Result<Status> {
-    let Some(Record {
-        init: Some((pid, started)),
-        ..
-    }) = read_record(dir)?
-    else {
+    let Some(record) = read_record(dir)? else {
+        return Ok(Status::Creating);
+    };
+    let Some((pid, started)) = record.init else {
         return Ok(Status::Creating);
     };
     if dir.join(EXIT_FILE).exists() || !is_init(pid, started) {
         return Ok(Status::Stopped);
+    }
+    if record
+        .container_cgroup()
+        .and_then(std::result::Result::ok)
+        .is_some_and(|cgroup| cgroup.frozen())
+    {
+        return Ok(Status::Paused);
     }
     Ok(if dir.join(FIFO).exists() {
         Status::Created
@@ -905,6 +1353,10 @@ mod tests {
             monitor: None,
             init,
             annotations: BTreeMap::new(),
+            cgroup: None,
+            cgroup_base: None,
+            hooks: None,
+            cgroup_inode: None,
         };
         let fd = open_directory(&dir).unwrap();
         let write_record = |_: &Path, record: &Record| write_record_at(&fd, record);
@@ -939,5 +1391,20 @@ mod tests {
         assert!(read_record_at(&stale).unwrap().is_none());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn records_keep_their_hooks_and_older_ones_have_none() {
+        let older: Record =
+            serde_json::from_str(r#"{"bundle": "/b", "init": null, "annotations": {}}"#).unwrap();
+        assert!(older.hooks.is_none());
+        let mut hooks = crate::hooks::Hooks::default();
+        hooks.poststop.push(crate::hooks::Hook::new("/bin/cleanup"));
+        let record = Record {
+            hooks: Some(ContainerHooks::new(hooks, "c1", "/b", BTreeMap::new())),
+            ..older
+        };
+        let back: Record = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(back.hooks, record.hooks);
     }
 }

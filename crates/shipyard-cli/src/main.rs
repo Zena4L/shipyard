@@ -3,6 +3,12 @@
 //! This crate only parses flags and reports results; the work happens in
 //! `shipyard-runtime`.
 
+mod devices;
+#[allow(
+    dead_code,
+    reason = "shared with `shipyard-runtime`, whose `update` uses what `run` doesn't"
+)]
+mod limits;
 mod run;
 
 use std::io::{IsTerminal as _, Write};
@@ -13,6 +19,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use shipyard_runtime::Backend;
 use shipyard_runtime::process::{self, EXIT_ENGINE_ERROR};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::{Format, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 
 /// A lightweight container engine.
 #[derive(Debug, Parser)]
@@ -144,11 +153,53 @@ fn init_tracing(log_level: Option<LogLevel>, debug: bool) {
     // escape codes in a log file or CI output are just noise.
     let colour = std::io::stderr().is_terminal()
         && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    // Debugging (a flag, or `RUST_LOG`): every line in the full format, so
+    // warnings keep their time and place among the rest.
+    let debugging = matches!(
+        flag,
+        Some(LogLevel::Info | LogLevel::Debug | LogLevel::Trace)
+    ) || (flag.is_none() && std::env::var_os("RUST_LOG").is_some());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_ansi(colour)
+        .event_format(Lines {
+            full: Format::default(),
+            short_warnings: !debugging,
+        })
         .init();
+}
+
+/// How events print: warnings and errors as the command's own lines
+/// (`shipyard: warning: …`, as [`warning`] prints them), whichever part of
+/// Shipyard they come from; the rest (`--debug`, `RUST_LOG`) in tracing's
+/// full format, where the time and the module matter, and while debugging
+/// warnings too.
+struct Lines {
+    full: Format,
+    short_warnings: bool,
+}
+
+impl<S, N> FormatEvent<S, N> for Lines
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let label = match *event.metadata().level() {
+            tracing::Level::WARN if self.short_warnings => "warning",
+            tracing::Level::ERROR if self.short_warnings => "error",
+            _ => return self.full.format_event(context, writer, event),
+        };
+        write!(writer, "shipyard: {label}: ")?;
+        context.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
 }
 
 #[cfg(test)]

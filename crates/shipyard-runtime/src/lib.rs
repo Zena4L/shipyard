@@ -20,12 +20,16 @@ compile_error!("shipyard only supports UNIX platforms (Linux, macOS)");
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("shipyard only supports 64-bit platforms");
 
+pub mod cgroup;
 pub mod container;
+pub mod devices;
 mod error;
+pub mod hooks;
 mod id_map;
 pub mod isolation;
 pub mod oci;
 pub mod process;
+pub mod resources;
 pub mod security;
 mod small_file;
 

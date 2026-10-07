@@ -196,6 +196,32 @@ fn realtime_name(_number: i32) -> Option<String> {
     None
 }
 
+/// Whether `signal` is pending for this process: sent, and held back
+/// because it's blocked (an unblocked one is handled or dropped at once).
+pub(crate) fn is_pending(signal: NixSignal) -> bool {
+    let mut pending = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigpending` fills the set it's given.
+    if unsafe { libc::sigpending(pending.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: filled by the successful call above.
+    unsafe { libc::sigismember(pending.as_ptr(), signal as libc::c_int) == 1 }
+}
+
+/// Takes `signal` off this process's pending signals, if it's there.
+#[cfg(target_os = "linux")]
+pub(crate) fn discard_pending(signal: NixSignal) {
+    let mut set = nix::sys::signal::SigSet::empty();
+    set.add(signal);
+    let now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid signal set and timeout; no siginfo wanted. The zero
+    // timeout makes `sigtimedwait` only look.
+    unsafe { libc::sigtimedwait(set.as_ref(), std::ptr::null_mut(), &raw const now) };
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;

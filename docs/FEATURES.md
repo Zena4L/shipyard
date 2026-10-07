@@ -121,22 +121,35 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 ## 5. Resource control — stage 5
 
-- **cgroup v2 limits:**
-  - memory: `memory.max`, `memory.high`, swap
+- **cgroup v2 limits** (v2 only; managed by writing `/sys/fs/cgroup` directly, without
+  systemd's D-Bus; where cgroups can't be used, a run asking for no limits still works and
+  a limit asked for is refused):
+  - memory: `memory.max`, `memory.low` (a reservation), swap; any other controller file
+    (`memory.high`, say) through OCI's `unified`
   - CPU: `cpu.max`, `cpu.weight`, cpuset
   - processes: `pids.max`
-  - disk I/O: `io.max`
-- **OOM detection:** via `memory.events`, reported clearly ("killed: out of memory, exit 137").
-- **Live stats:** CPU, memory, I/O and process count, for `stats`, `top` and the UI.
-- **Change limits on a running container:** `update`.
-- **Pause and resume:** via `cgroup.freeze`.
+  - disk I/O: `io.max`, `io.weight` (where the kernel has it)
+- **OOM detection:** via `memory.events`, reported clearly ("the command was killed: out of
+  memory", exit 137; "(out of memory)" in the runtime's exit record).
+- **Live stats:** CPU, memory, I/O and process count: `shipyard-runtime events --stats`
+  now; `shipyard stats`, `top` and the UI with stage 9's named containers.
+- **Change limits on a running container:** `shipyard-runtime update` now; `shipyard
+  update` with stage 9.
+- **Pause and resume:** via `cgroup.freeze`: `shipyard-runtime pause`/`resume` now;
+  `shipyard pause` with stage 9.
+- **Docker's limit flags on `shipyard run`** (`--memory`, `--cpus`, `--pids-limit`, …) and
+  OCI's `linux.resources`, `unified` and `cgroupsPath`.
+- **The runtime's other cgroup commands:** `ps`, `kill --all`; and OCI hooks (all six
+  phases), carried from stage 3.
 - **Device access control** (moved here from stage 4): an eBPF program attached to the
   container's cgroup (cgroup v2), allowing only the devices it should open.
 - **Rootless cgroups:** delegation through systemd.
+- **`oomScoreAdj`** and `--oom-score-adj`.
 - **Cgroup namespaces** (moved here from stage 2): the container sees its own cgroup as
   the root.
-- **Joined processes** (`exec`) join the container's cgroup, and a cgroup kill catches
-  anything that escaped the parent-death signal.
+- **Moved to `exec`'s stage (8):** joined processes entering the container's cgroup
+  (and its device rules), so a cgroup kill catches anything that escaped the
+  parent-death signal. Joining has no command until `exec`.
 
 ## 6. Images and storage — stage 6
 
@@ -197,6 +210,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Pseudoterminals** for `-it`, with resize via `SIGWINCH` and the `TIOCSWINSZ` ioctl.
 - **`attach` / detach:** with detach keys.
 - **`exec` sessions:** each with its own terminal.
+- **`exec` joins the container's cgroup** (moved from stage 5): its limits, device rules
+  and freezing cover what it runs, and a cgroup kill catches it.
 - **File-descriptor passing:** `--preserve-fds` and systemd-style socket activation
   (`LISTEN_FDS`).
 - **Logs:** log files with rotation; `logs --follow --tail --since --timestamps`.

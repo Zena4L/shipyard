@@ -30,7 +30,7 @@
 //! becomes the command itself.
 
 use std::io::Write as _;
-use std::os::fd::{AsFd, AsRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -38,16 +38,21 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
 
-use super::channel::{GAVE_UP_MARK, Report, ReportReader, START_MARK, encode_status, report_pipe};
+use super::channel::{
+    GAVE_UP_MARK, Report, ReportReader, START_MARK, decode_record, encode, encode_status,
+    report_pipe,
+};
 use super::child::{
     Failure, SETUP_FAILED, command_main, report_failure, wait_for_go, write_record,
 };
 use super::failure::UnmappedId;
-use super::failure::{ChildStep, FailureContext, describe};
+use super::failure::{ChildFailure, ChildStep, FailureContext, describe};
 use super::plan::ChildPlan;
-use super::setup::{is_sealed_setup, read_setup};
+use super::setup::{HooksSetup, is_sealed_setup, read_setup};
 use super::status::ExitStatus;
 use super::{identity, rootfs, sysctl};
+use crate::container::{State, Status};
+use crate::hooks::{self, HookError, Phase};
 use crate::isolation::IdMaps;
 use crate::security::seccomp::SeccompError;
 use crate::security::{Confinement, ConfinementError, SeccompFilter};
@@ -120,11 +125,12 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     };
     let setup =
         read_setup(setup_fd).unwrap_or_else(|errno| fail(Failure::at(ChildStep::ReadSetup, errno)));
-    if let Some(gate) = setup.gate {
+    let hooks_pipe = setup.hooks.as_ref().map(|hooks| hooks.pipe);
+    for fd in setup.gate.into_iter().chain(hooks_pipe) {
         // Passed across the exec like the others: close-on-exec again.
         let _ = nix::fcntl::fcntl(
             // SAFETY: inherited across the exec; borrowed only for this call.
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(gate) },
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         );
     }
@@ -139,7 +145,9 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     // Whether the user namespace lets the command set its groups, read
     // before `/proc` is the container's too.
     let setgroups_allowed = super::user_namespace::setgroups_allowed();
-    set_up(&setup).unwrap_or_else(|failure| fail(failure));
+    // The container's state, if it stopped for hooks: `startContainer`'s
+    // too.
+    let state = set_up(&setup, report).unwrap_or_else(|failure| fail(failure));
     // A keyring of the container's own, not its caller's: the init joins
     // it, and the command inherits it.
     join_session_keyring()
@@ -211,6 +219,12 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         }
         None => (report, None),
     };
+    if let (Some(hooks), Some(state)) = (&setup.hooks, state)
+        && let Err(failure) = start_container(hooks, state, &plan, last_cap)
+    {
+        let read = setup.gate.is_none().then_some(report);
+        start_container_failed(failure, read, hooks, &mut context);
+    }
 
     let Some(go) = go else {
         // No PID namespace, so no init: this process becomes the command.
@@ -343,7 +357,8 @@ fn explain_failure(read: std::os::fd::OwnedFd, context: &FailureContext) -> Opti
                 let _ = writeln!(std::io::stderr(), "shipyard: {error}");
                 return Some(error.exit_code());
             }
-            Ok(Report::Running) | Err(_) => return None,
+            // The command never stops for hooks: only the clean image does.
+            Ok(Report::Running | Report::AtHooks) | Err(_) => return None,
         }
     }
 }
@@ -376,7 +391,7 @@ fn wait_at_gate(gate: RawFd) {
             Err(Errno::EPIPE) => {
                 // Our own SIGPIPE: blocked, so it's pending even though it's
                 // ignored, and would be forwarded to the command later.
-                discard_pending(nix::sys::signal::Signal::SIGPIPE);
+                super::discard_pending(nix::sys::signal::Signal::SIGPIPE);
                 continue;
             }
             _ => std::process::exit(SETUP_FAILED),
@@ -407,26 +422,21 @@ fn unread(fifo: &impl AsFd) -> Option<libc::c_int> {
     (asked == 0).then_some(count)
 }
 
-/// Takes `signal` off this process's pending signals, if it's there.
-fn discard_pending(signal: nix::sys::signal::Signal) {
-    let mut set = nix::sys::signal::SigSet::empty();
-    set.add(signal);
-    let now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: a valid signal set and timeout; no siginfo wanted. The zero
-    // timeout makes `sigtimedwait` only look.
-    unsafe { libc::sigtimedwait(set.as_ref(), std::ptr::null_mut(), &raw const now) };
-}
-
 /// The container setup, in the new namespaces: a session of its own (no
 /// controlling terminal, its own process group), mounts that don't
 /// propagate out, its own root filesystem or a `/proc` for the new PID
-/// namespace, and the hostname.
-fn set_up(setup: &super::setup::Setup) -> Result<(), Failure> {
+/// namespace, and the hostname. With hooks, it stops once the mounts are
+/// made ([`stop_for_hooks`], with `report`), and returns the state they got.
+fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, Failure> {
     let at = |step| move |errno| Failure::at(step, errno);
     nix::unistd::setsid().map_err(at(ChildStep::Session))?;
+    if setup.cgroup.namespace {
+        // Here, not at the clone: this process is in the container's cgroup
+        // by now (born there, or moved there before the go byte), so that's
+        // the namespace's root, and `/proc/self/cgroup` says `/` (G10).
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWCGROUP)
+            .map_err(at(ChildStep::CgroupNamespace))?;
+    }
     if setup.private_mounts {
         // First, before any mount: on hosts where `/` is shared (systemd),
         // a mount made here would otherwise appear on the host too. Slave,
@@ -442,10 +452,18 @@ fn set_up(setup: &super::setup::Setup) -> Result<(), Failure> {
         )
         .map_err(at(ChildStep::MountPrivate))?;
     }
-    if let Some(root) = &setup.root {
+    // Once the mounts are made: the hooks' state, if there are hooks.
+    let stop = || {
+        setup
+            .hooks
+            .as_ref()
+            .map(|hooks| stop_for_hooks(report, hooks))
+            .transpose()
+    };
+    let state = if let Some(root) = &setup.root {
         // `/proc`, `/sys` and `/dev` inside it (and the sysctls, before its
-        // `/proc/sys` is made read-only), then the switch.
-        rootfs::enter(root, &setup.sysctls)?;
+        // `/proc/sys` is made read-only), the hooks, then the switch.
+        rootfs::enter(root, &setup.sysctls, setup.cgroup.mount, stop)?
     } else {
         if setup.mount_proc {
             // Mounted by this process, so it shows the new PID namespace.
@@ -459,7 +477,11 @@ fn set_up(setup: &super::setup::Setup) -> Result<(), Failure> {
             .map_err(at(ChildStep::MountProc))?;
         }
         sysctl::apply_at(Path::new("/proc"), &setup.sysctls)?;
-    }
+        if let Some(cgroup) = setup.cgroup.mount {
+            mount_cgroup_over_the_hosts(cgroup).map_err(at(ChildStep::MountCgroup))?;
+        }
+        stop()?
+    };
     if let Some(hostname) = &setup.hostname {
         nix::unistd::sethostname(hostname).map_err(at(ChildStep::Hostname))?;
     }
@@ -470,7 +492,163 @@ fn set_up(setup: &super::setup::Setup) -> Result<(), Failure> {
     // life (an unmount of it would fail). The command changes to its own.
     // (With a root filesystem, already done by the switch.)
     let _ = std::env::set_current_dir("/");
-    Ok(())
+    Ok(state)
+}
+
+/// Stops for the runtime's hooks: says so on the `report` pipe, then waits
+/// on the hooks pipe for the container's state (`prestart` and
+/// `createRuntime` ran), and runs `createContainer` with it, here: in the
+/// container's namespaces, before the root is switched. End-of-file with no
+/// state means a runtime hook failed (the runtime says which): exit, as a
+/// setup that failed.
+fn stop_for_hooks(report: RawFd, hooks: &HooksSetup) -> Result<State, Failure> {
+    use std::io::Read as _;
+    write_record(report, &encode(ChildStep::AtHooks, 0, 0));
+    // SAFETY: inherited across the exec, and only read here, once.
+    let mut pipe = unsafe { std::fs::File::from_raw_fd(hooks.pipe) };
+    let mut state = Vec::new();
+    pipe.read_to_end(&mut state)
+        .map_err(|err| Failure::at(ChildStep::Handshake, super::io_errno(&err)))?;
+    drop(pipe);
+    if state.is_empty() {
+        std::process::exit(SETUP_FAILED);
+    }
+    let state: State = serde_json::from_slice(&state)
+        .map_err(|_| Failure::at(ChildStep::Handshake, Errno::EPROTO))?;
+    hooks::run(Phase::CreateContainer, &hooks.create_container, &state)
+        .map_err(|err| hook_failure(ChildStep::CreateContainerHook, &err))?;
+    Ok(state)
+}
+
+/// Runs `startContainer`, inside the container, with `state` (now
+/// "created"), and says how it went.
+///
+/// Not from this process: its programs come from the container's root
+/// filesystem, which the image controls, and this process still has every
+/// capability (a rootful container's are root's on the host) and no
+/// seccomp filter. A child of its own runs them, confined first as the
+/// init is about to be ([`confine_self`]: every capability gone but
+/// `CAP_KILL`, `no_new_privs`, the container's filter), and reports a
+/// failure as a record on a pipe of its own.
+fn start_container(
+    hooks: &HooksSetup,
+    state: State,
+    plan: &ChildPlan,
+    last_cap: u8,
+) -> Result<(), ChildFailure> {
+    let state = State {
+        status: Status::Created,
+        ..state
+    };
+    let at = |step| {
+        move |errno| ChildFailure {
+            step,
+            errno,
+            detail: 0,
+        }
+    };
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .map_err(at(ChildStep::StartContainerHook))?;
+    // SAFETY: this process is single-threaded (a fresh image that started
+    // no threads), so the child may run ordinary code; it exits with
+    // `_exit`, never returning here.
+    let runner = match unsafe { nix::unistd::fork() }.map_err(at(ChildStep::InitFork))? {
+        nix::unistd::ForkResult::Child => {
+            drop(read);
+            let filter = plan
+                .confinement
+                .as_ref()
+                .and_then(|confinement| confinement.seccomp.as_ref());
+            let failure = match confine_self(last_cap, filter) {
+                Err(Unconfined::Capabilities) => {
+                    Some(Failure::at(ChildStep::HookRunnerCapabilities, Errno::EPERM))
+                }
+                Err(Unconfined::Filter(failure)) => Some(failure),
+                Ok(()) => hooks::run(Phase::StartContainer, &hooks.start_container, &state)
+                    .err()
+                    .map(|err| hook_failure(ChildStep::StartContainerHook, &err)),
+            };
+            if let Some(failure) = &failure {
+                report_failure(write.as_raw_fd(), failure);
+            }
+            // SAFETY: a forked child, which must not run the init's exit
+            // handlers.
+            unsafe { libc::_exit(if failure.is_some() { SETUP_FAILED } else { 0 }) }
+        }
+        nix::unistd::ForkResult::Parent { child } => child,
+    };
+    drop(write);
+    let mut record = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::fs::File::from(read), &mut record);
+    let ended = nix::sys::wait::waitpid(runner, None);
+    if let Some(failure) = decode_record(&record) {
+        return Err(failure);
+    }
+    match ended {
+        Ok(nix::sys::wait::WaitStatus::Exited(_, 0)) => Ok(()),
+        // Ended without saying why (killed: its seccomp filter, say).
+        _ => Err(at(ChildStep::StartContainerHook)(Errno::ECHILD)),
+    }
+}
+
+/// Ends the container over `failure` of `startContainer`: reported on the
+/// `report` pipe while shipyard reads it (`Some`: no start gate); past the
+/// gate, nobody does any more, so it's said on the container's stderr, and
+/// the exit (125) says the rest.
+fn start_container_failed(
+    failure: ChildFailure,
+    report: Option<RawFd>,
+    hooks: &HooksSetup,
+    context: &mut FailureContext,
+) -> ! {
+    if let Some(report) = report {
+        report_failure(report, &failure.into());
+    } else {
+        context
+            .hooks
+            .start_container
+            .clone_from(&hooks.start_container);
+        let _ = writeln!(
+            std::io::stderr(),
+            "shipyard: {}",
+            describe(failure, context)
+        );
+    }
+    std::process::exit(SETUP_FAILED);
+}
+
+/// A hook's failure, as the report record that carries it.
+fn hook_failure(step: ChildStep, err: &HookError) -> Failure {
+    let (errno, detail) = err.to_record();
+    Failure::at(step, errno).raw_detail(detail)
+}
+
+/// The container's own cgroup at `/sys/fs/cgroup`, without a root
+/// filesystem: over the host's tree, which the container would otherwise see
+/// (its own mount namespace: the host's view stays).
+///
+/// Not right on it: there's one cgroup2 superblock, and the kernel refuses
+/// to mount a superblock on its own mount's root (EBUSY). So an empty,
+/// read-only tmpfs covers it first, as `/sys`'s host mounts are covered
+/// (`rootfs.rs`). Not unmounted instead: in a user namespace the kernel
+/// locks the host's mounts.
+fn mount_cgroup_over_the_hosts(cgroup: crate::isolation::CgroupMount) -> nix::Result<()> {
+    const AT: &str = "/sys/fs/cgroup";
+    let cover = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY;
+    mount(
+        Some("tmpfs"),
+        AT,
+        Some("tmpfs"),
+        cover,
+        Some("size=4k,mode=755"),
+    )?;
+    mount(
+        Some("cgroup2"),
+        AT,
+        Some("cgroup2"),
+        cgroup.mount_flags(),
+        None::<&str>,
+    )
 }
 
 /// `setdomainname(2)`: the NIS domain name, in the container's UTS

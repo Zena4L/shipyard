@@ -9,6 +9,13 @@
 //!   tells the child whether the parent is still alive (see `child.rs`).
 //! - **The status pipe** (container init → parent): the command's raw wait
 //!   status, which the init can't pass on as its own (see `init.rs`).
+//! - **The hooks pipe** (parent → container's clean image), only when the
+//!   container has hooks to run while it's set up: the clean image stops
+//!   before `pivot_root` and says so on the report pipe (an
+//!   [`AtHooks`](ChildStep::AtHooks) record, the one record that isn't a
+//!   failure); the parent runs `prestart` and `createRuntime`, then writes
+//!   the container's state into the pipe and closes it. End-of-file with
+//!   nothing written means "don't go on".
 //!
 //! Both ends are close-on-exec. If `exec` succeeds, the kernel closes the
 //! child's write end and the parent reads end-of-file. If it fails, the child
@@ -37,6 +44,15 @@ pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd)> {
 /// close-on-exec and at fd 3 or above: the child holds both until it closes
 /// the parent's copy.
 pub(crate) fn go_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = cloexec_pipe()?;
+    Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+/// Creates the hooks pipe, returning `(read, write)`. Both ends are
+/// close-on-exec and above stdio: the read end is passed to the clean image
+/// by number, across its re-exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn hooks_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let (read, write) = cloexec_pipe()?;
     Ok((above_stdio(read)?, above_stdio(write)?))
 }
@@ -195,6 +211,13 @@ pub(crate) fn encode(step: ChildStep, errno: i32, detail: u64) -> [u8; RECORD_LE
     [s0, s1, 0, 0, e0, e1, e2, e3, d0, d1, d2, d3, d4, d5, d6, d7]
 }
 
+/// A whole record read in one piece (a pipe a process wrote at most one
+/// record into before it exited), decoded; `None` if it isn't one.
+#[cfg(target_os = "linux")]
+pub(crate) fn decode_record(bytes: &[u8]) -> Option<ChildFailure> {
+    decode(<[u8; RECORD_LEN]>::try_from(bytes).ok()?)
+}
+
 fn decode(record: [u8; RECORD_LEN]) -> Option<ChildFailure> {
     let [s0, s1, _, _, e0, e1, e2, e3, d0, d1, d2, d3, d4, d5, d6, d7] = record;
     Some(ChildFailure {
@@ -211,6 +234,9 @@ pub(crate) enum Report {
     Pending,
     /// End-of-file with no record: `exec` succeeded.
     Running,
+    /// The container's clean image stopped for the runtime's hooks, and
+    /// waits on the hooks pipe. More comes after.
+    AtHooks,
     /// The child reported a failure.
     Failed(ChildFailure),
 }
@@ -244,12 +270,18 @@ impl ReportReader {
         loop {
             let Some(rest) = self.record.get_mut(self.filled..).filter(|r| !r.is_empty()) else {
                 // A whole record: no need to wait for end-of-file.
-                return decode(self.record).map(Report::Failed).ok_or_else(|| {
+                let failure = decode(self.record).ok_or_else(|| {
                     Error::sys(
                         "the child's startup report names an unknown step",
                         Errno::EPROTO,
                     )
-                });
+                })?;
+                if failure.step == ChildStep::AtHooks {
+                    // Not the end: the next record (or end-of-file) is.
+                    self.filled = 0;
+                    return Ok(Report::AtHooks);
+                }
+                return Ok(Report::Failed(failure));
             };
             match nix::unistd::read(self.pipe.as_fd(), rest) {
                 Ok(0) => return self.at_end_of_file(),
@@ -411,6 +443,21 @@ mod tests {
             Report::Failed(failure) => assert_eq!(failure.step, ChildStep::Chdir),
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stop_for_hooks_is_not_the_end() {
+        let mut bytes = encode(ChildStep::AtHooks, 0, 0).to_vec();
+        bytes.extend(encode(ChildStep::Mount, libc::ENOENT, 2));
+        let (mut reader, _) = reader_with(&bytes, true);
+        assert_eq!(reader.read().unwrap(), Report::AtHooks);
+        match reader.read().unwrap() {
+            Report::Failed(failure) => assert_eq!(failure.step, ChildStep::Mount),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        let (mut reader, _) = reader_with(&encode(ChildStep::AtHooks, 0, 0), true);
+        assert_eq!(reader.read().unwrap(), Report::AtHooks);
+        assert_eq!(read_settled(&mut reader).unwrap(), Report::Running);
     }
 
     #[test]
