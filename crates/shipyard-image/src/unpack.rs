@@ -2040,9 +2040,11 @@ pub(crate) mod tests {
     fn an_owner_outside_the_ranges_becomes_root_without_setuid() {
         let scratch = Scratch::new("collapse");
         let mut layer = Layer::default();
-        layer
-            .file_owned("inside", 0o4755, (1000, 1000))
-            .file_owned("outside", 0o6755, (70000, 1000));
+        layer.file_owned("inside", 0o4755, (1000, 1000)).file_owned(
+            "outside",
+            0o6755,
+            (70000, 1000),
+        );
         let options = UnpackOptions {
             ownership: Ownership::Apply {
                 uids: IdRanges(vec![(0, 65536)]),
