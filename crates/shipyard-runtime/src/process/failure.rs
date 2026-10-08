@@ -87,6 +87,10 @@ pub(crate) enum ChildStep {
     /// The runner of the `startContainer` hooks (a child of the init)
     /// couldn't drop the init's capabilities before running them.
     HookRunnerCapabilities = 58,
+    /// Mounting the image overlay as the root filesystem failed.
+    MountOverlay = 59,
+    /// Attaching the image overlay real root made (`--uidmap`) failed.
+    AttachOverlay = 60,
 }
 
 impl ChildStep {
@@ -153,6 +157,8 @@ impl ChildStep {
             56 => Self::StartContainerHook,
             57 => Self::DeviceNode,
             58 => Self::HookRunnerCapabilities,
+            59 => Self::MountOverlay,
+            60 => Self::AttachOverlay,
             _ => return None,
         })
     }
@@ -268,12 +274,33 @@ impl FailureContext {
     /// `ProcessSpec`), and with a root filesystem of its own, inside that.
     /// (For hints only: an absolute symlink inside the root filesystem would
     /// be followed on the host here.)
+    ///
+    /// An image's root is an overlay mounted only inside the container
+    /// (its directory on the host stays empty): the path is looked up
+    /// through its layers, roughly as overlay does, the writable one first,
+    /// then the image's, top first; a whiteout (a 0:0 character device) of
+    /// the path itself hides it. (Not opaque directories, nor whiteouts of a
+    /// directory above it, nor an absolute symlink on the way, which is
+    /// followed on the host: for hints only.)
     fn resolve(&self, path: &Path) -> PathBuf {
         let inside = self.cwd.join(path);
-        match &self.container_root {
-            Some(root) => root.path.join(inside.strip_prefix("/").unwrap_or(&inside)),
-            None => inside,
+        let relative = inside.strip_prefix("/").unwrap_or(&inside);
+        let Some(root) = &self.container_root else {
+            return inside;
+        };
+        let Some(overlay) = &root.overlay else {
+            return root.path.join(relative);
+        };
+        let hidden = root.path.join(relative);
+        for layer in std::iter::once(&overlay.upper).chain(overlay.lower.iter().rev()) {
+            let candidate = layer.join(relative);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(meta) if is_whiteout(&meta) => return hidden,
+                Ok(_) => return candidate,
+                Err(_) => {}
+            }
         }
+        hidden
     }
 
     /// The user, as given: by name if there is one, else by number.
@@ -476,6 +503,8 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::UnmappedId
         | ChildStep::GroupsDenied => describe_confinement(step, errno, detail),
         ChildStep::BindRoot
+        | ChildStep::MountOverlay
+        | ChildStep::AttachOverlay
         | ChildStep::RootTarget
         | ChildStep::MountSys
         | ChildStep::MountCgroup
@@ -735,6 +764,12 @@ fn describe_container(
     ctx: &FailureContext,
 ) -> SpawnError {
     match step {
+        ChildStep::MountOverlay => describe_overlay(errno, detail, ctx, &kernel_release()),
+        ChildStep::AttachOverlay => isolation_setup(
+            "attaching the image's overlay in the container (made for its user namespace)",
+            errno,
+            ctx,
+        ),
         ChildStep::BindRoot => isolation_setup(
             &format!("binding {} onto itself", ctx.root_filesystem()),
             errno,
@@ -924,6 +959,66 @@ fn on_noexec_mount(path: &Path) -> bool {
     }
 }
 
+/// Why an image's overlay couldn't be mounted, and what to do about it:
+/// what the kernel's answer means for overlay (`release`: the kernel's, as
+/// `uname -r` prints it, if known).
+fn describe_overlay(errno: Errno, detail: u64, ctx: &FailureContext, release: &str) -> SpawnError {
+    const DOING: &str = "mounting the image's overlay as the root filesystem";
+    let rootless = !ctx.root;
+    let why = match errno {
+        Errno::E2BIG => format!(
+            "the image has {detail} layers, more than this kernel can stack in one mount \
+             (Linux 6.8 or later stacks up to 500)"
+        ),
+        Errno::ENODEV => {
+            "this kernel has no overlay filesystem (load it: modprobe overlay)".to_owned()
+        }
+        Errno::EINVAL => {
+            let what = if rootless {
+                "it may be overlayfs itself, or lack user extended attributes"
+            } else {
+                "it may be overlayfs itself"
+            };
+            format!(
+                "the image store's filesystem can't hold an overlay's writable layer ({what}): \
+                 set SHIPYARD_IMAGE_STORE to a directory on a disk filesystem"
+            )
+        }
+        Errno::EPERM | Errno::EACCES if rootless => match kernel_version(release) {
+            Some(version) if version < (5, 11) => format!(
+                "a rootless overlay needs Linux 5.11 or later, and this is {release}: run as \
+                 root, or on a newer kernel"
+            ),
+            _ => "this system doesn't let the container's root mount overlay here (an \
+                  AppArmor or other security policy, or an image store it can't reach): run \
+                  as root, or lift the policy"
+                .to_owned(),
+        },
+        _ => return isolation_setup(DOING, errno, ctx),
+    };
+    SpawnError::new(
+        SpawnErrorKind::Isolation,
+        format!("{DOING}: {}: {why}", errno.desc()),
+        errno,
+    )
+}
+
+/// The running kernel's release, as `uname -r` prints it (empty if it
+/// can't be read).
+fn kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|release| release.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// A kernel release's major and minor version (`5.10.0-26-amd64`: 5, 10).
+fn kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split(['.', '-']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// A namespace setup step that failed. EPERM there means missing privileges:
 /// root's, or (when shipyard is root) the container's or a security policy's.
 fn isolation_setup(doing: &str, errno: Errno, ctx: &FailureContext) -> SpawnError {
@@ -1048,6 +1143,12 @@ fn has_slash(path: &Path) -> bool {
     path.as_os_str().as_encoded_bytes().contains(&b'/')
 }
 
+/// Whether `meta` is an overlay whiteout: a character device numbered 0:0.
+fn is_whiteout(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    meta.file_type().is_char_device() && meta.rdev() == 0
+}
+
 /// The directories a PATH search went through, for "command not found".
 fn searched_dirs(ctx: &FailureContext) -> Option<String> {
     let dirs: Vec<String> = ctx
@@ -1062,6 +1163,106 @@ fn searched_dirs(ctx: &FailureContext) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overlay_refusal_says_why() {
+        let mut rootless = ctx("sh", &[]);
+        rootless.root = false;
+        let message = |errno, release: &str, ctx: &FailureContext| {
+            describe_overlay(errno, 61, ctx, release).to_string()
+        };
+        assert!(message(Errno::E2BIG, "6.1.0", &rootless).contains("61 layers"));
+        assert!(message(Errno::ENODEV, "6.1.0", &rootless).contains("modprobe overlay"));
+        assert!(message(Errno::EINVAL, "6.1.0", &rootless).contains("SHIPYARD_IMAGE_STORE"));
+        assert!(message(Errno::EPERM, "5.10.0-26-amd64", &rootless).contains("5.11 or later"));
+        assert!(message(Errno::EPERM, "6.8.0", &rootless).contains("AppArmor"));
+        let mut root = rootless.clone();
+        root.root = true;
+        assert!(!message(Errno::EPERM, "5.10.0", &root).contains("5.11"));
+        assert_eq!(kernel_version("7.0.14-orbstack-00380"), Some((7, 0)));
+        assert_eq!(kernel_version("garbage"), None);
+    }
+
+    #[test]
+    fn an_image_programs_hints_look_through_its_layers() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("shipyard-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let make = |path: &str, mode: u32| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/nowhere\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        make("base/bin/tool", 0o755);
+        make("top/bin/other", 0o755);
+        std::fs::create_dir_all(dir.join("upper")).unwrap();
+        let mut root = Root::new(dir.join("merged"));
+        root.overlay = Some(crate::isolation::Overlay::new(
+            vec![dir.join("base"), dir.join("top")],
+            dir.join("upper"),
+            dir.join("work"),
+        ));
+        let mut context = ctx("/bin/tool", &["/bin/tool"]);
+        context.cwd = "/".into();
+        context.container_root = Some(root);
+        assert_eq!(
+            context.resolve(Path::new("/bin/tool")),
+            dir.join("base/bin/tool")
+        );
+        assert_eq!(
+            context.resolve(Path::new("/bin/other")),
+            dir.join("top/bin/other")
+        );
+        let missing = context.resolve(Path::new("/bin/none"));
+        assert!(!missing.exists());
+        let message = describe_exec(Errno::ENOENT, 0, &context).to_string();
+        assert!(
+            message.contains("interpreter or loader is missing"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two rules `resolve` adds: the writable layer before the image's,
+    /// and a whiteout hiding what's below it. (A whiteout is a 0:0
+    /// character device: making one needs root.)
+    #[test]
+    #[ignore = "needs root"]
+    fn an_upper_file_shadows_and_a_whiteout_hides() {
+        let dir = std::env::temp_dir().join(format!("shipyard-whiteout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for path in ["base/bin/tool", "base/bin/gone", "upper/bin/tool"] {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        }
+        nix::sys::stat::mknod(
+            &dir.join("upper/bin/gone"),
+            nix::sys::stat::SFlag::S_IFCHR,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
+        let mut root = Root::new(dir.join("merged"));
+        root.overlay = Some(crate::isolation::Overlay::new(
+            vec![dir.join("base")],
+            dir.join("upper"),
+            dir.join("work"),
+        ));
+        let mut context = ctx("/bin/tool", &["/bin/tool"]);
+        context.cwd = "/".into();
+        context.container_root = Some(root);
+        assert_eq!(
+            context.resolve(Path::new("/bin/tool")),
+            dir.join("upper/bin/tool")
+        );
+        assert!(
+            !context.resolve(Path::new("/bin/gone")).exists(),
+            "whited out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ctx(program: &str, candidates: &[&str]) -> FailureContext {
         FailureContext {
@@ -1099,7 +1300,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 58, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 60, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }

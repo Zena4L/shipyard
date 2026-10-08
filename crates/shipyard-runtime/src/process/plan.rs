@@ -127,7 +127,7 @@ pub(crate) struct Reexec {
     pub(crate) namespace_root: bool,
 }
 
-/// The descriptors an isolated spawn opens for the re-exec (see [`Reexec`]).
+/// The descriptors an isolated spawn opens for the re-exec (see `Reexec`).
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -143,6 +143,8 @@ pub(crate) struct ReexecFds {
     /// The hooks pipe's read end, if the setup stops for hooks: passed on
     /// too.
     pub(crate) hooks: Option<RawFd>,
+    /// An overlay real root made: passed on too.
+    pub(crate) overlay: Option<RawFd>,
 }
 
 /// The user and groups to switch to.
@@ -479,6 +481,7 @@ fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
         .into_iter()
         .chain(fds.gate)
         .chain(fds.hooks)
+        .chain(fds.overlay)
         .collect();
     let kept: Vec<u32> = passed
         .iter()

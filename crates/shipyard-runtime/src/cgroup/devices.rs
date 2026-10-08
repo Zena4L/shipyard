@@ -270,10 +270,24 @@ fn bpf<T>(command: libc::c_int, attr: &mut T) -> Result<libc::c_long, Errno> {
 
 /// `BPF_PROG_LOAD` with `attr`: the program's new descriptor.
 fn load_program(attr: &mut ProgramLoad) -> Result<OwnedFd, Errno> {
-    let fd = libc::c_int::try_from(bpf(BPF_PROG_LOAD, attr)?).map_err(|_| Errno::EBADF)?;
+    // The verifier gives up with EAGAIN when a signal is pending for the
+    // thread (a child's SIGCHLD, say). Returning to user space delivers it,
+    // so the load is simply tried again, as libbpf does.
+    let mut tries = 1;
+    let fd = loop {
+        match bpf(BPF_PROG_LOAD, attr) {
+            Err(Errno::EAGAIN) if tries < LOAD_TRIES => tries += 1,
+            result => break result?,
+        }
+    };
+    let fd = libc::c_int::try_from(fd).map_err(|_| Errno::EBADF)?;
     // SAFETY: `bpf(2)` just returned this descriptor; nothing else owns it.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
+
+/// How many times a load the verifier gave up on (EAGAIN) is tried: as
+/// libbpf.
+const LOAD_TRIES: u32 = 5;
 
 #[cfg(test)]
 mod tests {

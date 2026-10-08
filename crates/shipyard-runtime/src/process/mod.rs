@@ -54,7 +54,10 @@ pub use supervisor::Supervisor;
 #[cfg(target_os = "linux")]
 pub(crate) use user_namespace::bundle_user_namespace;
 #[cfg(target_os = "linux")]
-pub use user_namespace::rootless_id_maps;
+pub use user_namespace::{
+    become_namespace_root, current_id_maps, map_user_namespace, rootless_id_maps,
+    unshare_user_namespace,
+};
 
 /// The hidden argument that makes the shipyard binary run as a container's
 /// init (see [`init_entry_point`]).

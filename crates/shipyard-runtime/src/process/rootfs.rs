@@ -89,7 +89,7 @@ pub(crate) use linux::enter;
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::OsString;
-    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
 
@@ -100,7 +100,7 @@ mod linux {
     use nix::sys::statvfs::{FsFlags, statvfs};
     use nix::unistd::{fchdir, pivot_root, symlinkat};
 
-    use super::{DEV_ENTRIES, Target};
+    use super::{DEV_ENTRIES, Target, overlay};
     use crate::isolation::CgroupMount;
     use crate::process::child::Failure;
     use crate::process::failure::ChildStep;
@@ -145,6 +145,7 @@ mod linux {
     /// (the hooks' moment: `init.rs`). Returns what `before_pivot` did.
     pub(crate) fn enter<T>(
         root: &RootSetup,
+        cwd: &Path,
         sysctls: &[(String, String)],
         cgroup: Option<CgroupMount>,
         before_pivot: impl FnOnce() -> Step<T>,
@@ -152,7 +153,31 @@ mod linux {
         // Device nodes and directories get exactly the modes given here.
         // Whatever runs in between (hooks), and after, gets the umask back.
         let umask_before = umask(Mode::empty());
-        let root_fd = bind_root(root.path())?;
+        // The bind sources, cloned before anything is mounted over the host's
+        // paths (see `staging`), where the root needs it.
+        let mut cloned: Vec<Option<ClonedSource>> = Vec::new();
+        let root_fd = if let Some(mounted) = root.attach() {
+            // Made by real root (`--uidmap`: the container's own root can't
+            // reach the image store, nor the directory it's for): attached in
+            // this mount namespace where the container's root can reach, a
+            // private staging tmpfs; the mount's descriptor is the root's.
+            // SAFETY: inherited across the exec for this; owned by nothing
+            // else here.
+            let mounted = unsafe { OwnedFd::from_raw_fd(mounted) };
+            cloned = clone_sources(root)?;
+            let fail = |errno| Failure::at(ChildStep::AttachOverlay, errno);
+            let on = staging().map_err(fail)?;
+            overlay::attach(&mounted, on.as_fd()).map_err(fail)?;
+            mounted
+        } else {
+            // An image root: mounted here, inside the container's namespaces,
+            // so a rootless overlay mount lands in the user namespace where
+            // the kernel allows it.
+            if let Some((lower, upper, work, userxattr)) = root.overlay() {
+                mount_overlay(root.path(), &lower, upper, work, userxattr)?;
+            }
+            bind_root(root.path())?
+        };
         mount_standard(&root_fd, root, cgroup)?;
         if !sysctls.is_empty() {
             // Through the `/proc` just mounted in the root filesystem.
@@ -161,7 +186,8 @@ mod linux {
             sysctl::apply(&proc, sysctls)?;
         }
         for (index, mount) in root.mounts.iter().enumerate() {
-            add_mount(&root_fd, mount)
+            let source = cloned.get(index).and_then(Option::as_ref);
+            add_mount(&root_fd, mount, source)
                 .map_err(|(step, errno)| Failure::at(step, errno).detail(index))?;
         }
         for (index, device) in root.devices.iter().enumerate() {
@@ -179,12 +205,105 @@ mod linux {
             make_read_only(path)
                 .map_err(|errno| Failure::at(ChildStep::ReadonlyPath, errno).detail(index))?;
         }
+        // As Docker: a working directory the root filesystem doesn't have (an
+        // image's `WorkingDir`, a `-w`) is made, root's, `rwxr-xr-x` (the
+        // umask is 0 here). After the switch, so nothing here can lead to the
+        // host; before a read-only root is. If it can't be made, changing to
+        // it fails, saying so.
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let _ = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(cwd);
+        }
         if root.read_only {
             remount(Path::new("/"), MsFlags::MS_RDONLY)
                 .map_err(|errno| Failure::at(ChildStep::ReadOnlyRoot, errno))?;
         }
         umask(umask_before);
         Ok(before)
+    }
+
+    /// A directory to attach a root real root made on: `root` in a small
+    /// tmpfs on `/tmp`, in the container's mount namespace only (gone with
+    /// the host's tree at the pivot). Opened `O_PATH`.
+    ///
+    /// It hides the host's `/tmp` from paths looked up after it: the bind
+    /// sources are cloned before ([`clone_sources`]). The mount follows a
+    /// `/tmp` that's a symlink, and so does the open after it.
+    fn staging() -> Result<OwnedFd, Errno> {
+        mount(
+            Some("tmpfs"),
+            "/tmp",
+            Some("tmpfs"),
+            NOSUID_NODEV_NOEXEC,
+            Some("mode=700,size=64k"),
+        )?;
+        let tmp = nix::fcntl::open(
+            "/tmp",
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        mkdirat(&tmp, "root", Mode::from_bits_truncate(0o700))?;
+        openat(
+            &tmp,
+            "root",
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+    }
+
+    /// A bind mount's source, cloned as a detached mount tree
+    /// (`open_tree(OPEN_TREE_CLONE)`), to attach by descriptor.
+    pub(super) struct ClonedSource {
+        tree: OwnedFd,
+        is_dir: bool,
+    }
+
+    /// Every bind source of `root`'s mounts, cloned while the host's paths
+    /// are as they are (`None` for a tmpfs). The clones are made with this
+    /// process's credentials, as a bind by path would be.
+    fn clone_sources(root: &RootSetup) -> Step<Vec<Option<ClonedSource>>> {
+        root.mounts
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let Some(source) = entry.source() else {
+                    return Ok(None);
+                };
+                clone_tree(source, entry.recursive)
+                    .map(Some)
+                    .map_err(|errno| Failure::at(ChildStep::Mount, errno).detail(index))
+            })
+            .collect()
+    }
+
+    /// `open_tree(path, OPEN_TREE_CLONE)`, with what's mounted below it if
+    /// `recursive`.
+    fn clone_tree(path: &Path, recursive: bool) -> nix::Result<ClonedSource> {
+        use std::os::unix::ffi::OsStrExt as _;
+        const OPEN_TREE_CLONE: libc::c_uint = 1;
+        let path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let mut flags = OPEN_TREE_CLONE | libc::c_uint::try_from(libc::O_CLOEXEC).unwrap_or(0);
+        if recursive {
+            flags |= libc::c_uint::try_from(libc::AT_RECURSIVE).unwrap_or(0);
+        }
+        // SAFETY: `open_tree` takes a directory descriptor, a NUL-terminated
+        // path and flags, and returns a new descriptor or -1.
+        let fd =
+            unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, path.as_ptr(), flags) };
+        let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+        if fd < 0 {
+            return Err(Errno::last());
+        }
+        // SAFETY: a new descriptor the kernel just gave this process.
+        let tree = unsafe { OwnedFd::from_raw_fd(fd) };
+        let is_dir =
+            SFlag::from_bits_truncate(nix::sys::stat::fstat(&tree)?.st_mode & SFlag::S_IFMT.bits())
+                == SFlag::S_IFDIR;
+        Ok(ClonedSource { tree, is_dir })
     }
 
     /// Binds the root filesystem onto itself, recursively: `pivot_root`
@@ -207,6 +326,42 @@ mod linux {
             Mode::empty(),
         )
         .map_err(fail)
+    }
+
+    /// Mounts an overlay at `merged`: read-only `lower` layers (passed base
+    /// first, stacked top-first for the kernel) under a writable `upper`,
+    /// with `work` as the kernel's scratch area. `userxattr` is set for a
+    /// rootless mount (a user namespace), where overlay keeps its state in
+    /// `user.overlay.*`. Runs in the container's mount and user namespaces,
+    /// so the kernel permits an unprivileged mount.
+    ///
+    /// With the new mount API where the kernel has `lowerdir+` (6.8), one
+    /// call per layer: up to overlay's own limit (500). Elsewhere, one `mount(2)`,
+    /// whose options are at most a page: the paths are made relative to
+    /// the directory they share to fit more, and an image with more layers
+    /// than fit is refused (`E2BIG`, the detail its layer count).
+    fn mount_overlay(
+        merged: &Path,
+        lower: &[&Path],
+        upper: &Path,
+        work: &Path,
+        userxattr: bool,
+    ) -> Step {
+        let fail = |errno| Failure::at(ChildStep::MountOverlay, errno);
+        match overlay::mount_new(merged, lower, upper, work, userxattr) {
+            Ok(()) => Ok(()),
+            Err(overlay::NewApi::Unsupported) => {
+                overlay::mount_legacy(merged, lower, upper, work, userxattr).map_err(|errno| {
+                    let detail = if errno == Errno::E2BIG {
+                        lower.len()
+                    } else {
+                        0
+                    };
+                    fail(errno).detail(detail)
+                })
+            }
+            Err(overlay::NewApi::Failed(errno)) => Err(fail(errno)),
+        }
     }
 
     /// `/proc`, a read-only `/sys` (with the container's cgroup at
@@ -472,10 +627,15 @@ mod linux {
 
     /// One of the container's own mounts: a bind from the host, or a tmpfs,
     /// at its destination resolved inside the root (made if missing).
-    fn add_mount(root: &OwnedFd, entry: &MountSetup) -> Result<(), (ChildStep, Errno)> {
+    fn add_mount(
+        root: &OwnedFd,
+        entry: &MountSetup,
+        cloned: Option<&ClonedSource>,
+    ) -> Result<(), (ChildStep, Errno)> {
         // A file is bound onto a file, a directory onto a directory.
-        let leaf = match entry.source() {
-            Some(source) if !source.is_dir() => Leaf::File,
+        let leaf = match (cloned, entry.source()) {
+            (Some(cloned), _) if !cloned.is_dir => Leaf::File,
+            (None, Some(source)) if !source.is_dir() => Leaf::File,
             _ => Leaf::Directory,
         };
         let resolve = || resolve_in_root(root, entry.destination(), leaf);
@@ -505,7 +665,12 @@ mod linux {
             })
             .map_err(|errno| (ChildStep::Mount, errno));
         };
-        bind(&target, leaf, source, entry.recursive).map_err(|errno| (ChildStep::Mount, errno))?;
+        match cloned {
+            // By descriptor, onto the target's.
+            Some(cloned) => overlay::attach(&cloned.tree, target.as_fd()),
+            None => bind(&target, leaf, source, entry.recursive),
+        }
+        .map_err(|errno| (ChildStep::Mount, errno))?;
         if restrictions.is_empty() {
             return Ok(());
         }
@@ -883,6 +1048,358 @@ mod linux {
             );
             // Not an escape: left as it is.
             assert_eq!(unescape_mount_point("/x\\9y\\"), Path::new("/x\\9y\\"));
+        }
+    }
+}
+
+/// Mounting an image's overlay, by the new mount API or the old one.
+#[cfg(target_os = "linux")]
+pub(crate) mod overlay {
+    use std::ffi::{CStr, CString, OsString};
+    use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Component, Path, PathBuf};
+
+    use nix::errno::Errno;
+    use nix::fcntl::OFlag;
+    use nix::mount::{MsFlags, mount};
+
+    // From the kernel's `linux/mount.h` (the `libc` crate has the system
+    // call numbers, not these).
+    const FSOPEN_CLOEXEC: libc::c_uint = 0x1;
+    const FSCONFIG_SET_FLAG: libc::c_uint = 0;
+    const FSCONFIG_SET_STRING: libc::c_uint = 1;
+    const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+    const FSMOUNT_CLOEXEC: libc::c_uint = 0x1;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+    const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x40;
+    const MOUNT_ATTR_NODEV: libc::c_uint = 0x4;
+
+    /// The most a `mount(2)` option string can be: a page (4 KiB, or 16 or
+    /// 64 KiB on some arm64 kernels), its NUL included.
+    fn mount_data_max() -> usize {
+        nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+            .ok()
+            .flatten()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(4096)
+    }
+
+    /// Why the new mount API didn't mount it.
+    pub(crate) enum NewApi {
+        /// This kernel can't: no new mount API (Linux 5.2), or no
+        /// `lowerdir+` (6.8). The old way it is.
+        Unsupported,
+        /// It refused (for a reason the old way would share).
+        Failed(Errno),
+    }
+
+    /// Mounts the overlay with the new mount API ([`build`]), then
+    /// `move_mount` onto `merged`.
+    pub(super) fn mount_new(
+        merged: &Path,
+        lower: &[&Path],
+        upper: &Path,
+        work: &Path,
+        userxattr: bool,
+    ) -> Result<(), NewApi> {
+        let mounted = build(lower, upper, work, userxattr)?;
+        let target = CString::new(merged.as_os_str().as_bytes())
+            .map_err(|_| NewApi::Failed(Errno::EINVAL))?;
+        move_mount(&mounted, None, &target, 0).map_err(NewApi::Failed)
+    }
+
+    /// The overlay as a detached mount, not attached anywhere yet: `fsopen`,
+    /// a `fsconfig` per option (each layer its own `lowerdir+`, top first),
+    /// `fsmount`. Overlay reaches its layers with the credentials of whoever
+    /// makes it: real root here can make one for a container whose root
+    /// can't reach the image store ([`attach`]).
+    pub(crate) fn build(
+        lower: &[&Path],
+        upper: &Path,
+        work: &Path,
+        userxattr: bool,
+    ) -> Result<OwnedFd, NewApi> {
+        // SAFETY: `fsopen` takes a NUL-terminated name and flags, and
+        // returns a new descriptor or -1.
+        let fs = unsafe { libc::syscall(libc::SYS_fsopen, c"overlay".as_ptr(), FSOPEN_CLOEXEC) };
+        let fs = match owned(fs) {
+            Ok(fs) => fs,
+            Err(Errno::ENOSYS) => return Err(NewApi::Unsupported),
+            Err(errno) => return Err(NewApi::Failed(errno)),
+        };
+        // EINVAL anywhere means the old way: a kernel without `lowerdir+`
+        // refuses it (6.5 to 6.7), takes it into a legacy option string and
+        // refuses that when it's a page (before 6.5), or refuses the result
+        // at `FSCONFIG_CMD_CREATE`. A real problem (the upper directory on
+        // overlayfs, say) gets the same answer from the old way.
+        let unsupported = |errno| {
+            if errno == Errno::EINVAL {
+                NewApi::Unsupported
+            } else {
+                NewApi::Failed(errno)
+            }
+        };
+        // Each path by a descriptor, as `/proc/self/fd/N`: `fsconfig` takes
+        // at most 256 bytes a value, which a deep store's paths can pass.
+        // (Opened here, so they're looked up with this process's
+        // credentials, as overlay would.)
+        let opened = |path: &Path| {
+            nix::fcntl::open(
+                path,
+                OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            )
+            .map_err(NewApi::Failed)
+        };
+        let set_dir = |key: &CStr, path: &Path| -> Result<(), NewApi> {
+            let dir = opened(path)?;
+            let value = format!("/proc/self/fd/{}", dir.as_raw_fd());
+            set_string(&fs, key, value.as_bytes()).map_err(unsupported)
+        };
+        for layer in lower.iter().rev() {
+            set_dir(c"lowerdir+", layer)?;
+        }
+        set_dir(c"upperdir", upper)?;
+        set_dir(c"workdir", work)?;
+        if userxattr {
+            fsconfig(&fs, FSCONFIG_SET_FLAG, Some(c"userxattr"), None).map_err(unsupported)?;
+        }
+        fsconfig(&fs, FSCONFIG_CMD_CREATE, None, None).map_err(unsupported)?;
+        // SAFETY: `fsmount` takes the context's descriptor and flags, and
+        // returns a new descriptor (the detached mount) or -1.
+        // `nodev`: no device node in an image is ever opened through it.
+        let mounted = unsafe {
+            libc::syscall(
+                libc::SYS_fsmount,
+                fs.as_raw_fd(),
+                FSMOUNT_CLOEXEC,
+                MOUNT_ATTR_NODEV,
+            )
+        };
+        owned(mounted).map_err(NewApi::Failed)
+    }
+
+    /// Attaches the detached mount `mounted` ([`build`], or a cloned tree)
+    /// on what's open as `on` (an `O_PATH` descriptor): by descriptor, so no
+    /// path is looked up again.
+    ///
+    /// # Errors
+    ///
+    /// The errno of `move_mount`.
+    pub(crate) fn attach(mounted: &OwnedFd, on: BorrowedFd<'_>) -> Result<(), Errno> {
+        move_mount(mounted, Some(on.as_raw_fd()), c"", MOVE_MOUNT_T_EMPTY_PATH)
+    }
+
+    /// `move_mount` of the detached mount `mounted` onto `target`, in the
+    /// directory `at` (or the working directory), with `flags` on top of
+    /// `MOVE_MOUNT_F_EMPTY_PATH`.
+    fn move_mount(
+        mounted: &OwnedFd,
+        at: Option<std::os::fd::RawFd>,
+        target: &CStr,
+        flags: libc::c_uint,
+    ) -> Result<(), Errno> {
+        // SAFETY: `move_mount` takes the detached mount's descriptor with an
+        // empty path (`MOVE_MOUNT_F_EMPTY_PATH`), and the target as a
+        // directory descriptor and a NUL-terminated path (empty with
+        // `MOVE_MOUNT_T_EMPTY_PATH`); it returns 0 or -1.
+        let moved = unsafe {
+            libc::syscall(
+                libc::SYS_move_mount,
+                mounted.as_raw_fd(),
+                c"".as_ptr(),
+                at.unwrap_or(libc::AT_FDCWD),
+                target.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH | flags,
+            )
+        };
+        if moved < 0 {
+            return Err(Errno::last());
+        }
+        Ok(())
+    }
+
+    /// Mounts the overlay with one `mount(2)`: every path relative to the
+    /// directory they all share (this process's working directory for the
+    /// call, put back after), so as many layers as can fit in a page do.
+    ///
+    /// # Errors
+    ///
+    /// `E2BIG` if they don't fit; the errno of a step that failed.
+    pub(super) fn mount_legacy(
+        merged: &Path,
+        lower: &[&Path],
+        upper: &Path,
+        work: &Path,
+        userxattr: bool,
+    ) -> Result<(), Errno> {
+        let all: Vec<&Path> = lower.iter().copied().chain([upper, work]).collect();
+        let base = shared_ancestor(&all);
+        let options = legacy_options(&base, lower, upper, work, userxattr)?;
+        let back = nix::fcntl::open(
+            ".",
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        nix::unistd::chdir(&base)?;
+        let mounted = mount(
+            Some("overlay"),
+            merged,
+            Some("overlay"),
+            MsFlags::MS_NODEV,
+            Some(options.as_os_str()),
+        );
+        // The mount's own error first: it's the one that says something.
+        let restored = nix::unistd::fchdir(&back);
+        mounted?;
+        restored
+    }
+
+    /// The options of a legacy overlay mount, paths relative to `base`.
+    ///
+    /// # Errors
+    ///
+    /// `E2BIG` if they'd be over a page.
+    pub(super) fn legacy_options(
+        base: &Path,
+        lower: &[&Path],
+        upper: &Path,
+        work: &Path,
+        userxattr: bool,
+    ) -> Result<OsString, Errno> {
+        let relative = |path: &Path| -> OsString {
+            match path.strip_prefix(base) {
+                Ok(rest) if !rest.as_os_str().is_empty() => rest.as_os_str().to_owned(),
+                _ => path.as_os_str().to_owned(),
+            }
+        };
+        let mut options = OsString::from("lowerdir=");
+        // Top first: the engine passes base first.
+        for (index, dir) in lower.iter().rev().enumerate() {
+            if index > 0 {
+                options.push(":");
+            }
+            options.push(relative(dir));
+        }
+        options.push(",upperdir=");
+        options.push(relative(upper));
+        options.push(",workdir=");
+        options.push(relative(work));
+        if userxattr {
+            options.push(",userxattr");
+        }
+        if options.len() >= mount_data_max() {
+            return Err(Errno::E2BIG);
+        }
+        Ok(options)
+    }
+
+    /// The deepest directory every one of `paths` is in (`/` at least).
+    pub(super) fn shared_ancestor(paths: &[&Path]) -> PathBuf {
+        let mut shared: Vec<Component<'_>> = match paths.first() {
+            Some(first) => first.parent().unwrap_or(first).components().collect(),
+            None => return PathBuf::from("/"),
+        };
+        for path in paths.iter().skip(1) {
+            let parts: Vec<Component<'_>> = path.parent().unwrap_or(path).components().collect();
+            let same = shared
+                .iter()
+                .zip(&parts)
+                .take_while(|(a, b)| a == b)
+                .count();
+            shared.truncate(same);
+        }
+        let ancestor: PathBuf = shared.iter().collect();
+        if ancestor.as_os_str().is_empty() {
+            PathBuf::from("/")
+        } else {
+            ancestor
+        }
+    }
+
+    /// A descriptor a system call returned (or its errno).
+    fn owned(raw: libc::c_long) -> Result<OwnedFd, Errno> {
+        let fd = i32::try_from(raw).map_err(|_| Errno::EBADF)?;
+        if fd < 0 {
+            return Err(Errno::last());
+        }
+        // SAFETY: a new descriptor the kernel just gave this process,
+        // owned by nothing else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// `fsconfig(FSCONFIG_SET_STRING, key, value)`.
+    fn set_string(fs: &OwnedFd, key: &CStr, value: &[u8]) -> Result<(), Errno> {
+        let value = CString::new(value).map_err(|_| Errno::EINVAL)?;
+        fsconfig(fs, FSCONFIG_SET_STRING, Some(key), Some(&value))
+    }
+
+    /// One `fsconfig` call on the context `fs`.
+    fn fsconfig(
+        fs: &OwnedFd,
+        command: libc::c_uint,
+        key: Option<&CStr>,
+        value: Option<&CStr>,
+    ) -> Result<(), Errno> {
+        let pointer =
+            |text: Option<&std::ffi::CStr>| text.map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
+        // SAFETY: `fsconfig` takes the context's descriptor, a command, and
+        // a key and value that are NUL-terminated strings or null (as the
+        // command wants), and an auxiliary number (0 here); it returns 0 or
+        // -1.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_fsconfig,
+                fs.as_raw_fd(),
+                command,
+                pointer(key),
+                pointer(value),
+                0,
+            )
+        };
+        if rc < 0 { Err(Errno::last()) } else { Ok(()) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn legacy_options_are_relative_and_bounded() {
+            let layers: Vec<PathBuf> = (0..3)
+                .map(|i| PathBuf::from(format!("/store/layers/{i:064x}/diff")))
+                .collect();
+            let lower: Vec<&Path> = layers.iter().map(PathBuf::as_path).collect();
+            let upper = Path::new("/store/containers/run-1/upper");
+            let work = Path::new("/store/containers/run-1/work");
+            let all: Vec<&Path> = lower.iter().copied().chain([upper, work]).collect();
+            let base = shared_ancestor(&all);
+            assert_eq!(base, Path::new("/store"));
+            let options = legacy_options(&base, &lower, upper, work, true).unwrap();
+            let text = options.to_str().unwrap();
+            assert!(
+                text.starts_with(&format!("lowerdir=layers/{:064x}/diff:", 2)),
+                "top first: {text}"
+            );
+            assert!(text.ends_with(
+                ",upperdir=containers/run-1/upper,workdir=containers/run-1/work,userxattr"
+            ));
+            // About 55 such layers fit in a page; 100 don't.
+            let many: Vec<PathBuf> = (0..100)
+                .map(|i| PathBuf::from(format!("/store/layers/{i:064x}/diff")))
+                .collect();
+            let many: Vec<&Path> = many.iter().map(PathBuf::as_path).collect();
+            assert_eq!(
+                legacy_options(&base, &many, upper, work, false),
+                Err(Errno::E2BIG)
+            );
+            assert_eq!(
+                shared_ancestor(&[Path::new("/a/x"), Path::new("/b/y")]),
+                Path::new("/")
+            );
         }
     }
 }

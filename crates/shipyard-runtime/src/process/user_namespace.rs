@@ -398,6 +398,105 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+// --- A helper process in a user namespace of its own ---------------------------
+//
+// Not a container: a process that makes its own user namespace, has the
+// caller map it (as for a container: directly, or through `newuidmap` and
+// `newgidmap`), and then works as root over the IDs it was given. How a
+// rootless caller extracts image layers owned by the image's users, or
+// removes them again (Podman's `unshare`). The helper's side is
+// [`unshare_user_namespace`] then [`become_namespace_root`]; the caller's is
+// [`map_user_namespace`] in between.
+
+/// Moves this process into a new user namespace (`unshare(CLONE_NEWUSER)`),
+/// where it has every capability over nothing yet: its IDs show as the
+/// overflow ID until the parent writes its maps. The process must be
+/// single-threaded (the kernel refuses otherwise).
+///
+/// # Errors
+///
+/// [`Error::Sys`] if the kernel refuses, with the host setting that's why.
+pub fn unshare_user_namespace() -> Result<()> {
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|errno| {
+        let why = if matches!(errno, Errno::EPERM | Errno::ENOSPC | Errno::EACCES) {
+            format!(" ({})", userns_refusal())
+        } else {
+            String::new()
+        };
+        Error::sys(format!("making a user namespace{why}"), errno)
+    })
+}
+
+/// Writes the maps of the process `pid`, which made a user namespace of its
+/// own ([`unshare_user_namespace`]), as for a container: directly for root
+/// or a caller's own IDs, else through `newuidmap` and `newgidmap`.
+///
+/// # Errors
+///
+/// The [`Error`] of writing them.
+pub fn map_user_namespace(pid: u32, maps: &IdMaps) -> Result<()> {
+    let pid =
+        i32::try_from(pid).map_err(|_| Error::sys("mapping a user namespace", Errno::ESRCH))?;
+    write_maps(Pid::from_raw(pid), maps)
+}
+
+/// Becomes root of this process's user namespace, once its maps are
+/// written: no supplementary groups (where `setgroups` is allowed), then
+/// group and user 0.
+///
+/// # Errors
+///
+/// [`Error::Sys`] if a step fails, including when the maps were never
+/// written (ID 0 isn't mapped).
+pub fn become_namespace_root() -> Result<()> {
+    if setgroups_allowed() {
+        nix::unistd::setgroups(&[])
+            .map_err(|errno| Error::sys("dropping supplementary groups", errno))?;
+    }
+    let root = (nix::unistd::Gid::from_raw(0), nix::unistd::Uid::from_raw(0));
+    nix::unistd::setresgid(root.0, root.0, root.0)
+        .map_err(|errno| Error::sys("becoming group 0 in the user namespace", errno))?;
+    nix::unistd::setresuid(root.1, root.1, root.1)
+        .map_err(|errno| Error::sys("becoming root in the user namespace", errno))
+}
+
+/// This process's own maps (`/proc/self/uid_map` and `gid_map`): which IDs
+/// it can give files. In the initial user namespace, every ID maps to
+/// itself.
+///
+/// # Errors
+///
+/// [`Error::Sys`] if a map can't be read or parsed.
+pub fn current_id_maps() -> Result<IdMaps> {
+    let read = |kind: &str| -> Result<Vec<IdMap>> {
+        let path = format!("/proc/self/{kind}");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| Error::sys(format!("reading {path}"), super::io_errno(&err)))?;
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let numbers: Vec<u32> = line
+                    .split_whitespace()
+                    .map(str::parse)
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|_| Error::sys(format!("parsing {path}"), Errno::EINVAL))?;
+                match numbers[..] {
+                    [container, host, size] => Ok(IdMap {
+                        container,
+                        host,
+                        size,
+                    }),
+                    _ => Err(Error::sys(format!("parsing {path}"), Errno::EINVAL)),
+                }
+            })
+            .collect()
+    };
+    Ok(IdMaps {
+        uids: read("uid_map")?,
+        gids: read("gid_map")?,
+    })
+}
+
 /// Why the kernel refuses user namespaces to an unprivileged caller, from
 /// what the host's settings read.
 pub(crate) fn userns_refusal() -> String {

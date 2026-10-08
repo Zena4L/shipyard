@@ -8,6 +8,7 @@
 #   scripts/test-linux.sh                # run everything
 #   scripts/test-linux.sh --shell        # a shell in the same container, to debug
 #   scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
+#   scripts/test-linux.sh --fuzz [SECONDS]  # each fuzz target (fuzz/) for SECONDS (300)
 #
 # The container is privileged: creating namespaces and mounting need
 # CAP_SYS_ADMIN, and Docker's default seccomp profile blocks `clone3` and
@@ -43,12 +44,17 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
 fi
 
 mode=test
+fuzz_seconds=300
 case "${1:-}" in
     "") ;;
     --shell) mode=shell ;;
     --root-shell) mode=root-shell ;;
+    --fuzz)
+        mode=fuzz
+        fuzz_seconds=${2:-300}
+        ;;
     *)
-        echo "usage: $0 [--shell | --root-shell]" >&2
+        echo "usage: $0 [--shell | --root-shell | --fuzz [SECONDS]]" >&2
         exit 2
         ;;
 esac
@@ -103,6 +109,12 @@ if [ "$(cat /proc/self/cgroup)" = "0::/" ] && [ -w "$cgroup/cgroup.subtree_contr
     done
 fi
 
+# A real /tmp: the container's own is overlayfs, which refuses what an image
+# store needs (whiteout devices for a normal user; an overlay's upper layer).
+# A host's /tmp is a disk or tmpfs, as here. (A rootless store on tmpfs also
+# needs its `user.*` extended attributes: Linux 6.6 or later.)
+mount -t tmpfs -o mode=1777 tmpfs /tmp
+
 # Drops to `tester` (all its IDs, no capabilities: what an ordinary user
 # has), keeping the toolchain's environment, in its delegated cgroup.
 as_tester() (
@@ -111,7 +123,7 @@ as_tester() (
     fi
     exec setpriv --reuid tester --regid tester --init-groups \
         env HOME=/home/tester "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" \
-        SHIPYARD_TEST_DELEGATED=required \
+        SHIPYARD_TEST_DELEGATED=required SHIPYARD_TEST_ROOTLESS=required \
         "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" "$@"
 )
 
@@ -138,6 +150,34 @@ case "$MODE" in
         bash
         exit
         ;;
+    fuzz)
+        # As `tester`: a layer that escaped its directory reaches only what
+        # a normal user can. Nightly and cargo-fuzz are installed once, into
+        # the toolchain volumes (that needs network). The corpora, and any
+        # input that crashed a target, are kept in the build volume, under
+        # /target/fuzz.
+        as_tester bash -c '
+            set -euo pipefail
+            rustup toolchain install nightly --profile minimal >/dev/null
+            [ -x "$CARGO_HOME/bin/cargo-fuzz" ] || cargo install --locked cargo-fuzz
+            python3 scripts/fuzz-seeds.py /target/fuzz/corpus
+            # cargo-fuzz writes beside its crate, and /src is read-only: a
+            # copy, pointed back at the sources.
+            rm -rf /target/fuzz/crate
+            cp -r fuzz /target/fuzz/crate
+            sed -i "s|path = \"../crates/|path = \"/src/crates/|" /target/fuzz/crate/Cargo.toml
+            for target in manifest challenge reference tar unpack; do
+                echo "== fuzz $target, $FUZZ_SECONDS s"
+                mkdir -p "/target/fuzz/crashes/$target"
+                cargo +nightly fuzz run --fuzz-dir /target/fuzz/crate --target-dir /target/fuzz/build \
+                    "$target" "/target/fuzz/corpus/$target" -- \
+                    -max_total_time="$FUZZ_SECONDS" \
+                    -artifact_prefix="/target/fuzz/crashes/$target/"
+            done
+            echo "== no fuzz target crashed"
+        '
+        exit
+        ;;
 esac
 
 echo "== clippy"
@@ -151,7 +191,7 @@ echo "== all Linux checks passed"
 EOF
 
 tty_flags=()
-if [ "$mode" != test ]; then
+if [ "$mode" = shell ] || [ "$mode" = root-shell ]; then
     tty_flags=(--interactive --tty)
 fi
 
@@ -164,5 +204,6 @@ exec docker run --rm --privileged --init ${tty_flags[@]+"${tty_flags[@]}"} \
     --volume shipyard-linux-rustup:/usr/local/rustup \
     --env CARGO_TARGET_DIR=/target \
     --env MODE="$mode" \
+    --env FUZZ_SECONDS="$fuzz_seconds" \
     --workdir /src \
     "$image" bash -c "$inside"

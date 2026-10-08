@@ -9,9 +9,10 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > bundles step by step, as an [OCI runtime](runtime.md). The command is confined:
 > a minimal set of capabilities, `no_new_privs`, and a seccomp filter. It runs
 > **rootless** for anyone without root, in a user namespace whose root is that user
-> (root can ask for one with `--uidmap`). It doesn't have its own network yet, and
-> it has no resource limits of its own yet (cgroups), so it isn't a hardened
-> boundary yet. It starts the command the way a
+> (root can ask for one with `--uidmap`). It can run a **pulled image**
+> (`--image`), stacking its layers into a root filesystem with overlayfs, and mount
+> **volumes** (`--volume`). It doesn't have its own network yet, so it isn't a
+> hardened boundary yet. It starts the command the way a
 > container runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
 > leaves behind), and reports exactly how it ended. On macOS, commands aren't
@@ -23,6 +24,8 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | Page | What it covers |
 |---|---|
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
+| [Images](images.md) | `shipyard pull`, `run --image`, `images`, `rmi`, `image prune`, `system df`: pulling, private registries and the local store |
+| [Volumes](volumes.md) | `shipyard volume …` and `--volume`: named volumes and bind mounts |
 | [OCI bundles](bundles.md) | `shipyard run --bundle`: a container described by a `config.json`, what's supported, refused and ignored |
 | [The OCI runtime](runtime.md) | `shipyard-runtime`: `create`, `start`, `state`, `kill` and `delete`, one step at a time, as `runc` |
 | [Runtime reference](runtime-cli.md) | Every `shipyard-runtime` command and flag, generated from the binary itself |

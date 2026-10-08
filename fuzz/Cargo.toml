@@ -1,0 +1,54 @@
+# Fuzz targets for what Shipyard reads from untrusted sources: registries'
+# documents and headers, image references, and layer archives. Built on
+# nightly with cargo-fuzz, outside the main workspace; run them with
+# `scripts/test-linux.sh --fuzz` (docs/DEVELOPMENT.md).
+[package]
+name = "shipyard-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+shipyard-image = { path = "../crates/shipyard-image" }
+
+# Its own workspace: not one of Shipyard's crates.
+[workspace]
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "challenge"
+path = "fuzz_targets/challenge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reference"
+path = "fuzz_targets/reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar"
+path = "fuzz_targets/tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack"
+path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false

@@ -127,6 +127,24 @@ pub(crate) struct RootSetup {
     pub(crate) mounts: Vec<MountSetup>,
     /// Device nodes to make, in order (`Isolation::devices`).
     pub(crate) devices: Vec<DeviceSetup>,
+    /// If set, mount this overlay at `path` before binding (an image root).
+    pub(crate) overlay: Option<OverlaySetup>,
+    /// An overlay real root made already (`--uidmap`: see `spawn.rs`), to
+    /// attach instead: the detached mount's descriptor, inherited.
+    attach: Option<RawFd>,
+}
+
+/// The overlay layers to mount as the root, serialized for the init.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OverlaySetup {
+    /// Read-only layer directories, base first (as bytes, like other paths).
+    pub(crate) lower: Vec<Vec<u8>>,
+    /// The writable upper directory.
+    pub(crate) upper: Vec<u8>,
+    /// The overlay work directory.
+    pub(crate) work: Vec<u8>,
+    /// Whether to mount with `userxattr` (rootless, in a user namespace).
+    pub(crate) userxattr: bool,
 }
 
 /// A device node to make ([`DeviceNode`](crate::devices::DeviceNode)), its
@@ -234,6 +252,7 @@ impl RootSetup {
         mqueue: bool,
         id_maps: Option<&IdMaps>,
         devices: &[crate::devices::DeviceNode],
+        attach: Option<RawFd>,
     ) -> Self {
         /// The `tty` group in most distributions.
         const TTY: u32 = 5;
@@ -251,12 +270,45 @@ impl RootSetup {
             },
             mounts: root.mounts.iter().map(MountSetup::new).collect(),
             devices: devices.iter().map(DeviceSetup::new).collect(),
+            attach,
+            overlay: root
+                .overlay
+                .as_ref()
+                .filter(|_| attach.is_none())
+                .map(|overlay| OverlaySetup {
+                    lower: overlay.lower.iter().map(bytes).collect(),
+                    upper: bytes(&overlay.upper),
+                    work: bytes(&overlay.work),
+                    // Rootless (a user namespace) needs userxattr; real root
+                    // mounts without it.
+                    userxattr: id_maps.is_some(),
+                }),
         }
     }
 
     /// The directory on the host.
     pub(crate) fn path(&self) -> &Path {
         as_path(&self.path)
+    }
+
+    /// The overlay real root made, to attach (the mount's descriptor), if it
+    /// did.
+    pub(crate) fn attach(&self) -> Option<RawFd> {
+        self.attach
+    }
+
+    /// The overlay to mount at [`path`](Self::path) before binding, if the
+    /// root is an image: the lower layers (base first), upper, work, and
+    /// whether to use `userxattr` (rootless).
+    pub(crate) fn overlay(&self) -> Option<(Vec<&Path>, &Path, &Path, bool)> {
+        self.overlay.as_ref().map(|overlay| {
+            (
+                overlay.lower.iter().map(|p| as_path(p)).collect(),
+                as_path(&overlay.upper),
+                as_path(&overlay.work),
+                overlay.userxattr,
+            )
+        })
     }
 
     /// The paths to mask, inside the container.
@@ -306,6 +358,12 @@ fn as_path(bytes: &[u8]) -> &Path {
 }
 
 impl Setup {
+    /// The command's working directory (inside the container's root, if
+    /// it has one).
+    pub(crate) fn cwd(&self) -> &Path {
+        as_path(&self.cwd)
+    }
+
     /// The setup for running `spec` isolated as `isolation` says, in a
     /// cgroup of its own if `own_cgroup`, stopping for hooks on `hooks_pipe`
     /// if it's given.
@@ -316,6 +374,7 @@ impl Setup {
         gate: Option<RawFd>,
         own_cgroup: bool,
         hooks_pipe: Option<RawFd>,
+        attach: Option<RawFd>,
     ) -> Self {
         let bytes = |s: &OsStr| s.as_bytes().to_vec();
         Self {
@@ -353,6 +412,7 @@ impl Setup {
                     isolation.has(Namespace::Ipc),
                     isolation.id_maps.as_ref(),
                     &isolation.devices.nodes,
+                    attach,
                 )
             }),
             gate,
@@ -545,7 +605,15 @@ mod tests {
             "/b",
             std::collections::BTreeMap::new(),
         ));
-        let setup = Setup::new(&spec, &[libc::SIGHUP], &isolation, Some(7), true, Some(9));
+        let setup = Setup::new(
+            &spec,
+            &[libc::SIGHUP],
+            &isolation,
+            Some(7),
+            true,
+            Some(9),
+            None,
+        );
         let fd = setup.to_memfd().unwrap();
         // Sealed: no more writes.
         assert!(nix::unistd::write(&fd, b"x").is_err());
