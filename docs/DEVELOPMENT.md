@@ -28,6 +28,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-it
 
 # On macOS: type-check the Linux-only code without leaving the Mac
 cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu
+# Since stage 6, this needs a Linux cross-compiler for ring's C code
+# (`brew install aarch64-unknown-linux-gnu` / a `musl-cross` toolchain), or
+# just run the check in the container (`scripts/test-linux.sh`), which builds
+# natively and needs no cross-toolchain.
 ```
 
 CI runs, on every push and PR:
@@ -74,8 +78,10 @@ user-namespace tests need (`scripts/test-image/Dockerfile`: the `uidmap` package
 time, which needs network, and again only when the Dockerfile changes. The steps:
 
 1. clippy with warnings as errors;
-2. the whole test suite as a normal user (`tester`): the rootless tests and the
-   isolated terminal tests run here;
+2. the whole test suite as a normal user (`tester`): the rootless tests, the
+   rootless image runs and the isolated terminal tests run here. As in CI,
+   `SHIPYARD_TEST_ROOTLESS=required` makes a rootless test that can't run fail
+   instead of skip;
 3. the suite again with the root-only tests, run as root (as the CI `root` job
    does). Before it, `/` is made a shared mount, as on systemd
    hosts, so a mount namespace that leaks mounts would be caught.
@@ -84,7 +90,12 @@ time, which needs network, and again only when the Dockerfile changes. The steps
 scripts/test-linux.sh            # everything; exits non-zero on any failure
 scripts/test-linux.sh --shell        # a shell in the same container, to debug
 scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
+scripts/test-linux.sh --fuzz [SECONDS]   # each fuzz target for SECONDS (300)
 ```
+
+The container's `/tmp` is a fresh tmpfs: its own root is overlayfs, which can't hold
+an image store's writable layers or a normal user's whiteout devices. A rootless
+store on tmpfs needs Linux 6.6 or later (user extended attributes on tmpfs).
 
 **cgroups** (stage 5) are set up first, as on a systemd host: the container's cgroup
 namespace root can't hand controllers to children while it holds processes (the
@@ -138,6 +149,17 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   The cgroup lines do what `scripts/test-linux.sh` does: Docker leaves the container's
   processes in its cgroup namespace's root, which then can't hand controllers down
   (cgroup v2's no-internal-processes rule), so Shipyard refuses limits there.
+- **Fuzzing:** `fuzz/` holds cargo-fuzz targets for what Shipyard reads from outside:
+  `manifest` (manifests, indexes, configs), `challenge` (`WWW-Authenticate` headers and
+  token answers), `reference`, `tar` (the tar reader) and `unpack` (a layer extracted
+  beside a canary directory, which must not change). It's its own workspace, built on
+  nightly, so it's not in CI. `scripts/test-linux.sh --fuzz` installs nightly and
+  cargo-fuzz into the toolchain volumes once (that needs network), writes starting
+  corpora with `scripts/fuzz-seeds.py`, and runs each target as `tester` (an escape
+  reaches only what a normal user can). Corpora and crashing inputs are kept in the
+  build volume, under `/target/fuzz`; turn a crash into a unit test in the module it
+  found, then fix it. Running it under `fuzz/` on a host with nightly works too:
+  `cargo +nightly fuzz run manifest`.
 - **Kernel probes:** `scripts/probes/*.c` check the kernel behaviour a stage relies on,
   before it's built on. Each file's header says how to run it, usually in the privileged
   container. The stage notes record the results.

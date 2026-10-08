@@ -88,6 +88,24 @@ pub(crate) fn entry_point() {
     std::process::exit(125);
 }
 
+/// Marks close-on-exec again the descriptors the setup names that were
+/// passed across the exec (the gate, the hooks pipe, an overlay to
+/// attach): the command must not inherit them.
+fn close_on_exec_again(setup: &super::setup::Setup) {
+    let hooks_pipe = setup.hooks.as_ref().map(|hooks| hooks.pipe);
+    let attach = setup
+        .root
+        .as_ref()
+        .and_then(super::setup::RootSetup::attach);
+    for fd in setup.gate.into_iter().chain(hooks_pipe).chain(attach) {
+        let _ = nix::fcntl::fcntl(
+            // SAFETY: inherited across the exec; borrowed only for this call.
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        );
+    }
+}
+
 /// Sets the container up, then runs the command: as the init's child (PID
 /// 2), or as this very process without a PID namespace.
 fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool) -> ! {
@@ -125,15 +143,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     };
     let setup =
         read_setup(setup_fd).unwrap_or_else(|errno| fail(Failure::at(ChildStep::ReadSetup, errno)));
-    let hooks_pipe = setup.hooks.as_ref().map(|hooks| hooks.pipe);
-    for fd in setup.gate.into_iter().chain(hooks_pipe) {
-        // Passed across the exec like the others: close-on-exec again.
-        let _ = nix::fcntl::fcntl(
-            // SAFETY: inherited across the exec; borrowed only for this call.
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        );
-    }
+    close_on_exec_again(&setup);
     // The proof that this image started: without it, shipyard reports an
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);
@@ -463,7 +473,7 @@ fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, F
     let state = if let Some(root) = &setup.root {
         // `/proc`, `/sys` and `/dev` inside it (and the sysctls, before its
         // `/proc/sys` is made read-only), the hooks, then the switch.
-        rootfs::enter(root, &setup.sysctls, setup.cgroup.mount, stop)?
+        rootfs::enter(root, setup.cwd(), &setup.sysctls, setup.cgroup.mount, stop)?
     } else {
         if setup.mount_proc {
             // Mounted by this process, so it shows the new PID namespace.

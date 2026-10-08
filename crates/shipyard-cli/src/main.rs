@@ -4,14 +4,17 @@
 //! `shipyard-runtime`.
 
 mod devices;
+mod image;
 #[allow(
     dead_code,
     reason = "shared with `shipyard-runtime`, whose `update` uses what `run` doesn't"
 )]
 mod limits;
 mod run;
+mod storage_helper;
+mod volumes;
 
-use std::io::{IsTerminal as _, Write};
+use std::io::{BufRead, IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -64,14 +67,95 @@ impl LogLevel {
 enum Command {
     /// Run a command in a container: on Linux, isolated in namespaces, optionally with its own root filesystem.
     Run(Box<run::RunArgs>),
+    /// Pull an image into the local store (and extract it, on Linux), so a
+    /// run starts at once and needs no registry.
+    Pull {
+        /// Print nothing but the image's digest.
+        #[arg(short, long)]
+        quiet: bool,
+        /// The image, like `alpine:3.20` or `ghcr.io/owner/app@sha256:...`.
+        #[arg(value_name = "IMAGE")]
+        reference: String,
+    },
+    /// List images in the local store.
+    Images,
+    /// Remove one or more images from the local store (reference-counted; shared layers survive).
+    Rmi {
+        /// Untag an image even while a running container uses it (its layers
+        /// stay until the container ends and a prune collects them).
+        #[arg(short, long)]
+        force: bool,
+        /// The image references to remove.
+        #[arg(value_name = "IMAGE", required = true)]
+        images: Vec<String>,
+    },
+    /// Manage images.
+    #[command(subcommand)]
+    Image(ImageCommand),
+    /// Manage named volumes.
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+    /// System-wide information and maintenance.
+    #[command(subcommand)]
+    System(SystemCommand),
     /// Show how this host will run containers.
     Doctor,
+}
+
+/// `shipyard volume …`.
+#[derive(Debug, Subcommand)]
+enum VolumeCommand {
+    /// Create a named volume.
+    Create {
+        /// The volume's name.
+        name: String,
+    },
+    /// List named volumes.
+    Ls,
+    /// Show a volume's details.
+    Inspect {
+        /// The volume's name.
+        name: String,
+    },
+    /// Remove one or more named volumes (never one a running container
+    /// uses).
+    Rm {
+        /// The volumes to remove.
+        #[arg(value_name = "VOLUME", required = true)]
+        names: Vec<String>,
+    },
+    /// Remove every named volume no running container uses (asks first).
+    Prune {
+        /// Don't ask (needed where there's no terminal to ask on).
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+/// `shipyard image …`.
+#[derive(Debug, Subcommand)]
+enum ImageCommand {
+    /// List images in the local store.
+    Ls,
+    /// Remove unreferenced images, layers and blobs from the store.
+    Prune,
+}
+
+/// `shipyard system …`.
+#[derive(Debug, Subcommand)]
+enum SystemCommand {
+    /// Show the store's disk usage.
+    Df,
 }
 
 fn main() -> ExitCode {
     // First of all: a container's init re-execs this binary to become a
     // clean process, and takes over here (it never returns then).
     process::init_entry_point();
+    // The storage helper (a rootless caller's layer work, in a user
+    // namespace of its own) is this binary too; making the namespace needs a
+    // single-threaded process, so before anything else as well.
+    storage_helper::entry_point();
     // Before anything else: a privileged start must not get any further.
     if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into());
@@ -94,6 +178,12 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Run(args) => run::run(*args),
+        Command::Pull { quiet, reference } => pull(&reference, quiet),
+        Command::Images | Command::Image(ImageCommand::Ls) => images(),
+        Command::Rmi { force, images } => Ok(rmi(&images, force)),
+        Command::Image(ImageCommand::Prune) => image_prune(),
+        Command::Volume(command) => volume_command(&command),
+        Command::System(SystemCommand::Df) => system_df(),
         Command::Doctor => doctor(),
     };
     result.unwrap_or_else(|err| fail(&err))
@@ -104,8 +194,259 @@ fn fail(err: &anyhow::Error) -> ExitCode {
     report(err, EXIT_ENGINE_ERROR)
 }
 
+/// `shipyard images`: lists the images in the store.
+fn images() -> Result<ExitCode> {
+    let mut images = image::list_images()?;
+    images.sort_by(|a, b| a.reference.cmp(&b.reference));
+    let rows: Vec<Vec<String>> = images
+        .into_iter()
+        .map(|image| {
+            let manifest = &image.record.manifest;
+            let short: String = manifest
+                .strip_prefix("sha256:")
+                .unwrap_or(manifest)
+                .chars()
+                .take(12)
+                .collect();
+            vec![
+                image.reference,
+                short,
+                image.record.layers.len().to_string(),
+            ]
+        })
+        .collect();
+    table(
+        &mut std::io::stdout().lock(),
+        &["REFERENCE", "MANIFEST", "LAYERS"],
+        &rows,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Writes `rows` under `header`, in columns as wide as their widest cell,
+/// three spaces apart (the last one unpadded).
+fn table(out: &mut impl Write, header: &[&str], rows: &[Vec<String>]) -> std::io::Result<()> {
+    let mut widths: Vec<usize> = header.iter().map(|cell| cell.chars().count()).collect();
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |out: &mut dyn Write, cells: &mut dyn Iterator<Item = &str>| {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for (index, (cell, width)) in cells.zip(&widths).enumerate() {
+            if index + 1 < widths.len() {
+                let _ = write!(text, "{cell:<width$}   ");
+            } else {
+                text.push_str(cell);
+            }
+        }
+        writeln!(out, "{}", text.trim_end())
+    };
+    line(out, &mut header.iter().copied())?;
+    for row in rows {
+        line(out, &mut row.iter().map(String::as_str))?;
+    }
+    Ok(())
+}
+
+/// `shipyard pull IMAGE`: pulls it, then prints its digest.
+fn pull(reference: &str, quiet: bool) -> Result<ExitCode> {
+    let digest = image::pull_command(reference, quiet)?;
+    let mut out = std::io::stdout().lock();
+    if quiet {
+        writeln!(out, "{digest}")?;
+    } else {
+        writeln!(out, "Digest: {digest}")?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `shipyard rmi IMAGE...`: removes images, collecting unshared blobs. One
+/// that can't be removed is reported, and the rest still are.
+fn rmi(references: &[String], force: bool) -> ExitCode {
+    each(references, |reference| {
+        let removed = image::remove_image(reference, force)?;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "Untagged: {reference}")?;
+        for digest in removed {
+            writeln!(out, "Deleted: {digest}")?;
+        }
+        Ok(())
+    })
+}
+
+/// Does `act` for each of `names`, reporting each failure and going on;
+/// exits 125 if any failed.
+fn each(names: &[String], mut act: impl FnMut(&str) -> Result<()>) -> ExitCode {
+    let mut code = ExitCode::SUCCESS;
+    for name in names {
+        if let Err(err) = act(name) {
+            code = report(&err, EXIT_ENGINE_ERROR);
+        }
+    }
+    code
+}
+
+/// `shipyard image prune`: removes unreferenced blobs and layers.
+fn image_prune() -> Result<ExitCode> {
+    let removed = image::prune_images()?;
+    let mut out = std::io::stdout().lock();
+    for digest in &removed {
+        writeln!(out, "Deleted: {digest}")?;
+    }
+    writeln!(out, "Removed {} unreferenced blob(s)", removed.len())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `shipyard system df`: shows what the images, the running containers'
+/// writable layers and the volumes take, and how much of it nothing uses.
+fn system_df() -> Result<ExitCode> {
+    let store = image::disk_usage()?;
+    let disk = &store.disk;
+    let images = image::Usage {
+        count: store.images,
+        bytes: disk.blob_bytes + disk.layer_bytes,
+        reclaimable: disk.blob_reclaimable + disk.layer_reclaimable,
+        complete: disk.complete,
+    };
+    let rows: Vec<Vec<String>> = [
+        ("Images", &images),
+        ("Containers", &store.containers),
+        ("Volumes", &volumes::usage()?),
+    ]
+    .into_iter()
+    .map(|(kind, usage)| {
+        // Directories it couldn't read (another user's): at least this.
+        let at_least = if usage.complete { "" } else { "≥ " };
+        vec![
+            kind.to_owned(),
+            usage.count.to_string(),
+            format!("{at_least}{}", human_bytes(usage.bytes)),
+            format!("{at_least}{}", human_bytes(usage.reclaimable)),
+        ]
+    })
+    .collect();
+    table(
+        &mut std::io::stdout().lock(),
+        &["TYPE", "COUNT", "SIZE", "RECLAIMABLE"],
+        &rows,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `shipyard volume …`: create, list, inspect, remove, prune named volumes.
+fn volume_command(command: &VolumeCommand) -> Result<ExitCode> {
+    match command {
+        VolumeCommand::Create { name } => {
+            let volume = volumes::create(name)?;
+            writeln!(std::io::stdout().lock(), "{}", volume.name)?;
+        }
+        VolumeCommand::Ls => {
+            let rows: Vec<Vec<String>> = volumes::list()?
+                .into_iter()
+                .map(|volume| vec![volume.name, volume.data.display().to_string()])
+                .collect();
+            table(
+                &mut std::io::stdout().lock(),
+                &["VOLUME", "MOUNTPOINT"],
+                &rows,
+            )?;
+        }
+        VolumeCommand::Inspect { name } => {
+            let volume = volumes::inspect(name)?;
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{:<12} {}", "Name:", volume.name)?;
+            writeln!(out, "{:<12} {}", "Mountpoint:", volume.data.display())?;
+        }
+        VolumeCommand::Rm { names } => {
+            return Ok(each(names, |name| {
+                volumes::remove(name)?;
+                writeln!(std::io::stdout().lock(), "{name}")?;
+                Ok(())
+            }));
+        }
+        VolumeCommand::Prune { force } => return volume_prune(*force),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `shipyard volume prune`: asks first (on a terminal; elsewhere `-f` is
+/// needed), then removes every volume no running container uses.
+fn volume_prune(force: bool) -> Result<ExitCode> {
+    const QUESTION: &str = "Remove every volume no running container uses, and its data?";
+    if !force {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            anyhow::bail!(
+                "volume prune deletes data: run it on a terminal to be asked, or give -f"
+            );
+        }
+        if !confirm(QUESTION, &mut stdin.lock(), &mut std::io::stderr().lock())? {
+            writeln!(std::io::stderr().lock(), "Nothing removed")?;
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let pruned = volumes::prune()?;
+    let mut out = std::io::stdout().lock();
+    for name in &pruned.removed {
+        writeln!(out, "{name}")?;
+    }
+    writeln!(out, "Removed {} volume(s)", pruned.removed.len())?;
+    if !pruned.in_use.is_empty() {
+        writeln!(
+            out,
+            "Kept {} in use: {}",
+            pruned.in_use.len(),
+            pruned.in_use.join(", ")
+        )?;
+    }
+    drop(out);
+    let mut code = ExitCode::SUCCESS;
+    for err in &pruned.failed {
+        code = report(err, EXIT_ENGINE_ERROR);
+    }
+    Ok(code)
+}
+
+/// Asks `question` on `output`, `[y/N]`, and reads the answer from `input`:
+/// whether it's yes (no, unless it says so).
+fn confirm(question: &str, input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
+    write!(output, "{question} [y/N] ")?;
+    output.flush()?;
+    // Bytes, not a `String`: an answer that isn't UTF-8 is a no, not an
+    // error.
+    let mut answer = Vec::new();
+    input.read_until(b'\n', &mut answer)?;
+    Ok(matches!(
+        answer.trim_ascii().to_ascii_lowercase().as_slice(),
+        b"y" | b"yes"
+    ))
+}
+
+/// A byte count in a human unit (B, KiB, MiB, GiB).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "display only; precision loss at these magnitudes is immaterial"
+    )]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Prints a warning: something asked for that Shipyard goes on without.
-fn warning(text: &str) {
+pub(crate) fn warning(text: &str) {
     // Not `eprintln!`: it panics if stderr is a closed pipe.
     let _ = writeln!(std::io::stderr().lock(), "shipyard: warning: {text}");
 }
@@ -209,6 +550,42 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn a_prompt_means_no_unless_it_says_yes() {
+        let ask = |answer: &str| {
+            let mut output = Vec::new();
+            let yes = confirm("Sure?", &mut answer.as_bytes(), &mut output).unwrap();
+            assert_eq!(output, b"Sure? [y/N] ");
+            yes
+        };
+        assert!(ask("y\n") && ask("YES\n") && ask(" yes "));
+        assert!(!ask("\n") && !ask("n\n") && !ask("") && !ask("yep\n"));
+    }
+
+    #[test]
+    fn byte_counts_in_human_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(human_bytes(3 << 40), "3.0 TiB");
+        assert_eq!(human_bytes(u64::MAX), "16777216.0 TiB");
+    }
+
+    #[test]
+    fn columns_are_as_wide_as_their_widest_cell() {
+        let mut out = Vec::new();
+        let rows = vec![
+            vec!["a-much-longer-name".to_owned(), "1".to_owned()],
+            vec!["b".to_owned(), "22".to_owned()],
+        ];
+        table(&mut out, &["NAME", "N"], &rows).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME                 N\na-much-longer-name   1\nb                    22\n"
+        );
+    }
 
     /// `docs/user/cli.md` is generated from the flag definitions above, so the
     /// published reference can never drift from the real CLI.

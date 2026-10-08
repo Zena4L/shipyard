@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The fuzz targets build on nightly with cargo-fuzz, as their own workspace
+# (docs/DEVELOPMENT.md).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -16,13 +19,19 @@ publish = false
 # Internal crates
 shipyard-runtime = { path = "crates/shipyard-runtime" }
 shipyard-test-support = { path = "crates/shipyard-test-support" }
+# Stage 6: images and storage (the engine layer).
+shipyard-image = { path = "crates/shipyard-image" }
+shipyard-storage = { path = "crates/shipyard-storage" }
 
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # Features are added as each stage needs them.
+# Docker's `auth` credentials (base64 of `user:password`); ureq has it too.
+base64 = "0.23"
 nix = { version = "0.31", default-features = false, features = [
+  "dir",
   "fs",
   "hostname",
   "mount",
@@ -41,6 +50,29 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Stage 6 (images and storage). Decisions are recorded in
+# docs/stages/06-images-plan.md. No async runtime (blocking I/O + a thread
+# pool until stage 11's API needs async).
+#
+# Registry client: ureq is blocking and bundles rustls (no OpenSSL system
+# dependency). rustls' crypto provider (ring) is C/asm, not pure Rust — the
+# one exception to the pure-Rust preference, accepted because rustls has no
+# pure-Rust provider today; its licenses (Apache-2.0, ISC) are allowed in
+# deny.toml. `platform-verifier`: certificates are checked against the
+# operating system's trust store, as Docker and Podman do (so a private CA
+# installed on the host works). No `gzip`: ureq would otherwise decompress a
+# blob a CDN labels `Content-Encoding: gzip`, and its digest would fail.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+# Content addressing and blob verification are sha256.
+sha2 = "0.11"
+# Layer decompression. The default miniz_oxide backend is pure Rust; gzip is
+# the near-universal layer format. (zstd is added as a later, feature-gated
+# step: it wraps a C library.)
+flate2 = "1"
+# Reading layer tar streams. Used for parsing only — never its `unpack`:
+# extraction is done by Shipyard under the stage-6 safety invariants.
+tar = "0.4"
+
 # Test-only crates.
 clap-markdown = "0.1"
 proptest = "1"
@@ -51,6 +83,9 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
+# cargo-fuzz builds with `--cfg fuzzing`, which opens `shipyard-image`'s
+# entry points for the fuzz targets.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -10,13 +10,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
 use shipyard_runtime::hooks::ContainerHooks;
-use shipyard_runtime::isolation::{IdMap, IdMaps, Isolation, Namespace, Root, RootlessMaps};
+use shipyard_runtime::isolation::{IdMap, IdMaps, Isolation, Mount, Namespace, Root, RootlessMaps};
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
 };
 use shipyard_runtime::security::seccomp::Profile;
 use shipyard_runtime::security::{Capabilities, Capability, CapabilitySet, Seccomp, Security};
+use shipyard_storage::{VolumeHold, VolumeMount};
 
 use crate::limits::LimitArgs;
 
@@ -26,9 +27,10 @@ pub(crate) struct RunArgs {
     #[arg(short, long, value_name = "KEY[=VALUE]", value_parser = value_parser!(OsString))]
     env: Vec<OsString>,
 
-    /// Working directory inside the container (absolute path).
-    #[arg(short, long, value_name = "DIR", default_value = "/")]
-    workdir: PathBuf,
+    /// Working directory inside the container (absolute path): the image's,
+    /// or `/`, if not given.
+    #[arg(short, long, value_name = "DIR")]
+    workdir: Option<PathBuf>,
 
     /// Run as this user and group: names (from the container's /etc/passwd
     /// and /etc/group) or numbers.
@@ -100,11 +102,46 @@ pub(crate) struct RunArgs {
 
     /// Use DIR as the container's root filesystem: it becomes `/` inside,
     /// with its own /proc, /sys and /dev (Linux).
-    #[arg(long, value_name = "DIR", conflicts_with = "no_isolation")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        group = "root",
+        conflicts_with = "no_isolation"
+    )]
     rootfs: Option<PathBuf>,
 
-    /// Make the container's root filesystem read-only (with --rootfs).
-    #[arg(long, requires = "rootfs")]
+    /// Run a pulled image: its layers become the container's root filesystem,
+    /// stacked read-only under a writable layer with overlayfs, and its
+    /// baked-in command, environment, working directory and user are the
+    /// defaults (Linux). Give a reference like `alpine:3.20` or
+    /// `ghcr.io/owner/app@sha256:...`.
+    #[arg(
+        long,
+        value_name = "REF",
+        group = "root",
+        conflicts_with_all = ["no_isolation", "rootfs"],
+    )]
+    image: Option<String>,
+
+    /// Run COMMAND instead of the image's entrypoint (and without its
+    /// default arguments); `""` runs the command alone.
+    #[arg(long, value_name = "COMMAND", requires = "image", value_parser = value_parser!(OsString))]
+    entrypoint: Option<OsString>,
+
+    /// When to pull the image: `missing` (if the store doesn't have it),
+    /// `always`, or `never` (the store's, or an error).
+    #[arg(
+        long,
+        value_enum,
+        value_name = "WHEN",
+        default_value = "missing",
+        requires = "image"
+    )]
+    pull: crate::image::PullPolicy,
+
+    /// Make the container's root filesystem read-only (with --rootfs or
+    /// --image).
+    #[arg(long, requires = "root")]
     read_only: bool,
 
     /// Give the command a capability on top of the default set, like
@@ -145,7 +182,7 @@ pub(crate) struct RunArgs {
             "command", "env", "workdir", "user", "group_add", "ulimit", "oom_score_adj",
             "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
             "cap_add", "cap_drop", "security_opt", "uidmap", "gidmap", "limits", "device",
-            "device_cgroup_rule",
+            "device_cgroup_rule", "image", "pull", "volume",
         ],
     )]
     bundle: Option<PathBuf>,
@@ -154,9 +191,16 @@ pub(crate) struct RunArgs {
     #[command(flatten)]
     limits: LimitArgs,
 
+    /// Mount a named volume or host path into the container:
+    /// `SOURCE:DEST[:ro]`. A bare SOURCE (no slash) is a named volume, created
+    /// on first use; a path is bind-mounted. Repeatable (Linux, with a root
+    /// filesystem).
+    #[arg(long, value_name = "SOURCE:DEST[:ro]", conflicts_with = "no_isolation")]
+    volume: Vec<String>,
+
     /// The command to run, followed by its arguments.
     #[arg(
-        required_unless_present = "bundle",
+        required_unless_present_any = ["bundle", "image"],
         trailing_var_arg = true,
         value_name = "COMMAND",
         value_parser = value_parser!(OsString),
@@ -174,53 +218,196 @@ pub(crate) struct Invocation {
     warnings: Vec<String>,
 }
 
+/// A `shipyard run` checked as far as it can be before its image is
+/// pulled: a mistake in a flag costs no download.
+pub(crate) enum Checked {
+    /// An OCI bundle's run, complete.
+    Bundle(Box<Invocation>),
+    /// A command's run, finished once its image (if any) is ready.
+    Command(Box<Planned>),
+}
+
+/// A command's run, checked: everything but what an image brings.
+pub(crate) struct Planned {
+    args: RunArgs,
+    stop: StopPolicy,
+    /// Without its root yet, for an image.
+    isolation: Option<Isolation>,
+    /// Why a rootless caller's maps are short, if they are.
+    short_maps: Option<String>,
+    /// The `--volume`s, parsed: a host path absolute and found.
+    volumes: Vec<VolumeMount>,
+}
+
 impl RunArgs {
-    /// Builds and validates the process spec, stop policy and isolation.
-    pub(crate) fn into_invocation(self) -> Result<Invocation> {
+    /// Checks and builds everything an image doesn't change, with no side
+    /// effects: the stop policy, the isolation (without an image's root),
+    /// the process (as far as it's given), the volumes.
+    pub(crate) fn check(self) -> Result<Checked> {
         let stop = StopPolicy {
             signal: self.stop_signal,
             timeout: Duration::from_secs(self.stop_timeout),
         };
         stop.validate()?;
         if let Some(dir) = &self.bundle {
-            return from_bundle(dir, stop);
+            return Ok(Checked::Bundle(Box::new(from_bundle(dir, stop)?)));
+        }
+        if self.image.is_some() && !cfg!(target_os = "linux") {
+            bail!(
+                "--image needs Linux (overlayfs), which {} doesn't have",
+                std::env::consts::OS
+            );
         }
         let (isolation, short_maps) = self.isolation()?;
-        let mut user = match self.user {
-            Some((name, group)) => {
-                let mut user = User::named(name, group);
-                // A container's own /etc/group, as Docker; not the host's,
-                // whose groups an ordinary user couldn't take anyway.
-                user.names.memberships = isolation.is_some();
-                user
-            }
-            // Root inside, as Docker and Podman (for a rootless caller, root
-            // inside is the caller); without isolation, the caller.
-            None if isolation.is_some() => User::new(0, 0),
-            None => User::current(),
-        };
-        user.names.additional_groups = dedup(self.group_add);
-
-        let mut env = Env::new();
-        for entry in &self.env {
-            add_env(&mut env, entry)?;
+        let volumes = self.volume_mounts()?;
+        if let Some(dir) = self.workdir.as_ref().filter(|dir| !dir.is_absolute()) {
+            bail!("--workdir must be an absolute path, not {}", dir.display());
         }
-        env.fill_default_path();
-
-        let mut spec = ProcessSpec::new(self.command);
-        spec.env = env;
-        spec.cwd = self.workdir;
-        spec.user = user;
-        spec.rlimits = last_wins(self.ulimit);
         if self.oom_score_adj.is_some() && !cfg!(target_os = "linux") {
             bail!(
                 "--oom-score-adj needs Linux's OOM killer, which {} doesn't have",
                 std::env::consts::OS
             );
         }
+        self.check_process(isolation.as_ref())?;
+        Ok(Checked::Command(Box::new(Planned {
+            args: self,
+            stop,
+            isolation,
+            short_maps,
+            volumes,
+        })))
+    }
+
+    /// The process as far as the flags give it, checked (the image's
+    /// command, environment and working directory aside: a placeholder
+    /// stands in for them, and they're checked once the image is there).
+    fn check_process(&self, isolation: Option<&Isolation>) -> Result<()> {
+        let mut command: Vec<OsString> = self
+            .entrypoint
+            .iter()
+            .filter(|given| !given.is_empty())
+            .cloned()
+            .chain(self.command.iter().cloned())
+            .collect();
+        if command.is_empty() {
+            command.push(OsString::from("true"));
+        }
+        let mut spec = ProcessSpec::new(command);
+        for entry in &self.env {
+            add_env(&mut spec.env, entry)?;
+        }
+        spec.cwd = self.workdir.clone().unwrap_or_else(|| PathBuf::from("/"));
+        spec.user = self.resolve_user(isolation, None)?;
+        spec.rlimits = last_wins(self.ulimit.clone());
         spec.oom_score_adj = self.oom_score_adj;
         spec.validate()?;
+        Ok(())
+    }
+
+    /// The `--volume`s, parsed and checked as the runtime will (a named
+    /// volume's place stands in for its directory); a host path made
+    /// absolute (symlinks resolved) and found.
+    fn volume_mounts(&self) -> Result<Vec<VolumeMount>> {
+        if !self.volume.is_empty() && self.rootfs.is_none() && self.image.is_none() {
+            bail!("--volume needs a root filesystem (--image or --rootfs)");
+        }
+        self.volume
+            .iter()
+            .map(|spec| {
+                let mut mount = VolumeMount::parse(spec)
+                    .map_err(|err| anyhow::anyhow!("--volume {spec}: {err}"))?;
+                if !shipyard_storage::volume::is_named_volume(&mount.source) {
+                    mount.source = canonical_source(&mount.source)
+                        .with_context(|| format!("--volume {spec}"))?;
+                }
+                let stand_in = Path::new("/").join(&mount.source);
+                Mount::bind(stand_in, &mount.destination)
+                    .validate()
+                    .with_context(|| format!("--volume {spec}"))?;
+                Ok(mount)
+            })
+            .collect()
+    }
+}
+
+impl Planned {
+    /// Finishes the run with `image`'s root and defaults, if it has an
+    /// image: each applies only where a flag didn't say otherwise. Named
+    /// volumes are made if new, and held: keep what's returned with them
+    /// until the run ends.
+    pub(crate) fn finish(
+        self,
+        image: Option<ImageDefaults>,
+    ) -> Result<(Invocation, Vec<VolumeHold>)> {
+        let Self {
+            args,
+            stop,
+            mut isolation,
+            short_maps,
+            volumes,
+        } = self;
+        let config = image.as_ref().map(|image| &image.config);
         let mut warnings: Vec<String> = short_maps.into_iter().collect();
+
+        // The user: an explicit --user wins; else the image's User; else the
+        // isolation default (root inside) or the caller (unisolated).
+        let user = args.resolve_user(isolation.as_ref(), config)?;
+
+        // Environment: the image's variables first, then --env (which wins),
+        // then a default PATH if none. The image's are taken as they are:
+        // one without a value is never looked up here, on the host.
+        let mut env = Env::new();
+        if let Some(config) = config {
+            add_image_env(&mut env, &config.env, &mut warnings)?;
+        }
+        for entry in &args.env {
+            add_env(&mut env, entry)?;
+        }
+        env.fill_default_path();
+
+        let mut spec = ProcessSpec::new(args.resolve_command(config)?);
+        spec.env = env;
+        spec.cwd = args.resolve_workdir(config);
+        spec.user = user;
+        spec.rlimits = last_wins(args.ulimit.clone());
+        spec.oom_score_adj = args.oom_score_adj;
+        spec.validate()?;
+
+        let mut held = Vec::new();
+        if let Some(isolation) = isolation.as_mut() {
+            if let Some(image) = image {
+                // The image's layers become the root: an overlay mounted at
+                // this path inside the container's namespaces.
+                let mut root = Root::new(image.root);
+                root.read_only = args.read_only;
+                root.overlay = Some(image.overlay);
+                isolation.root = Some(root);
+            }
+            let named = match isolation.root.as_mut() {
+                Some(root) => bind_volumes(root, volumes)?,
+                // `check` refused volumes without a root.
+                None => Vec::new(),
+            };
+            // All checked before a volume is made. An overlay path that can't
+            // be used is the image store's.
+            isolation.validate().map_err(|err| {
+                let store = matches!(
+                    err,
+                    shipyard_runtime::isolation::IsolationError::InvalidOverlayPath { .. }
+                );
+                let err = anyhow::Error::from(err);
+                if store {
+                    err.context(
+                        "the image store's path can't be used for an overlay (set \
+                         SHIPYARD_IMAGE_STORE to another directory)",
+                    )
+                } else {
+                    err
+                }
+            })?;
+            held = hold_volumes(&named)?;
+        }
         if isolation
             .as_ref()
             .and_then(|isolation| isolation.id_maps.as_ref())
@@ -232,13 +419,88 @@ impl RunArgs {
                     .to_owned(),
             );
         }
-        Ok(Invocation {
-            spec,
-            stop,
-            isolation,
-            warnings,
-        })
+        Ok((
+            Invocation {
+                spec,
+                stop,
+                isolation,
+                warnings,
+            },
+            held,
+        ))
     }
+}
+
+/// Adds an image's `Env` `entries` to `env`, as they are: one without a
+/// value (`NAME`, not `NAME=value`) is skipped with a warning, and never
+/// looked up on the host, as a `--env NAME` is (the image would read the
+/// caller's secrets).
+fn add_image_env(env: &mut Env, entries: &[String], warnings: &mut Vec<String>) -> Result<()> {
+    for entry in entries {
+        if entry.contains('=') {
+            env.push_entry(OsStr::new(entry))
+                .context("the image's Env")?;
+        } else {
+            warnings.push(format!(
+                "the image's Env entry `{entry}` has no value; ignored"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `source` made absolute, symlinks resolved, as UTF-8.
+fn canonical_source(source: &str) -> Result<String> {
+    std::fs::canonicalize(source)
+        .with_context(|| source.to_owned())?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{source}: a path that isn't UTF-8"))
+}
+
+/// Binds `volumes` into `root`: a host path as it is (resolved again, as
+/// close to the run as can be), a named volume's directory (made or not:
+/// [`hold_volumes`] makes it). Returns the named volumes' names.
+fn bind_volumes(root: &mut Root, volumes: Vec<VolumeMount>) -> Result<Vec<String>> {
+    let mut named = Vec::new();
+    let mut store = None;
+    for mount in volumes {
+        let source = if shipyard_storage::volume::is_named_volume(&mount.source) {
+            let store = match &store {
+                Some(store) => store,
+                None => store.insert(crate::volumes::volumes()?),
+            };
+            let data = store.data_path(&mount.source)?;
+            named.push(mount.source);
+            data
+        } else {
+            PathBuf::from(canonical_source(&mount.source)?)
+        };
+        let mut bind = Mount::bind(source, mount.destination);
+        if mount.read_only {
+            bind.flags
+                .push(shipyard_runtime::isolation::MountFlag::ReadOnly);
+        }
+        root.mounts.push(bind);
+    }
+    Ok(named)
+}
+
+/// Makes the named volumes `names` if new, and holds them: nothing removes
+/// a volume while its hold lives.
+fn hold_volumes(names: &[String]) -> Result<Vec<VolumeHold>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = crate::volumes::volumes()?;
+    names
+        .iter()
+        .map(|name| {
+            store
+                .hold(name)
+                .with_context(|| format!("the volume {name}"))
+        })
+        .collect()
 }
 
 /// A run of the OCI bundle in `dir`: everything but the stop policy comes
@@ -313,6 +575,7 @@ impl RunArgs {
                 (!self.uidmap.is_empty(), "--uidmap"),
                 (!self.device.is_empty(), "--device"),
                 (!self.device_cgroup_rule.is_empty(), "--device-cgroup-rule"),
+                (!self.volume.is_empty(), "--volume"),
             ] {
                 if given {
                     bail!(
@@ -349,6 +612,7 @@ impl RunArgs {
         if isolation.id_maps.is_some() {
             isolation.namespaces.push(Namespace::User);
         }
+        // An image's root comes once it's pulled (`Planned::finish`).
         if let Some(dir) = &self.rootfs {
             // Absolute and without symlinks, as the runtime wants it; and a
             // mistyped path is caught here, with its name.
@@ -363,14 +627,91 @@ impl RunArgs {
             &mut isolation.devices,
             &self.device,
             &self.device_cgroup_rule,
-            isolation.root.is_some(),
+            self.rootfs.is_some() || self.image.is_some(),
         )?;
-        isolation.validate()?;
+        if self.image.is_some() {
+            isolation.validate_expecting_root()?;
+        } else {
+            isolation.validate()?;
+        }
         Ok((Some(isolation), short_maps))
     }
 }
 
 impl RunArgs {
+    /// The user to run as: an explicit `--user` wins; else the image's `User`
+    /// (`name`, `uid`, or `uid:gid`); else root inside an isolated run, or the
+    /// caller without isolation.
+    fn resolve_user(
+        &self,
+        isolation: Option<&Isolation>,
+        image: Option<&shipyard_image::RuntimeConfig>,
+    ) -> Result<User> {
+        let spec = match &self.user {
+            Some((name, group)) => Some((name.clone(), group.clone())),
+            None => match image.and_then(|config| config.user.as_deref()) {
+                Some(user) => Some(parse_user(user).map_err(|e| anyhow::anyhow!(e))?),
+                None => None,
+            },
+        };
+        let mut user = match spec {
+            Some((name, group)) => {
+                let mut user = User::named(name, group);
+                user.names.memberships = isolation.is_some();
+                user
+            }
+            None if isolation.is_some() => User::new(0, 0),
+            None => User::current(),
+        };
+        user.names.additional_groups = dedup(self.group_add.clone());
+        Ok(user)
+    }
+
+    /// The command to run, as Docker makes it: the entrypoint (the image's,
+    /// or `--entrypoint`'s; none for `--entrypoint ""`), then the command
+    /// given, or else the image's `Cmd` (unless `--entrypoint` replaced its
+    /// entrypoint: then that goes too).
+    fn resolve_command(
+        &self,
+        image: Option<&shipyard_image::RuntimeConfig>,
+    ) -> Result<Vec<OsString>> {
+        let Some(config) = image else {
+            // Clap requires one without --image or --bundle.
+            return Ok(self.command.clone());
+        };
+        let owned = |list: &[String]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let (entrypoint, default) = match &self.entrypoint {
+            // As Docker: no entrypoint, and the image's `Cmd` if nothing's
+            // given.
+            Some(given) if given.is_empty() => (Vec::new(), owned(&config.cmd)),
+            Some(given) => (vec![given.clone()], Vec::new()),
+            None => (owned(&config.entrypoint), owned(&config.cmd)),
+        };
+        let arguments = if self.command.is_empty() {
+            default
+        } else {
+            self.command.clone()
+        };
+        let command: Vec<OsString> = entrypoint.into_iter().chain(arguments).collect();
+        if command.is_empty() {
+            bail!("the image sets no command, so give one");
+        }
+        Ok(command)
+    }
+
+    /// The working directory: `--workdir`, else the image's `WorkingDir`,
+    /// else `/`.
+    fn resolve_workdir(&self, image: Option<&shipyard_image::RuntimeConfig>) -> PathBuf {
+        self.workdir
+            .clone()
+            .or_else(|| {
+                image
+                    .and_then(|config| config.working_dir.as_deref())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
     /// The user namespace for this run, and why its maps are short if they
     /// are: for root, the one `--uidmap` asks for (if any); for anyone else,
     /// always one, with maps chosen for them by `rootless` (their own ID,
@@ -524,12 +865,100 @@ fn parse_security_opt(s: &str) -> Result<SecurityOpt, String> {
 /// exit code, or `128 + N` if signal N killed it. Failures to start it exit
 /// 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
+    let planned = match args.check()? {
+        Checked::Bundle(invocation) => return Ok(run_invocation(*invocation)?.exit()),
+        Checked::Command(planned) => planned,
+    };
+    // The flags checked, the image is made ready: pulled if it must be, its
+    // layers extracted, and the run's writable area made. The overlay is
+    // mounted by the runtime inside the container's namespaces (not here).
+    // The area and the volumes are the run's for its whole life: let go
+    // when it ends, before the CLI exits (or on an error on the way, when
+    // they drop).
+    #[cfg(target_os = "linux")]
+    let (defaults, area) = prepare_image(&planned)?.unzip();
+    #[cfg(not(target_os = "linux"))]
+    let defaults = None;
+    let (invocation, held_volumes) = planned.finish(defaults)?;
+    let ended = run_invocation(invocation)?;
+    drop(held_volumes);
+    #[cfg(target_os = "linux")]
+    if let Some(area) = area {
+        area.remove();
+    }
+    Ok(ended.exit())
+}
+
+/// Prepares the image named by `--image`, if any (Linux only): pulls it,
+/// extracts its layers and makes the run's writable area, returning the
+/// defaults a run applies and the area (to keep until the run ends).
+#[cfg(target_os = "linux")]
+fn prepare_image(planned: &Planned) -> Result<Option<(ImageDefaults, crate::image::RunArea)>> {
+    let Some(reference) = &planned.args.image else {
+        return Ok(None);
+    };
+    // As root, `--uidmap`'s maps: the layers are shifted by them. (A
+    // rootless caller's maps are its own range, which extraction uses.)
+    let maps = planned
+        .isolation
+        .as_ref()
+        .and_then(|isolation| isolation.id_maps.as_ref())
+        .filter(|_| nix::unistd::geteuid().is_root());
+    let prepared = crate::image::prepare(reference, planned.args.pull, maps)?;
+    Ok(Some((
+        ImageDefaults {
+            root: prepared.root,
+            overlay: prepared.overlay,
+            config: prepared.config,
+        },
+        prepared.area,
+    )))
+}
+
+/// What an image contributes to a run: its root filesystem (an overlay the
+/// runtime mounts) and its baked-in defaults, applied under explicit flags.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageDefaults {
+    /// The merged mount point — the container's root path.
+    pub root: PathBuf,
+    /// The overlay there (layer dirs + upper + work).
+    pub overlay: shipyard_runtime::isolation::Overlay,
+    /// The image's runtime config (default command, env, workdir, user).
+    pub config: shipyard_image::RuntimeConfig,
+}
+
+/// How a run ended, for the CLI to end the same way.
+enum Ended {
+    /// With this exit code.
+    Code(ExitCode),
+    /// Interrupted (Ctrl-C), so that a shell loop around `shipyard run`
+    /// stops too: the CLI dies from the same signal (or exits with `code`
+    /// if it can't).
+    Interrupted { signal: Signal, code: ExitCode },
+}
+
+impl Ended {
+    /// Ends the CLI as the run ended: dies from the signal, or returns the
+    /// code. (Last of all: dying from a signal runs no destructors.)
+    fn exit(self) -> ExitCode {
+        match self {
+            Self::Code(code) => code,
+            Self::Interrupted { signal, code } => {
+                process::die_from(signal);
+                code
+            }
+        }
+    }
+}
+
+/// Runs a built invocation under the supervisor.
+fn run_invocation(invocation: Invocation) -> Result<Ended> {
     let Invocation {
         spec,
         stop,
         isolation,
         warnings,
-    } = args.into_invocation()?;
+    } = invocation;
     for warning in &warnings {
         crate::warning(warning);
     }
@@ -547,16 +976,16 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
             if isolation_failed && isolation.as_ref().is_some_and(only_namespaces) {
                 crate::hint("--no-isolation runs the command without namespaces");
             }
-            return Ok(exit);
+            return Ok(Ended::Code(exit));
         }
     };
+    let code = ExitCode::from(status.code());
     if let ExitStatus::Signaled { signal, .. } = status
         && signal == Signal::INT
     {
-        // So that a shell loop around `shipyard run` stops on Ctrl-C too.
-        process::die_from(signal);
+        return Ok(Ended::Interrupted { signal, code });
     }
-    Ok(ExitCode::from(status.code()))
+    Ok(Ended::Code(code))
 }
 
 /// Whether `isolation` asks for nothing but the namespaces themselves, so
@@ -689,6 +1118,17 @@ fn parse_id(s: &str) -> Result<u32, String> {
 }
 
 #[cfg(test)]
+impl RunArgs {
+    /// Checked and finished without an image, as a run without one is.
+    fn into_invocation(self) -> Result<Invocation> {
+        match self.check()? {
+            Checked::Bundle(invocation) => Ok(*invocation),
+            Checked::Command(planned) => Ok(planned.finish(None)?.0),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
 
@@ -711,6 +1151,120 @@ mod tests {
 
     fn spec(args: &[&str]) -> ProcessSpec {
         parse(args).unwrap().into_invocation().unwrap().spec
+    }
+
+    /// An image's runtime config with this entrypoint and command.
+    fn image(entrypoint: &[&str], cmd: &[&str]) -> shipyard_image::RuntimeConfig {
+        let owned = |list: &[&str]| list.iter().map(|&s| s.to_owned()).collect();
+        shipyard_image::RuntimeConfig {
+            entrypoint: owned(entrypoint),
+            cmd: owned(cmd),
+            working_dir: Some("/app".to_owned()),
+            ..shipyard_image::RuntimeConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_command_is_dockers() {
+        let command = |args: &[&str], config: &shipyard_image::RuntimeConfig| {
+            let mut argv = vec!["--image", "x"];
+            argv.extend_from_slice(args);
+            parse(&argv)
+                .unwrap()
+                .resolve_command(Some(config))
+                .map(|command| command.join(OsStr::new(" ")).into_string().unwrap())
+        };
+        let both = image(&["/entry", "-q"], &["serve"]);
+        assert_eq!(command(&[], &both).unwrap(), "/entry -q serve");
+        assert_eq!(
+            command(&["other", "arg"], &both).unwrap(),
+            "/entry -q other arg",
+            "arguments replace Cmd, after the entrypoint"
+        );
+        assert_eq!(
+            command(&["--entrypoint", "/bin/echo"], &both).unwrap(),
+            "/bin/echo",
+            "--entrypoint drops Cmd too"
+        );
+        assert_eq!(
+            command(&["--entrypoint", "/bin/echo", "hi"], &both).unwrap(),
+            "/bin/echo hi"
+        );
+        assert_eq!(
+            command(&["--entrypoint", "", "ls", "/"], &both).unwrap(),
+            "ls /"
+        );
+        assert_eq!(
+            command(&["--entrypoint", ""], &both).unwrap(),
+            "serve",
+            "no entrypoint, the image's Cmd (as Docker)"
+        );
+        let cmd_only = image(&[], &["/bin/sh"]);
+        assert_eq!(command(&[], &cmd_only).unwrap(), "/bin/sh");
+        assert_eq!(command(&["true"], &cmd_only).unwrap(), "true");
+        let err = command(&[], &image(&[], &[])).unwrap_err();
+        assert!(err.to_string().contains("sets no command"), "{err}");
+        assert!(
+            parse(&["--entrypoint", "x", "true"]).is_err(),
+            "--entrypoint needs --image"
+        );
+    }
+
+    #[test]
+    fn an_explicit_workdir_wins_even_slash() {
+        let config = image(&[], &["sh"]);
+        let workdir = |args: &[&str]| {
+            let mut argv = vec!["--image", "x"];
+            argv.extend_from_slice(args);
+            parse(&argv).unwrap().resolve_workdir(Some(&config))
+        };
+        assert_eq!(workdir(&["-w", "/", "true"]), Path::new("/"));
+        assert_eq!(workdir(&["true"]), Path::new("/app"), "the image's");
+        assert_eq!(
+            parse(&["true"]).unwrap().resolve_workdir(None),
+            Path::new("/")
+        );
+    }
+
+    #[test]
+    fn an_images_env_never_reads_the_host() {
+        // HOME is set wherever tests run: an image naming it must not get it.
+        assert!(std::env::var_os("HOME").is_some());
+        let mut env = Env::new();
+        let mut warnings = Vec::new();
+        let entries = ["HOME".to_owned(), "LANG=C.UTF-8".to_owned()];
+        add_image_env(&mut env, &entries, &mut warnings).unwrap();
+        assert_eq!(env.get(OsStr::new("HOME")), None);
+        assert_eq!(env.get(OsStr::new("LANG")), Some(OsStr::new("C.UTF-8")));
+        assert!(warnings[0].contains("`HOME` has no value"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_volume_is_a_name_or_an_absolute_host_path_that_exists() {
+        let mounts = |spec: &str| {
+            parse(&["--rootfs", "/", "--volume", spec, "true"])
+                .unwrap()
+                .volume_mounts()
+        };
+        assert!(mounts("./here:/mnt").is_err(), "relative");
+        let missing = mounts("/no/such/dir:/mnt").unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("/no/such/dir"),
+            "{missing:#}"
+        );
+        let found = mounts("/tmp:/mnt:ro").unwrap();
+        assert!(Path::new(&found[0].source).is_absolute() && found[0].read_only);
+        assert_eq!(mounts("data:/data").unwrap()[0].source, "data");
+        let err = parse(&["--volume", "data:/data", "true"])
+            .unwrap()
+            .into_invocation()
+            .unwrap_err();
+        let expected = if cfg!(target_os = "linux") {
+            "needs a root filesystem"
+        } else {
+            "--volume needs Linux"
+        };
+        assert!(err.to_string().contains(expected), "{err}");
     }
 
     #[test]
@@ -1181,7 +1735,11 @@ mod tests {
         let isolation = |args: &[&str]| parse(args).unwrap().into_invocation();
         // Contradictions, whatever the system.
         assert!(parse(&["--no-isolation", "--rootfs", "/", "true"]).is_err());
-        assert!(parse(&["--read-only", "true"]).is_err(), "needs --rootfs");
+        assert!(
+            parse(&["--read-only", "true"]).is_err(),
+            "needs --rootfs or --image"
+        );
+        assert!(parse(&["--read-only", "--image", "alpine", "true"]).is_ok());
         let missing = isolation(&["--rootfs", "/no/such/dir", "true"]).unwrap_err();
         assert!(format!("{missing:#}").contains("--rootfs"), "{missing:#}");
         if cfg!(target_os = "linux") {

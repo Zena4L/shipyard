@@ -1,0 +1,38 @@
+[package]
+name = "shipyard-image"
+description = "OCI/Docker images: registry client, manifests, content-addressed store, safe layer unpacking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Portable (cfg(unix)): pulling, digests, decompression, tar parsing and the
+# on-disk store all run on macOS and Linux, so most of stage 6 is testable and
+# fuzzable without the Linux VM.
+# Credentials from Docker's config (`auth` is base64).
+base64.workspace = true
+flate2.workspace = true
+# `fsetxattr`, which `nix` doesn't wrap (file capabilities, opaque marks).
+libc.workspace = true
+# Filesystem work by directory descriptor (`openat` and the other `*at()`
+# calls), so nothing in an untrusted layer is ever reached by path.
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# Building test archives only: layers are read by Shipyard's own reader
+# (`tar_reader.rs`), which bounds what an untrusted archive can make it hold.
+tar.workspace = true
+
+[lints]
+workspace = true

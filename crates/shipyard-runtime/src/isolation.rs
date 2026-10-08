@@ -253,6 +253,27 @@ impl Isolation {
     /// that isn't valid, or a root filesystem without a mount namespace or
     /// with paths that aren't absolute.
     pub fn validate(&self) -> Result<(), IsolationError> {
+        self.check(self.root.is_some())?;
+        if let Some(root) = &self.root {
+            root.validate()?;
+        }
+        Ok(())
+    }
+
+    /// As [`validate`](Self::validate), for an isolation whose root
+    /// filesystem comes later (an image's, made once it's pulled): every
+    /// check but the root's own, as if it were there. So a mistake shows
+    /// before the root costs anything to make.
+    ///
+    /// # Errors
+    ///
+    /// As [`validate`](Self::validate), the root's paths aside.
+    pub fn validate_expecting_root(&self) -> Result<(), IsolationError> {
+        self.check(true)
+    }
+
+    /// Every check but the root's paths, with or without a root.
+    fn check(&self, with_root: bool) -> Result<(), IsolationError> {
         check_kinds(&self.namespaces)?;
         match (&self.id_maps, self.has(Namespace::User)) {
             (Some(maps), true) => maps.validate()?,
@@ -269,7 +290,7 @@ impl Isolation {
         self.devices.validate()?;
         // Nodes are made in the container's own `/dev`: without a root
         // filesystem, `/dev` is the host's.
-        if !self.devices.nodes.is_empty() && self.root.is_none() {
+        if !self.devices.nodes.is_empty() && !with_root {
             return Err(IsolationError::DeviceNodesNeedRoot);
         }
         if let Some(container) = &self.hooks {
@@ -301,7 +322,7 @@ impl Isolation {
         for (key, value) in &self.sysctls {
             validate_sysctl(key, value, self.has(Namespace::Ipc))?;
         }
-        if let Some(root) = &self.root {
+        if with_root {
             // Without its own mount namespace, the pivot would move the
             // host's processes into the container's root.
             if !self.has(Namespace::Mount) {
@@ -313,7 +334,6 @@ impl Isolation {
             if self.has(Namespace::User) && !self.has(Namespace::Pid) {
                 return Err(IsolationError::UserRootNeedsPid);
             }
-            root.validate()?;
         }
         Ok(())
     }
@@ -369,6 +389,70 @@ pub struct Root {
     pub readonly_paths: Vec<PathBuf>,
     /// More mounts, in order, after `/proc`, `/sys` and `/dev`.
     pub mounts: Vec<Mount>,
+    /// If set, the root is an overlay of an image's layers: mounted at
+    /// [`path`](Self::path) *inside the container's namespaces*, where the
+    /// kernel permits it (rootless overlay needs the container's user
+    /// namespace); or, for a user namespace real root sets up (`--uidmap`),
+    /// whose root can't reach the layers, made by real root and attached
+    /// inside.
+    pub overlay: Option<Overlay>,
+}
+
+/// An overlay to mount as the root filesystem: read-only lower (image) layers
+/// stacked under a writable upper layer. The engine extracts the layers to
+/// directories; see [`Root::overlay`] for who mounts them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Overlay {
+    /// The read-only layer directories, base first (the init reverses them
+    /// into overlay's top-first option order).
+    pub lower: Vec<PathBuf>,
+    /// The writable upper directory.
+    pub upper: PathBuf,
+    /// The overlay work directory.
+    pub work: PathBuf,
+}
+
+impl Overlay {
+    /// An overlay from its layer directories (base first), writable upper, and
+    /// work directory.
+    #[must_use]
+    pub fn new(lower: Vec<PathBuf>, upper: PathBuf, work: PathBuf) -> Self {
+        Self { lower, upper, work }
+    }
+
+    /// Rejects what overlay would refuse, or misread: no layer; a path that
+    /// isn't plainly absolute, or holds a `,`, `:` or `\\` (which an old
+    /// kernel's mount options separate or escape with); an upper and work
+    /// directory on
+    /// different parents (overlay wants them on one filesystem, and the
+    /// engine makes them side by side).
+    fn validate(&self) -> Result<(), IsolationError> {
+        let invalid = |path: &Path, reason| IsolationError::InvalidOverlayPath {
+            path: path.to_owned(),
+            reason,
+        };
+        if self.lower.is_empty() {
+            return Err(IsolationError::OverlayWithoutLayers);
+        }
+        for path in self.lower.iter().chain([&self.upper, &self.work]) {
+            if !is_plain_absolute(path) {
+                return Err(invalid(path, "it must be absolute, without . or .."));
+            }
+            if path
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .any(|b| matches!(b, b',' | b':' | b'\\'))
+            {
+                return Err(invalid(path, "it can't hold a `,`, `:` or `\\`"));
+            }
+        }
+        if self.upper.parent() != self.work.parent() {
+            return Err(invalid(&self.work, "it must be beside the upper directory"));
+        }
+        Ok(())
+    }
 }
 
 /// A mount in the container: a host directory or file bound in, or a fresh
@@ -451,7 +535,14 @@ impl Mount {
         self.flags.contains(&flag)
     }
 
-    fn validate(&self) -> Result<(), IsolationError> {
+    /// Rejects a mount the container must not have: a destination that
+    /// isn't plainly absolute, or is `/`, `/dev`, or in `/proc` or `/sys`; a
+    /// bind source that isn't plainly absolute; options with a NUL byte.
+    ///
+    /// # Errors
+    ///
+    /// [`IsolationError::InvalidMount`], saying why.
+    pub fn validate(&self) -> Result<(), IsolationError> {
         let invalid = |reason| IsolationError::InvalidMount {
             destination: self.destination.clone(),
             reason,
@@ -492,6 +583,7 @@ impl Root {
             masked_paths: DEFAULT_MASKED_PATHS.map(PathBuf::from).to_vec(),
             readonly_paths: DEFAULT_READONLY_PATHS.map(PathBuf::from).to_vec(),
             mounts: Vec::new(),
+            overlay: None,
         }
     }
 
@@ -510,6 +602,9 @@ impl Root {
         let inside = self.masked_paths.iter().chain(&self.readonly_paths);
         if let Some(path) = inside.into_iter().find(|path| !is_plain_absolute(path)) {
             return Err(IsolationError::InvalidContainerPath(path.clone()));
+        }
+        if let Some(overlay) = &self.overlay {
+            overlay.validate()?;
         }
         self.mounts.iter().try_for_each(Mount::validate)
     }
@@ -747,6 +842,17 @@ pub enum IsolationError {
     /// The root filesystem's path isn't absolute, or has `.` or `..` in it.
     #[error("the root filesystem's path must be absolute, without . or .. (got {})", .0.display())]
     InvalidRootPath(PathBuf),
+    /// An image's overlay has no layer.
+    #[error("an image's overlay needs at least one layer")]
+    OverlayWithoutLayers,
+    /// A path of an image's overlay can't be used.
+    #[error("the overlay path {}: {reason}", path.display())]
+    InvalidOverlayPath {
+        /// The path.
+        path: PathBuf,
+        /// Why.
+        reason: &'static str,
+    },
     /// A masked or read-only path isn't absolute, or has `.` or `..` in it.
     #[error("paths inside the container must be absolute, without . or .. (got {})", .0.display())]
     InvalidContainerPath(PathBuf),
@@ -817,6 +923,83 @@ pub enum IsolationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root that comes later is checked as if it were there, but for its
+    /// own paths.
+    #[test]
+    fn expecting_a_root_checks_all_but_the_roots_paths() {
+        use crate::devices::{DeviceKind, DeviceNode};
+        let mut isolation = Isolation::standard();
+        isolation
+            .devices
+            .nodes
+            .push(DeviceNode::new("/dev/fuse", DeviceKind::Char, 10, 229));
+        assert_eq!(
+            isolation.validate(),
+            Err(IsolationError::DeviceNodesNeedRoot)
+        );
+        assert_eq!(isolation.validate_expecting_root(), Ok(()));
+        isolation.namespaces = vec![Namespace::Uts];
+        assert_eq!(
+            isolation.validate_expecting_root(),
+            Err(IsolationError::RootNeedsMount)
+        );
+        let mut hostname = Isolation::standard();
+        hostname.hostname = Some("bad_name".to_owned());
+        assert!(hostname.validate_expecting_root().is_err());
+    }
+
+    #[test]
+    fn an_overlay_is_checked_before_it_reaches_the_kernel() {
+        let good = || {
+            Overlay::new(
+                vec!["/s/layers/a/diff".into(), "/s/layers/b/diff".into()],
+                "/s/containers/run-1/upper".into(),
+                "/s/containers/run-1/work".into(),
+            )
+        };
+        let check = |overlay: Overlay| {
+            let mut root = Root::new("/s/containers/run-1/merged");
+            root.overlay = Some(overlay);
+            root.validate()
+        };
+        assert_eq!(check(good()), Ok(()));
+        let mut none = good();
+        none.lower.clear();
+        assert_eq!(check(none), Err(IsolationError::OverlayWithoutLayers));
+        for bad in [
+            "/s:x/layers/a/diff",
+            "/s,x/layers/a/diff",
+            "s/layers/a",
+            "/s/../a",
+        ] {
+            let mut overlay = good();
+            overlay.lower[0] = bad.into();
+            assert!(
+                matches!(
+                    check(overlay),
+                    Err(IsolationError::InvalidOverlayPath { .. })
+                ),
+                "{bad}"
+            );
+        }
+        for bad in ["/s/containers/run,1/upper", "/s/containers/run\\1/upper"] {
+            let mut overlay = good();
+            overlay.upper = bad.into();
+            overlay.work = std::path::Path::new(bad).with_file_name("work");
+            let checked = check(overlay);
+            assert!(
+                matches!(checked, Err(IsolationError::InvalidOverlayPath { .. })),
+                "{bad}: {checked:?}"
+            );
+        }
+        let mut apart = good();
+        apart.work = "/elsewhere/work".into();
+        assert!(matches!(
+            check(apart),
+            Err(IsolationError::InvalidOverlayPath { .. })
+        ));
+    }
 
     #[test]
     fn a_root_needs_a_mount_namespace_and_plain_absolute_paths() {

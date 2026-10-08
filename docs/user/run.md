@@ -287,6 +287,12 @@ sudo shipyard run --uidmap 0:100000:65536 sh -c 'id; cat /proc/self/uid_map'
   sudo shipyard run --uidmap 0:100000:65536 --rootfs rootfs sh
   ```
 
+  With `--image`, that's done for you: the image's layers are extracted again for
+  that map, as a copy whose files belong to the mapped IDs (one copy per distinct
+  map, removed with the image), and the container's writable layer belongs to the
+  mapped root. Shipyard (as root) mounts the image itself, since the mapped root
+  can't reach the store; that needs Linux 6.8 or later.
+
 - **`/dev` and `/sys` are the host's, bound in.** A user namespace can't create
   device nodes, so `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`,
   `/dev/urandom` and `/dev/tty` are binds of the host's own. `/sys` is the host's,
@@ -427,11 +433,12 @@ shipyard run --rootfs ./rootfs sh
 With `--rootfs DIR`, the directory DIR becomes the container's `/`. The command
 sees only what's in it: nothing of the host's files is reachable from inside. DIR
 must hold the programs you run and everything they need (their libraries, for
-example). Any directory works, such as an unpacked image or a `debootstrap`. Pulling
-images comes in a later version.
+example). Any directory works, such as an unpacked image or a `debootstrap`. To
+run a pulled image instead of a prepared directory, use `--image` (below).
 
 The program and the working directory (`-w`) are looked up inside DIR, with the
-container's `PATH`.
+container's `PATH`. A working directory DIR doesn't have is made there (root's,
+`rwxr-xr-x`), as Docker does.
 
 Shipyard adds what every container needs:
 
@@ -489,6 +496,64 @@ they are. The mount's other options, such as `nosuid` or `noexec`, are kept.
   program up on the host to explain the error, where such a link may resolve.
 - **"mounted noexec"** (exit code 126): DIR is on a file system that forbids
   running programs (on some systems, `/tmp`). Put it somewhere else.
+
+## Image (`--image`)
+
+Instead of preparing a root filesystem by hand, run a pulled image:
+
+```sh
+shipyard run --image alpine:3.20 cat /etc/alpine-release
+```
+
+Shipyard pulls the image (if the store doesn't have it), stacks its layers into a
+root filesystem with overlayfs, and runs it. Every flag is checked first, so a
+mistake costs no download. The image's baked-in environment, working directory,
+user and command are the defaults; any flag you give wins over them:
+
+- **The command** is made as Docker makes it: the image's entrypoint, then the
+  command you give, or else the image's default command (`Cmd`).
+  `--entrypoint PROGRAM` runs PROGRAM instead of the image's entrypoint (and drops
+  its default command too); `--entrypoint ""` runs your command alone.
+- **The environment** is the image's, then each `--env` (which wins). An image's
+  variable is taken as the image sets it, never from your shell.
+- **The working directory** is `--workdir`, else the image's, else `/`. If the
+  image doesn't have it, it's made (root's, `rwxr-xr-x`), as Docker does.
+- **The user** is `--user`, else the image's, else root inside the container.
+
+```sh
+shipyard run --image nginx:alpine nginx -v            # its entrypoint, your arguments
+shipyard run --image alpine:3.20 --entrypoint /bin/echo hi
+shipyard run --image node:20 -w / pwd                 # / (not the image's workdir)
+```
+
+`--pull WHEN` says when to pull: `missing` (the default: only if the store
+doesn't have the image), `always` (ask the registry each time, as a tag may have
+moved), or `never` (the store's copy, or an error). A stored image runs without a
+network.
+
+`--image` can't be combined with `--rootfs` (they're two ways to give the root).
+It works with the rest of `run` — `--read-only`, limits, `--volume`, capabilities.
+`--read-only` needs one of the two: without a root filesystem of the container's
+own, there's nothing of its own to make read-only.
+Running an image needs Linux (overlayfs); see [Images](images.md) for references,
+the store, and the `images`/`rmi`/`prune` commands.
+
+## Volumes (`--volume`)
+
+Mount persistent storage or a host path into the container:
+
+```sh
+shipyard run --image alpine --volume data:/var/lib/data …     # a named volume
+shipyard run --image alpine --volume /host/dir:/mnt:ro …      # a host path, read-only
+```
+
+`--volume SOURCE:DEST[:ro]`: a bare `SOURCE` (no slash) is a **named volume**,
+created on first use and kept from removal while the container runs; an absolute
+host path (it must exist; symlinks are resolved) is **bind-mounted**. `DEST` is
+where it appears inside (absolute; not `/`, `/dev`, or in `/proc` or `/sys`).
+`:ro` mounts it read-only. Repeatable. A volume needs a root filesystem, so use
+`--volume` with `--image` or `--rootfs`. Every `--volume` is checked before an
+image is pulled. See [Volumes](volumes.md).
 
 ## Environment
 

@@ -156,33 +156,50 @@ Shipyard has three layers, mirroring how the established tools split up:
 **Images**
 
 - **Formats:** the [OCI image spec](https://github.com/opencontainers/image-spec), plus
-  Docker v2 manifests for compatibility.
+  Docker v2 manifests for compatibility (Docker's `null` lists included).
 - **Registry client** ([OCI distribution spec](https://github.com/opencontainers/distribution-spec)):
-  - token authentication
-  - Docker Hub, GHCR and private registries
-  - credential helpers
-- **Multi-arch:** pick the right platform from a manifest list (e.g. `linux/arm64`).
+  - Bearer token and Basic authentication
+  - Docker Hub, GHCR and private registries, over HTTPS with the system's trust store
+    (plain HTTP only on loopback)
+  - credentials read from Docker's config: `auths`, `credsStore`, `credHelpers`
+    (`docker-credential-*` helpers) and identity tokens; `shipyard login` later
+- **Multi-arch:** pick the right platform from a manifest list (e.g. `linux/arm64`,
+  with ARM variants).
 - **Downloads:**
-  - parallel and resumable
-  - sha256 verification of every blob
-  - gzip and zstd decompression
+  - parallel, and resumable (HTTP `Range`) across retries and across pulls
+  - sha256 verification of every blob, a digest pin checked, every size bounded
+  - gzip decompression; zstd later (a zstd layer is refused by name)
 - **Safe layer unpacking:**
-  - deletion markers: `.wh.` whiteout files and opaque directories
-  - protection against path traversal and malicious tar entries
-- **Content-addressed store:** identical layers are stored once.
-- **Commands:** `images`, `pull`, `tag`, `rmi`, `inspect`, `history`, `save`/`load`,
-  `import`/`export`.
-- **Garbage collection:** reference-counted, plus `prune`.
+  - every path reached by directory descriptor, never through a symlink; hard links
+    only to the layer's own files
+  - deletion markers: `.wh.` whiteout files and opaque directories, made as overlayfs
+    reads them
+  - owners, modes, times and file capabilities as the image gives them; rootless, in a
+    user namespace with the caller's subordinate IDs
+  - limits against archive bombs; the layer's digest and `diff_id` both checked
+  - fuzzed (cargo-fuzz targets for the parsers and the unpacker)
+- **Content-addressed store:** identical layers are stored once; shared safely by
+  concurrent pulls, runs and collections.
+- **Commands:** `pull`, `images`, `rmi`, `image prune`, `run --image` (with `--pull`
+  and `--entrypoint`). `tag`, `inspect`, `history`, `save`/`load`, `import`/`export`
+  move to stage 9.
+- **Garbage collection:** reference-counted, plus `prune`; never what a running
+  container or a pull in progress uses.
 - *Later:* `push`, signature verification (cosign / sigstore).
 
 **Storage**
 
-- **overlayfs layer driver:** read-only image layers plus a per-container writable layer.
-- **Rootless overlayfs:** native on kernel 5.11+, with a `fuse-overlayfs` fallback.
-- **Mount types:** named volumes, bind mounts and tmpfs mounts.
-- **Mount options:** read-only/read-write and propagation.
+- **overlayfs layer driver:** read-only image layers plus a per-container writable
+  layer, mounted inside the container's namespaces (the new mount API on Linux 6.8+, a
+  `mount(2)` fallback before), with a clear message when the system refuses it.
+- **Rootless overlayfs:** native on kernel 5.11+. The `fuse-overlayfs` fallback moves
+  to later: it needs a helper outside the container's PID namespace to be safe.
+- **`--uidmap` with images** (as root): layers extracted again for the map.
+- **Mount types:** named volumes and bind mounts (`--volume`), kept from removal while
+  in use. tmpfs mounts and propagation options come with `--mount` (stage 9).
+- **Mount options:** read-only/read-write.
 - **Commands:** `volume create / ls / inspect / rm / prune`.
-- **Disk accounting:** `system df`.
+- **Disk accounting:** `system df` (images, containers' writable layers, volumes).
 
 ## 7. Networking — stage 7
 

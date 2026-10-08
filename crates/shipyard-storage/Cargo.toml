@@ -1,0 +1,18 @@
+[package]
+name = "shipyard-storage"
+description = "Container storage: named volumes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `flock`: a volume a run uses is held, so nothing removes it.
+nix.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

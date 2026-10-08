@@ -12,3 +12,9 @@
 # Local container state during development
 /.shipyard/
 /docs/book
+
+# cargo-fuzz's output, where it runs on the host (fuzz/)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

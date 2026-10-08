@@ -7,9 +7,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The programs every test root filesystem has, in `/bin`.
-pub const PROGRAMS: [&str; 13] = [
+pub const PROGRAMS: [&str; 15] = [
     "sh", "cat", "ls", "stat", "touch", "head", "sleep", "readlink", "mkdir", "wc", "stty", "tty",
-    "mknod",
+    "mknod", "chown", "chmod",
 ];
 
 /// What `/marker` holds: proof the command sees this root filesystem.

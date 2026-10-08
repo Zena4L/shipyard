@@ -399,6 +399,8 @@ struct CleanImageFiles {
     gate: Option<RawFd>,
     /// The hooks pipe (read, write), if the setup stops for hooks.
     hooks: Option<(OwnedFd, OwnedFd)>,
+    /// An image's overlay made here (see [`prebuilt_overlay`]).
+    overlay: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -415,6 +417,7 @@ impl CleanImageFiles {
             .is_some_and(|container| container.hooks.during_setup())
             .then(hooks_pipe)
             .transpose()?;
+        let overlay = prebuilt_overlay(isolation)?;
         Ok(Self {
             status_read,
             status_write,
@@ -426,10 +429,12 @@ impl CleanImageFiles {
                 options.gate,
                 options.cgroup.is_some(),
                 hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
+                overlay.as_ref().map(AsRawFd::as_raw_fd),
             )
             .to_memfd()?,
             gate: options.gate,
             hooks,
+            overlay,
         })
     }
 
@@ -464,8 +469,48 @@ impl CleanImageFiles {
             exe: self.exe.as_raw_fd(),
             gate: self.gate,
             hooks: self.hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
+            overlay: self.overlay.as_ref().map(AsRawFd::as_raw_fd),
         }
     }
+}
+
+/// An image's overlay, made here by real root for a container with a user
+/// namespace of its own (`--uidmap`): the container's root is another host
+/// user, which can't reach the image store (private to root), so it can't
+/// mount the overlay itself. Overlay reaches its layers as whoever made it.
+/// The detached mount, for the init to attach; `None` where the init mounts
+/// it (no user namespace, or rootless: the store is the caller's).
+#[cfg(target_os = "linux")]
+fn prebuilt_overlay(isolation: &Isolation) -> Result<Option<OwnedFd>> {
+    let Some(root) = &isolation.root else {
+        return Ok(None);
+    };
+    let Some(overlay) = &root.overlay else {
+        return Ok(None);
+    };
+    if isolation.id_maps.is_none() || !nix::unistd::geteuid().is_root() {
+        return Ok(None);
+    }
+    let lower: Vec<&std::path::Path> = overlay
+        .lower
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    // `userxattr`: the mapped layers carry only `user.overlay.*` marks
+    // (`trusted.*` ones aren't made for them).
+    let mounted = super::rootfs::overlay::build(&lower, &overlay.upper, &overlay.work, true)
+        .map_err(|err| match err {
+            super::rootfs::overlay::NewApi::Unsupported => Error::sys(
+                "mounting the image's overlay for a user namespace (--uidmap with an image \
+                 needs Linux 6.8 or later, and an image store on a disk filesystem: see \
+                 SHIPYARD_IMAGE_STORE)",
+                nix::errno::Errno::ENOSYS,
+            ),
+            super::rootfs::overlay::NewApi::Failed(errno) => {
+                Error::sys("mounting the image's overlay for a user namespace", errno)
+            }
+        })?;
+    Ok(Some(mounted))
 }
 
 /// The running shipyard binary, for the cloned child to re-exec (see

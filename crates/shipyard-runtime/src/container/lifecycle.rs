@@ -978,7 +978,13 @@ fn cgroup_of(id: &str, record: Option<&Record>) -> Result<cgroup::Cgroup> {
 pub fn delete(root: &Path, id: &str, force: bool) -> Result<Vec<String>> {
     let dir = existing(root, id)?;
     let lock = lock(&dir)?;
-    let status = status_of(&dir)?;
+    // An init that's gone is stopped enough here, its monitor still cleaning
+    // up or not: this removes the cgroup itself, under the lock the monitor
+    // waits for (and whose directory, once gone, it leaves alone).
+    let status = match status_of(&dir)? {
+        Status::Created | Status::Running | Status::Paused if init_gone(&dir)? => Status::Stopped,
+        status => status,
+    };
     match status {
         Status::Running | Status::Paused if !force => {
             return Err(wrong(id, status, "delete", "stopped (or --force)"));
@@ -990,7 +996,7 @@ pub fn delete(root: &Path, id: &str, force: bool) -> Result<Vec<String>> {
                 let _ = signal_process(pid, started, libc::SIGKILL);
             }
             let deadline = Instant::now() + WAIT;
-            while status_of(&dir)? != Status::Stopped {
+            while !init_gone(&dir)? {
                 if Instant::now() > deadline {
                     return Err(ContainerError::Setup(format!("container {id} didn't stop")));
                 }
@@ -1171,7 +1177,12 @@ fn wrong(id: &str, status: Status, action: &'static str, wanted: &'static str) -
 }
 
 /// Where the container is: stopped once it ended (its exit recorded, or its
-/// init gone or replaced), created while the gate is there, running after.
+/// init gone or replaced and its monitor too), created while the gate is
+/// there, running after.
+///
+/// An init that's gone isn't enough while its monitor lives: the monitor is
+/// still removing the cgroup, and a stopped container has nothing left (a
+/// `cgroupsPath` it names is free to make again).
 fn status_of(dir: &Path) -> Result<Status> {
     let Some(record) = read_record(dir)? else {
         return Ok(Status::Creating);
@@ -1179,7 +1190,10 @@ fn status_of(dir: &Path) -> Result<Status> {
     let Some((pid, started)) = record.init else {
         return Ok(Status::Creating);
     };
-    if dir.join(EXIT_FILE).exists() || !is_init(pid, started) {
+    let monitor_alive = record
+        .monitor
+        .is_some_and(|(monitor, started)| is_alive(monitor, started));
+    if dir.join(EXIT_FILE).exists() || !(is_alive(pid, started) || monitor_alive) {
         return Ok(Status::Stopped);
     }
     if record
@@ -1194,6 +1208,15 @@ fn status_of(dir: &Path) -> Result<Status> {
     } else {
         Status::Running
     })
+}
+
+/// Whether the container's init ended (its exit recorded, or it's gone or
+/// replaced), whatever its monitor is doing.
+fn init_gone(dir: &Path) -> Result<bool> {
+    Ok(dir.join(EXIT_FILE).exists()
+        || read_record(dir)?
+            .and_then(|record| record.init)
+            .is_some_and(|(pid, started)| !is_alive(pid, started)))
 }
 
 fn read_record(dir: &Path) -> Result<Option<Record>> {
@@ -1268,8 +1291,9 @@ fn parse_stat(stat: &[u8]) -> Option<u64> {
     fields.nth(18)?.parse().ok()
 }
 
-/// Whether `pid` is still the init recorded with start time `started`.
-fn is_init(pid: i32, started: u64) -> bool {
+/// Whether `pid` is still the process (an init or a monitor) recorded with
+/// start time `started`: not gone, nor its PID reused.
+fn is_alive(pid: i32, started: u64) -> bool {
     start_time(pid) == Some(started)
 }
 
@@ -1284,7 +1308,7 @@ fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     let pidfd = libc::c_int::try_from(pidfd).unwrap_or(-1);
     if pidfd < 0 {
-        if !is_init(pid, started) {
+        if !is_alive(pid, started) {
             return Err(Errno::ESRCH);
         }
         return nix::sys::signal::kill(
@@ -1294,7 +1318,7 @@ fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()
     }
     // SAFETY: `pidfd_open` just returned it; nothing else owns it.
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-    if !is_init(pid, started) {
+    if !is_alive(pid, started) {
         return Err(Errno::ESRCH);
     }
     // SAFETY: a valid pidfd, a signal number, no siginfo, no flags.
@@ -1332,9 +1356,9 @@ mod tests {
     fn this_process_is_its_own_init() {
         let me = i32::try_from(std::process::id()).unwrap();
         let started = start_time(me).unwrap();
-        assert!(is_init(me, started));
+        assert!(is_alive(me, started));
         assert!(
-            !is_init(me, started + 1),
+            !is_alive(me, started + 1),
             "a reused PID has another start time"
         );
         assert_eq!(signal_process(me, started + 1, 0), Err(Errno::ESRCH));
@@ -1367,6 +1391,16 @@ mod tests {
         assert_eq!(status_of(&dir).unwrap(), Status::Running);
         write_record(&dir, &record(Some((me, 1)))).unwrap();
         assert_eq!(status_of(&dir).unwrap(), Status::Stopped, "a reused PID");
+        let finishing = Record {
+            monitor: Some((me, start_time(me).unwrap())),
+            ..record(Some((me, 1)))
+        };
+        write_record(&dir, &finishing).unwrap();
+        assert_eq!(
+            status_of(&dir).unwrap(),
+            Status::Running,
+            "an init gone, its monitor still cleaning up"
+        );
         write_record(&dir, &record(Some((me, start_time(me).unwrap())))).unwrap();
         std::fs::write(dir.join(EXIT_FILE), "exited").unwrap();
         assert_eq!(status_of(&dir).unwrap(), Status::Stopped);
