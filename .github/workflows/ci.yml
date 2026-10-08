@@ -125,6 +125,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: rustup target add x86_64-unknown-linux-musl
+      # rustls' crypto provider, ring, compiles C, and for a musl target its
+      # build looks for `musl-gcc`.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
       - run: cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-musl
 
   docs:

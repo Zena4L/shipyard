@@ -43,7 +43,7 @@ CI runs, on every push and PR:
   `SHIPYARD_TEST_ROOTLESS=required`, so a rootless test that can't run fails instead
   of skipping;
 - the tests again as root on Linux and macOS (see below);
-- clippy for `x86_64-unknown-linux-musl`;
+- clippy for `x86_64-unknown-linux-musl` (with `musl-tools`: ring compiles C with `musl-gcc`);
 - the docs build (warnings as errors);
 - cargo-deny.
 

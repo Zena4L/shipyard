@@ -2031,6 +2031,36 @@ pub(crate) mod tests {
         assert!(!dest.join(".wh.gone").exists() && !dest.join("opaque/.wh..wh..opq").exists());
     }
 
+    /// An owner the ranges don't cover (a user namespace with too few IDs)
+    /// gives way to 0, and its file loses setuid and setgid: a setuid
+    /// program of root's it was never meant to be.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs root"]
+    fn an_owner_outside_the_ranges_becomes_root_without_setuid() {
+        let scratch = Scratch::new("collapse");
+        let mut layer = Layer::default();
+        layer
+            .file_owned("inside", 0o4755, (1000, 1000))
+            .file_owned("outside", 0o6755, (70000, 1000));
+        let options = UnpackOptions {
+            ownership: Ownership::Apply {
+                uids: IdRanges(vec![(0, 65536)]),
+                gids: IdRanges(vec![(0, 65536)]),
+                shift: None,
+            },
+            ..keep()
+        };
+        let (dest, result) = extract_with(&scratch, &layer, &[], &options);
+        let report = result.unwrap();
+        let inside = std::fs::metadata(dest.join("inside")).unwrap();
+        assert_eq!((inside.uid(), inside.mode() & 0o7777), (1000, 0o4755));
+        let outside = std::fs::metadata(dest.join("outside")).unwrap();
+        assert_eq!((outside.uid(), outside.gid()), (0, 1000));
+        assert_eq!(outside.mode() & 0o7777, 0o755, "setuid and setgid dropped");
+        assert_eq!(report.ids_collapsed, 1);
+    }
+
     proptest::proptest! {
         /// Whatever a layer of files, directories, links and whiteouts does,
         /// nothing outside it changes.
