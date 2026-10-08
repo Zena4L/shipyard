@@ -513,7 +513,8 @@ user and command are the defaults; any flag you give wins over them:
 - **The command** is made as Docker makes it: the image's entrypoint, then the
   command you give, or else the image's default command (`Cmd`).
   `--entrypoint PROGRAM` runs PROGRAM instead of the image's entrypoint (and drops
-  its default command too); `--entrypoint ""` runs your command alone.
+  its default command too); `--entrypoint ""` runs your command alone (or, with none, the image's default
+  command, as Docker does).
 - **The environment** is the image's, then each `--env` (which wins). An image's
   variable is taken as the image sets it, never from your shell.
 - **The working directory** is `--workdir`, else the image's, else `/`. If the

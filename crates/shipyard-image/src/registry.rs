@@ -666,8 +666,10 @@ impl Registry {
             .param("realm")
             .ok_or_else(|| self.auth_error("the challenge names no realm"))?;
         // A token over plain HTTP could be read or swapped on the way, and a
-        // realm can't move a pull off HTTPS (or send credentials off it).
-        if self.secure && !realm.starts_with("https://") {
+        // realm can't move a pull off HTTPS (or send credentials off it); a
+        // loopback registry's realm may be plain HTTP only on this machine
+        // too.
+        if !realm_allowed(realm, self.secure) {
             return Err(self.auth_error("the token realm isn't HTTPS"));
         }
         let scope = bearer
@@ -1085,6 +1087,20 @@ pub(crate) fn parse_token(bytes: &[u8]) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
+/// Whether a token `realm` may be asked: over HTTPS, or (for a registry
+/// reached over plain HTTP, on this machine) a plain-HTTP realm on this
+/// machine too. Anything that doesn't plainly name a loopback host
+/// (`user@host`, another scheme) is refused.
+fn realm_allowed(realm: &str, secure: bool) -> bool {
+    if realm.starts_with("https://") {
+        return true;
+    }
+    !secure
+        && realm
+            .strip_prefix("http://")
+            .is_some_and(|rest| rest.split(['/', '?', '#']).next().is_some_and(is_loopback))
+}
+
 /// Whether `host` (with an optional port) is this machine.
 fn is_loopback(host: &str) -> bool {
     let without_port = if let Some(rest) = host.strip_prefix('[') {
@@ -1250,6 +1266,30 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("isn't HTTPS"), "{err}");
+    }
+
+    /// A registry on this machine is reached over plain HTTP, and so may its
+    /// token realm be, but only on this machine: credentials never cross
+    /// the network unencrypted.
+    #[test]
+    fn a_plain_http_realm_must_be_on_this_machine() {
+        for realm in ["https://auth.example/token", "https://127.0.0.1/t"] {
+            assert!(realm_allowed(realm, true), "{realm}");
+            assert!(realm_allowed(realm, false), "{realm}");
+        }
+        assert!(realm_allowed("http://127.0.0.1:5000/token?x=1", false));
+        assert!(realm_allowed("http://localhost/token", false));
+        assert!(realm_allowed("http://[::1]:5000", false));
+        assert!(!realm_allowed("http://127.0.0.1/token", true));
+        for realm in [
+            "http://auth.example/token",
+            "http://127.0.0.1@auth.example/token",
+            "http://localhost.auth.example/token",
+            "ftp://127.0.0.1/token",
+            "HTTP://auth.example/token",
+        ] {
+            assert!(!realm_allowed(realm, false), "{realm}");
+        }
     }
 
     #[test]

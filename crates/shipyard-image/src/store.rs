@@ -104,7 +104,10 @@ impl StoreLock {
 
     /// Turns an exclusive lock into a shared one, for the slow part of a
     /// collection (deleting what it moved to trash): runs can start
-    /// meanwhile, and no other collection can.
+    /// meanwhile. `flock(2)` doesn't make the change atomic (the old lock
+    /// goes first), so another collection waiting for the lock may get it
+    /// in between, and delete the same trash; removal tolerates that
+    /// (what another process removed first counts as removed).
     ///
     /// # Errors
     ///

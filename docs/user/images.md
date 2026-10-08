@@ -47,6 +47,9 @@ shipyard pull alpine:3.20       # prints each layer, then Digest: sha256:…
 shipyard pull -q alpine:3.20    # the digest only
 ```
 
+The digest printed is the manifest of this machine's platform, the one `images`
+lists; for a multi-platform tag, Docker prints the index's instead.
+
 `run --pull` chooses, as Docker's flag does: `missing` (the default), `always`,
 or `never` (the store's copy, or an error). Layers download in parallel.
 
@@ -68,8 +71,8 @@ A reference names the registry, repository and version:
 | `alpine@sha256:…` | the exact content, pinned by digest |
 
 The rules follow Docker's: a bare single name is an official image under
-`library/`; the registry is the first path segment only if it has a `.` or `:`
-or is `localhost`; with no tag or digest, the tag is `latest`. A digest pins the
+`library/`; the registry is the first path segment only if it has a `.` or `:`,
+is `localhost`, or is an IPv6 address in brackets (`[::1]:5000`); with no tag or digest, the tag is `latest`. A digest pins the
 exact bytes and wins over a tag.
 
 **Multi-architecture images.** A tag like `alpine:3.20` is usually a *manifest
@@ -108,8 +111,8 @@ warns and goes on without signing in, which is all a public image needs. Identit
 tokens (Azure ACR, some single sign-on logins) work too.
 
 Credentials are sent only to the registry and to the token service it names,
-over HTTPS (plain HTTP only to a registry on this machine), and never to another
-host a redirect leads to, such as a download CDN.
+over HTTPS (plain HTTP only to a registry, and its token service, on this
+machine), and never to another host a redirect leads to, such as a download CDN.
 They never appear in messages or logs. If a registry turns them down, Shipyard
 says where they came from, so you know what to sign in to again.
 

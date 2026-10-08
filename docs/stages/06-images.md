@@ -212,8 +212,9 @@ volumes/<name>/_data       volumes/.locks/<name>, volumes/.trash/<unique>
   falls back to one `mount(2)`, after a `chdir` to the layers' shared parent so the paths
   are short and relative; past a page of options it refuses with the layer count, rather
   than let the kernel truncate them.
-- **The working directory is made, as Docker does.** After `pivot_root`, before a read-only
-  remount, with `mkdirat` by descriptor and umask 0 (mode 0755).
+- **The working directory is made, as Docker does.** After `pivot_root` (so a path can
+  only lead within the new root), before a read-only remount, with umask 0 (mode 0755).
+  If it can't be made, the change into it fails and says so.
 
 ## Kernel checks
 
@@ -276,6 +277,7 @@ What the first version got wrong, and what now stops it:
 | A volume removed while a container uses it | a shared `flock` held for the run's life; `rm` refuses, `prune` skips | `a_volume_in_use_is_never_removed` |
 | A credential helper that hangs or floods | `poll(2)` timeout, output cap; killed as a process group and reaped | `a_helper_that_hangs_or_floods_is_stopped` |
 | Credentials sent where a redirect led | only the registry and its token realm get them | `a_challenge_from_where_a_redirect_led_gets_no_credentials` |
+| A loopback registry naming a plain-HTTP token realm elsewhere (found while writing the book) | a plain-HTTP realm must be on this machine too | `a_plain_http_realm_must_be_on_this_machine` |
 | More than a page of layers in one `mount(2)` | the new API (no limit to 500); otherwise relative paths, then a refusal naming the layer count | `an_image_of_sixty_layers_runs`, `legacy_options_are_relative_and_bounded` |
 | A `,` or `:` in the store path | refused before the mount, naming `SHIPYARD_IMAGE_STORE` | `an_overlay_is_checked_before_it_reaches_the_kernel` |
 | A refused overlay mount | the errno explained: no overlay module, the store's filesystem, the kernel version, AppArmor's restriction | `an_overlay_refusal_says_why` |
@@ -286,7 +288,12 @@ What the first version got wrong, and what now stops it:
 from outside: `manifest`, `challenge`, `reference`, `tar`, and `unpack`, which extracts each
 input beside a canary directory and fails if anything outside the layer changes. Their seeds
 (`scripts/fuzz-seeds.py`) include the escapes above. `scripts/test-linux.sh --fuzz` runs
-each for five minutes as a normal user.
+each for five minutes as a normal user. In the step-6 run (2026-10-08, Linux 7.0, aarch64)
+the targets went through about 64 million inputs with no crash, after one fix: the
+`reference` target found, within seconds, that the 255-byte name limit was checked before
+Hub's `library/` was added, so a 248-byte name was accepted and its canonical form then
+refused (`the_name_length_limit_counts_library`). A bug planted for the purpose (the
+walk following symlinks) was caught by the `unpack` target at once.
 
 ## Known limitations (by design, for stage 6)
 
@@ -299,6 +306,10 @@ each for five minutes as a normal user.
 - **A blob's directory entry isn't fsynced**: a blob lost to a crash is downloaded again. A
   layer's data and renames are synced (`syncfs`, then an `fsync` of `layers/`).
 - **No insecure registries or mirrors:** plain HTTP is for loopback only.
+- **An index isn't recorded.** A multi-platform image is recorded by its platform's
+  manifest; the index blob is stored, but `image prune` collects it, after which a run
+  pinned to the index digest (`alpine@sha256:<index>`) pulls again. `shipyard pull`
+  prints the platform manifest's digest, where Docker prints the index's.
 
 ## Carried forward
 
@@ -352,4 +363,4 @@ once for what could go wrong), mutation-checked and run by hand on Linux:
 | 3b | credentials; resumable downloads | a wrong blob committable in a partial race; credentials sent to redirect targets |
 | 4 | `run` checked before the pull, Docker's rules, volumes in use, `system df` | a lock file named like trash, letting prune delete an in-use volume |
 | 5 | the overlay: new mount API, fallback, hints; `--uidmap` with images | 5.2–6.4 kernels that never fell back; a `/tmp` bind source hidden by staging |
-| 6 | the gap tests, fuzzing, these notes | the image end-to-end tests never ran as a normal user (now `required`) |
+| 6 | the gap tests, fuzzing, these notes | the image end-to-end tests never ran as a normal user (now `required`); also, from the final runs: a plain-HTTP token realm off this machine allowed for a loopback registry, and (stage 5) a device program refused with `EAGAIN` when a signal arrived during verification, now retried as libbpf does |
