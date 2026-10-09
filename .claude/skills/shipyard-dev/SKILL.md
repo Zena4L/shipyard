@@ -131,6 +131,13 @@ glibc hides: libc types differ (`time_t` is deprecated there; `statfs`'s filesys
 
 ## Running Linux code from macOS
 
+- **A real distribution** (Ubuntu's AppArmor, its cgroup layout) needs a VM with its own
+  kernel: OrbStack's has no AppArmor. Lima (`brew install lima`, installed) with
+  `template:ubuntu-24.04`, a static musl build copied in (`limactl copy`; `/tmp/lima`
+  isn't shared), installed to `/usr/local/bin` where the AppArmor profile attaches
+  (docs/DEVELOPMENT.md). Don't run `limactl shell` commands you haven't read: one
+  stray `install … /dev/null` replaced the VM's `/dev/null` once.
+
 - `scripts/test-linux.sh` builds the test image (`scripts/test-image/Dockerfile`, tagged by
   the file's hash) and runs everything. For one-off scripts (a single test file, a
   manual check, a mutant), use `references/run-in-linux.sh` from this skill: it runs a
@@ -197,6 +204,9 @@ The rules, each learned the hard way:
   every mutant and proves nothing; stage 7.5 had one.
 - A `mac` mutant whose test is Linux-only runs zero tests and "survives": run it as
   `tester` or `root` instead.
+- **The runner's `tester` mutants run in tester's delegated cgroup** (as test-linux.sh's
+  tests do); before that, a cgroup assertion behind `if let Some(base) = delegated_cgroup()`
+  was skipped and its mutant "survived".
 - **A fix against a race needs a test that loses the race without it.** Stage 7.6's
   freeze-before-kill survived its first test (one shell forking: killed on the first
   pass) and a 64-process fork bomb; only a 1024-process one (capped by `pids.max`)

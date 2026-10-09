@@ -375,14 +375,16 @@ const RUNTIME_BINARY: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
 const PRIVILEGED: &str = "started with elevated privileges";
 
 /// Every way into either binary (the CLIs, and the hidden entry points of
-/// the init, the monitor, the storage helper and the DNS server) refuses to start setuid: root running
-/// a copy that's setuid to another user. The same copies without the bit
-/// get past the check (and, started by hand, the entry points say so).
+/// the init, the monitor, the storage helper, the DNS server and doctor's
+/// probe) refuses to start setuid: root running a copy that's setuid to
+/// another user. The same copies without the bit get past the check (and,
+/// started by hand, the entry points say so).
 #[test]
 #[ignore = "needs root"]
 fn a_privileged_start_is_refused_at_every_entry_point() {
-    let starts: [(&str, &[&str], &str); 7] = [
+    let starts: [(&str, &[&str], &str); 8] = [
         (SHIPYARD_BINARY, &["doctor"], ""),
+        (SHIPYARD_BINARY, &["__shipyard-probe"], "bad arguments"),
         (
             SHIPYARD_BINARY,
             &["__shipyard-init"],

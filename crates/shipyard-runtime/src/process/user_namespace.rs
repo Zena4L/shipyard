@@ -11,6 +11,7 @@
 //!   out the ranges root granted the user in `/etc/subuid` and
 //!   `/etc/subgid`: how a rootless container gets 65536 IDs.
 
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr};
@@ -500,35 +501,82 @@ pub fn current_id_maps() -> Result<IdMaps> {
 /// Why the kernel refuses user namespaces to an unprivileged caller, from
 /// what the host's settings read.
 pub(crate) fn userns_refusal() -> String {
+    userns_restriction().unwrap_or_else(|| {
+        "the system refused to create a user namespace (a security policy, or a container \
+         without privileges)"
+            .to_owned()
+    })
+}
+
+/// The host setting that restricts unprivileged user namespaces for this
+/// program, and how to lift it, if one does (`shipyard doctor` says so
+/// before a run fails). AppArmor's restriction doesn't count once
+/// Shipyard's profile confines this process: it lifts it.
+#[must_use]
+pub fn userns_restriction() -> Option<String> {
     let read = |path: &str| {
         std::fs::read_to_string(path)
             .ok()
             .map(|value| value.trim().to_owned())
     };
-    explain_refusal(
+    // The profile confining this process: "shipyard (unconfined)" with
+    // Shipyard's loaded and attached, "unconfined" without.
+    let profile =
+        read("/proc/self/attr/apparmor/current").or_else(|| read("/proc/self/attr/current"));
+    restriction_of(
         read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref(),
         read("/proc/sys/kernel/unprivileged_userns_clone").as_deref(),
         read("/proc/sys/user/max_user_namespaces").as_deref(),
+        profile.as_deref(),
+        std::env::current_exe().ok().as_deref(),
     )
 }
 
-/// The explanation for the three settings' values (`None`: not there).
-fn explain_refusal(apparmor: Option<&str>, clone: Option<&str>, max: Option<&str>) -> String {
+/// Where Shipyard's AppArmor profile attaches (`contrib/apparmor/shipyard`).
+const PROFILE_PATHS: [&str; 2] = ["/usr/local/bin", "/usr/bin"];
+
+/// The restriction the three settings' values make (`None`: not there),
+/// for this process confined by `profile` and running `exe`.
+fn restriction_of(
+    apparmor: Option<&str>,
+    clone: Option<&str>,
+    max: Option<&str>,
+    profile: Option<&str>,
+    exe: Option<&Path>,
+) -> Option<String> {
     if apparmor == Some("1") {
-        "AppArmor restricts unprivileged user namespaces here \
-         (kernel.apparmor_restrict_unprivileged_userns=1, Ubuntu's default since 23.10); \
-         an AppArmor profile for shipyard, or setting it to 0, allows them"
-            .to_owned()
+        if profile.is_some_and(|profile| profile.starts_with("shipyard ")) {
+            return None;
+        }
+        let mut message = "AppArmor restricts unprivileged user namespaces here \
+                           (kernel.apparmor_restrict_unprivileged_userns=1, Ubuntu's default \
+                           since 23.10); Shipyard's AppArmor profile \
+                           (contrib/apparmor/shipyard) allows them through Shipyard's \
+                           binaries, or kernel.apparmor_restrict_unprivileged_userns=0 for \
+                           every program"
+            .to_owned();
+        if let Some(exe) = exe.filter(|exe| {
+            !exe.parent()
+                .is_some_and(|dir| PROFILE_PATHS.iter().any(|path| dir == Path::new(path)))
+        }) {
+            let _ = write!(
+                message,
+                " (the profile attaches to shipyard in /usr/local/bin and /usr/bin, and this \
+                 one is {}: add its path to the profile)",
+                exe.display()
+            );
+        }
+        Some(message)
     } else if clone == Some("0") {
-        "unprivileged user namespaces are disabled here \
-         (kernel.unprivileged_userns_clone=0); setting it to 1 allows them"
-            .to_owned()
+        Some(
+            "unprivileged user namespaces are disabled here \
+             (kernel.unprivileged_userns_clone=0); setting it to 1 allows them"
+                .to_owned(),
+        )
     } else if max == Some("0") {
-        "user namespaces are disabled here (user.max_user_namespaces=0)".to_owned()
+        Some("user namespaces are disabled here (user.max_user_namespaces=0)".to_owned())
     } else {
-        "the system refused to create a user namespace (a security policy, or a container \
-         without privileges)"
-            .to_owned()
+        None
     }
 }
 
@@ -638,12 +686,53 @@ mod tests {
 
     #[test]
     fn refusals_name_the_setting() {
-        assert!(explain_refusal(Some("1"), None, Some("1000")).contains("apparmor_restrict"));
-        assert!(
-            explain_refusal(Some("0"), Some("0"), None).contains("unprivileged_userns_clone=0")
+        let installed = Some(Path::new("/usr/local/bin/shipyard"));
+        let apparmor =
+            restriction_of(Some("1"), None, Some("1000"), Some("unconfined"), installed).unwrap();
+        assert!(apparmor.contains("apparmor_restrict"), "{apparmor}");
+        assert!(apparmor.contains("contrib/apparmor/shipyard"), "{apparmor}");
+        assert!(!apparmor.contains("add its path"), "{apparmor}");
+        // Shipyard's profile loaded and attached: lifted, nothing to name.
+        assert_eq!(
+            restriction_of(
+                Some("1"),
+                None,
+                None,
+                Some("shipyard (unconfined)"),
+                installed
+            ),
+            None
         );
-        assert!(explain_refusal(None, None, Some("0")).contains("max_user_namespaces=0"));
-        assert!(explain_refusal(Some("0"), Some("1"), Some("100")).contains("security policy"));
+        // Installed where the profile doesn't attach: said so.
+        let elsewhere = restriction_of(
+            Some("1"),
+            None,
+            None,
+            Some("unconfined"),
+            Some(Path::new("/home/u/.cargo/bin/shipyard")),
+        )
+        .unwrap();
+        assert!(
+            elsewhere.contains("/home/u/.cargo/bin/shipyard: add its path"),
+            "{elsewhere}"
+        );
+        assert!(
+            restriction_of(Some("0"), Some("0"), None, None, installed)
+                .unwrap()
+                .contains("unprivileged_userns_clone=0")
+        );
+        assert!(
+            restriction_of(None, None, Some("0"), None, installed)
+                .unwrap()
+                .contains("max_user_namespaces=0")
+        );
+        // Nothing restricts: no restriction to name (a refusal then blames a
+        // policy or a container).
+        assert_eq!(
+            restriction_of(Some("0"), Some("1"), Some("100"), None, installed),
+            None
+        );
+        assert_eq!(restriction_of(None, None, None, None, installed), None);
     }
 
     #[test]

@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 
 use super::bpf::{Assembler, Instruction, Label, Test};
-use super::profile::{check_action, kernel_version};
+use super::profile::check_action;
 use super::{Action, Arch, Arg, Condition, Operator, Profile, Rule, SeccompError};
 use crate::security::CapabilitySet;
 
@@ -263,7 +263,7 @@ fn kernel_at_least(condition: &Condition, target: &Target) -> Result<Option<bool
         .min_kernel
         .as_ref()
         .map(|version| {
-            kernel_version(version)
+            crate::kernel::version(version)
                 .map(|min| target.kernel >= min)
                 .ok_or_else(|| SeccompError::MinKernel(version.clone()))
         })

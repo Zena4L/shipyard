@@ -47,7 +47,7 @@ A lightweight container engine
 * `volume` — Manage named volumes
 * `network` — Manage networks (bridges containers share; Linux, root)
 * `system` — System-wide information and maintenance
-* `doctor` — Show how this host will run containers
+* `doctor` — Check whether this host can run containers, and what to fix
 
 ###### **Options:**
 
@@ -384,7 +384,7 @@ Show the store's disk usage
 
 ## `shipyard doctor`
 
-Show how this host will run containers
+Check whether this host can run containers, and what to fix
 
 **Usage:** `shipyard doctor`
 

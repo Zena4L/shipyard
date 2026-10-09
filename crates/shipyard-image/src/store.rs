@@ -318,6 +318,23 @@ impl Store {
         Ok(Self { root })
     }
 
+    /// Checks a store's root as [`open`](Self::open) would, without making
+    /// or changing anything (`shipyard doctor`): fine if it's missing (open
+    /// makes it); else it must be a directory only its owner can reach.
+    /// Returns the warning `open` would log if someone else owns it.
+    ///
+    /// # Errors
+    ///
+    /// What `open` would fail with: [`StoreError::NotPrivate`], or
+    /// [`StoreError::Io`] for one that isn't a directory or can't be read.
+    pub fn check_root(root: &Path) -> Result<Option<String>, StoreError> {
+        match fs::metadata(root) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Store::io(root, "reading the store directory", source)),
+            Ok(_) => existing_root(root),
+        }
+    }
+
     /// The store's root directory.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -639,26 +656,35 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
     match fs::DirBuilder::new().mode(0o700).create(root) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let meta = fs::metadata(root)
-                .map_err(|source| Store::io(root, "reading the store directory", source))?;
-            if !meta.is_dir() {
-                return Err(Store::io(
-                    root,
-                    "opening the store directory",
-                    io::Error::from(io::ErrorKind::NotADirectory),
-                ));
-            }
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(StoreError::NotPrivate(root.display().to_string()));
-            }
-            if let Some(warning) = owner_warning(root, meta.uid(), nix::unistd::geteuid().as_raw())
-            {
+            if let Some(warning) = existing_root(root)? {
                 tracing::warn!("{warning}");
             }
             Ok(())
         }
         Err(source) => Err(Store::io(root, "creating the store directory", source)),
     }
+}
+
+/// Checks a store root that exists: a directory, private to its owner;
+/// the warning for one someone else owns.
+fn existing_root(root: &Path) -> Result<Option<String>, StoreError> {
+    let meta = fs::metadata(root)
+        .map_err(|source| Store::io(root, "reading the store directory", source))?;
+    if !meta.is_dir() {
+        return Err(Store::io(
+            root,
+            "opening the store directory",
+            io::Error::from(io::ErrorKind::NotADirectory),
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(StoreError::NotPrivate(root.display().to_string()));
+    }
+    Ok(owner_warning(
+        root,
+        meta.uid(),
+        nix::unistd::geteuid().as_raw(),
+    ))
 }
 
 /// The warning for a store directory `root` owned by `owner` that `euid`

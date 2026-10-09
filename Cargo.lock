@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-image"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "base64",
  "flate2",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-network"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "libc",
  "nix",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-runtime"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "libc",
  "nix",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-storage"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nix",
  "thiserror",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-test-support"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "libc",
  "nix",

@@ -218,7 +218,7 @@ Layers are extracted carefully: an entry can't reach outside its layer, through
 disk is refused; an image's deletions (whiteouts) become overlay's own markers,
 never written through a link. Each layer is checked against both of its digests,
 compressed and uncompressed. The engineering detail is in
-[the stage 6 notes](../stages/06-images.md).
+[the stage 6 notes](https://github.com/Zena4L/shipyard/blob/main/docs/stages/06-images.md).
 
 **One image can't change another's files.** Images that share a layer share
 its extracted files, but a layer whose entries leave out a directory they're in

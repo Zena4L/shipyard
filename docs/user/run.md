@@ -448,9 +448,10 @@ shipyard run sh -c 'id; cat /proc/self/uid_map'
   `unshare -U -r`, say), Shipyard is root there and runs containers as root does,
   but `--group-add` fails the same way.
 - **When user namespaces are off,** `run` says which setting stops them:
-  - Ubuntu (23.10 and later) restricts them with AppArmor:
-    `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, or an AppArmor
-    profile for shipyard, allows them;
+  - Ubuntu (23.10 and later) restricts them with AppArmor: Shipyard's AppArmor
+    profile allows them for Shipyard alone (see
+    [Ubuntu 23.10 and later](README.md#ubuntu-2310-and-later-apparmor)), or
+    `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` for every program;
   - older Debian kernels have `kernel.unprivileged_userns_clone=0`;
   - `user.max_user_namespaces=0` disables them entirely.
 

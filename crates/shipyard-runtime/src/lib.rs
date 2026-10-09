@@ -27,6 +27,7 @@ mod error;
 pub mod hooks;
 mod id_map;
 pub mod isolation;
+pub mod kernel;
 pub mod oci;
 pub mod process;
 pub mod resources;

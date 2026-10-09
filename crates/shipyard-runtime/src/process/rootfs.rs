@@ -347,21 +347,14 @@ mod linux {
         work: &Path,
         userxattr: bool,
     ) -> Step {
-        let fail = |errno| Failure::at(ChildStep::MountOverlay, errno);
-        match overlay::mount_new(merged, lower, upper, work, userxattr) {
-            Ok(()) => Ok(()),
-            Err(overlay::NewApi::Unsupported) => {
-                overlay::mount_legacy(merged, lower, upper, work, userxattr).map_err(|errno| {
-                    let detail = if errno == Errno::E2BIG {
-                        lower.len()
-                    } else {
-                        0
-                    };
-                    fail(errno).detail(detail)
-                })
-            }
-            Err(overlay::NewApi::Failed(errno)) => Err(fail(errno)),
-        }
+        overlay::mount_overlay(merged, lower, upper, work, userxattr).map_err(|errno| {
+            let detail = if errno == Errno::E2BIG {
+                lower.len()
+            } else {
+                0
+            };
+            Failure::at(ChildStep::MountOverlay, errno).detail(detail)
+        })
     }
 
     /// `/proc`, a read-only `/sys` (with the container's cgroup at
@@ -1126,6 +1119,27 @@ pub(crate) mod overlay {
         Unsupported,
         /// It refused (for a reason the old way would share).
         Failed(Errno),
+    }
+
+    /// Mounts an overlay at `merged`, as a container's root filesystem is
+    /// (see `linux::mount_overlay`): with the new mount API where the kernel
+    /// can, else with one `mount(2)`.
+    ///
+    /// # Errors
+    ///
+    /// The errno of the mount that failed.
+    pub(crate) fn mount_overlay(
+        merged: &Path,
+        lower: &[&Path],
+        upper: &Path,
+        work: &Path,
+        userxattr: bool,
+    ) -> Result<(), Errno> {
+        match mount_new(merged, lower, upper, work, userxattr) {
+            Ok(()) => Ok(()),
+            Err(NewApi::Unsupported) => mount_legacy(merged, lower, upper, work, userxattr),
+            Err(NewApi::Failed(errno)) => Err(errno),
+        }
     }
 
     /// Mounts the overlay with the new mount API ([`build`]), then

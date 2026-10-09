@@ -776,14 +776,7 @@ fn cap_last_cap() -> Result<u8, Errno> {
 /// `minKernel` conditions. `(0, 0)` if `uname` doesn't say: rules that need
 /// a newer kernel are then left out, and a filter can only get stricter.
 fn kernel_version() -> (u32, u32) {
-    nix::sys::utsname::uname()
-        .ok()
-        .and_then(|name| {
-            name.release()
-                .to_str()
-                .and_then(crate::security::seccomp::kernel_version)
-        })
-        .unwrap_or_default()
+    crate::kernel::version(&crate::kernel::release()).unwrap_or_default()
 }
 
 /// A confinement this kernel can't apply, as a setup failure.

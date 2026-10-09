@@ -1,0 +1,20 @@
+# AppArmor profile for Shipyard: lets its binaries make user namespaces
+# where AppArmor restricts unprivileged ones
+# (kernel.apparmor_restrict_unprivileged_userns=1, Ubuntu's default since
+# 23.10). It confines nothing else ("unconfined"), as Podman's and Chrome's
+# profiles for the same restriction do.
+#
+# Install (as root), for binaries in /usr/local/bin or /usr/bin:
+#   install -m 0644 contrib/apparmor/shipyard /etc/apparmor.d/shipyard
+#   apparmor_parser -r /etc/apparmor.d/shipyard
+# Installed elsewhere? Add the path to the profile's attachment below.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile shipyard /usr/{local/,}bin/shipyard{,-runtime} flags=(unconfined) {
+  userns,
+
+  # Site-specific additions.
+  include if exists <local/shipyard>
+}

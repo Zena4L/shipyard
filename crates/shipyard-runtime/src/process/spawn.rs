@@ -756,7 +756,10 @@ unsafe fn launch(
             Err(Errno::EPERM) if nix::unistd::geteuid().is_root() => Err(Error::IsolationRefused),
             // Without root, the user namespace is what the kernel refused:
             // the others are its own.
-            Err(Errno::EPERM) if isolation.has(crate::isolation::Namespace::User) => {
+            // (AppArmor's restriction refuses with EACCES.)
+            Err(Errno::EPERM | Errno::EACCES)
+                if isolation.has(crate::isolation::Namespace::User) =>
+            {
                 Err(Error::UserNamespacesRefused {
                     reason: super::user_namespace::userns_refusal(),
                 })
