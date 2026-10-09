@@ -34,8 +34,8 @@ pub use containers::{Area, AreaError, ContainerArea, LiveArea, areas, remove_are
 pub use credentials::{Credential, CredentialError, Credentials, FoundCredential};
 pub use digest::{Digest, DigestError, Verifier, VerifyError};
 pub use images::{
-    ExtractError, Extracted, extract_layers, layer_directories, layer_specs, remove_layers,
-    trash_layers,
+    ExtractError, Extracted, extract_layers, layer_directories, layer_specs, placed_layers,
+    remove_layers, trash_layers,
 };
 // `index::Index` (the store's reference index) is reached through the module
 // path to avoid colliding with `manifest::Index` (a multi-platform image
@@ -81,3 +81,8 @@ pub mod fuzzing {
 /// These are small JSON documents; a layer streams instead of being read
 /// whole, so this cap only ever applies to metadata.
 pub const MANIFEST_SIZE_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// The most layers an image may have: Docker builds at most 127 (overlayfs
+/// once stacked no more), and every layer costs a directory, its files and
+/// a lower in the mount. Checked before any layer is fetched.
+pub const MAX_LAYERS: usize = 128;

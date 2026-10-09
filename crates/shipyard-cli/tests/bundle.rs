@@ -415,11 +415,35 @@ fn a_destination_led_into_proc_is_refused() {
     let run = run_bundle(&bundle, &config);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(
-        run.stderr.contains("leads into /proc or /sys"),
+        run.stderr.contains("leads into a kernel interface"),
         "{}",
         run.stderr
     );
     assert_eq!(run.stdout, "");
+}
+
+/// The same for the other kernel interfaces Shipyard mounts: a symlink in
+/// the root filesystem leading to `/dev/pts` is refused. One asked for by
+/// its own name (a tmpfs on `/dev/mqueue`) is the caller's to choose, and
+/// works.
+#[test]
+#[ignore = "needs root"]
+fn a_destination_led_into_a_kernel_interface_is_refused_and_one_named_isnt() {
+    let bundle = Bundle::new();
+    std::os::unix::fs::symlink("/dev/pts", bundle.root.host_path("/data")).unwrap();
+    let mut config = running(&bundle, "echo ran");
+    config["mounts"] = json!([{"destination": "/data", "type": "tmpfs", "source": "tmpfs"}]);
+    let steered = run_bundle(&bundle, &config);
+    assert_eq!(steered.code, Some(125), "{}", steered.stderr);
+    assert!(
+        steered.stderr.contains("leads into a kernel interface"),
+        "{}",
+        steered.stderr
+    );
+    config["mounts"] = json!([{"destination": "/dev/mqueue", "type": "tmpfs", "source": "tmpfs"}]);
+    let named = run_bundle(&bundle, &config);
+    assert_eq!(named.code, Some(0), "{}", named.stderr);
+    assert_eq!(named.stdout, "ran\n");
 }
 
 /// A destination through a symlink planted in the root filesystem, pointing

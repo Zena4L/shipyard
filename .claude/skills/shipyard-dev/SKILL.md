@@ -54,9 +54,12 @@ Each stage is split into steps in its plan; a step too big for one round is spli
 further (6 → 6a/6b) after asking. For every step:
 
 1. **Plan mode.** Explore the code read-only, ask the decisions, then write a "Step N
-   detailed design" section into the plan: context, decisions (dated), design per file,
-   tests (units, Linux root/rootless end-to-end, fuzz), mutation checks, docs,
-   verification, and the TLPI/kernel concepts. Exit plan mode for approval.
+   detailed design" section into the plan: context, decisions (dated), **a threat model**
+   (who is hostile here: the container, a local user, the network, a registry, the image;
+   and what each may never do, as invariants with a test each), design per file, tests
+   (units, Linux root/rootless end-to-end, fuzz), mutation checks, docs, verification,
+   and the TLPI/kernel concepts. For a step with a security surface, run a Murphy review
+   against the plan before building. Exit plan mode for approval.
 2. **Build it**, tests with it. Run `cargo fmt`, macOS clippy and tests as you go;
    Linux-only code must be compiled and run in the container (see below).
 3. **Clean-code review**: a background subagent, report only, with the step's files,
@@ -75,6 +78,32 @@ further (6 → 6a/6b) after asking. For every step:
 9. **Update the plan** ("Step N — built and reviewed": what it built, review fixes,
    verification numbers, carried forward) and the memory progress line.
 10. **Report** with the TLPI concepts.
+
+## The hardening track
+
+`docs/ROADMAP.md`'s "Hardening track" (H1–H9) is what stages 0–7 taught us to do
+differently. Each item has a home stage: when planning that stage, build it in. These
+rules apply from now on, in every step:
+
+- **New engine logic goes where the engine will live (H1).** Don't grow `run.rs` or the
+  CLI's `network.rs`: put new logic in a library crate behind a typed API the CLI calls,
+  so stage 11's API and the UI can use it. Prefer a function returning data the CLI
+  prints over a function that prints.
+- **Every on-disk format gets a version on its first write (H2),** and a test that reads
+  the previous version. No new liveness lock of a stage's own without asking: stage 9
+  unifies them.
+- **Threat model in the plan (H3):** see the workflow above.
+- **Test the kind of an error, not its wording (H6).** New errors get a variant in their
+  crate's error enum; tests match the variant (or one stable key phrase the docs quote
+  too); messages may then be reworded freely.
+- **A timing budget for anything on a run's path (H7):** an end-to-end test that fails if
+  it gets slower than a generous bound (stage 7's
+  `a_rootless_run_ends_as_soon_as_its_command_does` is the model).
+- **Anything Shipyard writes in place of a standard tool gets a differential test
+  against it (H5, H8),** and a line in the ROADMAP's H8 record saying why it's owned.
+- **Real hosts (H4):** until the VM jobs exist, assume CI's Ubuntu differs from the test
+  container (AppArmor, systemd-resolved, its cgroup layout), and say so in the report
+  when a change touches any of them.
 
 ## Verification checklist
 
@@ -163,6 +192,16 @@ The rules, each learned the hard way:
 - Run a mutant where its test runs: a test gated on Linux (`/proc/…`) skips on macOS,
   so its mutant "survives" there.
 - Check each pattern matches exactly once (`BAD-PATTERN` otherwise).
+- **Run the controls first** (`--control`): each mutant's test on the unchanged code must
+  pass. A test that fails anyway (a missing program in the minimal root, say) "catches"
+  every mutant and proves nothing; stage 7.5 had one.
+- A `mac` mutant whose test is Linux-only runs zero tests and "survives": run it as
+  `tester` or `root` instead.
+- **A fix against a race needs a test that loses the race without it.** Stage 7.6's
+  freeze-before-kill survived its first test (one shell forking: killed on the first
+  pass) and a 64-process fork bomb; only a 1024-process one (capped by `pids.max`)
+  outran the kills. Check the mutant fails for the right reason (its log), not just
+  that it fails.
 
 ## Editing safely
 

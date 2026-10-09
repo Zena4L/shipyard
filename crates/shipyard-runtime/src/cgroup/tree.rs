@@ -63,6 +63,12 @@ pub struct Tree {
 }
 
 impl Tree {
+    /// Its base: the cgroup Shipyard's own are made below.
+    #[must_use]
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
     /// This process's part of the tree.
     ///
     /// # Errors
@@ -165,7 +171,7 @@ impl Tree {
                     Err(errno) => last = cgroup.error("locking the cgroup", errno),
                 },
                 Err(CgroupError::Exists(path)) => {
-                    if !remove_if_stale(&path) {
+                    if !remove_if_stale(&path, &self.base) {
                         last = CgroupError::RunInUse(path);
                     }
                 }
@@ -177,8 +183,8 @@ impl Tree {
     }
 
     /// Removes the `run/` cgroups left by shipyard processes that are gone
-    /// (killed before they could clean up): those whose lock nobody holds.
-    /// Best effort.
+    /// (killed before they could clean up): those whose lock nobody holds,
+    /// with what's left in them killed. Best effort.
     pub fn sweep_stale_runs(&self) {
         let Ok(entries) = std::fs::read_dir(self.base.join(RUN_PARENT)) else {
             return;
@@ -190,7 +196,7 @@ impl Tree {
                 .to_str()
                 .is_some_and(|name| name.parse::<u32>().is_ok())
             {
-                remove_if_stale(&entry.path());
+                remove_if_stale(&entry.path(), &self.base);
             }
         }
     }

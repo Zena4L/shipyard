@@ -1822,7 +1822,7 @@ mod tests {
             limits.cpu_max,
             Some(CpuMax {
                 quota: Some(50_000),
-                period: 100_000
+                period: Some(100_000)
             })
         );
         assert_eq!(limits.cpuset_cpus.as_deref(), Some("0-1"));

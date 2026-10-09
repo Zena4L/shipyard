@@ -72,6 +72,13 @@ pub(crate) fn entry_point() {
     if args.next().as_deref() != Some(entry) {
         return;
     }
+    // As for the CLI itself: a privileged start (setuid, file capabilities)
+    // gets no further. Anyone can start this entry point by hand, before the
+    // CLI's own check would run.
+    if let Err(err) = super::refuse_privileged_start() {
+        let _ = writeln!(std::io::stderr(), "shipyard-init: {err}");
+        std::process::exit(125);
+    }
     let mut fd = || args.next().and_then(|a| a.to_str()?.parse::<RawFd>().ok());
     if let (Some(setup), Some(status), Some(report)) = (fd(), fd(), fd())
         && is_sealed_setup(setup)
@@ -540,6 +547,9 @@ fn stop_for_hooks(report: RawFd, hooks: &HooksSetup) -> Result<State, Failure> {
     // SAFETY: inherited across the exec, and only read here, once.
     let mut pipe = unsafe { std::fs::File::from_raw_fd(hooks.pipe) };
     let mut state = Vec::new();
+    // No deadline of its own: shipyard writes it once its hooks ran (each
+    // bounded by its OCI `timeout`; one without may run as long as it
+    // likes, as runc's), and end-of-file comes if shipyard dies.
     pipe.read_to_end(&mut state)
         .map_err(|err| Failure::at(ChildStep::Handshake, super::io_errno(&err)))?;
     drop(pipe);
@@ -616,6 +626,9 @@ fn start_container(
     };
     drop(write);
     let mut record = Vec::new();
+    // No deadline of its own: the runner applies each hook's OCI `timeout`
+    // (one without may run as long as it likes, as runc's), and a deadline
+    // here would end hooks the spec lets run.
     let _ = std::io::Read::read_to_end(&mut std::fs::File::from(read), &mut record);
     let ended = nix::sys::wait::waitpid(runner, None);
     if let Some(failure) = decode_record(&record) {

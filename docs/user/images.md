@@ -112,7 +112,10 @@ tokens (Azure ACR, some single sign-on logins) work too.
 
 Credentials are sent only to the registry and to the token service it names,
 over HTTPS (plain HTTP only to a registry, and its token service, on this
-machine), and never to another host a redirect leads to, such as a download CDN.
+machine), and never to another host a redirect leads to, such as a download CDN. A
+token service that answers a request carrying credentials with a redirect is refused
+("its token service redirected elsewhere, and credentials aren't sent on"); one asked
+without credentials may redirect.
 They never appear in messages or logs. If a registry turns them down, Shipyard
 says where they came from, so you know what to sign in to again.
 
@@ -216,6 +219,18 @@ disk is refused; an image's deletions (whiteouts) become overlay's own markers,
 never written through a link. Each layer is checked against both of its digests,
 compressed and uncompressed. The engineering detail is in
 [the stage 6 notes](../stages/06-images.md).
+
+**One image can't change another's files.** Images that share a layer share
+its extracted files, but a layer whose entries leave out a directory they're in
+(`usr/local/bin/tool` with no `usr/local/` entry) takes that directory's owner
+and permissions from the layers below it, so it's extracted again for each set
+of layers below it.
+
+**Limits.** Extracting stops while the store's filesystem still has 5 % of its
+space (at least 1 GiB, at most 10 GiB) and 5 % of its inodes (at most a million)
+free, whatever the layer holds: a layer of millions of empty files is stopped as
+surely as a large one. An image may have at most 128 layers (Docker builds at most
+127); one with more is refused before anything is downloaded.
 
 **Interrupted downloads go on where they stopped.** A layer that's cut off, by
 the network or by stopping the pull, is kept in the store as a partial download,

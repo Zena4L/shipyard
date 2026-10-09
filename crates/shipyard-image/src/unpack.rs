@@ -78,6 +78,10 @@ pub struct FreeSpace {
     /// least 1 GiB on a small disk and at most 10 GiB on a large one (5 % of
     /// 4 TB would stop every pull on a disk with 150 GB free).
     pub reserve: u64,
+    /// Inodes (files, directories, links) an unprivileged writer may still
+    /// make, and how many to leave free (5 %, at most a million); `None`
+    /// where the filesystem has no fixed number (btrfs, say, says 0).
+    pub files: Option<(u64, u64)>,
 }
 
 impl FreeSpace {
@@ -97,15 +101,46 @@ impl FreeSpace {
             u64::from(stat.blocks_available()),
             u64::from(stat.blocks()),
         );
+        #[allow(
+            clippy::useless_conversion,
+            reason = "the statvfs field types differ between platforms"
+        )]
+        let (files_available, files) = (u64::from(stat.files_available()), u64::from(stat.files()));
         Ok(Self {
             available: available.saturating_mul(fragment),
             reserve: (total.saturating_mul(fragment) / 20).clamp(GIB, 10 * GIB),
+            files: (files > 0).then(|| (files_available, (files / 20).min(MAX_FILES_RESERVE))),
         })
+    }
+
+    /// Whether this leaves enough free: `min_free` bytes (the reserve if
+    /// `None`), and the inodes' reserve.
+    fn check(self, min_free: Option<u64>) -> Result<(), UnpackError> {
+        let reserve = min_free.unwrap_or(self.reserve);
+        if self.available < reserve {
+            return Err(UnpackError::NoSpace {
+                available: self.available,
+                reserve,
+            });
+        }
+        if let Some((available, reserve)) = self.files
+            && available < reserve
+        {
+            return Err(UnpackError::NoInodes { available, reserve });
+        }
+        Ok(())
     }
 }
 
 /// How often the free space is checked while writing, in bytes.
 const SPACE_CHECK_EVERY: u64 = 64 * 1024 * 1024;
+/// What an entry counts toward the next free-space check, whatever it
+/// holds: a directory or an empty file writes no data, but takes an inode
+/// and a block. So a layer of many of them is checked too: every 1024
+/// entries at the most.
+const ENTRY_COST: u64 = SPACE_CHECK_EVERY / 1024;
+/// The most inodes (files) left free, when 5 % of a filesystem's are more.
+const MAX_FILES_RESERVE: u64 = 1_000_000;
 
 /// The layer to extract: what the bytes must hash to, and how they're
 /// compressed.
@@ -294,6 +329,11 @@ pub struct LayerReport {
     pub aufs_ignored: u64,
     /// POSIX global headers ignored.
     pub global_headers_ignored: u64,
+    /// Directories the layer implies (an entry below one it has no entry
+    /// for), made with the lower layers' metadata there: the extraction is
+    /// then the layer's on those lowers only (see `LayerOwners::name_on`).
+    #[serde(default)]
+    pub implied_dirs: u64,
 }
 
 impl LayerReport {
@@ -344,6 +384,7 @@ impl LayerReport {
         self.xattrs_not_applied += other.xattrs_not_applied;
         self.aufs_ignored += other.aufs_ignored;
         self.global_headers_ignored += other.global_headers_ignored;
+        self.implied_dirs += other.implied_dirs;
     }
 }
 
@@ -393,6 +434,17 @@ pub enum UnpackError {
     TooLarge {
         /// The limit.
         limit: u64,
+    },
+    /// The filesystem would be left with too few free inodes.
+    #[error(
+        "only {available} inodes (files) free on the image store's filesystem, and \
+         {reserve} must stay free"
+    )]
+    NoInodes {
+        /// Inodes free.
+        available: u64,
+        /// Inodes that must stay free.
+        reserve: u64,
     },
     /// The filesystem would be left with too little free space.
     #[error(
@@ -581,6 +633,7 @@ impl<'a> Unpacker<'a> {
     /// Places one entry; a file's data is read from `data`.
     fn place(&mut self, entry: &Entry, data: &mut impl Read) -> Result<(), UnpackError> {
         self.report.entries += 1;
+        self.charge(ENTRY_COST)?;
         let Some(name) = entry.path.file_name() else {
             // The layer root itself (`./`).
             return self.place_root(entry);
@@ -699,11 +752,7 @@ impl<'a> Unpacker<'a> {
             }
             file.write_all(&self.buffer[..read])
                 .map_err(|source| io_error(&format!("writing {}", path.display()), source))?;
-            self.unchecked += read as u64;
-            if self.unchecked >= SPACE_CHECK_EVERY {
-                self.unchecked = 0;
-                self.check_space()?;
-            }
+            self.charge(read as u64)?;
         }
         let fd = OwnedFd::from(file);
         self.apply(&fd, Meta::of(entry), path)?;
@@ -843,6 +892,7 @@ impl<'a> Unpacker<'a> {
     /// it), or root's 0755.
     fn record_implied(&mut self, made: Vec<(PathBuf, (u64, u64))>) -> Result<(), UnpackError> {
         for (path, identity) in made {
+            self.report.implied_dirs += 1;
             let meta = self.lower_meta(&path)?.unwrap_or_else(Meta::implied);
             self.record(path, Created::Directory { meta, identity })?;
         }
@@ -1007,18 +1057,23 @@ impl<'a> Unpacker<'a> {
         }
     }
 
-    /// Refuses to go on if the filesystem is nearly full.
+    /// Counts `bytes` written toward the next free-space check, which
+    /// comes once [`SPACE_CHECK_EVERY`] have been since the last.
+    fn charge(&mut self, bytes: u64) -> Result<(), UnpackError> {
+        self.unchecked += bytes;
+        if self.unchecked >= SPACE_CHECK_EVERY {
+            self.unchecked = 0;
+            self.check_space()?;
+        }
+        Ok(())
+    }
+
+    /// Refuses to go on if the filesystem is nearly full: of bytes, or of
+    /// inodes.
     fn check_space(&self) -> Result<(), UnpackError> {
         let space = FreeSpace::of(self.walker.root())
             .map_err(failed("checking the free space under", Path::new("/")))?;
-        let reserve = self.options.limits.min_free.unwrap_or(space.reserve);
-        if space.available < reserve {
-            return Err(UnpackError::NoSpace {
-                available: space.available,
-                reserve,
-            });
-        }
-        Ok(())
+        space.check(self.options.limits.min_free)
     }
 
     /// After the last entry: the whiteouts and opaque directories, then the
@@ -1791,6 +1846,142 @@ pub(crate) mod tests {
             matches!(result, Err(UnpackError::NoSpace { .. })),
             "{result:?}"
         );
+    }
+
+    /// What a layer decompresses to after its tar's end (the two zero
+    /// blocks) is read, to check the `diff_id` against the whole stream, but
+    /// never past the decompressed-size limit: a small blob that inflates to
+    /// far more after the end is refused there. (Within the limit, the same
+    /// kind of tail is fine: the control.)
+    #[test]
+    fn what_follows_the_archives_end_is_bounded_too() {
+        let scratch = Scratch::new("tail");
+        let mut layer = Layer::default();
+        layer.file("f", b"f");
+        let with_tail = |tail: usize| {
+            let mut tar = layer.tar();
+            tar.resize(tar.len() + tail, 0);
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            gz.write_all(&tar).unwrap();
+            let blob = gz.finish().unwrap();
+            let spec = LayerSpec {
+                digest: Digest::sha256(&blob),
+                media_type: GZIP_TYPES[0].to_owned(),
+                diff_id: Digest::sha256(&tar),
+            };
+            (blob, spec)
+        };
+        let mut options = keep();
+        options.limits.max_bytes = 1024 * 1024;
+        // 16 MiB of zeros after the end: a blob of a few KiB.
+        let (blob, spec) = with_tail(16 * 1024 * 1024);
+        assert!(blob.len() < 64 * 1024, "{}", blob.len());
+        let (_, result) = extract_blob(&scratch, &blob, &spec, &[], &options);
+        assert!(
+            matches!(result, Err(UnpackError::TooLarge { .. })),
+            "{result:?}"
+        );
+        let (blob, spec) = with_tail(64 * 1024);
+        let (dest, result) = extract_blob(&scratch, &blob, &spec, &[], &options);
+        result.unwrap();
+        assert!(dest.join("f").is_file());
+    }
+
+    /// Directories and empty files write no data, but each takes an inode:
+    /// they count toward the free-space checks too, so a layer of nothing
+    /// else stops short of a filesystem's last inodes (here a tmpfs of
+    /// 20000), with the error that says so, not at the end of them. A
+    /// smaller one fits there (the control). As root: the tmpfs is mounted
+    /// in a mount namespace of this test's thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root"]
+    fn a_layer_of_empty_entries_stops_short_of_the_last_inodes() {
+        use nix::mount::{MntFlags, MsFlags, mount, umount2};
+        std::thread::spawn(|| {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).unwrap();
+            mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            )
+            .unwrap();
+            let scratch = Scratch::new("inodes");
+            std::fs::create_dir_all(&scratch.0).unwrap();
+            mount(
+                Some("tmpfs"),
+                &scratch.0,
+                Some("tmpfs"),
+                MsFlags::empty(),
+                Some("nr_inodes=20000"),
+            )
+            .unwrap();
+            let empties = |count: usize| {
+                let mut layer = Layer::default();
+                for index in 0..count {
+                    if index % 2 == 0 {
+                        layer.dir(&format!("d{index}"), 0o755);
+                    } else {
+                        layer.file(&format!("f{index}"), b"");
+                    }
+                }
+                layer
+            };
+            let (stopped, result) = extract_with(&scratch, &empties(30_000), &[], &keep());
+            assert!(
+                matches!(result, Err(UnpackError::NoInodes { .. })),
+                "{result:?}"
+            );
+            // (The caller removes a failed layer's directory: its temporary.)
+            std::fs::remove_dir_all(stopped).unwrap();
+            let (_, result) = extract_with(&scratch, &empties(5_000), &[], &keep());
+            assert_eq!(result.unwrap().entries, 5_000);
+            umount2(&scratch.0, MntFlags::MNT_DETACH).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Inodes have a reserve of their own, where the filesystem has a fixed
+    /// number of them; where it has none (btrfs says 0), nothing is refused
+    /// for them.
+    #[test]
+    fn free_inodes_are_checked_where_there_are_a_number() {
+        let space = |files| FreeSpace {
+            available: 100 * GIB,
+            reserve: GIB,
+            files,
+        };
+        assert!(matches!(
+            space(Some((10, 50))).check(None),
+            Err(UnpackError::NoInodes {
+                available: 10,
+                reserve: 50
+            })
+        ));
+        assert!(space(Some((50, 50))).check(None).is_ok());
+        assert!(space(None).check(None).is_ok());
+        assert!(matches!(
+            space(None).check(Some(200 * GIB)),
+            Err(UnpackError::NoSpace { .. })
+        ));
+    }
+
+    /// The inodes' reserve is 5 % of them, at most a million, and none is
+    /// claimed where the filesystem reports no inodes.
+    #[cfg(unix)]
+    #[test]
+    fn a_filesystems_inodes_are_read() {
+        let scratch = Scratch::new("inodes");
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let dir = std::fs::File::open(&scratch.0).unwrap();
+        let space = FreeSpace::of(&dir).unwrap();
+        if let Some((available, reserve)) = space.files {
+            assert!(available > 0);
+            assert!(reserve <= MAX_FILES_RESERVE, "{reserve}");
+        }
     }
 
     #[test]

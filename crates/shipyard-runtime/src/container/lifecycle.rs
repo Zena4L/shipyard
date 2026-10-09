@@ -94,23 +94,51 @@ struct Record {
     /// a `cgroupsPath` naming it) isn't this container's, and is left alone.
     #[serde(default)]
     cgroup_inode: Option<u64>,
+    /// `cgroup` is about to be made, not made yet: a cgroup at that path
+    /// may be another's (`create` failed, "exists already") or this one's,
+    /// its `create` killed before it could say so.
+    #[serde(default)]
+    cgroup_pending: bool,
 }
 
 impl Record {
-    /// Its cgroup, if it has one and it's a container's own.
+    /// Its cgroup, if it has one and it's a container's own (not just
+    /// pending).
     fn container_cgroup(&self) -> Option<std::result::Result<cgroup::Cgroup, cgroup::CgroupError>> {
         use std::os::unix::fs::MetadataExt as _;
+        if self.cgroup_pending {
+            return None;
+        }
         let path = self.cgroup.clone()?;
         if let Some(inode) = self.cgroup_inode
             && std::fs::metadata(&path).is_ok_and(|now| now.ino() != inode)
         {
             return None;
         }
-        let base = self
-            .cgroup_base
+        Some(cgroup::Cgroup::recorded(path, self.base()))
+    }
+
+    /// The base its cgroup was made below (see `cgroup_base`).
+    fn base(&self) -> PathBuf {
+        self.cgroup_base
             .clone()
-            .unwrap_or_else(|| PathBuf::from(cgroup::ROOT));
-        Some(cgroup::Cgroup::recorded(path, base))
+            .unwrap_or_else(|| PathBuf::from(cgroup::ROOT))
+    }
+}
+
+impl Record {
+    /// Removes its cgroup if it's pending, there, and empty: a `create`
+    /// killed between making it and recording it. Only `rmdir`, which the
+    /// kernel refuses for a cgroup with processes or cgroups in it: one that
+    /// isn't empty may be another container's (with this ID, under another
+    /// `--root`), and nothing is killed.
+    fn remove_pending_cgroup(&self) {
+        if self.cgroup_pending
+            && let Some(path) = &self.cgroup
+            && cgroup::Cgroup::recorded(path.clone(), self.base()).is_ok()
+        {
+            let _ = std::fs::remove_dir(path);
+        }
     }
 }
 
@@ -156,10 +184,7 @@ pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
         ));
     }
     if let Err(why) = &tree {
-        warnings.extend(cgroup::devices_without_cgroup(
-            &loaded.isolation.devices,
-            why,
-        ));
+        warnings.extend(cgroup::devices_without_cgroup(&loaded.isolation, why));
     }
     DirBuilder::new()
         .recursive(true)
@@ -191,14 +216,15 @@ pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
         cgroup_base: None,
         hooks: hooks.clone(),
         cgroup_inode: None,
+        cgroup_pending: false,
     };
     let cgroup = if let Ok(tree) = &tree {
         let path = loaded
             .cgroups_path
             .unwrap_or_else(|| cgroup::runtime_cgroup(id));
         match limited_cgroup(tree, &path, &loaded.isolation, (id, &dir_fd), &mut record) {
-            Ok((cgroup, warning)) => {
-                warnings.extend(warning);
+            Ok((cgroup, limited)) => {
+                warnings.extend(limited);
                 Some(cgroup)
             }
             Err(err) => {
@@ -241,31 +267,44 @@ fn with_warnings(err: ContainerError, warnings: &[String]) -> ContainerError {
 
 /// Makes the container's cgroup at `path` (below `tree`'s base) with
 /// `isolation`'s limits written in and its device program attached, before
-/// anything runs in it; removed again if they can't be. Returns it, and a
-/// warning if its device rules can't be enforced.
+/// anything runs in it; removed again if they can't be. Returns it, and the
+/// warnings: limits that do nothing here, device rules that can't be
+/// enforced.
 ///
 /// It's put in `record`, written to container `id`'s state directory (open
-/// at `dir`), as soon as it's made: the limits and the device program take a while, and a
-/// `create` killed meanwhile must leave a cgroup `delete` can find.
+/// at `dir`), as pending before it's made and as made right after: a
+/// `create` killed at any point must leave a cgroup `delete` can find.
 fn limited_cgroup(
     tree: &cgroup::Tree,
     path: &Path,
     isolation: &crate::isolation::Isolation,
     (id, dir): (&str, &OwnedFd),
     record: &mut Record,
-) -> Result<(cgroup::Cgroup, Option<String>)> {
+) -> Result<(cgroup::Cgroup, Vec<String>)> {
     use std::os::unix::fs::MetadataExt as _;
+    let write = |record: &Record| {
+        lock_at(dir)
+            .map_err(locking(id))
+            .and_then(|_lock| write_record_at(dir, record))
+    };
+    // Pending first: a `create` killed between the `mkdir` and the record
+    // leaves a cgroup `delete` can still find (and remove only if it's empty,
+    // see [`Record::remove_pending_cgroup`]).
+    record.cgroup = Some(tree.base().join(path));
+    record.cgroup_base = Some(tree.base().to_path_buf());
+    record.cgroup_pending = true;
+    write(record)?;
     let made = tree.create(path)?;
     record.cgroup = Some(made.path().to_path_buf());
-    record.cgroup_base = Some(made.base().to_path_buf());
+    record.cgroup_pending = false;
     record.cgroup_inode = std::fs::metadata(made.path()).ok().map(|meta| meta.ino());
-    let recorded = lock_at(dir)
-        .map_err(locking(id))
-        .and_then(|_lock| write_record_at(dir, record));
-    // Nothing is skipped: a bundle's swap limit is never a default.
+    let recorded = write(record);
+    // What `limit` skips or warns about (a bundle's swap limit is never a
+    // default: only warnings), then the device program's.
     let confined = recorded.and_then(|()| {
-        made.limit(&isolation.resources)?;
-        Ok(cgroup::enforce_devices(&made, &isolation.devices)?)
+        let mut warnings = made.limit(&isolation.resources)?;
+        warnings.extend(cgroup::enforce_devices(&made, &isolation.devices)?);
+        Ok(warnings)
     });
     match confined {
         Ok(warning) => Ok((made, warning)),
@@ -456,6 +495,12 @@ pub fn monitor_entry_point() {
     if args.get(1).map(OsString::as_os_str) != Some(MONITOR_ARG.as_ref()) {
         return;
     }
+    // As for the CLI itself: a privileged start (setuid, file capabilities)
+    // gets no further. Anyone can start this entry point by hand.
+    if let Err(err) = crate::process::refuse_privileged_start() {
+        let _ = writeln!(std::io::stderr(), "shipyard-monitor: {err}");
+        std::process::exit(125);
+    }
     let fd = |at: usize| {
         args.get(at)
             .and_then(|fd| fd.to_str()?.parse::<RawFd>().ok())
@@ -558,12 +603,18 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
     // SIGKILL wasn't someone's `kill`.
     let killed =
         nix::sys::stat::fstatat(dir, KILLED_FILE, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW).is_ok();
-    let out_of_memory = !killed && cgroup.as_ref().is_some_and(|cgroup| cgroup.oom_kills() > 0);
+    let oom = cgroup
+        .as_ref()
+        .map(cgroup::Cgroup::oom_events)
+        .filter(|events| !killed && events.kills > 0);
     // Before "stopped" is recorded: a stopped container has nothing left.
     remove_cgroup();
     let ended = match status {
-        Ok(status) if out_of_memory && status.killed_by_sigkill() => {
-            format!("{} (out of memory)", describe_exit(status))
+        Ok(status)
+            if status.killed_by_sigkill()
+                && let Some(oom) = oom =>
+        {
+            format!("{} ({})", describe_exit(status), oom.cause())
         }
         Ok(status) => describe_exit(status),
         Err(err) => format!("unknown ({err})"),
@@ -649,7 +700,10 @@ fn spawn_container(
     }
 }
 
-/// Waits (blocking) until the report pipe resolves.
+/// Waits (blocking) until the report pipe resolves. No deadline, as runc's
+/// `create` has none: a setup hung in the kernel (a mount on a dead NFS
+/// server) hangs `create` too, and `delete --force` (or a signal) ends it;
+/// one that fails reports at once, and a dead init closes the pipe.
 fn wait_for_report(child: &mut crate::process::spawn::Child) -> crate::Result<()> {
     loop {
         child.check_exec()?;
@@ -1029,6 +1083,9 @@ pub fn delete(root: &Path, id: &str, force: bool) -> Result<Vec<String>> {
     // One that's gone already (with the user manager it was below, at a
     // logout) is nothing to remove: its base may be gone too.
     let record = read_record(&dir)?;
+    if let Some(record) = &record {
+        record.remove_pending_cgroup();
+    }
     if let Some(recorded) = record
         .as_ref()
         .filter(|record| record.cgroup.as_ref().is_some_and(|path| path.exists()))
@@ -1382,6 +1439,7 @@ mod tests {
             cgroup_base: None,
             hooks: None,
             cgroup_inode: None,
+            cgroup_pending: false,
         };
         let fd = open_directory(&dir).unwrap();
         let write_record = |_: &Path, record: &Record| write_record_at(&fd, record);

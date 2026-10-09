@@ -29,8 +29,12 @@ made by `create`, with the bundle's `linux.resources` limits written in before a
 runs there, recorded in the state, and removed when the container ends; `delete`
 removes it too, killing anything left in it. A cgroup that exists already is never
 taken over: with the default path, an ID can be used by one container at a time across
-every `--root`, and a second one fails with "the cgroup … exists already". A container
-the kernel's OOM killer ended has "(out of memory)" in its exit record; one ended by
+every `--root`, and a second one fails with "the cgroup … exists already". A `create`
+killed while it made the cgroup leaves it behind, noted in its state: `delete` of that
+container removes it if it's empty (it never kills what's there), and the ID can be
+created again. A container
+the kernel's OOM killer ended has "(out of memory)" in its exit record ("(the host or a
+parent cgroup ran out of memory)" if it never reached its own limit); one ended by
 `kill … KILL` or `delete` doesn't, though the OOM killer struck one of its processes
 before.
 

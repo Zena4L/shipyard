@@ -37,10 +37,66 @@ and what was carried forward to later stages.
 - tests for every stage
 - the CLI growing with each stage
 - the production-quality items in FEATURES.md §15, adopted as soon as they apply
+- the [hardening track](#hardening-track), each item from its home stage
 
 Stages 2–9 are Linux-only. Until stage 12 lands, develop them on macOS inside a Lima VM,
 and run their tests in a Linux container with `scripts/test-linux.sh` (see
 [DEVELOPMENT.md](DEVELOPMENT.md)).
+
+## Hardening track
+
+What looking back at stages 0–7 says to do differently (decided 2026-10-09). Each item
+has a home stage; none waits for stage 14. The first two get more expensive with every
+stage, so they come first.
+
+| # | Item | Why | Home |
+|---|---|---|---|
+| H1 | **An engine crate** (`shipyard-engine`): the logic now in the CLI (`run.rs`, `network.rs`, …) behind a typed API; the CLI a thin client of it, with `--json` output | stage 11's API and stage 13's UI need it as a library; the move grows with every stage | stage 9 (start in stage 8 for what it adds) |
+| H2 | **One state model, versioned:** one container record and state machine, one liveness rule and one recovery path in place of each stage's own lock-and-sweep; a schema version on every on-disk format from its first write, and a test reading the previous version | today's records (run areas, leases, run directories, volume holds, `dns.lock`, cgroup records) each work alone; upgrades rest on `serde` defaults | stage 9 |
+| H3 | **A threat model in every plan:** who is hostile (the container, a local user, the network, a registry, the image) and what each may never do, written as invariants with a test each; the Murphy review run against the plan too | stage 6's tar escapes and stage 7's router advertisements, open router and lockable leases were all found after building | from stage 8 |
+| H4 | **Real hosts in CI:** VM jobs on the distributions users run (Ubuntu with AppArmor, Fedora with SELinux, an older LTS kernel), the probes on each | the test container is one privileged Debian on one kernel; stage 7's last failures appeared only on Ubuntu | stage 8 (one VM job), widened by stage 12 |
+| H5 | **Quality tools in CI:** `cargo-mutants` on changed files, the fuzz targets on a schedule, the OCI runtime conformance suite, differential tests of Shipyard's own netlink and nf_tables against `ip` and `nft` | the method works but runs by hand; conformance was planned for stage 14 though the runtime exists since stage 3 | conformance and differential tests in stage 8; mutants and scheduled fuzzing in stage 9 |
+| H6 | **Errors as a designed surface:** stable error kinds (and codes) in one module per crate; tests assert the kind, not the wording; messages stay free to improve | wording drifted across steps, and tests matching on wording broke CI twice | with H1 (stage 9), and each new error from stage 8 |
+| H7 | **Performance budgets as tests:** run start, run exit, a cached pull, a network attach; a regression fails | pasta's one-second exit delay was found by accident | stage 8 |
+| H8 | **Owned components decided explicitly:** for each piece Shipyard writes itself instead of using a crate or a tool (netlink, nf_tables, seccomp, eBPF, tar, DNS), the trade-off recorded here, and a differential test against a reference | each is a large, security-relevant surface Shipyard maintains alone | recorded in stage 8; tests with H5 |
+| H9 | **Build hygiene:** small debug info (done: `line-tables-only`), CI caches, documented clean-up of build volumes | builds reached 30 GB on disk and 65 GB in Docker before anyone looked | done in stage 7; kept |
+
+## Open findings
+
+A review of the whole codebase after stage 7 (2026-10-09; five reviewers, one per area)
+found these; each was then re-checked against the code by independent agents, which
+corrected several (the severities and findings below are the corrected ones). Stage 7.5
+(hardening) fixed the first group, and 7.6 the stage 1–7 findings the review had left (F18's pins, F19–F23, F25–F28); the rest have their stage. Each fix
+comes with a test that reproduces the problem first. Remove a row when its fix lands.
+
+| ID | Severity | Finding | Fix | Home |
+|---|---|---|---|---|
+| F6 | high | A joined process runs unconfined (no capability drop, no seccomp); not reachable yet (no `exec` command); `/proc/<joiner>` and `exe` patterns (CVE-2016-9962, CVE-2019-5736, CVE-2024-21626) | confine it, non-dumpable before `setns`, no host procfs descriptors | 8 (`exec`) |
+| F10 | low | No per-source conntrack limit: one container can fill the host's connection table (the `ct state invalid drop` landed in 7.5) | `ct count` per source, as an option (D10) | 9 |
+| F14 | medium | firewalld rejects by rule, not policy: containers have no way out there and no warning; the Docker fix leaves published ports broken | detect firewalld's table (suggest `--zone=trusted`); complete the Docker fix | 8 (with H4's VM CI) |
+| F17 | low | Terminal settings aren't restored after an isolated run (a container can leave the shared terminal raw) | save and restore the termios; stage 8's pseudo-terminal replaces the path | 8 |
+| F18 | low | CI: one distribution; no fuzzing or mutation in CI (actions are pinned by commit since 7.6) | H4, H5 | 8–9 |
+| F24 | low | An OCI bind source is checked at load but resolved again by path at start: swapped for a symlink in between, another host path is bound (runc shares it) | open it with `O_PATH`/`O_NOFOLLOW` at load and carry the descriptor through the init's re-exec; it needs write access above another bundle's source, so it waits | later |
+| F29 | low | For a program embedding the runtime library: the subreaper reaps and kills its own children and stays set; SIGPIPE can kill it if the child dies before go; the parent-death signal is tied to the thread that forked | scope reaping to the command's tree and reset the subreaper; `MSG_NOSIGNAL`/blocked SIGPIPE; document "the main thread" | 11 (the API) |
+| F30 | low | DNS TCP slots still per client; no opt-in to keep containers from the host's own services and the cloud metadata address (169.254.169.254); internal networks reach host services bound to every address | per-lease TCP slots; an input chain option | 9 |
+| F31 | low | Stages 7.5 and 7.6's residuals: link-local IPv6 isn't tied to its container; a store root that's a symlink is only warned about; a root filesystem's own device nodes open where no device program guards; a symlink can steer a volume onto Shipyard's tmpfs covers in `/sys`, or onto securityfs, debugfs or the like below a bundle's own recursive `/sys` bind; a container that hit its memory limit, then lost a process to the host's OOM killer, reads "out of memory"; `--blkio-weight` doesn't set BFQ's `io.bfq.weight` (runc does); `update --cpu-period` alone clears the quota (runc keeps it); a `delete` of a killed `create` can remove another `--root`'s same-ID cgroup in the moment before its init joins it (that `create` fails) | each as noted in `stages/07.5-hardening.md` | later |
+
+**Stage 7.5 decisions (2026-10-09):**
+- **D1:** no device program for a rootful run → drop `CAP_MKNOD` (in every set) and warn; `/dev` is unchanged (a `nodev` `/dev` with made nodes wouldn't open them: probe 10); refusing would break cgroup-v1 hosts.
+- **D2:** a memfd that can't be exec'd → today's descriptor, with a warning.
+- **D3:** host-`/` rootful runs warn; a required flag waits for a major version.
+- **D4:** inherited metadata kept; chain-ID names only for extractions that inherited.
+- **D5:** 128 layers per image.
+- **D6:** fix the built-in profile's data (bundles mean exactly what they say).
+- **D7:** anti-spoofing in a `bridge`-family table.
+- **D8, D9:** warn, don't refuse.
+- **D10:** a per-source conntrack limit becomes a stage 9 option.
+- **D11:** F16 closed with a bound test.
+- **D12:** F12 closed without deadlines: each wait is bounded by its other end (shipyard
+  itself, end-of-file if it dies; each hook's OCI `timeout`, and a hook without one may
+  run as long as it likes, as runc's), or behaves as runc's (`create` waits as long as a
+  setup hung in the kernel, ended by `delete --force`). A deadline would end hooks the
+  spec lets run. Each wait says so in a comment.
 
 ## Milestones
 

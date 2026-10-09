@@ -76,6 +76,8 @@ pub enum CapabilityError {
 impl Capability {
     /// `CAP_KILL`: signal processes of other users.
     pub const KILL: Self = Self(5);
+    /// `CAP_MKNOD`: make device nodes.
+    pub const MKNOD: Self = Self(27);
 
     /// The capability with kernel number `number`, if this table knows it.
     #[must_use]

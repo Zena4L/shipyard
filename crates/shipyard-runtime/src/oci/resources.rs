@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::{BundleError, Reader, asks_nothing};
 use crate::cgroup::{RUN_PARENT, RUNTIME_PARENT};
 use crate::devices::{Access, DeviceKind, DeviceRule};
-use crate::resources::{self, CPU_PERIOD, CpuMax, IoLimit, Limit, Resources};
+use crate::resources::{self, CpuMax, IoLimit, Limit, Resources};
 
 /// `linux.resources`. Fields the spec doesn't define are ignored.
 #[derive(Deserialize, Default)]
@@ -287,15 +287,7 @@ impl Reader<'_> {
             }
         }
         limits.cpu_weight = cpu.shares.and_then(resources::weight_from_shares);
-        // runc's: a quota of 0 or -1 is none, a period of 0 the default.
-        let quota = cpu.quota.and_then(resources::positive);
-        let period = cpu.period.filter(|&period| period > 0);
-        if quota.is_some() || period.is_some() {
-            limits.cpu_max = Some(CpuMax {
-                quota,
-                period: period.unwrap_or(CPU_PERIOD),
-            });
-        }
+        limits.cpu_max = CpuMax::from_parts(cpu.quota, cpu.period);
         limits.cpuset_cpus = cpu.cpus.clone().filter(|cpus| !cpus.is_empty());
         limits.cpuset_mems = cpu.mems.clone().filter(|mems| !mems.is_empty());
     }

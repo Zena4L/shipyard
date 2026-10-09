@@ -146,7 +146,9 @@ pub use stats::{
 #[cfg(target_os = "linux")]
 mod devices;
 #[cfg(target_os = "linux")]
-pub(crate) use devices::{devices_without_cgroup, enforce_devices, is_host_root};
+pub(crate) use devices::{
+    devices_unguarded, devices_without_cgroup, enforce_devices, is_host_root,
+};
 #[cfg(target_os = "linux")]
 mod live;
 #[cfg(target_os = "linux")]
@@ -156,7 +158,7 @@ mod tree;
 #[cfg(target_os = "linux")]
 pub use live::{available_controllers, is_cgroup2, own_cgroup};
 #[cfg(target_os = "linux")]
-pub use manage::{Cgroup, CgroupError, RunCgroup, run_cgroup, runtime_cgroup};
+pub use manage::{Cgroup, CgroupError, OomEvents, RunCgroup, run_cgroup, runtime_cgroup};
 #[cfg(target_os = "linux")]
 pub use tree::{NoTree, Tree};
 

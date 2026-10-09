@@ -225,6 +225,10 @@ struct StatusPipe {
     /// There's an init (a PID namespace): otherwise the clean image became
     /// the command, and how it ended is the command's.
     has_init: bool,
+    /// A sealed copy of shipyard's binary was made for the init: checked
+    /// once the command runs (see [`warn_if_init_unsealed`]).
+    #[cfg(target_os = "linux")]
+    sealed_init: bool,
 }
 
 /// Starts the process `spec` describes and returns without waiting.
@@ -459,8 +463,12 @@ struct CleanImageFiles {
     /// here once the child exists.
     status_read: OwnedFd,
     status_write: OwnedFd,
-    /// The shipyard binary.
+    /// The binary the child re-execs: a sealed copy of shipyard's (see
+    /// [`own_binary`]).
     exe: OwnedFd,
+    /// Shipyard's binary file itself, when `exe` is a copy: for a host
+    /// that won't run a memfd (a security module's policy).
+    host_exe: Option<OwnedFd>,
     /// The setup, in a sealed memfd (see `setup.rs`).
     setup: OwnedFd,
     /// The start gate, if any (`SpawnOptions::gate`).
@@ -486,10 +494,12 @@ impl CleanImageFiles {
             .then(hooks_pipe)
             .transpose()?;
         let overlay = prebuilt_overlay(isolation)?;
+        let (exe, host_exe) = own_binary()?;
         Ok(Self {
             status_read,
             status_write,
-            exe: open_own_binary()?,
+            exe,
+            host_exe,
             setup: super::setup::Setup::new(
                 spec,
                 &options.keep_ignored,
@@ -519,6 +529,7 @@ impl CleanImageFiles {
                 .placement
                 .isolation()
                 .is_some_and(|isolation| isolation.has(crate::isolation::Namespace::Pid)),
+            sealed_init: self.host_exe.is_some(),
         };
         let hooks = self.hooks.and_then(|(_, pipe)| {
             let container = options.placement.isolation()?.hooks.clone()?;
@@ -535,6 +546,7 @@ impl CleanImageFiles {
             status: self.status_write.as_raw_fd(),
             report,
             exe: self.exe.as_raw_fd(),
+            host_exe: self.host_exe.as_ref().map(AsRawFd::as_raw_fd),
             gate: self.gate,
             hooks: self.hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
             overlay: self.overlay.as_ref().map(AsRawFd::as_raw_fd),
@@ -581,17 +593,105 @@ fn prebuilt_overlay(isolation: &Isolation) -> Result<Option<OwnedFd>> {
     Ok(Some(mounted))
 }
 
-/// The running shipyard binary, for the cloned child to re-exec (see
-/// `init.rs`). Opened by descriptor, before the clone: the file on disk may
-/// be replaced by an upgrade meanwhile.
+/// The binary for the cloned child to re-exec as the container's init (see
+/// `init.rs`): a sealed in-memory copy of the running one, and the running
+/// one's file, for when a copy can't be run.
+///
+/// The init runs inside the container, so the container could reach the
+/// file it was started from (`/proc/1/exe`, with the right privileges):
+/// were that shipyard's binary on disk, container root could overwrite the
+/// program host root runs next (CVE-2019-5736). A sealed memfd can't be
+/// changed by anyone, as runc does. Both are opened before the clone, by
+/// descriptor: the file on disk may be replaced by an upgrade meanwhile.
+///
+/// Where no copy can be made (`vm.memfd_noexec` at 2 refuses executable
+/// memfds), the file itself, with a warning: no worse than before.
 #[cfg(target_os = "linux")]
-fn open_own_binary() -> Result<OwnedFd> {
-    nix::fcntl::open(
+fn own_binary() -> Result<(OwnedFd, Option<OwnedFd>)> {
+    let host = nix::fcntl::open(
         "/proc/self/exe",
         nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
-    .map_err(|e| Error::sys("opening shipyard's own binary for the container init", e))
+    .map_err(|e| Error::sys("opening shipyard's own binary for the container init", e))?;
+    match sealed_copy(&host) {
+        Ok(copy) => Ok((copy, Some(host))),
+        Err(errno) => {
+            tracing::warn!(
+                "couldn't make a sealed copy of shipyard's binary for the container's init \
+                 ({}); it runs the binary's file itself",
+                errno.desc()
+            );
+            Ok((host, None))
+        }
+    }
+}
+
+/// Warns if the container's init (`pid`) runs shipyard's binary file, not
+/// the sealed copy made for it: the copy's exec was refused (a security
+/// module's policy on memfds, say), and the child, which can't say so
+/// itself, fell back to the file. Silent where the link can't be read (the
+/// init's gone, or isn't ours to look at): never a false alarm.
+#[cfg(target_os = "linux")]
+fn warn_if_init_unsealed(pid: Pid) {
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+        && !runs_sealed_copy(&exe)
+    {
+        tracing::warn!(
+            "the container's init runs shipyard's binary file ({}), not a sealed copy of it \
+             (this host refused to run the copy): root in the container could reach the file \
+             through /proc/1/exe",
+            exe.display()
+        );
+    }
+}
+
+/// Whether `exe` (a process's `/proc/PID/exe` link) is the init's sealed
+/// copy: a memfd named as [`sealed_copy`] names it.
+#[cfg(target_os = "linux")]
+fn runs_sealed_copy(exe: &std::path::Path) -> bool {
+    exe.as_os_str()
+        .as_encoded_bytes()
+        .starts_with(SEALED_COPY_LINK.as_bytes())
+}
+
+/// What `/proc/PID/exe` reads for a process running the sealed copy.
+#[cfg(target_os = "linux")]
+const SEALED_COPY_LINK: &str = "/memfd:shipyard-init";
+
+/// A sealed, executable memfd holding the file `from` (see [`own_binary`]).
+#[cfg(target_os = "linux")]
+fn sealed_copy(from: &OwnedFd) -> std::result::Result<OwnedFd, Errno> {
+    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+    use nix::sys::memfd::{MFdFlags, memfd_create};
+
+    let flags = MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING;
+    // `MFD_EXEC` (Linux 6.3) asks for an executable memfd, which
+    // `vm.memfd_noexec` at 1 would otherwise not give; an older kernel
+    // doesn't know the flag (EINVAL), and its memfds are all executable.
+    let memfd = match memfd_create(
+        c"shipyard-init",
+        flags | MFdFlags::from_bits_retain(libc::MFD_EXEC),
+    ) {
+        Err(Errno::EINVAL) => memfd_create(c"shipyard-init", flags)?,
+        made => made?,
+    };
+    let io = |error: std::io::Error| super::io_errno(&error);
+    // A duplicate shares the file offset, which the exec doesn't use.
+    let mut source = std::fs::File::from(from.try_clone().map_err(io)?);
+    let mut copy = std::fs::File::from(memfd);
+    // `std::io::copy` copies in the kernel where it can (`copy_file_range`,
+    // `sendfile`), and reads and writes otherwise.
+    let copied = std::io::copy(&mut source, &mut copy).map_err(io)?;
+    if copied != source.metadata().map_err(io)?.len() {
+        return Err(Errno::EIO);
+    }
+    let copy = OwnedFd::from(copy);
+    fcntl(
+        &copy,
+        FcntlArg::F_ADD_SEALS(SealFlag::from_bits_retain(super::setup::SEALS)),
+    )?;
+    Ok(copy)
 }
 
 /// Which side of the `fork` or `clone` this is.
@@ -742,7 +842,17 @@ impl Child {
                 Ok(()) => return Ok(()),
                 Err(err) => Err(err),
             },
-            Report::Running => Ok(()),
+            Report::Running => {
+                #[cfg(target_os = "linux")]
+                if self
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.sealed_init)
+                {
+                    warn_if_init_unsealed(self.pid);
+                }
+                Ok(())
+            }
             Report::Failed(failure) => Err(describe(failure, &self.context).into()),
         };
         self.report = None;
@@ -1057,5 +1167,46 @@ mod tests {
         assert!(!terminates_by_default(NixSignal::SIGTSTP));
         assert!(!terminates_by_default(NixSignal::SIGSTOP));
         assert!(!terminates_by_default(NixSignal::SIGCHLD));
+    }
+
+    /// The init's binary is a copy of the running one, byte for byte, that
+    /// nobody can change: every seal is on, and a write is refused. (The
+    /// file it was copied from has none: the check isn't vacuous.)
+    /// Only the sealed copy's link counts as it: the binary's file, or any
+    /// other memfd, doesn't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_the_sealed_copys_link_counts() {
+        use std::path::Path;
+        assert!(runs_sealed_copy(Path::new("/memfd:shipyard-init")));
+        assert!(runs_sealed_copy(Path::new(
+            "/memfd:shipyard-init (deleted)"
+        )));
+        assert!(!runs_sealed_copy(Path::new("/usr/bin/shipyard")));
+        assert!(!runs_sealed_copy(Path::new("/memfd:other")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_inits_binary_is_a_sealed_copy() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let (copy, host) = own_binary().unwrap();
+        let host = host.expect("a copy, so the file itself as well");
+        assert!(super::super::setup::is_sealed_setup(copy.as_raw_fd()));
+        assert!(!super::super::setup::is_sealed_setup(host.as_raw_fd()));
+        let read = |fd: &OwnedFd| {
+            let mut file = std::fs::File::from(fd.try_clone().unwrap());
+            file.rewind().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        let bytes = read(&copy);
+        assert!(!bytes.is_empty());
+        assert!(bytes == read(&host), "the copy differs from the binary");
+        let mut file = std::fs::File::from(copy);
+        let refused = file.write_all(b"x").unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EPERM), "{refused}");
     }
 }

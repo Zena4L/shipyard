@@ -101,11 +101,16 @@ pub(crate) struct Handshake {
 /// (see `init.rs`): built here, so the child only makes system calls.
 #[cfg(target_os = "linux")]
 pub(crate) struct Reexec {
-    /// The shipyard binary, opened before the clone.
+    /// The binary to exec, opened before the clone: a sealed copy of
+    /// shipyard's (see `spawn.rs`).
     pub(crate) exe: RawFd,
     /// `/proc/self/fd/<exe>`: the same binary as a path, for when `execveat`
     /// isn't available.
     pub(crate) exe_path: CString,
+    /// Shipyard's binary file (and its `/proc/self/fd` path), when `exe` is
+    /// a copy: tried only if the copy won't run (a security module's policy
+    /// on memfds, say). Close-on-exec, so the init never holds it.
+    pub(crate) host_exe: Option<(RawFd, CString)>,
     /// The clean image's arguments: the hidden entry point and the passed
     /// descriptors' numbers.
     pub(crate) argv: CStringArray,
@@ -119,7 +124,8 @@ pub(crate) struct Reexec {
     /// their close-on-exec flag is cleared just before the exec.
     pub(crate) passed: Vec<RawFd>,
     /// Every other descriptor from 3 up is closed before the exec: these
-    /// ranges (for `close_range`), everything but `passed` and `exe`.
+    /// ranges (for `close_range`), everything but `passed`, `exe` and
+    /// `host_exe`.
     pub(crate) close_ranges: Vec<(u32, u32)>,
     /// In a new user namespace: become its root (uid and gid 0 inside)
     /// before the exec, or the exec would leave the clean image without
@@ -138,6 +144,8 @@ pub(crate) struct ReexecFds {
     pub(crate) status: RawFd,
     pub(crate) report: RawFd,
     pub(crate) exe: RawFd,
+    /// Shipyard's binary file, when `exe` is a copy of it.
+    pub(crate) host_exe: Option<RawFd>,
     /// The start gate (`SpawnOptions::gate`), passed on too.
     pub(crate) gate: Option<RawFd>,
     /// The hooks pipe's read end, if the setup stops for hooks: passed on
@@ -486,14 +494,17 @@ fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
     let kept: Vec<u32> = passed
         .iter()
         .chain([&fds.exe])
+        .chain(fds.host_exe.as_ref())
         .filter_map(|&fd| u32::try_from(fd).ok())
         .collect();
+    let path = |fd: RawFd| c_string(format!("/proc/self/fd/{fd}").as_bytes(), "the binary");
     Ok(Reexec {
         exe: fds.exe,
-        exe_path: c_string(
-            format!("/proc/self/fd/{}", fds.exe).as_bytes(),
-            "the binary",
-        )?,
+        exe_path: path(fds.exe)?,
+        host_exe: fds
+            .host_exe
+            .map(|fd| Ok::<_, Error>((fd, path(fd)?)))
+            .transpose()?,
         argv: CStringArray::new(argv.clone()),
         argv_sigpipe: CStringArray::new(
             argv.into_iter()

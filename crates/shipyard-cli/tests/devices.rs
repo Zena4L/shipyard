@@ -203,6 +203,95 @@ fn a_rule_lets_made_nodes_open() {
     );
 }
 
+/// Starts `binary ARGS…` where no cgroup tree can be found: a mount
+/// namespace of its own with an empty tmpfs on `/sys/fs/cgroup`, as on a
+/// cgroup v1 host (to Shipyard).
+fn without_cgroups(binary: &str, args: &[&str]) -> Command {
+    let mut command = Command::new("unshare");
+    command
+        .args(["--mount", "--propagation", "private", "sh", "-c"])
+        .arg("mount -t tmpfs tmpfs /sys/fs/cgroup && exec \"$@\"")
+        .args(["sh", binary])
+        .args(args);
+    command
+}
+
+/// What a container with no device program is told it goes without.
+const WITHOUT_MKNOD: &str = "it goes without CAP_MKNOD, so it can't make device nodes";
+
+/// Real root with no cgroup has no device program to keep root inside
+/// from the host's disks: the container goes without `CAP_MKNOD`, so it
+/// can't make a node, while the usual devices, and one given, still work.
+/// With a cgroup (the control), it can make one (which the program then
+/// keeps it from opening).
+#[test]
+#[ignore = "needs root"]
+fn without_a_device_program_root_inside_cant_make_nodes() {
+    let root = RootFs::minimal();
+    let script = "mknod /dev/disk b 7 0 2> /dev/null && echo made; \
+                  head -c 1 /dev/zero > /dev/null && echo zero; \
+                  echo x > /dev/null && echo null; echo x > /dev/given && echo given; \
+                  while read -r key value; do [ \"$key\" != CapBnd: ] || echo \"$value\"; \
+                  done < /proc/self/status";
+    let args = [
+        "run",
+        "--rootfs",
+        root.arg(),
+        "--device",
+        "/dev/null:/dev/given",
+        "sh",
+        "-c",
+        script,
+    ];
+    let bounding = |run: &Run| {
+        let line = run.stdout.lines().last().unwrap_or_default().to_owned();
+        let bits = line.split_whitespace().last().unwrap_or_default();
+        u64::from_str_radix(bits, 16).unwrap_or_else(|_| panic!("{line}"))
+    };
+    let mknod = 1_u64 << 27;
+    let guarded = run(SHIPYARD.command(&args));
+    assert_eq!(guarded.code, Some(0), "{}", guarded.stderr);
+    assert!(
+        guarded.stdout.starts_with("made\nzero\nnull\ngiven\n"),
+        "{}",
+        guarded.stdout
+    );
+    assert_ne!(bounding(&guarded) & mknod, 0);
+    assert!(
+        !guarded.stderr.contains(WITHOUT_MKNOD),
+        "{}",
+        guarded.stderr
+    );
+    let unguarded = run(without_cgroups(env!("CARGO_BIN_EXE_shipyard"), &args));
+    assert_eq!(unguarded.code, Some(0), "{}", unguarded.stderr);
+    assert!(
+        unguarded.stdout.starts_with("zero\nnull\ngiven\n"),
+        "{}: {}",
+        unguarded.stdout,
+        unguarded.stderr
+    );
+    assert_eq!(bounding(&unguarded) & mknod, 0);
+    assert!(
+        unguarded.stderr.contains(WITHOUT_MKNOD),
+        "{}",
+        unguarded.stderr
+    );
+    // Without a root filesystem, `/dev` is the host's: the warning says
+    // what that leaves open.
+    let host_dev = run(without_cgroups(
+        env!("CARGO_BIN_EXE_shipyard"),
+        &["run", "true"],
+    ));
+    assert_eq!(host_dev.code, Some(0), "{}", host_dev.stderr);
+    assert!(
+        host_dev
+            .stderr
+            .contains("it sees the host's /dev (no root filesystem), whose devices all open"),
+        "{}",
+        host_dev.stderr
+    );
+}
+
 // --- As root: bundles -------------------------------------------------------------
 
 /// A bundle's config with `script`, its device rules and nodes.
@@ -258,6 +347,62 @@ fn a_bundles_rules_and_nodes() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let _ = runtime(state.path(), &["delete", "--force", "dev"]);
+}
+
+/// A bundle given `CAP_MKNOD` goes without it too where no device program
+/// can guard it (no cgroup), run by `shipyard run --bundle` or by
+/// `shipyard-runtime create`, which says so. With a cgroup (the control),
+/// it keeps it.
+#[test]
+#[ignore = "needs root"]
+fn without_a_device_program_a_bundle_loses_cap_mknod() {
+    let bundle = Bundle::new();
+    let mut config = device_bundle(
+        &bundle,
+        "mknod /tmp/a b 7 0 2> /dev/null && echo made; head -c 0 /dev/null && echo null",
+        &json!({}),
+    );
+    for set in ["bounding", "effective", "permitted"] {
+        config["process"]["capabilities"][set] = json!(["CAP_MKNOD"]);
+    }
+    bundle.write(&config);
+    let args = ["run", "--bundle", bundle.arg()];
+    let guarded = run(SHIPYARD.command(&args));
+    assert_eq!(guarded.stdout, "made\nnull\n", "{}", guarded.stderr);
+    let unguarded = run(without_cgroups(env!("CARGO_BIN_EXE_shipyard"), &args));
+    assert_eq!(unguarded.stdout, "null\n", "{}", unguarded.stderr);
+    assert!(
+        unguarded.stderr.contains(WITHOUT_MKNOD),
+        "{}",
+        unguarded.stderr
+    );
+    // The runtime: `create` warns, and the container can't make the node.
+    let state = Scratch::new();
+    let root = state.path().join("root");
+    let created = without_cgroups(RUNTIME, &["--root", arg(&root)])
+        .args(["create", "--bundle", bundle.arg(), "nomknod"])
+        .stdout(std::fs::File::create(state.path().join("create.out")).unwrap())
+        .stderr(std::fs::File::create(state.path().join("create.err")).unwrap())
+        .status()
+        .unwrap();
+    assert!(created.success(), "{}", output(state.path(), "create.err"));
+    assert!(
+        output(state.path(), "create.err").contains(WITHOUT_MKNOD),
+        "{}",
+        output(state.path(), "create.err")
+    );
+    assert!(runtime(state.path(), &["start", "nomknod"]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while output(state.path(), "create.out") != "null\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}: {}",
+            output(state.path(), "create.out"),
+            output(state.path(), "create.err")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = runtime(state.path(), &["delete", "--force", "nomknod"]);
 }
 
 /// `shipyard-runtime --root STATE/root ARGS…`, its output in `STATE/CMD.out`

@@ -4,7 +4,7 @@ A container's network is chosen with `shipyard run --network MODE`. On Linux:
 
 | Mode | The container's network |
 |---|---|
-| `bridge` | The default network: an address of its own on a bridge shared with other containers and the host, and a way out. **Root's default** (where root may change the network: not inside a container without `CAP_NET_ADMIN`, say). |
+| `bridge` | The default network: an address of its own on a bridge shared with other containers and the host, and a way out. **Root's default** (where root may change the network: not inside a container without `CAP_NET_ADMIN`, say; there the container gets the host's network, and `run` warns, unless you ask for `--network host`). |
 | `NAME` | A network made with `shipyard network create NAME`. Root only. |
 | `pasta` | One of its own, connected through [pasta](https://passt.top): a way out and published ports. **The default without root.** |
 | `host` | The host's: its interfaces, addresses and ports. |
@@ -339,6 +339,18 @@ What gets in:
 - **Containers on one network** reach each other.
 - **Containers on different networks don't**, and **nothing outside the host**
   reaches a container's address, except through a **published port**.
+- **A container sends only as itself.** Root in a container can write any packet
+  (it has `CAP_NET_RAW` by default), but on a network only what's from its own
+  addresses and hardware address gets past its port of the bridge: it can't pass
+  for another container, the gateway or the host, nor answer ARP (or IPv6's
+  neighbour discovery) for an address that isn't its own. Only IPv4, ARP and IPv6
+  get through at all: frames inside VLAN tags, and other protocols, don't. So a
+  container can't act as a router, a VPN or a bridge for others on the network, nor
+  run a DHCP client or an address probe from `0.0.0.0` (`arping -D`). Changing its
+  address or hardware address inside (with `--cap-add NET_ADMIN`) cuts it off. A
+  link-local IPv6 address isn't checked yet.
+- **Packets the kernel's connection tracking finds invalid** (outside any
+  connection's window, say) are dropped on their way into or out of a network.
 
 ### Published ports (`-p`, `-P`)
 
@@ -383,8 +395,11 @@ shipyard: published 0.0.0.0:41665 -> 80/tcp
 
 ### Other firewalls
 
-Shipyard's rules live in an nftables table of their own, `inet shipyard`, which
-it makes and keeps up to date. It never changes anyone else's rules. If another
+Shipyard's rules live in nftables tables of their own, `inet shipyard` and
+`bridge shipyard` (each container's port: what it may send as), which it makes and
+keeps up to date. On a kernel without bridge filtering (`nf_tables` for bridges),
+the second can't be made: `run` warns that containers can send as one another
+there, and goes on. It never changes anyone else's rules. If another
 program flushes the firewall (`nft flush ruleset`, a firewall service reloading,
 as `systemctl restart nftables` does), the containers that run lose, until the
 next `shipyard run` rebuilds the table whole:
@@ -393,7 +408,8 @@ next `shipyard run` rebuilds the table whole:
 - what keeps networks apart, and the host's routing closed to others;
 - the guard that keeps them from the host's loopback services, on a network
   whose containers publish ports (a container with `CAP_NET_RAW`, which it has by
-  default, could reach a service listening on `127.0.0.1` only).
+  default, could reach a service listening on `127.0.0.1` only);
+- what keeps each from sending as another.
 
 So after a flush, run any container on a network at once: `sudo shipyard run
 true` (on the default network) puts the table back.

@@ -34,6 +34,15 @@ use super::syscalls;
 /// vendored by Docker 29.8; Apache-2.0, by the Moby authors): every call
 /// most programs need, and none of the ones that reach into the kernel's
 /// own state (`keyctl`, `bpf`, `mount`, …) unless a capability grants them.
+///
+/// One change of Shipyard's (the rule's `comment` says so): its `>` rule on
+/// `socket`'s domain also requires the argument's high half to be 0.
+/// Comparisons are on 64 bits, as libseccomp's (and a bundle's mean exactly
+/// that), but the kernel reads an `int` argument's low 32 bits only:
+/// `0x1_0000_0028` passes `> 40` and is `AF_VSOCK` to the kernel. (High
+/// bits only make a value bigger, so an allowing `<` or `==` can't be
+/// passed that way.) A test checks every allowing `>`, `>=` and `!=` has
+/// the guard, so a newer copy of Docker's can't drop it unnoticed.
 const DOCKER_DEFAULT: &str = include_str!("docker-default.json");
 
 /// Which seccomp filter a container's command runs under.

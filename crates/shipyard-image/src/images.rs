@@ -45,6 +45,8 @@ use crate::unpack::{self, LayerReport, LayerSpec, UnpackError, UnpackOptions};
 pub struct Extracted {
     /// The layers' content directories (`layers/<name>/diff`), base first.
     pub directories: Vec<PathBuf>,
+    /// Their directories' names in `layers/`, base first.
+    pub names: Vec<String>,
     /// What extracting the new ones did (layers already in the store add
     /// nothing).
     pub report: LayerReport,
@@ -74,6 +76,9 @@ pub enum ExtractError {
         /// `diff_ids` in the config.
         diff_ids: usize,
     },
+    /// The image has more layers than [`MAX_LAYERS`](crate::MAX_LAYERS).
+    #[error("the image has {0} layers, more than the {limit} an image may have", limit = crate::MAX_LAYERS)]
+    TooManyLayers(usize),
     /// A name given to [`remove_layers`] isn't a layer's.
     #[error("`{0}` isn't the name of a layer")]
     NotALayer(String),
@@ -127,6 +132,9 @@ pub fn layer_specs(
             diff_ids: config.diff_ids.len(),
         });
     }
+    if manifest.layers.len() > crate::MAX_LAYERS {
+        return Err(ExtractError::TooManyLayers(manifest.layers.len()));
+    }
     Ok(manifest
         .layers
         .iter()
@@ -139,18 +147,60 @@ pub fn layer_specs(
         .collect())
 }
 
-/// The content directories `layers` (base first) have, or will have once
-/// extracted, with files owned as `owners` says.
+/// The content directories (`layers/<name>/diff`) of the layers whose
+/// directories are `names` (base first), whether or not they exist yet.
 #[must_use]
-pub fn layer_directories(store: &Store, layers: &[LayerSpec], owners: LayerOwners) -> Vec<PathBuf> {
-    layers
-        .iter()
-        .map(|layer| store.layer_diff(&layer.digest, owners))
-        .collect()
+pub fn layer_directories(store: &Store, names: &[String]) -> Vec<PathBuf> {
+    names.iter().map(|name| store.layer_diff(name)).collect()
+}
+
+/// The names in `layers/` of `layers` (base first) as owned by `owners`, if
+/// every one is extracted already: a layer's digest name
+/// ([`LayerOwners::name`]), or, for a layer that implies directories, its
+/// name on the layers below it ([`LayerOwners::name_on`]). Changes nothing.
+///
+/// # Errors
+///
+/// [`ExtractError::Io`] if the store can't be read.
+pub fn placed_layers(
+    store: &Store,
+    layers: &[LayerSpec],
+    owners: LayerOwners,
+) -> Result<Option<Vec<String>>, ExtractError> {
+    let layers_dir = layers_dir(store)?;
+    let mut names: Vec<String> = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let found = [
+            owners.name(&layer.digest),
+            owners.name_on(&layer.digest, &names),
+        ]
+        .into_iter()
+        .find(|name| has_diff(&layers_dir, name));
+        let Some(name) = found else {
+            return Ok(None);
+        };
+        names.push(name);
+    }
+    Ok(Some(names))
+}
+
+/// Whether `layers/<name>/diff` is a directory. Changes nothing (unlike
+/// `placed`, which moves aside a layer in an old layout).
+fn has_diff(layers_dir: &OwnedFd, name: &str) -> bool {
+    fsat::open_dir_at(layers_dir, OsStr::new(name))
+        .and_then(|layer| fsat::open_dir_at(&layer, OsStr::new(DIFF)))
+        .is_ok()
 }
 
 /// Extracts every layer in `layers` (base first) the store doesn't have
 /// extracted yet, and returns all their content directories.
+///
+/// A layer is extracted once, under its digest's name, for every image
+/// that has it; but one that implies directories, whose metadata then
+/// comes from the layers below, is extracted for those lowers, under its
+/// name on them ([`LayerOwners::name_on`]). Which one a layer is depends
+/// on its own entries only. (A store from before kept every layer under
+/// its digest's name: those stay as they are.)
 ///
 /// # Errors
 ///
@@ -173,14 +223,25 @@ pub fn extract_layers(
     let mut diffs: Vec<OwnedFd> = Vec::with_capacity(layers.len());
     // Extracted here, to place once all are on disk: (temporary, final).
     let mut to_place: Vec<(OsString, String)> = Vec::new();
+    // Each layer's directory name, base first.
+    let mut names: Vec<String> = Vec::with_capacity(layers.len());
 
     for (index, layer) in layers.iter().enumerate() {
-        let name = owners.name(&layer.digest);
-        if let Some(diff) = placed(&layers_dir, &name)? {
+        let plain = owners.name(&layer.digest);
+        let stacked = owners.name_on(&layer.digest, &names);
+        let mut found = None;
+        for name in [&plain, &stacked] {
+            if let Some(diff) = placed(&layers_dir, name)? {
+                found = Some((diff, name.clone()));
+                break;
+            }
+        }
+        if let Some((diff, name)) = found {
             diffs.push(diff);
+            names.push(name);
             continue;
         }
-        let temporary = temporaries.create(&name)?;
+        let temporary = temporaries.create(&plain)?;
         let diff = make_diff(&layers_dir, &temporary)?;
         let blob = store.open_blob(&layer.digest)?;
         let layer_report =
@@ -192,7 +253,13 @@ pub fn extract_layers(
                 }
             })?;
         report.add(&layer_report);
+        let name = if layer_report.implied_dirs > 0 {
+            stacked
+        } else {
+            plain
+        };
         diffs.push(diff);
+        names.push(name.clone());
         to_place.push((temporary, name));
     }
 
@@ -217,7 +284,8 @@ pub fn extract_layers(
     }
 
     Ok(Extracted {
-        directories: layer_directories(store, layers, owners),
+        directories: layer_directories(store, &names),
+        names,
         report,
     })
 }
@@ -428,10 +496,13 @@ mod tests {
                 .exists(),
             "no marker"
         );
-        let mut expected: Vec<String> = specs
-            .iter()
-            .map(|spec| LayerOwners::Caller.name(&spec.digest))
-            .collect();
+        // The top layer implies `etc` (no entry of its own): it's placed
+        // under its name on the base.
+        let base_name = LayerOwners::Caller.name(&specs[0].digest);
+        let top_name =
+            LayerOwners::Caller.name_on(&specs[1].digest, std::slice::from_ref(&base_name));
+        assert_eq!(extracted.names, [base_name.clone(), top_name.clone()]);
+        let mut expected = vec![base_name, top_name];
         expected.sort();
         assert_eq!(names(&store), expected, "no temporaries left");
 
@@ -439,6 +510,126 @@ mod tests {
         let again = extract_layers(&store, &specs, &keep()).unwrap();
         assert_eq!(again.directories, extracted.directories);
         assert_eq!(again.report, LayerReport::default());
+    }
+
+    /// A layer that implies directories (`usr/local/bin/tool`, no entries
+    /// for the directories) gets their owner and mode from the layers below
+    /// it, as its builder had them: so two images sharing it over different
+    /// bases each see their own base's, and the first extracted can't
+    /// change what the other sees. A layer that implies none (the bases) is
+    /// extracted once, under its digest's name.
+    #[test]
+    fn a_layer_implying_directories_is_its_own_on_each_base() {
+        let scratch = Scratch::new("implied");
+        let mut open = Layer::default();
+        open.dir("usr", 0o755).dir("usr/local", 0o777);
+        let mut closed = Layer::default();
+        closed.dir("usr", 0o755).dir("usr/local", 0o755);
+        let mut shared = Layer::default();
+        shared.file("usr/local/tool", b"tool");
+        let (store, specs) = store_with(&scratch, &[&open, &closed, &shared]);
+        let image = |base: usize| vec![specs[base].clone(), specs[2].clone()];
+        let mode = |extracted: &Extracted| {
+            let meta = std::fs::metadata(extracted.directories[1].join("usr/local")).unwrap();
+            meta.permissions().mode() & 0o7777
+        };
+        // The open base first: what a hostile image would do.
+        let hostile = extract_layers(&store, &image(0), &keep()).unwrap();
+        let victim = extract_layers(&store, &image(1), &keep()).unwrap();
+        assert_eq!(mode(&hostile), 0o777);
+        assert_eq!(
+            mode(&victim),
+            0o755,
+            "the shared layer kept the other base's mode"
+        );
+        assert_ne!(hostile.directories[1], victim.directories[1]);
+        let plain = |index: usize| LayerOwners::Caller.name(&specs[index].digest);
+        assert_eq!(victim.names[0], plain(1));
+        assert_eq!(
+            victim.names[1],
+            LayerOwners::Caller.name_on(&specs[2].digest, &[plain(1)])
+        );
+        // Found again as they are, without extracting.
+        assert_eq!(
+            placed_layers(&store, &image(1), LayerOwners::Caller).unwrap(),
+            Some(victim.names.clone())
+        );
+        let again = extract_layers(&store, &image(1), &keep()).unwrap();
+        assert_eq!(again.names, victim.names);
+        assert_eq!(again.report, LayerReport::default());
+    }
+
+    /// `placed_layers` finds nothing until every layer is extracted, and
+    /// changes nothing.
+    #[test]
+    fn placed_layers_needs_every_layer() {
+        let scratch = Scratch::new("placed");
+        let mut base = Layer::default();
+        base.dir("etc", 0o755).file("etc/a", b"a");
+        let mut top = Layer::default();
+        top.file("b", b"b");
+        let (store, specs) = store_with(&scratch, &[&base, &top]);
+        assert_eq!(
+            placed_layers(&store, &specs, LayerOwners::Caller).unwrap(),
+            None
+        );
+        extract_layers(&store, &specs[..1], &keep()).unwrap();
+        assert_eq!(
+            placed_layers(&store, &specs, LayerOwners::Caller).unwrap(),
+            None
+        );
+        let extracted = extract_layers(&store, &specs, &keep()).unwrap();
+        assert_eq!(
+            placed_layers(&store, &specs, LayerOwners::Caller).unwrap(),
+            Some(extracted.names)
+        );
+        assert_eq!(
+            placed_layers(&store, &specs, LayerOwners::Image).unwrap(),
+            None,
+            "another owner's layers aren't these"
+        );
+    }
+
+    /// An image may have at most `MAX_LAYERS` layers.
+    #[test]
+    fn an_image_has_at_most_max_layers() {
+        let manifest_with = |count: usize| {
+            let layer = |n: usize| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": Digest::sha256(&n.to_le_bytes()).to_string(),
+                    "size": 1
+                })
+            };
+            let diff_ids: Vec<String> = (0..count)
+                .map(|n| Digest::sha256(&n.to_be_bytes()).to_string())
+                .collect();
+            let manifest = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": Digest::sha256(b"config").to_string(), "size": 1},
+                "layers": (0..count).map(layer).collect::<Vec<_>>()
+            });
+            let config = serde_json::json!({
+                "architecture": "amd64", "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": diff_ids}
+            });
+            (
+                ImageManifest::parse(manifest.to_string().as_bytes()).unwrap(),
+                ImageConfig::parse(config.to_string().as_bytes()).unwrap(),
+            )
+        };
+        let (manifest, config) = manifest_with(crate::MAX_LAYERS);
+        assert_eq!(
+            layer_specs(&manifest, &config).unwrap().len(),
+            crate::MAX_LAYERS
+        );
+        let (manifest, config) = manifest_with(crate::MAX_LAYERS + 1);
+        assert!(matches!(
+            layer_specs(&manifest, &config),
+            Err(ExtractError::TooManyLayers(129))
+        ));
     }
 
     #[test]

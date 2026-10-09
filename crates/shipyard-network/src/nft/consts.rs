@@ -54,6 +54,7 @@ pub(crate) const NFTA_SET_DATA_TYPE: u16 = 6;
 pub(crate) const NFTA_SET_DATA_LEN: u16 = 7;
 /// Every new set needs one, unique in its batch.
 pub(crate) const NFTA_SET_ID: u16 = 10;
+pub(crate) const NFTA_SET_USERDATA: u16 = 13;
 pub(crate) const NFT_SET_INTERVAL: u32 = 0x4;
 pub(crate) const NFT_SET_MAP: u32 = 0x8;
 
@@ -112,10 +113,12 @@ pub(crate) const NFTA_CT_DREG: u16 = 1;
 pub(crate) const NFTA_CT_KEY: u16 = 2;
 
 /// Expressions' values.
+pub(crate) const NFT_META_PROTOCOL: u32 = 1;
 pub(crate) const NFT_META_NFPROTO: u32 = 15;
 pub(crate) const NFT_META_L4PROTO: u32 = 16;
 pub(crate) const NFT_META_IIFNAME: u32 = 6;
 pub(crate) const NFT_META_OIFNAME: u32 = 7;
+pub(crate) const NFT_PAYLOAD_LL_HEADER: u32 = 0;
 pub(crate) const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
 pub(crate) const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = 2;
 pub(crate) const NFT_CMP_EQ: u32 = 0;
@@ -128,7 +131,8 @@ pub(crate) const NFT_CT_STATUS: u32 = 2;
 
 /// A route type: the address is one of this host's (`RTN_LOCAL`).
 pub(crate) const RTN_LOCAL: u32 = 2;
-/// `ct state` bits: established and related.
+/// `ct state` bits: invalid, established and related.
+pub(crate) const CT_STATE_INVALID: u32 = 1;
 pub(crate) const CT_STATE_ESTABLISHED: u32 = 1 << 1;
 pub(crate) const CT_STATE_RELATED: u32 = 1 << 2;
 /// `ct status` bit: the connection's destination was NAT'd (`IPS_DST_NAT`).
@@ -147,6 +151,13 @@ pub(crate) const NF_INET_LOCAL_IN: u32 = 1;
 pub(crate) const NF_INET_FORWARD: u32 = 2;
 pub(crate) const NF_INET_LOCAL_OUT: u32 = 3;
 pub(crate) const NF_INET_POST_ROUTING: u32 = 4;
+/// The bridge's first hook: a frame as it enters the bridge, from a port.
+pub(crate) const NF_BR_PRE_ROUTING: u32 = 0;
+
+/// Ethertypes (`ETH_P_*`), as `meta protocol` holds them.
+pub(crate) const ETH_P_IP: u16 = 0x0800;
+pub(crate) const ETH_P_ARP: u16 = 0x0806;
+pub(crate) const ETH_P_IPV6: u16 = 0x86dd;
 
 /// nft's own data types (`datatype.h`), recorded with a set so `nft list`
 /// shows its keys properly; the kernel only keeps them. A concatenation's
@@ -154,6 +165,7 @@ pub(crate) const NF_INET_POST_ROUTING: u32 = 4;
 pub(crate) const TYPE_NFPROTO: u32 = 2;
 pub(crate) const TYPE_IPADDR: u32 = 7;
 pub(crate) const TYPE_IP6ADDR: u32 = 8;
+pub(crate) const TYPE_ETHERADDR: u32 = 9;
 pub(crate) const TYPE_INET_PROTOCOL: u32 = 12;
 pub(crate) const TYPE_INET_SERVICE: u32 = 13;
 pub(crate) const TYPE_IFNAME: u32 = 41;
@@ -223,6 +235,15 @@ mod tests {
             (NFT_META_NFPROTO.into(), libc::NFT_META_NFPROTO.into()),
             (NFT_META_L4PROTO.into(), libc::NFT_META_L4PROTO.into()),
             (NFT_META_IIFNAME.into(), libc::NFT_META_IIFNAME.into()),
+            (NFT_META_PROTOCOL.into(), libc::NFT_META_PROTOCOL.into()),
+            (
+                NFT_PAYLOAD_LL_HEADER.into(),
+                libc::NFT_PAYLOAD_LL_HEADER.into(),
+            ),
+            (NF_BR_PRE_ROUTING.into(), libc::NF_BR_PRE_ROUTING.into()),
+            (ETH_P_IP.into(), libc::ETH_P_IP.into()),
+            (ETH_P_ARP.into(), libc::ETH_P_ARP.into()),
+            (ETH_P_IPV6.into(), libc::ETH_P_IPV6.into()),
             (NFT_META_OIFNAME.into(), libc::NFT_META_OIFNAME.into()),
             (
                 NFT_PAYLOAD_NETWORK_HEADER.into(),

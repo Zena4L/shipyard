@@ -361,8 +361,9 @@ impl Index {
             }
         }
 
-        // Extracted layer directories (`layers/<hex>`, `<hex>-caller`) no
-        // image or running container needs, and leftovers. Anything else
+        // Extracted layer directories (`layers/<hex>`, and its `-caller`,
+        // `-map-` and `-on-` forms) no image or running container needs, and
+        // leftovers. Anything else
         // there isn't the store's.
         let referenced_layers = self.referenced_layers();
         let layers_dir = self.root.join("layers");
@@ -604,6 +605,29 @@ mod tests {
 
     fn hex(short: &str) -> String {
         short.repeat(64 / short.len().max(1))
+    }
+
+    /// A layer's directory, under any of its names (its digest's, a
+    /// caller's, a mapped one's, on given lowers), is kept while an image
+    /// lists the layer or a container stacks it, and only then.
+    #[test]
+    fn every_name_of_a_layer_is_kept_while_it_is_needed() {
+        let digest = crate::Digest::parse(&format!("sha256:{}", hex("c"))).unwrap();
+        let referenced: BTreeSet<String> = [hex("c")].into();
+        let none = BTreeSet::new();
+        let lowers = [hex("a")];
+        for name in [
+            LayerOwners::Image.name(&digest),
+            LayerOwners::Caller.name(&digest),
+            LayerOwners::Mapped(1).name(&digest),
+            LayerOwners::Image.name_on(&digest, &lowers),
+            LayerOwners::Mapped(1).name_on(&digest, &lowers),
+        ] {
+            assert!(!layer_unneeded(&name, &none, &referenced), "{name}");
+            assert!(layer_unneeded(&name, &none, &none), "{name}");
+            let in_use: BTreeSet<String> = [name.clone()].into();
+            assert!(!layer_unneeded(&name, &in_use, &none), "{name}");
+        }
     }
 
     #[test]

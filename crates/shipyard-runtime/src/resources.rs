@@ -72,8 +72,21 @@ pub enum Limit {
 pub struct CpuMax {
     /// Microseconds per period; `None` is no limit (`max`).
     pub quota: Option<u64>,
-    /// The period, in microseconds (1000 to 1,000,000).
-    pub period: u64,
+    /// The period, in microseconds (1000 to 1,000,000); `None` leaves the
+    /// cgroup's own (100,000 in a new one): only the quota is written.
+    pub period: Option<u64>,
+}
+
+impl CpuMax {
+    /// `cpu.max` from a quota and a period as runc takes them: a quota of 0
+    /// or less is none (`max`), a period of 0 the cgroup's own; neither
+    /// given is no `cpu.max` at all.
+    #[must_use]
+    pub fn from_parts(quota: Option<i64>, period: Option<u64>) -> Option<CpuMax> {
+        let quota = quota.and_then(positive);
+        let period = period.filter(|&period| period > 0);
+        (quota.is_some() || period.is_some()).then_some(CpuMax { quota, period })
+    }
 }
 
 /// One device's `io.max` line: the limits given, the others unlimited.
@@ -227,12 +240,9 @@ impl Resources {
             return Err(ResourceError::ReservationAboveLimit { low, max });
         }
         if let Some(cpu) = self.cpu_max {
-            in_range(
-                "the CPU period (microseconds)",
-                cpu.period,
-                1_000,
-                1_000_000,
-            )?;
+            if let Some(period) = cpu.period {
+                in_range("the CPU period (microseconds)", period, 1_000, 1_000_000)?;
+            }
             if let Some(quota) = cpu.quota {
                 at_least("the CPU quota (microseconds)", quota, 1_000)?;
             }
@@ -314,7 +324,15 @@ impl Resources {
         }
         if let Some(CpuMax { quota, period }) = self.cpu_max {
             let quota = quota.map_or_else(|| "max".to_owned(), |quota| quota.to_string());
-            add("cpu.max", format!("{quota} {period}"));
+            // The quota alone keeps the cgroup's period (`update
+            // --cpu-quota` keeps an earlier `--cpu-period`, as runc's).
+            add(
+                "cpu.max",
+                match period {
+                    Some(period) => format!("{quota} {period}"),
+                    None => quota,
+                },
+            );
         }
         if let Some(pids) = self.pids_max {
             add("pids.max", pids.to_string());
@@ -490,7 +508,7 @@ pub fn cpus(text: &str) -> Result<CpuMax, ResourceError> {
     }
     Ok(CpuMax {
         quota: Some(quota),
-        period: CPU_PERIOD,
+        period: Some(CPU_PERIOD),
     })
 }
 
@@ -591,7 +609,7 @@ mod tests {
             cpus("1.5").unwrap(),
             CpuMax {
                 quota: Some(150_000),
-                period: 100_000
+                period: Some(100_000)
             }
         );
         assert_eq!(cpus("2").unwrap().quota, Some(200_000));
@@ -670,7 +688,7 @@ mod tests {
             memory_max: Some(512 << 20),
             cpu_max: Some(CpuMax {
                 quota: Some(50_000),
-                period: 100_000,
+                period: Some(100_000),
             }),
             cpu_weight: Some(100),
             cpuset_cpus: Some("0-3,6".into()),
@@ -699,14 +717,14 @@ mod tests {
             Resources {
                 cpu_max: Some(CpuMax {
                     quota: Some(500),
-                    period: 100_000,
+                    period: Some(100_000),
                 }),
                 ..Resources::default()
             },
             Resources {
                 cpu_max: Some(CpuMax {
                     quota: None,
-                    period: 10,
+                    period: Some(10),
                 }),
                 ..Resources::default()
             },
@@ -745,7 +763,7 @@ mod tests {
             swap_max: Some(Limit::Max),
             cpu_max: Some(CpuMax {
                 quota: None,
-                period: 100_000,
+                period: Some(100_000),
             }),
             cpu_weight: Some(39),
             cpuset_cpus: Some("0-1".into()),
@@ -787,6 +805,28 @@ mod tests {
         );
         assert!(Resources::default().files().is_empty());
         assert!(Resources::default().controllers().is_empty());
+    }
+
+    /// A quota with no period given writes the quota alone, so the cgroup
+    /// keeps its own period (an `update --cpu-quota` after a run with
+    /// `--cpu-period`, as runc's); with one, both.
+    #[test]
+    fn a_quota_alone_keeps_the_period() {
+        let cpu_max = |period| Resources {
+            cpu_max: Some(CpuMax {
+                quota: Some(50_000),
+                period,
+            }),
+            ..Resources::default()
+        };
+        assert_eq!(
+            cpu_max(None).files(),
+            [("cpu.max".to_owned(), "50000".to_owned())]
+        );
+        assert_eq!(
+            cpu_max(Some(200_000)).files(),
+            [("cpu.max".to_owned(), "50000 200000".to_owned())]
+        );
     }
 
     #[test]

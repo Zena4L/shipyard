@@ -150,6 +150,12 @@ fn main() -> ExitCode {
     // monitor, started again with hidden arguments.
     process::init_entry_point();
     container::monitor_entry_point();
+    // Then: a privileged start (setuid, file capabilities) must not get any
+    // further. (The entry points above check for themselves.)
+    if let Err(err) = process::refuse_privileged_start() {
+        let _ = writeln!(std::io::stderr().lock(), "shipyard-runtime: {err}");
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,

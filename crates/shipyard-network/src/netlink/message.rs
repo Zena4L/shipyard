@@ -225,17 +225,20 @@ impl MessageBuilder {
         self
     }
 
+    /// How long the finished message is, header included.
+    pub(crate) fn encoded_len(&self) -> usize {
+        HEADER_LEN.saturating_add(self.body.len())
+    }
+
     /// The finished message, with its length, sequence number `seq` and the
     /// sender's port ID `port` filled in.
     pub(crate) fn finish(&self, seq: u32, port: u32) -> Result<Vec<u8>, BuildError> {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
-        let len = HEADER_LEN
-            .checked_add(self.body.len())
-            .and_then(|len| u32::try_from(len).ok())
-            .ok_or(BuildError::TooLong("message"))?;
-        let mut bytes = Vec::with_capacity(HEADER_LEN + self.body.len());
+        // (A length that saturated doesn't fit either.)
+        let len = u32::try_from(self.encoded_len()).map_err(|_| BuildError::TooLong("message"))?;
+        let mut bytes = Vec::with_capacity(self.encoded_len());
         bytes.extend_from_slice(&len.to_ne_bytes());
         bytes.extend_from_slice(&self.kind.to_ne_bytes());
         bytes.extend_from_slice(&self.flags.to_ne_bytes());

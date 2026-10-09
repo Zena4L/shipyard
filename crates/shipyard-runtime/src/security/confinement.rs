@@ -12,7 +12,6 @@
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(target_os = "linux", test))]
 use super::Capability;
 use super::CapabilitySet;
 use super::Seccomp;
@@ -123,6 +122,33 @@ pub enum Capabilities {
 }
 
 impl Capabilities {
+    /// The same, without `capability` in any set.
+    #[must_use]
+    pub fn without(self, capability: Capability) -> Self {
+        match self {
+            Self::Exact(mut sets) => {
+                for set in [
+                    &mut sets.bounding,
+                    &mut sets.effective,
+                    &mut sets.permitted,
+                    &mut sets.inheritable,
+                    &mut sets.ambient,
+                ] {
+                    set.remove(capability);
+                }
+                Self::Exact(sets)
+            }
+            Self::Default {
+                mut kept,
+                mut added,
+            } => {
+                kept.remove(capability);
+                added.remove(capability);
+                Self::Default { kept, added }
+            }
+        }
+    }
+
     /// The sets for a command running as `uid`.
     #[must_use]
     pub fn resolve(self, uid: u32) -> CapabilitySets {
@@ -382,6 +408,47 @@ mod tests {
             .iter()
             .map(|name| name.parse::<Capability>().unwrap())
             .collect()
+    }
+
+    /// `without` takes the capability out of every set, of either kind,
+    /// and leaves the rest as they were.
+    #[test]
+    fn without_takes_a_capability_out_of_every_set() {
+        let both = set(&["CAP_MKNOD", "CAP_CHOWN"]);
+        let exact = Capabilities::Exact(CapabilitySets {
+            bounding: both,
+            effective: both,
+            permitted: both,
+            inheritable: both,
+            ambient: both,
+        });
+        let Capabilities::Exact(sets) = exact.without(Capability::MKNOD) else {
+            panic!("not exact any more");
+        };
+        let chown = set(&["CAP_CHOWN"]);
+        for kept in [
+            sets.bounding,
+            sets.effective,
+            sets.permitted,
+            sets.inheritable,
+            sets.ambient,
+        ] {
+            assert_eq!(kept, chown);
+        }
+        let default = Capabilities::Default {
+            kept: CapabilitySet::DOCKER_DEFAULT,
+            added: both,
+        };
+        let without = default.without(Capability::MKNOD).resolve(0);
+        assert!(!without.bounding.contains(Capability::MKNOD));
+        assert!(without.bounding.contains(Capability::KILL));
+        assert!(
+            without
+                .bounding
+                .contains(set(&["CAP_CHOWN"]).iter().next().unwrap())
+        );
+        // The control: as given, root has it.
+        assert!(default.resolve(0).bounding.contains(Capability::MKNOD));
     }
 
     #[test]

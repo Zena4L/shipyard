@@ -32,10 +32,16 @@ mod objects;
     allow(dead_code, reason = "the client is Linux's")
 )]
 mod ruleset;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the client is Linux's")
+)]
+mod spoofing;
 
 pub use decode::Chain;
 pub use objects::Element;
 pub use ruleset::{ClosedRouting, NetworkRules, PortRule, TABLE};
+pub use spoofing::PortGuard;
 
 #[cfg(target_os = "linux")]
 pub use linux::Nftables;
@@ -60,7 +66,22 @@ impl Ruleset {
         allow(dead_code, reason = "the client is Linux's")
     )]
     pub(crate) fn of(userdata: &[u8], rules: usize) -> Ruleset {
-        if userdata == ruleset::VERSION && rules == ruleset::rules().len() {
+        Self::of_table(userdata, rules, ruleset::VERSION, ruleset::rules().len())
+    }
+
+    /// The same for the bridge table (`spoofing`).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "the client is Linux's")
+    )]
+    pub(crate) fn of_bridge_table(userdata: &[u8], rules: usize) -> Ruleset {
+        Self::of_table(userdata, rules, spoofing::VERSION, spoofing::rules().len())
+    }
+
+    /// Current only with `version` as its user data and all `expected`
+    /// rules.
+    fn of_table(userdata: &[u8], rules: usize, version: &[u8], expected: usize) -> Ruleset {
+        if userdata == version && rules == expected {
             Ruleset::Current
         } else {
             Ruleset::Outdated
@@ -86,6 +107,20 @@ mod tests {
         assert_eq!(Ruleset::of(ruleset::VERSION, 0), Ruleset::Outdated);
         assert_eq!(Ruleset::of(ruleset::VERSION, all - 1), Ruleset::Outdated);
         assert_eq!(Ruleset::of(b"", all), Ruleset::Outdated);
+        // The bridge table's version is its own.
+        let bridge = super::spoofing::rules().len();
+        assert_eq!(
+            Ruleset::of_bridge_table(super::spoofing::VERSION, bridge),
+            Ruleset::Current
+        );
+        assert_eq!(
+            Ruleset::of_bridge_table(ruleset::VERSION, bridge),
+            Ruleset::Outdated
+        );
+        assert_eq!(
+            Ruleset::of_bridge_table(super::spoofing::VERSION, bridge - 1),
+            Ruleset::Outdated
+        );
     }
 }
 
@@ -117,6 +152,7 @@ mod linux {
     use super::decode::{self, Chain};
     use super::objects::{self, Element, delete_elements, delete_table};
     use super::ruleset::{self, ClosedRouting, FAMILY, NetworkRules, PortRule, TABLE};
+    use super::spoofing::{self, PortGuard};
     use crate::netlink::{BatchItem, NetlinkError, Socket};
 
     /// A connection to `nf_tables`, in the calling thread's network
@@ -136,43 +172,102 @@ mod linux {
 
         /// Whether Shipyard's table is there, and this version's.
         pub fn ruleset(&mut self) -> Result<Ruleset, NetlinkError> {
-            let mut message = objects::message(NFT_MSG_GETTABLE, 0, FAMILY);
-            message.attr_str(NFTA_TABLE_NAME, TABLE);
+            Ok(match self.table(FAMILY, TABLE)? {
+                None => Ruleset::Missing,
+                Some((userdata, rules)) => Ruleset::of(&userdata, rules),
+            })
+        }
+
+        /// Whether Shipyard's bridge table (the module `spoofing`) is
+        /// there, and this version's.
+        pub fn bridge_ruleset(&mut self) -> Result<Ruleset, NetlinkError> {
+            Ok(match self.table(spoofing::FAMILY, spoofing::TABLE)? {
+                None => Ruleset::Missing,
+                Some((userdata, rules)) => Ruleset::of_bridge_table(&userdata, rules),
+            })
+        }
+
+        /// The table `name` in `family`'s user data and number of rules, if
+        /// it's there.
+        fn table(
+            &mut self,
+            family: u8,
+            name: &str,
+        ) -> Result<Option<(Vec<u8>, usize)>, NetlinkError> {
+            let mut message = objects::message(NFT_MSG_GETTABLE, 0, family);
+            message.attr_str(NFTA_TABLE_NAME, name);
             let mut userdata = None;
-            let found = self
-                .socket
-                .exchange("reading the table shipyard", &message, |reply| {
-                    userdata = Some(decode::table_userdata(reply)?);
-                    Ok(())
-                });
+            let found =
+                self.socket
+                    .exchange(&format!("reading the table {name}"), &message, |reply| {
+                        userdata = Some(decode::table_userdata(reply)?);
+                        Ok(())
+                    });
             match found {
-                Ok(()) => Ok(Ruleset::of(
-                    userdata.as_deref().unwrap_or_default(),
-                    self.rule_count()?,
-                )),
-                Err(error) if error.errno() == Some(Errno::ENOENT) => Ok(Ruleset::Missing),
+                Ok(()) => {
+                    let mut message = objects::message(NFT_MSG_GETRULE, 0, family);
+                    message.attr_str(NFTA_RULE_TABLE, name);
+                    let rules = self
+                        .socket
+                        .dump(
+                            &format!("listing the table {name}'s rules"),
+                            &message,
+                            |_| Ok(Some(())),
+                        )?
+                        .len();
+                    Ok(Some((userdata.unwrap_or_default(), rules)))
+                }
+                Err(error) if error.errno() == Some(Errno::ENOENT) => Ok(None),
                 Err(error) => Err(error),
             }
         }
 
-        /// How many rules Shipyard's table has.
-        fn rule_count(&mut self) -> Result<usize, NetlinkError> {
-            let mut message = objects::message(NFT_MSG_GETRULE, 0, FAMILY);
-            message.attr_str(NFTA_RULE_TABLE, TABLE);
-            Ok(self
-                .socket
-                .dump("listing the table shipyard's rules", &message, |_| {
-                    Ok(Some(()))
-                })?
-                .len())
+        /// Makes Shipyard's bridge table, replacing whatever table of that
+        /// name is there, in one batch of its own (a kernel without bridge
+        /// filtering refuses it, and nothing else goes with it). Then
+        /// `guards` are put in its sets, in batches of their own.
+        pub fn install_bridge_table(&mut self, guards: &[PortGuard]) -> Result<(), NetlinkError> {
+            let mut items = Vec::new();
+            if self.bridge_ruleset()? != Ruleset::Missing {
+                items.push(delete_table(spoofing::FAMILY, spoofing::TABLE));
+            }
+            items.extend(spoofing::install(&[]));
+            self.batch("installing shipyard's bridge rules", &items)?;
+            for guard in guards {
+                self.guard(guard)?;
+            }
+            Ok(())
+        }
+
+        /// Lets the container on `guard`'s port send only as itself (what's
+        /// there already stays).
+        pub fn guard(&mut self, guard: &PortGuard) -> Result<(), NetlinkError> {
+            self.batch(
+                &format!("keeping {} to its own addresses", guard.port),
+                &spoofing::guard_items(guard),
+            )
+        }
+
+        /// Takes `guard`'s port out of the bridge table (what isn't there
+        /// is fine): the port first, which stops it being checked.
+        pub fn unguard(&mut self, guard: &PortGuard) -> Result<(), NetlinkError> {
+            let items: Vec<BatchItem> = spoofing::guard_elements(guard)
+                .iter()
+                .rev()
+                .map(|(set, elements)| {
+                    delete_elements(spoofing::FAMILY, spoofing::TABLE, set, elements)
+                })
+                .collect();
+            self.each_if_present(&format!("forgetting the port {}", guard.port), items)
         }
 
         /// Makes Shipyard's table, with `networks` in its sets and routing
         /// `closed` as recorded, replacing whatever table of that name is
-        /// there:
-        /// in one batch, so the old rules give way to the new at once. Then
-        /// `ports` are published again (in batches of their own: there can
-        /// be many).
+        /// there: in one batch, so the old rules give way to the new at
+        /// once. `ports` are published again in that batch too, so the new
+        /// table never lacks them, unless there are too many for one, or one
+        /// is refused (which would refuse the table with it): then in batches
+        /// of their own, after.
         pub fn install(
             &mut self,
             networks: &[NetworkRules],
@@ -184,8 +279,18 @@ mod linux {
                 items.push(delete_table(FAMILY, TABLE));
             }
             items.extend(ruleset::install(networks, &[], closed));
-            self.batch("installing shipyard's firewall rules", &items)?;
-            for item in ruleset::port_items(ports, false) {
+            let table = items.len();
+            let (items, more) = ruleset::fit_ports(items, ruleset::port_items(ports, false));
+            let more = match self.batch("installing shipyard's firewall rules", &items) {
+                Ok(()) => more,
+                Err(_) if items.len() > table => {
+                    let (table, ports) = items.split_at(table);
+                    self.batch("installing shipyard's firewall rules", table)?;
+                    ports.to_vec()
+                }
+                Err(error) => return Err(error),
+            };
+            for item in more {
                 self.batch("publishing the containers' ports again", &[item])?;
             }
             Ok(())

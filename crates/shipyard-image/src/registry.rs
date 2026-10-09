@@ -309,7 +309,7 @@ impl Registry {
             // (it's for the registry), but follows a redirect within it (by
             // host name: another port on the same host is the same
             // machine, and gets it too).
-            .max_redirects(10)
+            .max_redirects(MAX_REDIRECTS)
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .https_only(secure)
             .user_agent(concat!("shipyard/", env!("CARGO_PKG_VERSION")))
@@ -693,6 +693,13 @@ impl Registry {
                     from: found.source.clone(),
                 }));
             }
+            // With credentials, a redirect isn't followed (see
+            // `token_request`): said so, rather than as a bad status.
+            if found.is_some() && (300..400).contains(&status) {
+                return Err(Attempt::Fatal(self.auth_error(
+                    "its token service redirected elsewhere, and credentials aren't sent on",
+                )));
+            }
             let bytes = read_capped(
                 &mut successful(response, &context)?,
                 MAX_SMALL_RESPONSE,
@@ -709,6 +716,10 @@ impl Registry {
     /// username and password, or (an identity token) by `OAuth2`'s
     /// refresh-token grant, as Docker does. Never with the registry's own
     /// authorization: the realm is another service.
+    ///
+    /// A request carrying credentials follows no redirect: a 307 or 308
+    /// would send an identity token's form body on to wherever it led, and
+    /// a username is in the query. Only an anonymous one is followed.
     fn token_request(
         &self,
         realm: &str,
@@ -734,6 +745,7 @@ impl Registry {
                 .post(realm)
                 .config()
                 .timeout_recv_body(Some(deadline))
+                .max_redirects(0)
                 .build()
                 .send_form(form)
                 .map_err(failed);
@@ -759,6 +771,11 @@ impl Registry {
             .get(&url)
             .config()
             .timeout_recv_body(Some(deadline))
+            .max_redirects(if authorization.is_some() {
+                0
+            } else {
+                MAX_REDIRECTS
+            })
             .build();
         if let Some(authorization) = authorization {
             request = request.header("Authorization", authorization);
@@ -774,6 +791,9 @@ impl Registry {
         }
     }
 }
+
+/// The most redirects a request follows (a blob's to its CDN, say).
+const MAX_REDIRECTS: u32 = 10;
 
 /// How long receiving a body of `size` bytes may take: [`BODY_TIMEOUT`],
 /// plus its size at [`SLOWEST_RATE`]; at most [`LONGEST_BODY`] if `capped`.

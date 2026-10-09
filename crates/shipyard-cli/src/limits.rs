@@ -182,15 +182,7 @@ impl LimitArgs {
         if let Some(cpus) = self.cpus.as_deref().filter(|cpus| !is_zero(cpus)) {
             return Ok(Some(resources::cpus(cpus)?));
         }
-        let quota = self.cpu_quota.and_then(resources::positive);
-        let period = self.cpu_period.filter(|&period| period > 0);
-        if quota.is_none() && period.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(CpuMax {
-            quota,
-            period: period.unwrap_or(resources::CPU_PERIOD),
-        }))
+        Ok(CpuMax::from_parts(self.cpu_quota, self.cpu_period))
     }
 
     /// `io.max`: one line per device, with every limit given for it.
@@ -345,7 +337,7 @@ mod tests {
             cpus.cpu_max,
             Some(CpuMax {
                 quota: Some(150_000),
-                period: 100_000
+                period: Some(100_000)
             })
         );
         assert_eq!(cpus.cpu_weight, resources::weight_from_shares(512));
@@ -354,7 +346,7 @@ mod tests {
             quota.cpu_max,
             Some(CpuMax {
                 quota: Some(50_000),
-                period: 200_000
+                period: Some(200_000)
             })
         );
         for none in ["-1", "0"] {

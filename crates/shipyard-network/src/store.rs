@@ -285,6 +285,21 @@ impl Lease {
         std::iter::once(self.ip).chain(self.ip6.map(IpAddr::V6))
     }
 
+    /// Its port's guard: what its container may send as (see the module
+    /// `nft::spoofing`): its addresses, from its hardware address.
+    #[must_use]
+    pub fn port_guard(&self) -> crate::nft::PortGuard {
+        crate::nft::PortGuard {
+            port: self.host_veth.clone(),
+            mac: self.mac,
+            ip: match self.ip {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            },
+            ip6: self.ip6,
+        }
+    }
+
     /// Its published ports, as the firewall's rules: a port on every
     /// address goes to its IPv4 address, and to its IPv6 one if it has one;
     /// a port on an address, to its address of that family (none if it has
@@ -519,6 +534,24 @@ impl Networks {
             .into_iter()
             .filter_map(|(lease, live)| live.then_some(lease))
             .collect())
+    }
+
+    /// The guards of every network's live leases' ports (without any
+    /// network's lock, as [`live_leases`]).
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read.
+    ///
+    /// [`live_leases`]: Self::live_leases
+    pub fn live_port_guards(&self) -> Result<Vec<crate::nft::PortGuard>, StoreError> {
+        let mut guards = Vec::new();
+        for network in self.list()? {
+            for lease in self.live_leases(&network.name)? {
+                guards.push(lease.port_guard());
+            }
+        }
+        Ok(guards)
     }
 
     /// The ports every network's live leases publish, as the firewall's
@@ -1003,6 +1036,10 @@ pub struct LeaseDir {
     path: PathBuf,
 }
 
+/// A leases directory's version ([`LeaseDir::version`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeasesVersion(u64, i64, i64);
+
 /// The networks' directory, open: a network's DNS server reads the other
 /// networks' configs and leases through it (those its askers are on too),
 /// whoever it is by then (see [`LeaseDir`]).
@@ -1115,9 +1152,34 @@ impl LeaseDir {
         })
     }
 
+    /// What changes whenever a lease is made or removed, so a reader can
+    /// tell its last [`live`](Self::live) is out of date: the directory's
+    /// inode and modification time. `None` if it can't be read.
+    #[must_use]
+    pub fn version(&self) -> Option<LeasesVersion> {
+        let stat = nix::sys::stat::fstat(&self.dir).ok()?;
+        #[allow(
+            clippy::useless_conversion,
+            reason = "the stat field types differ between platforms"
+        )]
+        Some(LeasesVersion(
+            u64::from(stat.st_ino),
+            i64::from(stat.st_mtime),
+            i64::from(stat.st_mtime_nsec),
+        ))
+    }
+
     /// The live leases (none once the directory is gone: the network was
     /// removed). An entry that can't be read is left out.
     pub fn live(&self) -> Result<Vec<Lease>, StoreError> {
+        self.read_live().map(|read| read.leases)
+    }
+
+    /// The live leases, and whether the read is settled: false if a lease
+    /// was still being written (made, locked, not filled in yet), which a
+    /// moment later would be among them. A reader keeping what it read for
+    /// a while (the DNS server) keeps only a settled read.
+    pub fn read_live(&self) -> Result<LiveLeases, StoreError> {
         use nix::dir::Dir;
         use nix::fcntl::{OFlag, openat};
         use nix::sys::stat::Mode;
@@ -1130,16 +1192,17 @@ impl LeaseDir {
         );
         let mut listing = match listing {
             Ok(listing) => listing,
-            Err(Errno::ENOENT) => return Ok(Vec::new()),
+            Err(Errno::ENOENT) => return Ok(LiveLeases::settled()),
             Err(errno) => return Err(StoreError::io(context(), io::Error::from(errno))),
         };
         let mut leases = Vec::new();
+        let mut settled = true;
         for entry in listing.iter() {
             let entry = match entry {
                 Ok(entry) => entry,
                 // Removed while it was open (the network went): a removed
                 // directory lists nothing.
-                Err(Errno::ENOENT) => return Ok(Vec::new()),
+                Err(Errno::ENOENT) => return Ok(LiveLeases::settled()),
                 Err(errno) => return Err(StoreError::io(context(), io::Error::from(errno))),
             };
             let name = entry.file_name();
@@ -1158,14 +1221,37 @@ impl LeaseDir {
             // One this process can't open (a lease an older shipyard made
             // readable by root alone, something else put there) is skipped:
             // it mustn't hide every other container's.
-            if let Ok(Some((Some(lease), file))) = read_lease(opened, &path)
+            if let Ok(Some((lease, file))) = read_lease(opened, &path)
                 && is_held(file)
             {
-                leases.push(lease);
+                match lease {
+                    Some(lease) => leases.push(lease),
+                    // Locked and empty: its run is writing it.
+                    None => settled = false,
+                }
             }
         }
         leases.sort_by_key(|lease| ip_order(lease.ip));
-        Ok(leases)
+        Ok(LiveLeases { leases, settled })
+    }
+}
+
+/// What [`LeaseDir::read_live`] read.
+#[derive(Debug, Default)]
+pub struct LiveLeases {
+    /// The live leases.
+    pub leases: Vec<Lease>,
+    /// No lease was still being written.
+    pub settled: bool,
+}
+
+impl LiveLeases {
+    /// None, for certain.
+    fn settled() -> Self {
+        LiveLeases {
+            leases: Vec::new(),
+            settled: true,
+        }
     }
 }
 
@@ -2192,6 +2278,29 @@ mod tests {
         let again = network.allocate(&named("d1", Some("db"), &[])).unwrap();
         assert_eq!(again.lease().name.as_deref(), Some("db"));
         drop((elsewhere, again));
+    }
+
+    /// A lease still being written (made and locked, not filled in yet)
+    /// makes a read unsettled: a moment later it would be among the live
+    /// ones. Once it isn't held, it's nothing, and the read settled.
+    #[test]
+    fn a_lease_being_written_unsettles_a_read() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let live = network.allocate(&request("a")).unwrap();
+        let leases = LeaseDir::open(&networks, "app").unwrap();
+        let read = leases.read_live().unwrap();
+        assert!(read.settled);
+        assert_eq!(read.leases, vec![live.lease().clone()]);
+        let writing = File::create(scratch.0.join("app/leases/10.89.0.9")).unwrap();
+        let held = Flock::lock(writing, FlockArg::LockExclusiveNonblock).unwrap();
+        let read = leases.read_live().unwrap();
+        assert!(!read.settled);
+        assert_eq!(read.leases, vec![live.lease().clone()]);
+        drop(held);
+        assert!(leases.read_live().unwrap().settled);
     }
 
     #[test]

@@ -651,7 +651,7 @@ mod linux {
         // The destination's text was checked (not in /proc or /sys), but a
         // symlink in the root filesystem can still lead there: what counts
         // is where the target is (runc's CVE-2019-19921).
-        if on_kernel_interface(&target) {
+        if on_kernel_interface(&target, entry.destination()) {
             return Err((ChildStep::MountTarget, Errno::EXDEV));
         }
         let restrictions = entry.restrictions()
@@ -732,7 +732,7 @@ mod linux {
             return Err(Errno::ENODEV);
         }
         let target = resolve_in_root(root, device.path(), Leaf::File)?;
-        if on_kernel_interface(&target) {
+        if on_kernel_interface(&target, device.path()) {
             return Err(Errno::EXDEV);
         }
         bind(&target, Leaf::File, source, false)
@@ -747,7 +747,7 @@ mod linux {
             return Err(Errno::EINVAL);
         };
         let dir = resolve_in_root(root, parent, Leaf::Directory)?;
-        if on_kernel_interface(&dir) {
+        if on_kernel_interface(&dir, parent) {
             return Err(Errno::EXDEV);
         }
         let (kind, number) = device_identity(device);
@@ -781,15 +781,41 @@ mod linux {
         )
     }
 
-    /// Whether what's open at `target` is in a `proc` or `sysfs` file
-    /// system: the container's `/proc` or `/sys`, mounted already.
-    fn on_kernel_interface(target: &OwnedFd) -> bool {
-        use nix::sys::statfs::{PROC_SUPER_MAGIC, SYSFS_MAGIC, fstatfs};
-        fstatfs(target).is_ok_and(|fs| {
-            let kind = fs.filesystem_type();
-            kind == PROC_SUPER_MAGIC || kind == SYSFS_MAGIC
-        })
+    /// Whether what's open at `target`, which `destination` asked for, is a
+    /// kernel interface nothing may be mounted on: in a `proc` or `sysfs`
+    /// file system (the container's `/proc` or `/sys`, mounted already); or
+    /// in its cgroup, `devpts` or `mqueue` one, unless `destination` names
+    /// that place itself (`/dev/mqueue`, asked for, is the caller's
+    /// choice). Anywhere else, a symlink in the root filesystem led there
+    /// (runc's CVE-2019-19921).
+    fn on_kernel_interface(target: &OwnedFd, destination: &Path) -> bool {
+        use nix::sys::statfs::{
+            CGROUP2_SUPER_MAGIC, DEVPTS_SUPER_MAGIC, PROC_SUPER_MAGIC, SYSFS_MAGIC, fstatfs,
+        };
+        // Refused if it can't be told: this is a guard.
+        let Ok(fs) = fstatfs(target) else {
+            return true;
+        };
+        let kind = fs.filesystem_type();
+        if kind == PROC_SUPER_MAGIC || kind == SYSFS_MAGIC {
+            return true;
+        }
+        let place = if kind == CGROUP2_SUPER_MAGIC {
+            "/sys/fs/cgroup"
+        } else if kind == DEVPTS_SUPER_MAGIC {
+            "/dev/pts"
+        } else if i128::from(kind.0) == MQUEUE_MAGIC {
+            "/dev/mqueue"
+        } else {
+            return false;
+        };
+        !destination.starts_with(place)
     }
+
+    /// `mqueue`'s file system magic (`MQUEUE_MAGIC`, `linux/magic.h`), which
+    /// neither libc nor nix has. Compared as an `i128`: `statfs`' type is
+    /// signed on glibc and unsigned on musl, and both fit.
+    const MQUEUE_MAGIC: i128 = 0x1980_0202;
 
     /// Binds the host's `source` onto the target, with the mounts below it
     /// if `recursive` (`rbind`).

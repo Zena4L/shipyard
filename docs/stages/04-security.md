@@ -169,7 +169,11 @@ the command (command_main; after-fork rules)
   `config.json`: non-blocking, regular files only, at most 1 MiB (`small_file.rs`,
   shared).
 - **Docker's profile is vendored** (`docker-default.json`, from `moby/profiles` v0.2.3,
-  Apache-2.0) and parsed at run time.
+  Apache-2.0) and parsed at run time. One change of Shipyard's (stage 7.5, F8): the
+  `socket` rule allowing domains `> 40` also requires the argument's high half to be 0
+  (the kernel reads the `int` domain on 32 bits, so `0x1_0000_0028` would otherwise get
+  `AF_VSOCK` past it). A test checks every allowing `>`, `>=` and `!=` in the profile has
+  that guard.
 - **The compiler** (`compile.rs`, pure): Docker's conditions resolved as Docker does;
   the architecture checked first (native, else kill; on x86-64, the x32 bit, except a
   tracer's `-1`); a binary search over call numbers (about a dozen comparisons, where a

@@ -28,7 +28,8 @@
 //! - `dstnat` (prerouting) and `output` (the host's own packets): a packet
 //!   for one of the host's addresses, whose protocol and port (and address)
 //!   are in a ports map, goes to the container's instead (DNAT).
-//! - `forward` (what the host routes): replies pass; so does what stays on
+//! - `forward` (what the host routes): what conntrack finds invalid, into
+//!   or out of a container's bridge, is dropped; replies pass; so does what stays on
 //!   one bridge (a host with `br_netfilter` hands switched frames to this
 //!   hook too); nothing goes into or out of an internal network; what was
 //!   DNAT'd (a published port) passes; anything else for a container's bridge
@@ -57,9 +58,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::consts::{
-    CT_STATE_ESTABLISHED, CT_STATE_RELATED, IFNAMSIZ, IPS_DST_NAT, NF_ACCEPT, NF_DROP,
-    NF_INET_FORWARD, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_INET,
-    NFPROTO_IPV4, NFPROTO_IPV6, NFT_CMP_EQ, NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS,
+    CT_STATE_ESTABLISHED, CT_STATE_INVALID, CT_STATE_RELATED, IFNAMSIZ, IPS_DST_NAT, NF_ACCEPT,
+    NF_DROP, NF_INET_FORWARD, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING,
+    NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NFT_CMP_EQ, NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS,
     NFT_FIB_RESULT_ADDRTYPE, NFT_META_IIFNAME, NFT_META_L4PROTO, NFT_META_NFPROTO,
     NFT_META_OIFNAME, NFT_NAT_DNAT, NFT_PAYLOAD_NETWORK_HEADER, NFT_PAYLOAD_TRANSPORT_HEADER,
     NFT_REG32_00, NFT_SET_INTERVAL, NFTA_FIB_F_DADDR, RTN_LOCAL, TYPE_IFNAME, TYPE_INET_PROTOCOL,
@@ -78,10 +79,14 @@ pub const TABLE: &str = "shipyard";
 /// Its family: IPv4 and IPv6 (`inet`).
 pub(crate) const FAMILY: u8 = NFPROTO_INET;
 /// Its user data: what version of these rules it holds.
-pub(crate) const VERSION: &[u8] = b"shipyard ruleset 4";
+pub(crate) const VERSION: &[u8] = b"shipyard ruleset 5";
 /// The most elements one request adds or removes: each is answered alone,
 /// and a batch must fit the socket's buffers.
 const ELEMENTS_PER_REQUEST: usize = 256;
+/// The most bytes of requests the table's install batch carries with the
+/// ports in it: well inside a netlink socket's default send buffer (about
+/// 208 KiB; a larger batch is refused whole, `EMSGSIZE`).
+const ONE_BATCH: usize = 64 * 1024;
 
 /// The chains' names.
 pub(crate) mod chain {
@@ -538,10 +543,26 @@ fn guard_rules() -> [Vec<Expr>; 2] {
 }
 
 /// `forward`'s (see the module).
-fn forward_rules() -> [Vec<Expr>; 7] {
+fn forward_rules() -> [Vec<Expr>; 9] {
     let drop = || Expr::Verdict(NF_DROP);
     let accept = || Expr::Verdict(NF_ACCEPT);
+    let invalid = || ct_bits(NFT_CT_STATE, CT_STATE_INVALID, true);
     [
+        // What conntrack can't place (out of any connection's window, an
+        // error about no connection), into or out of a container's bridge:
+        // dropped, as Kubernetes does. Other programs' traffic is theirs.
+        [
+            interface_in(NFT_META_IIFNAME, set::BRIDGES, false),
+            invalid(),
+            vec![drop()],
+        ]
+        .concat(),
+        [
+            interface_in(NFT_META_OIFNAME, set::BRIDGES, false),
+            invalid(),
+            vec![drop()],
+        ]
+        .concat(),
         [
             ct_bits(NFT_CT_STATE, CT_STATE_ESTABLISHED | CT_STATE_RELATED, true),
             vec![accept()],
@@ -751,6 +772,26 @@ pub(crate) fn port_items(ports: &[PortRule], exclusive: bool) -> Vec<BatchItem> 
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The table's install batch `table` with the `ports` items in it, if they
+/// fit one batch ([`ONE_BATCH`]); else `table` alone, and the ports for
+/// batches of their own (returned).
+pub(crate) fn fit_ports(
+    mut table: Vec<BatchItem>,
+    ports: Vec<BatchItem>,
+) -> (Vec<BatchItem>, Vec<BatchItem>) {
+    let size: usize = table
+        .iter()
+        .chain(&ports)
+        .map(|item| item.message.encoded_len())
+        .sum();
+    if size <= ONE_BATCH {
+        table.extend(ports);
+        (table, Vec::new())
+    } else {
+        (table, ports)
+    }
 }
 
 /// `ports`' elements, by map (one whose families don't match is none).
@@ -979,6 +1020,36 @@ mod tests {
         );
     }
 
+    /// The ports go in the table's own batch while they fit one; past that,
+    /// in batches of their own.
+    #[test]
+    fn ports_go_in_the_tables_batch_while_they_fit() {
+        let ports = |count: u16| -> Vec<PortRule> {
+            (0..count)
+                .map(|n| {
+                    rule(Published {
+                        host_ip: None,
+                        host_port: 1000 + n,
+                        container_port: 80,
+                        protocol: Protocol::Tcp,
+                    })
+                })
+                .collect()
+        };
+        let table = || install(&[], &[], &ClosedRouting::default());
+        let tables = table().len();
+        let few = port_items(&ports(3), false);
+        let (batch, more) = fit_ports(table(), few.clone());
+        assert_eq!(batch.len(), tables + few.len());
+        assert!(more.is_empty());
+        let many = port_items(&ports(4000), false);
+        let size: usize = many.iter().map(|item| item.message.encoded_len()).sum();
+        assert!(size > ONE_BATCH, "{size}");
+        let (batch, more) = fit_ports(table(), many.clone());
+        assert_eq!(batch.len(), tables);
+        assert_eq!(more.len(), many.len());
+    }
+
     #[test]
     fn a_ports_element_reads_back_as_its_rule() {
         for published in [
@@ -1173,9 +1244,26 @@ mod tests {
             .filter(|(chain, _)| *chain == "forward")
             .map(|(_, exprs)| exprs)
             .collect();
-        assert_eq!(forward.len(), 7);
-        // Replies first, what stays on a bridge, then the internal networks,
-        // then DNAT, then the rest, then routing for others if closed.
+        assert_eq!(forward.len(), 9);
+        // What conntrack finds invalid on a bridge first, then replies, what
+        // stays on a bridge, the internal networks, DNAT, the rest, then
+        // routing for others if closed.
+        let invalid = ct_bits(NFT_CT_STATE, CT_STATE_INVALID, true);
+        for (rule, key) in forward[..2]
+            .iter()
+            .zip([NFT_META_IIFNAME, NFT_META_OIFNAME])
+        {
+            assert_eq!(
+                *rule,
+                [
+                    interface_in(key, set::BRIDGES, false),
+                    invalid.clone(),
+                    vec![Expr::Verdict(NF_DROP)]
+                ]
+                .concat()
+            );
+        }
+        let forward = &forward[2..];
         assert_eq!(forward[0].last(), Some(&Expr::Verdict(NF_ACCEPT)));
         assert_eq!(
             forward[1],
@@ -1229,7 +1317,7 @@ mod tests {
         assert_eq!(what[0], "adding the table shipyard");
         assert_eq!(what[1], "adding the set bridges");
         assert_eq!(what[12], "adding the chain guard");
-        assert!(what.contains(&"adding rule 7 of the chain forward"));
+        assert!(what.contains(&"adding rule 9 of the chain forward"));
         assert_eq!(
             what[what.len() - 5..],
             [

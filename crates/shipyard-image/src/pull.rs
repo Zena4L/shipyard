@@ -94,6 +94,9 @@ pub enum PullError {
     /// The config is larger than a config should be.
     #[error("the image config is {0} bytes, over the limit for one")]
     ConfigTooLarge(u64),
+    /// The image has more layers than [`MAX_LAYERS`](crate::MAX_LAYERS).
+    #[error("the image has {0} layers, more than the {limit} an image may have", limit = crate::MAX_LAYERS)]
+    TooManyLayers(usize),
     /// A layer is in a form Shipyard can't extract.
     #[error(transparent)]
     Layer(#[from] UnpackError),
@@ -318,6 +321,9 @@ fn check_manifest(manifest: &ImageManifest) -> Result<(), PullError> {
     }
     if manifest.config.size > crate::MANIFEST_SIZE_LIMIT {
         return Err(PullError::ConfigTooLarge(manifest.config.size));
+    }
+    if manifest.layers.len() > crate::MAX_LAYERS {
+        return Err(PullError::TooManyLayers(manifest.layers.len()));
     }
     for layer in &manifest.layers {
         crate::unpack::layer_compression(&layer.media_type)?;
