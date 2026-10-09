@@ -42,7 +42,9 @@ fn ok(args: &[&str], script: &str) -> String {
 
 /// The same, with a `PATH` that has no `newuidmap`: the single-ID map.
 fn without_helpers(args: &[&str], script: &str) -> Run {
-    let mut command = SHIPYARD.command(&[&["run"], args, &["sh", "-c", script]].concat());
+    // The host's network: pasta is on the PATH taken away.
+    let mut command =
+        SHIPYARD.command(&[&["run", "--network", "host"], args, &["sh", "-c", script]].concat());
     command.env("PATH", "/nonexistent");
     run(command)
 }

@@ -21,6 +21,12 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard volume inspect`↴](#shipyard-volume-inspect)
 * [`shipyard volume rm`↴](#shipyard-volume-rm)
 * [`shipyard volume prune`↴](#shipyard-volume-prune)
+* [`shipyard network`↴](#shipyard-network)
+* [`shipyard network create`↴](#shipyard-network-create)
+* [`shipyard network ls`↴](#shipyard-network-ls)
+* [`shipyard network inspect`↴](#shipyard-network-inspect)
+* [`shipyard network rm`↴](#shipyard-network-rm)
+* [`shipyard network prune`↴](#shipyard-network-prune)
 * [`shipyard system`↴](#shipyard-system)
 * [`shipyard system df`↴](#shipyard-system-df)
 * [`shipyard doctor`↴](#shipyard-doctor)
@@ -39,6 +45,7 @@ A lightweight container engine
 * `rmi` — Remove one or more images from the local store (reference-counted; shared layers survive)
 * `image` — Manage images
 * `volume` — Manage named volumes
+* `network` — Manage networks (bridges containers share; Linux, root)
 * `system` — System-wide information and maintenance
 * `doctor` — Show how this host will run containers
 
@@ -78,10 +85,22 @@ Run a command in a container: on Linux, isolated in namespaces, optionally with 
 * `--stop-timeout <SECONDS>` — Seconds to wait after the stop signal before killing the command
 
   Default value: `10`
-* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname and IPC, as you. On Linux, commands are isolated by default (rootless, in a user namespace, without root); on macOS they always run like this for now
+* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname, IPC and network, as you. On Linux, commands are isolated by default (rootless, in a user namespace, without root); on macOS they always run like this for now
 * `--hostname <NAME>` — Hostname inside the container (Linux)
 * `--domainname <NAME>` — NIS domain name inside the container (Linux)
-* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux; IPC settings only)
+* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host)
+* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--name <NAME>` — The container's name: on each network made with `shipyard network create` that it joins, other containers find it by this name (Linux). Letters, digits, _ and -
+* `--network-alias <NAME>` — Another name the container answers to on each network made with `shipyard network create` that it joins. Repeatable (Linux)
+* `--ip <IP>` — The container's address on its network (a bridge network's; with one network only: on several, name=NETWORK,ip=IP gives each its own)
+* `--ip6 <IP>` — The container's IPv6 address on its network (one made with --ipv6; with one network only: on several, name=NETWORK,ip6=IP gives each its own)
+* `--mac-address <MAC>` — The container's hardware address on its network (a bridge network's; with one network only), locally administered, like 02:42:0a:58:00:02
+* `--add-host <NAME:IP>` — Add NAME with address IP to the container's /etc/hosts. Repeatable (Linux; with --image or --rootfs)
+* `--dns <IP>` — A DNS server for the container's /etc/resolv.conf, instead of the host's. Repeatable (Linux; with --image or --rootfs)
+* `--dns-search <DOMAIN>` — A DNS search domain, instead of the host's. Repeatable (Linux; with --image or --rootfs)
+* `--dns-option <OPTION>` — A resolver option (like ndots:2), instead of the host's. Repeatable (Linux; with --image or --rootfs)
+* `-p`, `--publish <SPEC>` — Publish a container's port on the host, like 8080:80 (the host's port 8080, on every IPv4 address, to the container's 80), 127.0.0.1:8080:80 (on that address only), 80 (a free host port) or 53:53/udp. Ranges work (8000-8010:80-90). Repeatable (Linux; a bridge network, or pasta)
+* `-P`, `--publish-all` — Publish every port the image says it uses (its exposed ports) on free host ports (Linux; a bridge network, or pasta)
 * `--rootfs <DIR>` — Use DIR as the container's root filesystem: it becomes `/` inside, with its own /proc, /sys and /dev (Linux)
 * `--image <REF>` — Run a pulled image: its layers become the container's root filesystem, stacked read-only under a writable layer with overlayfs, and its baked-in command, environment, working directory and user are the defaults (Linux). Give a reference like `alpine:3.20` or `ghcr.io/owner/app@sha256:...`
 * `--entrypoint <COMMAND>` — Run COMMAND instead of the image's entrypoint (and without its default arguments); `""` runs the command alone
@@ -257,6 +276,85 @@ Remove one or more named volumes (never one a running container uses)
 Remove every named volume no running container uses (asks first)
 
 **Usage:** `shipyard volume prune [OPTIONS]`
+
+###### **Options:**
+
+* `-f`, `--force` — Don't ask (needed where there's no terminal to ask on)
+
+
+
+## `shipyard network`
+
+Manage networks (bridges containers share; Linux, root)
+
+**Usage:** `shipyard network <COMMAND>`
+
+###### **Subcommands:**
+
+* `create` — Create a network: a bridge with a subnet of its own
+* `ls` — List networks
+* `inspect` — Show networks' details, and the containers on them, as JSON
+* `rm` — Remove one or more networks (never one a container uses, nor the default one)
+* `prune` — Remove every network no container uses but the default one (asks first)
+
+
+
+## `shipyard network create`
+
+Create a network: a bridge with a subnet of its own
+
+**Usage:** `shipyard network create [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — The network's name
+
+###### **Options:**
+
+* `--subnet <CIDR>` — Its subnet, like `10.90.0.0/24` (a free one by default); once more with an IPv6 prefix, like `fd00:1::/64`, for IPv6 too
+* `--gateway <IP>` — Its gateway, the bridge's address (the subnet's first by default); once per family
+* `--ipv6` — IPv6 too: a prefix of its own (a random ULA /64 unless --subnet gives one), and a way out through the host's IPv6 address
+* `--internal` — No way out of it: containers on it reach each other and the host only
+
+
+
+## `shipyard network ls`
+
+List networks
+
+**Usage:** `shipyard network ls`
+
+
+
+## `shipyard network inspect`
+
+Show networks' details, and the containers on them, as JSON
+
+**Usage:** `shipyard network inspect <NETWORK>...`
+
+###### **Arguments:**
+
+* `<NETWORK>` — The networks
+
+
+
+## `shipyard network rm`
+
+Remove one or more networks (never one a container uses, nor the default one)
+
+**Usage:** `shipyard network rm <NETWORK>...`
+
+###### **Arguments:**
+
+* `<NETWORK>` — The networks to remove
+
+
+
+## `shipyard network prune`
+
+Remove every network no container uses but the default one (asks first)
+
+**Usage:** `shipyard network prune [OPTIONS]`
 
 ###### **Options:**
 

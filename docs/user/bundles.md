@@ -61,10 +61,11 @@ the container's whole life, as with `runc run`: all of its [hooks](#hooks) run, 
 | `process.capabilities` | The five capability sets (`bounding`, `effective`, `permitted`, `inheritable`, `ambient`), exactly, by name (`CAP_KILL`). An unknown name is an error. **Leaving it out means none**, with a warning (`runc` would leave the process every capability root has). For a process running as root, the bounding set is what really limits it: unless `noNewPrivileges` is set, running a program gives root its whole bounding set back (the kernel's rule). |
 | `process.noNewPrivileges` | When `true`, nothing the process runs can gain privileges: setuid programs and file capabilities give nothing. Leaving it out means `false`, as the specification says (unlike `shipyard run`, where it's on by default). |
 | `linux.seccomp` | A seccomp profile, which the process runs under (see [System calls](run.md#system-calls-seccomp) for what's supported). It's checked before anything starts: a misspelled call name or an unsupported action is an error. Fields Shipyard doesn't know are ignored, with a warning for each, as the specification requires. **Leaving it out means no filter**, as with `runc` (unlike `shipyard run`, which applies Docker's profile). |
-| `linux.namespaces` | Which of `pid`, `mount`, `uts`, `ipc`, `user` and `cgroup` the container gets. `mount` is required (for the root filesystem). Without `pid`, there's no small init, and the command shares the host's process IDs (`shipyard-runtime` then needs a cgroup: see [Cgroups](#cgroups)). A `cgroup` namespace makes the container's own cgroup its root (`/proc/self/cgroup` says `0::/`). A `user` namespace needs both mappings below; see [Rootless bundles](#rootless-bundles) for running without root. |
+| `linux.namespaces` | Which of `pid`, `mount`, `uts`, `ipc`, `network`, `user` and `cgroup` the container gets. `mount` is required (for the root filesystem). A `network` namespace has only a loopback interface, brought up; with a `path` (such as `/proc/PID/ns/net`, or a bind mount of one made by `ip netns add`), the container joins that network namespace instead, as it is (joining needs root, and only a `network` namespace can be joined by its path for now; one joined with a `user` namespace keeps its settings out of the container's reach, so `net.*` settings are refused there, and joining the host's own gets no settings or devices); without a `network` entry, the container shares the host's network. A `/sys` of the container's own shows its network's interfaces (rootless too, with a `network` namespace it made). Without `pid`, there's no small init, and the command shares the host's process IDs (`shipyard-runtime` then needs a cgroup: see [Cgroups](#cgroups)). A `cgroup` namespace makes the container's own cgroup its root (`/proc/self/cgroup` says `0::/`). A `user` namespace needs both mappings below; see [Rootless bundles](#rootless-bundles) for running without root. |
 | `linux.uidMappings`, `linux.gidMappings` | The user namespace's ID maps: `{"containerID": 0, "hostID": 100000, "size": 65536}` entries, checked as `--uidmap` is (ID 0 mapped, no overlaps; see [User namespaces](run.md#user-namespaces)). They need a `user` namespace, and it needs them. Other fields in an entry are ignored. Mappings that include host ID 0 work (as root), with a warning: a user inside is then root on the host's files. |
 | `linux.maskedPaths`, `linux.readonlyPaths` | Exactly the paths hidden or made read-only (see [Root filesystem](run.md#root-filesystem)). **Leaving them out means none**, not Shipyard's defaults. |
-| `linux.sysctl` | Kernel settings the container owns: the IPC ones (`kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), which need an `ipc` namespace. Any other one would change the host, so it's an error (exit 125), not ignored. Values must be strings. |
+| `linux.sysctl` | Kernel settings the container owns: the IPC ones (`kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), which need an `ipc` namespace, and the network ones (`net.*`), which need a `network` namespace (but not conntrack's `net.netfilter.nf_conntrack_max`, `nf_conntrack_expect_max` and `nf_conntrack_helper`, which are the whole machine's). Any other one would change the host, so it's an error (exit 125), not ignored. Values must be strings. |
+| `linux.netDevices` | The host's network devices to move into the container's `network` namespace: `{"eth1": {"name": "eth0"}}` moves `eth1` in, named `eth0` there (without `name`, it keeps its own). It needs root, and a `network` namespace. When the container ends, the kernel gives a physical device back to the host's first network namespace **under its name in the container** (or `devN` if that's taken), without its addresses, and destroys a virtual one (a veth, say) with the container's namespace. If one of the devices can't be moved, the ones already moved are moved back, under their own names, before the bundle fails. Moving the device the host reaches its network through cuts the host off until the container ends. |
 | `linux.resources` | The container's limits, as `runc` reads them: `memory` (`limit`, `reservation`, `swap` as memory **plus** swap; `-1` is no limit, `0` not set), `cpu` (`shares`, `quota`, `period`, `cpus`, `mems`), `pids.limit`, `blockIO` (`weight`, and the four `throttle…Device` lists), and `unified` (other files of the controllers, such as `"memory.high": "400M"`, written last). cgroup v1's units are converted to v2's (shares to `cpu.weight`, block I/O weights to `io.weight`). It needs a cgroup of the container's own: root's, or rootless in your delegated subtree (see [Cgroups](#cgroups)); what cgroup v2 can't apply is refused (see [What's refused](#whats-refused)). |
 | `linux.cgroupsPath` | Where [`shipyard-runtime`](runtime.md) puts the container's cgroup: an absolute path is below `/sys/fs/cgroup` as root (below your delegated subtree, rootless), a relative one below `/sys/fs/cgroup/shipyard/runtime/`. It must not exist yet (no joining another container's cgroup), nor be below a cgroup that holds processes (another container's, say: it would share that one's limits, freezing and kill), and `.` and `..` aren't allowed, nor a place inside `shipyard/run/` (`shipyard run`'s). Its parents get only the controllers the limits need. systemd's `slice:prefix:name` form is refused. `shipyard run --bundle` ignores it, with a warning: each run's cgroup is its own. |
 | `linux.resources.devices` | Device rules, as `runc` reads them: `{"allow": false, "access": "rwm"}` entries with an optional `type` (`a` for both, the default, `c` or `b`), `major` and `minor` (missing or `-1`: any) and `access` (any of `rwm`; all three if missing). Later rules win, for each of read, write and mknod. Shipyard adds `runc`'s list after them: `mknod` of any device, and `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `/dev/pts/*` and `/dev/net/tun`. **A bundle may use only those, and what its rules allow**, as with `runc`: a `linux.devices` node needs a rule of its own here to be opened. At most 256 rules, runc's list included. See [Devices](run.md#devices). |
@@ -246,8 +247,8 @@ leave the container **less confined than the config asks**, so the bundle is ref
 (exit code 125; `shipyard-runtime`: 1). Every such field is listed at once, so you can fix them all:
 
 - `process.apparmorProfile`, `process.selinuxLabel`, `linux.mountLabel`;
-- `network` and `time` namespaces, and joining an existing one (a namespace with
-  a `path`, `user` and `cgroup` included);
+- `time` namespaces, and joining an existing namespace other than a `network` one
+  (a namespace with a `path`, `user` and `cgroup` included);
 - in `linux.resources`, what cgroup v2 can't apply: a kernel memory limit (`memory.kernel`, `kernelTCP`;
   `-1` is accepted, as "unlimited"), `memory.swappiness` (`-1` is accepted, as "the
   default"), `memory.disableOOMKiller: true`, real-time CPU time
@@ -257,17 +258,16 @@ leave the container **less confined than the config asks**, so the bundle is ref
 - `linux.cgroupsPath` in systemd's `slice:prefix:name` form;
 - `process.terminal: true`;
 - `process.scheduler`, `process.ioPriority` and `process.execCPUAffinity`;
-- `linux.intelRdt`, `linux.memoryPolicy`, `linux.personality`, `linux.netDevices`
-  and `linux.timeOffsets`;
+- `linux.intelRdt`, `linux.memoryPolicy`, `linux.personality` and
+  `linux.timeOffsets`;
 - `shared` propagation (`linux.rootfsPropagation`, or a mount option), which would
   let the container's mounts reach the host, and `unbindable` propagation, which
   comes later;
 - mounts of any type but `bind` and `tmpfs`.
 
-A config made by `runc spec` asks for a terminal and a network namespace, so it's
-refused until those arrive. Remove those fields (and set `terminal` to `false`) to run
-it with what Shipyard has now. Its capabilities, `noNewPrivileges` and device rule are
-applied.
+A config made by `runc spec` asks for a terminal, so it's refused until that arrives.
+Set `terminal` to `false` to run it with what Shipyard has now. Its capabilities,
+`noNewPrivileges`, device rule and network namespace are applied.
 
 ## What's ignored
 

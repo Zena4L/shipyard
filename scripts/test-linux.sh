@@ -166,7 +166,7 @@ case "$MODE" in
             rm -rf /target/fuzz/crate
             cp -r fuzz /target/fuzz/crate
             sed -i "s|path = \"../crates/|path = \"/src/crates/|" /target/fuzz/crate/Cargo.toml
-            for target in manifest challenge reference tar unpack; do
+            for target in manifest challenge reference tar unpack netlink ports dns proc_net; do
                 echo "== fuzz $target, $FUZZ_SECONDS s"
                 mkdir -p "/target/fuzz/crashes/$target"
                 cargo +nightly fuzz run --fuzz-dir /target/fuzz/crate --target-dir /target/fuzz/build \

@@ -26,6 +26,7 @@ use super::plan::{ChildPlan, Handshake};
 use super::signal::Signal;
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
+use super::supervisor::NetworkHook;
 use crate::isolation::{Isolation, Join};
 use crate::{Error, Result};
 
@@ -123,12 +124,22 @@ struct PendingHooks {
 /// - into the container's cgroup, if the clone didn't place it (`in_cgroup`
 ///   false: the `clone` fallback);
 /// - its user namespace's maps (probe U2);
+/// - the host's network devices it's to have, moved into its network
+///   namespace (`Isolation::net_devices`);
+/// - the caller's network hook, with the child's PID and network namespace
+///   (the engine's veth and addresses, or the pasta it starts);
 /// - `spec`'s OOM score adjustment, with shipyard's privileges.
 ///
 /// If any fails, the child never runs: it's killed and reaped here, before
 /// anyone learns its PID.
 #[cfg(target_os = "linux")]
-fn before_go(pid: Pid, spec: &ProcessSpec, options: &SpawnOptions, in_cgroup: bool) -> Result<()> {
+fn before_go(
+    pid: Pid,
+    spec: &ProcessSpec,
+    options: &SpawnOptions,
+    network: Option<NetworkHook<'_>>,
+    in_cgroup: bool,
+) -> Result<()> {
     // A container's cgroup the clone couldn't place it in (its fallback).
     let placed = match &options.cgroup {
         Some(cgroup) if !in_cgroup && options.placement.isolation().is_some() => {
@@ -146,7 +157,27 @@ fn before_go(pid: Pid, spec: &ProcessSpec, options: &SpawnOptions, in_cgroup: bo
             None => Ok(()),
         }
     });
-    let ready = mapped.and_then(|()| match spec.oom_score_adj {
+    let connected = mapped.and_then(|()| {
+        use std::os::fd::AsFd as _;
+        let devices = options
+            .placement
+            .isolation()
+            .map_or(&[][..], |isolation| &isolation.net_devices);
+        if devices.is_empty() && network.is_none() {
+            return Ok(());
+        }
+        let netns = super::network::open_netns(pid)?;
+        super::network::move_devices(netns.as_fd(), devices)?;
+        match network {
+            Some(hook) => hook(super::NetworkTarget {
+                pid: pid.as_raw(),
+                netns: netns.as_fd(),
+            })
+            .map_err(Error::Network),
+            None => Ok(()),
+        }
+    });
+    let ready = connected.and_then(|()| match spec.oom_score_adj {
         Some(adj) => set_oom_score_adj(pid, adj),
         None => Ok(()),
     });
@@ -207,6 +238,7 @@ struct StatusPipe {
 pub(crate) fn spawn(
     spec: &ProcessSpec,
     options: &SpawnOptions,
+    network: Option<NetworkHook<'_>>,
     started: impl FnOnce(Pid),
 ) -> Result<Child> {
     let (report_read, report_write) = report_pipe()?;
@@ -216,17 +248,14 @@ pub(crate) fn spawn(
         read: go_read.as_raw_fd(),
         parent_end: go_write.as_raw_fd(),
     };
-    // The maps go to `/proc/PID`, as our `/proc` numbers the child. Another
-    // PID namespace's `/proc` would give the same number to another process.
     #[cfg(target_os = "linux")]
-    if options
-        .placement
-        .isolation()
-        .is_some_and(|isolation| isolation.id_maps.is_some())
-        && !super::proc_is_ours()
-    {
-        return Err(Error::ForeignProc);
-    }
+    let network_join = match options.placement.isolation() {
+        Some(isolation) => {
+            check_proc_numbers_children(isolation, network.is_some())?;
+            open_network_join(isolation)?
+        }
+        None => None,
+    };
     #[cfg(target_os = "linux")]
     let isolated = options
         .placement
@@ -272,6 +301,8 @@ pub(crate) fn spawn(
             #[cfg(target_os = "linux")]
             joining.as_ref(),
             #[cfg(target_os = "linux")]
+            network_join.as_ref(),
+            #[cfg(target_os = "linux")]
             cgroup_dir.as_ref().map(AsRawFd::as_raw_fd),
         )
     }? {
@@ -283,9 +314,9 @@ pub(crate) fn spawn(
         Launched::Parent { pid, in_cgroup } => (pid, in_cgroup),
     };
     #[cfg(target_os = "linux")]
-    before_go(pid, spec, options, in_cgroup)?;
+    before_go(pid, spec, options, network, in_cgroup)?;
     #[cfg(not(target_os = "linux"))]
-    let _ = in_cgroup;
+    let _ = (in_cgroup, network);
     started(pid);
     drop(mask);
     drop(report_write);
@@ -320,6 +351,43 @@ pub(crate) fn spawn(
         context,
         reaped: false,
     })
+}
+
+/// Checks that our `/proc` numbers the child as we do, where the parent
+/// writes to `/proc/PID` before the go byte (the maps; the moves of network
+/// devices and the network hook, to `/proc/PID/ns/net`): another PID
+/// namespace's `/proc` would give the same number to another process.
+#[cfg(target_os = "linux")]
+fn check_proc_numbers_children(isolation: &Isolation, hooked: bool) -> Result<()> {
+    let writes_proc = isolation.id_maps.is_some() || !isolation.net_devices.is_empty() || hooked;
+    if writes_proc && !super::proc_is_ours() {
+        return Err(Error::ForeignProc);
+    }
+    Ok(())
+}
+
+/// The network namespace `isolation` joins, opened before anything starts.
+/// One that's shipyard's own (the host's, usually) is the container's in
+/// nothing: its settings and devices aren't the container's to change.
+#[cfg(target_os = "linux")]
+fn open_network_join(isolation: &Isolation) -> Result<Option<super::network::NetworkJoin>> {
+    let Some(path) = isolation.network_path.as_deref() else {
+        return Ok(None);
+    };
+    let join = super::network::NetworkJoin::open(path)?;
+    let changes_it = !isolation.net_devices.is_empty()
+        || isolation
+            .sysctls
+            .iter()
+            .any(|(key, _)| key.starts_with("net."));
+    if changes_it && join.is_shipyards_own() {
+        return Err(Error::Network(format!(
+            "the network namespace {} is shipyard's own (the host's): network settings and \
+             devices can't be given to a container that joins it",
+            join.path().display()
+        )));
+    }
+    Ok(Some(join))
 }
 
 /// The command's result, from what the container's init sent (`report`)
@@ -546,6 +614,7 @@ enum Launched {
 unsafe fn launch(
     options: &SpawnOptions,
     #[cfg(target_os = "linux")] joining: Option<&super::join::Joining>,
+    #[cfg(target_os = "linux")] network_join: Option<&super::network::NetworkJoin>,
     #[cfg(target_os = "linux")] cgroup: Option<RawFd>,
 ) -> Result<Launched> {
     #[cfg(target_os = "linux")]
@@ -562,9 +631,24 @@ unsafe fn launch(
     #[cfg(target_os = "linux")]
     if let Some(isolation) = options.placement.isolation() {
         use super::clone::{Cloned, clone_process};
+        // A network namespace to join: entered for the clone, so the child
+        // starts in it (`clone_flags` leaves `CLONE_NEWNET` out), and left
+        // right after.
+        if let Some(join) = network_join {
+            join.enter()?;
+        }
         // SAFETY: the caller's contract; the flags are namespace flags only
         // (`Isolation::validate` refuses CLONE_NEWTIME).
-        return match unsafe { clone_process(isolation.clone_flags(), cgroup) } {
+        let cloned = unsafe { clone_process(isolation.clone_flags(), cgroup) };
+        if let Some(join) = network_join {
+            match &cloned {
+                // The child stays: it's to start in that namespace.
+                Ok(Cloned::Child) => {}
+                Ok(Cloned::Parent { pid, .. }) => join.leave(Some(*pid)),
+                Err(_) => join.leave(None),
+            }
+        }
+        return match cloned {
             Ok(Cloned::Child) => Ok(Launched::Child),
             Ok(Cloned::Parent { pid, in_cgroup }) => Ok(Launched::Parent { pid, in_cgroup }),
             // Root and still refused: a container without privileges, or a

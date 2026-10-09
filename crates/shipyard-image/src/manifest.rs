@@ -367,6 +367,9 @@ pub struct RuntimeConfig {
     pub working_dir: Option<String>,
     /// The user (`name`, `uid`, or `uid:gid`), if the image sets one.
     pub user: Option<String>,
+    /// The ports the image says it listens on (`ExposedPorts`' keys, like
+    /// `80/tcp`), sorted: what `run -P` publishes.
+    pub exposed_ports: Vec<String>,
 }
 
 /// An image config as it appears in JSON.
@@ -401,6 +404,10 @@ struct RawRuntimeConfig {
     working_dir: Option<String>,
     #[serde(rename = "User", default)]
     user: Option<String>,
+    /// A JSON object whose keys are the ports (its values are empty
+    /// objects), or `null`.
+    #[serde(rename = "ExposedPorts", default)]
+    exposed_ports: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 impl ImageConfig {
@@ -441,6 +448,10 @@ impl ImageConfig {
                 cmd: runtime.cmd,
                 working_dir: runtime.working_dir.filter(|d| !d.is_empty()),
                 user: runtime.user.filter(|u| !u.is_empty()),
+                exposed_ports: runtime
+                    .exposed_ports
+                    .map(|ports| ports.into_keys().collect())
+                    .unwrap_or_default(),
             },
         })
     }
@@ -629,7 +640,8 @@ mod tests {
                     "Entrypoint": ["/bin/sh"],
                     "Cmd": ["-c", "echo hi"],
                     "WorkingDir": "/work",
-                    "User": "1000:1000"
+                    "User": "1000:1000",
+                    "ExposedPorts": {{ "8080/tcp": {{}}, "53/udp": {{}} }}
                 }}
             }}"#
         );
@@ -642,6 +654,7 @@ mod tests {
         assert_eq!(config.config.cmd, ["-c", "echo hi"]);
         assert_eq!(config.config.working_dir.as_deref(), Some("/work"));
         assert_eq!(config.config.user.as_deref(), Some("1000:1000"));
+        assert_eq!(config.config.exposed_ports, ["53/udp", "8080/tcp"]);
     }
 
     #[test]

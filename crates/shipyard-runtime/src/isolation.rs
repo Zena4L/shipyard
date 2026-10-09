@@ -102,12 +102,17 @@ impl Namespace {
             .unwrap_or(u64::MAX)
     }
 
-    /// Whether this stage can create it. The others come with the stages that
-    /// give them meaning: network (stage 7), time (not planned yet).
+    /// Whether it can be made. The time namespace isn't planned yet.
     fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::Pid | Self::Mount | Self::Uts | Self::Ipc | Self::User | Self::Cgroup
+            Self::Pid
+                | Self::Mount
+                | Self::Uts
+                | Self::Ipc
+                | Self::Network
+                | Self::User
+                | Self::Cgroup
         )
     }
 }
@@ -166,6 +171,37 @@ pub struct Isolation {
     /// Which devices it may use, and the nodes made in its `/dev` (Docker's
     /// defaults to begin with): enforced by its cgroup's device program.
     pub devices: crate::devices::Devices,
+    /// An existing network namespace to join (a path to it, such as
+    /// `/proc/PID/ns/net` or a bind mount of one) instead of making one.
+    /// Needs [`Namespace::Network`] in `namespaces`. `None` makes a new one,
+    /// if `Network` is listed.
+    pub network_path: Option<PathBuf>,
+    /// Network devices of the host moved into the container's network
+    /// namespace (OCI's `linux.netDevices`). Needs [`Namespace::Network`].
+    pub net_devices: Vec<NetDevice>,
+}
+
+/// A network device of the host, moved into the container's network
+/// namespace when it starts. When the namespace goes, the kernel gives a
+/// physical device back to the host's; a virtual one is destroyed with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NetDevice {
+    /// Its name on the host.
+    pub host: String,
+    /// Its name in the container.
+    pub name: String,
+}
+
+impl NetDevice {
+    /// The host's device `host`, named `name` in the container.
+    #[must_use]
+    pub fn new(host: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            name: name.into(),
+        }
+    }
 }
 
 /// The container's view of its cgroup at `/sys/fs/cgroup` (always `nosuid`,
@@ -222,19 +258,39 @@ impl Isolation {
             resources: crate::resources::Resources::default(),
             hooks: None,
             devices: crate::devices::Devices::docker_default(),
+            network_path: None,
+            net_devices: Vec::new(),
         }
     }
 
     /// The `CLONE_NEW*` flags for its namespaces, the ones made at the clone.
     /// Not the cgroup namespace: the clean image makes that one itself, once
     /// it's in its cgroup, so the namespace's root is the container's cgroup
-    /// whichever way it got there (see `init.rs`).
+    /// whichever way it got there (see `init.rs`). Nor a network namespace
+    /// that's joined: the parent enters it for the clone (see `spawn.rs`).
     #[cfg(target_os = "linux")]
     pub(crate) fn clone_flags(&self) -> libc::c_int {
         self.namespaces
             .iter()
             .filter(|&&namespace| namespace != Namespace::Cgroup)
+            .filter(|&&namespace| namespace != Namespace::Network || self.makes_network_namespace())
             .fold(0, |flags, namespace| flags | namespace.clone_flag())
+    }
+
+    /// Whether the container may set its network namespace's settings: one
+    /// made for it, or one it joins outside a user namespace of its own (in
+    /// one, the joined namespace belongs to another user namespace, whose
+    /// settings root inside can't write).
+    fn owns_network_settings(&self) -> bool {
+        self.makes_network_namespace()
+            || (self.has(Namespace::Network) && !self.has(Namespace::User))
+    }
+
+    /// Whether it makes a network namespace (rather than joining one, or
+    /// sharing the host's).
+    #[must_use]
+    pub fn makes_network_namespace(&self) -> bool {
+        self.has(Namespace::Network) && self.network_path.is_none()
     }
 
     /// Whether it includes a new `namespace`.
@@ -270,6 +326,50 @@ impl Isolation {
     /// As [`validate`](Self::validate), the root's paths aside.
     pub fn validate_expecting_root(&self) -> Result<(), IsolationError> {
         self.check(true)
+    }
+
+    /// The network namespace's path and the devices moved into it.
+    fn check_network(&self) -> Result<(), IsolationError> {
+        if let Some(path) = &self.network_path {
+            if !self.has(Namespace::Network) {
+                return Err(IsolationError::NetworkPathNeedsNetwork);
+            }
+            if !is_plain_absolute(path) {
+                return Err(IsolationError::InvalidNetworkPath(path.clone()));
+            }
+        }
+        if self.net_devices.is_empty() {
+            return Ok(());
+        }
+        if !self.has(Namespace::Network) {
+            return Err(IsolationError::NetDevicesNeedNetwork);
+        }
+        let (mut names, mut hosts) = (Vec::new(), Vec::new());
+        for device in &self.net_devices {
+            let invalid = |reason: String| IsolationError::InvalidNetDevice {
+                host: device.host.clone(),
+                reason,
+            };
+            for name in [&device.host, &device.name] {
+                shipyard_network::route::validate_name(name)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if name == "lo" {
+                    return Err(invalid("the loopback device can't be moved".to_owned()));
+                }
+            }
+            if names.contains(&&device.name) {
+                return Err(invalid(format!(
+                    "another device is also named {} in the container",
+                    device.name
+                )));
+            }
+            if hosts.contains(&&device.host) {
+                return Err(invalid("it's listed twice".to_owned()));
+            }
+            names.push(&device.name);
+            hosts.push(&device.host);
+        }
+        Ok(())
     }
 
     /// Every check but the root's paths, with or without a root.
@@ -319,8 +419,14 @@ impl Isolation {
                 other => other,
             })?;
         }
+        self.check_network()?;
         for (key, value) in &self.sysctls {
-            validate_sysctl(key, value, self.has(Namespace::Ipc))?;
+            validate_sysctl(
+                key,
+                value,
+                self.has(Namespace::Ipc),
+                self.owns_network_settings(),
+            )?;
         }
         if with_root {
             // Without its own mount namespace, the pivot would move the
@@ -715,14 +821,38 @@ pub const IPC_SYSCTLS: [&str; 8] = [
     "kernel.shm_rmid_forced",
 ];
 
+/// Network settings that are the whole machine's even though a network
+/// namespace made by root shows them, writable: conntrack's table size and
+/// its helpers (`nf_conntrack_standalone.c` makes them read-only only in a
+/// namespace a user namespace owns).
+pub const HOST_WIDE_NET_SYSCTLS: [&str; 3] = [
+    "net.netfilter.nf_conntrack_max",
+    "net.netfilter.nf_conntrack_expect_max",
+    "net.netfilter.nf_conntrack_helper",
+];
+
 /// Accepts only the sysctls a container owns: [`IPC_SYSCTLS`] and
-/// `fs.mqueue.*`, with an IPC namespace (`has_ipc`). Any other one isn't
-/// namespaced, so setting it from the container would change the host.
+/// `fs.mqueue.*`, with an IPC namespace (`has_ipc`), and `net.*`, with a
+/// network namespace whose settings are the container's (`has_net`: one made
+/// for it, or one it joins outside a user namespace of its own). Any other
+/// one isn't namespaced, so setting it from the container would change the
+/// host.
+///
+/// Which `net.*` settings a network namespace has is mostly the kernel's to
+/// say: a setting that belongs to the whole machine isn't in a container's
+/// `/proc/sys/net`, so setting it fails when the container starts. The
+/// exceptions are [`HOST_WIDE_NET_SYSCTLS`]: a network namespace made by
+/// root shows them, writable, though they're the whole machine's.
 ///
 /// # Errors
 ///
 /// [`IsolationError::Sysctl`], saying why.
-pub fn validate_sysctl(key: &str, value: &str, has_ipc: bool) -> Result<(), IsolationError> {
+pub fn validate_sysctl(
+    key: &str,
+    value: &str,
+    has_ipc: bool,
+    has_net: bool,
+) -> Result<(), IsolationError> {
     let refuse = |reason| {
         Err(IsolationError::Sysctl {
             key: key.to_owned(),
@@ -741,9 +871,15 @@ pub fn validate_sysctl(key: &str, value: &str, has_ipc: bool) -> Result<(), Isol
         return refuse("its value contains a NUL or a newline");
     }
     if key.starts_with("net.") {
+        if HOST_WIDE_NET_SYSCTLS.contains(&key) {
+            return refuse("it's the whole machine's, even in a network namespace");
+        }
+        if has_net {
+            return Ok(());
+        }
         return refuse(
-            "network settings need the container's own network namespace, which comes in \
-             a later version (now it would change the host's)",
+            "network settings need a network namespace of the container's own: without one, it \
+             would change the host's",
         );
     }
     if key == "kernel.hostname" || key == "kernel.domainname" {
@@ -874,6 +1010,26 @@ pub enum IsolationError {
         domainname: String,
         /// What's wrong with it.
         reason: &'static str,
+    },
+    /// A network namespace path, but no network namespace listed.
+    #[error("joining a network namespace needs the network namespace listed")]
+    NetworkPathNeedsNetwork,
+    /// A network namespace path that isn't absolute, or has `.` or `..`.
+    #[error("the network namespace's path must be absolute, without . or .. (got {})", .0.display())]
+    InvalidNetworkPath(PathBuf),
+    /// Network devices to move, but no network namespace to move them into.
+    #[error(
+        "moving network devices into the container needs a network namespace of its own (without \
+         one, they'd stay the host's)"
+    )]
+    NetDevicesNeedNetwork,
+    /// A network device that can't be moved as asked.
+    #[error("the network device {host}: {reason}")]
+    InvalidNetDevice {
+        /// Its name on the host.
+        host: String,
+        /// Why not.
+        reason: String,
     },
     /// A sysctl the container can't set.
     #[error("sysctl {key}: {reason}")]
@@ -1055,24 +1211,127 @@ mod tests {
 
     #[test]
     fn only_the_containers_own_sysctls_are_allowed() {
-        assert_eq!(validate_sysctl("kernel.shmmax", "1048576", true), Ok(()));
-        assert_eq!(validate_sysctl("fs.mqueue.msg_max", "20", true), Ok(()));
-        for (key, value, has_ipc) in [
-            ("kernel.shmmax", "1", false),
-            ("net.ipv4.ip_forward", "1", true),
-            ("kernel.hostname", "x", true),
-            ("vm.swappiness", "1", true),
-            ("kernel..shmmax", "1", true),
-            ("../../etc", "1", true),
-            ("kernel.shmmax", "1\n2", true),
-            ("", "1", true),
+        assert_eq!(
+            validate_sysctl("kernel.shmmax", "1048576", true, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sysctl("fs.mqueue.msg_max", "20", true, false),
+            Ok(())
+        );
+        // With a network namespace of its own, network settings are its own.
+        assert_eq!(
+            validate_sysctl("net.ipv4.ip_forward", "1", false, true),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sysctl("net.ipv4.ping_group_range", "0 2147483647", false, true),
+            Ok(())
+        );
+        for (key, value, has_ipc, has_net) in [
+            ("kernel.shmmax", "1", false, true),
+            ("net.ipv4.ip_forward", "1", true, false),
+            ("kernel.hostname", "x", true, true),
+            ("vm.swappiness", "1", true, true),
+            ("kernel..shmmax", "1", true, true),
+            ("net..ipv4", "1", true, true),
+            ("../../etc", "1", true, true),
+            ("kernel.shmmax", "1\n2", true, true),
+            ("net.ipv4.ip_forward", "1\n2", true, true),
+            ("", "1", true, true),
         ] {
             assert!(
                 matches!(
-                    validate_sysctl(key, value, has_ipc),
+                    validate_sysctl(key, value, has_ipc, has_net),
                     Err(IsolationError::Sysctl { .. })
                 ),
-                "{key}={value:?} with IPC {has_ipc}"
+                "{key}={value:?} with IPC {has_ipc}, network {has_net}"
+            );
+        }
+        let error = validate_sysctl("net.ipv4.ip_forward", "1", true, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network namespace of the container's own"),
+            "{error}"
+        );
+        // One a root-made namespace shows, but that's the whole machine's.
+        assert!(validate_sysctl("net.netfilter.nf_conntrack_max", "1", true, true).is_err());
+    }
+
+    #[test]
+    fn a_network_namespace_is_made_or_joined() {
+        let mut isolation = Isolation::standard();
+        isolation.namespaces.push(Namespace::Network);
+        assert_eq!(isolation.validate(), Ok(()));
+        assert!(isolation.makes_network_namespace());
+        isolation.network_path = Some("/proc/42/ns/net".into());
+        assert_eq!(isolation.validate(), Ok(()));
+        assert!(!isolation.makes_network_namespace());
+        isolation.network_path = Some("relative/net".into());
+        assert_eq!(
+            isolation.validate(),
+            Err(IsolationError::InvalidNetworkPath("relative/net".into()))
+        );
+        // Joined, its settings are the container's, but not from a user
+        // namespace of its own (the namespace belongs to another).
+        isolation.network_path = Some("/proc/42/ns/net".into());
+        isolation.sysctls = vec![("net.ipv4.ip_forward".into(), "1".into())];
+        assert_eq!(isolation.validate(), Ok(()));
+        isolation.namespaces.push(Namespace::User);
+        isolation.id_maps = Some(IdMaps::single((1000, 1000)));
+        let refused = isolation.validate();
+        assert!(
+            matches!(refused, Err(IsolationError::Sysctl { .. })),
+            "{refused:?}"
+        );
+        let mut without = Isolation::standard();
+        without.network_path = Some("/proc/42/ns/net".into());
+        assert_eq!(
+            without.validate(),
+            Err(IsolationError::NetworkPathNeedsNetwork)
+        );
+        assert!(!without.makes_network_namespace());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_joined_network_namespace_isnt_made_at_the_clone() {
+        let mut isolation = Isolation::standard();
+        isolation.namespaces.push(Namespace::Network);
+        assert_ne!(isolation.clone_flags() & libc::CLONE_NEWNET, 0);
+        isolation.network_path = Some("/proc/42/ns/net".into());
+        assert_eq!(isolation.clone_flags() & libc::CLONE_NEWNET, 0);
+        assert_ne!(isolation.clone_flags() & libc::CLONE_NEWPID, 0);
+    }
+
+    #[test]
+    fn network_devices_need_a_network_namespace_and_good_names() {
+        let mut isolation = Isolation::standard();
+        isolation.net_devices = vec![NetDevice::new("eth1", "eth0")];
+        assert_eq!(
+            isolation.validate(),
+            Err(IsolationError::NetDevicesNeedNetwork)
+        );
+        isolation.namespaces.push(Namespace::Network);
+        assert_eq!(isolation.validate(), Ok(()));
+        for bad in [
+            vec![NetDevice::new("lo", "lo0")],
+            vec![NetDevice::new("eth1", "lo")],
+            vec![NetDevice::new("eth1", "a-name-longer-than-15")],
+            vec![NetDevice::new("eth/1", "eth0")],
+            vec![
+                NetDevice::new("eth1", "eth0"),
+                NetDevice::new("eth2", "eth0"),
+            ],
+        ] {
+            isolation.net_devices.clone_from(&bad);
+            assert!(
+                matches!(
+                    isolation.validate(),
+                    Err(IsolationError::InvalidNetDevice { .. })
+                ),
+                "{bad:?}"
             );
         }
     }
@@ -1166,14 +1425,12 @@ mod tests {
             Err(IsolationError::Duplicate(Namespace::Pid))
         );
 
-        for later in [Namespace::Network, Namespace::Time] {
-            let mut isolation = Isolation::standard();
-            isolation.namespaces.push(later);
-            assert_eq!(
-                isolation.validate(),
-                Err(IsolationError::Unsupported(later))
-            );
-        }
+        let mut isolation = Isolation::standard();
+        isolation.namespaces.push(Namespace::Time);
+        assert_eq!(
+            isolation.validate(),
+            Err(IsolationError::Unsupported(Namespace::Time))
+        );
     }
 
     #[test]
@@ -1190,6 +1447,8 @@ mod tests {
             resources: crate::resources::Resources::default(),
             hooks: None,
             devices: crate::devices::Devices::docker_default(),
+            network_path: None,
+            net_devices: Vec::new(),
         };
         assert_eq!(isolation.validate(), Err(IsolationError::PidNeedsMount));
         // A mount namespace alone is fine: its /proc still shows the host's
@@ -1206,6 +1465,8 @@ mod tests {
             resources: crate::resources::Resources::default(),
             hooks: None,
             devices: crate::devices::Devices::docker_default(),
+            network_path: None,
+            net_devices: Vec::new(),
         };
         assert_eq!(mount_only.validate(), Ok(()));
     }
@@ -1242,9 +1503,10 @@ mod tests {
             join(vec![Namespace::Uts, Namespace::Uts]).validate(),
             Err(IsolationError::Duplicate(Namespace::Uts))
         );
+        assert_eq!(join(vec![Namespace::Network]).validate(), Ok(()));
         assert_eq!(
-            join(vec![Namespace::Network]).validate(),
-            Err(IsolationError::Unsupported(Namespace::Network))
+            join(vec![Namespace::Time]).validate(),
+            Err(IsolationError::Unsupported(Namespace::Time))
         );
         assert_eq!(
             join(vec![Namespace::Pid, Namespace::Uts]).validate(),
@@ -1313,6 +1575,8 @@ mod tests {
             resources: crate::resources::Resources::default(),
             hooks: None,
             devices: crate::devices::Devices::docker_default(),
+            network_path: None,
+            net_devices: Vec::new(),
         };
         assert_eq!(isolation.validate(), Err(IsolationError::HostnameNeedsUts));
     }

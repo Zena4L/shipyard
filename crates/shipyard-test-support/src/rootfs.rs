@@ -72,6 +72,12 @@ impl RootFs {
         self.dir.join(inside.trim_start_matches('/'))
     }
 
+    /// Adds the host's `program` (found in the usual directories) to
+    /// `/bin`, with the libraries it loads.
+    pub fn add_host_program(&self, program: &str) {
+        self.add_program(&host_program(program));
+    }
+
     /// Copies the host program at `host` into `/bin`, with what it loads.
     fn add_program(&self, host: &Path) {
         let name = host.file_name().unwrap();

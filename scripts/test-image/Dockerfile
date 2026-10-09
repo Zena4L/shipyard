@@ -3,15 +3,19 @@
 #
 # - `uidmap`: `newuidmap` and `newgidmap`, the setuid helpers that let a user
 #   map the subordinate IDs /etc/subuid gives them (`subuid(5)`);
+# - `passt`: pasta, rootless containers' network (stage 7). Debian 13's: 12's
+#   (2023) can't carry connections to a published port into a container;
+# - `nftables`: `nft`, for the firewall tests to look at Shipyard's table and
+#   to make another program's chains (Shipyard itself never runs it);
 # - `tester`, the normal user the tests run as, with 65536 subordinate IDs
 #   from 100000.
 #
 # Built once by test-linux.sh (which needs network then), and again only when
 # this file changes.
-FROM rust:1-bookworm
+FROM rust:1-trixie
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends uidmap \
+    && apt-get install -y --no-install-recommends uidmap passt nftables \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home tester \

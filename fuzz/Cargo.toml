@@ -1,5 +1,6 @@
 # Fuzz targets for what Shipyard reads from untrusted sources: registries'
-# documents and headers, image references, and layer archives. Built on
+# documents and headers, image references, layer archives, what the kernel
+# sends over netlink, and `-p`. Built on
 # nightly with cargo-fuzz, outside the main workspace; run them with
 # `scripts/test-linux.sh --fuzz` (docs/DEVELOPMENT.md).
 [package]
@@ -14,6 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 shipyard-image = { path = "../crates/shipyard-image" }
+shipyard-network = { path = "../crates/shipyard-network" }
 
 # Its own workspace: not one of Shipyard's crates.
 [workspace]
@@ -49,6 +51,34 @@ bench = false
 [[bin]]
 name = "unpack"
 path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netlink"
+path = "fuzz_targets/netlink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ports"
+path = "fuzz_targets/ports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proc_net"
+path = "fuzz_targets/proc_net.rs"
 test = false
 doc = false
 bench = false

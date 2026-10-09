@@ -91,6 +91,9 @@ pub(crate) enum ChildStep {
     MountOverlay = 59,
     /// Attaching the image overlay real root made (`--uidmap`) failed.
     AttachOverlay = 60,
+    /// Bringing up the loopback interface of the container's network
+    /// namespace failed.
+    Loopback = 61,
 }
 
 impl ChildStep {
@@ -159,6 +162,7 @@ impl ChildStep {
             58 => Self::HookRunnerCapabilities,
             59 => Self::MountOverlay,
             60 => Self::AttachOverlay,
+            61 => Self::Loopback,
             _ => return None,
         })
     }
@@ -519,18 +523,13 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::MountRestrict
         | ChildStep::UserLookup
         | ChildStep::Domainname
-        | ChildStep::Sysctl => describe_container(step, errno, detail, ctx),
+        | ChildStep::Sysctl
+        | ChildStep::Loopback
+        | ChildStep::AtHooks => describe_container(step, errno, detail, ctx),
         ChildStep::DeviceNode => describe_device(errno, detail, ctx),
         ChildStep::CreateContainerHook
         | ChildStep::StartContainerHook
         | ChildStep::HookRunnerCapabilities => describe_hook(failure, ctx),
-        // Never a failure (see `ReportReader`); said plainly if it ever
-        // shows up as one.
-        ChildStep::AtHooks => isolation_setup(
-            "the container's init stopped for hooks at the wrong time",
-            errno,
-            ctx,
-        ),
     }
 }
 
@@ -826,19 +825,48 @@ fn describe_container(
             SpawnError::new(SpawnErrorKind::Setup, message, errno)
         }
         ChildStep::Domainname => isolation_setup("setting the container's domain name", errno, ctx),
-        ChildStep::Sysctl => {
-            let sysctl = usize::try_from(detail)
-                .ok()
-                .and_then(|index| ctx.sysctls.get(index))
-                .map_or_else(
-                    || "a sysctl".to_owned(),
-                    |(key, value)| format!("{key}={value}"),
-                );
-            isolation_setup(&format!("setting sysctl {sysctl}"), errno, ctx)
-        }
+        ChildStep::Sysctl => describe_sysctl(errno, detail, ctx),
+        // Never a failure (see `ReportReader`); said plainly if it ever
+        // shows up as one.
+        ChildStep::AtHooks => isolation_setup(
+            "the container's init stopped for hooks at the wrong time",
+            errno,
+            ctx,
+        ),
+        ChildStep::Loopback => isolation_setup(
+            "bringing up the loopback interface of the container's network namespace",
+            errno,
+            ctx,
+        ),
         // The other steps are `describe`'s.
         _ => isolation_setup("setting up the container", errno, ctx),
     }
+}
+
+/// A sysctl (`detail`: its index) couldn't be set.
+fn describe_sysctl(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
+    let found = usize::try_from(detail)
+        .ok()
+        .and_then(|index| ctx.sysctls.get(index));
+    let sysctl = found.map_or_else(
+        || "a sysctl".to_owned(),
+        |(key, value)| format!("{key}={value}"),
+    );
+    // A network namespace has only the settings that are its own: the
+    // host's alone aren't in its /proc/sys/net.
+    let host_wide_net_setting =
+        errno == Errno::ENOENT && found.is_some_and(|(key, _)| key.starts_with("net."));
+    if host_wide_net_setting {
+        return SpawnError::new(
+            SpawnErrorKind::Isolation,
+            format!(
+                "setting sysctl {sysctl}: a network namespace has no such setting (it may be the \
+                 whole machine's, which a container can't change)"
+            ),
+            errno,
+        );
+    }
+    isolation_setup(&format!("setting sysctl {sysctl}"), errno, ctx)
 }
 
 /// One of the container's own mounts (`detail`: its index) failed.
@@ -1300,7 +1328,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 60, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 61, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -1400,6 +1428,47 @@ mod tests {
     fn out_of_range_detail_falls_back_to_the_program() {
         let err = exec(Errno::ENOEXEC, u64::MAX, &ctx("/x", &["/x"]));
         assert!(err.to_string().starts_with("/x:"), "{err}");
+    }
+
+    #[test]
+    fn network_namespace_failures_say_what_and_why() {
+        let mut ctx = ctx("/x", &["/x"]);
+        ctx.sysctls = vec![
+            ("net.core.rmem_max".into(), "1".into()),
+            ("kernel.shmmax".into(), "1".into()),
+        ];
+        let fail = |step, errno, detail| {
+            describe(
+                ChildFailure {
+                    step,
+                    errno,
+                    detail,
+                },
+                &ctx,
+            )
+            .to_string()
+        };
+        assert_eq!(
+            fail(ChildStep::Loopback, Errno::EPERM, 0),
+            format!(
+                "bringing up the loopback interface of the container's network namespace: {}{}",
+                Errno::EPERM.desc(),
+                permission_hint(false, "isolation")
+            )
+        );
+        // A network setting only the whole machine has: said so.
+        let host_only = fail(ChildStep::Sysctl, Errno::ENOENT, 0);
+        assert!(
+            host_only.starts_with(
+                "setting sysctl net.core.rmem_max=1: a network namespace has no such setting"
+            ),
+            "{host_only}"
+        );
+        // Any other missing setting: the plain error.
+        assert_eq!(
+            fail(ChildStep::Sysctl, Errno::ENOENT, 1),
+            format!("setting sysctl kernel.shmmax=1: {}", Errno::ENOENT.desc())
+        );
     }
 
     #[test]

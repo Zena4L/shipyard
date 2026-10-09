@@ -219,6 +219,11 @@ pub enum Error {
     #[error(transparent)]
     Hook(#[from] crate::hooks::HookError),
 
+    /// Setting up the container's network failed: what was being done and
+    /// why (a netlink request the kernel refused, with its reason).
+    #[error("{0}")]
+    Network(String),
+
     /// A system call failed in shipyard itself. `op` says what we were doing;
     /// the errno is the error's source, so full-chain printing shows both once.
     #[error("{op}")]

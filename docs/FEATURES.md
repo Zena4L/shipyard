@@ -204,18 +204,41 @@ Shipyard has three layers, mirroring how the established tools split up:
 ## 7. Networking — stage 7
 
 - **Network namespaces** (moved here from stage 2): one per container, except in `host`
-  mode.
-- **Network modes:** `none`, `host`, `bridge`.
-- **Bridges and veth pairs:** created over netlink (rtnetlink), with no shelling out to `ip`.
-- **IP address management:** subnet allocation and persisted IP leases.
-- **Outbound traffic and ports:** NAT via nftables masquerade, plus port publishing.
-- **Rootless networking:** `pasta` or `slirp4netns`.
+  mode; joined by path and `netDevices` moved in for OCI bundles; a sysfs of the
+  container's own; `net.*` sysctls, with Docker's defaults.
+- **Network modes:** `none`, `host`, `bridge` and networks made with `network create`
+  (root), `pasta` (rootless's default). Rootless without pasta is refused with a hint.
+- **Netlink of Shipyard's own:** rtnetlink (links, addresses, routes), nf_tables and
+  conntrack messages built and read by bounded, fuzzed code; no `ip` or `nft` binary.
+- **Bridges and veth pairs:** each container's interface born in its namespace with its
+  final name; a fixed bridge MAC; hairpin.
+- **IP address management:** a subnet per network (avoiding the host's routes), leases
+  held by `flock` for the run's life and swept after a killed run (with its veth,
+  firewall elements and conntrack entries); `--ip`, `--mac-address`.
+- **Commands:** `network create [--subnet --gateway --internal --ipv6] / ls / inspect /
+  rm / prune`.
+- **Outbound traffic and ports:** one nf_tables table of Shipyard's own: masquerade,
+  `-p`/`-P` through DNAT maps (host ports held by bound sockets), hairpin, localhost
+  clients with the 127/8 guard, isolation between networks, internal (no-egress)
+  networks, routing closed to all but containers; other firewalls detected and warned
+  about with the fix.
+- **Rootless networking:** pasta, one per container, attached by PID: outbound traffic,
+  published ports, the host's DNS through `169.254.1.1`, IPv6 where the host has it;
+  never the host's loopback. (`slirp4netns` isn't supported.)
 - **Name resolution:**
-  - an embedded per-network DNS, so containers resolve each other by name
-  - generated `/etc/hosts` and `/etc/resolv.conf`
-- **Network options:** multiple networks per container, internal (no-egress) networks, IPv6.
-- **Connection observation:** reading `/proc/net/tcp` inside each container's network
-  namespace. This powers the UI's "observed but undeclared" dependencies.
+  - a DNS server per user-defined network: containers resolve each other by `--name`,
+    `--network-alias` and run ID (A, AAAA, PTR), across every network they share;
+    everything else is forwarded to the host's resolvers (internal networks refuse)
+  - generated `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` (`--add-host`,
+    `--dns`, `--dns-search`, `--dns-option`); the run ID as the default hostname
+- **Network options:** several networks per container (`--network` repeated, or Docker's
+  long form), internal networks, IPv6 (a ULA `/64` with NAT66, `--ip6`, `-p` on IPv6).
+- **Connection observation:** a library reading `/proc/<pid>/net/{tcp,tcp6,udp,udp6}`
+  through a container's init (pinned by a pidfd), listening and established sockets,
+  fuzzed. Its command (and the UI's "observed but undeclared" dependencies) come with
+  stage 9.
+- *Moved:* `network connect`/`disconnect`, the sockets command and the DNS servers' own
+  cgroup and restart to stage 9; `exec` joining the network namespace to stage 8.
 
 ## 8. Terminals, I/O and logs — stage 8
 
@@ -229,6 +252,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **`exec` sessions:** each with its own terminal.
 - **`exec` joins the container's cgroup** (moved from stage 5): its limits, device rules
   and freezing cover what it runs, and a cgroup kill catches it.
+- **`exec` joins the container's network namespace** (moved from stage 7), whatever its
+  network mode.
 - **File-descriptor passing:** `--preserve-fds` and systemd-style socket activation
   (`LISTEN_FDS`).
 - **Logs:** log files with rotation; `logs --follow --tail --since --timestamps`.
@@ -248,6 +273,10 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **`events` stream:** start, stop, die, OOM, pull, …
 - **Commands across processes:** `kill`, `wait`, `stop` and `ps` work on containers started
   by other shipyard invocations, using the on-disk state.
+- **Networks of named containers** (moved from stage 7): `network connect` /
+  `disconnect` on a running container; `port` and a view of its sockets (stage 7's
+  reader); `--name` for everything, not only DNS; the DNS servers in a cgroup of their
+  own, restarted if killed; a warning when a container's pasta dies.
 - *Optional:* generated systemd units so containers start at boot.
 
 ## 10. Compose and stacks — stage 10

@@ -55,6 +55,23 @@ const SAFETY_NET: Duration = Duration::from_secs(1);
 /// `nohup` (HUP) and a script's `&` (INT, QUIT) set up to protect a job.
 const KEEP_IGNORED: [c_int; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT];
 
+/// A caller's network setup for a container: called with the container
+/// ([`NetworkTarget`]) before anything in it runs (see
+/// [`Supervisor::supervise_with_network`]); its error message is reported
+/// as [`Error::Network`].
+pub type NetworkHook<'a> = &'a mut dyn FnMut(NetworkTarget<'_>) -> Result<(), String>;
+
+/// The container a [`NetworkHook`] sets up: its init's process ID (in
+/// shipyard's PID namespace: a helper like pasta joins its namespaces by
+/// it), and a descriptor of its network namespace.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkTarget<'a> {
+    /// The container's init.
+    pub pid: libc::pid_t,
+    /// Its network namespace.
+    pub netns: std::os::fd::BorrowedFd<'a>,
+}
+
 /// Supervises commands. Owns this process's signal handlers, so only one can
 /// exist per process; create it before starting anything.
 ///
@@ -124,7 +141,37 @@ impl Supervisor {
         let placement = isolation.map_or(Placement::Host, |isolation| {
             Placement::New(Box::new(isolation.clone()))
         });
-        self.run(spec, stop, placement)
+        self.run(spec, stop, placement, None)
+    }
+
+    /// Like [`supervise`](Self::supervise), with `network` called once the
+    /// container's namespaces exist and before anything in it runs: with a
+    /// descriptor of its network namespace, to give it interfaces and
+    /// addresses from outside (as an engine does). Every signal is held
+    /// while it runs, so it must finish in bounded time. An error from it
+    /// stops the container before it starts ([`Error::Network`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`supervise`](Self::supervise), and the hook's own; and
+    /// [`Error::Network`] if `isolation` doesn't make a network namespace
+    /// (the hook would configure the host's, or one the container joins).
+    pub fn supervise_with_network(
+        &mut self,
+        spec: &ProcessSpec,
+        stop: StopPolicy,
+        isolation: &Isolation,
+        network: NetworkHook<'_>,
+    ) -> Result<ExitStatus> {
+        // The hook configures the namespace it's given: never the host's, or
+        // one the container joins (someone else's).
+        if !isolation.makes_network_namespace() {
+            return Err(Error::Network(
+                "a network hook needs a network namespace made for the container".to_owned(),
+            ));
+        }
+        let placement = Placement::New(Box::new(isolation.clone()));
+        self.run(spec, stop, placement, Some(network))
     }
 
     /// Like [`supervise`](Self::supervise), but the command starts inside
@@ -154,7 +201,7 @@ impl Supervisor {
         stop: StopPolicy,
         join: &Join,
     ) -> Result<ExitStatus> {
-        self.run(spec, stop, Placement::Join(join.clone()))
+        self.run(spec, stop, Placement::Join(join.clone()), None)
     }
 
     fn run(
@@ -162,6 +209,7 @@ impl Supervisor {
         spec: &ProcessSpec,
         stop: StopPolicy,
         placement: Placement,
+        network: Option<NetworkHook<'_>>,
     ) -> Result<ExitStatus> {
         stop.validate()?;
         match &placement {
@@ -216,7 +264,7 @@ impl Supervisor {
             allow(unused_assignments, reason = "only Linux reports OOM kills")
         )]
         let mut killed_by_us = false;
-        let result = spawn(&spec, &options, started).and_then(|mut child| {
+        let result = spawn(&spec, &options, network, started).and_then(|mut child| {
             let result = self.watch(&mut child, stop, job_terminal, own_session, hooks.as_ref());
             if result.is_err() {
                 // Never leave the command running unsupervised.

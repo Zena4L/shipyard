@@ -18,6 +18,10 @@ the previous one. Don't jump ahead or build later stages early.
 
 - `crates/shipyard-cli/`: the `shipyard` binary (clap, anyhow, tracing).
 - `crates/shipyard-runtime/`: low-level primitives (processes, namespaces, mounts, cgroups).
+- `crates/shipyard-image/`: images: the registry client, the content-addressed store, safe
+  layer unpacking.
+- `crates/shipyard-network/`: networking: Shipyard's own netlink (rtnetlink, nf_tables,
+  conntrack), networks and leases, pasta, the DNS server, reading a container's sockets.
 - `crates/shipyard-test-support/`: helpers for the end-to-end tests (running the binary,
   hostile parents, the pseudo-terminal harness). Dev-only, never published.
   Library errors use `thiserror`.

@@ -14,6 +14,8 @@
 )]
 
 pub mod bundle;
+#[cfg(target_os = "linux")]
+pub mod net;
 pub mod pty;
 pub mod rootfs;
 
@@ -270,6 +272,24 @@ fn rootless_unavailable(needs: Rootless) -> Option<String> {
     None
 }
 
+/// Runs `test` on a thread of its own, in a network namespace of its own
+/// (`unshare(CLONE_NEWNET)` changes only the calling thread's), and returns
+/// what it returns; a panic in it is the test's. What `test` starts (a
+/// `shipyard` command) is in that namespace too: a fork copies the calling
+/// thread's namespaces. So a test that makes interfaces never touches the
+/// host's networking (or the CI runner's), and what it made goes with the
+/// thread. Needs root (`CAP_SYS_ADMIN`).
+#[cfg(target_os = "linux")]
+pub fn in_new_netns<T: Send + 'static>(test: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::spawn(move || {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)
+            .expect("a network namespace of the test's own (it needs root)");
+        test()
+    })
+    .join()
+    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// Whether the tests run as root (effective user 0).
 #[must_use]
 pub fn is_root() -> bool {
@@ -404,6 +424,12 @@ impl Running {
         self.lines
             .recv_timeout(TIMEOUT)
             .expect("the command printed nothing")
+    }
+
+    /// Stops shipyard as a user would (SIGTERM), and waits for it.
+    pub fn stop(self) {
+        self.signal(libc::SIGTERM);
+        let _ = self.finish_status();
     }
 
     /// Sends `signal` to shipyard.

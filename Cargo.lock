@@ -483,6 +483,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -502,6 +511,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -917,6 +927,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shipyard-image",
+ "shipyard-network",
  "shipyard-runtime",
  "shipyard-storage",
  "shipyard-test-support",
@@ -944,6 +955,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shipyard-network"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "nix",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "shipyard-runtime"
 version = "0.0.1"
 dependencies = [
@@ -952,6 +975,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "shipyard-network",
  "shipyard-test-support",
  "thiserror",
  "tracing",
@@ -972,6 +996,7 @@ dependencies = [
  "libc",
  "nix",
  "serde_json",
+ "shipyard-network",
 ]
 
 [[package]]

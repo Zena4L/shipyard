@@ -48,7 +48,7 @@ use super::child::{
 use super::failure::UnmappedId;
 use super::failure::{ChildFailure, ChildStep, FailureContext, describe};
 use super::plan::ChildPlan;
-use super::setup::{HooksSetup, is_sealed_setup, read_setup};
+use super::setup::{HooksSetup, NetworkSetup, is_sealed_setup, read_setup};
 use super::status::ExitStatus;
 use super::{identity, rootfs, sysctl};
 use crate::container::{State, Status};
@@ -435,8 +435,9 @@ fn unread(fifo: &impl AsFd) -> Option<libc::c_int> {
 /// The container setup, in the new namespaces: a session of its own (no
 /// controlling terminal, its own process group), mounts that don't
 /// propagate out, its own root filesystem or a `/proc` for the new PID
-/// namespace, and the hostname. With hooks, it stops once the mounts are
-/// made ([`stop_for_hooks`], with `report`), and returns the state they got.
+/// namespace, its loopback interface, and the hostname. With hooks, it
+/// stops once the mounts are made ([`stop_for_hooks`], with `report`), and
+/// returns the state they got.
 fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, Failure> {
     let at = |step| move |errno| Failure::at(step, errno);
     nix::unistd::setsid().map_err(at(ChildStep::Session))?;
@@ -446,6 +447,12 @@ fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, F
         // the namespace's root, and `/proc/self/cgroup` says `/` (G10).
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWCGROUP)
             .map_err(at(ChildStep::CgroupNamespace))?;
+    }
+    if setup.network == NetworkSetup::Own {
+        // A new network namespace has only `lo`, and it's down: programs
+        // that talk to themselves over 127.0.0.1 need it up. Before the
+        // hooks, so `createContainer` sees it too.
+        bring_loopback_up().map_err(at(ChildStep::Loopback))?;
     }
     if setup.private_mounts {
         // First, before any mount: on hosts where `/` is shared (systemd),
@@ -503,6 +510,21 @@ fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, F
     // (With a root filesystem, already done by the switch.)
     let _ = std::env::set_current_dir("/");
     Ok(state)
+}
+
+/// Brings up `lo` in this process's network namespace: a request over
+/// rtnetlink (this process is single-threaded, and already inside, with its
+/// capabilities there). A failure that isn't the kernel's refusal (no
+/// answer, one that can't be read) is reported as EIO, for want of an errno.
+fn bring_loopback_up() -> Result<(), nix::errno::Errno> {
+    use shipyard_network::route::{LinkChange, Rtnetlink};
+    /// The loopback interface is always the first a namespace gets (the
+    /// kernel registers it first: `loopback_net_init`).
+    const LOOPBACK: u32 = 1;
+    let mut rtnetlink = Rtnetlink::new().map_err(|error| error.errno().unwrap_or(Errno::EIO))?;
+    rtnetlink
+        .change(LOOPBACK, LinkChange::Up(true))
+        .map_err(|error| error.errno().unwrap_or(Errno::EIO))
 }
 
 /// Stops for the runtime's hooks: says so on the `report` pipe, then waits

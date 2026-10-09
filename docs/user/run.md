@@ -10,8 +10,9 @@ environment and exactly the user, working directory and limits you ask for.
 > **Status:** on Linux, `run` isolates the command in its own process IDs, mounts,
 > hostname and IPC (see [Isolation](#isolation)). With `--rootfs` it also gets a
 > root filesystem of its own (see [Root filesystem](#root-filesystem)); without it, it
-> sees the host's files. It always shares the host's network: networking comes in a
-> later version. On macOS the command isn't isolated yet.
+> sees the host's files. It has a network of its own with a way out and
+> published ports (`-p`): the default bridge network as root, pasta without (see
+> [Network](#network)). On macOS the command isn't isolated yet.
 
 ## Arguments
 
@@ -40,13 +41,14 @@ its own view of:
 |---|---|
 | Process IDs | The command sees only its own processes (`ps`, `/proc`). It's PID 2: PID 1 is a small init (see below). |
 | Mounts | Mounts made inside stay inside; the host never sees them. Mounts the host makes or removes later do reach the container, so a disk unmounted on the host isn't kept busy by it. |
-| Hostname | Its own copy; set it with `--hostname`. |
+| Hostname | Its own copy: `--hostname`, else the run's ID (12 hexadecimal digits) with a network of its own, or the host's name with the host's network. |
 | IPC | Its own System V IPC objects and POSIX message queues. |
 | Keyring | A new, empty session keyring (`man 7 keyrings`), as runc gives each container: the keys your login session holds stay out of its reach. |
 | Cgroup | Run as root, a **cgroup** of its own (see [Cgroup](#cgroup) below). |
+| Network | Its own: the default bridge network as root, pasta without; or what `--network` says (see [Network](#network)). |
 
-Without `--rootfs`, the command sees the host's files. It always sees the host's
-network: networking comes in a later version.
+Without `--rootfs`, the command sees the host's files. With `--network host`, it
+sees the host's network.
 
 - **Root or not.** Run as root, the container is rootful. Run as anyone else, it's
   **rootless**: it gets a user namespace of its own (see [Rootless](#rootless)).
@@ -57,10 +59,13 @@ network: networking comes in a later version.
   AppArmor, SELinux). `run` then exits with 125 and says why; use `--no-isolation`
   there.
 - **`--no-isolation`** runs the command without namespaces, as you: it shares the
-  host's processes, mounts, hostname and IPC.
+  host's processes, mounts, hostname, IPC and network.
 - **`--hostname NAME`** sets the hostname inside: letters, digits and hyphens in
   dot-separated parts (like `web-1` or `db.internal`), at most 64 characters, no
-  part starting or ending with a hyphen. Not with `--no-isolation`.
+  part starting or ending with a hyphen. Without it, a container with a network
+  of its own is named by the run's ID, 12 hexadecimal digits new for each run,
+  as Docker names a container; one with the host's network keeps the host's
+  name. Not with `--no-isolation`.
 - **`--domainname NAME`** sets the NIS domain name inside (what `domainname`
   prints), with the same rules as the hostname. The host's is unchanged. Not
   with `--no-isolation`.
@@ -69,10 +74,16 @@ network: networking comes in a later version.
   owns are allowed: the shared-memory, message-queue and semaphore ones
   (`kernel.shmmax`, `kernel.shmall`, `kernel.shmmni`, `kernel.shm_rmid_forced`,
   `kernel.msgmax`, `kernel.msgmnb`, `kernel.msgmni`, `kernel.sem`, and
-  `fs.mqueue.*`). The kernel keeps a separate copy of those for each
-  container, so the host's stay as they are. Any other setting would change
-  the whole machine, so it's refused, including network settings (`net.*`),
-  until containers get networking of their own. Use `--hostname` and
+  `fs.mqueue.*`), and, with a network of its own (any `--network` but `host`), the
+  network ones (`net.*`, such as `--sysctl net.ipv4.ip_forward=1`). The kernel
+  keeps a separate copy of those for each container, so the host's stay as they
+  are. Any other setting would change the whole machine, so it's refused, and so
+  are network settings when the container shares the host's network, and
+  conntrack's table size and helpers (`net.netfilter.nf_conntrack_max`,
+  `nf_conntrack_expect_max`, `nf_conntrack_helper`), which are the whole
+  machine's. A network
+  setting the whole machine shares (one the kernel keeps no copy of per network)
+  fails when the container starts, saying so. Use `--hostname` and
   `--domainname` for those two. Not with `--no-isolation`.
 - **A small init is PID 1.** The process with PID 1 in a container is special:
   the system ignores any signal it has no handler for. So Shipyard runs its own
@@ -91,14 +102,67 @@ network: networking comes in a later version.
   and the system calls most programs need (see [System calls](#system-calls-seccomp)).
   In a rootful container it's still root on the host's files, unless `--uidmap`
   (see [User namespaces](#user-namespaces)) makes root inside an ordinary user
-  outside; in a rootless one it's you (see [Rootless](#rootless)). The container
-  shares the host's network, and uses as much memory and CPU as it likes unless
-  you set limits (see [Memory, CPU and I/O limits](#memory-cpu-and-io-limits)).
+  outside; in a rootless one it's you (see [Rootless](#rootless)). With
+  `--network host`, the container shares the host's network; it uses as much
+  memory and CPU as it likes unless you set limits (see
+  [Memory, CPU and I/O limits](#memory-cpu-and-io-limits)).
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
 - **macOS:** commands aren't isolated yet (as with `--no-isolation`);
-  `--hostname`, `--domainname`, `--sysctl` and `--rootfs` are errors there.
+  `--hostname`, `--domainname`, `--sysctl`, `--rootfs`, the network flags
+  (`--network`, `--name`, `--network-alias`, `--ip6`, `-p`, `--add-host`, the `--dns`
+  flags) and the other isolation flags are errors there.
+
+### Network
+
+`--network MODE` says what network the container gets:
+
+| Mode | The container's network |
+|---|---|
+| `bridge` | One of its own on the default network: an address on a bridge it shares with other containers and the host, and a way out. Root only, and root's default. |
+| `NAME` | The same on a network made with `shipyard network create NAME`. Root only. |
+| `pasta` | One of its own, connected through pasta: a way out and published ports. The default without root. |
+| `host` | The host's: its interfaces, addresses and ports. |
+| `none` | One of its own, with only a loopback interface (`lo`, up, `127.0.0.1`): no way in or out. |
+
+```sh
+shipyard run --network none cat /proc/net/dev    # only lo
+sudo shipyard run --network bridge --image alpine:3.20 ip addr show eth0
+```
+
+On a bridge network the container has `eth0` with an address of its own, and a
+default route through the bridge. It reaches the other containers on the network,
+the host and the internet; the host reaches it, and so does anyone through the
+ports it publishes (`-p 8080:80`, `-P`). `--ip` and `--mac-address` choose its
+addresses. On a network made with `shipyard network create`, containers find
+each other by name: `--name db` (and each `--network-alias`) is a name the
+network's DNS server answers. [Networking](networking.md) covers networks,
+addresses, names, published ports, other firewalls, and the `/etc/hosts`,
+`/etc/hostname` and `/etc/resolv.conf` a container gets (with the `--add-host`
+and `--dns` flags).
+
+With a network of its own (any `--network` but `host`):
+
+- **Its own settings.** `--sysctl net.*` changes the container's copy (see
+  `--sysctl` above). As Docker does, any user in the container may listen on a
+  port below 1024 (`net.ipv4.ip_unprivileged_port_start=0`) and use `ping` without
+  privileges (`net.ipv4.ping_group_range`: every group the container has). It
+  routes nothing (`net.ipv4.ip_forward=0` and `net.ipv6.conf.all.forwarding=0`,
+  whatever the host's): a container on two networks never joins them. A `--sysctl` of yours for any of these wins.
+- **Its own `/sys`** (with `--rootfs` or `--image`): `/sys/class/net` lists only its
+  own interfaces, rootless too.
+- **Programs that talk to themselves over `127.0.0.1` work.** With `none`,
+  nothing else can reach the container, or be reached from it.
+
+Without root, a container gets a network of its own through pasta (`--network
+pasta`, the default; see [Networking](networking.md#rootless-containers-pasta)).
+A container can be on several bridge networks: `--network` once for each (see
+[Several networks](networking.md#several-networks)). On a network made with
+`--ipv6` it has an IPv6 address too (`--ip6` chooses it; see
+[IPv6](networking.md#ipv6)). Rootless bridge networks (and with them, names
+between rootless containers) come in a later version. Not with
+`--no-isolation`.
 
 ### Cgroup
 
@@ -162,9 +226,12 @@ for good: not even a setuid-root program inside gets them back.
   `=` works too, for `seccomp:` as well).
   **Docker's default is off**; Shipyard's is on.
 - **Programs with file capabilities don't get them either,** for the same reason:
-  Debian's `ping`, for example, holds `cap_net_raw` instead of being setuid, so a
-  non-root `ping` fails. Give the user the capability itself (`--cap-add NET_RAW`,
-  which a non-root user keeps), or turn `no_new_privs` off.
+  Debian's `ping`, for example, holds `cap_net_raw` instead of being setuid. A
+  non-root `ping` still works in a container with a network of its own (the
+  default): it falls back to an ICMP datagram socket, which every group the
+  container has may open (`net.ipv4.ping_group_range`). With `--network host`, it
+  depends on the host's setting; otherwise give the user the capability itself
+  (`--cap-add NET_RAW`, which a non-root user keeps), or turn `no_new_privs` off.
 - **`--cap-add ALL`** means every capability this kernel has: an older one lacks the
   newest (Linux 5.9 added `CAP_PERFMON`, `CAP_BPF` and `CAP_CHECKPOINT_RESTORE`).
   Naming one it lacks is an error.
@@ -293,13 +360,18 @@ sudo shipyard run --uidmap 0:100000:65536 sh -c 'id; cat /proc/self/uid_map'
   mapped root. Shipyard (as root) mounts the image itself, since the mapped root
   can't reach the store; that needs Linux 6.8 or later.
 
-- **`/dev` and `/sys` are the host's, bound in.** A user namespace can't create
+- **`/dev` is the host's, bound in, and so is `/sys` without a network of its
+  own.** A user namespace can't create
   device nodes, so `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`,
   `/dev/urandom` and `/dev/tty` are binds of the host's own. `/sys` is the host's,
-  read-only, until containers get their own network (a later version). What the host
-  mounted inside it (its cgroup tree, for one) is covered by an empty directory, as
-  in a container without a user namespace; `/sys/fs/cgroup` then shows the
-  container's own cgroup (see [Cgroup](#cgroup)). `/dev/pts` belongs to the `tty`
+  read-only, unless the container has a network of its own (any `--network` but
+  `host`, and the default is one): a user namespace can only mount a `/sys` of its
+  own with its own network, and only
+  where the host's is fully visible (inside another container it often isn't, and
+  the host's is bound instead). What the
+  host mounted inside it (its cgroup tree, for one) is covered by an empty
+  directory, as in a container without a user namespace; `/sys/fs/cgroup` then
+  shows the container's own cgroup (see [Cgroup](#cgroup)). `/dev/pts` belongs to the `tty`
   group (5) only if group 5 is mapped. With `--cap-add SYS_ADMIN`, root inside can
   unmount those covers, and then reads (never writes) what they hid, such as the
   host's cgroup tree.
@@ -385,7 +457,11 @@ shipyard run sh -c 'id; cat /proc/self/uid_map'
   (see [Rootless bundles](bundles.md#rootless-bundles)).
 - **A cgroup and limits** where a cgroup subtree is delegated to you (see
   [Cgroup](#cgroup)).
-- **Not rootless yet:** networking of its own comes in a later version.
+- **A network of its own,** through pasta, by default: a way out and published
+  ports (`-p`), as for root, but no networks shared between containers (see
+  [Networking](networking.md#rootless-containers-pasta)). It needs pasta (the
+  `passt` package); without it, a rootless run is refused, saying how to do
+  without (`--network host` or `--network none`).
 
 ### On a terminal, isolated
 
@@ -445,7 +521,7 @@ Shipyard adds what every container needs:
 | Path | What it is |
 |---|---|
 | `/proc` | The container's own processes only. |
-| `/sys` | Read-only. |
+| `/sys` | Read-only. Its network interfaces are the container's own with a network of its own (any `--network` but `host`), else the host's. |
 | `/dev` | A fresh, small directory with only `null`, `zero`, `full`, `random`, `urandom` and `tty`, the links `fd`, `stdin`, `stdout`, `stderr` and `ptmx`, and its own `pts` (terminals), `shm` (shared memory) and `mqueue` (message queues). The host's devices aren't there. |
 
 Shipyard creates `/proc`, `/sys` and `/dev` in DIR if they're missing. DIR itself
@@ -471,12 +547,13 @@ they are. The mount's other options, such as `nosuid` or `noexec`, are kept.
 
 **Limits for now:**
 
-- `/sys` shows the host's network devices, until containers get networking of their
-  own.
+- `/sys` shows the host's network devices unless the container has a network of
+  its own (any `--network` but `host`).
 - Directories mounted *inside* DIR on the host come along into the container, but
   `--read-only` doesn't make them read-only.
-- There's no `/etc/hosts`, `/etc/resolv.conf` or `/etc/hostname` from Shipyard
-  yet, and no volumes: only what DIR has.
+- Shipyard replaces DIR's `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf`
+  for the run only where DIR has them as regular files, never writing into DIR (see
+  [Networking](networking.md#the-hostname-and-etc-files)).
 
 **Errors** (exit code 125, before the command starts):
 
