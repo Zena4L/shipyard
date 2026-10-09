@@ -105,7 +105,9 @@ Too many containers for one user can run into the kernel's key quota
   followed *inside* the root filesystem, never out to the host's files.
 - **Not allowed:** destinations in `/proc` or `/sys`, at `/dev` itself, or `/`.
   `/dev/...` below it is fine. A destination that a symbolic link in the root
-  filesystem leads into `/proc` or `/sys` is refused too (exit 125).
+  filesystem leads into a kernel interface (`/proc`, `/sys`, the cgroup tree,
+  `/dev/pts` or `/dev/mqueue`) is refused too (exit 125). Naming `/dev/pts` or
+  `/dev/mqueue` directly is fine.
 - **The standard mounts** (`/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`,
   `/dev/mqueue`), which most configs list, are accepted. Shipyard always mounts them
   itself, with its own options.

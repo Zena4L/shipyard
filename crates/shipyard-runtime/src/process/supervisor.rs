@@ -1035,7 +1035,7 @@ fn make_run_cgroup(placement: &Placement) -> Result<Option<crate::cgroup::RunCgr
 /// the container has no cgroup, for `why`.
 #[cfg(target_os = "linux")]
 fn warn_devices_without_cgroup(isolation: &Isolation, why: &impl std::fmt::Display) {
-    if let Some(warning) = crate::cgroup::devices_without_cgroup(&isolation.devices, why) {
+    for warning in crate::cgroup::devices_without_cgroup(isolation, why) {
         tracing::warn!("{warning}");
     }
 }
@@ -1052,16 +1052,18 @@ fn run_warning(hooks: &ContainerHooks, phase: Phase, pid: Option<i32>) {
 /// another process in it.
 #[cfg(target_os = "linux")]
 fn report_oom(cgroup: &crate::cgroup::Cgroup, status: ExitStatus, killed_by_us: bool) {
-    let kills = cgroup.oom_kills();
+    let events = cgroup.oom_events();
+    let kills = events.kills;
     if kills == 0 {
         return;
     }
+    let cause = events.cause();
     if status.killed_by_sigkill() && !killed_by_us {
-        tracing::warn!("the command was killed: out of memory");
+        tracing::warn!("the command was killed: {cause}");
     } else if kills == 1 {
-        tracing::warn!("a process in the container was killed: out of memory");
+        tracing::warn!("a process in the container was killed: {cause}");
     } else {
-        tracing::warn!("{kills} processes in the container were killed: out of memory");
+        tracing::warn!("{kills} processes in the container were killed: {cause}");
     }
 }
 

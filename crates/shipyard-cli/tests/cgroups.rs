@@ -134,10 +134,11 @@ fn a_finished_run_leaves_no_cgroup() {
     assert!(!cgroup.exists(), "{} is left", cgroup.display());
 }
 
-/// A shipyard killed before it could clean up leaves an empty `run/<pid>`;
-/// the next run removes it. One a live run holds (its lock) stays, even if
-/// its PID isn't one this `/proc` shows: a shipyard in another PID
-/// namespace sharing the tree.
+/// A shipyard killed before it could clean up leaves its `run/<pid>`, maybe
+/// with processes in it (with no PID namespace to end them): the next run
+/// kills them, and the cgroup goes. One a live run holds (its lock) stays,
+/// and so does what's in it, even if its PID isn't one this `/proc` shows: a
+/// shipyard in another PID namespace sharing the tree.
 #[test]
 #[ignore = "needs root"]
 fn the_next_run_sweeps_cgroups_of_dead_runs() {
@@ -146,13 +147,49 @@ fn the_next_run_sweeps_cgroups_of_dead_runs() {
     let held = run_cgroup(gone_pid());
     std::fs::create_dir_all(&dead).unwrap();
     let lock = lock_new_cgroup(&held);
+    // What a run killed outright left in its cgroup (no PID namespace ended
+    // it), and what a live run has in its own.
+    let in_cgroup = |cgroup: &Path| {
+        let process = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), process.id().to_string()).unwrap();
+        process
+    };
+    let mut left = in_cgroup(&dead);
+    let mut living = in_cgroup(&held);
 
-    let run = run(SHIPYARD.command(&["run", "true"]));
+    let first = run(SHIPYARD.command(&["run", "true"]));
+    // Killed by the sweep; its cgroup goes with the next one, once empty.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ended = loop {
+        if let Some(status) = left.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let second = run(SHIPYARD.command(&["run", "true"]));
     let (held_left, dead_left) = (held.exists(), dead.exists());
+    let still_living = living.try_wait().unwrap().is_none();
+    let _ = left.kill();
+    let _ = left.wait();
+    let _ = living.kill();
+    let _ = living.wait();
     drop(lock);
     let _ = std::fs::remove_dir(&held);
     let _ = std::fs::remove_dir(&dead);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    assert_eq!(second.code, Some(0), "{}", second.stderr);
+    assert_eq!(
+        ended.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status)),
+        Some(libc::SIGKILL),
+        "what a dead run left wasn't killed"
+    );
+    assert!(still_living, "a live run's process was killed");
     assert!(held_left, "a live run's cgroup was removed");
     assert!(!dead_left, "{} is left", dead.display());
 }

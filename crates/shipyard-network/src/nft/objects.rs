@@ -16,8 +16,8 @@ use super::consts::{
     NFTA_RULE_EXPRESSIONS, NFTA_RULE_TABLE, NFTA_SET_DATA_LEN, NFTA_SET_DATA_TYPE,
     NFTA_SET_ELEM_DATA, NFTA_SET_ELEM_FLAGS, NFTA_SET_ELEM_KEY, NFTA_SET_ELEM_LIST_ELEMENTS,
     NFTA_SET_ELEM_LIST_SET, NFTA_SET_ELEM_LIST_TABLE, NFTA_SET_FLAGS, NFTA_SET_ID,
-    NFTA_SET_KEY_LEN, NFTA_SET_KEY_TYPE, NFTA_SET_NAME, NFTA_SET_TABLE, NFTA_TABLE_NAME,
-    NFTA_TABLE_USERDATA,
+    NFTA_SET_KEY_LEN, NFTA_SET_KEY_TYPE, NFTA_SET_NAME, NFTA_SET_TABLE, NFTA_SET_USERDATA,
+    NFTA_TABLE_NAME, NFTA_TABLE_USERDATA, TYPE_IFNAME,
 };
 use super::expr::Expr;
 use crate::netlink::{BatchItem, MessageBuilder, flag, nfnl_message};
@@ -150,6 +150,9 @@ pub(crate) fn new_set(family: u8, table: &str, set: &SetSpec, id: u32) -> BatchI
         .attr_be32(NFTA_SET_FLAGS, flags)
         .attr_be32(NFTA_SET_KEY_TYPE, set.key.0)
         .attr_be32(NFTA_SET_KEY_LEN, set.key.1);
+    if set.key.0 == TYPE_IFNAME {
+        message.attr(NFTA_SET_USERDATA, &host_endian_key());
+    }
     if let Some((kind, len)) = set.data {
         message
             .attr_be32(NFTA_SET_DATA_TYPE, kind)
@@ -160,6 +163,20 @@ pub(crate) fn new_set(family: u8, table: &str, set: &SetSpec, id: u32) -> BatchI
         what: format!("adding the set {}", set.name),
         message,
     }
+}
+
+/// The user data nft reads a set's key byte order from, saying it's the
+/// host's (libnftnl's `NFTNL_UDATA_SET_KEYBYTEORDER`, type 0, holding
+/// nft's `BYTEORDER_HOST_ENDIAN`, 1). The kernel ignores it; without it,
+/// nft reads an interface name's bytes as big-endian and lists every one
+/// as `""` (concatenations are typed field by field, and list fine).
+fn host_endian_key() -> Vec<u8> {
+    const KEY_BYTE_ORDER: u8 = 0;
+    const HOST_ENDIAN: u32 = 1;
+    let value = HOST_ENDIAN.to_ne_bytes();
+    let mut record = vec![KEY_BYTE_ORDER, 4];
+    record.extend_from_slice(&value);
+    record
 }
 
 /// Adds `elements` to `set` (with `exclusive`, one that's there already is
@@ -222,4 +239,46 @@ fn elements_message(
             }
         });
     message
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::*;
+    use crate::nft::consts::TYPE_IPADDR;
+
+    /// A set keyed by an interface name carries nft's key byte order (or
+    /// `nft list` shows its names as `""`); one keyed by an address, whose
+    /// byte order nft knows, carries none.
+    #[test]
+    fn interface_name_sets_say_their_byte_order() {
+        let set = |key_type| {
+            new_set(
+                1,
+                "t",
+                &SetSpec {
+                    name: "s",
+                    flags: 0,
+                    key: (key_type, 16),
+                    data: None,
+                },
+                1,
+            )
+            .message
+            .finish(1, 1)
+            .unwrap()
+        };
+        let record = host_endian_key();
+        assert_eq!(record[..2], [0, 4]);
+        // The whole attribute: its length (4 + 6) and type, then the record.
+        let attribute = [
+            &10_u16.to_ne_bytes()[..],
+            &NFTA_SET_USERDATA.to_ne_bytes(),
+            &record,
+        ]
+        .concat();
+        let carries = |bytes: &[u8]| bytes.windows(attribute.len()).any(|at| at == attribute);
+        assert!(carries(&set(TYPE_IFNAME)));
+        assert!(!carries(&set(TYPE_IPADDR)));
+    }
 }

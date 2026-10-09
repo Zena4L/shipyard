@@ -90,6 +90,50 @@ fn the_ruleset_installs_is_current_and_is_rebuilt() {
     });
 }
 
+/// Ports as many as fit the table's own batch go in it, which the kernel
+/// takes whole; more go in batches of their own: all are there either way.
+#[test]
+#[ignore = "needs root"]
+fn many_ports_install_with_the_table_or_after_it() {
+    in_new_netns(|| {
+        let mut nft = Nftables::new().unwrap();
+        for (count, one_batch) in [(1000, true), (4000, false)] {
+            let ports: Vec<PortRule> = (0..count).map(|n| port(1000 + n, None)).collect();
+            // (Without the second round's `delete_table`: a few bytes.)
+            let table = super::ruleset::install(&[bridge()], &[], &ClosedRouting::default());
+            let (_, more) =
+                super::ruleset::fit_ports(table, super::ruleset::port_items(&ports, false));
+            assert_eq!(more.is_empty(), one_batch, "{count} ports");
+            nft.install(&[bridge()], &ports, &ClosedRouting::default())
+                .unwrap();
+            assert_eq!(nft.elements(set::PORTS).unwrap().len(), usize::from(count));
+        }
+    });
+}
+
+/// A port the kernel refuses (one key, two containers) doesn't take the
+/// table down with it: the table is installed alone, and the error is the
+/// port's.
+#[test]
+#[ignore = "needs root"]
+fn a_refused_port_leaves_the_table_installed() {
+    in_new_netns(|| {
+        let mut nft = Nftables::new().unwrap();
+        let clash = PortRule {
+            container: IpAddr::V4(Ipv4Addr::new(10, 88, 0, 3)),
+            ..port(8080, None)
+        };
+        let refused = nft.install(
+            &[bridge()],
+            &[port(8080, None), clash],
+            &ClosedRouting::default(),
+        );
+        assert!(refused.is_err());
+        assert_eq!(nft.ruleset().unwrap(), Ruleset::Current);
+        assert_eq!(nft.elements(set::BRIDGES).unwrap().len(), 1);
+    });
+}
+
 #[test]
 #[ignore = "needs root"]
 fn networks_and_ports_come_and_go() {

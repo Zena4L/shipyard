@@ -32,6 +32,7 @@ use crate::hooks::Hook;
 use crate::isolation::{
     CgroupMount, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root,
 };
+use crate::security::Capability;
 use crate::{Error, Result};
 
 /// The container's setup, as the clean image receives it.
@@ -406,6 +407,14 @@ impl Setup {
         attach: Option<RawFd>,
     ) -> Self {
         let bytes = |s: &OsStr| s.as_bytes().to_vec();
+        // Nothing else would keep it from making the host's disks' nodes
+        // and opening them (see `devices_unguarded`). A cgroup here always
+        // has the device program, for real root: `enforce_devices` fails
+        // the run otherwise.
+        let mut security = isolation.security.clone();
+        if crate::cgroup::devices_unguarded(isolation, own_cgroup) {
+            security.capabilities = security.capabilities.without(Capability::MKNOD);
+        }
         Self {
             args: spec.args.iter().map(|arg| bytes(arg)).collect(),
             env: spec.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect(),
@@ -459,7 +468,7 @@ impl Setup {
                 )
             }),
             gate,
-            security: isolation.security.clone(),
+            security,
             user_namespace: isolation
                 .id_maps
                 .as_ref()
@@ -552,8 +561,9 @@ impl Setup {
     }
 }
 
-/// The seals `to_memfd` adds: no writes, no resizing, no other seals.
-const SEALS: libc::c_int =
+/// The seals `to_memfd` adds (and `spawn.rs` to the init's binary): no
+/// writes, no resizing, no other seals.
+pub(super) const SEALS: libc::c_int =
     libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
 
 /// Whether `fd` is a setup as `to_memfd` leaves it: a memfd with every

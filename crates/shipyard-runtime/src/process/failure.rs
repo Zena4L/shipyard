@@ -20,6 +20,9 @@ use crate::security::Capability;
 #[cfg(target_os = "linux")]
 use crate::security::{Seccomp, Security};
 
+/// The kernel interfaces nothing may be mounted on (see the rootfs guard).
+const KERNEL_INTERFACES: &str = "/proc, /sys, the cgroup tree, /dev/pts or /dev/mqueue";
+
 /// The child's setup steps. The numbers travel over the report pipe, so
 /// they never change; new steps get new numbers, wherever they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,7 +557,7 @@ fn describe_device(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnErro
                 .to_owned()
         }
         Errno::EEXIST => "something else is at that path already".to_owned(),
-        Errno::EXDEV => "the path leads into /proc or /sys".to_owned(),
+        Errno::EXDEV => format!("the path leads into a kernel interface ({KERNEL_INTERFACES})"),
         other => other.desc().to_owned(),
     };
     SpawnError::new(
@@ -893,8 +896,9 @@ fn describe_mount(step: ChildStep, errno: Errno, detail: u64, ctx: &FailureConte
             return SpawnError::new(
                 SpawnErrorKind::Setup,
                 format!(
-                    "the mount point {destination} leads into /proc or /sys (through a \
-                     symbolic link in the root filesystem), where mounts aren't allowed"
+                    "the mount point {destination} leads into a kernel interface \
+                     ({KERNEL_INTERFACES}) through a symbolic link in the root filesystem, where \
+                     mounts aren't allowed"
                 ),
                 errno,
             );

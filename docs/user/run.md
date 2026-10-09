@@ -102,7 +102,9 @@ sees the host's network.
   and the system calls most programs need (see [System calls](#system-calls-seccomp)).
   In a rootful container it's still root on the host's files, unless `--uidmap`
   (see [User namespaces](#user-namespaces)) makes root inside an ordinary user
-  outside; in a rootless one it's you (see [Rootless](#rootless)). With
+  outside; in a rootless one it's you (see [Rootless](#rootless)). Without
+  `--image` or `--rootfs`, those files are the host's own, its whole `/`: a
+  rootful run warns about it ("the container is root on the host's own files"). With
   `--network host`, the container shares the host's network; it uses as much
   memory and CPU as it likes unless you set limits (see
   [Memory, CPU and I/O limits](#memory-cpu-and-io-limits)).
@@ -801,7 +803,7 @@ delegated to this user") unless `systemctl edit user@.service` adds them
 | `--memory-reservation SIZE` | Memory kept for the container when the host runs short. | `memory.low` |
 | `--memory-swap SIZE` | Memory **plus** swap (needs `--memory`, except `-1`); `-1` for unlimited swap. | `memory.swap.max` |
 | `--cpus N` | N CPUs' worth of time (`1.5`) in every 100 ms. | `cpu.max` |
-| `--cpu-period µs`, `--cpu-quota µs` | The same in raw terms (a quota of `-1` or `0`: none). Not with `--cpus`. | `cpu.max` |
+| `--cpu-period µs`, `--cpu-quota µs` | The same in raw terms (a quota of `-1` or `0`: none). Not with `--cpus`. A quota alone keeps the period the cgroup has (100 ms unless `--cpu-period` set another). | `cpu.max` |
 | `-c`, `--cpu-shares N` | A share of the CPU against other containers (1024 is the default share). | `cpu.weight` |
 | `--cpuset-cpus LIST`, `--cpuset-mems LIST` | Which CPUs and memory nodes (`0-3`, `0,2`). | `cpuset.cpus`, `cpuset.mems` |
 | `--pids-limit N` | The most processes and threads, the init included (`-1` or `0`: none). | `pids.max` |
@@ -817,7 +819,12 @@ delegated to this user") unless `systemctl edit user@.service` adds them
   the command, the run ends with 137 and the warning
   "the command was killed: out of memory". If it's another process,
   the command goes on, and Shipyard says one was killed. (A command Shipyard killed
-  itself, after `--stop-timeout`, isn't blamed on the OOM killer.)
+  itself, after `--stop-timeout`, isn't blamed on the OOM killer.) When the container
+  never reached its `--memory` limit, memory ran short outside it (the whole machine,
+  or a limit on a cgroup above it, such as your user's slice), and the warning says
+  so: "… the host or a parent cgroup ran out of memory". A container that hit its
+  limit earlier and was then killed for the host's sake is still reported as "out of
+  memory": the kernel's counters don't tell the two apart.
 - **0 means "not set"** for every flag, as with Docker: `--memory 0`, `--cpus 0`,
   `--memory-swap 0` (Docker's default swap) and so on.
 - **The init counts:** it's one of the container's processes. With `--pids-limit 1` it
@@ -828,7 +835,9 @@ delegated to this user") unless `systemctl edit user@.service` adds them
   `io.weight` comes from the kernel's I/O cost controller (`CONFIG_BLK_CGROUP_IOCOST`),
   so `--blkio-weight` is refused
   ("the container's cgroup has no io.weight: this kernel doesn't have it, …") without
-  them.
+  them. Where the file exists but nothing acts on it, Shipyard warns: a weight needs the
+  I/O cost controller turned on for the disk (`io.cost.qos` at the cgroup root, off by
+  default). The BFQ scheduler's own weight (`io.bfq.weight`) isn't set.
   A cgroup that holds processes never hands a controller down (the kernel would then
   refuse to place anything below it): inside a container whose processes sit in its
   cgroup namespace's root (a plain `docker run`), limits are refused, saying so. Move
@@ -861,6 +870,13 @@ permitted".
 and `/dev/net/tun`. It may make a node of any device with `mknod` (root has the
 capability by default), but can't open one it made. Without `--rootfs` the container sees the host's `/dev`, and
 the same rules apply: `/dev/sda` is there, but it can't be opened.
+
+Where Shipyard can't give the container a cgroup (cgroup v1, or a read-only
+`/sys/fs/cgroup`, as inside some containers), there's no program to ask. A rootful
+container then goes without `CAP_MKNOD`, even if `--cap-add` gave it, so it can't
+make device nodes; the ones Shipyard makes for it (the defaults and `--device`) still
+work. Shipyard warns when this happens. Without `--rootfs`, it still sees the host's
+`/dev`, and every device there opens.
 
 - **`--device HOST[:CONTAINER][:PERMS]`** gives the container a device of the host's,
   at `CONTAINER` in it (its own path if you leave it out), for `PERMS`: any of `r`

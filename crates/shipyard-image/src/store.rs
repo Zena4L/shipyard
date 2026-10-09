@@ -49,6 +49,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
@@ -156,6 +157,9 @@ impl LayerOwners {
     const CALLER_SUFFIX: &'static str = "-caller";
     /// What comes before a [`Mapped`](Self::Mapped) layer's map identity.
     const MAP_INFIX: &'static str = "-map-";
+    /// What comes before the identity of the layers a stacked layer was
+    /// extracted on ([`name_on`](Self::name_on)).
+    const ON_INFIX: &'static str = "-on-";
 
     /// The name of `digest`'s layer directory: its hex, with a suffix for a
     /// caller-owned or mapped one.
@@ -168,14 +172,36 @@ impl LayerOwners {
         }
     }
 
+    /// The name of `digest`'s layer directory when it was extracted on
+    /// `lowers` (their directories' names, base first), for a layer that
+    /// implies directories (`dir/file` with no `dir/` entry). Those take
+    /// their owner and mode from the lowers (what the image's builder had
+    /// there), so the extraction is that layer's on those lowers only: on
+    /// others it's another directory, and one image can't change what
+    /// another sees.
+    #[must_use]
+    pub fn name_on(self, digest: &Digest, lowers: &[String]) -> String {
+        let mut hash = Fnv::new();
+        for lower in lowers {
+            hash.feed(lower.as_bytes());
+            // Names never hold a NUL: it separates them.
+            hash.feed(&[0]);
+        }
+        format!("{}{}{:016x}", self.name(digest), Self::ON_INFIX, hash.0)
+    }
+
     /// The digest hex a layer directory's name is for, if it is one's.
     #[must_use]
     pub fn digest_hex(name: &str) -> Option<&str> {
+        let name = match name.rsplit_once(Self::ON_INFIX) {
+            Some((base, id)) if is_identity(id) => base,
+            _ => name,
+        };
         let hex = name
             .strip_suffix(Self::CALLER_SUFFIX)
             .or_else(|| {
                 let (hex, id) = name.rsplit_once(Self::MAP_INFIX)?;
-                (id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
+                is_identity(id).then_some(hex)
             })
             .unwrap_or(name);
         Digest::parse(&format!("sha256:{hex}"))
@@ -189,15 +215,8 @@ impl LayerOwners {
 /// the same maps name the same layers, run after run.
 #[must_use]
 pub fn map_id(uids: &[(u32, u32, u32)], gids: &[(u32, u32, u32)]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0100_0000_01b3;
-    let mut hash = OFFSET;
-    let mut feed = |value: u32| {
-        for byte in value.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-    };
+    let mut hash = Fnv::new();
+    let mut feed = |value: u32| hash.feed(&value.to_le_bytes());
     for (index, maps) in [uids, gids].into_iter().enumerate() {
         feed(u32::try_from(index).unwrap_or(0));
         for &(container, host, size) in maps {
@@ -206,7 +225,29 @@ pub fn map_id(uids: &[(u32, u32, u32)], gids: &[(u32, u32, u32)]) -> u64 {
             feed(size);
         }
     }
-    hash
+    hash.0
+}
+
+/// A 64-bit FNV-1a hash, fed bytes: stable across runs and builds (layer
+/// directories are named by it).
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+/// Whether `id` is an identity in a layer directory's name: 16 hex digits.
+fn is_identity(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A content-addressed blob store rooted at a directory.
@@ -328,14 +369,11 @@ impl Store {
         )?)
     }
 
-    /// The content directory of an extracted layer (what overlayfs stacks),
-    /// whether or not it exists.
+    /// The content directory of the extracted layer whose directory is
+    /// `name` (what overlayfs stacks), whether or not it exists.
     #[must_use]
-    pub fn layer_diff(&self, digest: &Digest, owners: LayerOwners) -> PathBuf {
-        self.root
-            .join("layers")
-            .join(owners.name(digest))
-            .join(DIFF)
+    pub fn layer_diff(&self, name: &str) -> PathBuf {
+        self.root.join("layers").join(name).join(DIFF)
     }
 
     /// The path a blob with `digest` has, whether or not it exists.
@@ -613,10 +651,28 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
             if meta.permissions().mode() & 0o077 != 0 {
                 return Err(StoreError::NotPrivate(root.display().to_string()));
             }
+            if let Some(warning) = owner_warning(root, meta.uid(), nix::unistd::geteuid().as_raw())
+            {
+                tracing::warn!("{warning}");
+            }
             Ok(())
         }
         Err(source) => Err(Store::io(root, "creating the store directory", source)),
     }
+}
+
+/// The warning for a store directory `root` owned by `owner` that `euid`
+/// opens, if they differ: whoever owns it can change the images this one
+/// runs (as root, say, with a user's `SHIPYARD_IMAGE_STORE` kept by
+/// `sudo`). Not refused: that can be meant.
+fn owner_warning(root: &Path, owner: u32, euid: u32) -> Option<String> {
+    (owner != euid).then(|| {
+        format!(
+            "the image store {} belongs to user {owner}, not to you (user {euid}): \
+             whoever owns it can change the images you run",
+            root.display()
+        )
+    })
 }
 
 /// Opens (or makes) a partial blob, never through a symlink, checked to be
@@ -813,6 +869,64 @@ mod tests {
     /// A throwaway directory, removed when dropped, following the repository's
     /// test convention (a unique name under the system temp dir).
     struct Scratch(PathBuf);
+
+    /// A store of another user's is warned about; one's own isn't.
+    #[test]
+    fn a_store_of_another_users_is_warned_about() {
+        let root = Path::new("/store");
+        assert_eq!(owner_warning(root, 1000, 1000), None);
+        let warning = owner_warning(root, 1000, 0).unwrap();
+        assert!(
+            warning.contains("belongs to user 1000, not to you (user 0)"),
+            "{warning}"
+        );
+    }
+
+    /// Existing stores' mapped layers keep their names: the identity of
+    /// given maps is what it always was.
+    #[test]
+    fn map_identities_are_stable() {
+        assert_eq!(
+            map_id(&[(0, 100_000, 65536)], &[(0, 100_000, 65536)]),
+            0xcb8a_b172_b3ae_52e0
+        );
+    }
+
+    /// A layer extracted on lowers is named by them (their names, in
+    /// order), after its owners' suffix, and its name still says its
+    /// digest, for garbage collection.
+    #[test]
+    fn stacked_layers_are_named_by_their_lowers() {
+        let digest = Digest::sha256(b"layer");
+        let lowers = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let on = |owners: LayerOwners, names: &[&str]| owners.name_on(&digest, &lowers(names));
+        let name = on(LayerOwners::Image, &["aa", "bb"]);
+        assert_eq!(name, on(LayerOwners::Image, &["aa", "bb"]));
+        assert!(name.starts_with(&format!("{}-on-", digest.hex())), "{name}");
+        for other in [
+            on(LayerOwners::Image, &["bb", "aa"]),
+            on(LayerOwners::Image, &["aab", "b"]),
+            on(LayerOwners::Image, &["aa"]),
+            on(LayerOwners::Image, &[]),
+        ] {
+            assert_ne!(name, other);
+        }
+        for owners in [
+            LayerOwners::Image,
+            LayerOwners::Caller,
+            LayerOwners::Mapped(7),
+        ] {
+            let name = on(owners, &["aa"]);
+            assert!(name.starts_with(&owners.name(&digest)), "{name}");
+            assert_eq!(LayerOwners::digest_hex(&name), Some(digest.hex().as_str()));
+        }
+        assert_eq!(
+            LayerOwners::digest_hex(&format!("{}-on-xyz", digest.hex())),
+            None
+        );
+    }
 
     #[test]
     fn mapped_layers_are_named_by_their_maps() {

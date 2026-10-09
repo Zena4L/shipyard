@@ -184,6 +184,13 @@ pub(crate) fn host_root() -> bool {
 /// the default is the host's network, as before.
 #[cfg(target_os = "linux")]
 pub(crate) fn can_network() -> bool {
+    host_root() && why_no_network().is_none()
+}
+
+/// What keeps the host's root from the default bridge network, if
+/// anything: no `CAP_NET_ADMIN`, or a read-only `/proc/sys`.
+#[cfg(target_os = "linux")]
+pub(crate) fn why_no_network() -> Option<&'static str> {
     /// `CAP_NET_ADMIN`'s bit.
     const CAP_NET_ADMIN: u32 = 12;
     let net_admin = fs::read_to_string("/proc/self/status").is_ok_and(|status| {
@@ -193,13 +200,15 @@ pub(crate) fn can_network() -> bool {
             .and_then(|caps| u64::from_str_radix(caps.trim(), 16).ok())
             .is_some_and(|caps| caps & (1 << CAP_NET_ADMIN) != 0)
     });
-    host_root()
-        && net_admin
-        && nix::unistd::access(
-            "/proc/sys/net/ipv4/ip_forward",
-            nix::unistd::AccessFlags::W_OK,
-        )
-        .is_ok()
+    if !net_admin {
+        return Some("shipyard has no CAP_NET_ADMIN");
+    }
+    let writable = nix::unistd::access(
+        "/proc/sys/net/ipv4/ip_forward",
+        nix::unistd::AccessFlags::W_OK,
+    )
+    .is_ok();
+    (!writable).then_some("/proc/sys is read-only here")
 }
 
 /// Off Linux: never.
@@ -308,6 +317,71 @@ fn ensure_firewall(
     }
     nft.add_network(&NetworkRules::from(config))?;
     Ok(())
+}
+
+/// Makes Shipyard's bridge table current (the module `nft::spoofing`:
+/// each container sends only as itself), as [`ensure_firewall`] does the
+/// other: whether it's there. A kernel without bridge filtering refuses
+/// it; then containers can still send as one another, as before it, and
+/// the run goes on, warned.
+#[cfg(target_os = "linux")]
+fn ensure_bridge_table(
+    networks: &shipyard_network::store::Networks,
+    nft: &mut shipyard_network::nft::Nftables,
+) -> bool {
+    use shipyard_network::nft::Ruleset;
+    let unguarded = |why: &str| {
+        crate::warning(&format!(
+            "containers on a network can send as one another here: {why}"
+        ));
+        false
+    };
+    match nft.bridge_ruleset() {
+        Ok(Ruleset::Current) => return true,
+        Ok(_) => {}
+        Err(error) => return unguarded(&format!("reading shipyard's bridge table: {error}")),
+    }
+    let _all = match networks.lock_all() {
+        Ok(lock) => lock,
+        Err(error) => return unguarded(&error.to_string()),
+    };
+    match nft.bridge_ruleset() {
+        Ok(Ruleset::Current) => return true,
+        Ok(_) => {}
+        Err(error) => return unguarded(&format!("reading shipyard's bridge table: {error}")),
+    }
+    if let Err(error) = nft.install_bridge_table(&[]) {
+        // Only the kernel's refusal of the table itself says it has none.
+        let no_filtering = matches!(
+            error.errno(),
+            Some(nix::errno::Errno::EAFNOSUPPORT | nix::errno::Errno::EOPNOTSUPP)
+        );
+        return unguarded(&if no_filtering {
+            format!("the kernel has no bridge filtering ({error})")
+        } else {
+            format!("making shipyard's bridge table: {error}")
+        });
+    }
+    // Every live container's port, read only now that the table is there: a
+    // run guarding its port meanwhile is among them, or guards it after.
+    match networks.live_port_guards() {
+        Ok(guards) => {
+            for guard in guards {
+                if let Err(error) = nft.guard(&guard) {
+                    crate::warning(&format!(
+                        "the container on the port {} can send as another: {error}",
+                        guard.port
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            crate::warning(&format!(
+                "running containers can send as one another until they're run again: {error}"
+            ));
+        }
+    }
+    true
 }
 
 /// Why `-p` can't go on `config`'s network: an internal one, or an IPv6
@@ -463,6 +537,15 @@ fn release_lease(
         && let Err(error) = nft.unpublish(&ports)
     {
         crate::warning(&format!("unpublishing the ports of {whose}: {error}"));
+    }
+    // Only where the bridge table is (a kernel without bridge filtering
+    // has none).
+    if matches!(
+        nft.bridge_ruleset(),
+        Ok(shipyard_network::nft::Ruleset::Current | shipyard_network::nft::Ruleset::Outdated)
+    ) && let Err(error) = nft.unguard(&lease.port_guard())
+    {
+        crate::warning(&format!("forgetting the port of {whose}: {error}"));
     }
     if connected && let Err(error) = shipyard_network::attach::disconnect(config, lease) {
         crate::warning(&format!(
@@ -667,6 +750,7 @@ impl Attachment {
         attach::ensure_bridge(&config).with_context(|| format!("the network {name}"))?;
         ensure_firewall(&networks, &mut nft, &config)
             .with_context(|| format!("the network {name}'s firewall rules"))?;
+        let guarded = ensure_bridge_table(&networks, &mut nft);
         if !config.internal {
             open_routing(&networks, &mut nft, &config)?;
         }
@@ -696,6 +780,13 @@ impl Attachment {
             }
             publish(&networks, &mut nft, &lease.lease().port_rules())?;
             announce(ports, &lease.lease().ports);
+            // Before its veth exists: from its first frame, it sends only as
+            // itself.
+            if guarded && let Err(error) = nft.guard(&lease.lease().port_guard()) {
+                crate::warning(&format!(
+                    "the container can send as another on the network {name}: {error}"
+                ));
+            }
         }
         let has_dns = attachment.config.has_dns();
         if has_dns {
@@ -1112,14 +1203,20 @@ fn warn_about_host_resolvers() {
 
 /// A run's directory, `<runtime dir>/runs/<id>`, with the `/etc` files bound
 /// into its container (and pasta's files, for a pasta run). Held (an
-/// exclusive `flock` on it) while the run lives; removed when it ends, or by
-/// the next run if it was killed.
+/// exclusive `flock` on its file [`RUN_LOCK`], and on it) while the run lives; removed
+/// when it ends, or by the next run if it was killed.
 #[derive(Debug)]
 pub(crate) struct RunDir {
     path: PathBuf,
-    /// Held while the run lives (see [`sweep_runs`]).
-    lock: Option<nix::fcntl::Flock<File>>,
+    /// Held while the run lives (see [`sweep_runs`]): its [`RUN_LOCK`],
+    /// and the directory itself, which an older Shipyard's sweep probes.
+    lock: Option<[nix::fcntl::Flock<File>; 2]>,
 }
+
+/// The file in a run's directory whose lock says the run lives: the run's
+/// own (0600), so no other user can open it, and hold it to keep a dead
+/// run's directory from being swept. (The directory is 0755.)
+const RUN_LOCK: &str = "lock";
 
 /// The files a run gets, by name: each goes in the container's `/etc`.
 pub(crate) const ETC_FILES: [&str; 3] = ["hosts", "hostname", "resolv.conf"];
@@ -1162,7 +1259,7 @@ impl RunDir {
             .with_context(|| format!("making {}", path.display()))?;
         // Removed on drop from here on, even if what follows fails.
         let mut dir = RunDir { path, lock: None };
-        dir.lock = Some(lock_dir(&dir.path)?);
+        dir.lock = Some([lock_run(&dir.path, true)?, lock_dir(&dir.path)?]);
         drop(sweeping);
         let own = plan.mode.own_namespace();
         // With the host's network, its files as they are (its resolvers work
@@ -1296,10 +1393,10 @@ fn make_runs_dir(runs: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The lock on `runs` itself (a file in it, `lock`), held to sweep it or
+/// The lock on `runs` itself (its file [`RUNS_LOCK`]), held to sweep it or
 /// add to it; each holder is brief, so it's waited for.
 fn lock_runs(runs: &Path) -> Result<nix::fcntl::Flock<File>> {
-    let path = runs.join("lock");
+    let path = runs.join(RUNS_LOCK);
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1309,9 +1406,11 @@ fn lock_runs(runs: &Path) -> Result<nix::fcntl::Flock<File>> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, errno)| anyhow::anyhow!("locking {}: {}", path.display(), errno.desc()))
+    flock(file, &path, nix::fcntl::FlockArg::LockExclusive)
 }
+
+/// The file in `runs` [`lock_runs`] locks: not a run's directory.
+const RUNS_LOCK: &str = "lock";
 
 /// Removes the run directories whose runs are gone (their lock is free).
 /// Called with [`lock_runs`] held.
@@ -1320,21 +1419,53 @@ fn sweep_runs(runs: &Path) {
         return;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let path = entry.path();
-        if let Ok(_stale) = lock_dir(&path) {
+        // One without the file was made by an older Shipyard, which locked
+        // the directory itself: probed that way, so an upgrade never sweeps
+        // a live run's files.
+        let lock = if path.join(RUN_LOCK).symlink_metadata().is_ok() {
+            lock_run(&path, false)
+        } else {
+            lock_dir(&path)
+        };
+        if let Ok(_stale) = lock {
             let _ = fs::remove_dir_all(&path);
         }
     }
 }
 
-/// An exclusive `flock` on the directory `path`, without waiting.
+/// An exclusive `flock` on the run directory `dir`'s [`RUN_LOCK`] file,
+/// without waiting; the file is made (the run's alone) if `make`.
+fn lock_run(dir: &Path, make: bool) -> Result<nix::fcntl::Flock<File>> {
+    let path = dir.join(RUN_LOCK);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(make)
+        .create_new(make)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    flock(file, &path, nix::fcntl::FlockArg::LockExclusiveNonblock)
+}
+
+/// An exclusive `flock` on the directory `path`, without waiting: how an
+/// older Shipyard held its runs' directories, and probes them still.
 fn lock_dir(path: &Path) -> Result<nix::fcntl::Flock<File>> {
     let dir = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    nix::fcntl::Flock::lock(dir, nix::fcntl::FlockArg::LockExclusiveNonblock)
+    flock(dir, path, nix::fcntl::FlockArg::LockExclusiveNonblock)
+}
+
+/// `file` (open at `path`) locked as `how` says.
+fn flock(file: File, path: &Path, how: nix::fcntl::FlockArg) -> Result<nix::fcntl::Flock<File>> {
+    nix::fcntl::Flock::lock(file, how)
         .map_err(|(_, errno)| anyhow::anyhow!("locking {}: {}", path.display(), errno.desc()))
 }
 
@@ -1577,6 +1708,47 @@ pub(crate) fn prune() -> Result<Pruned> {
 mod tests {
     use super::*;
     use shipyard_network::nft::Chain;
+
+    /// A run's lock is a file only it can open: a lock on its directory
+    /// (anyone's) no longer keeps a dead run's files from the sweep. An older
+    /// Shipyard's directory, without the file, is still probed by its own
+    /// lock.
+    #[test]
+    fn the_sweep_goes_by_each_runs_own_lock_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runs = std::env::temp_dir().join(format!("shipyard-runs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runs);
+        let dir = |name: &str| {
+            let path = runs.join(name);
+            fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let live = dir("live");
+        let _live = lock_run(&live, true).unwrap();
+        let mode = fs::metadata(live.join(RUN_LOCK))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        let dead = dir("dead");
+        drop(lock_run(&dead, true).unwrap());
+        let _squatter = lock_dir(&dead).unwrap();
+        let old_live = dir("old-live");
+        let _old_live = lock_dir(&old_live).unwrap();
+        let old_dead = dir("old-dead");
+        let _sweeping = lock_runs(&runs).unwrap();
+
+        sweep_runs(&runs);
+        assert!(live.exists());
+        assert!(!dead.exists());
+        assert!(old_live.exists());
+        assert!(!old_dead.exists());
+        assert!(
+            runs.join(RUNS_LOCK).exists(),
+            "the runs' own lock is no run"
+        );
+        fs::remove_dir_all(&runs).unwrap();
+    }
 
     #[test]
     fn ipv6s_route_goes_through_a_network_with_ipv6() {

@@ -265,6 +265,12 @@ mod linux {
         if args.get(1).map(OsString::as_os_str) != Some(HELPER_ARG.as_ref()) {
             return;
         }
+        // As for the CLI itself: a privileged start (setuid, file
+        // capabilities) gets no further, not even to its arguments.
+        if let Err(err) = shipyard_runtime::process::refuse_privileged_start() {
+            let _ = writeln!(std::io::stderr(), "shipyard-storage: {err}");
+            std::process::exit(125);
+        }
         let fd = |at: usize| -> Option<RawFd> {
             args.get(at)?
                 .to_str()?
@@ -293,12 +299,6 @@ mod linux {
             &held,
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         );
-        // As for the CLI itself: a privileged start (setuid, file
-        // capabilities) gets no further.
-        if let Err(err) = shipyard_runtime::process::refuse_privileged_start() {
-            let _ = writeln!(std::io::stderr(), "shipyard-storage: {err}");
-            std::process::exit(125);
-        }
         crate::init_tracing(None, false);
         // 0 on success, 1 otherwise (the caller reads the answer, not this).
         let succeeded = helper(&store, input, output);

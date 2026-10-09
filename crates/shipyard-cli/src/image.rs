@@ -431,21 +431,16 @@ fn extract(
     maps: Option<&IdMaps>,
 ) -> Result<(Vec<PathBuf>, Vec<String>)> {
     use shipyard_image::{Limits, Ownership, UnpackOptions};
-    let named = |owners: LayerOwners| {
-        let names = layers
-            .iter()
-            .map(|layer| owners.name(&layer.digest))
-            .collect();
-        (
-            shipyard_image::layer_directories(store, layers, owners),
-            names,
-        )
+    // The layers' directories and names, if all are extracted (each
+    // layer's name depends on its entries: `placed_layers`).
+    let placed = |owners: LayerOwners| -> Result<Option<(Vec<PathBuf>, Vec<String>)>> {
+        Ok(shipyard_image::placed_layers(store, layers, owners)?
+            .map(|names| (shipyard_image::layer_directories(store, &names), names)))
     };
     let extractor = Extractor::for_caller(maps)?;
-    let wanted = named(extractor.owners());
-    if wanted.0.iter().all(|dir| dir.is_dir()) {
+    if let Some(placed) = placed(extractor.owners())? {
         // All there already: nothing to start.
-        return Ok(wanted);
+        return Ok(placed);
     }
     let in_process = |ownership, trusted_xattrs| {
         let options = UnpackOptions {
@@ -502,7 +497,7 @@ fn extract(
     for warning in report.warnings() {
         crate::warning(&warning);
     }
-    Ok(named(owners))
+    placed(owners)?.context("the image's layers aren't in the store after extracting them")
 }
 
 /// Runs `request` in the storage helper, on this store, under `held`.

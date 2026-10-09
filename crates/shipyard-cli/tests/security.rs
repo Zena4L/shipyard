@@ -151,6 +151,18 @@ fn a_non_root_user_gets_only_what_was_added() {
     }
 }
 
+/// Fails unless setuid bits work in `dir`: on a `nosuid` filesystem a
+/// setuid program runs unprivileged, and a test of what one does would pass
+/// for the wrong reason.
+fn assert_setuid_works_in(dir: &std::path::Path) {
+    let flags = nix::sys::statvfs::statvfs(dir).unwrap().flags();
+    assert!(
+        !flags.contains(nix::sys::statvfs::FsFlags::ST_NOSUID),
+        "{} is on a nosuid filesystem: set TMPDIR elsewhere",
+        dir.display()
+    );
+}
+
 /// A host directory with a setuid-root copy of `id`, removed on drop.
 struct SetuidId {
     dir: PathBuf,
@@ -160,6 +172,7 @@ impl SetuidId {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!("shipyard-setuid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        assert_setuid_works_in(&dir);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::copy("/usr/bin/id", dir.join("id")).unwrap();
         std::fs::set_permissions(dir.join("id"), std::fs::Permissions::from_mode(0o4755)).unwrap();
@@ -248,6 +261,168 @@ fn the_init_still_forwards_signals_to_a_non_root_command() {
     let (code, _) = running.finish();
     assert_eq!(code, 9, "the signal didn't reach the command");
     assert_ne!(code, killed_by(libc::SIGKILL));
+}
+
+/// The init runs a sealed in-memory copy of shipyard's binary, never the
+/// file on the host (CVE-2019-5736): even root inside allowed to follow
+/// `/proc/1/exe` reaches only the copy. (The command's own `exe` is its
+/// file, as ever: the check reads the link it means to.)
+#[test]
+#[ignore = "needs root"]
+fn the_init_runs_a_sealed_copy_of_the_binary() {
+    let run = shipyard_run(
+        &["--cap-add", "SYS_PTRACE"],
+        "readlink /proc/1/exe; readlink /proc/self/exe",
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let mut links = run.stdout.lines();
+    let init = links.next().unwrap_or_default();
+    assert!(
+        init.starts_with("/memfd:shipyard-init"),
+        "{init}: {}",
+        run.stderr
+    );
+    let own = links.next().unwrap_or_default();
+    assert!(own.starts_with('/') && !own.contains("memfd"), "{own}");
+    // Running the copy, it says nothing about the binary (the warning is
+    // for an init that fell back to the file).
+    assert!(!run.stderr.contains("not a sealed copy"), "{}", run.stderr);
+}
+
+/// A rootful run with no root filesystem of its own is root on the host's
+/// own files, and is told so; one with a root filesystem, or with a user
+/// namespace (`--uidmap`: root inside isn't the host's), isn't.
+#[test]
+#[ignore = "needs root"]
+fn root_on_the_hosts_own_files_is_warned_about() {
+    const WARNING: &str = "the container is root on the host's own files";
+    let hosts = run_args(&["true"]);
+    assert_eq!(hosts.code, Some(0), "{}", hosts.stderr);
+    assert!(hosts.stderr.contains(WARNING), "{}", hosts.stderr);
+    let root = shipyard_test_support::rootfs::RootFs::minimal();
+    let own = run_args(&["--rootfs", root.arg(), "sh", "-c", "exit 0"]);
+    assert_eq!(own.code, Some(0), "{}", own.stderr);
+    assert!(!own.stderr.contains(WARNING), "{}", own.stderr);
+    let mapped = run_args(&["--uidmap", "0:100000:65536", "true"]);
+    assert_eq!(mapped.code, Some(0), "{}", mapped.stderr);
+    assert!(!mapped.stderr.contains(WARNING), "{}", mapped.stderr);
+}
+
+/// Copying the binary for the init doesn't slow a run's start noticeably
+/// (a debug build is tens of megabytes; the copy is in the kernel): a
+/// whole run of `true` stays well under a generous bound.
+#[test]
+#[ignore = "needs root"]
+fn an_isolated_run_still_starts_quickly() {
+    let started = std::time::Instant::now();
+    let run = run_args(&["true"]);
+    let took = started.elapsed();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+}
+
+// --- As root: a privileged start ------------------------------------------------------
+
+/// Copies of the `shipyard` and `shipyard-runtime` binaries in a directory
+/// of their own, removed on drop.
+struct Copies {
+    dir: PathBuf,
+}
+
+impl Copies {
+    /// `mode` on every copy, owned by `owner`.
+    fn new(owner: u32, mode: u32) -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "shipyard-privileged-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_setuid_works_in(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for binary in [SHIPYARD_BINARY, RUNTIME_BINARY] {
+            let copy = dir.join(std::path::Path::new(binary).file_name().unwrap());
+            std::fs::copy(binary, &copy).unwrap();
+            std::os::unix::fs::chown(&copy, Some(owner), None).unwrap();
+            // After `chown`, which clears the setuid bit.
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        Self { dir }
+    }
+
+    /// Runs the copy of `binary` with `args`.
+    fn run(&self, binary: &str, args: &[&str]) -> Run {
+        let copy = self
+            .dir
+            .join(std::path::Path::new(binary).file_name().unwrap());
+        let mut command = std::process::Command::new(copy);
+        command.args(args);
+        run(command)
+    }
+}
+
+impl Drop for Copies {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+const SHIPYARD_BINARY: &str = env!("CARGO_BIN_EXE_shipyard");
+const RUNTIME_BINARY: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
+
+/// What a refused privileged start says (`Error::PrivilegedStart`).
+const PRIVILEGED: &str = "started with elevated privileges";
+
+/// Every way into either binary (the CLIs, and the hidden entry points of
+/// the init, the monitor, the storage helper and the DNS server) refuses to start setuid: root running
+/// a copy that's setuid to another user. The same copies without the bit
+/// get past the check (and, started by hand, the entry points say so).
+#[test]
+#[ignore = "needs root"]
+fn a_privileged_start_is_refused_at_every_entry_point() {
+    let starts: [(&str, &[&str], &str); 7] = [
+        (SHIPYARD_BINARY, &["doctor"], ""),
+        (
+            SHIPYARD_BINARY,
+            &["__shipyard-init"],
+            "internal entry point",
+        ),
+        (SHIPYARD_BINARY, &["__shipyard-storage"], "bad arguments"),
+        (
+            SHIPYARD_BINARY,
+            &["__shipyard-dns"],
+            "without its four arguments",
+        ),
+        (
+            RUNTIME_BINARY,
+            &["state", "no-such-container"],
+            "no-such-container",
+        ),
+        (RUNTIME_BINARY, &["__shipyard-init"], "internal entry point"),
+        (
+            RUNTIME_BINARY,
+            &["__shipyard-monitor"],
+            "internal entry point",
+        ),
+    ];
+    let setuid = Copies::new(1000, 0o4755);
+    let plain = Copies::new(1000, 0o755);
+    for (binary, args, unprivileged) in starts {
+        let refused = setuid.run(binary, args);
+        assert_ne!(refused.code, Some(0), "{binary} {args:?}");
+        assert!(
+            refused.stderr.contains(PRIVILEGED),
+            "{binary} {args:?}: {}",
+            refused.stderr
+        );
+        let started = plain.run(binary, args);
+        assert!(
+            !started.stderr.contains(PRIVILEGED) && started.stderr.contains(unprivileged),
+            "{binary} {args:?}: {}",
+            started.stderr
+        );
+    }
 }
 
 // --- As root: bundles ----------------------------------------------------------------
@@ -425,6 +600,59 @@ fn filters_work_here() -> bool {
         eprintln!("under Rosetta emulation, where no seccomp filter can be installed; skipping");
     }
     !under_rosetta()
+}
+
+/// A `python3` command that calls `socket(DOMAIN, SOCK_STREAM, 0)` for each
+/// domain given, with all 64 bits of it, and prints the errno each got (0
+/// for a socket).
+fn sockets(domains: &[u64]) -> String {
+    let calls: Vec<String> = domains
+        .iter()
+        .map(|domain| {
+            format!(
+                "set_errno(0); fd = libc.syscall(c({}), c({domain:#x}), c(1), c(0)); \
+                 print(0 if fd >= 0 else get_errno())",
+                libc::SYS_socket
+            )
+        })
+        .collect();
+    format!(
+        "python3 -c 'from ctypes import *; libc = CDLL(None, use_errno=True); \
+         c = c_ulong; {}'",
+        calls.join("; ")
+    )
+}
+
+/// The default filter's `socket` rules hold however the domain is passed:
+/// `AF_VSOCK` (40) is refused, and so is `0x1_0000_0028`, which the kernel
+/// reads as 40 (an `int`) though 64-bit comparisons alone would let it by.
+/// `AF_UNIX` and `AF_INET` still make sockets (the control).
+#[test]
+#[ignore = "needs root"]
+fn the_default_filter_refuses_vsock_however_its_passed() {
+    if !filters_work_here() {
+        return;
+    }
+    let run = shipyard_run(&[], &sockets(&[1, 2, 40, 0x1_0000_0028, 0x1_0000_0026]));
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let eperm = libc::EPERM.to_string();
+    let errnos: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(errnos, ["0", "0", &eperm, &eperm, &eperm], "{}", run.stderr);
+}
+
+/// The same, rootless.
+#[test]
+fn the_default_filter_refuses_vsock_however_its_passed_rootless() {
+    if !shipyard_test_support::rootless(shipyard_test_support::Rootless::Single)
+        || !filters_work_here()
+    {
+        return;
+    }
+    let run = shipyard_run(&[], &sockets(&[1, 0x1_0000_0028]));
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let eperm = libc::EPERM.to_string();
+    let errnos: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(errnos, ["0", &eperm], "{}", run.stderr);
 }
 
 /// A seccomp profile in a file, removed on drop.

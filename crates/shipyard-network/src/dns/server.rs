@@ -309,6 +309,17 @@ struct Shared {
     connections: Taken,
     /// What each asker's run is on besides this network, found lately.
     elsewhere: Mutex<HashMap<String, (Instant, Elsewhere)>>,
+    /// The network's live leases, as last read ([`Shared::own`]).
+    own: Mutex<Option<Own>>,
+}
+
+/// The network's live leases as read at `read`, when the leases directory
+/// was at `version`.
+#[derive(Debug)]
+struct Own {
+    version: crate::store::LeasesVersion,
+    read: Instant,
+    leases: Arc<Vec<crate::store::Lease>>,
 }
 
 /// What an asker is on besides the server's network: the names of those
@@ -325,6 +336,14 @@ struct Elsewhere {
 /// asks a lot mustn't slow everyone's), and a second's lag is fine for
 /// other networks' containers.
 const ELSEWHERE_FOR: Duration = Duration::from_secs(1);
+/// How long the network's live leases are kept, if no lease was made or
+/// removed meanwhile: reading them takes a file and a lock test per lease,
+/// too much for every query (a container that asks a lot mustn't slow
+/// everyone's). A new lease (once written: a read that met one being
+/// written isn't kept) or a removed one is seen at once; a container killed
+/// a moment ago, whose lease is still there until swept, may still be
+/// answered for this long.
+const OWN_FOR: Duration = Duration::from_secs(1);
 
 /// The most askers' runs remembered at once.
 const ELSEWHERE_MAX: usize = 256;
@@ -345,7 +364,7 @@ impl Shared {
     /// internal and so are all the client's others: a container with a way
     /// out elsewhere may look the world's names up (as Docker's resolver).
     fn known_to(&self, client: IpAddr) -> (Known, bool) {
-        let own = self.leases.live().unwrap_or_default();
+        let own = self.own();
         let asker = own
             .iter()
             .find(|lease| lease.ip == client.to_canonical())
@@ -360,6 +379,33 @@ impl Shared {
             known.also(subnets, names);
         }
         (known, !self.zone.internal || elsewhere.way_out)
+    }
+
+    /// The network's live leases: as last read, if no lease was made or
+    /// removed since and that was within [`OWN_FOR`]; read afresh
+    /// otherwise.
+    fn own(&self) -> Arc<Vec<crate::store::Lease>> {
+        let version = self.leases.version();
+        let mut own = self.own.lock().unwrap_or_else(PoisonError::into_inner);
+        if let (Some(version), Some(last)) = (version, own.as_ref())
+            && last.version == version
+            && last.read.elapsed() < OWN_FOR
+        {
+            return Arc::clone(&last.leases);
+        }
+        let read = self.leases.read_live().unwrap_or_default();
+        let leases = Arc::new(read.leases);
+        *own = version.filter(|_| read.settled).map(|version| Own {
+            version,
+            read: Instant::now(),
+            leases: Arc::clone(&leases),
+        });
+        leases
+    }
+
+    /// Who `client`'s forwarding places count against ([`forwarder`]).
+    fn forwarder(&self, client: IpAddr) -> IpAddr {
+        forwarder(self.zone, &self.own(), client)
     }
 
     /// What the run `run` is on besides this network ([`Elsewhere`]), as
@@ -430,6 +476,20 @@ fn from_network(zone: Zone, gateway: IpAddr, client: IpAddr) -> bool {
         && Some(v4) != zone.subnet.broadcast()
 }
 
+/// Who the forwarding places of a query from `client` count against: the
+/// client, where it's the address of one of `leases` (the network's live
+/// ones); otherwise the network, all such clients together. A container can
+/// write any source address it likes (where the bridge table can't stop it):
+/// a hundred made up mustn't take every place from the containers.
+fn forwarder(zone: Zone, leases: &[crate::store::Lease], client: IpAddr) -> IpAddr {
+    let client = client.to_canonical();
+    if leases.iter().any(|lease| lease.ip == client) {
+        client
+    } else {
+        zone.subnet.network().addr()
+    }
+}
+
 /// Serves until it's time to stop: returns why. The caller exits then (with
 /// the network's lock, for [`Ending::Idle`]).
 pub fn serve(setup: Setup, sockets: Sockets) -> Result<Ending, ServerError> {
@@ -464,6 +524,7 @@ pub fn serve(setup: Setup, sockets: Sockets) -> Result<Ending, ServerError> {
         forwards: Taken::default(),
         connections: Taken::default(),
         elsewhere: Mutex::default(),
+        own: Mutex::default(),
     });
     let udp = Arc::new(sockets.udp);
     let tcp = sockets.tcp;
@@ -680,7 +741,8 @@ fn serve_udp(socket: &Arc<UdpSocket>, shared: &Arc<Shared>) {
             Response::Nothing => continue,
             Response::Forward(query) => query,
         };
-        if !shared.forwards.take(MAX_FORWARDS, client.ip()) {
+        let forwarder = shared.forwarder(client.ip());
+        if !shared.forwards.take(MAX_FORWARDS, forwarder) {
             let _ = socket.send_to(&servfail(&query), client);
             continue;
         }
@@ -690,10 +752,10 @@ fn serve_udp(socket: &Arc<UdpSocket>, shared: &Arc<Shared>) {
             let reply =
                 forward_udp(&forwarded, &state.upstreams()).unwrap_or_else(|| servfail(&query));
             let _ = to_client.send_to(&reply, client);
-            state.forwards.give_back(client.ip());
+            state.forwards.give_back(forwarder);
         });
         if spawned.is_err() {
-            shared.forwards.give_back(client.ip());
+            shared.forwards.give_back(forwarder);
         }
     }
 }
@@ -891,6 +953,40 @@ mod tests {
         ] {
             assert!(!from_network(zone, gateway, not.parse().unwrap()), "{not}");
         }
+    }
+
+    /// A query's forwarding places count against its client where that's a
+    /// live lease's address; against the network, all together, for any
+    /// other (made-up) source: those can't take every place.
+    #[test]
+    fn made_up_sources_share_their_forwarding_places() {
+        let zone = Zone {
+            subnet: "10.89.0.0/24".parse().unwrap(),
+            subnet6: None,
+            internal: false,
+        };
+        let lease: crate::store::Lease = serde_json::from_value(serde_json::json!({
+            "ip": "10.89.0.2", "mac": [2, 66, 10, 89, 0, 2], "run": "r",
+            "hostname": "h", "host_veth": "shyr"
+        }))
+        .unwrap();
+        let leased: IpAddr = "10.89.0.2".parse().unwrap();
+        let network: IpAddr = "10.89.0.0".parse().unwrap();
+        assert_eq!(
+            forwarder(zone, std::slice::from_ref(&lease), leased),
+            leased
+        );
+        let taken = Taken::default();
+        let mut granted = 0;
+        for last in 3..=200_u8 {
+            let made_up = IpAddr::from([10, 89, 0, last]);
+            let key = forwarder(zone, std::slice::from_ref(&lease), made_up);
+            assert_eq!(key, network);
+            granted += usize::from(taken.take(MAX_FORWARDS, key));
+        }
+        assert_eq!(granted, MAX_FORWARDS.per_client);
+        // The leased client still has its own.
+        assert!(taken.take(MAX_FORWARDS, leased));
     }
 
     /// A query for example.com, with the ID 7.

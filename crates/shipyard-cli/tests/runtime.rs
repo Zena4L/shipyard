@@ -628,6 +628,69 @@ fn a_container_has_a_cgroup_for_its_life() {
     assert_eq!(runtime.call(&["delete", "grouped"]).code, Some(0));
 }
 
+/// A `create` killed between making its cgroup and recording it leaves the
+/// cgroup pending in its state: `delete` removes it (only `rmdir`: one with a
+/// process in it is left, and nothing is killed), and the ID can be created
+/// again.
+#[test]
+#[ignore = "needs root"]
+fn delete_removes_a_killed_creates_pending_cgroup() {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let runtime = Runtime::new();
+    let pending = |id: &str| {
+        let dir = runtime.root.join(id);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
+        let record = json!({
+            "bundle": "/nonexistent",
+            "init": null,
+            "annotations": {},
+            "cgroup": cgroup_of(id),
+            "cgroup_base": "/sys/fs/cgroup",
+            "cgroup_pending": true,
+        });
+        std::fs::write(dir.join("state.json"), record.to_string()).unwrap();
+        std::fs::create_dir_all(cgroup_of(id)).unwrap();
+    };
+    pending("leftover");
+    assert_eq!(runtime.call(&["delete", "leftover"]).code, Some(0));
+    assert!(!cgroup_of("leftover").exists());
+    let bundle = bundle_running("exec sleep 300");
+    let call = runtime.create("leftover", &bundle, &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(
+        runtime.call(&["delete", "--force", "leftover"]).code,
+        Some(0)
+    );
+
+    // The control: one with a process in it (not the killed `create`'s).
+    pending("occupied");
+    let mut inside = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        cgroup_of("occupied").join("cgroup.procs"),
+        inside.id().to_string(),
+    )
+    .unwrap();
+    assert_eq!(runtime.call(&["delete", "occupied"]).code, Some(0));
+    assert_eq!(
+        cgroup_procs(&cgroup_of("occupied")),
+        [i64::from(inside.id())]
+    );
+    inside.kill().unwrap();
+    let _ = inside.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::fs::remove_dir(cgroup_of("occupied")).is_err() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Without a PID namespace, the init's death doesn't end the rest: the
 /// cgroup does. A process the init left behind is killed by `delete
 /// --force`, and the cgroup goes.
@@ -1116,6 +1179,19 @@ fn update_changes_limits_live() {
     assert_eq!(call.code, Some(0), "{}", call.stderr);
     assert_eq!(read("pids.max"), "30\n");
     assert_eq!(read("memory.max"), "67108864\n", "the rest stays");
+    // A quota alone keeps the period set before (as runc's).
+    let call = runtime.call(&[
+        "update",
+        "--cpu-quota",
+        "25000",
+        "--cpu-period",
+        "50000",
+        "growing",
+    ]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let call = runtime.call(&["update", "--cpu-quota", "40000", "growing"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(read("cpu.max"), "40000 50000\n");
     assert_eq!(
         runtime.call(&["update", "growing"]).code,
         Some(1),

@@ -685,3 +685,44 @@ fn moving_a_device_needs_root() {
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(run.stderr.contains("it needs root"), "{}", run.stderr);
 }
+
+/// Root without `CAP_NET_ADMIN` (inside a container started without it,
+/// say) can't make the bridge network: the container gets the host's, and
+/// the run says so. With it (the control), no such warning.
+#[test]
+#[ignore = "needs root"]
+fn root_without_net_admin_is_told_it_gets_the_hosts_network() {
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        let warned = "the container gets the host's network: the bridge network needs \
+                      CAP_NET_ADMIN";
+        // The same command, under `setpriv`, without the capability.
+        let shipyard = networks.command(&["run", "true"]);
+        let mut without = std::process::Command::new("setpriv");
+        without
+            .args([
+                "--bounding-set",
+                "-net_admin",
+                "--inh-caps",
+                "-net_admin",
+                "--",
+            ])
+            .arg(shipyard.get_program())
+            .args(shipyard.get_args())
+            .envs(
+                shipyard
+                    .get_envs()
+                    .filter_map(|(key, value)| Some((key, value?))),
+            );
+        let run = run(without);
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert!(
+            run.stderr.contains(warned) && run.stderr.contains("shipyard has no CAP_NET_ADMIN"),
+            "{}",
+            run.stderr
+        );
+        let with = networks.run(&["run", "true"]);
+        assert_eq!(with.code, Some(0), "{}", with.stderr);
+        assert!(!with.stderr.contains(warned), "{}", with.stderr);
+    });
+}

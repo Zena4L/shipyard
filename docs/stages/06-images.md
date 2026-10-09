@@ -103,8 +103,10 @@ shipyard rmi / image prune            (shipyard-cli/image.rs: collect)
 gc.lock                    shared: pulls, extractions, runs being prepared; exclusive: GC
 index.json, index.lock     references → manifest, config, layers
 blobs/sha256/<hex>         read-only, named by digest; .<hex>.partial while downloading
-layers/<hex>[-caller|-map-<id>]/diff
-                           one per layer and owner kind; .tmp-… while extracting, .trash-… going
+layers/<hex>[-caller|-map-<id>][-on-<id>]/diff
+                           one per layer and owner kind (and, for a layer implying
+                           directories, per set of lowers: stage 7.5, F1); .tmp-… while
+                           extracting, .trash-… going
 containers/run-…/          upper, work, merged; flock-held for the run's life
 volumes/<name>/_data       volumes/.locks/<name>, volumes/.trash/<unique>
 ```

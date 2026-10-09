@@ -952,6 +952,14 @@ impl RunArgs {
         } else if crate::network::can_network() {
             NetworkMode::bridge(shipyard_network::store::DEFAULT_NETWORK)
         } else if crate::network::host_root() {
+            #[cfg(target_os = "linux")]
+            if let Some(why) = crate::network::why_no_network() {
+                crate::warning(&format!(
+                    "the container gets the host's network: the bridge network needs \
+                     CAP_NET_ADMIN and a writable /proc/sys, and {why}. Pass --network host \
+                     to choose it (without this warning), or --network none for no network"
+                ));
+            }
             NetworkMode::Host
         } else {
             NetworkMode::Pasta
@@ -1327,6 +1335,15 @@ fn run_invocation(
     } = invocation;
     for warning in &warnings {
         crate::warning(warning);
+    }
+    if isolation.as_ref().is_some_and(|isolation| {
+        isolation.root.is_none() && isolation.id_maps.is_none() && crate::network::host_root()
+    }) {
+        crate::warning(
+            "the container is root on the host's own files: with no --image or --rootfs, its \
+             root filesystem is the host's, and root in it can change them (give it an image, \
+             or a user namespace with --uidmap)",
+        );
     }
     tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;

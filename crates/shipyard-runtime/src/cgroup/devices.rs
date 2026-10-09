@@ -24,6 +24,7 @@ use nix::errno::Errno;
 
 use super::{Cgroup, CgroupError};
 use crate::devices::Devices;
+use crate::isolation::Isolation;
 
 /// `bpf(2)` commands.
 const BPF_PROG_LOAD: libc::c_int = 5;
@@ -152,16 +153,50 @@ fn unenforced_warning(devices: &Devices, why: &str, root: bool) -> Option<String
         .then(|| format!("the device rules can't be enforced here ({why}); {left}"))
 }
 
-/// The warning for `devices` when the container has no cgroup, for `why`
-/// (see [`unenforced_devices`]).
+/// The warnings for a container with `isolation` that has no cgroup, for
+/// `why`: its device rules, if asked for, go unenforced (see
+/// [`unenforced_devices`]); and if [`devices_unguarded`], what it goes
+/// without instead.
 pub(crate) fn devices_without_cgroup(
-    devices: &Devices,
+    isolation: &Isolation,
     why: &impl std::fmt::Display,
-) -> Option<String> {
-    unenforced_devices(
-        devices,
-        &format!("the container has no cgroup of its own: {why}"),
-    )
+) -> Vec<String> {
+    let why = format!("the container has no cgroup of its own: {why}");
+    let unguarded = devices_unguarded(isolation, false).then(|| {
+        // Without a root filesystem, `/dev` is the host's, its nodes there
+        // to open: going without `CAP_MKNOD` doesn't change that.
+        let left = if isolation.root.is_some() {
+            "so it can't make device nodes (those its root filesystem holds, if any, \
+             still open)"
+        } else {
+            "but it sees the host's /dev (no root filesystem), whose devices all open"
+        };
+        format!(
+            "no device program can guard the container's devices here ({why}): it goes \
+             without CAP_MKNOD, {left}"
+        )
+    });
+    unenforced_devices(&isolation.devices, &why)
+        .into_iter()
+        .chain(unguarded)
+        .collect()
+}
+
+/// Whether nothing would keep a container with `isolation` (and a cgroup of
+/// its own, or not: `own_cgroup`) from the host's devices: real root, no
+/// user namespace, and no cgroup to hold the device program. Root in the
+/// container could then `mknod` any device and open it (the host's disks),
+/// so it goes without `CAP_MKNOD` (in every set: nothing it runs gets it
+/// back). The nodes Shipyard makes for it stay as they are (the init makes
+/// them before the command's capabilities apply). What that leaves it is
+/// only nodes it's given: layers carry none (`unpack.rs` skips them),
+/// mounting needs `CAP_SYS_ADMIN`, and a user namespace's root can't make
+/// any (`mknod` checks the host's namespace); but with no root filesystem
+/// its `/dev` is the host's, and a `--rootfs` directory's own nodes are
+/// there too (both the caller's to choose). (Real root with a cgroup always
+/// gets the program: `enforce_devices` fails the run otherwise.)
+pub(crate) fn devices_unguarded(isolation: &Isolation, own_cgroup: bool) -> bool {
+    !own_cgroup && isolation.id_maps.is_none() && is_host_root()
 }
 
 /// Whether this process is real root: euid 0 in the host's user namespace,

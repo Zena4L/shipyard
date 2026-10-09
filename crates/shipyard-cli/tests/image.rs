@@ -202,6 +202,25 @@ fn fixture_of(root: &RootFs, extra: usize) -> (Serving, String) {
         std::fs::write(dir.0.join("top"), index.to_string()).unwrap();
         layers.push(layer_tar(&dir.0));
     }
+    fixture_layers(layers)
+}
+
+/// A layer of one file, `path`, holding `content`, with no entries for the
+/// directories it's in: it implies them.
+fn implying_layer(path: &str, content: &[u8]) -> (Vec<u8>, String) {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    builder.append_data(&mut header, path, content).unwrap();
+    let tar = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&tar).unwrap();
+    (encoder.finish().unwrap(), sha256(&tar))
+}
+
+/// A fixture registry serving an image of `layers` (base first).
+fn fixture_layers(layers: Vec<(Vec<u8>, String)>) -> (Serving, String) {
     let diff_ids: Vec<String> = layers.iter().map(|(_, id)| format!("\"{id}\"")).collect();
     let config = format!(
         r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}},"config":{{"Cmd":["/bin/cat","/marker"]}}}}"#,
@@ -874,6 +893,35 @@ fn volumes_and_entrypoints_as_docker_has_them() {
     );
     assert!(entry.status.success(), "{}", text(&entry).1);
     assert!(text(&entry).0.contains("shipyard test root filesystem"));
+}
+
+/// A layer that implies a directory (`work/sub/file`, no `work/sub/`) is
+/// extracted for the layers below it, under its name on them (`-on-`), and
+/// found there by the next run, rootless (through the storage helper) and
+/// as root.
+#[test]
+fn a_layer_implying_directories_is_placed_on_its_base() {
+    let store = Scratch::new();
+    let base = RootFs::minimal();
+    let (serving, image) = fixture_layers(vec![
+        layer_tar(base.path()),
+        implying_layer("work/sub/file", b"implied"),
+    ]);
+    for _ in 0..2 {
+        let output = shipyard(&store, &["run", "--image", &image, "cat", "/work/sub/file"]);
+        if !image_runs_here(&output) {
+            return;
+        }
+        let (stdout, stderr) = text(&output);
+        assert_eq!(stdout, "implied", "{stderr}");
+    }
+    let stacked: Vec<String> = layers(&store)
+        .into_iter()
+        .filter(|name| name.contains("-on-"))
+        .collect();
+    assert_eq!(stacked.len(), 1, "{:?}", layers(&store));
+    assert_eq!(layers(&store).len(), 2, "{:?}", layers(&store));
+    drop(serving);
 }
 
 /// More layers than one old-style mount's options hold: the new mount API

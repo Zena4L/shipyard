@@ -285,7 +285,9 @@ impl FixtureRegistry {
         }
         let response = {
             let mut routes = self.routes.lock().unwrap();
-            match routes.get_mut(path) {
+            // A route is a path: a token request's query isn't part of it.
+            let route = path.split_once('?').map_or(path, |(route, _)| route);
+            match routes.get_mut(route) {
                 Some(queue) if queue.len() > 1 => queue.remove(0),
                 Some(queue) => queue[0].clone(),
                 None => Response::status(404, &[]),
@@ -772,6 +774,33 @@ fn an_image_too_big_for_the_disk_is_refused_before_its_layers() {
     assert!(matches!(err, PullError::NoSpace { .. }), "{err}");
     // The manifest and the config: no layer.
     assert_eq!(serving.requests(), 2);
+}
+
+/// An image with more layers than an image may have is refused from its
+/// manifest, before any blob is fetched; one with as many as allowed pulls.
+#[test]
+fn an_image_with_too_many_layers_is_refused_before_its_blobs() {
+    let mut fixture = FixtureRegistry::default();
+    host_image(
+        &mut fixture,
+        "deep",
+        "v1",
+        "amd64",
+        shipyard_image::MAX_LAYERS + 1,
+    );
+    host_image(
+        &mut fixture,
+        "deep",
+        "v2",
+        "amd64",
+        shipyard_image::MAX_LAYERS,
+    );
+    let serving = fixture.serve();
+    let scratch = Scratch::new();
+    let err = pull(&serving, "localhost/deep:v1", &amd64(), &scratch.store()).unwrap_err();
+    assert!(matches!(err, PullError::TooManyLayers(129)), "{err}");
+    assert_eq!(serving.requests(), 1, "only the manifest");
+    pull(&serving, "localhost/deep:v2", &amd64(), &scratch.store()).unwrap();
 }
 
 #[test]
@@ -1307,6 +1336,59 @@ fn a_helper_is_asked_once_and_a_broken_one_is_no_reason_to_fail() {
         credentials,
     )
     .unwrap();
+}
+
+/// A token service that redirects elsewhere: with credentials, the
+/// redirect isn't followed (an identity token's form, or a username in the
+/// query, would go on to wherever it led), and the pull says why. Without,
+/// it is (the control: the redirect leads somewhere that's asked).
+#[test]
+fn credentials_never_follow_a_token_services_redirect() {
+    let elsewhere = FixtureRegistry::default().serve();
+    let challenge = |fixture: &mut FixtureRegistry| {
+        fixture.require_auth = true;
+        fixture.challenges = vec![r#"Bearer realm="{base}/moved",service="fixture""#.to_owned()];
+        let location = format!("{}/token", elsewhere.base);
+        fixture.route("/moved", Response::status(307, &[("Location", &location)]));
+    };
+    let mut fixture = FixtureRegistry::default();
+    challenge(&mut fixture);
+    host_image(&mut fixture, "private", "v1", "amd64", 1);
+    let serving = fixture.serve();
+    // A password (a GET, the username in the query), and an identity token
+    // (a POST, the token in its form).
+    for config in [
+        r#"{"auths":{"localhost":{"auth":"bWU6cHc="}}}"#,
+        r#"{"auths":{"https://localhost/v1/":{"identitytoken":"refresh-123"}}}"#,
+    ] {
+        let scratch = Scratch::new();
+        let credentials = docker_config(&scratch.0, config);
+        let err = pull_signed(
+            &serving,
+            "localhost/private:v1",
+            &scratch.store(),
+            credentials,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("credentials aren't sent on"),
+            "{config}: {err}"
+        );
+        assert!(
+            elsewhere.seen.token_request.lock().unwrap().is_none()
+                && elsewhere.seen.token_form.lock().unwrap().is_none(),
+            "{config}: the credentials went where the redirect led"
+        );
+    }
+    // Anonymous: followed, and the pull goes on from there.
+    pull(
+        &serving,
+        "localhost/private:v1",
+        &amd64(),
+        &Scratch::new().store(),
+    )
+    .unwrap();
+    assert!(elsewhere.seen.token_request.lock().unwrap().is_some());
 }
 
 #[test]

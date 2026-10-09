@@ -176,6 +176,38 @@ fn a_name_is_one_running_containers_at_a_time() {
     });
 }
 
+/// A container killed outright leaves its lease until the next run sweeps
+/// it, but its lock goes at once: within a second or so (the server reads
+/// the leases again at least that often, however often it's asked), its
+/// names are nobody's, before any sweep.
+#[test]
+#[ignore = "needs root"]
+fn a_killed_containers_name_goes_within_a_second() {
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        let _world = FakeResolver::start(upstream.netns(), WORLD);
+        networks.create(&["app"]);
+        let (db, _) = networks.sleeping(&["--network", "app", "--name", "db"]);
+        let (client, netns) = networks.sleeping(&["--network", "app"]);
+        let server = networks.gateway("app");
+        let (db_ip, _) = container(&networks, "app", "db");
+        // Asked once: the server has read the leases.
+        let named = resolve(&netns, server, "db", rtype::A).unwrap();
+        assert_eq!(addresses(&named), [db_ip]);
+        db.signal(libc::SIGKILL);
+        let _ = db.finish_status();
+        std::thread::sleep(Duration::from_millis(1500));
+        let gone = resolve(&netns, server, "db", rtype::A).unwrap();
+        assert_eq!(
+            addresses(&gone),
+            [WORLD],
+            "still answered for a dead container"
+        );
+        client.stop();
+    });
+}
+
 #[test]
 #[ignore = "needs root"]
 fn one_server_runs_as_nobody_until_its_network_is_idle() {

@@ -33,6 +33,10 @@ pub(super) const SHIPYARD: &str = "shipyard";
 /// whether they're frozen, and how long a run waits between tries at
 /// claiming its cgroup.
 pub(super) const POLL: Duration = Duration::from_millis(10);
+/// How long a freeze before a kill may take (see `kill_frozen`): a process
+/// in uninterruptible sleep holds it up, and [`Cgroup::remove`] kills again
+/// every [`POLL`].
+const FREEZE_FOR_KILL: Duration = Duration::from_millis(500);
 
 /// How many passes [`Cgroup::signal_all`] makes at most, without
 /// `cgroup.kill`: each signals what the last one hadn't seen.
@@ -179,6 +183,39 @@ pub enum CgroupError {
     },
 }
 
+/// Whether a written `io.weight` does anything: only where iocost is on
+/// for some disk (`qos`, the root's `io.cost.qos`: a line with `enable=1`),
+/// as cgroup v2 documents. (BFQ reads a file of its own, `io.bfq.weight`,
+/// which Shipyard doesn't write.)
+fn io_weight_has_effect(qos: &str) -> bool {
+    qos.lines()
+        .any(|line| line.split_whitespace().any(|field| field == "enable=1"))
+}
+
+/// What the OOM killer did in a cgroup (`memory.events`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OomEvents {
+    /// How often its memory limit was hit and the OOM killer called (`oom`).
+    pub limit_hits: u64,
+    /// How many of its processes the OOM killer killed (`oom_kill`): for its
+    /// limit, or for memory short elsewhere (the host's, or a parent
+    /// cgroup's limit, counted in that cgroup's `oom`).
+    pub kills: u64,
+}
+
+impl OomEvents {
+    /// Why its processes were killed: its own memory limit, or (with the
+    /// limit never hit) memory short outside it.
+    #[must_use]
+    pub fn cause(self) -> &'static str {
+        if self.limit_hits > 0 {
+            "out of memory"
+        } else {
+            "the host or a parent cgroup ran out of memory"
+        }
+    }
+}
+
 /// `shipyard run`'s cgroup, for the shipyard process `pid`, relative to the
 /// base.
 #[must_use]
@@ -194,16 +231,28 @@ pub fn runtime_cgroup(id: &str) -> PathBuf {
     Path::new(RUNTIME_PARENT).join(id)
 }
 
-/// Removes the run cgroup at `path` if no live run holds its lock, and
-/// nothing is in it (`rmdir` refuses then). Whether it went, or was gone.
-pub(super) fn remove_if_stale(path: &Path) -> bool {
+/// Removes the run cgroup at `path` (below `base`) if no live run holds its
+/// lock. Whether it went, or was gone.
+///
+/// The run that made it held the lock for its whole life, so taking it
+/// means that run is gone; what it left in its cgroup (processes that
+/// outlived it, with no PID namespace to end them, or cgroups made below)
+/// is killed, then the cgroup goes, deepest first. Only one of shipyard's
+/// run cgroups ([`Cgroup::recorded`]: never the root, a parent, or this
+/// process's own). What's still dying is left for the next sweep: a run's
+/// start never waits on it.
+pub(super) fn remove_if_stale(path: &Path, base: &Path) -> bool {
     let _lock = match lock_dir(path) {
         Ok(lock) => lock,
         Err(errno) => return errno == Errno::ENOENT,
     };
     // Locked, and still the directory at the path: nobody else removes it
-    // while the lock is held.
-    std::fs::remove_dir(path).is_ok()
+    // while the lock is held. Empty, it goes at once (the usual case).
+    if std::fs::remove_dir(path).is_ok() {
+        return true;
+    }
+    Cgroup::recorded(path.to_owned(), base.to_owned())
+        .is_ok_and(|cgroup| cgroup.remove(Duration::ZERO).is_ok())
 }
 
 /// `shipyard run`'s cgroup, held: its lock tells later runs it's alive.
@@ -410,6 +459,18 @@ impl Cgroup {
                 }
             });
         }
+        // Not where the root's file can't be read (inside a cgroup
+        // namespace, it isn't there): no telling, so no warning.
+        if written.iter().any(|file| file == "io.weight")
+            && let Ok(qos) = std::fs::read_to_string(Path::new(ROOT).join("io.cost.qos"))
+            && !io_weight_has_effect(&qos)
+        {
+            skipped.push(
+                "the I/O weight has no effect here: it needs the iocost controller turned on \
+                 for the disk (io.cost.qos at the root)"
+                    .to_owned(),
+            );
+        }
         Ok(skipped)
     }
 
@@ -417,10 +478,20 @@ impl Cgroup {
     /// (`memory.events`' `oom_kill`); 0 without a memory controller.
     #[must_use]
     pub fn oom_kills(&self) -> u64 {
-        std::fs::read_to_string(self.path.join("memory.events"))
-            .ok()
-            .and_then(|text| parse_keyed(&text).get("oom_kill").copied())
-            .unwrap_or(0)
+        self.oom_events().kills
+    }
+
+    /// What the OOM killer did in it (`memory.events`); none without a
+    /// memory controller.
+    #[must_use]
+    pub fn oom_events(&self) -> OomEvents {
+        let text = std::fs::read_to_string(self.path.join("memory.events")).unwrap_or_default();
+        let events = parse_keyed(&text);
+        let count = |key| events.get(key).copied().unwrap_or(0);
+        OomEvents {
+            limit_hits: count("oom"),
+            kills: count("oom_kill"),
+        }
     }
 
     /// What it has used (see [`Stats`](super::Stats)).
@@ -451,9 +522,31 @@ impl Cgroup {
     /// again until a pass finds none it hadn't signalled (a fork mid-pass),
     /// a few passes at most.
     pub fn signal_all(&self, signal: libc::c_int) {
-        if signal == libc::SIGKILL && write_file(&self.path.join("cgroup.kill"), "1").is_ok() {
-            return;
+        if signal != libc::SIGKILL {
+            self.signal_each(signal);
+        } else if write_file(&self.path.join("cgroup.kill"), "1").is_err() {
+            self.kill_frozen();
         }
+    }
+
+    /// SIGKILL to every process in it, frozen first (before Linux 5.14,
+    /// without `cgroup.kill`): one by one, a process forking faster than the
+    /// kills come could outrun them, but a frozen one can't fork, and still
+    /// dies of SIGKILL. Thawed after, for what's left to go. (Not freezable,
+    /// before Linux 5.2: one by one all the same.) One frozen already (a
+    /// paused container) is left frozen: whatever outlived the kill stays
+    /// paused.
+    fn kill_frozen(&self) {
+        let thaw = !self.frozen() && self.freeze(true, FREEZE_FOR_KILL).is_ok();
+        self.signal_each(libc::SIGKILL);
+        if thaw {
+            let _ = self.freeze(false, FREEZE_FOR_KILL);
+        }
+    }
+
+    /// `signal` to each process in it and below, PID by PID (see
+    /// [`signal_all`](Self::signal_all)).
+    fn signal_each(&self, signal: libc::c_int) {
         let mut sent: Vec<Pid> = Vec::new();
         for _ in 0..SIGNAL_PASSES {
             let new: Vec<Pid> = self
@@ -795,6 +888,92 @@ fn io_errno(err: &std::io::Error) -> Errno {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frozen, then killed one by one (before Linux 5.14, without
+    /// `cgroup.kill`): a fork bomb goes, all of it, where passes PID by PID
+    /// (every process forks again) don't catch up; the cgroup is thawed
+    /// after. One paused already stays frozen. (`pids.max` keeps the bomb
+    /// small.)
+    #[test]
+    #[ignore = "needs root"]
+    fn a_forking_cgroup_is_killed_frozen() {
+        if !nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let tree = super::super::Tree::find().unwrap();
+        for paused in [false, true] {
+            let cgroup = tree
+                .create(&runtime_cgroup(&format!(
+                    "kill-frozen-{}-{paused}",
+                    std::process::id()
+                )))
+                .unwrap();
+            let small = Resources {
+                pids_max: Some(1024),
+                ..Resources::default()
+            };
+            cgroup.limit(&small).unwrap();
+            // In the cgroup before it forks: none of its children start
+            // outside.
+            let procs = cgroup.path().join("cgroup.procs");
+            let mut forker = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "echo $$ > \"$0\" && bomb() { while :; do bomb & done; }; bomb",
+                    procs.to_str().unwrap(),
+                ])
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cgroup.pids().len() < 3 {
+                assert!(Instant::now() < deadline, "it didn't fork");
+                std::thread::sleep(POLL);
+            }
+            if paused {
+                cgroup.freeze(true, Duration::from_secs(5)).unwrap();
+            }
+            cgroup.kill_frozen();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cgroup.populated() {
+                assert!(Instant::now() < deadline, "left: {:?}", cgroup.pids());
+                std::thread::sleep(POLL);
+            }
+            assert_eq!(cgroup.frozen(), paused);
+            let _ = forker.wait();
+            cgroup.remove(Duration::from_secs(5)).unwrap();
+        }
+    }
+
+    /// The OOM killer's cause: the container's own limit if it was hit,
+    /// otherwise memory short outside it (its `oom_kill` counts both).
+    #[test]
+    fn an_oom_kill_without_the_limit_hit_was_from_outside() {
+        let limit = OomEvents {
+            limit_hits: 1,
+            kills: 1,
+        };
+        assert_eq!(limit.cause(), "out of memory");
+        let outside = OomEvents {
+            limit_hits: 0,
+            kills: 2,
+        };
+        assert_eq!(
+            outside.cause(),
+            "the host or a parent cgroup ran out of memory"
+        );
+    }
+
+    /// An I/O weight takes effect with iocost on for some disk; iocost's
+    /// file present but off (as by default) isn't enough.
+    #[test]
+    fn an_io_weight_needs_iocost_on() {
+        let on = "8:0 enable=1 ctrl=auto rpct=0.00 rlat=250000\n";
+        let off = "8:0 enable=0 ctrl=auto rpct=0.00 rlat=250000\n";
+        assert!(io_weight_has_effect(on));
+        assert!(io_weight_has_effect(&format!("{off}{on}")));
+        assert!(!io_weight_has_effect(off));
+        assert!(!io_weight_has_effect(""));
+    }
 
     #[test]
     fn runs_and_runtime_containers_have_their_own_parents() {

@@ -307,7 +307,14 @@ fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Fa
     });
     if !closed {
         // No `close_range` (before Linux 5.9, or seccomp): the plan's list.
-        let keep = |fd: RawFd| reexec.passed.contains(&fd) || fd == reexec.exe;
+        let keep = |fd: RawFd| {
+            reexec.passed.contains(&fd)
+                || fd == reexec.exe
+                || reexec
+                    .host_exe
+                    .as_ref()
+                    .is_some_and(|(host, _)| fd == *host)
+        };
         let close = |fd: RawFd| {
             if !keep(fd) {
                 // SAFETY: `close` is async-signal-safe; a descriptor that
@@ -335,6 +342,24 @@ fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Fa
     } else {
         &reexec.argv
     };
+    exec_binary(reexec.exe, &reexec.exe_path, argv, &reexec.env);
+    // A sealed copy that won't run (a security module's policy on memfds,
+    // say): shipyard's file.
+    if let Some((host, host_path)) = &reexec.host_exe {
+        exec_binary(*host, host_path, argv, &reexec.env);
+    }
+    Failure::at(ChildStep::Reexec, Errno::last())
+}
+
+/// Execs the binary open at `fd` (`path` is the same, through `/proc`);
+/// returns only if that failed, with `errno` saying why.
+#[cfg(target_os = "linux")]
+fn exec_binary(
+    fd: RawFd,
+    path: &std::ffi::CStr,
+    argv: &super::plan::CStringArray,
+    env: &super::plan::CStringArray,
+) {
     // SAFETY: `execveat` and `execve` are async-signal-safe system calls.
     // Every pointer passed is a NUL-terminated string or a null-terminated
     // array of them, prepared before the fork and alive until the exec (or
@@ -342,17 +367,16 @@ fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Fa
     unsafe {
         libc::syscall(
             libc::SYS_execveat,
-            reexec.exe,
+            fd,
             c"".as_ptr(),
             argv.as_ptr(),
-            reexec.env.as_ptr(),
+            env.as_ptr(),
             libc::AT_EMPTY_PATH,
         );
         // No `execveat` (before Linux 3.19, seccomp, some emulators): the
-        // same file through `/proc`, which is still the host's here.
-        libc::execve(reexec.exe_path.as_ptr(), argv.as_ptr(), reexec.env.as_ptr());
+        // same file through `/proc` (the host's, still, at this point).
+        libc::execve(path.as_ptr(), argv.as_ptr(), env.as_ptr());
     }
-    Failure::at(ChildStep::Reexec, Errno::last())
 }
 
 #[cfg(target_os = "linux")]

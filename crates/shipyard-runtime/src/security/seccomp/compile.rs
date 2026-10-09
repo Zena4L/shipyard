@@ -599,6 +599,90 @@ mod tests {
         }
     }
 
+    /// Docker's `socket` rules allow every domain but `AF_NETLINK` (38) and
+    /// `AF_VSOCK` (40). The kernel reads the domain (an `int`) on 32 bits,
+    /// so the same domains with high bits set are refused too, where
+    /// 64-bit comparisons alone would allow them (`0x1_0000_0028 > 40`).
+    /// The usual domains, which never have them, still go through.
+    #[test]
+    fn dockers_socket_rules_hold_with_high_bits_set() {
+        for arch in [Arch::Aarch64, Arch::X86_64] {
+            let filter = docker(arch, &DOCKER_CAPS);
+            let socket = |domain: u64| verdict_of(&filter, arch, "socket", [domain, 0, 0, 0, 0, 0]);
+            for domain in [1, 2, 10, 17, 39, 41, 45] {
+                assert_eq!(socket(domain), RET_ALLOW, "{arch:?} domain {domain}");
+            }
+            for domain in [
+                38,
+                40,
+                0x1_0000_0026,
+                0x1_0000_0028,
+                0xffff_ffff_0000_0028,
+                0x8000_0000_0000_0002,
+            ] {
+                assert_eq!(
+                    socket(domain),
+                    RET_ERRNO | EPERM,
+                    "{arch:?} domain {domain:#x}"
+                );
+            }
+        }
+    }
+
+    /// A bundle's profile means exactly what it says, on 64 bits, as
+    /// libseccomp has it: only the built-in profile adds the guard.
+    #[test]
+    fn a_bundles_comparisons_stay_on_64_bits() {
+        let p = profile(
+            r#"{"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": ["socket"],
+                "action": "SCMP_ACT_ALLOW",
+                "args": [{"index": 0, "value": 40, "op": "SCMP_CMP_GT"}]}]}"#,
+        );
+        let filter = compile(&p, &target(Arch::X86_64, &[])).unwrap();
+        let socket = |domain| verdict_of(&filter, Arch::X86_64, "socket", [domain, 0, 0, 0, 0, 0]);
+        assert_eq!(socket(0x1_0000_0028), RET_ALLOW);
+        assert_eq!(socket(40), RET_ERRNO | EPERM);
+    }
+
+    /// Every rule of the built-in profile that allows a call when an
+    /// argument is `>`, `>=` or `!=` a value also requires that argument's
+    /// high half to be 0: high bits the kernel ignores (an `int`'s) would
+    /// otherwise pass it. (They only make a value bigger, so an allowing
+    /// `<`, `<=` or `==` can't be passed that way; and the profile's rules
+    /// on arguments all allow, which the reasoning needs.) A newer copy of
+    /// Docker's profile without the guard fails here. (There is such a rule:
+    /// the check isn't vacuous.)
+    #[test]
+    fn dockers_profile_guards_the_high_half_of_compared_arguments() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let mut guarded = 0;
+        for rule in docker_default().unwrap().syscalls {
+            if rule.args.is_empty() {
+                continue;
+            }
+            assert_eq!(rule.action, Action::Allow, "{:?}", rule.names);
+            for arg in &rule.args {
+                if !matches!(
+                    arg.op,
+                    Operator::Greater | Operator::GreaterOrEqual | Operator::NotEqual
+                ) {
+                    continue;
+                }
+                guarded += 1;
+                assert!(
+                    rule.args.iter().any(|guard| guard.index == arg.index
+                        && guard.op == Operator::MaskedEqual
+                        && guard.value == HIGH
+                        && guard.value_two == 0),
+                    "{:?}: argument {} has no high-half guard",
+                    rule.names,
+                    arg.index
+                );
+            }
+        }
+        assert!(guarded >= 1, "{guarded}");
+    }
+
     #[test]
     fn other_architectures_and_x32_are_killed() {
         let x86 = docker(Arch::X86_64, &DOCKER_CAPS);

@@ -345,3 +345,50 @@ fn each_familys_default_route_goes_through_a_network_that_has_it() {
         running.stop();
     });
 }
+
+/// A container sends only as itself over IPv6 too (the bridge table): a
+/// datagram from another address of the network's prefix it took never
+/// reaches its neighbour, while one from its own address does.
+#[test]
+#[ignore = "needs root"]
+fn a_container_sends_only_as_itself_over_ipv6() {
+    use std::net::UdpSocket;
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        networks.create(&["--ipv6", "app"]);
+        let (one, one_netns) = networks.sleeping(&["--network", "app", "--name", "one"]);
+        let (two, two_netns) = networks.sleeping(&["--network", "app", "--name", "two"]);
+        let (own, theirs) = (
+            address6(&networks, "app", "one"),
+            address6(&networks, "app", "two"),
+        );
+        let mut octets = own.octets();
+        octets[15] = 0xee;
+        let spoofed = Ipv6Addr::from(octets);
+        in_netns(&one_netns, || {
+            let mut rt = Rtnetlink::new().unwrap();
+            let eth0 = rt.link("eth0").unwrap().unwrap();
+            rt.add_address(eth0.index, IpNet::new(IpAddr::V6(spoofed), 64).unwrap())
+                .unwrap();
+        });
+        // No duplicate address detection in the container: usable at once.
+        let arrives = |from: Ipv6Addr| {
+            let receiver = in_netns(&two_netns, || UdpSocket::bind((theirs, 9999))).unwrap();
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            in_netns(&one_netns, || {
+                let sender = UdpSocket::bind((from, 0)).unwrap();
+                for _ in 0..3 {
+                    let _ = sender.send_to(b"hello", (theirs, 9999));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+            receiver.recv_from(&mut [0_u8; 16]).is_ok()
+        };
+        assert!(arrives(own), "its own address didn't get through");
+        assert!(!arrives(spoofed), "another address got through");
+        one.stop();
+        two.stop();
+    });
+}

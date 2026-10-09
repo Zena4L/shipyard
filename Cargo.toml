@@ -108,6 +108,8 @@ missing_errors_doc = "allow"
 # No unwrap/expect outside tests (see clippy.toml); return errors instead.
 unwrap_used = "warn"
 expect_used = "warn"
+# Every `#[allow]` says why (`reason = "…"`), so it can be judged later.
+allow_attributes_without_reason = "deny"
 
 [profile.release]
 lto = "fat"
