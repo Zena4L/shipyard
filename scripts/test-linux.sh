@@ -124,6 +124,7 @@ as_tester() (
     exec setpriv --reuid tester --regid tester --init-groups \
         env HOME=/home/tester "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" \
         SHIPYARD_TEST_DELEGATED=required SHIPYARD_TEST_ROOTLESS=required \
+        SHIPYARD_TEST_TOOLS=required \
         "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" "$@"
 )
 
@@ -192,7 +193,8 @@ echo "== tests, as a normal user"
 as_tester cargo test --locked --workspace
 as_root
 echo "== tests, including the root-only ones, run as root"
-cargo test --locked --workspace -- --include-ignored
+# The image has ip, nft and dig: the differential tests (H5) must run.
+SHIPYARD_TEST_TOOLS=required cargo test --locked --workspace -- --include-ignored
 echo "== all Linux checks passed"
 EOF
 

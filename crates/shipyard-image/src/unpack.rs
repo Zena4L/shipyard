@@ -139,6 +139,19 @@ const SPACE_CHECK_EVERY: u64 = 64 * 1024 * 1024;
 /// and a block. So a layer of many of them is checked too: every 1024
 /// entries at the most.
 const ENTRY_COST: u64 = SPACE_CHECK_EVERY / 1024;
+/// The most entries placed between two checks of the free inodes.
+const ENTRIES_PER_CHECK: u64 = 1024;
+
+/// How many entries may be placed before the free inodes are checked again,
+/// given `files` (free, and the reserve to keep): half the margin above
+/// the reserve, between 1 and [`ENTRIES_PER_CHECK`]. (An entry takes one
+/// inode or a little more: see `Unpacker::count_entry`.)
+fn entries_until_check(files: Option<(u64, u64)>) -> u64 {
+    files.map_or(ENTRIES_PER_CHECK, |(available, reserve)| {
+        (available.saturating_sub(reserve) / 2).clamp(1, ENTRIES_PER_CHECK)
+    })
+}
+
 /// The most inodes (files) left free, when 5 % of a filesystem's are more.
 const MAX_FILES_RESERVE: u64 = 1_000_000;
 
@@ -588,6 +601,9 @@ struct Unpacker<'a> {
     report: LayerReport,
     /// Bytes written since the free space was last checked.
     unchecked: u64,
+    /// Entries still to place before the free space is checked again
+    /// (see [`Unpacker::count_entry`]).
+    entries_left: u64,
     buffer: Vec<u8>,
 }
 
@@ -607,6 +623,7 @@ impl<'a> Unpacker<'a> {
             options,
             report: LayerReport::default(),
             unchecked: 0,
+            entries_left: ENTRIES_PER_CHECK,
             buffer: vec![0; 64 * 1024],
         }
     }
@@ -633,6 +650,7 @@ impl<'a> Unpacker<'a> {
     /// Places one entry; a file's data is read from `data`.
     fn place(&mut self, entry: &Entry, data: &mut impl Read) -> Result<(), UnpackError> {
         self.report.entries += 1;
+        self.count_entry()?;
         self.charge(ENTRY_COST)?;
         let Some(name) = entry.path.file_name() else {
             // The layer root itself (`./`).
@@ -1062,18 +1080,34 @@ impl<'a> Unpacker<'a> {
     fn charge(&mut self, bytes: u64) -> Result<(), UnpackError> {
         self.unchecked += bytes;
         if self.unchecked >= SPACE_CHECK_EVERY {
-            self.unchecked = 0;
+            self.check_space()?;
+        }
+        Ok(())
+    }
+
+    /// Counts one entry toward the next check of the free inodes. Each
+    /// takes at least one (more where its extended attributes are charged
+    /// to the inode budget: tmpfs since Linux 6.6, every file labelled under
+    /// SELinux), so the next check comes before the entries placed since
+    /// the last could use up what was left above the reserve: after half of
+    /// it at most (and every [`ENTRIES_PER_CHECK`] anyway).
+    fn count_entry(&mut self) -> Result<(), UnpackError> {
+        self.entries_left = self.entries_left.saturating_sub(1);
+        if self.entries_left == 0 {
             self.check_space()?;
         }
         Ok(())
     }
 
     /// Refuses to go on if the filesystem is nearly full: of bytes, or of
-    /// inodes.
-    fn check_space(&self) -> Result<(), UnpackError> {
+    /// inodes. Re-arms both counters.
+    fn check_space(&mut self) -> Result<(), UnpackError> {
         let space = FreeSpace::of(self.walker.root())
             .map_err(failed("checking the free space under", Path::new("/")))?;
-        space.check(self.options.limits.min_free)
+        space.check(self.options.limits.min_free)?;
+        self.unchecked = 0;
+        self.entries_left = entries_until_check(space.files);
+        Ok(())
     }
 
     /// After the last entry: the whiteouts and opaque directories, then the
@@ -1885,6 +1919,22 @@ pub(crate) mod tests {
         let (dest, result) = extract_blob(&scratch, &blob, &spec, &[], &options);
         result.unwrap();
         assert!(dest.join("f").is_file());
+    }
+
+    /// The free inodes are checked again before the entries placed since
+    /// could use up the margin above the reserve: after half of it at most.
+    #[test]
+    fn inodes_are_checked_before_the_margin_can_go() {
+        assert_eq!(entries_until_check(None), ENTRIES_PER_CHECK);
+        assert_eq!(
+            entries_until_check(Some((1_000_000, 50_000))),
+            ENTRIES_PER_CHECK
+        );
+        // A small filesystem: 1025 free over a reserve of 1000 (the case a
+        // check every 1024 entries ran past, on tmpfs under SELinux).
+        assert_eq!(entries_until_check(Some((1025, 1000))), 12);
+        // At the reserve: checked at the next entry.
+        assert_eq!(entries_until_check(Some((1000, 1000))), 1);
     }
 
     /// Directories and empty files write no data, but each takes an inode:

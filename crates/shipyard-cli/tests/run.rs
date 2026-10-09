@@ -310,10 +310,9 @@ fn children_shipyard_had_before_are_left_running() {
     let mut command = Command::new("sh");
     command.args([
         "-c",
-        concat!(
-            "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exec '",
-            env!("CARGO_BIN_EXE_shipyard"),
-            "' run --no-isolation true"
+        &format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exec '{}' run --no-isolation true",
+            SHIPYARD.path()
         ),
     ]);
     let run = run(command);
@@ -406,4 +405,100 @@ fn the_oom_score_adjustment_reaches_the_command() {
     let run = shipyard_run(&["--oom-score-adj", "900", "cat", "/proc/self/oom_score_adj"]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, "900\n");
+}
+
+// --- `-i` and `-t` (stage 8, step 8.2a) ---
+
+/// `shipyard run ARGS…` with `input` piped to its stdin.
+fn run_fed(args: &[&str], input: &[u8]) -> Run {
+    shipyard_test_support::run_with_input(SHIPYARD.command(&[&["run"], args].concat()), Some(input))
+}
+
+/// `-it` needs a terminal to type on: Docker's rule, and its words, which
+/// scripts look for. Refused before anything starts.
+#[test]
+fn it_needs_a_terminal_to_type_on() {
+    let run = run_fed(&["-it", "true"], b"");
+    assert_eq!(run.code, Some(125), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("the input device is not a TTY"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// A bundle says in its own config.json whether it wants a terminal.
+#[test]
+fn t_with_a_bundle_points_at_its_config() {
+    let run = run_fed(&["-t", "--bundle", "/nonexistent"], b"");
+    assert_eq!(run.code, Some(125), "{}", run.stderr);
+    assert!(run.stderr.contains("process.terminal"), "{}", run.stderr);
+}
+
+// --- `-t` without isolation (stage 8, step 8.2b) ---
+
+/// With no terminal at all (no controlling terminal, input and output
+/// pipes: CI's case), `-t` still gives the command a terminal of its own.
+#[test]
+fn unisolated_t_gives_a_terminal_without_one_around() {
+    let run = run_fed(
+        &[
+            "--no-isolation",
+            "-t",
+            "sh",
+            "-c",
+            "[ -t 0 ] && [ -t 1 ] && tty",
+        ],
+        b"",
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stdout.starts_with("/dev/"), "{}", run.stdout);
+}
+
+/// `shipyard run -t … >> file` appends: the output goes through the file as
+/// it was opened, not one opened again (at offset 0, without `O_APPEND`).
+#[test]
+fn unisolated_t_appends_to_its_output_file() {
+    let path = std::env::temp_dir().join(format!("shipyard-t-append-{}", std::process::id()));
+    std::fs::write(&path, "header\n").expect("writing the file");
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("opening the file");
+    let output = SHIPYARD
+        .command(&["run", "--no-isolation", "-t", "echo", "body"])
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .output()
+        .expect("running shipyard");
+    let written = std::fs::read_to_string(&path).expect("reading the file");
+    std::fs::remove_file(&path).expect("removing the file");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(written, "header\nbody\r\n");
+}
+
+/// A command that takes a terminal (`-t`) leads its own session and group
+/// without isolation too, and that group is cleaned up as any command's:
+/// what it leaves running there goes when the run ends (macOS included,
+/// where there's no subreaper to find it).
+#[test]
+fn unisolated_t_leftovers_in_its_group_are_cleaned_up() {
+    let run = run_fed(
+        // Deaf to the hang-up its terminal gets when the run ends: only the
+        // group's cleanup ends it.
+        &[
+            "--no-isolation",
+            "-t",
+            "sh",
+            "-c",
+            "trap '' HUP; sleep 60 & echo $!",
+        ],
+        b"",
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let pid: libc::pid_t = run.stdout.trim().parse().expect("the sleep's PID");
+    assert!(
+        shipyard_test_support::gone(pid),
+        "the command's leftover {pid} is still running"
+    );
 }

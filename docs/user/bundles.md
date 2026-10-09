@@ -13,7 +13,10 @@ which `runc`, Podman and other tools read too.
 `--bundle` takes no command and none of the options that describe the container
 (`-e`, `-w`, `-u`, `--group-add`, `--ulimit`, `--hostname`, `--domainname`,
 `--sysctl`, `--rootfs`, `--read-only`, `--no-isolation`). `--stop-signal` and `--stop-timeout` still work: a
-config has no such settings. It needs Linux. Run as root, the container is rootful;
+config has no such settings. `-i` works too: as for any container, the bundle's
+process never gets your terminal, and gets your input only with `-i` (see [Input,
+output and terminals](run.md#input-output-and-terminals)). `-t` doesn't: a bundle
+asks for a terminal itself (`process.terminal`), which isn't supported yet. It needs Linux. Run as root, the container is rootful;
 run as anyone else, it's rootless (see [Rootless bundles](#rootless-bundles)). A run is
 the container's whole life, as with `runc run`: all of its [hooks](#hooks) run, from
 `prestart` to `poststop`.
@@ -206,6 +209,11 @@ A failure in a phase up to `startContainer` means the container doesn't run:
 A failing `poststart` or `poststop` hook is only a warning, as specification 1.2 says
 (1.3 makes a failing `poststart` stop the container): the rest of its phase
 runs, and so does the container.
+
+**While a `poststart` hook runs** under `shipyard run --bundle`, the container's output
+(on a terminal) and your input wait for it: Shipyard passes them on between its own
+steps. A container with a lot to say meanwhile waits once its pipe is full, so a
+`poststart` hook that waits for the container's output should have a `timeout`.
 
 **Hooks run with Shipyard's privileges:** as root, a bundle's hooks run as root on the
 host, outside the container. A bundle with hooks is code you run: only use bundles you

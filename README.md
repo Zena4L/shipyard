@@ -10,9 +10,8 @@ alternative to Docker / Podman / OrbStack with a small, clean interface.
 > container names on your own networks, IPv6). Volumes, private registries, OCI
 > bundles and an OCI runtime (`shipyard-runtime`, as runc) work too.
 >
-> **Not yet:** a pseudo-terminal of the container's own (`-it`), detached
-> containers, `exec` and logs (v0.2); isolation on macOS (v0.4). It isn't a
-> hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
+> **Not yet:** detached containers, `exec` and logs (v0.2); isolation on macOS
+> (v0.4). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
 > works is in the [user docs](docs/user/README.md), and the
 > [limitations](docs/user/README.md#limitations-in-v01) are listed there.
 
@@ -59,6 +58,7 @@ crates/
   shipyard-image/          # registries, the content-addressed image store, safe layer unpacking
   shipyard-network/        # its own netlink (rtnetlink, nf_tables), networks and leases, pasta, DNS
   shipyard-storage/        # named volumes
+  shipyard-engine/         # the engine: orchestration above the runtime, behind typed APIs
   shipyard-test-support/   # helpers for the end-to-end tests (dev only)
 contrib/apparmor/          # the AppArmor profile for hosts that restrict user namespaces
 docs/

@@ -24,6 +24,8 @@ shipyard-image = { path = "crates/shipyard-image" }
 shipyard-storage = { path = "crates/shipyard-storage" }
 # Stage 7: networking (the engine layer).
 shipyard-network = { path = "crates/shipyard-network" }
+# Stage 8: the engine itself (H1), above the runtime.
+shipyard-engine = { path = "crates/shipyard-engine" }
 
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
@@ -44,6 +46,8 @@ nix = { version = "0.31", default-features = false, features = [
   "resource",
   "sched",
   "signal",
+  # Pseudo-terminals and their settings (stage 8): `openpty`.
+  "term",
   # Netlink sockets (stage 7): `socket`, `bind`, `getsockname`, `sendto`,
   # `recvmsg` (with `uio`) and the receive timeout (with `time`).
   "socket",

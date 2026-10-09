@@ -19,7 +19,9 @@ use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 
-use shipyard_test_support::net::{Server, TestUser, Upstream, container_netns, fetch, fetch_from};
+use shipyard_test_support::net::{
+    Server, TestUser, Upstream, container_init, container_netns, fetch, fetch_from,
+};
 use shipyard_test_support::rootfs::RootFs;
 use shipyard_test_support::{
     Rootless, Running, Shipyard, in_new_netns, is_root, rootless, run, start_command,
@@ -202,6 +204,122 @@ fn a_rootless_container_never_reaches_the_hosts_loopback() {
     });
 }
 
+/// The process ID of the pasta serving the run whose runtime directory is
+/// `runtime` (its `pasta.pid`, in the run's directory), once pasta has
+/// written it (the file is made a moment before).
+fn pasta_of(runtime: &Path) -> i32 {
+    let runs = runtime.join("shipyard/runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let written = std::fs::read_dir(&runs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("pasta.pid"))
+            .find_map(|path| std::fs::read_to_string(path).ok()?.trim().parse().ok());
+        if let Some(pid) = written {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no pasta.pid in {}",
+            runs.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// pasta gets the container's network namespace as a file, never a process
+/// ID (under SELinux, `pasta_t` may not open another process's
+/// `/proc/<pid>/ns`), runs in the container's user namespace, and the host
+/// has no mount on the file.
+#[test]
+#[ignore = "needs root"]
+fn pasta_gets_the_namespace_as_a_file_the_host_never_sees_mounted() {
+    in_new_netns(|| {
+        let Some((user, _upstream)) = world() else {
+            return;
+        };
+        let runtime = runtime();
+        let (running, _netns) = sleeping(&user, &runtime, &[]);
+        let (init, _) = container_init(running.pid(), 1);
+        let pasta = pasta_of(&runtime);
+        let cmdline = std::fs::read(format!("/proc/{pasta}/cmdline")).unwrap();
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        let at = args
+            .iter()
+            .position(|arg| arg == "--netns")
+            .expect("--netns");
+        let file = &args[at + 1];
+        assert!(
+            file.starts_with(&runtime.join("shipyard/runs").to_string_lossy().into_owned())
+                && file.ends_with("/netns"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == &init.to_string()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--userns"), "{args:?}");
+        let ns =
+            |pid: &str, kind: &str| std::fs::read_link(format!("/proc/{pid}/ns/{kind}")).unwrap();
+        assert_eq!(
+            ns(&pasta.to_string(), "user"),
+            ns(&init.to_string(), "user")
+        );
+        // (pasta's own mount table can't be looked at for it: once the
+        // network is set up, pasta sandboxes itself in an empty mount
+        // namespace. That it set the network up from the file proves the
+        // bind: an empty file isn't a namespace.)
+        let mounted = |pid: &str| {
+            std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
+                .unwrap()
+                .lines()
+                .any(|line| line.split(' ').nth(4) == Some(file.as_str()))
+        };
+        assert!(!mounted("self"), "the host sees the bind mount on {file}");
+        running.signal(libc::SIGTERM);
+        let _ = running.finish_status();
+    });
+}
+
+/// Root's pasta run (`--network pasta`): the launcher doesn't join the
+/// container's user namespace, and its private mount namespace is what keeps
+/// the bind mount from propagating to the host's (shared) mounts. The
+/// network works, and the host never sees a mount on the namespace file.
+#[test]
+#[ignore = "needs root"]
+fn roots_pasta_run_leaves_no_mount_on_the_host() {
+    // Fedora's policy gives pasta (`pasta_t`) no capability in the host's
+    // own user namespace, which joining root's container needs: root's
+    // pasta can't work there (docs/user/networking.md).
+    if std::fs::read_to_string("/sys/fs/selinux/enforce").is_ok_and(|on| on.trim() == "1") {
+        eprintln!("skipping: SELinux enforcing confines pasta out of root's runs");
+        return;
+    }
+    in_new_netns(|| {
+        let upstream = Upstream::new();
+        upstream.route_default();
+        let server = Server::start(upstream.netns(), 7001, "root-out");
+        let running =
+            start_command(SHIPYARD.command(&["run", "--network", "pasta", "sleep", "30"]));
+        let netns = container_netns(running.pid());
+        assert_eq!(
+            fetch_from(&netns, at(Upstream::ADDRESS, 7001)).as_deref(),
+            Some("root-out")
+        );
+        let leaked: Vec<String> = std::fs::read_to_string("/proc/self/mountinfo")
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split(' ').nth(4).map(str::to_owned))
+            .filter(|point| point.ends_with("/netns") && point.contains("shipyard"))
+            .collect();
+        assert!(leaked.is_empty(), "the host sees {leaked:?}");
+        drop(server);
+        running.stop();
+    });
+}
+
 #[test]
 #[ignore = "needs root"]
 fn pasta_goes_with_a_killed_cli() {
@@ -211,18 +329,7 @@ fn pasta_goes_with_a_killed_cli() {
         };
         let runtime = runtime();
         let (running, _netns) = sleeping(&user, &runtime, &[]);
-        let runs = runtime.join("shipyard/runs");
-        let pid_file = std::fs::read_dir(&runs)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path().join("pasta.pid"))
-            .find(|path| path.exists())
-            .unwrap_or_else(|| panic!("no pasta.pid in {}", runs.display()));
-        let pasta: i32 = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pasta = pasta_of(&runtime);
         assert!(Path::new(&format!("/proc/{pasta}")).exists());
         // Out of the terminal's reach: a process group of its own, not
         // shipyard's (whose Ctrl-C is the container's to handle).

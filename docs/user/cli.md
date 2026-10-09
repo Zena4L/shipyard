@@ -71,6 +71,8 @@ Run a command in a container: on Linux, isolated in namespaces, optionally with 
 
 ###### **Options:**
 
+* `-i`, `--interactive` — Pass your input on to the command. Without it, an isolated command's stdin is empty (/dev/null), so it can't take keys meant for your shell
+* `-t`, `--tty` — Give the command a terminal of the container's own (a pseudo-terminal): full-screen programs, password prompts and job control work. With -i, what you type goes to it
 * `-e`, `--env <KEY[=VALUE]>` — Set an environment variable, or copy KEY from your shell if no value is given
 * `-w`, `--workdir <DIR>` — Working directory inside the container (absolute path): the image's, or `/`, if not given
 * `-u`, `--user <USER[:GROUP]>` — Run as this user and group: names (from the container's /etc/passwd and /etc/group) or numbers

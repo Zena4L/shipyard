@@ -104,7 +104,14 @@ fn close_on_exec_again(setup: &super::setup::Setup) {
         .root
         .as_ref()
         .and_then(super::setup::RootSetup::attach);
-    for fd in setup.gate.into_iter().chain(hooks_pipe).chain(attach) {
+    let terminal = setup.terminal.as_ref().map(|terminal| terminal.socket);
+    for fd in setup
+        .gate
+        .into_iter()
+        .chain(hooks_pipe)
+        .chain(attach)
+        .chain(terminal)
+    {
         let _ = nix::fcntl::fcntl(
             // SAFETY: inherited across the exec; borrowed only for this call.
             unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
@@ -199,7 +206,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     // kernel.
     let confinement = Confinement::new(&setup.security, spec.user.uid, last_cap, kernel_version())
         .unwrap_or_else(|err| fail(confinement_failure(&err)));
-    let (plan, mut context) = ChildPlan::for_container_command(
+    let (mut plan, mut context) = ChildPlan::for_container_command(
         &spec,
         setup.keep_ignored.clone(),
         setup.parent,
@@ -211,6 +218,13 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         .user_namespace
         .as_ref()
         .and_then(|namespace| namespace.maps.host_uid(0));
+    // The command's terminal, made here from the container's own devpts,
+    // its master relayed by shipyard (`-t`).
+    let slave = setup.terminal.as_ref().map(|terminal| {
+        make_terminal(terminal, spec.user.uid, spec.user.gid)
+            .unwrap_or_else(|failure| fail(failure))
+    });
+    plan.terminal = slave.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
     // With an init, its command waits until the init has confined itself
     // (`confine_self`): nothing in the container runs beside an init that
     // still has root's power. (Made before the start gate, so a failure is
@@ -250,6 +264,8 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     };
     let command = start_command(&plan, report, go, last_cap)
         .unwrap_or_else(|errno| fail(Failure::at(ChildStep::InitFork, errno)));
+    // The command has its terminal: the init keeps no part of it.
+    drop(slave);
     let (report, exec_failure) = match command_report {
         Some(read) => {
             // Our copy closed first, or the pipe never reaches end-of-file.
@@ -261,6 +277,100 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         None => (report, None),
     };
     become_init(command, status, report, exec_failure)
+}
+
+/// The command's pseudo-terminal (TLPI ch. 64): made from the container's
+/// own devpts (its root filesystem's, or the one `own_terminals` mounts),
+/// sized as the user's terminal (a new one is 0x0: probe T7), its slave
+/// opened from the master, never by path (another devpts could be mounted
+/// over it: T3), and given to the command's user, as runc does, so programs
+/// that open their terminal by name can. Everything `O_NOCTTY`: this
+/// process leads a session, and opening a terminal without it would make it
+/// the init's (T2). The master goes to shipyard (`SCM_RIGHTS`, T6), which
+/// says when it's relaying it: only then may the command write to it.
+/// Returns the slave, for the command.
+fn make_terminal(
+    terminal: &super::setup::TerminalSetup,
+    uid: u32,
+    gid: u32,
+) -> Result<OwnedFd, Failure> {
+    use nix::fcntl::OFlag;
+    let step =
+        |detail: usize| move |errno| Failure::at(ChildStep::TerminalOpen, errno).detail(detail);
+    let master = nix::fcntl::open(
+        "/dev/pts/ptmx",
+        OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(step(0))?;
+    let unlock: libc::c_int = 0;
+    // SAFETY: `TIOCSPTLCK` reads one int, which `unlock` is.
+    Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSPTLCK, &raw const unlock) })
+        .map_err(step(1))?;
+    super::terminal::set_window_size(master.as_raw_fd(), (terminal.rows, terminal.cols))
+        .map_err(step(2))?;
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `TIOCGPTPEER` takes the open flags and returns a new
+    // descriptor, which nothing else owns.
+    let slave = Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) })
+        .map_err(step(3))?;
+    // SAFETY: just returned by the kernel, ours alone.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    nix::unistd::fchown(
+        &slave,
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+    )
+    .map_err(step(4))?;
+    // SAFETY: inherited across the exec (see `Setup::terminal`), and ours.
+    let socket = unsafe { OwnedFd::from_raw_fd(terminal.socket) };
+    let sent = |errno| Failure::at(ChildStep::TerminalSend, errno);
+    super::terminal::send_fd(socket.as_fd(), master.as_fd()).map_err(sent)?;
+    drop(master);
+    // Shipyard's byte: the user's terminal is raw (if asked), and the
+    // master relayed. End-of-file: shipyard is gone.
+    let mut byte = [0_u8; 1];
+    loop {
+        match nix::unistd::read(&socket, &mut byte) {
+            Ok(1) => return Ok(slave),
+            Ok(_) => return Err(sent(Errno::EPIPE).detail(1)),
+            Err(Errno::EINTR) => {}
+            Err(errno) => return Err(sent(errno).detail(1)),
+        }
+    }
+}
+
+/// Without a root filesystem of its own, the container sees the host's
+/// `/dev`: its `/dev/pts` would name the host's terminals, the user's among
+/// them, which the container could open by path (and change, or read keys
+/// from) though it was never given one (D16). A devpts instance of its own
+/// over it shows only the container's, as a root filesystem's `/dev` does
+/// (`rootfs.rs`); and its `ptmx` over `/dev/ptmx`, so programs that make a
+/// terminal (`script`, `tmux`) make it there. Only in this mount namespace:
+/// the host's are untouched.
+fn own_terminals() -> Result<(), Errno> {
+    let mount_devpts = |options: &str| {
+        mount(
+            Some("devpts"),
+            "/dev/pts",
+            Some("devpts"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some(options),
+        )
+    };
+    // The `tty` group, where the user namespace maps it (probe T1: EINVAL
+    // where it doesn't).
+    match mount_devpts("newinstance,ptmxmode=0666,mode=0620,gid=5") {
+        Err(Errno::EINVAL) => mount_devpts("newinstance,ptmxmode=0666,mode=0620")?,
+        result => result?,
+    }
+    mount(
+        Some("/dev/pts/ptmx"),
+        "/dev/ptmx",
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
 }
 
 /// Forks the command, PID 2. It waits on the go pipe (read, write ends)
@@ -501,6 +611,9 @@ fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, F
             .map_err(at(ChildStep::MountProc))?;
         }
         sysctl::apply_at(Path::new("/proc"), &setup.sysctls)?;
+        if setup.private_mounts {
+            own_terminals().map_err(at(ChildStep::OwnTerminals))?;
+        }
         if let Some(cgroup) = setup.cgroup.mount {
             mount_cgroup_over_the_hosts(cgroup).map_err(at(ChildStep::MountCgroup))?;
         }

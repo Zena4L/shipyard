@@ -39,7 +39,7 @@ use shipyard_test_support::rootfs::RootFs;
 use shipyard_test_support::{Shipyard, child_of, is_root, killed_by};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
-const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
+const RUNTIME: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard-runtime"));
 
 /// A fake shell on a new pseudo-terminal, running `script` (see
 /// `shipyard_test_support::pty`).
@@ -78,6 +78,9 @@ const TESTS: &[(&str, fn())] = tests![
     term_is_passed_through_on_a_terminal,
     the_command_can_read_the_terminal,
     window_size_changes_reach_the_command_once,
+    unisolated_t_gives_a_terminal_of_its_own,
+    unisolated_it_ctrl_c_reaches_the_command,
+    unisolated_t_hangup_ends_the_input_of_a_command_ignoring_it,
 ];
 
 /// Tests of isolated runs (Linux, for namespaces). As root, like libtest's
@@ -90,15 +93,44 @@ const ISOLATED_TESTS: &[(&str, fn())] = tests![
     isolated_ctrl_backslash_quits_the_command,
     isolated_ctrl_z_stops_only_shipyard,
     an_isolated_command_that_stops_itself_resumes_with_ctrl_z_and_fg,
-    isolated_command_reads_the_terminal,
-    a_background_isolated_command_still_reads_the_terminal,
-    isolated_window_size_changes_reach_the_command,
+    with_i_the_command_reads_what_is_typed,
+    a_background_isolated_reader_waits_for_fg,
+    kill_of_a_run_stopped_for_input_ends_it,
+    an_isolated_command_never_holds_the_host_terminal,
+    a_bundle_run_never_holds_the_host_terminal,
+    a_bundle_without_a_pid_namespace_cant_reach_shipyards_descriptors,
+    a_poststart_hook_doesnt_hold_up_the_output,
+    a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request,
+    with_t_tty_names_the_containers_own_terminal,
+    with_t_stty_size_follows_the_window,
+    with_t_dev_tty_opens,
+    with_it_ctrl_c_reaches_the_inner_job_only,
+    with_it_ctrl_z_stops_the_inner_job_not_shipyard,
+    with_t_exit_codes_pass_through,
+    the_terminal_is_restored_after_kill_9_of_the_command,
+    the_terminal_is_restored_while_shipyard_is_stopped,
+    with_t_the_containers_descriptors_are_its_terminal_only,
+    with_it_in_the_background_waits_for_fg,
+    with_it_in_the_background_ignoring_sigttou_leaves_the_terminal_alone,
+    kill_of_a_run_waiting_for_the_terminal_ends_it,
+    a_background_run_whose_container_dies_doesnt_wait_for_fg,
+    a_raw_run_continued_in_the_background_leaves_the_terminal_alone,
+    a_flood_through_the_terminal_ends_promptly,
+    a_background_job_holding_the_terminal_doesnt_hang_the_run,
+    with_t_script_finds_its_pty_without_a_root_filesystem,
+    with_t_hangup_ends_the_command,
+    with_t_hangup_ends_the_input_of_a_command_ignoring_it,
+    with_t_kill_hup_is_forwarded,
+    with_t_the_terminal_is_the_commands_user,
+    the_terminal_survives_stops_around_the_end_of_runs,
+    the_shells_terminal_stays_blocking_after_kill_9_of_shipyard,
+    isolated_window_size_changes_are_forwarded,
     isolated_command_has_no_controlling_terminal,
     isolated_hangup_ends_the_command_and_shipyard,
     an_isolated_command_ignoring_hangup_keeps_running,
     with_a_root_filesystem_ctrl_c_is_forwarded_exactly_once,
-    with_a_root_filesystem_window_size_changes_reach_the_command,
-    a_root_filesystem_has_its_own_terminals,
+    with_a_root_filesystem_window_size_changes_are_forwarded,
+    in_a_root_filesystem_the_command_has_no_terminal,
     a_container_created_from_a_terminal_keeps_it,
     ctrl_c_during_a_hook_ends_the_run,
     ctrl_z_and_fg_with_limits,
@@ -503,8 +535,10 @@ fn kill_to_a_background_shipyard_is_forwarded() {
 
 /// A `kill -INT` to a *foreground* shipyard: Linux tells it apart from a
 /// typed Ctrl-C and forwards it; macOS can't, so it isn't forwarded there
-/// (documented in docs/user/run.md). USR1, sent second, is forwarded on both
-/// and marks the point by which a forwarded INT would have shown up.
+/// (documented in docs/user/run.md). USR1, sent after, is forwarded on both
+/// and marks the point by which a forwarded INT would have shown up. On
+/// Linux the INT's trap is waited for first: a shell with both pending may
+/// run USR1's (which exits) before INT's, as bash does.
 fn kill_to_a_foreground_shipyard() {
     let mut session = session(foreground_sh!(
         "trap 'echo got-int; kill $!' INT; trap 'echo got-usr1; kill $!; exit 0' USR1; echo ready; \
@@ -513,10 +547,12 @@ fn kill_to_a_foreground_shipyard() {
     let shipyard = session.job();
     session.expect("ready");
     // SAFETY: `kill` only sends signals to the shipyard this test started.
-    unsafe {
-        assert_eq!(libc::kill(shipyard, libc::SIGINT), 0);
-        assert_eq!(libc::kill(shipyard, libc::SIGUSR1), 0);
+    assert_eq!(unsafe { libc::kill(shipyard, libc::SIGINT) }, 0);
+    if cfg!(target_os = "linux") {
+        session.expect("got-int");
     }
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(shipyard, libc::SIGUSR1) }, 0);
     session.expect("got-usr1");
     assert_eq!(session.status(), Status::Exited(0));
     assert_eq!(
@@ -588,18 +624,11 @@ fn a_stop_request_still_kills_a_command_that_stops_itself() {
 /// without one), and stays alive until the end so the terminal does too.
 fn without_job_control_shipyard_does_not_stop_itself() {
     let mut session = session(|shell| {
-        let job = shell.spawn_program(
-            Mode::Foreground,
-            "sh",
-            &[
-                "-c",
-                concat!(
-                    "'",
-                    env!("CARGO_BIN_EXE_shipyard"),
-                    "' --debug run --no-isolation sh -c 'sleep 0.5; kill -STOP $$' & echo \"shipyard $!\""
-                ),
-            ],
+        let script = format!(
+            "'{}' --debug run --no-isolation sh -c 'sleep 0.5; kill -STOP $$' & echo \"shipyard $!\"",
+            SHIPYARD.path()
         );
+        let job = shell.spawn_program(Mode::Foreground, "sh", &["-c", &script]);
         shell.wait_leaving_terminal(job);
         shell.await_go();
     });
@@ -744,9 +773,10 @@ fn isolated_ctrl_backslash_quits_the_command() {
 }
 
 /// Ctrl-Z stops shipyard only. The command isn't in the terminal's group,
-/// so it keeps running, and its output keeps coming. When it finishes while
+/// so it keeps running; its output, which shipyard relays (it never holds
+/// the terminal: D16), waits in the pipe until `fg`. When it finishes while
 /// shipyard is stopped, nothing reaps it until `fg` resumes shipyard, which
-/// then reports the result.
+/// then passes on its last lines and reports the result.
 fn isolated_ctrl_z_stops_only_shipyard() {
     let mut session = session(|shell| {
         let job = shell.spawn(
@@ -775,52 +805,322 @@ fn isolated_ctrl_z_stops_only_shipyard() {
         !process_state(init).starts_with('T'),
         "the container was stopped too"
     );
-    // Still running: its last lines arrive while shipyard is stopped.
-    session.expect("finished");
+    // Still running, and done within its 3 s; its last lines wait for
+    // shipyard.
+    session.settle(std::time::Duration::from_secs(4));
+    assert_eq!(session.count("finished"), 0, "{}", session.transcript());
     assert!(
         process_state(shipyard).starts_with('T'),
         "shipyard was resumed"
     );
     session.go();
+    session.expect("finished");
     assert_eq!(session.status(), Status::Exited(0));
     session.finish();
 }
 
-/// In the foreground, the command reads the terminal. (Reading a terminal
-/// that isn't your controlling one is just reading a file.)
-fn isolated_command_reads_the_terminal() {
-    let mut session = session(foreground_isolated!("read x; echo \"got $x\""));
-    session.job();
-    session.type_keys(b"hi\n");
-    session.expect("got hi");
-    assert_eq!(session.status(), Status::Exited(0));
-    session.finish();
-}
-
-/// A known limitation (docs/user/run.md): in the background, the command
-/// isn't stopped by SIGTTIN when it reads the terminal (only a process whose
-/// controlling terminal it is gets that), so it reads what's typed, competing
-/// with the shell. Without isolation it would stop
-/// (`a_background_job_reading_the_terminal_waits_for_fg`).
-fn a_background_isolated_command_still_reads_the_terminal() {
+/// With `-i`, what's typed reaches the command (through shipyard's relay:
+/// D16), and ^D ends its input.
+fn with_i_the_command_reads_what_is_typed() {
     let mut session = session(|shell| {
         let job = shell.spawn(
-            Mode::Background,
-            &["run", "sh", "-c", "read x; echo \"got $x\""],
+            Mode::Foreground,
+            &[
+                "run",
+                "-i",
+                "sh",
+                "-c",
+                "read x; echo \"got $x\"; if read y; then echo more; else echo e\"\"nd; fi",
+            ],
         );
         shell.wait(job);
     });
     session.job();
+    session.type_keys(b"hi\n");
+    session.expect("got hi");
+    session.type_keys(b"\x04");
+    session.expect("end");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// In the background, `-i` doesn't take the shell's keys: shipyard, which
+/// reads the terminal for the command, is stopped by SIGTTIN as any program
+/// would be, until `fg`. (Before D16, the command held the terminal and read
+/// what was typed, competing with the shell.)
+fn a_background_isolated_reader_waits_for_fg() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Background,
+            &["run", "-i", "sh", "-c", "read x; echo \"got $x\""],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    session.job();
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTTIN));
+    session.go();
     session.type_keys(b"x\n");
     session.expect("got x");
     assert_eq!(session.status(), Status::Exited(0));
     session.finish();
 }
 
-/// Window-size changes are forwarded once, and the command sees the new
-/// size through its descriptor: `stty size` asks with `TIOCGWINSZ`, which
-/// works on any terminal descriptor.
-fn isolated_window_size_changes_reach_the_command() {
+/// A run stopped for input (SIGTTIN, above) still ends on `kill %1`: the
+/// shell's SIGTERM, then SIGCONT. Shipyard must not stop itself again for
+/// the terminal while it's stopping the command.
+fn kill_of_a_run_stopped_for_input_ends_it() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Background,
+            &[
+                "run",
+                "-i",
+                "--stop-timeout",
+                "1",
+                "sh",
+                "-c",
+                "read x; echo \"got $x\"",
+            ],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTTIN));
+    // As bash's `kill %1`: SIGTERM, then SIGCONT to the job.
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe {
+        libc::kill(shipyard, libc::SIGTERM);
+        libc::kill(shipyard, libc::SIGCONT);
+    }
+    session.go();
+    assert_eq!(
+        session.status(),
+        Status::Exited(killed_by(libc::SIGTERM)),
+        "{}",
+        session.transcript()
+    );
+    assert_eq!(session.count("got"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// D16: an isolated command never holds the host's terminal, so it can't
+/// type into it (`TIOCSTI`) or change its settings: its descriptors are
+/// pipes (and `/dev/null` for stdin without `-i`), relayed by shipyard. Nor
+/// can it open the terminal by path: without a root filesystem of its own,
+/// its `/dev/pts` is a devpts instance of its own, which holds no terminal
+/// yet (only `ptmx`). The terminal's settings are the same after as before
+/// (F17), and the output keeps its order (stdout and stderr share one pipe
+/// on one terminal).
+fn an_isolated_command_never_holds_the_host_terminal() {
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "run",
+                "sh",
+                "-c",
+                "for fd in 0 1 2; do [ -t $fd ] && echo \"fd $fd: a t\"\"ty\"; done; \
+                 stty raw 2>/dev/null || echo cannot-change; \
+                 echo \"pts: $(ls /dev/pts | tr '\\n' ' ')\"; \
+                 echo \"term=[$(printenv TERM)]\"; \
+                 echo one; echo two >&2; echo three",
+            ],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("cannot-change");
+    session.expect("pts: ptmx \r\n");
+    // No terminal, so no `TERM` to tempt it into sending a terminal's escapes.
+    session.expect("term=[]");
+    session.expect("one");
+    session.expect("two");
+    session.expect("three");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.expect("settings unchanged");
+    assert_eq!(session.count("a tty"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// The same for a bundle's run (`--bundle` takes the same path).
+fn a_bundle_run_never_holds_the_host_terminal() {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!([
+        "sh",
+        "-c",
+        "for fd in 0 1 2; do [ -t $fd ] && echo \"fd $fd: a t\"\"ty\"; done; echo do\"\"ne"
+    ]);
+    bundle.write(&config);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(BUNDLE_VAR, bundle.arg()) };
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let job = shell.spawn(Mode::Foreground, &["run", "--bundle", &bundle]);
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("done");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    assert_eq!(session.count("a tty"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// A bundle without a PID namespace sees shipyard in its `/proc`. While
+/// shipyard relays the terminal for it, the container's processes (the same
+/// user, here root) mustn't reach it through `/proc/<shipyard>/fd/N`.
+/// Following those links is checked as a debugger's access would be, and the
+/// kernel refuses a process that lacks any capability its target has (the
+/// container has fewer than shipyard; rootless, it has none in shipyard's
+/// user namespace), whether or not shipyard is dumpable. (Listing the
+/// directory isn't checked so: that's only its mode, and root owns it
+/// either way.) The control: shipyard is there to be seen (its `status` is
+/// readable by anyone).
+fn a_bundle_without_a_pid_namespace_cant_reach_shipyards_descriptors() {
+    if !is_root() {
+        println!("skipping: a bundle without a PID namespace runs as root here");
+        return;
+    }
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["linux"]["namespaces"] =
+        serde_json::json!([{"type": "mount"}, {"type": "uts"}, {"type": "ipc"}]);
+    config["mounts"] =
+        serde_json::json!([{"destination": "/proc", "type": "proc", "source": "proc"}]);
+    config["process"]["args"] = serde_json::json!([
+        "sh",
+        "-c",
+        "case \"$(head -1 /proc/$PPID/status)\" in *shipyard*) echo sees-ship\"\"yard;; esac; \
+         if readlink /proc/$PPID/fd/0 >/dev/null 2>&1 || cat /proc/$PPID/fd/0 </dev/null >/dev/null 2>&1; \
+         then echo re\"\"ached; else echo hid\"\"den; fi"
+    ]);
+    bundle.write(&config);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(BUNDLE_VAR, bundle.arg()) };
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let job = shell.spawn(Mode::Foreground, &["run", "--bundle", &bundle]);
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("sees-shipyard");
+    session.expect("hidden");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    assert_eq!(session.count("reached"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// A terminal that takes nothing (Ctrl-S: the user paused it) can't keep
+/// shipyard once the command has ended: its last output waits for the
+/// terminal, but a stop request (SIGTERM) throws that away. Twice: output
+/// that fits in the pipe and the relay (the command ends; SIGTERM reaches
+/// shipyard as it waits on the terminal), and output that doesn't (the
+/// command is blocked; SIGTERM stops it first).
+fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
+    for (bytes, ends) in [
+        ("100000", Status::Exited(0)),
+        ("400000", Status::Exited(killed_by(libc::SIGTERM))),
+    ] {
+        // SAFETY: this test binary is single-threaded (see the module docs).
+        unsafe { std::env::set_var(STALL_BYTES_VAR, bytes) };
+        let mut session = session(|shell| {
+            let bytes = std::env::var(STALL_BYTES_VAR).expect("the test sets the size");
+            let script = format!("echo re\"\"ady; sleep 1; head -c {bytes} /dev/zero | tr '\\0' x");
+            let job = shell.spawn(Mode::Foreground, &["run", "sh", "-c", &script]);
+            shell.wait(job);
+        });
+        let shipyard = session.job();
+        session.expect("ready");
+        // XOFF: the terminal stops taking output.
+        session.type_keys(b"\x13");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the
+        // job.
+        unsafe { libc::kill(shipyard, libc::SIGTERM) };
+        assert_eq!(session.status(), ends, "{bytes}: {}", session.transcript());
+        // (The shell is done and its terminal closed: nothing to resume.)
+        session.finish();
+    }
+}
+
+/// The size of [`a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request`]'s
+/// output, for the forked shell.
+const STALL_BYTES_VAR: &str = "SHIPYARD_TEST_STALL_BYTES";
+
+/// A `poststart` hook runs while the relay waits (it runs in shipyard's
+/// loop, between its turns: docs/user/bundles.md): the command's output
+/// still arrives, all of it, once the hook is done.
+fn a_poststart_hook_doesnt_hold_up_the_output() {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["hooks"] = serde_json::json!({"poststart": [{
+        "path": "/bin/sh",
+        "args": ["sh", "-c", "sleep 1"]
+    }]});
+    config["process"]["args"] =
+        serde_json::json!(["sh", "-c", "echo fir\"\"st; sleep 2; echo la\"\"st"]);
+    bundle.write(&config);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(BUNDLE_VAR, bundle.arg()) };
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let job = shell.spawn(Mode::Foreground, &["run", "--bundle", &bundle]);
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("first");
+    session.expect("last");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// The relay reads and writes the terminal through an open file of its own:
+/// the shell's stays blocking even when shipyard is killed outright, with no
+/// chance to put anything back (a shared `O_NONBLOCK` would make the shell's
+/// next read fail).
+fn the_shells_terminal_stays_blocking_after_kill_9_of_shipyard() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "-i", "sh", "-c", "echo re\"\"ady; read x"],
+        );
+        shell.wait(job);
+        shell.report_blocking();
+    });
+    let shipyard = session.job();
+    session.expect("ready");
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe { libc::kill(shipyard, libc::SIGKILL) };
+    assert_eq!(session.status(), Status::Signaled(libc::SIGKILL));
+    session.expect("terminal blocking");
+    session.finish();
+}
+
+/// Window-size changes are forwarded once. (The command has no terminal to
+/// read the size from: D16. With `-t`, the size is its own terminal's.)
+fn isolated_window_size_changes_are_forwarded() {
     let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
@@ -829,7 +1129,7 @@ fn isolated_window_size_changes_reach_the_command() {
                 "run",
                 "sh",
                 "-c",
-                "trap 'stty size; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
+                "trap 'echo got-w\"\"inch; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
             ],
         );
         shell.wait(job);
@@ -838,7 +1138,7 @@ fn isolated_window_size_changes_reach_the_command() {
     session.expect("giving the command its own process group");
     session.expect("ready");
     session.resize(40, 100);
-    session.expect("40 100");
+    session.expect("got-winch");
     assert_eq!(session.status(), Status::Exited(0));
     assert_eq!(
         session.count("forwarding a signal"),
@@ -850,14 +1150,15 @@ fn isolated_window_size_changes_reach_the_command() {
 }
 
 /// The command has no controlling terminal: `/dev/tty` can't be opened
-/// (ENXIO), though its descriptors are still the terminal. Programs that
-/// open `/dev/tty` to ask for a password fail (docs/user/run.md).
+/// (ENXIO), and its descriptors aren't a terminal either (D16). Programs
+/// that open `/dev/tty` to ask for a password fail without `-t`
+/// (docs/user/run.md).
 fn isolated_command_has_no_controlling_terminal() {
     let mut session = session(foreground_isolated!(
         "tty; if (: < /dev/tty) 2>/dev/null; then echo has-c\"\"tty; else echo no-c\"\"tty; fi"
     ));
     session.job();
-    session.expect("/dev/pts/");
+    session.expect("not a tty");
     session.expect("no-ctty");
     assert_eq!(session.status(), Status::Exited(0));
     assert_eq!(session.count("has-ctty"), 0, "{}", session.transcript());
@@ -971,30 +1272,28 @@ fn with_a_root_filesystem_ctrl_c_is_forwarded_exactly_once() {
     session.finish();
 }
 
-/// As [`isolated_window_size_changes_reach_the_command`], in a root
-/// filesystem: the size is the terminal's, set on the descriptor the
-/// command holds, wherever its `/dev` is.
-fn with_a_root_filesystem_window_size_changes_reach_the_command() {
+/// As [`isolated_window_size_changes_are_forwarded`], in a root filesystem.
+fn with_a_root_filesystem_window_size_changes_are_forwarded() {
     let _root = rootfs();
     let mut session = session(|shell| {
         foreground_in_rootfs(
             shell,
             &["--debug"],
-            "trap 'stty size; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
+            "trap 'echo got-w\"\"inch; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
         );
     });
     session.job();
     session.expect("ready");
     session.resize(40, 100);
-    session.expect("40 100");
+    session.expect("got-winch");
     assert_eq!(session.status(), Status::Exited(0));
     session.finish();
 }
 
-/// A root filesystem's `/dev/pts` is its own: the terminal the command was
-/// given (the host's) isn't in it, so `tty` can't name it. The command
-/// still writes to it.
-fn a_root_filesystem_has_its_own_terminals() {
+/// In a root filesystem the command has no terminal either (D16): `tty`
+/// says so, and its output still arrives, relayed. (Its `/dev/pts` is its
+/// own; `-t` gives it a terminal there.)
+fn in_a_root_filesystem_the_command_has_no_terminal() {
     let _root = rootfs();
     let mut session = session(|shell| {
         foreground_in_rootfs(shell, &[], "tty; echo wr\"\"ote");
@@ -1022,7 +1321,7 @@ struct StateRoot(std::path::PathBuf);
 
 impl Drop for StateRoot {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(RUNTIME)
+        let _ = std::process::Command::new(RUNTIME.path())
             .arg("--root")
             .arg(&self.0)
             .args(["delete", "--force", ON_A_TTY])
@@ -1059,7 +1358,7 @@ fn a_container_created_from_a_terminal_keeps_it() {
         let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
         let runtime = |shell: &mut Shell, args: &[&str]| {
             let args = [&["--root", root.as_str()], args].concat();
-            let job = shell.spawn_program(Mode::Foreground, RUNTIME, &args);
+            let job = shell.spawn_program(Mode::Foreground, RUNTIME.path(), &args);
             shell.wait(job);
         };
         runtime(shell, &["create", "--bundle", &bundle, ON_A_TTY]);
@@ -1201,8 +1500,9 @@ fn ctrl_c_during_a_hook_ends_the_run() {
 }
 
 /// Ctrl-Z stops shipyard (the isolated command, in a session of its own,
-/// goes on), and the run's cgroup and limits stay through the stop; `fg`
-/// resumes shipyard, which reports the end, and the cgroup goes with the run.
+/// goes on, its output waiting for the relay), and the run's cgroup and
+/// limits stay through the stop; `fg` resumes shipyard, which passes the
+/// output on and reports the end, and the cgroup goes with the run.
 fn ctrl_z_and_fg_with_limits() {
     if !cgroups_here() {
         return;
@@ -1240,8 +1540,9 @@ fn ctrl_z_and_fg_with_limits() {
         "67108864",
         "the limit through the stop"
     );
-    session.expect("done");
+    // Its output waits in the relay's pipe until shipyard is resumed (D16).
     session.go();
+    session.expect("done");
     assert_eq!(
         session.status(),
         Status::Exited(0),
@@ -1277,7 +1578,7 @@ fn an_oom_kill_on_a_terminal() {
         shell.await_go();
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "sh", "-c", "read x; echo \"got $x\""],
+            &["run", "-i", "sh", "-c", "read x; echo \"got $x\""],
         );
         shell.wait(job);
     });
@@ -1324,7 +1625,7 @@ fn pause_on_a_terminal() {
         let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
         let runtime = |shell: &mut Shell, args: &[&str]| {
             let args = [&["--root", root.as_str()], args].concat();
-            let job = shell.spawn_program(Mode::Foreground, RUNTIME, &args);
+            let job = shell.spawn_program(Mode::Foreground, RUNTIME.path(), &args);
             shell.wait(job);
         };
         runtime(shell, &["create", "--bundle", &bundle, ON_A_TTY]);
@@ -1373,5 +1674,565 @@ fn pause_on_a_terminal() {
     session.go();
     ok(&mut session, "kill --all");
     ok(&mut session, "delete");
+    session.finish();
+}
+
+// --- `-t`: a terminal of the container's own (stage 8, step 8.2b) ---
+
+/// Starts `shipyard run ARGS… sh -c SCRIPT` in the foreground and waits.
+macro_rules! foreground_t {
+    ([$($arg:expr),*], $script:expr) => {
+        |shell: &mut Shell| {
+            let job = shell.spawn(Mode::Foreground, &["run", $($arg,)* "sh", "-c", $script]);
+            shell.wait(job);
+        }
+    };
+}
+
+/// `tty` names the container's own terminal: the first of its own devpts,
+/// with a root filesystem and without one (8.2a's devpts).
+fn with_t_tty_names_the_containers_own_terminal() {
+    let mut without = session(foreground_t!(["-it"], "tty"));
+    without.job();
+    without.expect("/dev/pts/0");
+    assert_eq!(without.status(), Status::Exited(0));
+    without.finish();
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let path = std::env::var(ROOTFS_VAR).expect("the test sets the root filesystem");
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "-it", "--rootfs", &path, "sh", "-c", "tty"],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("/dev/pts/0");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// The container's terminal starts at the user's size (30 by 90 here: not
+/// the default 24 by 80, nor 0 by 0 as a new one would be) and follows it.
+fn with_t_stty_size_follows_the_window() {
+    let mut session = session(|shell| {
+        shell.await_go();
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "run",
+                "-it",
+                "sh",
+                "-c",
+                "stty size; trap 'stty size; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.resize(30, 90);
+    session.go();
+    session.job();
+    session.expect("30 90");
+    session.expect("ready");
+    session.resize(40, 100);
+    session.expect("40 100");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// `/dev/tty` opens: the terminal is the command's controlling terminal (how
+/// `sudo` and `ssh` ask for a password).
+fn with_t_dev_tty_opens() {
+    let mut session = session(foreground_t!(["-it"], "echo via-dev-t\"\"ty > /dev/tty"));
+    session.job();
+    session.expect("via-dev-tty");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// With `-it` the user's terminal is raw: Ctrl-C is a byte the container's
+/// terminal turns into SIGINT for its foreground job. Shipyard gets no
+/// signal and forwards none.
+fn with_it_ctrl_c_reaches_the_inner_job_only() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "--debug",
+                "run",
+                "-it",
+                "sh",
+                "-c",
+                "trap 'echo got-i\"\"nt; exit 0' INT; echo re\"\"ady; while :; do sleep 0.1; done",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("ready");
+    session.type_keys(CTRL_C);
+    session.expect("got-int");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(
+        session.count("forwarding a signal"),
+        0,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// Ctrl-Z stops the container's foreground job (job control inside), not
+/// Shipyard: the inner shell carries on at once.
+fn with_it_ctrl_z_stops_the_inner_job_not_shipyard() {
+    let mut session = session(foreground_t!(
+        ["-it"],
+        "set -m; echo re\"\"ady; sleep 5; echo after-sl\"\"eep"
+    ));
+    let shipyard = session.job();
+    session.expect("ready");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let stopped_at = std::time::Instant::now();
+    session.type_keys(CTRL_Z);
+    // Long before the 5 s sleep would have ended: it was stopped.
+    session.expect("after-sleep");
+    assert!(stopped_at.elapsed() < std::time::Duration::from_secs(3));
+    assert!(
+        !process_state(shipyard).starts_with('T'),
+        "shipyard was stopped"
+    );
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// The command's exit code is the run's.
+fn with_t_exit_codes_pass_through() {
+    let mut session = session(foreground_t!(["-it"], "exit 7"));
+    session.job();
+    assert_eq!(session.status(), Status::Exited(7));
+    session.finish();
+}
+
+/// The user's terminal is put back after the run, even when the command
+/// dies of SIGKILL (F17's case, now with Shipyard the only one to change it).
+fn the_terminal_is_restored_after_kill_9_of_the_command() {
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "-it", "sh", "-c", "echo re\"\"ady; kill -9 $$"],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("ready");
+    assert_eq!(session.status(), Status::Exited(killed_by(libc::SIGKILL)));
+    session.expect("settings unchanged");
+    session.finish();
+}
+
+/// Stopped (`kill -TSTP`: Ctrl-Z can't reach it in raw mode), Shipyard puts
+/// the terminal back for the shell; `fg` makes it raw again, and the
+/// container's shell is still there.
+fn the_terminal_is_restored_while_shipyard_is_stopped() {
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let job = shell.spawn(Mode::Foreground, &["run", "-it", "sh"]);
+        shell.wait(job);
+        shell.report_settings(&before);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    session.expect("# ");
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe { libc::kill(shipyard, libc::SIGTSTP) };
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTSTP));
+    session.expect("settings unchanged");
+    session.go();
+    session.type_keys(b"exit 4\r");
+    assert_eq!(
+        session.status(),
+        Status::Exited(4),
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// The command's descriptors are its own terminal's: no master (`ptmx`),
+/// nothing of the user's.
+fn with_t_the_containers_descriptors_are_its_terminal_only() {
+    let mut session = session(foreground_t!(
+        ["-it"],
+        "ls -l /proc/self/fd/; echo do\"\"ne"
+    ));
+    session.job();
+    session.expect("/dev/pts/0");
+    session.expect("done");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(session.count("ptmx"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// `-it` in the background waits for `fg` before making the terminal raw
+/// (job control: SIGTTOU), then runs.
+fn with_it_in_the_background_waits_for_fg() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Background,
+            &["run", "-it", "sh", "-c", "echo started-\"\"ok"],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    session.job();
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTTOU));
+    session.go();
+    session.expect("started-ok");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// With SIGTTOU ignored nothing would stop Shipyard in the background, and a
+/// background program mustn't change the shell's terminal: the run goes on
+/// without raw mode or input.
+fn with_it_in_the_background_ignoring_sigttou_leaves_the_terminal_alone() {
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let script = format!(
+            "trap '' TTOU; exec {} run -it sh -c 'echo ran-an\"\"yway'",
+            SHIPYARD.path()
+        );
+        let job = shell.spawn_program(Mode::Background, "/bin/sh", &["-c", &script]);
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("ran-anyway");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.expect("settings unchanged");
+    session.finish();
+}
+
+/// `kill %1` (SIGTERM, then SIGCONT) ends a background `-it` stopped while
+/// waiting for the terminal: it doesn't stop again for it.
+fn kill_of_a_run_waiting_for_the_terminal_ends_it() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Background,
+            &["run", "-it", "--stop-timeout", "1", "sh", "-c", "sleep 100"],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTTOU));
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe {
+        libc::kill(shipyard, libc::SIGTERM);
+        libc::kill(shipyard, libc::SIGCONT);
+    }
+    session.go();
+    let ended = session.status();
+    assert!(
+        matches!(ended, Status::Exited(code) if code == killed_by(libc::SIGTERM) || code == killed_by(libc::SIGKILL)),
+        "{ended:?}\n{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// A background `-it` waiting for `fg` whose container dies meanwhile (its
+/// init killed from outside): once continued, it ends, rather than stopping
+/// again for a terminal its command will never use.
+fn a_background_run_whose_container_dies_doesnt_wait_for_fg() {
+    let mut session = session(|shell| {
+        // No network: no pasta, so the init is Shipyard's only child.
+        let job = shell.spawn(
+            Mode::Background,
+            &["run", "-it", "--network", "none", "sh", "-c", "sleep 100"],
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTTOU));
+    let init = child_of(shipyard);
+    // SAFETY: `kill` has no memory-safety conditions; `init` is the
+    // container's init.
+    unsafe { libc::kill(init, libc::SIGKILL) };
+    // Dead (a zombie, for Shipyard to reap) before Shipyard goes on.
+    eventually("the init to die", || process_state(init).starts_with('Z'));
+    // SAFETY: as above; `shipyard` is the job.
+    unsafe { libc::kill(shipyard, libc::SIGCONT) };
+    session.go();
+    let ended = session.status();
+    assert!(
+        matches!(ended, Status::Exited(_)),
+        "{ended:?}\n{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// Stopped with `kill -TSTP`, then continued in the background (`bg`), a
+/// raw run leaves the shell's terminal as it is, even where nothing would
+/// stop it for changing it (SIGTTOU and SIGTTIN ignored): raw again only in
+/// the foreground.
+fn a_raw_run_continued_in_the_background_leaves_the_terminal_alone() {
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let script = format!(
+            "trap '' TTOU TTIN; exec {} run -it sh -c 'echo re\"\"ady; sleep 3'",
+            SHIPYARD.path()
+        );
+        let job = shell.spawn_program(Mode::Foreground, "/bin/sh", &["-c", &script]);
+        shell.wait(job);
+        shell.await_go();
+        shell.bg(job);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        shell.report_settings(&before);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    session.expect("ready");
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe { libc::kill(shipyard, libc::SIGTSTP) };
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTSTP));
+    session.go();
+    session.expect("settings unchanged");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// A lot of output through the terminal: all of it, and the run ends.
+fn a_flood_through_the_terminal_ends_promptly() {
+    let mut session = session(foreground_t!(
+        ["-it"],
+        "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo do\"\"ne"
+    ));
+    session.job();
+    session.expect("done");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// A background job keeping the terminal open doesn't keep the run: it ends
+/// when the command does (the container goes with it).
+fn a_background_job_holding_the_terminal_doesnt_hang_the_run() {
+    let mut session = session(foreground_t!(["-it"], "(sleep 100 &); echo do\"\"ne"));
+    session.job();
+    session.expect("done");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// Programs that make a terminal of their own (`script`, `tmux`, `ssh`) make
+/// it on the container's devpts, where they find it, without a root
+/// filesystem too.
+fn with_t_script_finds_its_pty_without_a_root_filesystem() {
+    let mut session = session(foreground_t!(["-it"], "script -qc tty /dev/null"));
+    session.job();
+    session.expect("/dev/pts/1");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// The user's terminal hangs up: so does the container's (its session gets
+/// SIGHUP), and the run ends 129.
+fn with_t_hangup_ends_the_command() {
+    let mut session = session(foreground_t!(["-it"], "echo re\"\"ady; exec sleep 100"));
+    session.job();
+    session.expect("ready");
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(killed_by(libc::SIGHUP)));
+    session.finish();
+}
+
+/// A command deaf to SIGHUP that reads its terminal until it ends, then
+/// exits 5.
+const HUP_DEAF: &str = "trap '' HUP; echo re\"\"ady; while read x; do :; done; exit 5";
+
+/// A hang-up is the terminal's, not only a signal: a command ignoring
+/// SIGHUP still finds its terminal gone (its reads end), as on a real
+/// terminal, rather than waiting on one nobody can type on.
+fn with_t_hangup_ends_the_input_of_a_command_ignoring_it() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(Mode::Foreground, &["run", "-it", "sh", "-c", HUP_DEAF]);
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("ready");
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(5));
+    session.finish();
+}
+
+/// `kill -HUP` (a reload, not a hang-up) is forwarded to the command, and
+/// its terminal stays.
+fn with_t_kill_hup_is_forwarded() {
+    let mut session = session(foreground_t!(
+        ["-it"],
+        "trap 'echo got-h\"\"up; exit 0' HUP; echo re\"\"ady; while :; do sleep 0.1; done"
+    ));
+    let shipyard = session.job();
+    session.expect("ready");
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe { libc::kill(shipyard, libc::SIGHUP) };
+    session.expect("got-hup");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// The terminal belongs to the command's user, so programs that open it by
+/// name can (`GPG_TTY`, `screen`).
+fn with_t_the_terminal_is_the_commands_user() {
+    // As root: a rootless run here gets only the single-ID map (the fake
+    // shell's jobs have no PATH to find newuidmap), where 1000 doesn't exist.
+    if !is_root() {
+        println!("skipping: only root's runs map user 1000 here");
+        return;
+    }
+    let mut session = session(foreground_t!(
+        ["-it", "--user", "1000"],
+        "test -O \"$(tty)\" && echo owns-it || echo not-its-own"
+    ));
+    session.job();
+    session.expect("owns-it");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// The name of the terminal the fake shell runs on (its stdin).
+fn shells_terminal() -> String {
+    // SAFETY: `ttyname` returns a string in static storage (or null), read
+    // at once; this binary is single-threaded.
+    let name = unsafe { libc::ttyname(libc::STDIN_FILENO) };
+    assert!(!name.is_null(), "the fake shell runs on a terminal");
+    // SAFETY: non-null, so a C string.
+    unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Without isolation `-t` makes a terminal on the host: the command's own,
+/// not the user's (Linux and macOS).
+fn unisolated_t_gives_a_terminal_of_its_own() {
+    let mut session = session(|shell| {
+        let users = format!("USERS_TTY={}", shells_terminal());
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "run",
+                "--no-isolation",
+                "-it",
+                "-e",
+                &users,
+                "sh",
+                "-c",
+                "t=$(tty); [ -t 0 ] && case $t in /dev/*) [ \"$t\" != \"$USERS_TTY\" ] && echo own-te\"\"rminal;; esac",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("own-terminal");
+    assert_eq!(session.status(), Status::Exited(0));
+    session.finish();
+}
+
+/// Without isolation too (Linux and macOS), closing the user's terminal
+/// hangs up the command's: one deaf to SIGHUP finds its input ended.
+fn unisolated_t_hangup_ends_the_input_of_a_command_ignoring_it() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "--no-isolation", "-it", "sh", "-c", HUP_DEAF],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("ready");
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(5));
+    session.finish();
+}
+
+/// Without isolation, `-it`'s Ctrl-C reaches the command through its own
+/// terminal: a byte its line discipline makes SIGINT, not a signal Shipyard
+/// forwards.
+fn unisolated_it_ctrl_c_reaches_the_command() {
+    let mut session = session(|shell| {
+        let job = shell.spawn(
+            Mode::Foreground,
+            &[
+                "--debug",
+                "run",
+                "--no-isolation",
+                "-it",
+                "sh",
+                "-c",
+                "trap 'echo got-i\"\"nt; exit 0' INT; echo re\"\"ady; while :; do sleep 0.1; done",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("ready");
+    session.type_keys(CTRL_C);
+    session.expect("got-int");
+    assert_eq!(session.status(), Status::Exited(0));
+    assert_eq!(
+        session.count("forwarding a signal"),
+        0,
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// SIGTSTP sent to `-it` runs at every point from their start to their end,
+/// once or twice in a row, then `fg`: the terminal is never left raw (nor
+/// raw settings saved as the ones to put back).
+fn the_terminal_survives_stops_around_the_end_of_runs() {
+    const RUNS: u64 = 24;
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        for _ in 0..RUNS {
+            let job = shell.spawn(Mode::Foreground, &["run", "-it", "sh", "-c", "sleep 0.05"]);
+            while let Status::Stopped(_) = shell.wait(job) {
+                shell.await_go();
+                shell.fg(job);
+            }
+        }
+        shell.report_settings(&before);
+    });
+    for run in 0..RUNS {
+        let shipyard = session.job();
+        std::thread::sleep(std::time::Duration::from_millis(run * 10));
+        // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the
+        // job (or has ended: then ESRCH).
+        unsafe {
+            libc::kill(shipyard, libc::SIGTSTP);
+            if run % 2 == 1 {
+                libc::kill(shipyard, libc::SIGTSTP);
+            }
+        }
+        loop {
+            match session.status() {
+                Status::Stopped(_) => session.go(),
+                Status::Exited(0) => break,
+                other => panic!("{other:?}\n{}", session.transcript()),
+            }
+        }
+    }
+    session.expect("settings unchanged");
     session.finish();
 }

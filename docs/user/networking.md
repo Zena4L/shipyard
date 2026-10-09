@@ -41,6 +41,10 @@ your distribution's `passt` package.
   is yours.
 - **What it can't reach:** the host's own loopback services (`127.0.0.1` on the
   host). They're the host's alone, as with a bridge network.
+- **SELinux (Fedora):** works. Fedora confines pasta, so Shipyard hands it the
+  container's network as a file of its own (as Podman does), never another
+  process's `/proc` entry, and keeps pasta's files out of your home directory
+  (in your runtime directory, `$XDG_RUNTIME_DIR`, as a login session has).
 - **IPv6:** a port published on `[::1]` is refused with pasta too.
 - **DNS:** the container asks `169.254.1.1`, over IPv4 (its `/etc/resolv.conf` says so, with
   an image or `--rootfs`), and pasta passes the question to the host's resolver,
@@ -63,7 +67,9 @@ your distribution's `passt` package.
 - **pasta's version:** Debian 12's pasta (from 2023) can't carry connections to a
   published port into a container; use a newer one (Debian 13, Ubuntu 24.04,
   Fedora).
-- `--network pasta` asks for it explicitly, root too. pasta goes when the run
+- `--network pasta` asks for it explicitly, root too (not under SELinux: Fedora's
+  policy gives pasta no root capabilities; root's containers use bridge networks
+  there). pasta goes when the run
   ends, even if `shipyard` is killed outright.
 
 ## Networks

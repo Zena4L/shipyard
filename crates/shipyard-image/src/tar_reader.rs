@@ -918,3 +918,6 @@ mod tests {
         assert!(reader.next_entry().is_err());
     }
 }
+
+#[cfg(test)]
+mod differential;

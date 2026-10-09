@@ -54,12 +54,32 @@ stage, so they come first.
 | H1 | **An engine crate** (`shipyard-engine`): the logic now in the CLI (`run.rs`, `network.rs`, …) behind a typed API; the CLI a thin client of it, with `--json` output | stage 11's API and stage 13's UI need it as a library; the move grows with every stage | stage 9 (start in stage 8 for what it adds) |
 | H2 | **One state model, versioned:** one container record and state machine, one liveness rule and one recovery path in place of each stage's own lock-and-sweep; a schema version on every on-disk format from its first write, and a test reading the previous version | today's records (run areas, leases, run directories, volume holds, `dns.lock`, cgroup records) each work alone; upgrades rest on `serde` defaults | stage 9 |
 | H3 | **A threat model in every plan:** who is hostile (the container, a local user, the network, a registry, the image) and what each may never do, written as invariants with a test each; the Murphy review run against the plan too | stage 6's tar escapes and stage 7's router advertisements, open router and lockable leases were all found after building | from stage 8 |
-| H4 | **Real hosts in CI:** VM jobs on the distributions users run (Ubuntu with AppArmor, Fedora with SELinux, an older LTS kernel), the probes on each | the test container is one privileged Debian on one kernel; stage 7's last failures appeared only on Ubuntu | stage 8 (one VM job), widened by stage 12; Ubuntu 24.04 checked by hand for v0.1 (rootless with the AppArmor restriction on, root bridge networks) |
-| H5 | **Quality tools in CI:** `cargo-mutants` on changed files, the fuzz targets on a schedule, the OCI runtime conformance suite, differential tests of Shipyard's own netlink and nf_tables against `ip` and `nft` | the method works but runs by hand; conformance was planned for stage 14 though the runtime exists since stage 3 | conformance and differential tests in stage 8; mutants and scheduled fuzzing in stage 9 |
+| H4 | **Real hosts in CI:** VM jobs on the distributions users run (Ubuntu with AppArmor, Fedora with SELinux, an older LTS kernel), the probes on each | the test container is one privileged Debian on one kernel; stage 7's last failures appeared only on Ubuntu | stage 8 (one VM job), widened by stage 12; Ubuntu 24.04 checked by hand for v0.1 (rootless with the AppArmor restriction on, root bridge networks). **Built in 8.1b:** CI's `apparmor` job (Ubuntu, the restriction on, the installed binaries and profile, a control without it) and `fedora` job (a QEMU/KVM VM, SELinux enforcing, both passes, the terminal probe) |
+| H5 | **Quality tools in CI:** `cargo-mutants` on changed files, the fuzz targets on a schedule, the OCI runtime conformance suite, differential tests of Shipyard's own netlink and nf_tables against `ip` and `nft` | the method works but runs by hand; conformance was planned for stage 14 though the runtime exists since stage 3 | conformance and differential tests in stage 8 (differential tests built in 8.1b: see [Owned components](#owned-components)); mutants and scheduled fuzzing in stage 9 |
 | H6 | **Errors as a designed surface:** stable error kinds (and codes) in one module per crate; tests assert the kind, not the wording; messages stay free to improve | wording drifted across steps, and tests matching on wording broke CI twice | with H1 (stage 9), and each new error from stage 8 |
-| H7 | **Performance budgets as tests:** run start, run exit, a cached pull, a network attach; a regression fails | pasta's one-second exit delay was found by accident | stage 8 |
-| H8 | **Owned components decided explicitly:** for each piece Shipyard writes itself instead of using a crate or a tool (netlink, nf_tables, seccomp, eBPF, tar, DNS), the trade-off recorded here, and a differential test against a reference | each is a large, security-relevant surface Shipyard maintains alone | recorded in stage 8; tests with H5 |
+| H7 | **Performance budgets as tests:** run start, run exit, a cached pull, a network attach; a regression fails | pasta's one-second exit delay was found by accident | stage 8 (built in 8.1b: `tests/budgets.rs`, whose documentation lists every budget) |
+| H8 | **Owned components decided explicitly:** for each piece Shipyard writes itself instead of using a crate or a tool (netlink, nf_tables, seccomp, eBPF, tar, DNS), the trade-off recorded here, and a differential test against a reference | each is a large, security-relevant surface Shipyard maintains alone | recorded in stage 8 ([below](#owned-components)); tests with H5 |
 | H9 | **Build hygiene:** small debug info (done: `line-tables-only`), CI caches, documented clean-up of build volumes | builds reached 30 GB on disk and 65 GB in Docker before anyone looked | done in stage 7; kept |
+
+## Owned components
+
+What Shipyard writes itself instead of using a crate or a tool (H8), why, and what it's
+checked against (8.1b). Each differential test runs a second, independent
+implementation on the same input; where they differ, one of them is wrong.
+
+| Component | Why it's Shipyard's own | Checked against | Tests |
+|---|---|---|---|
+| **netlink** (rtnetlink: links, addresses, routes) | No `ip` binary run as root, no C library, and no netlink crate whose dumps and errors would be another surface to audit; it's small and its parser is bounded and fuzzed | `ip -j`: what Shipyard makes, `ip` reads the same, and the reverse (links, addresses, routes and their types; a route's scope is checked by a unit test of what Shipyard sends) | `route/linux_tests.rs`: `ip_reads_what_shipyard_makes`, `shipyard_reads_what_ip_makes` (root) |
+| **nf_tables** (`inet shipyard`) | The same: no `nft` run as root; one batch, atomic, from Rust | `nft`: Shipyard's table lists with nothing unknown, its key rules read as meant, nft rebuilds it from its own listing to the same (a fixed point, the same rules per chain and the same elements), and `nft -j` gives each chain the type, hook, priority and policy, and each set the types and flags, Shipyard made them with. Not byte for byte: nft encodes some rules differently but equivalently | `nft/linux_tests.rs`: `nft_reads_and_rebuilds_shipyards_table`, `nft_json_describes_shipyards_chains_and_sets` (root) |
+| **seccomp** (a BPF compiler for Docker's profile) | No libseccomp (a C library): the binary stays static, and the filter's every instruction is Shipyard's | The kernel: the filter loads, and the e2e tests see what it allows and refuses; an interpreter runs it as the kernel would | `security/seccomp/`, `tests/security.rs`. A libseccomp differential: stage 9, with H5's tooling |
+| **eBPF** (device programs) | No libbpf or clang: a small assembler for one kind of program | The kernel's verifier (it loads them), the e2e device tests, and an interpreter as strict as the verifier | `devices/ebpf.rs`, `tests/devices.rs`. A bpftool differential: stage 9 |
+| **tar** (reading layers) | A layer is untrusted: the reader bounds what an archive can make it hold, and nothing is unpacked by path (the `tar` crate's `unpack` isn't used) | The `tar` crate: generated GNU and ustar archives, and PAX ones, read the same (for a PAX `mtime`, owner or extended attribute, which the crate hands over without applying, the reference is the test's own reading). Shipyard reads an empty number field as 0, as GNU tar does; the crate refuses it | `tar_reader/differential.rs` (proptest); the `tar` fuzz target fuzzes Shipyard's reader alone |
+| **DNS** (a server per network) | No daemon beside the container (as Podman's aardvark-dns or dnsmasq): one small server, started per network, as nobody | `dig` (BIND's library): names, aliases, case, other types, reverse, TCP, upstream, refusal | `tests/dns.rs`: `dig_reads_the_servers_answers_as_meant` (root) |
+
+What the tests found when first run (8.1b): the set `masquerade` was a keyword of nft's
+language, so `nft -f` couldn't read back a listing of Shipyard's table (renamed
+`masquerade4`, ruleset 6); and `Rtnetlink::add_route` wrote every route as unicast (it
+now writes the route's type).
 
 ## Open findings
 
@@ -74,12 +94,24 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
 | F6 | high | A joined process runs unconfined (no capability drop, no seccomp); not reachable yet (no `exec` command); `/proc/<joiner>` and `exe` patterns (CVE-2016-9962, CVE-2019-5736, CVE-2024-21626) | confine it, non-dumpable before `setns`, no host procfs descriptors | 8 (`exec`) |
 | F10 | low | No per-source conntrack limit: one container can fill the host's connection table (the `ct state invalid drop` landed in 7.5) | `ct count` per source, as an option (D10) | 9 |
 | F14 | medium | firewalld rejects by rule, not policy: containers have no way out there and no warning; the Docker fix leaves published ports broken | detect firewalld's table (suggest `--zone=trusted`); complete the Docker fix | 8 (with H4's VM CI) |
-| F17 | low | Terminal settings aren't restored after an isolated run (a container can leave the shared terminal raw) | save and restore the termios; stage 8's pseudo-terminal replaces the path | 8 |
 | F18 | low | CI: one distribution; no fuzzing or mutation in CI (actions are pinned by commit since 7.6) | H4, H5 | 8–9 |
 | F24 | low | An OCI bind source is checked at load but resolved again by path at start: swapped for a symlink in between, another host path is bound (runc shares it) | open it with `O_PATH`/`O_NOFOLLOW` at load and carry the descriptor through the init's re-exec; it needs write access above another bundle's source, so it waits | later |
 | F29 | low | For a program embedding the runtime library: the subreaper reaps and kills its own children and stays set; SIGPIPE can kill it if the child dies before go; the parent-death signal is tied to the thread that forked | scope reaping to the command's tree and reset the subreaper; `MSG_NOSIGNAL`/blocked SIGPIPE; document "the main thread" | 11 (the API) |
 | F30 | low | DNS TCP slots still per client; no opt-in to keep containers from the host's own services and the cloud metadata address (169.254.169.254); internal networks reach host services bound to every address | per-lease TCP slots; an input chain option | 9 |
 | F31 | low | Stages 7.5 and 7.6's residuals: link-local IPv6 isn't tied to its container; a store root that's a symlink is only warned about; a root filesystem's own device nodes open where no device program guards; a symlink can steer a volume onto Shipyard's tmpfs covers in `/sys`, or onto securityfs, debugfs or the like below a bundle's own recursive `/sys` bind; a container that hit its memory limit, then lost a process to the host's OOM killer, reads "out of memory"; `--blkio-weight` doesn't set BFQ's `io.bfq.weight` (runc does); `update --cpu-period` alone clears the quota (runc keeps it); a `delete` of a killed `create` can remove another `--root`'s same-ID cgroup in the moment before its init joins it (that `create` fails) | each as noted in `stages/07.5-hardening.md` | later |
+
+**Stage 8 decisions (2026-10-09):**
+- **D13:** stage 8 builds the pieces (terminals, a confined `exec`, a monitor that
+  captures output and serves attach, `logs`/`attach`/`cp` by runtime ID); the
+  user-facing commands by name come with stage 9's state model.
+- **D14:** real-host CI: a rootless Ubuntu job with AppArmor's restriction on and
+  the shipped profile, and a Fedora VM job (SELinux, firewalld).
+- **D15:** logs in the CRI format, rotated by size and count, versioned in a
+  `log.json` beside them (the log files stay pure CRI).
+- **D16:** an isolated command never holds the user's terminal: where Shipyard's
+  stdio is a terminal, it gets a pipe Shipyard relays (closes F17: a container
+  can't change the terminal's settings). `--no-isolation` keeps the terminal.
+- **D17:** an isolated command's stdin is `/dev/null` without `-i`, as Docker's.
 
 **Stage 7.5 decisions (2026-10-09):**
 - **D1:** no device program for a rootful run → drop `CAP_MKNOD` (in every set) and warn; `/dev` is unchanged (a `nodev` `/dev` with made nodes wouldn't open them: probe 10); refusing would break cgroup-v1 hosts.
@@ -102,7 +134,7 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
 
 | Version | After stage | What works | Status |
 |---|---|---|---|
-| **v0.1** | 7 | `shipyard run --image alpine sh` rootless on Linux, on the caller's own terminal: pulled from Docker Hub, isolated, resource-limited, networked. Docker's spelling, `run -it alpine sh`, comes with a pseudo-terminal of the container's own (stage 8) and the image as the first argument (stage 9) | reached; release-ready after the readiness pass (doctor, the AppArmor profile, release files; checked by hand on Ubuntu 24.04) |
+| **v0.1** | 7 | `shipyard run --image alpine sh` rootless on Linux, on the caller's own terminal: pulled from Docker Hub, isolated, resource-limited, networked. Docker's spelling, `run -it alpine sh`, comes with a pseudo-terminal of the container's own (stage 8: `run -it --image alpine sh` works since step 8.2) and the image as the first argument (stage 9) | reached; release-ready after the readiness pass (doctor, the AppArmor profile, release files; checked by hand on Ubuntu 24.04) |
 | **v0.2** | 9 | Containers run detached and survive the CLI exiting; logs, `exec`, restart policies | |
 | **v0.3** | 11 | Compose stacks and the API | |
 | **v0.4** | 12 | Works on macOS | |

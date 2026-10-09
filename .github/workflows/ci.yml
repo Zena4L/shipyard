@@ -46,33 +46,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Rootless containers (stage 4) run as this normal user: Ubuntu restricts
-      # unprivileged user namespaces with AppArmor (since 23.10), and the full
-      # ID map needs newuidmap/newgidmap and a subordinate range for the user.
-      # Their network is pasta (passt, stage 7).
+      # Rootless containers (stage 4) run as this normal user. Here they run
+      # the binaries cargo built (in target/), which Shipyard's AppArmor
+      # profile doesn't attach to, so Ubuntu's restriction on user namespaces
+      # (since 23.10) is turned off; the `apparmor` job below tests with it on.
       - name: allow rootless containers
         if: runner.os == 'Linux'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq uidmap passt
-          me=$(id -un)
-          grep -q "^$me:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$me"
-          grep -q "^$me:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$me"
-      # Rootless cgroups (stage 5) need a cgroup delegated to this user, as
-      # systemd's user manager (user@UID.service) is: start it (lingering),
-      # and run the tests in a scope inside it.
-      - name: a delegated cgroup (the user's systemd manager)
-        if: runner.os == 'Linux'
-        run: |
-          sudo loginctl enable-linger "$(id -un)"
-          bus="/run/user/$(id -u)/bus"
-          for _ in $(seq 50); do [ -S "$bus" ] && break; sleep 0.2; done
-          [ -S "$bus" ]
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" >> "$GITHUB_ENV"
+          scripts/ci/rootless-setup.sh
       - run: cargo clippy --locked --workspace --all-targets
       - name: cargo test
         run: |
@@ -123,15 +107,17 @@ jobs:
       # The pasta tests run shipyard as the runner's user (SUDO_UID) from
       # root: pasta for it, and rootless user namespaces allowed.
       # nft (nftables) only for the firewall tests to look with, and to make
-      # another program's chains: Shipyard never runs it.
-      - name: pasta, for rootless networking; nft, for the firewall tests
+      # another program's chains: Shipyard never runs it. nft, ip and dig are
+      # also the references Shipyard's own nf_tables, netlink and DNS server
+      # are tested against (H5).
+      - name: pasta, for rootless networking; nft and dig, for the tests
         if: runner.os == 'Linux'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           sudo apt-get update -qq
-          sudo apt-get install -y -qq passt uidmap nftables
+          sudo apt-get install -y -qq passt uidmap nftables bind9-dnsutils
       - name: host facts for the container tests
         if: runner.os == 'Linux'
         run: |
@@ -139,6 +125,63 @@ jobs:
           ldd --version | head -1
           findmnt -no PROPAGATION /
       - run: cargo test --locked --workspace -- --include-ignored
+        env:
+          # ip, nft and dig are installed above: the differential tests
+          # (H5) must run, not skip.
+          SHIPYARD_TEST_TOOLS: required
+
+  # A real host (H4): Ubuntu as users have it, the AppArmor restriction on
+  # user namespaces left on, and Shipyard installed in /usr/local/bin with
+  # its profile, as docs/user/README.md says. The end-to-end tests run the
+  # installed binaries (SHIPYARD_TEST_BIN_DIR). A control proves the profile
+  # is what lets them through.
+  apparmor:
+    name: rootless (Ubuntu, AppArmor on)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the restriction is on, as it is on users' machines
+        run: test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+      - run: scripts/ci/rootless-setup.sh
+      - run: cargo build --locked --bins
+      - name: install shipyard and its AppArmor profile, as a user would
+        run: |
+          sudo install -m 0755 target/debug/shipyard target/debug/shipyard-runtime /usr/local/bin/
+          sudo install -m 0644 contrib/apparmor/shipyard /etc/apparmor.d/shipyard
+          sudo apparmor_parser -r /etc/apparmor.d/shipyard
+      - name: the profile is what lets it make user namespaces (control)
+        run: scripts/ci/apparmor-control.sh
+      # shipyard-cli's tests: the end-to-end ones run the installed binaries.
+      # (The runtime's in-process tests make user namespaces from their own
+      # test binary, which no profile covers: they run in `check`.)
+      - name: cargo test, against the installed binaries
+        run: systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli
+        env:
+          SHIPYARD_TEST_BIN_DIR: /usr/local/bin
+          SHIPYARD_TEST_ROOTLESS: required
+          SHIPYARD_TEST_DELEGATED: required
+
+  # Another real host (H4): Fedora, SELinux enforcing, in a QEMU/KVM VM on
+  # the runner. Both passes (rootless, then root), from executables built
+  # here. firewalld is stopped until stage 8.6 (F14).
+  fedora:
+    name: Fedora VM (SELinux enforcing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/shipyard-vm
+          # The image is pinned in the script: a new pin, a new cache.
+          key: fedora-cloud-${{ hashFiles('scripts/ci/fedora-vm.sh') }}
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
+      - run: scripts/ci/fedora-vm.sh
 
   # musl (static, Alpine-style builds) has different libc types and wrappers;
   # make sure the code compiles there too.

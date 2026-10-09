@@ -176,6 +176,21 @@ fn value(attr: &Attr<'_>) -> Result<Vec<u8>, ParseError> {
     Err(ParseError::Missing("value"))
 }
 
+/// The chain of the rule in a `NEWRULE` message (the differential tests
+/// against `nft` count rules per chain).
+#[cfg(test)]
+pub(crate) fn rule_chain(message: &Message<'_>) -> Result<String, ParseError> {
+    use super::consts::NFTA_RULE_CHAIN;
+    let (_, attrs) = split(message)?;
+    for attr in attrs {
+        let attr = attr?;
+        if attr.kind == NFTA_RULE_CHAIN {
+            return lossy(&attr);
+        }
+    }
+    Err(ParseError::Missing("chain"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {

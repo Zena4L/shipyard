@@ -46,7 +46,7 @@ what could go wrong), mutation-checked and run by hand on Linux, then reviewed a
 | The firewall: one `inet shipyard` table, masquerade, published ports through DNAT maps, hairpin, the 127/8 guard, isolation between networks, internal networks, routing closed to all but containers | `shipyard-network/nft/` (`ruleset.rs`, `expr.rs`, `objects`, `decode.rs`) | `nft/ruleset.rs`'s 10 tests, `nft/linux_tests.rs`, `tests/firewall.rs` (9) |
 | `-p`/`-P`: parsing, ports held by bound sockets, kernel-chosen ports printed | `shipyard-network/ports.rs` | `the_forms_of_p`, `what_p_refuses`, `a_held_port_is_taken_and_a_free_one_is_chosen`, `a_published_port_is_held_while_its_run_lives`; the `ports` fuzz target |
 | conntrack: a freed address's connections flushed | `shipyard-network/conntrack.rs` | `a_flush_forgets_an_addresses_connections`, `a_killed_runs_ports_and_connections_are_swept_by_the_next` |
-| Rootless with pasta, attached by PID | `shipyard-network/pasta.rs`, `pidfd.rs` | `tests/pasta.rs` (8), `nothing_published_means_no_port_forwarded_either_way` |
+| Rootless with pasta, attached by PID (by a namespace file since stage 8.1c; `tests/pasta.rs` has 10 tests since) | `shipyard-network/pasta.rs`, `pidfd.rs` | `tests/pasta.rs` (8), `nothing_published_means_no_port_forwarded_either_way` |
 | A DNS server per network: names, aliases, run IDs; A, AAAA, PTR; forwarding; across networks | `shipyard-network/dns/`, the CLI's `dns_helper.rs` | `dns/*.rs`'s 25 tests, `tests/dns.rs` (7); the `dns` fuzz target |
 | Several networks per container | the CLI's `network.rs` (`take_all`, `route_network`, `resolver`), `run.rs` (`parse_long_network`, `combine_networks`) | `tests/networks.rs` (7), `a_second_network_is_another_interface_without_the_default_route` |
 | IPv6: ULA prefixes, NAT66, published ports on both families, router advertisements kept | `store.rs`, `attach.rs`, `nft/ruleset.rs`, `ports.rs` | `tests/ipv6.rs` (6), `only_the_hosts_own_interfaces_keep_taking_router_advertisements`, `ipv6_is_dnated_and_masqueraded_through_its_own_maps` |
@@ -90,7 +90,9 @@ shipyard run (CLI, single-threaded at every fork)            (shipyard-cli/run.r
                 socket made there: address(es), routes, MTU, up; accept_ra/autoconf/
                 accept_dad off
         pasta:  pasta … PID (it joins the user and network namespaces); pdeathsig;
-                ready when its pid file appears
+                ready when its pid file appears. (Since 8.1c: a launcher joins
+                the user namespace and bind-mounts the network namespace on a
+                file, which pasta gets with --netns.)
     init: lo up; its own sysfs when its user namespace owns its network namespace;
           net.* sysctls (ip_forward=0, IPv6 forwarding=0, ping range, port 0 start)
   the run ends: nft elements, veth, conntrack, lease, port sockets, pasta, run dir
@@ -137,7 +139,7 @@ maps, so rules are never edited:
 | Set or map | Holds |
 |---|---|
 | `bridges`, `same_bridge`, `internal` | Shipyard's bridges; internal networks' bridges |
-| `masquerade`, `masquerade6` | subnets with a way out |
+| `masquerade4`, `masquerade6` | subnets with a way out (`masquerade4` was `masquerade` until stage 8: a keyword of nft's language, which kept `nft -f` from reading the table back) |
 | `ports`, `ports_addr`, `ports6`, `ports6_addr` | `-p` maps: protocol and port (and host address) → container address and port |
 | `closed`, `uplinks` | the families whose forwarding Shipyard turned on, and the host's own interfaces then: routing between those stays closed |
 
@@ -209,8 +211,15 @@ maps, so rules are never edited:
   network, even an internal one).
 - **Locks are taken one network at a time,** never two at once, so runs joining `a, b` and
   `b, a` can't deadlock.
-- **pasta is attached by PID** (it joins the user and network namespaces itself: no bind
-  mount, which a rootless CLI couldn't make), in a process group of its own (Ctrl-C at the
+- **pasta was attached by PID until stage 8.1c** (it joined the user and network
+  namespaces itself: no bind mount, which a rootless CLI couldn't make in the host's mount
+  namespace). *Changed in 8.1c:* under
+  SELinux, Fedora's `pasta_t` may not open an unconfined process's `/proc/<pid>/ns`, so a
+  launcher (Shipyard re-executed) joins the container's user namespace, where it may make
+  a private mount namespace and bind-mount the network namespace on a file, and execs
+  pasta with `--netns FILE`, as Podman does, staying as its parent (under SELinux pasta's
+  exec clears its parent-death signal).
+- pasta runs in a process group of its own (Ctrl-C at the
   terminal doesn't kill it), with pdeathsig and an explicit kill at the end (bookworm's
   pasta never quits by itself).
 - **The test image moved to Debian trixie:** bookworm's 2023 pasta drops connections to

@@ -26,7 +26,7 @@ use shipyard_test_support::rootfs::RootFs;
 use shipyard_test_support::{Rootless, Run, Shipyard, rootless, run};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
-const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
+const RUNTIME: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard-runtime"));
 
 /// What a refused `open` says.
 const REFUSED: &str = "Operation not permitted";
@@ -262,7 +262,7 @@ fn without_a_device_program_root_inside_cant_make_nodes() {
         "{}",
         guarded.stderr
     );
-    let unguarded = run(without_cgroups(env!("CARGO_BIN_EXE_shipyard"), &args));
+    let unguarded = run(without_cgroups(SHIPYARD.path(), &args));
     assert_eq!(unguarded.code, Some(0), "{}", unguarded.stderr);
     assert!(
         unguarded.stdout.starts_with("zero\nnull\ngiven\n"),
@@ -278,10 +278,7 @@ fn without_a_device_program_root_inside_cant_make_nodes() {
     );
     // Without a root filesystem, `/dev` is the host's: the warning says
     // what that leaves open.
-    let host_dev = run(without_cgroups(
-        env!("CARGO_BIN_EXE_shipyard"),
-        &["run", "true"],
-    ));
+    let host_dev = run(without_cgroups(SHIPYARD.path(), &["run", "true"]));
     assert_eq!(host_dev.code, Some(0), "{}", host_dev.stderr);
     assert!(
         host_dev
@@ -369,7 +366,7 @@ fn without_a_device_program_a_bundle_loses_cap_mknod() {
     let args = ["run", "--bundle", bundle.arg()];
     let guarded = run(SHIPYARD.command(&args));
     assert_eq!(guarded.stdout, "made\nnull\n", "{}", guarded.stderr);
-    let unguarded = run(without_cgroups(env!("CARGO_BIN_EXE_shipyard"), &args));
+    let unguarded = run(without_cgroups(SHIPYARD.path(), &args));
     assert_eq!(unguarded.stdout, "null\n", "{}", unguarded.stderr);
     assert!(
         unguarded.stderr.contains(WITHOUT_MKNOD),
@@ -379,7 +376,7 @@ fn without_a_device_program_a_bundle_loses_cap_mknod() {
     // The runtime: `create` warns, and the container can't make the node.
     let state = Scratch::new();
     let root = state.path().join("root");
-    let created = without_cgroups(RUNTIME, &["--root", arg(&root)])
+    let created = without_cgroups(RUNTIME.path(), &["--root", arg(&root)])
         .args(["create", "--bundle", bundle.arg(), "nomknod"])
         .stdout(std::fs::File::create(state.path().join("create.out")).unwrap())
         .stderr(std::fs::File::create(state.path().join("create.err")).unwrap())
@@ -412,7 +409,7 @@ fn runtime(state: &Path, args: &[&str]) -> bool {
     let file = |extension: &str| {
         std::fs::File::create(state.join(format!("{}.{extension}", args[0]))).unwrap()
     };
-    Command::new(RUNTIME)
+    Command::new(RUNTIME.path())
         .arg("--root")
         .arg(state.join("root"))
         .args(args)

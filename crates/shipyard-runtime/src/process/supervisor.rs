@@ -37,6 +37,7 @@ use super::signals::{Arrival, Signals, Sources};
 use super::spawn::{Child, Placement, SpawnOptions, spawn};
 use super::spec::ProcessSpec;
 use super::status::ExitStatus;
+use super::stdio::{DRAIN_WAIT, Relay, Stdio};
 use super::stop::StopPolicy;
 use crate::hooks::{ContainerHooks, Phase};
 use crate::isolation::{Isolation, Join, Namespace};
@@ -87,6 +88,8 @@ pub struct Supervisor {
     /// makes `helper` one. They aren't the command's, and are left alone.
     /// A PID leaves the list when it's reaped (and could be reused).
     inherited: Vec<libc::pid_t>,
+    /// The command's standard descriptors (see [`set_stdio`](Self::set_stdio)).
+    stdio: Stdio,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -108,7 +111,22 @@ impl Supervisor {
         let inherited = direct_children().unwrap_or_default();
         #[cfg(not(target_os = "linux"))]
         let inherited = Vec::new();
-        Ok(Self { signals, inherited })
+        Ok(Self {
+            signals,
+            inherited,
+            stdio: Stdio::default(),
+        })
+    }
+
+    /// What the commands supervised from now on get as their standard
+    /// input, output and error: shipyard's own by default. A
+    /// [`Relay`](super::Stream::Relay) stream is a pipe, relayed to or from
+    /// shipyard's own descriptor for as long as the command runs, and then
+    /// until its last output is written out (see `stdio.rs`). A joined
+    /// command ([`supervise_joined`](Self::supervise_joined)) keeps
+    /// shipyard's own.
+    pub fn set_stdio(&mut self, stdio: Stdio) {
+        self.stdio = stdio;
     }
 
     /// Runs the command and supervises it until it has exited and everything
@@ -130,7 +148,9 @@ impl Supervisor {
     ///
     /// Invalid input, isolation on macOS, without root or without the init
     /// entry point, a container init that failed to start
-    /// ([`Error::InitDidNotStart`]), or a failure to start the command (see
+    /// ([`Error::InitDidNotStart`]), the relay's descriptors that can't be
+    /// opened (see [`set_stdio`](Self::set_stdio); [`Error::LinuxOnly`]
+    /// elsewhere), or a failure to start the command (see
     /// [`Error::exit_code`]).
     pub fn supervise(
         &mut self,
@@ -194,7 +214,8 @@ impl Supervisor {
     /// [`Error::JoinRefused`] as root), no such process
     /// ([`Error::NoSuchProcess`]), a container that is exiting
     /// ([`Error::ContainerExiting`]), a `/proc` of another PID namespace
-    /// ([`Error::ForeignProc`]), or a failure to start the command.
+    /// ([`Error::ForeignProc`]), standard descriptors other than shipyard's
+    /// own ([`Error::StdioForJoin`]), or a failure to start the command.
     pub fn supervise_joined(
         &mut self,
         spec: &ProcessSpec,
@@ -217,10 +238,13 @@ impl Supervisor {
             Placement::New(isolation) => check_isolation(isolation)?,
             Placement::Join(join) => check_join(join)?,
         }
+        check_stdio(&placement, self.stdio)?;
         let terminal = Terminal::open();
         // With a session of its own, the command never shares the terminal's
-        // group, whether or not shipyard has one.
-        let own_session = placement.has_own_session();
+        // group, whether or not shipyard has one. A command with a
+        // pseudo-terminal starts one to take it, isolated or not.
+        let pty = self.stdio.terminal.is_some();
+        let own_session = placement.has_own_session() || pty;
         let job_terminal = terminal.as_ref().filter(|_| !own_session);
         tracing::debug!(
             terminal = terminal.is_some(),
@@ -232,8 +256,11 @@ impl Supervisor {
                 "giving the command its own process group"
             }
         );
-        let spec = with_terminal_env(spec, terminal.is_some(), std::env::var_os("TERM"));
+        let spec = self.with_term(spec, terminal.is_some());
         let spec = resolve_names(spec, &placement)?;
+        // Before the run's cgroup: a failure here leaves nothing to remove.
+        let (child_ends, mut relay) =
+            super::stdio::prepare(self.stdio, matches!(placement, Placement::New(_)))?;
         #[cfg(target_os = "linux")]
         let cgroup = make_run_cgroup(&placement)?;
         #[cfg(target_os = "linux")]
@@ -243,8 +270,13 @@ impl Supervisor {
         #[cfg(not(target_os = "linux"))]
         let hooks = None;
         let options = SpawnOptions {
+            stdio: child_ends.targets(),
+            terminal: child_ends.terminal(),
+            takes_terminal: pty,
             placement,
-            new_process_group: job_terminal.is_none(),
+            // A command taking a terminal starts its own session: it mustn't
+            // be made a group leader first.
+            new_process_group: job_terminal.is_none() && !pty,
             keep_ignored: self
                 .signals
                 .ignored_at_startup()
@@ -264,8 +296,23 @@ impl Supervisor {
             allow(unused_assignments, reason = "only Linux reports OOM kills")
         )]
         let mut killed_by_us = false;
-        let result = spawn(&spec, &options, network, started).and_then(|mut child| {
-            let result = self.watch(&mut child, stop, job_terminal, own_session, hooks.as_ref());
+        // Whether the run ended on a stop request (or an error): then its last
+        // output gets only the drain's time, not whatever a stalled terminal
+        // would take.
+        let mut stop_requested = false;
+        let spawned = spawn(&spec, &options, network, started);
+        // The child has its copies (or there's no child): with ours closed,
+        // the command's stdin reads end-of-file when the relay closes it.
+        drop(child_ends);
+        let result = spawned.and_then(|mut child| {
+            let result = self.watch(
+                &mut child,
+                stop,
+                job_terminal,
+                own_session,
+                hooks.as_ref(),
+                relay.as_mut(),
+            );
             if result.is_err() {
                 // Never leave the command running unsupervised.
                 child.kill_all();
@@ -273,11 +320,20 @@ impl Supervisor {
             }
             result.map(|ended| {
                 killed_by_us = ended.killed_by_us;
+                stop_requested = ended.stop_requested;
                 ended.status
             })
         });
         #[cfg(target_os = "linux")]
         kill_leftovers(&mut self.inherited);
+        // Whichever way the run ended (an init's failure message comes this
+        // way too): the last output goes out, the user's input stays theirs.
+        if let Some(relay) = &mut relay {
+            self.drain(relay, stop_requested || result.is_err());
+            // The user's terminal is theirs again now, not after the
+            // cleanup below (a few seconds, at worst).
+            relay.release_terminal();
+        }
         #[cfg(target_os = "linux")]
         if let Some(run) = cgroup {
             if let Ok(status) = &result {
@@ -305,16 +361,35 @@ impl Supervisor {
         terminal: Option<&Terminal>,
         own_session: bool,
         hooks: Option<&ContainerHooks>,
+        mut relay: Option<&mut Relay>,
     ) -> Result<Ended> {
         let mut timers = StopTimers::default();
         loop {
-            self.wait_for_event(child, timers.next_wake())?;
+            self.wait_for_event(child, timers.next_wake(), relay.as_deref())?;
             let mut continued = false;
+            // With a pseudo-terminal relayed, the user's terminal's own
+            // signals are for it, not the command: a resize resizes it (the
+            // kernel tells its foreground job), a hang-up hangs it up. A
+            // `kill -HUP` while the terminal is there is forwarded as ever.
+            let pty = relay.as_deref().is_some_and(Relay::has_terminal);
             for arrival in self.signals.drain() {
                 match arrival.signal {
                     // Whoever sent it, it's a stop request.
                     libc::SIGTERM => timers.request(child, stop),
                     libc::SIGCONT => continued = true,
+                    libc::SIGWINCH if pty => {
+                        if let Some(relay) = relay.as_deref() {
+                            relay.resize();
+                        }
+                    }
+                    // The user's terminal hung up (its shell passes the
+                    // kernel's SIGHUP on to its jobs): the terminal says so,
+                    // the sender can't.
+                    libc::SIGHUP if pty && super::terminal::host_hung_up() => {
+                        if let Some(relay) = relay.as_deref_mut() {
+                            relay.hang_up();
+                        }
+                    }
                     _ if should_forward(arrival, Group::of(terminal)) => {
                         tracing::debug!(
                             signal = arrival.signal,
@@ -326,6 +401,9 @@ impl Supervisor {
                 }
             }
             timers.tick(child, stop, Instant::now());
+            if let Some(relay) = relay.as_deref_mut() {
+                relay.pump();
+            }
             // The exec report comes before reaping: a failed exec must be
             // reported as such, not as an ordinary exit.
             let resolving = child.report_fd().is_some();
@@ -341,7 +419,14 @@ impl Supervisor {
                 return Ok(Ended {
                     status,
                     killed_by_us: timers.killed_at.is_some(),
+                    stop_requested: timers.requested,
                 });
+            }
+            // After reaping: a run whose command has ended (or whose
+            // container died before its terminal was relayed) never stops
+            // for the terminal.
+            if let Some(relay) = relay.as_deref_mut() {
+                self.stop_for_the_terminal(relay, timers.requested);
             }
             if terminal.is_some() {
                 follow_stops(child, &self.signals, continued, timers.requested);
@@ -355,24 +440,129 @@ impl Supervisor {
         }
     }
 
-    /// Sleeps until a signal arrives, the report pipe has something, or
-    /// `wake_at` passes.
-    fn wait_for_event(&self, child: &Child, wake_at: Option<Instant>) -> Result<()> {
-        // The report pipe only until `exec` resolves; the unused slot just
-        // repeats the wake pipe and isn't passed to `poll`.
-        let wake = self.signals.wake_fd();
-        let report = child.report_fd();
-        let mut fds = [
-            PollFd::new(wake, PollFlags::POLLIN),
-            PollFd::new(report.unwrap_or(wake), PollFlags::POLLIN),
-        ];
-        let watched = if report.is_some() { 2 } else { 1 };
+    /// The command's `TERM`, where it has a terminal: shipyard's own if it
+    /// writes to that directly (`shipyard_has_one`), or its pseudo-terminal
+    /// (the host's `TERM`, else `xterm`). A command whose output is relayed
+    /// has none, so no `TERM` invites it to send a terminal's escapes into a
+    /// pipe.
+    fn with_term<'a>(&self, spec: &'a ProcessSpec, shipyard_has_one: bool) -> Cow<'a, ProcessSpec> {
+        let pty = self.stdio.terminal.is_some();
+        let has_terminal = pty || (shipyard_has_one && self.stdio.stdout == super::Stream::Inherit);
+        let host_term = std::env::var_os("TERM").or_else(|| pty.then(|| "xterm".into()));
+        with_terminal_env(spec, has_terminal, host_term)
+    }
+
+    /// Passes on the command's last output once it has ended (see
+    /// `stdio.rs`): the user's input is no longer read, everything read is
+    /// written out, and the pipes are waited on for end-of-file for up to
+    /// [`DRAIN_WAIT`]. Signals still count: a stop request (SIGTERM,
+    /// SIGINT, SIGHUP, SIGQUIT) throws away what the terminal hasn't taken,
+    /// so a stalled terminal (Ctrl-S, a frozen connection) can't keep
+    /// shipyard forever; job control stops shipyard as in the loop. If the
+    /// run already ended `stopping` (on a stop request, or an error), what's
+    /// left once the wait is over is thrown away too.
+    fn drain(&mut self, relay: &mut Relay, stopping: bool) {
+        relay.end_input();
+        let deadline = Instant::now() + DRAIN_WAIT;
+        loop {
+            relay.pump();
+            if Instant::now() >= deadline {
+                if stopping {
+                    relay.abandon();
+                }
+                relay.stop_waiting();
+            }
+            if relay.outputs_done() {
+                return;
+            }
+            let told_to_stop = self.signals.drain().into_iter().any(|arrival| {
+                matches!(
+                    arrival.signal,
+                    libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT
+                )
+            });
+            if told_to_stop {
+                tracing::debug!("told to stop while passing on the last output; dropping the rest");
+                relay.abandon();
+                return;
+            }
+            if relay.stop_needed().is_some() {
+                self.stop_for_the_terminal(relay, false);
+                continue;
+            }
+            let mut fds = vec![PollFd::new(self.signals.wake_fd(), PollFlags::POLLIN)];
+            fds.extend(relay.poll_fds());
+            let left = deadline.saturating_duration_since(Instant::now());
+            let timeout = if left.is_zero() {
+                PollTimeout::NONE
+            } else {
+                poll_timeout(left.min(Duration::from_millis(100)))
+            };
+            match poll(&mut fds, timeout) {
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(errno) => {
+                    tracing::debug!(%errno, "waiting on the command's last output");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stops shipyard for job control when the relay needs the terminal
+    /// from the background (to read it, or to write to it with `tostop`),
+    /// as the kernel would stop a program doing that itself; `fg` resumes
+    /// it. Never during a stop request (`stopping`), nor where nothing could
+    /// resume it: the relay then gives up on the terminal instead (input
+    /// ends, output is discarded).
+    fn stop_for_the_terminal(&self, relay: &mut Relay, stopping: bool) {
+        let Some(signal) = relay.stop_needed() else {
+            return;
+        };
+        if stopping || !under_job_control() {
+            relay.give_up_held_back();
+            if !stopping {
+                // At once: a terminal given up on is relayed now, and its
+                // command waits for that. (Not during a stop request: the
+                // command's input would end before the stop signal reaches
+                // it, and it would act on that end-of-file.)
+                relay.pump();
+            }
+            return;
+        }
+        tracing::debug!(signal, "waiting for the terminal: stopping until resumed");
+        // Stops shipyard right here, until its shell sends SIGCONT (`fg`);
+        // the user's terminal is put back meanwhile if it's raw.
+        relay.stop_self(signal);
+        // That SIGCONT is handled here: left pending, it would continue
+        // the command, which never stopped.
+        self.signals.forget(libc::SIGCONT);
+    }
+
+    /// Sleeps until a signal arrives, the report pipe has something, the
+    /// relay has something to move (see `stdio.rs`), or `wake_at` passes.
+    fn wait_for_event(
+        &self,
+        child: &Child,
+        wake_at: Option<Instant>,
+        relay: Option<&Relay>,
+    ) -> Result<()> {
+        // The report pipe only until `exec` resolves; the relay's
+        // descriptors while it has something to move.
+        let mut fds = vec![PollFd::new(self.signals.wake_fd(), PollFlags::POLLIN)];
+        fds.extend(
+            child
+                .report_fd()
+                .map(|report| PollFd::new(report, PollFlags::POLLIN)),
+        );
+        if let Some(relay) = relay {
+            fds.extend(relay.poll_fds());
+        }
         let now = Instant::now();
         let until = wake_at.map_or(SAFETY_NET, |at| {
             at.saturating_duration_since(now).min(SAFETY_NET)
         });
         let timeout = poll_timeout(until);
-        match poll(&mut fds[..watched], timeout) {
+        match poll(&mut fds, timeout) {
             // EINTR just means a signal arrived: the loop handles it next.
             Ok(_) | Err(Errno::EINTR) => Ok(()),
             Err(e) => Err(Error::sys("waiting for signals and the command", e)),
@@ -611,6 +801,8 @@ struct Ended {
     status: ExitStatus,
     /// Shipyard killed it: the stop timeout ran out.
     killed_by_us: bool,
+    /// It ended after a stop request (SIGTERM, then the stop signal).
+    stop_requested: bool,
 }
 
 /// The graceful-stop sequence: stop signal, then SIGKILL after the timeout,
@@ -810,8 +1002,6 @@ fn reap_quietly(pid: Pid) {
     unsafe { libc::waitpid(pid.as_raw(), &raw mut raw, libc::WNOHANG) };
 }
 
-/// With a terminal, pass the host's `TERM` through (unless the user set one),
-/// so full-screen programs like `top` or `vim` know how to draw.
 /// Resolves user and group names where the command runs: for an isolated
 /// run that's in the container, so the container's init does it (`init.rs`);
 /// for a run on the host, here, in the host's `/etc`. A joined command's
@@ -834,6 +1024,11 @@ fn resolve_names<'a>(
     Ok(Cow::Owned(spec))
 }
 
+/// With a terminal the command writes to directly, or a pseudo-terminal of
+/// its own (`-t`), pass the host's `TERM` through, or `xterm` for a
+/// pseudo-terminal when the host has none (unless the user set one), so
+/// full-screen programs like `top` or `vim` know how to draw. Not when its
+/// output is only relayed: it has no terminal then.
 fn with_terminal_env(
     spec: &ProcessSpec,
     terminal: bool,
@@ -850,6 +1045,22 @@ fn with_terminal_env(
     match with_term.env.set(term, &value) {
         Ok(()) => Cow::Owned(with_term),
         Err(_) => Cow::Borrowed(spec),
+    }
+}
+
+/// Refuses standard descriptors the placement can't have: a joined command
+/// keeps shipyard's own (no relay is set up on the join path).
+fn check_stdio(placement: &Placement, stdio: super::Stdio) -> Result<()> {
+    match placement {
+        Placement::Join(_) if !stdio.is_inherited() => Err(Error::StdioForJoin),
+        // The container's devpts would be mounted over the host's.
+        #[cfg(target_os = "linux")]
+        Placement::New(isolation)
+            if stdio.terminal.is_some() && !isolation.has(Namespace::Mount) =>
+        {
+            Err(Error::TerminalNeedsMount)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1089,6 +1300,21 @@ mod tests {
             check_isolation(&Isolation::standard()),
             Err(Error::NoInitEntryPoint)
         ));
+    }
+
+    #[test]
+    fn a_joined_command_keeps_shipyards_descriptors() {
+        let join = Placement::Join(Join::standard(1));
+        assert!(check_stdio(&join, crate::process::Stdio::default()).is_ok());
+        let relayed = crate::process::Stdio {
+            stdout: crate::process::Stream::Relay,
+            ..crate::process::Stdio::default()
+        };
+        assert!(matches!(
+            check_stdio(&join, relayed),
+            Err(Error::StdioForJoin)
+        ));
+        assert!(check_stdio(&Placement::Host, relayed).is_ok());
     }
 
     #[test]

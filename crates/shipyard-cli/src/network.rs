@@ -1089,7 +1089,7 @@ impl RunNetwork {
                             .iter()
                             .map(|attachment| &attachment.config)
                             .collect();
-                        RunDir::make(plan, &addresses, resolver(&configs))
+                        RunDir::make(plan, &addresses, resolver(&configs), false)
                     })
                     .transpose()?;
                 return Ok(RunNetwork {
@@ -1107,7 +1107,7 @@ impl RunNetwork {
                 let ports = held.iter().map(|held| held.published).collect();
                 // pasta answers DNS itself, for the host's resolver.
                 let resolver = std::net::IpAddr::V4(shipyard_network::pasta::DNS_ADDRESS);
-                let dir = RunDir::make(plan, &[], Some(resolver))?;
+                let dir = RunDir::make(plan, &[], Some(resolver), true)?;
                 let pasta = PastaPlan {
                     program,
                     features,
@@ -1128,7 +1128,7 @@ impl RunNetwork {
         let _ = requests;
         let dir = plan
             .etc_files
-            .then(|| RunDir::make(plan, &[], None))
+            .then(|| RunDir::make(plan, &[], None, false))
             .transpose()?;
         Ok(RunNetwork {
             connection: Connection::Nothing,
@@ -1231,10 +1231,11 @@ impl RunDir {
         plan: &NetworkPlan,
         addresses: &[std::net::IpAddr],
         resolver: Option<std::net::IpAddr>,
+        for_pasta: bool,
     ) -> Result<RunDir> {
         use shipyard_network::files;
         let mut failed = None;
-        let runs = runs_dirs()
+        let runs = runs_dirs(for_pasta)
             .into_iter()
             .find(|runs| match make_runs_dir(runs) {
                 Ok(()) => true,
@@ -1335,7 +1336,9 @@ impl Drop for RunDir {
 /// image store's; a directory of this user's in the temporary one
 /// ([`make_runs_dir`] checks it's theirs alone). The first that can be made
 /// is used: a rootless caller's `HOME` may be someone else's (`sudo -u`).
-fn runs_dirs() -> Vec<PathBuf> {
+/// A pasta run's never goes in the image store: under SELinux, pasta
+/// (`pasta_t`) may not reach files under `~/.local` (F32).
+fn runs_dirs(for_pasta: bool) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // Root in a user namespace of its own (`unshare -U -r`) isn't the
     // host's: `/run/shipyard` and `/var/lib/shipyard` aren't its own. Its
@@ -1348,7 +1351,9 @@ fn runs_dirs() -> Vec<PathBuf> {
         if let Ok(root) = shipyard_runtime::container::default_root() {
             dirs.push(root.join("runs"));
         }
-        if let Ok(store) = crate::image::store_dir() {
+        if let Ok(store) = crate::image::store_dir()
+            && !for_pasta
+        {
             dirs.push(store.join("runs"));
         }
     }
@@ -1708,6 +1713,20 @@ pub(crate) fn prune() -> Result<Pruned> {
 mod tests {
     use super::*;
     use shipyard_network::nft::Chain;
+
+    /// A pasta run's files never go in the image store (under `~/.local`,
+    /// out of SELinux-confined pasta's reach: F32); other runs' may.
+    #[test]
+    fn a_pasta_runs_files_never_go_in_the_image_store() {
+        let Ok(store) = crate::image::store_dir() else {
+            return;
+        };
+        let store = store.join("runs");
+        assert!(!runs_dirs(true).contains(&store));
+        if !nix::unistd::geteuid().is_root() || host_root() {
+            assert!(runs_dirs(false).contains(&store));
+        }
+    }
 
     /// A run's lock is a file only it can open: a lock on its directory
     /// (anyone's) no longer keeps a dead run's files from the sweep. An older

@@ -138,6 +138,7 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     if let Some(handshake) = &plan.handshake {
         wait_for_go(handshake.read)?;
     }
+    give_stdio(&plan.stdio)?;
     #[cfg(target_os = "linux")]
     if let Some(join) = &plan.join {
         // Already in the container's PID namespace (see `join.rs`).
@@ -165,9 +166,71 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     prepare_and_exec(plan)
 }
 
+/// Puts the descriptors the plan names onto 0, 1 and 2 (see `stdio.rs`).
+/// They're above 2, so `dup2` always makes a copy, and the copy isn't
+/// close-on-exec while the original is: only the copy survives the exec.
+/// After a raw `clone` too: `dup2` is a plain system call, with no state in
+/// the C library.
+fn give_stdio(stdio: &[Option<RawFd>; 3]) -> Result<(), Failure> {
+    for (target, source) in (0..).zip(stdio) {
+        if let Some(source) = *source {
+            // SAFETY: `dup2` is async-signal-safe; both are plain descriptor
+            // numbers, `source` open in this process.
+            if unsafe { libc::dup2(source, target) } == -1 {
+                return Err(Failure::at(ChildStep::Stdio, Errno::last())
+                    .detail(usize::try_from(target).unwrap_or(usize::MAX)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Makes the pseudo-terminal's `slave` this process's controlling terminal
+/// and its 0, 1 and 2 (TLPI §34.4). Only a session leader with no terminal
+/// can take one, so it starts a session first. Without a PID namespace the
+/// container's clean image becomes the command, and it leads its session
+/// already (`setsid` then fails with EPERM): that's fine. `TIOCSCTTY` with 0
+/// never takes a terminal that's another session's (probe T4). Plain system
+/// calls: after a raw `clone` too.
+fn take_terminal(slave: RawFd) -> Result<(), Failure> {
+    // SAFETY: `setsid`, `getsid` and `getpid` are async-signal-safe and take
+    // no pointers.
+    if unsafe { libc::setsid() } == -1 {
+        let errno = Errno::last();
+        // SAFETY: as above.
+        let leads_one = unsafe { libc::getsid(0) == libc::getpid() };
+        if errno != Errno::EPERM || !leads_one {
+            return Err(Failure::at(ChildStep::TerminalSession, errno));
+        }
+    }
+    #[allow(
+        clippy::useless_conversion,
+        reason = "the request is `ioctl`'s own type on Linux, not on macOS"
+    )]
+    let request = libc::TIOCSCTTY.into();
+    // SAFETY: `TIOCSCTTY` takes an integer argument; the descriptor is ours.
+    if unsafe { libc::ioctl(slave, request, 0) } == -1 {
+        return Err(Failure::at(ChildStep::ControllingTerminal, Errno::last()));
+    }
+    for target in 0..=2 {
+        // SAFETY: `dup2` is async-signal-safe; both are plain descriptor
+        // numbers, `slave` open and above 2.
+        if unsafe { libc::dup2(slave, target) } == -1 {
+            return Err(Failure::at(ChildStep::TerminalStdio, Errno::last())
+                .detail(usize::try_from(target).unwrap_or(usize::MAX)));
+        }
+    }
+    Ok(())
+}
+
 /// The steps that belong to the command itself, then `exec`: the rest of the
 /// setup, run in the command's own process. Only returns on failure.
 pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
+    // First: before the credentials change and the seccomp filter, which
+    // might refuse these calls.
+    if let Some(slave) = plan.terminal {
+        take_terminal(slave)?;
+    }
     mark_inherited_fds_cloexec(&plan.inherited_fds)?;
     apply_rlimits(plan)?;
     umask(Mode::from_bits_truncate(plan.umask));

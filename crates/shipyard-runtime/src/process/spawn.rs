@@ -55,6 +55,26 @@ pub(crate) struct SpawnOptions {
     /// who removes it once the container is gone).
     #[cfg(target_os = "linux")]
     pub(crate) cgroup: Option<crate::cgroup::Cgroup>,
+    /// The descriptors to put on the child's 0, 1 and 2 (`None`: keep
+    /// shipyard's own). Open until `spawn` returns (see `stdio.rs`).
+    pub(crate) stdio: [Option<RawFd>; 3],
+    /// The command's pseudo-terminal: its slave (no isolation), or the
+    /// socket the container's init sends it back on (see `stdio.rs`).
+    pub(crate) terminal: Option<super::stdio::ChildTerminal>,
+    /// The command takes a pseudo-terminal (`terminal`, or one its init
+    /// makes), so it starts a session of its own even on the host (see
+    /// [`SpawnOptions::starts_session`]).
+    pub(crate) takes_terminal: bool,
+}
+
+impl SpawnOptions {
+    /// Whether the command starts a session of its own: isolated or joined
+    /// ([`Placement::has_own_session`]), or to take a pseudo-terminal. It
+    /// then leads its own group, and nothing here may make it a group
+    /// leader first (its `setsid` would fail).
+    pub(crate) fn starts_session(&self) -> bool {
+        self.placement.has_own_session() || self.takes_terminal
+    }
 }
 
 /// Which namespaces the command starts in.
@@ -69,6 +89,18 @@ pub(crate) enum Placement {
     Join(Join),
 }
 
+impl SpawnOptions {
+    /// The slave the child takes as its terminal itself: one made here (no
+    /// isolation). An isolated command's is made by the container's init,
+    /// which gives it to the command.
+    fn slave(&self) -> Option<RawFd> {
+        match self.terminal {
+            Some(super::stdio::ChildTerminal::Slave(slave)) => Some(slave),
+            Some(super::stdio::ChildTerminal::Socket { .. }) | None => None,
+        }
+    }
+}
+
 impl Placement {
     /// The new namespaces, if that's where the command starts.
     #[cfg(target_os = "linux")]
@@ -79,9 +111,11 @@ impl Placement {
         }
     }
 
-    /// Whether the command starts a session of its own (isolated or joined).
-    /// It then has its own process group too, so `new_process_group`
-    /// doesn't apply, and it never shares the terminal's group.
+    /// Whether the command starts a session of its own (isolated or joined;
+    /// on the host, one that takes a pseudo-terminal does too: see
+    /// [`SpawnOptions::starts_session`]). It then has its own process group
+    /// too, so `new_process_group` doesn't apply, and it never shares the
+    /// terminal's group.
     pub(crate) fn has_own_session(&self) -> bool {
         !matches!(self, Self::Host)
     }
@@ -293,6 +327,11 @@ pub(crate) fn spawn(
         #[cfg(target_os = "linux")]
         joining.as_ref().map(super::join::Joining::setup),
     )?;
+    let plan = ChildPlan {
+        stdio: options.stdio,
+        terminal: options.slave(),
+        ..plan
+    };
 
     // Block every signal across `fork`: the supervisor's handler must never
     // run in the child before the child resets it.
@@ -329,7 +368,7 @@ pub(crate) fn spawn(
     let (status, hooks) = isolated.map(|files| files.parent_ends(options)).unzip();
     #[cfg(not(target_os = "linux"))]
     let status = None;
-    let group = if options.placement.has_own_session() {
+    let group = if options.starts_session() {
         // The child starts its own session: it leads the new group.
         Some(pid)
     } else {
@@ -477,6 +516,9 @@ struct CleanImageFiles {
     hooks: Option<(OwnedFd, OwnedFd)>,
     /// An image's overlay made here (see [`prebuilt_overlay`]).
     overlay: Option<OwnedFd>,
+    /// The socket the init sends the container's terminal back on (the
+    /// child's end: the supervisor holds it, and closes it after the spawn).
+    terminal: Option<RawFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -495,24 +537,42 @@ impl CleanImageFiles {
             .transpose()?;
         let overlay = prebuilt_overlay(isolation)?;
         let (exe, host_exe) = own_binary()?;
+        let terminal = match options.terminal {
+            Some(super::stdio::ChildTerminal::Socket { fd, size }) => Some((fd, size)),
+            Some(super::stdio::ChildTerminal::Slave(_)) | None => None,
+        };
+        // The init waits for shipyard to say the terminal is relayed before
+        // starting the command: a runtime container waiting at its gate has
+        // no shipyard to say so (its console socket comes with 8.3).
+        if terminal.is_some() && options.gate.is_some() {
+            return Err(Error::TerminalAtGate);
+        }
         Ok(Self {
             status_read,
             status_write,
             exe,
             host_exe,
-            setup: super::setup::Setup::new(
-                spec,
-                &options.keep_ignored,
-                isolation,
-                options.gate,
-                options.cgroup.is_some(),
-                hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
-                overlay.as_ref().map(AsRawFd::as_raw_fd),
-            )
-            .to_memfd()?,
+            setup: {
+                let mut setup = super::setup::Setup::new(
+                    spec,
+                    &options.keep_ignored,
+                    isolation,
+                    options.gate,
+                    options.cgroup.is_some(),
+                    hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
+                    overlay.as_ref().map(AsRawFd::as_raw_fd),
+                );
+                setup.terminal = terminal.map(|(fd, size)| super::setup::TerminalSetup {
+                    socket: fd,
+                    rows: size.0,
+                    cols: size.1,
+                });
+                setup.to_memfd()?
+            },
             gate: options.gate,
             hooks,
             overlay,
+            terminal: terminal.map(|(fd, _)| fd),
         })
     }
 
@@ -550,6 +610,7 @@ impl CleanImageFiles {
             gate: self.gate,
             hooks: self.hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
             overlay: self.overlay.as_ref().map(AsRawFd::as_raw_fd),
+            terminal: self.terminal,
         }
     }
 }

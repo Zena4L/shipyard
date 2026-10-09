@@ -49,6 +49,14 @@ pub(crate) struct ChildPlan {
     /// The setup handshake with shipyard (see `channel.rs`). `None` for the
     /// command a container's init starts, which has no handshake.
     pub(crate) handshake: Option<Handshake>,
+    /// Descriptors to `dup2` onto 0, 1 and 2 once the parent says go,
+    /// before the rest of the setup (`None` keeps what's there). Above 2 and
+    /// close-on-exec, so only the copies survive the exec.
+    pub(crate) stdio: [Option<RawFd>; 3],
+    /// A pseudo-terminal's slave for the command to take: a session of its
+    /// own, the slave its controlling terminal, and its 0, 1 and 2 (see
+    /// `child::take_terminal`).
+    pub(crate) terminal: Option<RawFd>,
     /// Isolated: how the cloned child re-execs into the container's clean
     /// image, which does the rest (see `init.rs`).
     #[cfg(target_os = "linux")]
@@ -153,6 +161,9 @@ pub(crate) struct ReexecFds {
     pub(crate) hooks: Option<RawFd>,
     /// An overlay real root made: passed on too.
     pub(crate) overlay: Option<RawFd>,
+    /// The socket the init sends the container's terminal back on: passed
+    /// on too.
+    pub(crate) terminal: Option<RawFd>,
 }
 
 /// The user and groups to switch to.
@@ -440,6 +451,8 @@ impl ChildPlan {
             new_process_group,
             keep_ignored,
             handshake,
+            stdio: [None; 3],
+            terminal: None,
             #[cfg(target_os = "linux")]
             reexec: None,
             #[cfg(target_os = "linux")]
@@ -490,6 +503,7 @@ fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
         .chain(fds.gate)
         .chain(fds.hooks)
         .chain(fds.overlay)
+        .chain(fds.terminal)
         .collect();
     let kept: Vec<u32> = passed
         .iter()

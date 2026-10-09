@@ -6,7 +6,10 @@
 # - `passt`: pasta, rootless containers' network (stage 7). Debian 13's: 12's
 #   (2023) can't carry connections to a published port into a container;
 # - `nftables`: `nft`, for the firewall tests to look at Shipyard's table and
-#   to make another program's chains (Shipyard itself never runs it);
+#   to make another program's chains, and the differential tests (H5) to
+#   rebuild it (Shipyard itself never runs it);
+# - `iproute2` and `bind9-dnsutils`: `ip` and `dig`, for the differential
+#   tests of Shipyard's own netlink and DNS server (H5, H8);
 # - `tester`, the normal user the tests run as, with 65536 subordinate IDs
 #   from 100000.
 #
@@ -15,7 +18,7 @@
 FROM rust:1-trixie
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends uidmap passt nftables \
+    && apt-get install -y --no-install-recommends uidmap passt nftables iproute2 bind9-dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home tester \

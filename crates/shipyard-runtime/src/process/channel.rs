@@ -168,7 +168,7 @@ pub(crate) fn send_go(pipe: &OwnedFd) {
 }
 
 #[cfg(target_os = "linux")]
-fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
+pub(super) fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
     nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
         .map_err(|e| Error::sys("creating a pipe to the child", e))
 }
@@ -177,7 +177,7 @@ fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
 /// in between could inherit the pipe; spawning only from the main thread of a
 /// single-threaded process avoids that.
 #[cfg(not(target_os = "linux"))]
-fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
+pub(super) fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
     use nix::fcntl::FdFlag;
     let (read, write) =
         nix::unistd::pipe().map_err(|e| Error::sys("creating a pipe to the child", e))?;
@@ -191,7 +191,7 @@ fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
 /// Moves `fd` to 3 or above if it landed on 0–2 (possible when a library
 /// caller closed its standard descriptors). There, the command would inherit
 /// our pipe as its stdin, stdout or stderr.
-fn above_stdio(fd: OwnedFd) -> Result<OwnedFd> {
+pub(super) fn above_stdio(fd: OwnedFd) -> Result<OwnedFd> {
     if fd.as_raw_fd() >= 3 {
         return Ok(fd);
     }

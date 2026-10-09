@@ -22,6 +22,9 @@ the previous one. Don't jump ahead or build later stages early.
   layer unpacking.
 - `crates/shipyard-network/`: networking: Shipyard's own netlink (rtnetlink, nf_tables,
   conntrack), networks and leases, pasta, the DNS server, reading a container's sockets.
+- `crates/shipyard-storage/`: named volumes.
+- `crates/shipyard-engine/`: the engine (H1): orchestration behind typed APIs that
+  return data, above the runtime. Only `shipyard-cli` may depend on it (`deny.toml`).
 - `crates/shipyard-test-support/`: helpers for the end-to-end tests (running the binary,
   hostile parents, the pseudo-terminal harness). Dev-only, never published.
   Library errors use `thiserror`.
@@ -32,7 +35,8 @@ the previous one. Don't jump ahead or build later stages early.
   container via `scripts/test-linux.sh`, or the Lima VM).
 - `docs/stages/`: stage notes, the engineering record of each finished stage (decisions,
   failure modes, platform differences, items carried forward).
-- `scripts/`: developer scripts (`test-linux.sh`) and kernel probes (`probes/`) that check
+- `scripts/`: developer scripts (`test-linux.sh`), CI's scripts (`ci/`: the AppArmor
+  control, the Fedora VM job) and kernel probes (`probes/`) that check
   the kernel behaviour a stage relies on.
 - `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
   - `cli.md` is generated from the clap definitions; never edit it by hand.

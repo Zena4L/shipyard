@@ -97,6 +97,26 @@ pub(crate) enum ChildStep {
     /// Bringing up the loopback interface of the container's network
     /// namespace failed.
     Loopback = 61,
+    /// Putting the command's standard input, output or error in place
+    /// failed (`dup2`). The detail is the descriptor: 0, 1 or 2.
+    Stdio = 62,
+    /// Mounting a devpts instance of the container's own over the host's
+    /// `/dev/pts` (no root filesystem of its own) failed.
+    OwnTerminals = 63,
+    /// Making the container's pseudo-terminal failed. The detail: 0 opening
+    /// its `ptmx`, 1 unlocking, 2 sizing, 3 opening the slave, 4 giving the
+    /// slave to the command's user.
+    TerminalOpen = 64,
+    /// Passing the pseudo-terminal's master to Shipyard failed (detail 0),
+    /// or Shipyard went away before saying it was relayed (detail 1).
+    TerminalSend = 65,
+    /// The command couldn't start a session of its own, to take its
+    /// terminal.
+    TerminalSession = 66,
+    /// The command couldn't make the terminal its controlling terminal.
+    ControllingTerminal = 67,
+    /// Putting the terminal on the command's 0, 1 or 2 (the detail) failed.
+    TerminalStdio = 68,
 }
 
 impl ChildStep {
@@ -166,6 +186,13 @@ impl ChildStep {
             59 => Self::MountOverlay,
             60 => Self::AttachOverlay,
             61 => Self::Loopback,
+            62 => Self::Stdio,
+            63 => Self::OwnTerminals,
+            64 => Self::TerminalOpen,
+            65 => Self::TerminalSend,
+            66 => Self::TerminalSession,
+            67 => Self::ControllingTerminal,
+            68 => Self::TerminalStdio,
             _ => return None,
         })
     }
@@ -434,6 +461,35 @@ fn namespace_root_note(error: SpawnError, ctx: &FailureContext) -> SpawnError {
     }
 }
 
+/// [`ChildStep::VerifyCredentials`]'s message.
+const LEFTOVER_PRIVILEGES: &str = "the user and groups did not change as expected; refusing to \
+                                   run with leftover privileges";
+
+/// What the command was doing when taking its terminal failed.
+fn taking_the_terminal(step: ChildStep, detail: u64) -> String {
+    match step {
+        ChildStep::TerminalSession => "starting a session for the command's terminal".to_owned(),
+        ChildStep::ControllingTerminal => {
+            "making the pseudo-terminal the command's controlling terminal".to_owned()
+        }
+        _ => format!(
+            "putting the command's terminal on its {}",
+            stdio_name(detail)
+        ),
+    }
+}
+
+/// Which standard descriptor a [`ChildStep::Stdio`] or
+/// [`ChildStep::TerminalStdio`] failure was about.
+fn stdio_name(fd: u64) -> &'static str {
+    match fd {
+        0 => "standard input",
+        1 => "standard output",
+        2 => "standard error",
+        _ => "standard descriptors",
+    }
+}
+
 /// What failed at `failure`'s step, and why.
 fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
     use SpawnErrorKind::Setup;
@@ -448,16 +504,16 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         ChildStep::Exec => describe_exec(errno, detail, ctx),
         ChildStep::ResetSignals => setup("resetting signal handlers".into()),
         ChildStep::CloseFds => setup("closing inherited file descriptors".into()),
+        ChildStep::Stdio => setup(format!("giving the command its {}", stdio_name(detail))),
+        ChildStep::TerminalSession | ChildStep::ControllingTerminal | ChildStep::TerminalStdio => {
+            setup(taking_the_terminal(step, detail))
+        }
         ChildStep::Rlimit => SpawnError::new(Setup, describe_rlimit(errno, detail, ctx), errno),
         ChildStep::Chdir => setup(format!("changing directory to {}", ctx.cwd.display())),
         ChildStep::SetGroups => setup("setting supplementary groups".into()),
         ChildStep::SetGid => setup(format!("switching to group {}", ctx.group_label())),
         ChildStep::SetUid => setup(format!("switching to user {}", ctx.user_label())),
-        ChildStep::VerifyCredentials => setup(
-            "the user and groups did not change as expected; \
-             refusing to run with leftover privileges"
-                .into(),
-        ),
+        ChildStep::VerifyCredentials => setup(LEFTOVER_PRIVILEGES.into()),
         ChildStep::ParentDeathSignal => setup("setting the parent-death signal".into()),
         ChildStep::ProcessGroup => setup("starting a new process group".into()),
         ChildStep::SignalMask => setup("clearing the signal mask".into()),
@@ -528,6 +584,9 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::Domainname
         | ChildStep::Sysctl
         | ChildStep::Loopback
+        | ChildStep::OwnTerminals
+        | ChildStep::TerminalOpen
+        | ChildStep::TerminalSend
         | ChildStep::AtHooks => describe_container(step, errno, detail, ctx),
         ChildStep::DeviceNode => describe_device(errno, detail, ctx),
         ChildStep::CreateContainerHook
@@ -859,6 +918,29 @@ fn describe_container(
         // shows up as one.
         ChildStep::AtHooks => isolation_setup(
             "the container's init stopped for hooks at the wrong time",
+            errno,
+            ctx,
+        ),
+        ChildStep::OwnTerminals => {
+            isolation_setup("mounting the container's own /dev/pts", errno, ctx)
+        }
+        ChildStep::TerminalOpen => isolation_setup(
+            match detail {
+                0 => "opening the container's /dev/pts/ptmx for its terminal",
+                1 => "unlocking the container's terminal",
+                2 => "sizing the container's terminal",
+                3 => "opening the container's terminal",
+                _ => "giving the container's terminal to its user",
+            },
+            errno,
+            ctx,
+        ),
+        ChildStep::TerminalSend => isolation_setup(
+            if detail == 0 {
+                "passing the container's terminal to shipyard"
+            } else {
+                "waiting for shipyard to relay the container's terminal"
+            },
             errno,
             ctx,
         ),
@@ -1359,7 +1441,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 61, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 68, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -1535,13 +1617,18 @@ mod tests {
             fail(ChildStep::SeccompCompile, Errno::EINVAL, 0),
             "the seccomp profile can't be compiled"
         );
-        assert_eq!(
-            fail(
-                ChildStep::NamespaceRoot,
-                Errno::EPERM,
-                NamespaceRootStep::Uid as u64
+        // (Where AppArmor restricts user namespaces, Ubuntu's, the message
+        // goes on to say so: this host's, not the test's.)
+        let root = fail(
+            ChildStep::NamespaceRoot,
+            Errno::EPERM,
+            NamespaceRootStep::Uid as u64,
+        );
+        assert!(
+            root.starts_with(
+                "becoming root in the container's user namespace: Operation not permitted"
             ),
-            "becoming root in the container's user namespace: Operation not permitted"
+            "{root}"
         );
         #[cfg(target_os = "linux")]
         for (which, id, wanted) in [

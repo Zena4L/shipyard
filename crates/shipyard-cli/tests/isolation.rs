@@ -563,7 +563,7 @@ fn an_init_that_cannot_start_is_reported() {
     };
     // A static shipyard (musl) can't be started through the loader at all.
     let dynamic = std::process::Command::new(loader)
-        .args(["--verify", env!("CARGO_BIN_EXE_shipyard")])
+        .args(["--verify", SHIPYARD.path()])
         .status()
         .is_ok_and(|status| status.success());
     if !dynamic {
@@ -571,7 +571,7 @@ fn an_init_that_cannot_start_is_reported() {
         return;
     }
     let mut command = std::process::Command::new(loader);
-    command.args([env!("CARGO_BIN_EXE_shipyard"), "run", "echo", "hi"]);
+    command.args([SHIPYARD.path(), "run", "echo", "hi"]);
     let run = run(command);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(

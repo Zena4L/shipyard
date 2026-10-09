@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use shipyard_test_support::bundle::Bundle;
-use shipyard_test_support::{Rootless, delegated_cgroup, rootless, under_rosetta};
+use shipyard_test_support::{Rootless, Shipyard, delegated_cgroup, rootless, under_rosetta};
 
-const RUNTIME: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
+const RUNTIME: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard-runtime"));
 
 /// A state root for one test, and a place for `create`'s output; removed on
 /// drop (with every container in it killed and deleted first).
@@ -53,7 +53,7 @@ impl Runtime {
     /// `shipyard-runtime --root ROOT ARGS…`, for calls that don't leave a
     /// container holding their output.
     fn call(&self, args: &[&str]) -> Call {
-        let output = Command::new(RUNTIME)
+        let output = Command::new(RUNTIME.path())
             .arg("--root")
             .arg(&self.root)
             .args(args)
@@ -69,7 +69,7 @@ impl Runtime {
 
     /// `create`, with its (and so the container's) output going to files.
     fn create(&self, id: &str, bundle: &Bundle, extra: &[&str]) -> Call {
-        self.create_with(id, bundle, extra, Command::new(RUNTIME))
+        self.create_with(id, bundle, extra, Command::new(RUNTIME.path()))
     }
 
     /// `create` like [`Runtime::create`], run by `command` (the runtime,
@@ -374,7 +374,7 @@ fn rootless_state_is_in_the_runtime_dir() {
     let runtime_dir = std::env::temp_dir().join(format!("shipyard-xdg-{}", std::process::id()));
     std::fs::create_dir_all(&runtime_dir).unwrap();
     let command = |args: &[&str], xdg: Option<&PathBuf>| {
-        let mut command = Command::new(RUNTIME);
+        let mut command = Command::new(RUNTIME.path());
         command
             .args(args)
             .stdin(Stdio::null())
@@ -498,7 +498,7 @@ fn the_lifecycle() {
 fn a_caller_ignoring_sigchld_doesnt_lose_the_exit() {
     let runtime = Runtime::new();
     let bundle = bundle_running("exit 3");
-    let mut command = Command::new(RUNTIME);
+    let mut command = Command::new(RUNTIME.path());
     // SAFETY: `ignore` only calls `sigaction`, as `pre_exec` requires.
     unsafe { command.pre_exec(|| shipyard_test_support::ignore(libc::SIGCHLD)) };
     let call = runtime.create_with("ignoring", &bundle, &[], command);
@@ -1001,7 +1001,7 @@ fn a_rootless_container_is_deleted_from_another_session() {
         let mut command = Command::new("setpriv");
         command
             .args(["--reuid", &uid, "--regid", &uid, "--clear-groups"])
-            .arg(RUNTIME);
+            .arg(RUNTIME.path());
         // SAFETY: open, write and close are async-signal-safe.
         unsafe {
             command.pre_exec(move || {
@@ -1269,7 +1269,7 @@ fn events_report_an_oom_kill() {
     ]);
     bundle.write(&config);
     assert_eq!(runtime.create("watched", &bundle, &[]).code, Some(0));
-    let mut events = Command::new(RUNTIME)
+    let mut events = Command::new(RUNTIME.path())
         .arg("--root")
         .arg(&runtime.root)
         .args(["events", "--interval", "100ms", "watched"])
@@ -1561,7 +1561,8 @@ fn hooks_are_what_create_read() {
     let mut config = bundle.config();
     config["process"]["args"] = json!(["sh", "-c", "echo ran"]);
     let ask = format!(
-        "{RUNTIME} --root {} state asked > {}",
+        "{} --root {} state asked > {}",
+        RUNTIME.path(),
         runtime.root.display(),
         out.display()
     );
@@ -1616,7 +1617,7 @@ fn deleting_during_a_hook_stops_it() {
     let hang = format!("echo $$ > {}; exec sleep 300", pid_file.display());
     config["hooks"]["createRuntime"] = json!([{"path": "/bin/sh", "args": ["sh", "-c", hang]}]);
     bundle.write(&config);
-    let mut create = Command::new(RUNTIME)
+    let mut create = Command::new(RUNTIME.path())
         .arg("--root")
         .arg(&runtime.root)
         .args(["create", "--bundle", bundle.arg(), "held"])
@@ -1773,7 +1774,7 @@ fn deleting_a_container_whose_setup_hangs() {
     let mut config = bundle.config();
     config["hooks"] = json!({"createRuntime": [{"path": "/bin/sleep", "args": ["sleep", "300"]}]});
     bundle.write(&config);
-    let mut create = Command::new(RUNTIME)
+    let mut create = Command::new(RUNTIME.path())
         .arg("--root")
         .arg(&runtime.root)
         .args(["create", "--bundle", bundle.arg(), "hung"])
@@ -1856,7 +1857,7 @@ fn create_works_with_its_stdio_closed() {
     let status = Command::new("sh")
         .arg("-c")
         .arg(r#"exec 0<&- 1>&- 2>&-; exec "$0" --root "$1" create --bundle "$2" closed"#)
-        .arg(RUNTIME)
+        .arg(RUNTIME.path())
         .arg(&runtime.root)
         .arg(bundle.arg())
         .status()
@@ -2024,7 +2025,8 @@ fn the_container_outlives_its_creator() {
     let bundle = bundle_running("sleep 300");
     // `create` from a shell in its own process group, then that group killed.
     let script = format!(
-        "{RUNTIME} --root {} create --bundle {} survivor >/dev/null 2>&1; kill -KILL 0",
+        "{} --root {} create --bundle {} survivor >/dev/null 2>&1; kill -KILL 0",
+        RUNTIME.path(),
         runtime.root.display(),
         bundle.arg()
     );
@@ -2066,7 +2068,7 @@ fn the_monitor_has_a_session_of_its_own() {
 fn the_runtime_binary_is_its_own_monitor_and_init() {
     // Started by hand with the hidden arguments, it refuses politely.
     for hidden in ["__shipyard-monitor", "__shipyard-init"] {
-        let output = Command::new(RUNTIME).arg(hidden).output().unwrap();
+        let output = Command::new(RUNTIME.path()).arg(hidden).output().unwrap();
         assert_eq!(output.status.code(), Some(125), "{hidden}");
     }
 }

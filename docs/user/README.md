@@ -143,7 +143,7 @@ namespace, a mount and an overlay next to the image store, and removes them agai
 Run a shell in Alpine Linux, pulled from Docker Hub:
 
 ```sh
-shipyard run --image alpine sh
+shipyard run -it --image alpine sh
 ```
 
 ```text
@@ -162,10 +162,10 @@ and with `--memory 512m` (or `--cpus`, `--pids-limit`, …) its own limits. See
 [Running commands](run.md) for everything `run` accepts, and [Images](images.md)
 for pulling and the image store.
 
-Until v0.2 brings a terminal of the container's own (`-it`), a shell runs on
-yours without it being its *controlling* terminal: `sudo` and `ssh` can't prompt
-for a password, `tty` says "not a tty" with an image, and Ctrl-Z stops Shipyard,
-not the shell (see [On a terminal, isolated](run.md#on-a-terminal-isolated)).
+`-it`, as with Docker, gives the shell a terminal of the container's own and passes
+what you type on to it: full-screen programs, password prompts and job control work
+inside (see [A terminal of the container's own](run.md#a-terminal-of-the-containers-own--t)).
+A container never gets your terminal itself.
 
 A command, and its exit code:
 
@@ -183,9 +183,8 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
 
 ## Limitations in v0.1
 
-- **No terminal of the container's own** (`-it`), **no detached containers**, no
-  `exec` and no logs: v0.2. A container lives as long as its
-  `shipyard run`.
+- **No detached containers**, no `exec` and no logs: v0.2. A container lives as
+  long as its `shipyard run`.
 - **macOS doesn't isolate yet:** commands run as ordinary processes until Shipyard runs
   them in a Linux VM of its own (v0.4).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge

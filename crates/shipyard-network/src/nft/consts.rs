@@ -169,7 +169,7 @@ pub(crate) const TYPE_ETHERADDR: u32 = 9;
 pub(crate) const TYPE_INET_PROTOCOL: u32 = 12;
 pub(crate) const TYPE_INET_SERVICE: u32 = 13;
 pub(crate) const TYPE_IFNAME: u32 = 41;
-const TYPE_BITS: u32 = 6;
+pub(crate) const TYPE_BITS: u32 = 6;
 
 /// The type of the concatenation of `types`, as nft computes it.
 pub(crate) fn concat_type(types: &[u32]) -> u32 {

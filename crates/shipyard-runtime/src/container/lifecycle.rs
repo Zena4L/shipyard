@@ -677,6 +677,10 @@ fn spawn_container(
         placement: Placement::New(Box::new(bundle.isolation)),
         gate: Some(gate.as_raw_fd()),
         cgroup,
+        // The OCI runtime's: the container keeps the caller's stdio.
+        stdio: [None; 3],
+        terminal: None,
+        takes_terminal: false,
     };
     let mut child =
         spawn(&bundle.spec, &options, None, |_| {}).map_err(|err| format!("{err:#}"))?;

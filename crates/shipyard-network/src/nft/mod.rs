@@ -406,6 +406,18 @@ mod linux {
             Ok(parts.into_iter().flatten().collect())
         }
 
+        /// The chain of each of Shipyard's table's rules, in order (the
+        /// differential tests against `nft`).
+        #[cfg(test)]
+        pub(crate) fn rule_chains(&mut self) -> Result<Vec<String>, NetlinkError> {
+            let mut message = objects::message(NFT_MSG_GETRULE, 0, FAMILY);
+            message.attr_str(NFTA_RULE_TABLE, TABLE);
+            self.socket
+                .dump("listing shipyard's rules", &message, |part| {
+                    decode::rule_chain(part).map(Some)
+                })
+        }
+
         /// Every chain of every table, in every family: Shipyard's and
         /// other programs' (Docker's, a firewall's).
         pub fn chains(&mut self) -> Result<Vec<Chain>, NetlinkError> {

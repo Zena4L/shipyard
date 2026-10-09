@@ -570,7 +570,9 @@ fn orphans_belong_to_the_init() {
 
 fn no_descriptors_reach_it() {
     let container = Container::sleeping();
-    let joined = run(join(&container, "ls -l /proc/$$/fd"));
+    // (`; true`: the shell stays, and `ls` lists its descriptors. Exec'd,
+    // `ls` would list its own, with the one it reads `/proc/N/fd` through.)
+    let joined = run(join(&container, "ls -l /proc/$$/fd; true"));
     assert_eq!(joined.code, Some(0), "{}", joined.stderr);
     for leak in ["pid:[", "mnt:[", "uts:[", "ipc:[", "/proc/"] {
         assert!(
@@ -716,6 +718,17 @@ fn an_init_that_cannot_start_is_reported_without_a_pid_namespace() {
     else {
         return;
     };
+    // A static test binary (built for musl) names no loader: run through
+    // one anyway, it isn't the case this checks.
+    let names_a_loader = std::fs::read(me().path()).is_ok_and(|binary| {
+        binary
+            .windows(8)
+            .any(|bytes| bytes == b"/lib/ld-" || bytes == b"lib64/ld")
+    });
+    if !names_a_loader {
+        eprintln!("skipping: a static test binary has no dynamic loader to run it through");
+        return;
+    }
     let mut command = std::process::Command::new(loader);
     command.args([me().path(), "container-nopid", "true"]);
     let ran = run(command);

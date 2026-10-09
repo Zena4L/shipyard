@@ -5,6 +5,46 @@ All notable changes to Shipyard. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change
 behaviour; each change is listed here).
 
+## Unreleased
+
+### Changed
+
+- **A container never gets your terminal** (stage 8): when Shipyard's stdin, stdout
+  or stderr is a terminal, an isolated command gets a pipe instead, which Shipyard
+  relays, so it can't type into your shell or change the terminal's settings.
+  Programs inside see no terminal (`tty` says "not a tty"); `--no-isolation` keeps
+  it, and without `--image` or `--rootfs` the container's `/dev/pts` is its own. A
+  `shipyard run -i … &` in the background now waits for `fg` instead of taking your
+  shell's keys.
+- **Input only with `-i`** (stage 8): an isolated command's stdin is empty
+  (`/dev/null`) unless `-i` (`--interactive`) is given, as with Docker. Scripts that
+  pipe input into `shipyard run` need `-i`.
+
+### Added
+
+- **`-i`/`--interactive`** passes your input on to the command; `-it` when your
+  input isn't a terminal is refused as Docker refuses it.
+- **`-t`/`--tty`: a terminal of the container's own** (stage 8): a pseudo-terminal
+  made inside the container, sized as your window and resized with it, the
+  command's controlling terminal. With `-it` your terminal is raw while it runs,
+  so `vi`, `top`, password prompts (`su`, `sudo`) and job control inside work;
+  it's put back when the run ends or Shipyard is stopped. `-t` works without
+  isolation (and on macOS) too.
+
+### Fixed
+
+- **Rootless networking works under SELinux** (Fedora; stage 8): Fedora confines
+  pasta, and its policy refused how Shipyard gave pasta the container (by process
+  ID), so every rootless run with its default network failed there.
+- **`--network pasta` works for root** (stage 8), as the docs said: pasta dropped to
+  `nobody` before joining the container's namespace, which `nobody` can't, so root's
+  pasta runs always failed. pasta now
+  gets the container's network namespace as a file, as with Podman.
+- **Shipyard's firewall table can be saved and restored with `nft`** (stage 8): one
+  of its sets was named `masquerade`, a keyword of nft's language, so `nft -f` refused
+  a listing of the table (`nft list ruleset > saved` then `nft -f saved` failed on
+  it). It's now `masquerade4`; the table is rebuilt on the next root run.
+
 ## 0.1.0 - unreleased
 
 The first milestone: `shipyard run --image alpine sh` rootless on Linux, on your own

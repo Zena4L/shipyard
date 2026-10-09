@@ -11,7 +11,7 @@ Shipyard has three layers, mirroring how the established tools split up:
 | Layer | Equivalent | Responsibility |
 |---|---|---|
 | **Runtime** (`shipyard-runtime`) | runc / crun | Turns a root filesystem plus an OCI `config.json` into an isolated process. Implements the [OCI runtime spec](https://github.com/opencontainers/runtime-spec). |
-| **Engine** (daemonless) | Podman | Images, storage, networks, volumes, state, compose, API. Calls the runtime. |
+| **Engine** (daemonless; `shipyard-engine`, `shipyard-image`, `shipyard-storage`; `shipyard-network` serves the runtime too) | Podman | Images, storage, networks, volumes, state, compose, API. Calls the runtime. |
 | **Product** | OrbStack | CLI, macOS VM backend, desktop UI, packaging. |
 
 ## 1. Process lifecycle — stage 1 *(POSIX, runs natively on macOS)*
@@ -247,7 +247,9 @@ Shipyard has three layers, mirroring how the established tools split up:
   - holds the container's stdio after the CLI exits
   - records the exit status
   - writes logs
-- **Pseudoterminals** for `-it`, with resize via `SIGWINCH` and the `TIOCSWINSZ` ioctl.
+- **Pseudoterminals** for `-it`, with resize via `SIGWINCH` and the `TIOCSWINSZ` ioctl
+  (built in step 8.2: made inside the container, its master passed back with
+  `SCM_RIGHTS`; the user's terminal raw and restored).
 - **`attach` / detach:** with detach keys.
 - **`exec` sessions:** each with its own terminal.
 - **`exec` joins the container's cgroup** (moved from stage 5): its limits, device rules

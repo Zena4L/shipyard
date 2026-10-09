@@ -223,6 +223,34 @@ already. The network tests make their interfaces in namespaces of their own
 (`in_new_netns`), with an `Upstream` namespace standing in for the internet
 (`shipyard_test_support::net`).
 
+### What CI runs
+
+`.github/workflows/ci.yml`, on every push and pull request:
+
+| Job | What it covers |
+|---|---|
+| `fmt`, `musl`, `docs`, `deny` | formatting; clippy for musl; rustdoc; dependencies |
+| `check` (Ubuntu, macOS) | clippy and every normal-user test. Rootless tests run the binaries cargo built, so the AppArmor restriction on user namespaces is turned off here |
+| `root` (Ubuntu, macOS) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
+| `apparmor` | **A real Ubuntu host** (H4): the restriction left on, `shipyard` and `shipyard-runtime` installed in `/usr/local/bin` with the profile (`contrib/apparmor/shipyard`), as users install them. `scripts/ci/apparmor-control.sh` first proves the profile is what lets them make user namespaces (unloaded, `shipyard doctor` fails); then `shipyard-cli`'s tests run the installed binaries (the runtime's in-process tests make user namespaces from their own test binary, which no profile covers: they run in `check`) |
+| `fedora` | **A real Fedora host** (H4): `scripts/ci/fedora-vm.sh` boots Fedora Cloud (pinned by SHA-256) in QEMU/KVM, SELinux enforcing, firewalld stopped (until stage 8.6), and runs the test executables built on the runner in both passes (`scripts/ci/run-test-binaries.sh`), plus the terminal probe |
+
+**Required, not skipped.** CI and `test-linux.sh` set `SHIPYARD_TEST_ROOTLESS`,
+`SHIPYARD_TEST_DELEGATED` and `SHIPYARD_TEST_TOOLS` to `required`: a rootless test that
+can't run, a missing delegated cgroup, or a missing reference tool (`ip`, `nft`, `dig`,
+for the differential tests) then fails instead of skipping.
+
+**Testing installed binaries.** With `SHIPYARD_TEST_BIN_DIR=DIR`, the end-to-end tests
+run `DIR/shipyard` and `DIR/shipyard-runtime` instead of what cargo built
+(`shipyard_test_support::binary`), and the rootless tests ask that `shipyard doctor`
+whether user namespaces work, instead of `unshare` (which no profile covers).
+
+**The Fedora job by hand**, on an x86-64 Linux machine with KVM (`qemu-system-x86_64`,
+`qemu-img`, `cloud-localds`, `jq`, `gcc`, and `/dev/kvm` yours: the kvm group):
+`scripts/ci/fedora-vm.sh` (`VM_SSH_PORT` if 2222 is taken). It builds, boots a throwaway
+VM, runs both passes there, and removes the VM; the image stays cached in
+`~/.cache/shipyard-vm`.
+
 ## Running Linux-only stages on macOS: Lima VM
 
 Eventually Shipyard manages its own VM (roadmap stage 12). Until then,

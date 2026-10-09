@@ -79,6 +79,18 @@ pub(crate) struct Setup {
     pub(crate) cgroup: CgroupSetup,
     /// Hooks to stop for while setting up, if there are any.
     pub(crate) hooks: Option<HooksSetup>,
+    /// A pseudo-terminal to make for the command (`-t`).
+    pub(crate) terminal: Option<TerminalSetup>,
+}
+
+/// The command's pseudo-terminal, made inside the container (see `init.rs`).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TerminalSetup {
+    /// The socket to send its master back to shipyard on, inherited.
+    pub(crate) socket: RawFd,
+    /// Its size, the user's terminal's.
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
 }
 
 /// The hooks part of the setup: where to wait for the runtime's, and the
@@ -479,6 +491,7 @@ impl Setup {
                     .cgroup_mount
                     .filter(|_| own_cgroup && isolation.has(Namespace::Mount)),
             },
+            terminal: None,
             hooks: hooks_pipe.map(|pipe| {
                 let hooks = isolation
                     .hooks

@@ -34,10 +34,12 @@ pub(crate) mod spawn;
 mod spec;
 mod startup;
 mod status;
+mod stdio;
 mod stop;
 mod supervisor;
 #[cfg(target_os = "linux")]
 mod sysctl;
+mod terminal;
 #[cfg(target_os = "linux")]
 mod user_namespace;
 
@@ -53,6 +55,7 @@ pub use spawn::die_from;
 pub use spec::{MAX_GROUPS, Names, ProcessSpec, SpecError, User};
 pub use startup::refuse_privileged_start;
 pub use status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND, ExitStatus};
+pub use stdio::{Pty, Stdio, Stream};
 pub use stop::{DEFAULT_STOP_TIMEOUT_SECS, StopPolicy, StopSignalError};
 pub use supervisor::{NetworkHook, NetworkTarget, Supervisor};
 #[cfg(target_os = "linux")]

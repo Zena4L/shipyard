@@ -16,7 +16,7 @@ use nix::sched::{CloneFlags, unshare};
 
 use super::{LinkChange, Route, RouteType, Rtnetlink};
 use crate::ipnet::{Family, IpNet};
-use crate::linux_test::{in_new_netns, this_netns};
+use crate::linux_test::{in_new_netns, reference_tool, this_netns};
 
 /// The hairpin mode of the bridge port with `index`, as the kernel lists it
 /// for the bridge family (`RTM_GETLINK` with `AF_BRIDGE`: one message per
@@ -325,5 +325,272 @@ fn a_dump_longer_than_a_datagram_is_read_whole() {
                 .count(),
             150
         );
+    });
+}
+
+// ---- Differential: Shipyard's rtnetlink against `ip -j` (H5) ----
+
+/// `ip -j ARGS…` in this thread's network namespace (a fork copies the
+/// calling thread's), as JSON.
+fn ip_json(args: &[&str]) -> serde_json::Value {
+    let output = std::process::Command::new("ip")
+        .arg("-j")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ip {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("ip's JSON")
+}
+
+/// What a link looks like to compare: name, kind, up, MTU, bridge, MAC.
+type LinkView = (
+    String,
+    Option<String>,
+    bool,
+    Option<u32>,
+    Option<String>,
+    Option<String>,
+);
+
+fn mac_text(mac: &[u8]) -> String {
+    mac.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Asserts that Shipyard's rtnetlink and `ip` see this namespace the same:
+/// every link, every address, and every route of the main table.
+fn ip_sees_the_same(rtnl: &mut Rtnetlink) {
+    let links = rtnl.links().unwrap();
+    same_links(&links, &ip_json(&["-d", "link", "show"]));
+    same_addresses(rtnl, &links);
+    same_routes(rtnl, &links);
+}
+
+/// The name of the link with `index`.
+fn name_of(links: &[super::Link], index: u32) -> Option<String> {
+    links
+        .iter()
+        .find(|link| link.index == index)
+        .map(|link| link.name.clone())
+}
+
+/// Every link: name, kind, up, MTU, bridge, and an Ethernet link's MAC
+/// (`ip` shows a tunnel's, `tunl0`'s say, as an IP address).
+fn same_links(links: &[super::Link], ip_links: &serde_json::Value) {
+    let ethernet: Vec<&str> = ip_links
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|link| matches!(link["link_type"].as_str(), Some("ether" | "loopback")))
+        .filter_map(|link| link["ifname"].as_str())
+        .collect();
+    let mut ours: Vec<LinkView> = links
+        .iter()
+        .map(|link| {
+            (
+                link.name.clone(),
+                link.kind.clone(),
+                link.flags & libc::IFF_UP as u32 != 0,
+                link.mtu,
+                link.master.and_then(|index| name_of(links, index)),
+                link.mac
+                    .as_deref()
+                    .filter(|_| ethernet.contains(&link.name.as_str()))
+                    .map(mac_text),
+            )
+        })
+        .collect();
+    let mut theirs: Vec<LinkView> = ip_links
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|link| {
+            let text = |key: &str| link[key].as_str().map(str::to_owned);
+            (
+                text("ifname").unwrap(),
+                link["linkinfo"]["info_kind"].as_str().map(str::to_owned),
+                link["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|flag| flag == "UP"),
+                link["mtu"].as_u64().map(|mtu| u32::try_from(mtu).unwrap()),
+                text("master"),
+                text("address").filter(|_| ethernet.contains(&text("ifname").unwrap().as_str())),
+            )
+        })
+        .collect();
+    ours.sort();
+    theirs.sort();
+    assert_eq!(ours, theirs, "links");
+}
+
+/// Every address, by interface.
+fn same_addresses(rtnl: &mut Rtnetlink, links: &[super::Link]) {
+    let index_of = |name: &str| {
+        links
+            .iter()
+            .find(|link| link.name == name)
+            .map(|link| link.index)
+            .unwrap()
+    };
+    let mut ours: Vec<(u32, IpNet)> = rtnl
+        .addresses(None)
+        .unwrap()
+        .into_iter()
+        .map(|address| (address.index, address.net))
+        .collect();
+    let mut theirs: Vec<(u32, IpNet)> = Vec::new();
+    for link in ip_json(&["addr", "show"]).as_array().unwrap() {
+        let index = index_of(link["ifname"].as_str().unwrap());
+        for info in link["addr_info"].as_array().unwrap() {
+            let text = format!(
+                "{}/{}",
+                info["local"].as_str().unwrap(),
+                info["prefixlen"].as_u64().unwrap()
+            );
+            theirs.push((index, net(&text)));
+        }
+    }
+    ours.sort_by_key(|(index, net)| (*index, net.to_string()));
+    theirs.sort_by_key(|(index, net)| (*index, net.to_string()));
+    assert_eq!(ours, theirs, "addresses");
+}
+
+/// Every route of the main table: destination, gateway, interface, type.
+fn same_routes(rtnl: &mut Rtnetlink, links: &[super::Link]) {
+    for (family, flag) in [(Family::V4, "-4"), (Family::V6, "-6")] {
+        let mut ours: Vec<String> = rtnl
+            .routes(family)
+            .unwrap()
+            .iter()
+            .map(|route| {
+                format!(
+                    "{} via {:?} dev {:?} {:?}",
+                    route.destination,
+                    route.gateway,
+                    route.index.and_then(|index| name_of(links, index)),
+                    route.route_type
+                )
+            })
+            .collect();
+        let mut theirs: Vec<String> = ip_json(&[flag, "route", "show", "table", "main"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|route| ip_route_text(route, family))
+            .collect();
+        ours.sort();
+        theirs.sort();
+        assert_eq!(ours, theirs, "{family:?} routes");
+    }
+}
+
+/// A route `ip -j` lists, in the form [`same_routes`] compares.
+fn ip_route_text(route: &serde_json::Value, family: Family) -> String {
+    let destination = match route["dst"].as_str().unwrap() {
+        "default" => IpNet::any(family).to_string(),
+        dst if dst.contains('/') => dst.to_owned(),
+        host => format!("{host}/{}", if family == Family::V4 { 32 } else { 128 }),
+    };
+    let gateway: Option<IpAddr> = route["gateway"]
+        .as_str()
+        .map(|gateway| gateway.parse().unwrap());
+    let kind = match route["type"].as_str() {
+        None | Some("unicast") => RouteType::Unicast,
+        Some("blackhole") => RouteType::Blackhole,
+        Some("unreachable") => RouteType::Unreachable,
+        Some("prohibit") => RouteType::Prohibit,
+        Some(other) => panic!("a route type Shipyard doesn't read: {other}"),
+    };
+    format!(
+        "{destination} via {gateway:?} dev {:?} {kind:?}",
+        route["dev"].as_str().map(str::to_owned)
+    )
+}
+
+/// What Shipyard's rtnetlink makes, `ip` reads back the same: a bridge with
+/// an MTU, a veth pair with one end its port, IPv4 and IPv6 addresses, and
+/// routes (through a gateway, default, blackhole).
+#[test]
+#[ignore = "needs root"]
+fn ip_reads_what_shipyard_makes() {
+    if !reference_tool("ip") {
+        return;
+    }
+    in_new_netns(|| {
+        let mut rtnl = Rtnetlink::new().unwrap();
+        rtnl.create_bridge("shy-br9").unwrap();
+        let bridge = rtnl.link("shy-br9").unwrap().unwrap().index;
+        rtnl.change(bridge, LinkChange::Mtu(1400)).unwrap();
+        rtnl.change(bridge, LinkChange::Address([0x02, 0x42, 0x0a, 0xc9, 0, 1]))
+            .unwrap();
+        rtnl.change(bridge, LinkChange::Up(true)).unwrap();
+        rtnl.create_veth("shy-v9", "shy-v9p", None, None).unwrap();
+        let port = rtnl.link("shy-v9").unwrap().unwrap().index;
+        rtnl.change(port, LinkChange::Master(bridge)).unwrap();
+        rtnl.change(port, LinkChange::Up(true)).unwrap();
+        rtnl.add_address(bridge, net("10.201.0.1/24")).unwrap();
+        rtnl.add_address(bridge, net("fd00:9::1/64")).unwrap();
+        rtnl.add_route(&Route {
+            destination: net("10.202.0.0/24"),
+            gateway: Some("10.201.0.2".parse().unwrap()),
+            index: None,
+            route_type: RouteType::Unicast,
+        })
+        .unwrap();
+        rtnl.add_route(&Route::default_via("10.201.0.254".parse().unwrap()))
+            .unwrap();
+        rtnl.add_route(&Route::default_via("fd00:9::fe".parse().unwrap()))
+            .unwrap();
+        rtnl.add_route(&Route {
+            destination: net("10.203.0.0/16"),
+            gateway: None,
+            index: None,
+            route_type: RouteType::Blackhole,
+        })
+        .unwrap();
+        ip_sees_the_same(&mut rtnl);
+    });
+}
+
+/// What `ip` makes, Shipyard's rtnetlink reads the same.
+#[test]
+#[ignore = "needs root"]
+fn shipyard_reads_what_ip_makes() {
+    if !reference_tool("ip") {
+        return;
+    }
+    in_new_netns(|| {
+        let ip = |args: &str| {
+            let status = std::process::Command::new("ip")
+                .args(args.split_whitespace())
+                .status()
+                .unwrap();
+            assert!(status.success(), "ip {args}");
+        };
+        for args in [
+            "link add shy-br8 type bridge",
+            "link set shy-br8 mtu 1300 address 02:42:0a:c8:00:01 up",
+            "link add shy-v8 type veth peer name shy-v8p",
+            "link set shy-v8 master shy-br8 up",
+            "addr add 10.208.0.1/24 dev shy-br8",
+            "addr add fd00:8::1/64 dev shy-br8 nodad",
+            "route add 10.209.0.0/24 via 10.208.0.2",
+            "route add default via 10.208.0.254",
+            "route add unreachable 10.210.0.0/16",
+            "route add prohibit 10.211.0.0/16",
+            "-6 route add default via fd00:8::fe",
+        ] {
+            ip(args);
+        }
+        let mut rtnl = Rtnetlink::new().unwrap();
+        ip_sees_the_same(&mut rtnl);
     });
 }

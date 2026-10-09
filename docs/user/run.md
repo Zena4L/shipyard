@@ -94,7 +94,8 @@ sees the host's network.
   It shows up as `shipyard-init` in `ps`. It holds none of Shipyard's command
   line or environment, so `-e` values passed to Shipyard can't be read from it
   inside the container.
-- **Terminal:** see [On a terminal, isolated](#on-a-terminal-isolated) below.
+- **Terminal:** a container never gets your terminal; see [Input, output and
+  terminals](#input-output-and-terminals) below.
 - **Cgroup:** see [Cgroup](#cgroup) below.
 - **If Shipyard is killed**, the whole container goes with it.
 - **Not a hardened boundary yet.** The command runs as root, with only a few of
@@ -466,37 +467,112 @@ shipyard run sh -c 'id; cat /proc/self/uid_map'
   `passt` package); without it, a rootless run is refused, saying how to do
   without (`--network host` or `--network none`).
 
+### Input, output and terminals
+
+A container never gets your terminal. Whatever holds a terminal can type into it
+as if you had (on systems that still allow that), or leave it in a broken state,
+and a container's programs are not yours. So when Shipyard's own input or output
+is a terminal, the isolated command gets a pipe in its place, and Shipyard passes
+the bytes along:
+
+- **Output** (stdout and stderr) appears on your terminal as usual, in the order
+  it was written when both go to the same terminal.
+- **Input** reaches the command only with **`-i`** (`--interactive`). Without it,
+  the command's stdin is empty (`/dev/null`), as with Docker: a command that reads
+  gets end-of-file at once, and can't take keys meant for your shell. With `-i`,
+  what you type is passed on line by line, and Ctrl-D ends the command's input.
+- **Files and pipes are passed on as they are:** `shipyard run -i … < file`,
+  `… | shipyard run -i …` and `shipyard run … > log` give the command those
+  directly.
+- **Not by name either:** without a root filesystem of its own (no `--image` or
+  `--rootfs`), the container's `/dev/pts` is its own, so your terminals aren't in
+  it to be opened.
+- **`-t`** gives the command a terminal of the container's own (below). `-it`
+  when your input isn't a terminal is refused as Docker refuses it: "the input
+  device is not a TTY".
+
+### A terminal of the container's own (`-t`)
+
+```sh
+shipyard run -it --image alpine sh
+```
+
+With **`-t`** (`--tty`), the command gets a *pseudo-terminal* made inside the
+container: the first of its own (`tty` prints `/dev/pts/0`), sized as your window,
+and its *controlling terminal*. Shipyard passes what it shows on to your terminal,
+and with **`-i`** what you type to it. So inside, everything a terminal gives works:
+
+- **Full-screen programs** (`vi`, `top`, `less`) and **password prompts** (`su`,
+  `sudo`, `ssh`, which ask on `/dev/tty`).
+- **Your keys are the container's.** With `-it` on a terminal, yours is in *raw
+  mode* while the run lasts: Ctrl-C, Ctrl-Z and Ctrl-\ go to the container's
+  terminal, which signals its foreground job, as your own terminal would. Ctrl-Z
+  stops a job inside (`fg` there resumes it), not Shipyard. Ctrl-D ends the
+  container shell's input.
+- **Resizing the window** resizes the container's terminal.
+- **Closing your terminal** hangs up the container's: its programs get SIGHUP,
+  and one that ignores it finds its input ended. A `kill -HUP` sent to Shipyard is
+  passed on as usual.
+- **Your terminal is put back** when the run ends, however the command ends,
+  and while Shipyard is stopped (`kill -TSTP`, or job control): `fg` makes it raw
+  again (`bg` leaves it as your shell has it). Only `kill -9` of Shipyard itself,
+  or SIGSTOP, leaves it raw; `reset` (or `stty sane`) fixes it.
+- **In the background**, `shipyard run -it … &` waits for `fg` before changing
+  your terminal, as any program that does would.
+- **`-t` alone** (no `-i`) gives a terminal without your input, also when the
+  output goes to a pipe or a file: `shipyard run -t … | cat` works, and
+  `>> file` appends (the terminal
+  takes your window's size, or 24 by 80 when none of Shipyard's input, output or
+  error is a terminal).
+- **The terminal belongs to the command's user** (`-u`), so programs that open it
+  by name can.
+
+Without `--image` or `--rootfs`, the container's `/dev/pts` is its own too (above),
+and programs that make terminals (`script`, `tmux`) make them there.
+
+With `--no-isolation` (and on macOS), `-t` makes the terminal on the host, and the
+command is the leader of a session of its own. Stopping the run reaches the
+command's process group: jobs its shell put in groups of their own (`set -m`) are
+left to the shell. On Linux Shipyard ends them anyway when the run ends; on macOS
+they can outlive it.
+
+**What the container shows reaches your terminal as it is,** escape sequences
+included (a title, a colour, or the less common ones some terminals act on), as
+with Docker. Run only images you'd let draw on your terminal.
+
+`--no-isolation` runs your own program, not a container: it keeps your terminal
+and your input, with full job control (see [Signals and
+stopping](#signals-and-stopping)).
+
 ### On a terminal, isolated
 
 An isolated command runs in a session of its own. It's never in the terminal's
-foreground group and has no *controlling terminal*, though its input and output
-are still the terminal. So:
+foreground group, has no *controlling terminal*, and (above) its input and
+output aren't the terminal. So:
 
+- **Programs see no terminal** without `-t`: `tty` prints "not a tty", and
+  programs that ask for a password on `/dev/tty` (`sudo`, `ssh`) can't prompt.
+  Full-screen programs (`vim`, `top`) need a terminal: use `-it`.
 - **Ctrl-C and Ctrl-\\** reach it through Shipyard, exactly once. Ctrl-C stops
   a `sleep` as usual, and Shipyard then ends as if interrupted, so a shell loop
   around it stops too.
-- **Resizing the window** is passed on (SIGWINCH), and the command sees the new
-  size.
-- **Ctrl-Z stops only Shipyard.** The command keeps running, and its output keeps
-  appearing. `fg` resumes Shipyard. If the command finishes meanwhile, Shipyard
-  reports it once resumed.
+- **Resizing the window** sends the command SIGWINCH, though it has no terminal
+  to read the new size from.
+- **Ctrl-Z stops only Shipyard.** The command keeps running; its output waits
+  until `fg` resumes Shipyard (a command with a lot to say waits too, once the
+  pipe is full). If the command finishes meanwhile, Shipyard passes on its last
+  output and reports it once resumed.
+- **In the background**, `shipyard run -i … &` is stopped as soon as it starts,
+  until `fg`: Shipyard reads the terminal for the command, and a background
+  program that reads the terminal is stopped (Docker's `-i` does the same). It
+  doesn't take keys you type into your shell. With `stty tostop`, any run in the
+  background is stopped once it has output to show.
 - **Closing the terminal** ends the command (exit code 129), unless the command
-  ignores hangups. Then it keeps running, and Shipyard with it.
+  ignores hangups. Then it keeps running, and Shipyard with it; its output goes
+  nowhere.
 - **A command that stops itself** (`kill -STOP $$`, or a debugger) doesn't stop
   Shipyard, so the terminal seems to hang. Press Ctrl-Z (Shipyard stops and
-  your shell comes back), then `fg`: that resumes both. Ctrl-Z typed into a
-  program like `vim` or `less` inside doesn't do this; the system ignores that
-  request for an isolated command.
-- **Programs that open `/dev/tty` fail.** That's how `sudo`, `ssh` and others ask
-  for a password, so they can't prompt. Use `--no-isolation` for those, until
-  full terminal support comes in a later version.
-- **With `--rootfs`, the terminal has no name inside.** The container's `/dev/pts`
-  is its own, so your terminal isn't in it: `tty` prints "not a tty", and programs
-  that look the terminal up by name can't find it. Reading and writing it, Ctrl-C
-  and resizing work as above.
-- **Don't run an isolated command that reads the terminal in the background.**
-  Nothing stops it from reading (as a background job normally would be), so it
-  takes keys you type into your shell.
+  your shell comes back), then `fg`: that resumes both.
 
 Use `--no-isolation` for full job control.
 
@@ -931,11 +1007,14 @@ The command starts clean, whatever state Shipyard was started in:
   `SIGQUIT`, the command keeps ignoring it. That's how `nohup shipyard run …`
   and `shipyard run … &` in a script keep protecting the command from hangups
   and Ctrl-C.
-- **File descriptors:** only stdin, stdout and stderr are passed on. Any other
+- **File descriptors:** only stdin, stdout and stderr are passed on (isolated,
+  as [Input, output and terminals](#input-output-and-terminals) says). Any other
   open descriptor is closed when the command starts.
 - **umask:** `022`.
-- **`TERM`:** when Shipyard runs in a terminal, your `TERM` is passed on (unless
-  you set one with `-e`), so full-screen programs like `top` and `vim` work.
+- **`TERM`:** when the command has a terminal (`-t`, or `--no-isolation` in a
+  terminal), your `TERM` is passed on, or `xterm` with `-t` if you have none
+  (unless you set one with `-e`), so full-screen programs like `top` and `vim`
+  work. An isolated command without `-t` has no terminal, so it gets none.
 - **On Linux:** if Shipyard is killed with `SIGKILL`, the command is killed too.
   (On macOS it can be left running in that one case.) Isolated, the whole
   container goes. With `--no-isolation`, one exception: a command run as
