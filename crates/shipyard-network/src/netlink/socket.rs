@@ -17,7 +17,7 @@ use nix::sys::socket::{
     AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, getsockname,
     recvmsg, sendto, setsockopt, socket, sockopt,
 };
-use nix::sys::time::TimeVal;
+use nix::sys::time::{TimeVal, TimeValLike as _};
 
 use super::conversation::{Conversation, NetlinkError, TIMEOUT_SECS, Transport};
 use super::message::{Message, MessageBuilder, ParseError};
@@ -79,10 +79,9 @@ impl Socket {
         // The kernel answers at once; the timeout only keeps a lost answer
         // from hanging the caller, which may be running with every signal
         // blocked (the network setup before a container starts).
-        let timeout = TimeVal::new(
-            libc::time_t::try_from(TIMEOUT_SECS).unwrap_or(libc::time_t::MAX),
-            0,
-        );
+        // (In seconds as an `i64`: `time_t` itself is deprecated on musl,
+        // whose width changed.)
+        let timeout = TimeVal::seconds(i64::try_from(TIMEOUT_SECS).unwrap_or(i64::MAX));
         setsockopt(&fd, sockopt::ReceiveTimeout, &timeout).map_err(fail)?;
         Ok(Socket {
             conversation: Conversation::new(Fd(fd), port),

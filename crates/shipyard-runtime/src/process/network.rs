@@ -22,16 +22,12 @@ use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
 use nix::sched::{CloneFlags, setns};
 use nix::sys::stat::Mode;
-use nix::sys::statfs::fstatfs;
+use nix::sys::statfs::{NSFS_MAGIC, fstatfs};
 use nix::unistd::Pid;
 use shipyard_network::route::{Rtnetlink, RtnetlinkError};
 
 use crate::error::{Error, Result};
 use crate::isolation::NetDevice;
-
-/// The magic number of `nsfs`, the filesystem of `/proc/PID/ns/*` (and of
-/// a bind mount of one).
-const NSFS_MAGIC: u32 = 0x6e73_6673;
 
 /// A network namespace to start the child in, and the parent's own to come
 /// back to.
@@ -56,7 +52,9 @@ impl NetworkJoin {
         let filesystem = fstatfs(&target)
             .map_err(|errno| Error::sys(opening(), errno))?
             .filesystem_type();
-        if u64::try_from(filesystem.0).ok() != Some(u64::from(NSFS_MAGIC)) {
+        // `nsfs`: the filesystem of `/proc/PID/ns/*` (and of a bind mount of
+        // one).
+        if filesystem != NSFS_MAGIC {
             return Err(Error::Network(format!(
                 "joining {}: it isn't a namespace",
                 path.display()

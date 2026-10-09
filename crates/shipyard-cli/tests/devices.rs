@@ -329,11 +329,14 @@ fn rootless_devices() {
     );
     let warned = ruled.stderr.contains("device rules can't be enforced");
     if warned {
-        // The command's own warning line, not tracing's format.
+        // The command's own warning line, not tracing's format (other
+        // warnings may come too: a host whose resolver is on its loopback
+        // gets one about DNS).
         assert!(
             ruled
                 .stderr
-                .starts_with("shipyard: warning: the device rules"),
+                .lines()
+                .any(|line| line.starts_with("shipyard: warning: the device rules")),
             "{}",
             ruled.stderr
         );

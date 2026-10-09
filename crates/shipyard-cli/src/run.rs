@@ -2439,7 +2439,12 @@ mod tests {
                 "true",
             ])
             .unwrap_err();
-            assert!(error.to_string().contains("--network none"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("any --network but host gives it one"),
+                "{error}"
+            );
             // Others reach the container whatever its network.
             let ipc = isolation(&["--network", "host", "--sysctl", "kernel.shmmax=1", "true"])
                 .unwrap()
