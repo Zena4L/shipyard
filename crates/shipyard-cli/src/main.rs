@@ -4,12 +4,14 @@
 //! `shipyard-runtime`.
 
 mod devices;
+mod dns_helper;
 mod image;
 #[allow(
     dead_code,
     reason = "shared with `shipyard-runtime`, whose `update` uses what `run` doesn't"
 )]
 mod limits;
+mod network;
 mod run;
 mod storage_helper;
 mod volumes;
@@ -95,6 +97,9 @@ enum Command {
     /// Manage named volumes.
     #[command(subcommand)]
     Volume(VolumeCommand),
+    /// Manage networks (bridges containers share; Linux, root).
+    #[command(subcommand)]
+    Network(NetworkCommand),
     /// System-wide information and maintenance.
     #[command(subcommand)]
     System(SystemCommand),
@@ -132,6 +137,54 @@ enum VolumeCommand {
     },
 }
 
+/// `shipyard network …`.
+#[derive(Debug, Subcommand)]
+enum NetworkCommand {
+    /// Create a network: a bridge with a subnet of its own.
+    Create {
+        /// Its subnet, like `10.90.0.0/24` (a free one by default); once
+        /// more with an IPv6 prefix, like `fd00:1::/64`, for IPv6 too.
+        #[arg(long, value_name = "CIDR")]
+        subnet: Vec<shipyard_network::IpNet>,
+        /// Its gateway, the bridge's address (the subnet's first by
+        /// default); once per family.
+        #[arg(long, value_name = "IP")]
+        gateway: Vec<std::net::IpAddr>,
+        /// IPv6 too: a prefix of its own (a random ULA /64 unless --subnet
+        /// gives one), and a way out through the host's IPv6 address.
+        #[arg(long)]
+        ipv6: bool,
+        /// No way out of it: containers on it reach each other and the host
+        /// only.
+        #[arg(long)]
+        internal: bool,
+        /// The network's name.
+        name: String,
+    },
+    /// List networks.
+    Ls,
+    /// Show networks' details, and the containers on them, as JSON.
+    Inspect {
+        /// The networks.
+        #[arg(value_name = "NETWORK", required = true)]
+        names: Vec<String>,
+    },
+    /// Remove one or more networks (never one a container uses, nor the
+    /// default one).
+    Rm {
+        /// The networks to remove.
+        #[arg(value_name = "NETWORK", required = true)]
+        names: Vec<String>,
+    },
+    /// Remove every network no container uses but the default one (asks
+    /// first).
+    Prune {
+        /// Don't ask (needed where there's no terminal to ask on).
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
 /// `shipyard image …`.
 #[derive(Debug, Subcommand)]
 enum ImageCommand {
@@ -156,6 +209,8 @@ fn main() -> ExitCode {
     // namespace of its own) is this binary too; making the namespace needs a
     // single-threaded process, so before anything else as well.
     storage_helper::entry_point();
+    // A network's DNS server is this binary too, started by a run.
+    dns_helper::entry_point();
     // Before anything else: a privileged start must not get any further.
     if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into());
@@ -183,6 +238,7 @@ fn main() -> ExitCode {
         Command::Rmi { force, images } => Ok(rmi(&images, force)),
         Command::Image(ImageCommand::Prune) => image_prune(),
         Command::Volume(command) => volume_command(&command),
+        Command::Network(command) => network_command(&command),
         Command::System(SystemCommand::Df) => system_df(),
         Command::Doctor => doctor(),
     };
@@ -336,6 +392,140 @@ fn system_df() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `shipyard network …`: create, list, inspect, remove, prune networks.
+fn network_command(command: &NetworkCommand) -> Result<ExitCode> {
+    match command {
+        NetworkCommand::Create {
+            subnet,
+            gateway,
+            ipv6,
+            internal,
+            name,
+        } => {
+            let config = network::create(&network::spec(name, subnet, gateway, *ipv6, *internal)?)?;
+            writeln!(std::io::stdout().lock(), "{}", config.name)?;
+        }
+        NetworkCommand::Ls => {
+            let rows: Vec<Vec<String>> = network::list(&[])?
+                .into_iter()
+                .map(|listed| {
+                    vec![
+                        listed.config.name,
+                        listed.config.subnet.to_string(),
+                        listed
+                            .config
+                            .subnet6
+                            .map_or_else(|| "-".to_owned(), |subnet6| subnet6.to_string()),
+                        listed.config.gateway.to_string(),
+                        listed.config.bridge,
+                        listed.leases.len().to_string(),
+                    ]
+                })
+                .collect();
+            table(
+                &mut std::io::stdout().lock(),
+                &[
+                    "NETWORK",
+                    "SUBNET",
+                    "SUBNET6",
+                    "GATEWAY",
+                    "BRIDGE",
+                    "CONTAINERS",
+                ],
+                &rows,
+            )?;
+        }
+        NetworkCommand::Inspect { names } => {
+            let networks: Vec<serde_json::Value> = network::list(names)?
+                .into_iter()
+                .map(|listed| {
+                    let containers: Vec<serde_json::Value> = listed
+                        .leases
+                        .iter()
+                        .map(|lease| {
+                            serde_json::json!({
+                                "Run": lease.run,
+                                "Name": lease.name,
+                                "Aliases": lease.aliases,
+                                "Hostname": lease.hostname,
+                                "Interface": lease.interface,
+                                "IPAddress": lease.ip,
+                                "IPv6Address": lease.ip6,
+                                "MacAddress": shipyard_network::store::format_mac(lease.mac),
+                                "HostVeth": lease.host_veth,
+                                "Ports": lease.ports,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "Name": listed.config.name,
+                        "Subnet": listed.config.subnet,
+                        "Gateway": listed.config.gateway,
+                        "Subnet6": listed.config.subnet6,
+                        "Gateway6": listed.config.gateway6,
+                        "Bridge": listed.config.bridge,
+                        "Internal": listed.config.internal,
+                        "Created": listed.config.created,
+                        "DNSRunning": listed.dns_running,
+                        "Containers": containers,
+                    })
+                })
+                .collect();
+            let mut out = std::io::stdout().lock();
+            serde_json::to_writer_pretty(&mut out, &networks)?;
+            writeln!(out)?;
+        }
+        NetworkCommand::Rm { names } => {
+            return Ok(each(names, |name| {
+                network::remove(name)?;
+                writeln!(std::io::stdout().lock(), "{name}")?;
+                Ok(())
+            }));
+        }
+        NetworkCommand::Prune { force } => return network_prune(*force),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `shipyard network prune`: asks first (on a terminal; elsewhere `-f` is
+/// needed), then removes every network no container uses but the default
+/// one.
+fn network_prune(force: bool) -> Result<ExitCode> {
+    const QUESTION: &str = "Remove every network no container uses (but the default one)?";
+    if !force {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            anyhow::bail!(
+                "network prune removes networks: run it on a terminal to be asked, or give -f"
+            );
+        }
+        if !confirm(QUESTION, &mut stdin.lock(), &mut std::io::stderr().lock())? {
+            writeln!(std::io::stderr().lock(), "Nothing removed")?;
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let pruned = network::prune()?;
+    let mut out = std::io::stdout().lock();
+    for name in &pruned.removed {
+        writeln!(out, "{name}")?;
+    }
+    writeln!(out, "Removed {} network(s)", pruned.removed.len())?;
+    if !pruned.in_use.is_empty() {
+        writeln!(
+            out,
+            "Kept {} in use: {}",
+            pruned.in_use.len(),
+            pruned.in_use.join(", ")
+        )?;
+    }
+    drop(out);
+    let mut code = ExitCode::SUCCESS;
+    for error in &pruned.failed {
+        code = report(error, EXIT_ENGINE_ERROR);
+    }
+    Ok(code)
+}
+
 /// `shipyard volume …`: create, list, inspect, remove, prune named volumes.
 fn volume_command(command: &VolumeCommand) -> Result<ExitCode> {
     match command {
@@ -449,6 +639,17 @@ fn human_bytes(bytes: u64) -> String {
 pub(crate) fn warning(text: &str) {
     // Not `eprintln!`: it panics if stderr is a closed pipe.
     let _ = writeln!(std::io::stderr().lock(), "shipyard: warning: {text}");
+}
+
+/// Prints something the user should know that isn't a problem (a port the
+/// kernel chose).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "networks are Linux's")
+)]
+pub(crate) fn notice(text: &str) {
+    // Not `eprintln!`: it panics if stderr is a closed pipe.
+    let _ = writeln!(std::io::stderr().lock(), "shipyard: {text}");
 }
 
 /// Prints a hint after an error: what the user can do about it.

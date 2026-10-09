@@ -305,7 +305,10 @@ fn mapping_host_root_warns() {
     let run = shipyard_run(&["--uidmap", "0:0:65536"], "true");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stderr.contains("map host ID 0"), "{}", run.stderr);
-    let quiet = shipyard_run(&["--uidmap", MAP], "true");
+    // The host's network: no warning of any kind (with a network of its own
+    // and no root of its own, a host whose resolver is on its loopback, as
+    // systemd-resolved's is, gets one about DNS).
+    let quiet = shipyard_run(&["--uidmap", MAP, "--network", "host"], "true");
     assert!(!quiet.stderr.contains("warning"), "{}", quiet.stderr);
 }
 

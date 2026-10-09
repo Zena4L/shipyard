@@ -31,6 +31,8 @@ nix = { workspace = true, features = ["poll", "user"] }
 serde.workspace = true
 serde_json.workspace = true
 shipyard-image.workspace = true
+# Networks: their store, bridges and veth pairs, a run's /etc files.
+shipyard-network.workspace = true
 shipyard-runtime.workspace = true
 shipyard-storage.workspace = true
 tracing.workspace = true
@@ -40,8 +42,9 @@ tracing-subscriber.workspace = true
 clap-markdown.workspace = true
 flate2.workspace = true
 libc.workspace = true
-# `hostname` for the isolation tests.
-nix = { workspace = true, features = ["hostname"] }
+# `hostname` for the isolation tests; `term` for the v0.1 milestone's
+# pseudo-terminal (tests/image.rs).
+nix = { workspace = true, features = ["hostname", "term"] }
 proptest.workspace = true
 shipyard-test-support.workspace = true
 tar.workspace = true

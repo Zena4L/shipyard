@@ -6,7 +6,7 @@ the edges of valid documents and archives, not on finding a first `{` or a
 tar header: registry documents as Docker Hub serves them (`null` lists
 included), `WWW-Authenticate` headers from real registries, references, and
 small layers, the hostile ones among them (escapes through symlinks, `..`,
-hard links and whiteouts).
+hard links and whiteouts), and netlink datagrams as the kernel sends them.
 
 Usage: fuzz-seeds.py DIR
 """
@@ -14,6 +14,8 @@ Usage: fuzz-seeds.py DIR
 import io
 import json
 import os
+import socket
+import struct
 import sys
 import tarfile
 
@@ -167,10 +169,145 @@ def layer_seeds():
     yield "pax-long-names", tar_bytes(long_names, tarfile.PAX_FORMAT)
 
 
+def nlmsg(kind, flags, payload, seq=1, port=0):
+    """A netlink message in this machine's byte order (as the kernel sends)."""
+    body = payload + b"\0" * (-len(payload) % 4)
+    return struct.pack("=IHHII", 16 + len(body), kind, flags, seq, port) + body
+
+
+def nlattr(kind, value):
+    """A netlink attribute, padded to 4 bytes."""
+    data = struct.pack("=HH", 4 + len(value), kind) + value
+    return data + b"\0" * (-len(data) % 4)
+
+
+NESTED = 0x8000
+
+
+def netlink_seeds():
+    """What the kernel says on a netlink socket: real dumps of this machine's
+    links, addresses and routes where it can be asked (Linux), and messages
+    shaped like them everywhere: an error with an extended ACK, the end of a
+    dump, a veth with nested link info."""
+    ifinfo = struct.pack("=BxHiII", 0, 772, 1, 0x10049, 0)
+    mtu = nlattr(4, struct.pack("=I", 65536))
+    yield "link-lo", nlmsg(16, 2, ifinfo + nlattr(3, b"lo\0") + mtu)
+    peer = nlattr(NESTED | 1, ifinfo + nlattr(3, b"eth0\0"))
+    info = nlattr(NESTED | 18, nlattr(1, b"veth\0") + nlattr(NESTED | 2, peer))
+    yield "link-veth", nlmsg(16, 2, ifinfo + nlattr(3, b"shy-a\0") + info)
+    ifaddr = struct.pack("=BBBBI", 2, 16, 0x80, 0, 3)
+    v4 = bytes([10, 88, 0, 1])
+    yield "address", nlmsg(20, 2, ifaddr + nlattr(1, v4) + nlattr(2, v4))
+    rtmsg = struct.pack("=BBBBBBBBI", 2, 0, 0, 0, 254, 3, 0, 1, 0)
+    oif = nlattr(4, struct.pack("=I", 3))
+    yield "route", nlmsg(24, 2, rtmsg + nlattr(5, v4) + oif)
+    # an error as a socket with NETLINK_CAP_ACK gets it: the code, the
+    # request's header alone (its length still the whole request's), then
+    # the extended ACK (flags CAPPED | ACK_TLVS)
+    header = struct.pack("=IHHII", 32, 16, 0x405, 7, 0)
+    reason = nlattr(1, b"Attribute failed policy validation\0")
+    yield "error-ext-ack", nlmsg(
+        2, 0x300, struct.pack("=i", -34) + header + reason + nlattr(2, struct.pack("=I", 36)), seq=7
+    )
+    yield "done", nlmsg(3, 2, struct.pack("=i", 0))
+    yield "done-interrupted-ext-ack", nlmsg(
+        3, 0x212, struct.pack("=i", -19) + nlattr(1, b"Can not find device\0")
+    )
+    if not hasattr(socket, "AF_NETLINK"):
+        return
+    dumps = [
+        ("links", 18, ifinfo),
+        ("addresses", 22, struct.pack("=BBBBI", 0, 0, 0, 0, 0)),
+        ("routes", 26, struct.pack("=BBBBBBBBI", 2, 0, 0, 0, 0, 0, 0, 0, 0)),
+    ]
+    for name, kind, family_header in dumps:
+        try:
+            with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as s:
+                s.settimeout(2)
+                s.send(nlmsg(kind, 0x301, family_header))
+                for part in range(16):
+                    data = s.recv(65536)
+                    yield f"kernel-{name}-{part}", data
+                    if done_in(data):
+                        break
+        except OSError:
+            pass
+
+
+def done_in(datagram):
+    """Whether any message in `datagram` is NLMSG_DONE (the kernel often
+    puts it at the end of the last datagram of data)."""
+    offset = 0
+    while offset + 16 <= len(datagram):
+        length, kind = struct.unpack_from("=IH", datagram, offset)
+        if kind == 3:
+            return True
+        if length < 16:
+            return False
+        offset += (length + 3) & ~3
+    return False
+
+
 def write(directory, name, data):
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, name), "wb") as out:
         out.write(data)
+
+
+# `-p` specs and `ExposedPorts` keys, good and bad.
+PORTS = [
+    "80", "8080:80", "8080:80/udp", "127.0.0.1:8080:80", "127.0.0.1::80",
+    "8000-8010:80-90", "80-90", "80/tcp", "53/udp", "[::1]:8080:80", "::1:8080:80",
+    "0", "65536", "8000-8001:80", "1:2:3:4:5", "80/sctp", "a.b:1:2", "1-65535",
+    "[2001:db8::1]:8080:80", "[::]::80/udp", "[2001:db8::1]", "[::1]:80:80", "[x]:1:2",
+]
+
+
+def dns_name(text):
+    return b"".join(bytes([len(label)]) + label.encode() for label in text.split(".") if label) + b"\0"
+
+
+def dns_query(qid, name, qtype, flags=0x0100):
+    header = struct.pack(">HHHHHH", qid, flags, 1, 0, 0, 0)
+    return header + dns_name(name) + struct.pack(">HH", qtype, 1)
+
+
+def dns_seeds():
+    """Queries a container sends, responses an upstream sends, and broken
+    ones: a pointer loop, a forward pointer, an over-long label."""
+    a_record = struct.pack(">HHHIH", 0xC00C, 1, 1, 0, 4) + bytes([10, 89, 0, 2])
+    response = struct.pack(">HHHHHH", 7, 0x8580, 1, 1, 0, 0) + dns_name("db") + struct.pack(">HH", 1, 1) + a_record
+    loop = struct.pack(">HHHHHH", 7, 0x0100, 1, 0, 0, 0) + b"\x01a\xc0\x0c" + struct.pack(">HH", 1, 1)
+    return [
+        ("a", dns_query(7, "db", 1)),
+        ("aaaa", dns_query(7, "db.example.com", 28)),
+        ("ptr", dns_query(7, "2.0.89.10.in-addr.arpa", 12)),
+        ("ptr6", dns_query(7, ".".join("2" + "0" * 23 + "98000000df") + ".ip6.arpa", 12)),
+        ("any", dns_query(7, "a1b2c3d4e5f6", 255)),
+        ("status", dns_query(7, "db", 1, flags=0x1000)),
+        ("response", response),
+        ("loop", loop),
+        ("forward", struct.pack(">HHHHHH", 7, 0, 1, 0, 0, 0) + b"\xc0\x20"),
+        ("long-label", struct.pack(">HHHHHH", 7, 0, 1, 0, 0, 0) + b"\x40" + b"x" * 64 + b"\0"),
+    ]
+
+
+# /proc/<pid>/net tables: a listener, a connection, IPv6, UDP, and broken lines.
+PROC_NET_HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+PROC_NET = {
+    "tcp": PROC_NET_HEADER
+    + "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 31337 1 0 100 0 0 10 0\n"
+    + "   1: 0200590A:0050 090200C0:D431 01 00000000:00000000 00:00000000 00000000     0        0 31338 1 0 20 4 30 10 -1\n",
+    "tcp6": PROC_NET_HEADER
+    + "   0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 31339 1\n",
+    "udp": PROC_NET_HEADER
+    + "  12: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 31340 2 0 0\n",
+    "udp6": PROC_NET_HEADER
+    + "   0: 00000000000000000000000000000000:0035 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 31341 2 0 0\n"
+    + "   1: 00000000000000000000000001000000:9C40 00000000000000000000000001000000:0035 01 00000000:00000000 00:00000000 00000000  1000        0 31342 2 0 0\n",
+    "short": PROC_NET_HEADER + "   0: 0100007F:1F90 00000000\n",
+    "wide": PROC_NET_HEADER + "   0: 0100007F00:1F90 00000000:0000 0A\n",
+}
 
 
 def main():
@@ -186,6 +323,14 @@ def main():
     for name, layer in layer_seeds():
         write(f"{root}/tar", name, layer)
         write(f"{root}/unpack", name, layer)
+    for name, message in netlink_seeds():
+        write(f"{root}/netlink", name, message)
+    for n, spec in enumerate(PORTS):
+        write(f"{root}/ports", f"seed-{n}", spec.encode())
+    for name, message in dns_seeds():
+        write(f"{root}/dns", name, message)
+    for name, table in PROC_NET.items():
+        write(f"{root}/proc_net", name, table.encode())
 
 
 if __name__ == "__main__":

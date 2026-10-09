@@ -106,7 +106,7 @@ mod linux {
     use crate::process::failure::ChildStep;
     use crate::process::io_errno;
     use crate::process::resolve::{Leaf, resolve_in_root};
-    use crate::process::setup::{DeviceSetup, MountSetup, RootSetup};
+    use crate::process::setup::{DeviceSetup, MountSetup, RootSetup, SysSetup};
     use crate::process::sysctl;
 
     type Step<T = ()> = Result<T, Failure>;
@@ -370,20 +370,28 @@ mod linux {
         let on = target(root, Target::Proc)?;
         mount_on(&on, "proc", "proc", NOSUID_NODEV_NOEXEC, None)
             .map_err(|errno| Failure::at(ChildStep::MountProc, errno))?;
-        // Read-only: it's the host's kernel and devices. Until the container
-        // has its own network namespace (stage 7), it lists the host's
-        // network devices (probe 7).
+        // Read-only: it's the host's kernel and devices. Its network devices
+        // are the ones of the network namespace it's mounted in: the
+        // container's own, or the host's when the container shares them
+        // (probe 7).
         let on = target(root, Target::Sys)?;
-        let sys = if setup.user_namespace {
-            bind_host_sys(root, &on)
-        } else {
-            mount_on(
+        let sys = match setup.sys {
+            SysSetup::Own => match mount_on(
                 &on,
                 "sysfs",
                 "sysfs",
                 NOSUID_NODEV_NOEXEC | MsFlags::MS_RDONLY,
                 None,
-            )
+            ) {
+                // In a user namespace, the kernel mounts a new sysfs only
+                // where the host's is fully visible: inside another
+                // container, part of it is covered (Docker's masked
+                // paths), and it refuses. The host's, bound, as without a
+                // network of its own.
+                Err(Errno::EPERM) if setup.user_namespace => bind_host_sys(root, &on),
+                mounted => mounted,
+            },
+            SysSetup::HostBind => bind_host_sys(root, &on),
         };
         sys.map_err(|errno| Failure::at(ChildStep::MountSys, errno))?;
         if let Some(cgroup) = cgroup {

@@ -10,7 +10,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
 use shipyard_runtime::hooks::ContainerHooks;
-use shipyard_runtime::isolation::{IdMap, IdMaps, Isolation, Mount, Namespace, Root, RootlessMaps};
+use shipyard_runtime::isolation::{
+    HOST_WIDE_NET_SYSCTLS, IdMap, IdMaps, Isolation, IsolationError, Mount, Namespace, Root,
+    RootlessMaps,
+};
 use shipyard_runtime::process::{self, ExitStatus};
 use shipyard_runtime::process::{
     DEFAULT_STOP_TIMEOUT_SECS, Env, ProcessSpec, Rlimit, Signal, StopPolicy, User,
@@ -20,9 +23,15 @@ use shipyard_runtime::security::{Capabilities, Capability, CapabilitySet, Seccom
 use shipyard_storage::{VolumeHold, VolumeMount};
 
 use crate::limits::LimitArgs;
+use crate::network::{ETC_FILES, Joined, NetworkMode, NetworkPlan, RunDir, RunId, RunNetwork};
+use shipyard_network::files::{DnsSettings, HostEntry};
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
+    /// The run's default network, worked out once (see `default_network`).
+    #[arg(skip)]
+    default_mode: std::cell::OnceCell<NetworkMode>,
+
     /// Set an environment variable, or copy KEY from your shell if no value is given.
     #[arg(short, long, value_name = "KEY[=VALUE]", value_parser = value_parser!(OsString))]
     env: Vec<OsString>,
@@ -81,7 +90,7 @@ pub(crate) struct RunArgs {
     stop_timeout: u64,
 
     /// Run without isolation: the command sees the host's processes, mounts,
-    /// hostname and IPC, as you. On Linux, commands are isolated by default
+    /// hostname, IPC and network, as you. On Linux, commands are isolated by default
     /// (rootless, in a user namespace, without root); on macOS they always
     /// run like this for now.
     #[arg(long, conflicts_with = "limits")]
@@ -96,9 +105,81 @@ pub(crate) struct RunArgs {
     domainname: Option<String>,
 
     /// Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824
-    /// (Linux; IPC settings only).
+    /// (Linux): IPC settings, or net.* with a network of its own (any
+    /// --network but host).
     #[arg(long, value_name = "KEY=VALUE", value_parser = parse_sysctl, conflicts_with = "no_isolation")]
     sysctl: Vec<(String, String)>,
+
+    /// The container's network: bridge (the default network: root's
+    /// default), pasta (a network of its own through pasta: the default
+    /// without root), host (the host's), none (one of its own with only a
+    /// loopback interface), or a network's name (Linux; bridge and names
+    /// need root). Repeatable for bridge networks: the container joins each,
+    /// in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one
+    /// its own settings.
+    #[arg(long, value_name = "MODE", value_parser = parse_network, conflicts_with = "no_isolation")]
+    network: Vec<NetworkMode>,
+
+    /// The container's name: on each network made with `shipyard network
+    /// create` that it joins, other containers find it by this name (Linux).
+    /// Letters, digits, _ and -.
+    #[arg(long, value_name = "NAME", value_parser = shipyard_network::dns::parse_name, conflicts_with = "no_isolation")]
+    name: Option<String>,
+
+    /// Another name the container answers to on each network made with
+    /// `shipyard network create` that it joins. Repeatable (Linux).
+    #[arg(long, value_name = "NAME", value_parser = shipyard_network::dns::parse_name, requires = "network")]
+    network_alias: Vec<String>,
+
+    /// The container's address on its network (a bridge network's; with
+    /// one network only: on several, name=NETWORK,ip=IP gives each its own).
+    #[arg(long, value_name = "IP", requires = "network")]
+    ip: Option<std::net::IpAddr>,
+
+    /// The container's IPv6 address on its network (one made with --ipv6;
+    /// with one network only: on several, name=NETWORK,ip6=IP gives each its
+    /// own).
+    #[arg(long, value_name = "IP", requires = "network")]
+    ip6: Option<std::net::Ipv6Addr>,
+
+    /// The container's hardware address on its network (a bridge
+    /// network's; with one network only), locally administered, like
+    /// 02:42:0a:58:00:02.
+    #[arg(long, value_name = "MAC", value_parser = shipyard_network::store::parse_mac, requires = "network")]
+    mac_address: Option<[u8; 6]>,
+
+    /// Add NAME with address IP to the container's /etc/hosts. Repeatable
+    /// (Linux; with --image or --rootfs).
+    #[arg(long, value_name = "NAME:IP", value_parser = shipyard_network::files::parse_host_entry, conflicts_with = "no_isolation")]
+    add_host: Vec<HostEntry>,
+
+    /// A DNS server for the container's /etc/resolv.conf, instead of the
+    /// host's. Repeatable (Linux; with --image or --rootfs).
+    #[arg(long, value_name = "IP", conflicts_with = "no_isolation")]
+    dns: Vec<std::net::IpAddr>,
+
+    /// A DNS search domain, instead of the host's. Repeatable (Linux; with
+    /// --image or --rootfs).
+    #[arg(long, value_name = "DOMAIN", value_parser = shipyard_network::files::parse_resolv_word, conflicts_with = "no_isolation")]
+    dns_search: Vec<String>,
+
+    /// A resolver option (like ndots:2), instead of the host's. Repeatable
+    /// (Linux; with --image or --rootfs).
+    #[arg(long, value_name = "OPTION", value_parser = shipyard_network::files::parse_resolv_word, conflicts_with = "no_isolation")]
+    dns_option: Vec<String>,
+
+    /// Publish a container's port on the host, like 8080:80 (the host's port
+    /// 8080, on every IPv4 address, to the container's 80), 127.0.0.1:8080:80
+    /// (on that address only), 80 (a free host port) or 53:53/udp. Ranges
+    /// work (8000-8010:80-90). Repeatable (Linux; a bridge network, or
+    /// pasta).
+    #[arg(short = 'p', long, value_name = "SPEC", value_parser = parse_publish, conflicts_with = "no_isolation")]
+    publish: Vec<PublishSpec>,
+
+    /// Publish every port the image says it uses (its exposed ports) on free
+    /// host ports (Linux; a bridge network, or pasta).
+    #[arg(short = 'P', long, requires = "image", conflicts_with = "no_isolation")]
+    publish_all: bool,
 
     /// Use DIR as the container's root filesystem: it becomes `/` inside,
     /// with its own /proc, /sys and /dev (Linux).
@@ -180,7 +261,10 @@ pub(crate) struct RunArgs {
         value_name = "DIR",
         conflicts_with_all = [
             "command", "env", "workdir", "user", "group_add", "ulimit", "oom_score_adj",
-            "no_isolation", "hostname", "domainname", "sysctl", "rootfs", "read_only",
+            "no_isolation", "hostname", "domainname", "sysctl", "network", "name",
+            "network_alias", "ip", "ip6", "mac_address",
+            "add_host", "dns", "dns_search", "dns_option", "publish", "publish_all", "rootfs",
+            "read_only",
             "cap_add", "cap_drop", "security_opt", "uidmap", "gidmap", "limits", "device",
             "device_cgroup_rule", "image", "pull", "volume",
         ],
@@ -216,6 +300,20 @@ pub(crate) struct Invocation {
     isolation: Option<Isolation>,
     /// What a bundle asks for that's ignored, to show the user.
     warnings: Vec<String>,
+    /// What its isolation has that the user didn't ask for.
+    generated: Generated,
+}
+
+/// What a run's isolation has that the user didn't ask for: Shipyard's own
+/// defaults, which `--no-isolation` could do without.
+#[derive(Debug, Clone, Copy, Default)]
+struct Generated {
+    /// The hostname is the run's ID.
+    hostname: bool,
+    /// The network is the default one.
+    network: bool,
+    /// The settings are the default network's own (no `--sysctl` given).
+    sysctls: bool,
 }
 
 /// A `shipyard run` checked as far as it can be before its image is
@@ -237,6 +335,8 @@ pub(crate) struct Planned {
     short_maps: Option<String>,
     /// The `--volume`s, parsed: a host path absolute and found.
     volumes: Vec<VolumeMount>,
+    /// Its network, for an isolated run.
+    pub(crate) network: Option<NetworkPlan>,
 }
 
 impl RunArgs {
@@ -258,7 +358,12 @@ impl RunArgs {
                 std::env::consts::OS
             );
         }
-        let (isolation, short_maps) = self.isolation()?;
+        let run = RunId::new()?;
+        let (isolation, short_maps) = self.isolation(&run)?;
+        let network = isolation
+            .as_ref()
+            .map(|_| self.network_plan(run))
+            .transpose()?;
         let volumes = self.volume_mounts()?;
         if let Some(dir) = self.workdir.as_ref().filter(|dir| !dir.is_absolute()) {
             bail!("--workdir must be an absolute path, not {}", dir.display());
@@ -276,6 +381,7 @@ impl RunArgs {
             isolation,
             short_maps,
             volumes,
+            network,
         })))
     }
 
@@ -339,6 +445,7 @@ impl Planned {
     pub(crate) fn finish(
         self,
         image: Option<ImageDefaults>,
+        etc: Option<&RunDir>,
     ) -> Result<(Invocation, Vec<VolumeHold>)> {
         let Self {
             args,
@@ -346,6 +453,7 @@ impl Planned {
             mut isolation,
             short_maps,
             volumes,
+            network: _,
         } = self;
         let config = image.as_ref().map(|image| &image.config);
         let mut warnings: Vec<String> = short_maps.into_iter().collect();
@@ -384,6 +492,9 @@ impl Planned {
                 root.overlay = Some(image.overlay);
                 isolation.root = Some(root);
             }
+            if let (Some(root), Some(etc)) = (isolation.root.as_mut(), etc) {
+                bind_etc_files(root, etc);
+            }
             let named = match isolation.root.as_mut() {
                 Some(root) => bind_volumes(root, volumes)?,
                 // `check` refused volumes without a root.
@@ -419,12 +530,18 @@ impl Planned {
                     .to_owned(),
             );
         }
+        let generated = Generated {
+            hostname: isolation.is_some() && args.hostname.is_none(),
+            network: isolation.is_some() && args.network.is_empty(),
+            sysctls: isolation.is_some() && args.sysctl.is_empty(),
+        };
         Ok((
             Invocation {
                 spec,
                 stop,
                 isolation,
                 warnings,
+                generated,
             },
             held,
         ))
@@ -447,6 +564,29 @@ fn add_image_env(env: &mut Env, entries: &[String], warnings: &mut Vec<String>) 
         }
     }
     Ok(())
+}
+
+/// Binds the run's `/etc` files (`etc`) into `root`, before the volumes, so a
+/// volume a user puts on one of them wins. An image's root takes them all
+/// (one that's missing is made in the overlay's writable layer, which goes
+/// with the run); a root filesystem of the user's own (`--rootfs`) only
+/// those it has as regular files: Shipyard never writes into it. (A link,
+/// like Debian's `resolv.conf` to systemd's, is followed inside the root to
+/// bind on its target, which would be made if it's missing; and `etc`
+/// itself is looked at without following a link.)
+fn bind_etc_files(root: &mut Root, etc: &RunDir) {
+    let is_file = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+    };
+    let etc_dir = root.path.join("etc");
+    let has_etc = std::fs::symlink_metadata(&etc_dir).is_ok_and(|metadata| metadata.is_dir());
+    for name in ETC_FILES {
+        if root.overlay.is_none() && !(has_etc && is_file(&etc_dir.join(name))) {
+            continue;
+        }
+        root.mounts
+            .push(Mount::bind(etc.file(name), Path::new("/etc").join(name)));
+    }
 }
 
 /// `source` made absolute, symlinks resolved, as UTF-8.
@@ -551,6 +691,7 @@ fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
         stop,
         isolation: Some(isolation),
         warnings,
+        generated: Generated::default(),
     })
 }
 
@@ -559,7 +700,7 @@ impl RunArgs {
     /// `--no-isolation`; none on macOS, where namespaces don't exist yet:
     /// the VM comes in a later version), and a warning if a rootless
     /// caller's user namespace maps fewer IDs than it could.
-    fn isolation(&self) -> Result<(Option<Isolation>, Option<String>)> {
+    fn isolation(&self, run: &RunId) -> Result<(Option<Isolation>, Option<String>)> {
         if self.no_isolation {
             return Ok((None, None));
         }
@@ -568,6 +709,15 @@ impl RunArgs {
                 (self.hostname.is_some(), "--hostname"),
                 (self.domainname.is_some(), "--domainname"),
                 (!self.sysctl.is_empty(), "--sysctl"),
+                (!self.network.is_empty(), "--network"),
+                (self.name.is_some(), "--name"),
+                (!self.network_alias.is_empty(), "--network-alias"),
+                (!self.add_host.is_empty(), "--add-host"),
+                (!self.dns.is_empty(), "--dns"),
+                (!self.dns_search.is_empty(), "--dns-search"),
+                (!self.dns_option.is_empty(), "--dns-option"),
+                (!self.publish.is_empty(), "--publish"),
+                (self.publish_all, "--publish-all"),
                 (self.rootfs.is_some(), "--rootfs"),
                 (!self.cap_add.is_empty(), "--cap-add"),
                 (!self.cap_drop.is_empty(), "--cap-drop"),
@@ -593,10 +743,10 @@ impl RunArgs {
             tracing::debug!("no namespaces on this system; running without isolation");
             return Ok((None, None));
         }
+        let mode = self.network_mode()?;
         let mut isolation = Isolation::standard();
-        isolation.hostname.clone_from(&self.hostname);
+        isolation.hostname = self.hostname_for(run, &mode);
         isolation.domainname.clone_from(&self.domainname);
-        isolation.sysctls.clone_from(&self.sysctl);
         isolation.security = self.security()?;
         isolation.resources = self.limits.resources()?;
         // Shipyard refuses to start setuid (`refuse_privileged_start`), so
@@ -612,6 +762,7 @@ impl RunArgs {
         if isolation.id_maps.is_some() {
             isolation.namespaces.push(Namespace::User);
         }
+        self.add_network(&mut isolation, &mode)?;
         // An image's root comes once it's pulled (`Planned::finish`).
         if let Some(dir) = &self.rootfs {
             // Absolute and without symlinks, as the runtime wants it; and a
@@ -629,16 +780,194 @@ impl RunArgs {
             &self.device_cgroup_rule,
             self.rootfs.is_some() || self.image.is_some(),
         )?;
-        if self.image.is_some() {
-            isolation.validate_expecting_root()?;
+        let checked = if self.image.is_some() {
+            isolation.validate_expecting_root()
         } else {
-            isolation.validate()?;
+            isolation.validate()
+        };
+        match checked {
+            // A network setting refused for want of a network of its own:
+            // the runtime can't name the flag that gives one.
+            Err(error @ IsolationError::Sysctl { .. })
+                if !mode.own_namespace() && wants_own_network(&error) =>
+            {
+                bail!(
+                    "{error} (any --network but host gives it one: the default, bridge, none, pasta)"
+                )
+            }
+            checked => checked?,
         }
         Ok((Some(isolation), short_maps))
     }
 }
 
 impl RunArgs {
+    /// Gives `isolation` the network `mode` (a namespace of its own, with
+    /// Docker's settings for one, for any mode but `host`), and the
+    /// `--sysctl` settings.
+    fn add_network(&self, isolation: &mut Isolation, mode: &NetworkMode) -> Result<()> {
+        if let NetworkMode::Bridges(networks) = mode
+            && isolation.id_maps.is_some()
+            && !crate::network::host_root()
+        {
+            let names: Vec<&str> = networks.iter().map(|joined| joined.name.as_str()).collect();
+            bail!(
+                "--network {}: {}",
+                names.join(", "),
+                crate::network::NETWORKS_NEED_ROOT
+            );
+        }
+        if mode.own_namespace() {
+            isolation.namespaces.push(Namespace::Network);
+            // The groups the container has: its own user namespace's, or
+            // without one, the namespace shipyard is in (all of them only
+            // for the host's root).
+            #[cfg(target_os = "linux")]
+            let current = (isolation.id_maps.is_none() && !crate::network::host_root())
+                .then(|| shipyard_runtime::process::current_id_maps().ok())
+                .flatten();
+            #[cfg(not(target_os = "linux"))]
+            let current: Option<IdMaps> = None;
+            let maps = isolation.id_maps.as_ref().or(current.as_ref());
+            isolation.sysctls = with_network_defaults(&self.sysctl, maps, |key| {
+                Path::new("/proc/sys").join(key.replace('.', "/")).exists()
+            });
+        } else {
+            isolation.sysctls.clone_from(&self.sysctl);
+        }
+        Ok(())
+    }
+
+    /// The run's network as the flags ask for it, checked.
+    fn network_plan(&self, run: RunId) -> Result<NetworkPlan> {
+        let mode = self.network_mode()?;
+        if (!self.publish.is_empty() || self.publish_all)
+            && !matches!(mode, NetworkMode::Bridges(_) | NetworkMode::Pasta)
+        {
+            bail!(
+                "--publish and --publish-all need a network the host reaches (bridge, a \
+                 network's name, or pasta): with {}",
+                match (&mode, self.network.is_empty()) {
+                    (NetworkMode::Host, false) => {
+                        "--network host, the container's ports are the host's already"
+                    }
+                    (NetworkMode::Host, true) => {
+                        "the host's network (the default here), the container's ports are the \
+                         host's already"
+                    }
+                    _ => "--network none, there's nothing to publish to",
+                }
+            );
+        }
+        let has_root = self.rootfs.is_some() || self.image.is_some();
+        let etc_flags = !self.add_host.is_empty()
+            || !self.dns.is_empty()
+            || !self.dns_search.is_empty()
+            || !self.dns_option.is_empty();
+        if etc_flags && !has_root {
+            bail!(
+                "--add-host and the --dns flags write the container's /etc files, which need a \
+                 root filesystem of its own (--image or --rootfs)"
+            );
+        }
+        let pasta = if mode == NetworkMode::Pasta {
+            let Some(program) = shipyard_network::pasta::find(std::env::var_os("PATH").as_deref())
+            else {
+                let needs = if self.network.is_empty() {
+                    "a rootless container's network needs pasta"
+                } else {
+                    "--network pasta needs pasta"
+                };
+                bail!(
+                    "{needs}: install the passt package, or run it with --network host (the \
+                     host's network) or --network none"
+                );
+            };
+            // Asked now, before anything is made: never while a container
+            // waits for its network.
+            let features = shipyard_network::pasta::Features::of(&program)?;
+            Some((program, features))
+        } else {
+            None
+        };
+        let hostname = match self.hostname_for(&run, &mode) {
+            Some(hostname) => hostname,
+            // The host's network, and its name with it.
+            None => nix::unistd::gethostname()
+                .context("reading the host's name")?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        Ok(NetworkPlan {
+            hostname,
+            mode,
+            run,
+            etc_files: has_root,
+            hosts: self.add_host.clone(),
+            dns: DnsSettings {
+                servers: self.dns.clone(),
+                search: self.dns_search.clone(),
+                options: self.dns_option.clone(),
+            },
+            ports: self
+                .publish
+                .iter()
+                .flat_map(|spec| spec.0.iter().copied())
+                .collect(),
+            publish_all: self.publish_all,
+            pasta,
+            defaulted: self.network.is_empty(),
+            name: self.name.clone(),
+        })
+    }
+
+    /// The run's network: what the `--network` flags ask for, with
+    /// `--ip`, `--ip6`, `--mac-address` and `--network-alias` given to the networks
+    /// they're for ([`combine_networks`]); else the default, as Docker's:
+    /// the default bridge network for the host's root (where it may make
+    /// one), pasta for everyone else; the host's network for a root that
+    /// can't have a bridge (no `CAP_NET_ADMIN`: in a container), and off
+    /// Linux.
+    fn network_mode(&self) -> Result<NetworkMode> {
+        if self.network.is_empty() {
+            return Ok(self.default_mode.get_or_init(Self::default_network).clone());
+        }
+        combine_networks(
+            &self.network,
+            Addresses {
+                ip: self.ip,
+                ip6: self.ip6,
+                mac: self.mac_address,
+            },
+            &self.network_alias,
+        )
+    }
+
+    /// The network a run gets without `--network` (see
+    /// [`network_mode`](Self::network_mode)): worked out once a run, as it
+    /// reads `/proc`.
+    fn default_network() -> NetworkMode {
+        if !cfg!(target_os = "linux") {
+            NetworkMode::Host
+        } else if crate::network::can_network() {
+            NetworkMode::bridge(shipyard_network::store::DEFAULT_NETWORK)
+        } else if crate::network::host_root() {
+            NetworkMode::Host
+        } else {
+            NetworkMode::Pasta
+        }
+    }
+
+    /// An isolated container's hostname: `--hostname`; else, with a network
+    /// of its own, the run's ID (as Docker names containers); else none to
+    /// set: with the host's network, it keeps the host's name (as Docker
+    /// does), the one the host's `/etc/hosts` and DNS know.
+    fn hostname_for(&self, run: &RunId, mode: &NetworkMode) -> Option<String> {
+        self.hostname
+            .clone()
+            .or_else(|| mode.own_namespace().then(|| run.as_str().to_owned()))
+    }
+
     /// The user to run as: an explicit `--user` wins; else the image's `User`
     /// (`name`, `uid`, or `uid:gid`); else root inside an isolated run, or the
     /// caller without isolation.
@@ -866,7 +1195,7 @@ fn parse_security_opt(s: &str) -> Result<SecurityOpt, String> {
 /// 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
     let planned = match args.check()? {
-        Checked::Bundle(invocation) => return Ok(run_invocation(*invocation)?.exit()),
+        Checked::Bundle(invocation) => return Ok(run_invocation(*invocation, None)?.exit()),
         Checked::Command(planned) => planned,
     };
     // The flags checked, the image is made ready: pulled if it must be, its
@@ -879,8 +1208,39 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
     let (defaults, area) = prepare_image(&planned)?.unzip();
     #[cfg(not(target_os = "linux"))]
     let defaults = None;
-    let (invocation, held_volumes) = planned.finish(defaults)?;
-    let ended = run_invocation(invocation)?;
+    // A bridge network's address and the /etc files, made now: the
+    // container is connected once its namespace exists.
+    let exposed = defaults
+        .as_ref()
+        .map_or(&[][..], |defaults: &ImageDefaults| {
+            &defaults.config.exposed_ports
+        });
+    let network =
+        match RunNetwork::set_up(planned.network.as_ref(), exposed) {
+            Ok(network) => network,
+            Err(error) => {
+                // The default bridge network couldn't be made (the kernel
+                // refused), not one asked for; not a mistake in a flag (a port
+                // in use).
+                if planned.network.as_ref().is_some_and(|plan| {
+                    plan.defaulted && matches!(plan.mode, NetworkMode::Bridges(_))
+                }) && network_refused(&error)
+                {
+                    crate::hint(crate::network::HOST_INSTEAD);
+                }
+                return Err(error);
+            }
+        };
+    let (invocation, held_volumes) = planned.finish(defaults, network.etc())?;
+    network.release_ports();
+    let mut connect = network.hook();
+    let hook = connect
+        .as_mut()
+        .map(|connect| connect as process::NetworkHook<'_>);
+    let ended = run_invocation(invocation, hook)?;
+    drop(connect);
+    // Its address given back and its veth gone before it ends, as the rest.
+    drop(network);
     drop(held_volumes);
     #[cfg(target_os = "linux")]
     if let Some(area) = area {
@@ -951,20 +1311,33 @@ impl Ended {
     }
 }
 
-/// Runs a built invocation under the supervisor.
-fn run_invocation(invocation: Invocation) -> Result<Ended> {
+/// Runs a built invocation under the supervisor, with `network` setting up
+/// the container's network before it starts (connecting it to a bridge
+/// network, or starting its pasta).
+fn run_invocation(
+    invocation: Invocation,
+    network: Option<process::NetworkHook<'_>>,
+) -> Result<Ended> {
     let Invocation {
         spec,
         stop,
         isolation,
         warnings,
+        generated,
     } = invocation;
     for warning in &warnings {
         crate::warning(warning);
     }
     tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;
-    let status = match supervisor.supervise(&spec, stop, isolation.as_ref()) {
+    let supervised = match (network, isolation.as_ref()) {
+        (Some(network), Some(isolation)) => {
+            supervisor.supervise_with_network(&spec, stop, isolation, network)
+        }
+        (Some(_), None) => bail!("a network needs an isolated run"),
+        (None, isolation) => supervisor.supervise(&spec, stop, isolation),
+    };
+    let status = match supervised {
         Ok(status) => status,
         Err(err) => {
             let code = err.exit_code();
@@ -973,7 +1346,11 @@ fn run_invocation(invocation: Invocation) -> Result<Ended> {
             // The runtime can't name the CLI's flag; this is where it's known.
             // Only when it would work: `--no-isolation` can't be combined with
             // a root filesystem, a hostname, a domain name or sysctls.
-            if isolation_failed && isolation.as_ref().is_some_and(only_namespaces) {
+            if isolation_failed
+                && isolation
+                    .as_ref()
+                    .is_some_and(|isolation| only_namespaces(isolation, generated))
+            {
                 crate::hint("--no-isolation runs the command without namespaces");
             }
             return Ok(Ended::Code(exit));
@@ -990,12 +1367,15 @@ fn run_invocation(invocation: Invocation) -> Result<Ended> {
 
 /// Whether `isolation` asks for nothing but the namespaces themselves, so
 /// that `--no-isolation` could replace it: no limits or device flags
-/// either, which need the container's cgroup.
-fn only_namespaces(isolation: &Isolation) -> bool {
-    isolation.root.is_none()
-        && isolation.hostname.is_none()
+/// either, which need the container's cgroup. What Shipyard made up
+/// (`generated`: the run's ID as hostname, the default network and its
+/// settings) isn't asked for.
+fn only_namespaces(isolation: &Isolation, generated: Generated) -> bool {
+    (!isolation.has(Namespace::Network) || generated.network)
+        && isolation.root.is_none()
+        && (isolation.hostname.is_none() || generated.hostname)
         && isolation.domainname.is_none()
-        && isolation.sysctls.is_empty()
+        && (isolation.sysctls.is_empty() || (generated.network && generated.sysctls))
         && isolation.security == Security::standard()
         && isolation.id_maps.is_none()
         && isolation.resources.is_empty()
@@ -1093,6 +1473,265 @@ fn parse_name_or_id(s: &str) -> Result<String, String> {
     Ok(s.to_owned())
 }
 
+/// Whether `error` refuses a network setting only because the container
+/// shares the host's network (not one that's the whole machine's anyway).
+fn wants_own_network(error: &IsolationError) -> bool {
+    matches!(error, IsolationError::Sysctl { key, .. }
+        if key.starts_with("net.") && !HOST_WIDE_NET_SYSCTLS.contains(&key.as_str()))
+}
+
+/// Whether `error` is the kernel refusing to set up a network (no right to,
+/// no `nf_tables`), rather than something the user can fix in a flag.
+fn network_refused(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<shipyard_network::NetlinkError>() || {
+            #[cfg(target_os = "linux")]
+            let attach = cause.is::<shipyard_network::attach::AttachError>()
+                || cause.is::<shipyard_network::route::RtnetlinkError>();
+            #[cfg(not(target_os = "linux"))]
+            let attach = false;
+            attach
+        }
+    })
+}
+
+/// One `-p`: the ports it publishes.
+#[derive(Debug, Clone)]
+pub(crate) struct PublishSpec(Vec<shipyard_network::ports::PortRequest>);
+
+/// `-p`'s `SPEC`.
+fn parse_publish(s: &str) -> Result<PublishSpec, String> {
+    shipyard_network::ports::parse_publish(s)
+        .map(PublishSpec)
+        .map_err(|error| error.to_string())
+}
+
+/// `--network`'s mode: `host`, `none`, `pasta`, `bridge` (the default
+/// network), or a network's name; or Docker's long form for a network,
+/// `name=NAME[,ip=IP][,ip6=IP][,mac-address=MAC][,alias=NAME…]`.
+fn parse_network(s: &str) -> Result<NetworkMode, String> {
+    match s {
+        "host" => Ok(NetworkMode::Host),
+        "none" => Ok(NetworkMode::None),
+        "pasta" => Ok(NetworkMode::Pasta),
+        long if long.contains('=') => {
+            parse_long_network(long).map(|joined| NetworkMode::Bridges(vec![joined]))
+        }
+        name => {
+            shipyard_network::store::validate_name(name).map_err(|error| error.to_string())?;
+            Ok(NetworkMode::bridge(name))
+        }
+    }
+}
+
+/// `--network`'s long form: `name=NAME`, then any of `ip=IP`, `ip6=IP`,
+/// `mac-address=MAC` and `alias=NAME` (repeatable), separated by commas.
+fn parse_long_network(text: &str) -> Result<Joined, String> {
+    let mut name = None;
+    let mut joined = Joined::default();
+    for setting in text.split(',') {
+        let Some((key, value)) = setting.split_once('=') else {
+            return Err(format!("{setting:?} isn't KEY=VALUE"));
+        };
+        match key {
+            "name" if name.is_none() => {
+                if crate::network::RESERVED.contains(&value) {
+                    return Err(format!(
+                        "--network {value} takes no settings: only bridge networks do"
+                    ));
+                }
+                shipyard_network::store::validate_name(value).map_err(|error| error.to_string())?;
+                name = Some(value.to_owned());
+            }
+            "ip" if joined.ip.is_none() => {
+                joined.ip = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("ip={value}: not an IP address"))?,
+                );
+            }
+            "ip6" if joined.ip6.is_none() => {
+                joined.ip6 = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("ip6={value}: not an IPv6 address"))?,
+                );
+            }
+            "mac-address" if joined.mac.is_none() => {
+                joined.mac = Some(shipyard_network::store::parse_mac(value)?);
+            }
+            "alias" => joined
+                .aliases
+                .push(shipyard_network::dns::parse_name(value)?),
+            "name" | "ip" | "ip6" | "mac-address" => return Err(format!("{key}= is given twice")),
+            _ => {
+                return Err(format!(
+                    "{key}= isn't a network setting: name=, ip=, ip6=, mac-address= or alias="
+                ));
+            }
+        }
+    }
+    joined.name = name.ok_or("the long form needs name=NETWORK")?;
+    Ok(joined)
+}
+
+/// `--ip`, `--ip6` and `--mac-address`: a container's addresses on its one
+/// bridge network.
+#[derive(Debug, Clone, Copy, Default)]
+struct Addresses {
+    ip: Option<std::net::IpAddr>,
+    ip6: Option<std::net::Ipv6Addr>,
+    mac: Option<[u8; 6]>,
+}
+
+impl Addresses {
+    /// Whether any is given.
+    fn any(self) -> bool {
+        self.ip.is_some() || self.ip6.is_some() || self.mac.is_some()
+    }
+}
+
+/// The run's network from its `--network` flags (`given`, one at least):
+/// one `host`, `none` or `pasta` alone; or bridge networks, each once, in
+/// order. `--ip`, `--ip6` and `--mac-address` (`addresses`) go to a bridge
+/// network, when there's only one; `--network-alias` (`aliases`) to each
+/// network that has names.
+fn combine_networks(
+    given: &[NetworkMode],
+    addresses: Addresses,
+    aliases: &[String],
+) -> Result<NetworkMode> {
+    let mut networks: Vec<Joined> = Vec::new();
+    for mode in given {
+        match mode {
+            NetworkMode::Bridges(more) => {
+                for joined in more {
+                    if networks.iter().any(|other| other.name == joined.name) {
+                        bail!("--network {}: given twice", joined.name);
+                    }
+                    networks.push(joined.clone());
+                }
+            }
+            alone if given.len() == 1 => {
+                if addresses.any() {
+                    bail!(
+                        "--ip, --ip6 and --mac-address need a bridge network (--network bridge, \
+                         or a name)"
+                    );
+                }
+                if !aliases.is_empty() {
+                    bail!(NO_NAMES_FOR_ALIASES);
+                }
+                return Ok(alone.clone());
+            }
+            _ => bail!(
+                "--network host, none and pasta can't be combined with other networks: a \
+                 container on several is on bridge networks"
+            ),
+        }
+    }
+    if addresses.any() {
+        let [only] = networks.as_mut_slice() else {
+            bail!(
+                "--ip, --ip6 and --mac-address are for one network: with several, give each its \
+                 own (--network name=NETWORK,ip=IP,ip6=IP,mac-address=MAC)"
+            );
+        };
+        if (addresses.ip.is_some() && only.ip.is_some())
+            || (addresses.ip6.is_some() && only.ip6.is_some())
+            || (addresses.mac.is_some() && only.mac.is_some())
+        {
+            bail!("--network {}: its address is given twice", only.name);
+        }
+        only.ip = only.ip.or(addresses.ip);
+        only.ip6 = only.ip6.or(addresses.ip6);
+        only.mac = only.mac.or(addresses.mac);
+    }
+    let named = networks
+        .iter()
+        .any(|joined| shipyard_network::store::has_dns(&joined.name));
+    if !aliases.is_empty() && !named {
+        bail!(NO_NAMES_FOR_ALIASES);
+    }
+    if networks.len() > MAX_NETWORKS {
+        bail!("a container can join at most {MAX_NETWORKS} networks");
+    }
+    for joined in &mut networks {
+        if !shipyard_network::store::has_dns(&joined.name) {
+            if !joined.aliases.is_empty() {
+                bail!(NO_NAMES_FOR_ALIASES);
+            }
+            continue;
+        }
+        joined.aliases.extend(aliases.iter().cloned());
+        // Each once, whatever its case.
+        let mut seen = std::collections::HashSet::new();
+        joined
+            .aliases
+            .retain(|alias| seen.insert(alias.to_ascii_lowercase()));
+    }
+    Ok(NetworkMode::Bridges(networks))
+}
+
+/// Why `--network-alias` (or `alias=`) can't be given here.
+const NO_NAMES_FOR_ALIASES: &str = "--network-alias and alias= need a network made with \
+                                    `shipyard network create`: only those have names (the \
+                                    default bridge network has none, as Docker's)";
+
+/// The most networks a container joins (its interfaces' and veths' names
+/// have room for two digits).
+const MAX_NETWORKS: usize = 100;
+
+/// `user` sysctls, after Docker's defaults for a container with a network of
+/// its own (a setting the user gives wins), each only if the host kernel has
+/// it (`has`):
+///
+/// - `net.ipv4.ip_unprivileged_port_start=0`: any user in the container may
+///   listen on a port below 1024 (it's the container's own network);
+/// - `net.ipv4.ping_group_range`: any group may `ping` with an ICMP socket,
+///   without `CAP_NET_RAW`. Every group ID from 0 up: the host's whole range
+///   without a user namespace; with one, up to the top of its group map (the
+///   kernel refuses a group it doesn't map, probe N2). The kernel compares
+///   the two ends as host IDs, and quietly turns `ping` off if the top's is
+///   below 0's, so the top is the highest group whose host ID is at least
+///   0's; none at all if group 0 isn't mapped;
+/// - `net.ipv4.ip_forward=0` and `net.ipv6.conf.all.forwarding=0`: the
+///   container routes nothing. A new network namespace can copy the host's
+///   settings, which are on wherever a bridge network is used: a container
+///   on two networks would route between them, behind the firewall's back
+///   (its frames never leave the bridges), and join networks kept apart.
+fn with_network_defaults(
+    user: &[(String, String)],
+    maps: Option<&IdMaps>,
+    has: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    /// The highest group ID (`gid_t`'s positive range).
+    const MAX_GROUP: u32 = 2_147_483_647;
+    let port_start = "net.ipv4.ip_unprivileged_port_start";
+    let ping_groups = "net.ipv4.ping_group_range";
+    let top_group = match maps {
+        None => Some(MAX_GROUP),
+        Some(maps) => maps.host_gid(0).and_then(|zero| {
+            maps.gids
+                .iter()
+                .map(|map| map.container.saturating_add(map.size.saturating_sub(1)))
+                .filter(|&top| maps.host_gid(top).is_some_and(|host| host >= zero))
+                .max()
+        }),
+    };
+    let mut defaults = vec![(port_start.to_owned(), "0".to_owned())];
+    if let Some(top) = top_group {
+        defaults.push((ping_groups.to_owned(), format!("0 {top}")));
+    }
+    defaults.push(("net.ipv4.ip_forward".to_owned(), "0".to_owned()));
+    defaults.push(("net.ipv6.conf.all.forwarding".to_owned(), "0".to_owned()));
+    defaults
+        .into_iter()
+        .filter(|(key, _)| has(key) && !user.iter().any(|(given, _)| given == key))
+        .chain(user.iter().cloned())
+        .collect()
+}
+
 /// `KEY=VALUE`, split at the first `=`. Which keys are allowed is checked
 /// with the rest of the isolation.
 fn parse_sysctl(s: &str) -> Result<(String, String), String> {
@@ -1123,7 +1762,7 @@ impl RunArgs {
     fn into_invocation(self) -> Result<Invocation> {
         match self.check()? {
             Checked::Bundle(invocation) => Ok(*invocation),
-            Checked::Command(planned) => Ok(planned.finish(None)?.0),
+            Checked::Command(planned) => Ok(planned.finish(None, None)?.0),
         }
     }
 }
@@ -1706,13 +2345,394 @@ mod tests {
     /// with.
     #[test]
     fn no_isolation_replaces_only_bare_namespaces() {
-        assert!(only_namespaces(&Isolation::standard()));
+        assert!(only_namespaces(
+            &Isolation::standard(),
+            Generated::default()
+        ));
+        // A hostname that's the run's ID isn't asked for: the hint still fits.
+        let hostname = Generated {
+            hostname: true,
+            ..Generated::default()
+        };
+        let mut named = Isolation::standard();
+        named.hostname = Some("a1b2c3d4e5f6".into());
+        assert!(only_namespaces(&named, hostname));
+        assert!(!only_namespaces(&named, Generated::default()));
         let mut limited = Isolation::standard();
         limited.resources.pids_max = Some(1);
-        assert!(!only_namespaces(&limited));
+        assert!(!only_namespaces(&limited, Generated::default()));
         let mut devices = Isolation::standard();
         devices.devices.asked = true;
-        assert!(!only_namespaces(&devices));
+        assert!(!only_namespaces(&devices, Generated::default()));
+        // --no-isolation would give it the host's network instead.
+        let mut network = Isolation::standard();
+        network.namespaces.push(Namespace::Network);
+        assert!(!only_namespaces(&network, Generated::default()));
+        // Unless it's the default one, not asked for, with its own default
+        // settings; a setting of the user's is asked for.
+        let default_network = Generated {
+            network: true,
+            sysctls: true,
+            ..Generated::default()
+        };
+        assert!(only_namespaces(&network, default_network));
+        network.sysctls = vec![("net.ipv4.ping_group_range".into(), "0 0".into())];
+        assert!(only_namespaces(&network, default_network));
+        // A setting of the user's (even one the default network has).
+        let asked = Generated {
+            sysctls: false,
+            ..default_network
+        };
+        assert!(!only_namespaces(&network, asked));
+    }
+
+    #[test]
+    fn network_modes() {
+        assert_eq!(parse_network("host"), Ok(NetworkMode::Host));
+        assert_eq!(parse_network("none"), Ok(NetworkMode::None));
+        assert_eq!(parse_network("bridge"), Ok(NetworkMode::bridge("bridge")));
+        assert_eq!(parse_network("app"), Ok(NetworkMode::bridge("app")));
+        assert!(parse_network("a/b").is_err());
+        assert!(parse(&["--network", "none", "--no-isolation", "true"]).is_err());
+        assert!(parse(&["--network", "-x", "true"]).is_err());
+        // Addresses need a network to be on; /etc files a root to be in.
+        assert!(parse(&["--ip", "10.0.0.2", "true"]).is_err());
+        assert!(parse(&["--mac-address", "02:42:0a:00:00:02", "true"]).is_err());
+        assert!(
+            parse(&[
+                "--mac-address",
+                "00:42:0a:00:00:02",
+                "--network",
+                "bridge",
+                "true"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--add-host", "db", "true"]).is_err());
+        let isolation = |args: &[&str]| {
+            parse(args)
+                .unwrap()
+                .into_invocation()
+                .map(|run| run.isolation)
+        };
+        if cfg!(target_os = "linux") {
+            let own = isolation(&["--network", "none", "true"]).unwrap().unwrap();
+            assert!(own.makes_network_namespace());
+            let host = isolation(&["--network", "host", "true"]).unwrap().unwrap();
+            assert!(!host.has(Namespace::Network));
+            // The default: a network of its own (the bridge network for the
+            // host's root, pasta without), except for a root that can't
+            // make one. (Without pasta installed, a rootless run is refused.)
+            if let Ok(Some(default)) = isolation(&["true"]) {
+                assert_eq!(
+                    default.has(Namespace::Network),
+                    crate::network::can_network() || !crate::network::host_root()
+                );
+            }
+            // A network setting needs a network of its own, and the error
+            // says how to give it one.
+            let error = isolation(&[
+                "--network",
+                "host",
+                "--sysctl",
+                "net.ipv4.ip_forward=1",
+                "true",
+            ])
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("any --network but host gives it one"),
+                "{error}"
+            );
+            // Others reach the container whatever its network.
+            let ipc = isolation(&["--network", "host", "--sysctl", "kernel.shmmax=1", "true"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(ipc.sysctls, [("kernel.shmmax".to_owned(), "1".to_owned())]);
+            let set = isolation(&[
+                "--network",
+                "none",
+                "--sysctl",
+                "net.ipv4.ip_forward=1",
+                "true",
+            ])
+            .unwrap()
+            .unwrap();
+            assert!(
+                set.sysctls
+                    .contains(&("net.ipv4.ip_forward".into(), "1".into()))
+            );
+        } else {
+            let error = isolation(&["--network", "none", "true"]).unwrap_err();
+            assert!(
+                error.to_string().contains("--network needs Linux"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_long_form_gives_a_network_its_own_settings() {
+        let parsed =
+            parse_network("name=app,ip=10.89.0.5,mac-address=02:42:0a:59:00:05,alias=web,alias=x")
+                .unwrap();
+        assert_eq!(
+            parsed,
+            NetworkMode::Bridges(vec![Joined {
+                name: "app".into(),
+                ip: Some("10.89.0.5".parse().unwrap()),
+                ip6: None,
+                mac: Some([2, 0x42, 10, 0x59, 0, 5]),
+                aliases: vec!["web".into(), "x".into()],
+            }])
+        );
+        for bad in [
+            "ip=10.89.0.5",
+            "name=host",
+            "name=app,ip=nope",
+            "name=app,ip=10.0.0.1,ip=10.0.0.2",
+            "name=app,name=db",
+            "name=app,gw-priority=1",
+            "name=app,alias=a.b",
+            "name=app,mac-address=01:00:00:00:00:00",
+            "name=app,ip",
+        ] {
+            assert!(parse_network(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn several_networks_are_bridge_networks_each_once() {
+        let mode = |args: &[&str]| parse(args).unwrap().network_mode();
+        let both = mode(&[
+            "--network",
+            "front",
+            "--network",
+            "name=back,alias=db",
+            "true",
+        ])
+        .unwrap();
+        let NetworkMode::Bridges(joined) = both else {
+            panic!("{both:?}");
+        };
+        assert_eq!(
+            joined
+                .iter()
+                .map(|one| one.name.as_str())
+                .collect::<Vec<_>>(),
+            ["front", "back"]
+        );
+        // A global alias goes to each network that has names.
+        let aliased = mode(&[
+            "--network",
+            "bridge",
+            "--network",
+            "back",
+            "--network-alias",
+            "db",
+            "true",
+        ])
+        .unwrap();
+        let NetworkMode::Bridges(joined) = aliased else {
+            panic!("{aliased:?}");
+        };
+        assert!(joined[0].aliases.is_empty());
+        assert_eq!(joined[1].aliases, ["db"]);
+        // --ip for one network goes to it.
+        let one = mode(&["--network", "app", "--ip", "10.89.0.9", "true"]).unwrap();
+        let NetworkMode::Bridges(joined) = one else {
+            panic!("{one:?}");
+        };
+        assert_eq!(joined[0].ip, Some("10.89.0.9".parse().unwrap()));
+        for (args, message) in [
+            (
+                &["--network", "host", "--network", "app", "true"][..],
+                "can't be combined",
+            ),
+            (
+                &["--network", "app", "--network", "app", "true"][..],
+                "given twice",
+            ),
+            (
+                &[
+                    "--network",
+                    "a",
+                    "--network",
+                    "b",
+                    "--ip",
+                    "10.0.0.2",
+                    "true",
+                ][..],
+                "with several, give each its own",
+            ),
+            (
+                &[
+                    "--network",
+                    "name=app,ip=10.89.0.2",
+                    "--ip",
+                    "10.89.0.3",
+                    "true",
+                ][..],
+                "given twice",
+            ),
+            (
+                &["--network", "name=bridge,alias=x", "true"][..],
+                "alias= need a network made with",
+            ),
+            (
+                &["--network", "none", "--ip", "10.0.0.2", "true"][..],
+                "need a bridge network",
+            ),
+        ] {
+            let error = mode(args).unwrap_err();
+            assert!(error.to_string().contains(message), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn names_are_dns_labels_and_aliases_need_a_created_network() {
+        assert!(parse(&["--name", "db.app", "true"]).is_err());
+        assert!(parse(&["--name", "db", "--no-isolation", "true"]).is_err());
+        // An alias needs the network named.
+        assert!(parse(&["--network-alias", "db", "true"]).is_err());
+        let plan = |args: &[&str]| parse(args).unwrap().network_plan(RunId::new().unwrap());
+        let error = plan(&["--network", "bridge", "--network-alias", "db", "true"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("alias= need a network made with"),
+            "{error}"
+        );
+        let named = plan(&[
+            "--network",
+            "app",
+            "--name",
+            "db",
+            "--network-alias",
+            "database",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("db"));
+        let NetworkMode::Bridges(joined) = &named.mode else {
+            panic!("{:?}", named.mode);
+        };
+        assert_eq!(joined[0].aliases, ["database"]);
+        // On the default network, a name is only recorded.
+        let bridge = plan(&["--network", "bridge", "--name", "db", "true"]).unwrap();
+        assert_eq!(bridge.name.as_deref(), Some("db"));
+    }
+
+    #[test]
+    fn a_network_of_its_own_gets_dockers_default_settings() {
+        let all = |_: &str| true;
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        // Without a user namespace: every group may ping.
+        assert_eq!(
+            with_network_defaults(&[], None, all),
+            [
+                pair("net.ipv4.ip_unprivileged_port_start", "0"),
+                pair("net.ipv4.ping_group_range", "0 2147483647"),
+                pair("net.ipv4.ip_forward", "0"),
+                pair("net.ipv6.conf.all.forwarding", "0"),
+            ]
+        );
+        // With one: up to the top of its group map.
+        let maps = IdMaps {
+            uids: vec![
+                IdMap {
+                    container: 0,
+                    host: 1000,
+                    size: 1,
+                },
+                IdMap {
+                    container: 1,
+                    host: 100_000,
+                    size: 65536,
+                },
+            ],
+            gids: vec![
+                IdMap {
+                    container: 0,
+                    host: 1000,
+                    size: 1,
+                },
+                IdMap {
+                    container: 1,
+                    host: 100_000,
+                    size: 65536,
+                },
+            ],
+        };
+        assert_eq!(
+            with_network_defaults(&[], Some(&maps), all)[1],
+            pair("net.ipv4.ping_group_range", "0 65536")
+        );
+        // The kernel compares the ends as host IDs: a top group mapped below
+        // group 0's host ID would turn ping off, so it's not the top.
+        let below = IdMaps {
+            uids: maps.uids.clone(),
+            gids: vec![
+                IdMap {
+                    container: 0,
+                    host: 200_000,
+                    size: 1,
+                },
+                IdMap {
+                    container: 1,
+                    host: 100_000,
+                    size: 65536,
+                },
+            ],
+        };
+        assert_eq!(
+            with_network_defaults(&[], Some(&below), all)[1],
+            pair("net.ipv4.ping_group_range", "0 0")
+        );
+        // A map without group 0: no ping default.
+        let shifted = IdMaps {
+            uids: vec![IdMap {
+                container: 1,
+                host: 100_000,
+                size: 10,
+            }],
+            gids: vec![IdMap {
+                container: 1,
+                host: 100_000,
+                size: 10,
+            }],
+        };
+        assert!(
+            !with_network_defaults(&[], Some(&shifted), all)
+                .iter()
+                .any(|(key, _)| key == "net.ipv4.ping_group_range")
+        );
+        // The user's value wins, and comes after (a container that routes
+        // asks for it).
+        let user = [
+            pair("net.ipv4.ip_unprivileged_port_start", "1024"),
+            pair("net.ipv4.ip_forward", "1"),
+        ];
+        assert_eq!(
+            with_network_defaults(&user, None, all),
+            [
+                pair("net.ipv4.ping_group_range", "0 2147483647"),
+                pair("net.ipv6.conf.all.forwarding", "0"),
+                pair("net.ipv4.ip_unprivileged_port_start", "1024"),
+                pair("net.ipv4.ip_forward", "1"),
+            ]
+        );
+        // A setting the kernel doesn't have is left out.
+        let no_ports = |key: &str| key != "net.ipv4.ip_unprivileged_port_start";
+        assert_eq!(
+            with_network_defaults(&[], None, no_ports),
+            [
+                pair("net.ipv4.ping_group_range", "0 2147483647"),
+                pair("net.ipv4.ip_forward", "0"),
+                pair("net.ipv6.conf.all.forwarding", "0"),
+            ]
+        );
     }
 
     #[test]

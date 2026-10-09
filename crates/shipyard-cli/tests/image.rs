@@ -190,7 +190,11 @@ fn fixture() -> (Serving, String) {
 /// one file, `/layer-N` (holding `N`), and writing `/top` (`N` too: the
 /// top layer's wins).
 fn fixture_with(extra: usize) -> (Serving, String) {
-    let root = RootFs::minimal();
+    fixture_of(&RootFs::minimal(), extra)
+}
+
+/// As [`fixture_with`], the base layer made from `root`.
+fn fixture_of(root: &RootFs, extra: usize) -> (Serving, String) {
     let mut layers = vec![layer_tar(root.path())];
     for index in 0..extra {
         let dir = Scratch::new();
@@ -685,10 +689,20 @@ fn a_volume_in_use_is_never_removed() {
         "3",
         1,
     );
-    let pruned = shipyard(&store, &["volume", "prune", "-f"]);
-    let (stdout, stderr) = text(&pruned);
-    assert!(pruned.status.success(), "{stderr}");
-    assert!(stdout.contains("Kept 1 in use: keep"), "{stdout}");
+    // The run's area comes before its volumes are held (as root, its
+    // network is set up in between): until then, there's nothing to prune.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let pruned = shipyard(&store, &["volume", "prune", "-f"]);
+        let (stdout, stderr) = text(&pruned);
+        assert!(pruned.status.success(), "{stderr}");
+        if stdout.contains("Kept 1 in use: keep") {
+            break;
+        }
+        assert!(stdout.contains("Removed 0 volume(s)"), "{stdout}");
+        assert!(std::time::Instant::now() < deadline, "{stdout}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let refused = shipyard(&store, &["volume", "rm", "keep"]);
     assert_eq!(refused.status.code(), Some(125));
     assert!(text(&refused).1.contains("in use"), "{}", text(&refused).1);
@@ -1032,4 +1046,243 @@ fn a_store_on_overlayfs_is_explained() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(run.status.code(), Some(125), "{stderr}");
     assert!(stderr.contains("SHIPYARD_IMAGE_STORE"), "{stderr}");
+}
+
+/// Milestone v0.1, end to end: a normal user's interactive shell in an
+/// image pulled from a registry, isolated, resource-limited and networked
+/// (`shipyard run --image IMAGE --memory 64m sh`), on the user's terminal (a
+/// pseudo-terminal the test types into, as a person would). Root sets the world up, each test in
+/// a network namespace of its own: an [`Upstream`] that's the way out,
+/// with a web server and a DNS server on it, and the host's resolver
+/// pointed at that DNS server (in a mount namespace of the run's own, so
+/// only pasta sees it). The user is [`TestUser`], in a cgroup delegated to
+/// it where there's one (`--memory` needs it).
+#[test]
+#[ignore = "needs root"]
+fn the_v0_1_milestone_a_rootless_interactive_shell_in_a_pulled_image_is_networked() {
+    use shipyard_test_support::net::{FakeResolver, Server, TestUser, Upstream};
+    shipyard_test_support::in_new_netns(|| {
+        let Some(user) = TestUser::find() else {
+            eprintln!("no unprivileged user to run rootless containers as; skipping");
+            return;
+        };
+        let upstream = Upstream::new();
+        upstream.route_default();
+        let _resolver = FakeResolver::start(upstream.netns(), Upstream::ADDRESS);
+        let _server = Server::start(upstream.netns(), 80, "hello from upstream\n");
+        // bash: its `/dev/tcp` is the image's `wget`.
+        let root = RootFs::minimal();
+        root.add_host_program("bash");
+        let (_serving, image) = fixture_of(&root, 0);
+        let scratch = Scratch::new();
+        std::os::unix::fs::chown(&scratch.0, Some(user.uid), Some(user.gid)).unwrap();
+        let resolv = scratch.0.join("resolv.conf");
+        std::fs::write(&resolv, format!("nameserver {}\n", Upstream::ADDRESS)).unwrap();
+        let cgroup = user.delegated_cgroup();
+        let memory: &[&str] = if cgroup.is_some() {
+            &["--memory", "64m"]
+        } else {
+            eprintln!("no cgroup delegated to the user: the run has no --memory");
+            &[]
+        };
+        let mut command = user.environment(Command::new(SHIPYARD), &scratch.0.join("runtime"));
+        command
+            .args(["run", "--image", &image])
+            .args(memory)
+            .arg("sh")
+            .env("SHIPYARD_IMAGE_STORE", scratch.store());
+        let mut console = Console::start(command, &user, &resolv, cgroup.as_deref());
+
+        // The image was pulled, and its shell is up: root's prompt.
+        console.expect("the shell's prompt", |seen| seen.contains("# "));
+        // Its own network, through pasta: a default route...
+        console.type_line("cat /proc/net/route");
+        console.expect("a default route", |seen| seen.contains("\t00000000\t"));
+        // ...and pasta's resolver, which forwards to the host's.
+        console.type_line("cat /etc/resolv.conf");
+        console.expect("pasta's resolver", |seen| {
+            seen.contains("nameserver 169.254.1.1")
+        });
+        // A name looked up through it, and a server upstream reached.
+        console.type_line("bash -c 'exec 3<>/dev/tcp/upstream/80 && cat <&3'");
+        console.expect("the upstream server's reply", |seen| {
+            seen.contains("hello from upstream")
+        });
+        // Its own hostname: the run's ID.
+        console.type_line("echo host=$(cat /proc/sys/kernel/hostname)");
+        console.expect("the run ID as hostname", |seen| {
+            // After the prompt: `# host=0123456789ab`.
+            seen.lines().any(|line| {
+                line.trim_end().rsplit_once("host=").is_some_and(|(_, id)| {
+                    id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+        });
+        // Its memory limit.
+        if cgroup.is_some() {
+            console.type_line("echo mem=$(cat /sys/fs/cgroup/memory.max)");
+            console.expect("the memory limit", |seen| seen.contains("mem=67108864"));
+        }
+        console.type_line("exit 3");
+        assert_eq!(console.wait(), Some(3), "{}", console.seen);
+    });
+}
+
+/// A command on a pseudo-terminal of its own (its controlling terminal),
+/// and everything it has written there.
+struct Console {
+    leader: std::fs::File,
+    child: std::process::Child,
+    seen: String,
+}
+
+impl Console {
+    /// How long anything may take to show up (a pull included).
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Starts `command` on a new terminal, as `user`: before it drops to
+    /// the user, the child (still root) bind-mounts `resolv` over the
+    /// host's `/etc/resolv.conf` in a mount namespace of its own, and moves
+    /// into `cgroup`.
+    fn start(
+        mut command: Command,
+        user: &shipyard_test_support::net::TestUser,
+        resolv: &std::path::Path,
+        cgroup: Option<&std::path::Path>,
+    ) -> Console {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        let pty = nix::pty::openpty(None, None).expect("a pseudo-terminal");
+        let follower = std::fs::File::from(pty.slave);
+        command
+            .stdin(follower.try_clone().unwrap())
+            .stdout(follower.try_clone().unwrap())
+            .stderr(follower);
+        // Made here: the child may not allocate.
+        let path = |path: &std::path::Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        let resolv = path(resolv);
+        let procs = cgroup.map(|dir| path(&dir.join("cgroup.procs")));
+        let (uid, gid) = (user.uid, user.gid);
+        let check = |result: libc::c_int| {
+            if result == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        // SAFETY: the closure runs in the forked child before exec, and
+        // calls only async-signal-safe system calls on data prepared above
+        // (no allocation, no locks); `last_os_error` only reads errno.
+        unsafe {
+            command.pre_exec(move || {
+                check(libc::setsid())?;
+                check(libc::ioctl(0, libc::TIOCSCTTY, 0))?;
+                check(libc::unshare(libc::CLONE_NEWNS))?;
+                check(libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ))?;
+                check(libc::mount(
+                    resolv.as_ptr(),
+                    c"/etc/resolv.conf".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                ))?;
+                if let Some(procs) = &procs {
+                    let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    check(fd)?;
+                    let written = libc::write(fd, c"0".as_ptr().cast(), 1);
+                    libc::close(fd);
+                    if written != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                check(libc::setgroups(1, &raw const gid))?;
+                check(libc::setresgid(gid, gid, gid))?;
+                check(libc::setresuid(uid, uid, uid))
+            });
+        }
+        let child = command.spawn().expect("starting shipyard");
+        // Our copies of the terminal go: the child's last close is its end.
+        drop(command);
+        Console {
+            leader: std::fs::File::from(pty.master),
+            child,
+            seen: String::new(),
+        }
+    }
+
+    /// Types `line` and Enter.
+    fn type_line(&mut self, line: &str) {
+        use std::io::Write as _;
+        self.leader
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("typing");
+    }
+
+    /// Reads what's there (up to a tenth of a second's wait); false once
+    /// the terminal has no other end.
+    fn read(&mut self) -> bool {
+        use std::io::Read as _;
+        use std::os::fd::AsFd as _;
+        let mut fds = [nix::poll::PollFd::new(
+            self.leader.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        if nix::poll::poll(&mut fds, 100u16).unwrap_or(0) == 0 {
+            return true;
+        }
+        let mut buffer = [0u8; 4096];
+        match self.leader.read(&mut buffer) {
+            Ok(0) | Err(_) => false,
+            Ok(read) => {
+                self.seen
+                    .push_str(&String::from_utf8_lossy(&buffer[..read]));
+                true
+            }
+        }
+    }
+
+    /// Waits until what's been written satisfies `done`.
+    fn expect(&mut self, what: &str, done: impl Fn(&str) -> bool) {
+        let deadline = std::time::Instant::now() + Self::WAIT;
+        while !done(&self.seen) {
+            assert!(
+                std::time::Instant::now() < deadline && self.read(),
+                "no {what} on the terminal:\n{}",
+                self.seen
+            );
+        }
+    }
+
+    /// Its exit code, once it has ended (reading the terminal meanwhile,
+    /// so it's never blocked writing).
+    fn wait(&mut self) -> Option<i32> {
+        let deadline = std::time::Instant::now() + Self::WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("waiting") {
+                return status.code();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "it never ended:\n{}",
+                self.seen
+            );
+            if !self.read() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+impl Drop for Console {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

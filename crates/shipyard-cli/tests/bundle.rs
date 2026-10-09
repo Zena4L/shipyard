@@ -116,8 +116,8 @@ fn bad_json_says_where() {
 }
 
 /// What `runc spec` writes asks for what Shipyard can't give yet (a
-/// terminal, a network namespace): the bundle is refused, naming each field,
-/// before anything starts. Its device rule is applied.
+/// terminal): the bundle is refused, naming the field, before anything
+/// starts. Its device rule and its network namespace are applied.
 #[test]
 fn a_runc_spec_config_is_refused_with_its_reasons() {
     let bundle = Bundle::new();
@@ -130,15 +130,14 @@ fn a_runc_spec_config_is_refused_with_its_reasons() {
     config["linux"]["resources"] = json!({"devices": [{"allow": false, "access": "rwm"}]});
     let run = run_bundle(&bundle, &config);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
-    for field in ["process.terminal", "linux.namespaces (network)"] {
-        assert!(run.stderr.contains(field), "{field}: {}", run.stderr);
-    }
-    // Applied since stage 4 (and the device rules since stage 5), so not
-    // among the reasons any more.
+    assert!(run.stderr.contains("process.terminal"), "{}", run.stderr);
+    // Applied since stage 4 (the device rules since stage 5, the network
+    // namespace since stage 7), so not among the reasons any more.
     for applied in [
         "process.capabilities",
         "process.noNewPrivileges",
         "linux.resources",
+        "linux.namespaces (network)",
     ] {
         assert!(!run.stderr.contains(applied), "{applied}: {}", run.stderr);
     }

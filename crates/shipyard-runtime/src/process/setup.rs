@@ -52,6 +52,8 @@ pub(crate) struct Setup {
     pub(crate) keep_ignored: Vec<libc::c_int>,
     /// Change `/`'s propagation first: a new mount namespace.
     pub(crate) private_mounts: bool,
+    /// Its network namespace.
+    pub(crate) network: NetworkSetup,
     /// Mount a fresh `/proc`: new PID and mount namespaces.
     pub(crate) mount_proc: bool,
     pub(crate) hostname: Option<String>,
@@ -100,6 +102,29 @@ pub(crate) struct CgroupSetup {
     pub(crate) mount: Option<CgroupMount>,
 }
 
+/// The container's network namespace, as the clean image sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NetworkSetup {
+    /// The host's: there's none of its own.
+    Host,
+    /// One it joined: set up by whoever made it.
+    Joined,
+    /// One made for it, with only `lo`, down: the clean image brings it up.
+    Own,
+}
+
+/// The container's `/sys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SysSetup {
+    /// A `sysfs` of its own: it shows the network devices of the network
+    /// namespace it's mounted in.
+    Own,
+    /// A read-only bind of the host's: in a user namespace that doesn't own
+    /// the network namespace (the host's, or a joined one), the kernel
+    /// refuses a new `sysfs` (probe U6).
+    HostBind,
+}
+
 /// The container's user namespace, as the clean image needs it.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct UserNamespaceSetup {
@@ -117,9 +142,11 @@ pub(crate) struct RootSetup {
     readonly: Vec<Vec<u8>>,
     /// Mount `/dev/mqueue`: a new IPC namespace, whose queues it shows.
     pub(crate) mqueue: bool,
-    /// In a user namespace: `/dev`'s nodes and `/sys` are binds of the
-    /// host's (`mknod` and a new `sysfs` are refused there).
+    /// In a user namespace: `/dev`'s nodes are binds of the host's (`mknod`
+    /// is refused there).
     pub(crate) user_namespace: bool,
+    /// What `/sys` is.
+    pub(crate) sys: SysSetup,
     /// The group `/dev/pts`'s terminals belong to: `tty` (5), unless a user
     /// namespace leaves it unmapped (the mount would be refused).
     pub(crate) pts_gid: Option<u32>,
@@ -251,6 +278,7 @@ impl RootSetup {
         root: &Root,
         mqueue: bool,
         id_maps: Option<&IdMaps>,
+        sys: SysSetup,
         devices: &[crate::devices::DeviceNode],
         attach: Option<RawFd>,
     ) -> Self {
@@ -264,6 +292,7 @@ impl RootSetup {
             readonly: root.readonly_paths.iter().map(bytes).collect(),
             mqueue,
             user_namespace: id_maps.is_some(),
+            sys,
             pts_gid: match id_maps {
                 Some(maps) => maps.host_gid(TTY).map(|_| TTY),
                 None => Some(TTY),
@@ -400,6 +429,13 @@ impl Setup {
                 .collect(),
             keep_ignored: keep_ignored.to_vec(),
             private_mounts: isolation.has(Namespace::Mount),
+            network: if isolation.makes_network_namespace() {
+                NetworkSetup::Own
+            } else if isolation.has(Namespace::Network) {
+                NetworkSetup::Joined
+            } else {
+                NetworkSetup::Host
+            },
             mount_proc: isolation.has(Namespace::Pid) && isolation.has(Namespace::Mount),
             hostname: isolation.hostname.clone(),
             domainname: isolation.domainname.clone(),
@@ -411,6 +447,13 @@ impl Setup {
                     root,
                     isolation.has(Namespace::Ipc),
                     isolation.id_maps.as_ref(),
+                    // A user namespace owns the network namespace made in
+                    // the same clone.
+                    if isolation.id_maps.is_none() || isolation.makes_network_namespace() {
+                        SysSetup::Own
+                    } else {
+                        SysSetup::HostBind
+                    },
                     &isolation.devices.nodes,
                     attach,
                 )

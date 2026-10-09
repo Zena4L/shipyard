@@ -22,6 +22,8 @@ shipyard-test-support = { path = "crates/shipyard-test-support" }
 # Stage 6: images and storage (the engine layer).
 shipyard-image = { path = "crates/shipyard-image" }
 shipyard-storage = { path = "crates/shipyard-storage" }
+# Stage 7: networking (the engine layer).
+shipyard-network = { path = "crates/shipyard-network" }
 
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
@@ -35,11 +37,18 @@ nix = { version = "0.31", default-features = false, features = [
   "fs",
   "hostname",
   "mount",
+  # Internet sockets (stage 7): holding a published port (`SockaddrIn`).
+  "net",
   "poll",
   "process",
   "resource",
   "sched",
   "signal",
+  # Netlink sockets (stage 7): `socket`, `bind`, `getsockname`, `sendto`,
+  # `recvmsg` (with `uio`) and the receive timeout (with `time`).
+  "socket",
+  "time",
+  "uio",
   "user",
 ] }
 # `config.json` (OCI bundles) and the container init's setup description

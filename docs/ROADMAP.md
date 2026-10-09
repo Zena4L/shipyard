@@ -19,7 +19,7 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 | 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp. Device access control moved to stage 5, with cgroups | TLPI 8, 9, 39; `user_namespaces(7)`, `capabilities(7)`, `seccomp(2)` | [done](stages/04-security.md) |
 | 5 | **Resource control** | cgroups v2 limits and cgroup namespaces, OOM detection, live stats, pause/resume, device access control (eBPF), OCI hooks; `shipyard`'s own `stats`/`top`/`pause`/`update` come with stage 9's named containers | TLPI 36; `cgroups(7)`; OCI runtime spec (hooks) | [done](stages/05-resources.md) |
 | 6 | **Images & storage** | Registry pulls (private registries, resumable), OCI/Docker manifests, safe layer unpacking (fuzzed), content-addressed store shared by concurrent runs, overlayfs (rootless too), volumes. `tag`/`inspect`/`save`… and `--mount` come with stage 9; the `fuse-overlayfs` fallback later | OCI image & distribution specs; `overlayfs` docs; TLPI 14, 18, 55 | [done](stages/06-images.md) |
-| 7 | **Networking** | Network namespaces, bridge + veth over netlink, IPAM, NAT, published ports, rootless networking, embedded DNS | TLPI 56–61; `netlink(7)`, `network_namespaces(7)` | |
+| 7 | **Networking** | Network namespaces, bridge + veth over Shipyard's own netlink, IPAM, NAT and published ports with its own nf_tables client, rootless networking with pasta, a DNS server per network, several networks per container, IPv6, reading a container's sockets. `network connect`/`disconnect` and the sockets command come with stage 9 | TLPI 56–61; `netlink(7)`, `rtnetlink(7)`, `network_namespaces(7)` | [done](stages/07-networking.md) |
 | 8 | **Terminals, I/O & logs** | Per-container monitor, PTYs, attach/detach, `exec`, log files with rotation, `cp` | TLPI 44, 62–64 | |
 | 9 | **Engine state** | On-disk state, locking, crash recovery, restart policies, health checks, events | TLPI 37, 55 | |
 | 10 | **Compose** | `compose.yaml` subset; `up / down / ps / logs`; dependency-ordered start | Compose spec | |
@@ -44,13 +44,13 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
 
 ## Milestones
 
-| Version | After stage | What works |
-|---|---|---|
-| **v0.1** | 7 | `shipyard run -it alpine sh` rootless on Linux: pulled from Docker Hub, isolated, resource-limited, networked |
-| **v0.2** | 9 | Containers run detached and survive the CLI exiting; logs, `exec`, restart policies |
-| **v0.3** | 11 | Compose stacks and the API |
-| **v0.4** | 12 | Works on macOS |
-| **v1.0** | 14 | Desktop UI, conformance-tested, hardened, packaged |
+| Version | After stage | What works | Status |
+|---|---|---|---|
+| **v0.1** | 7 | `shipyard run --image alpine sh` rootless on Linux, on the caller's own terminal: pulled from Docker Hub, isolated, resource-limited, networked. Docker's spelling, `run -it alpine sh`, comes with a pseudo-terminal of the container's own (stage 8) and the image as the first argument (stage 9) | reached |
+| **v0.2** | 9 | Containers run detached and survive the CLI exiting; logs, `exec`, restart policies | |
+| **v0.3** | 11 | Compose stacks and the API | |
+| **v0.4** | 12 | Works on macOS | |
+| **v1.0** | 14 | Desktop UI, conformance-tested, hardened, packaged | |
 
 ## Decisions
 
@@ -113,6 +113,21 @@ and run their tests in a Linux container with `scripts/test-linux.sh` (see
 - **Device control is Shipyard's own eBPF** (stage 5): runc's default list, compiled by
   Shipyard; real root fails closed where it has a cgroup, rootless goes without where
   the kernel refuses.
+- **Netlink is Shipyard's own** (stage 7): rtnetlink, nf_tables and conntrack messages are
+  built and read by its own bounded, fuzzed code; no `ip` or `nft` binary and no netlink
+  crate, as with the seccomp and eBPF compilers.
+- **Networking follows Docker's defaults** (stage 7): root's runs join the `bridge` network
+  (NAT, no names), rootless runs get pasta (one per container, attached by PID), and
+  rootless without pasta is refused with a hint, never quietly given the host's network.
+  OCI bundles keep the spec's meaning.
+- **The firewall is one table of Shipyard's own** (stage 7): `inet shipyard`, with static
+  rules and per-network and per-container sets and maps. Other firewalls are detected
+  and warned about with the exact fix, never changed.
+- **Turning a host into a router is undone for everyone else** (stage 7): when Shipyard
+  turns forwarding on, it routes only containers' traffic, keeps the host learning its
+  IPv6 routes (`accept_ra=2`), and never lets a container's router advertisements in.
+- **One DNS server per network, rootful, not a daemon** (stage 7): started by the first
+  run that needs it, outside the run's supervisor, as `nobody`; it exits when idle.
 - **No image building before stage 11.** It's out of scope until then; see
   [FEATURES.md](FEATURES.md#out-of-scope-on-purpose).
 

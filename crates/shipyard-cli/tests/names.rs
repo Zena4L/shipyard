@@ -77,11 +77,15 @@ fn identity(run: &Run) -> (String, u32, u32, BTreeSet<u32>) {
 #[test]
 fn sysctls_that_would_change_the_host_are_refused() {
     for (sysctl, reason) in [
-        ("net.ipv4.ip_forward=1", "network namespace"),
+        (
+            "net.ipv4.ip_forward=1",
+            "any --network but host gives it one",
+        ),
         ("vm.swappiness=10", "isn't namespaced"),
         ("kernel.hostname=x", "own settings"),
     ] {
-        let run = shipyard(&["--sysctl", sysctl], "true");
+        // The host's network (root's default is a network of its own).
+        let run = shipyard(&["--network", "host", "--sysctl", sysctl], "true");
         assert_eq!(run.code, Some(125), "{sysctl}: {}", run.stderr);
         assert!(run.stderr.contains(reason), "{sysctl}: {}", run.stderr);
     }

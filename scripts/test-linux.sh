@@ -166,7 +166,7 @@ case "$MODE" in
             rm -rf /target/fuzz/crate
             cp -r fuzz /target/fuzz/crate
             sed -i "s|path = \"../crates/|path = \"/src/crates/|" /target/fuzz/crate/Cargo.toml
-            for target in manifest challenge reference tar unpack; do
+            for target in manifest challenge reference tar unpack netlink ports dns proc_net; do
                 echo "== fuzz $target, $FUZZ_SECONDS s"
                 mkdir -p "/target/fuzz/crashes/$target"
                 cargo +nightly fuzz run --fuzz-dir /target/fuzz/crate --target-dir /target/fuzz/build \
@@ -182,6 +182,12 @@ esac
 
 echo "== clippy"
 as_tester cargo clippy --locked --workspace --all-targets -- -D warnings
+# The tests see a resolver on the host's loopback, as on a systemd host
+# (systemd-resolved's 127.0.0.53, as on CI's Ubuntu runners), not Docker's: a
+# container with a network of its own can't reach it, and runs say so. (Every
+# crate was fetched by clippy: nothing below needs the network's DNS.)
+printf 'nameserver 127.0.0.53\noptions edns0 trust-ad\n' >/tmp/resolv.conf
+mount --bind /tmp/resolv.conf /etc/resolv.conf
 echo "== tests, as a normal user"
 as_tester cargo test --locked --workspace
 as_root

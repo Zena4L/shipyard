@@ -39,7 +39,7 @@ CI runs, on every push and PR:
 - fmt;
 - clippy and tests on Linux and macOS. On Linux, the job first allows rootless
   containers (lifts Ubuntu's AppArmor restriction on user namespaces, installs
-  `uidmap`, gives the runner a subordinate range), and runs the tests with
+  `uidmap` and `passt`, gives the runner a subordinate range), and runs the tests with
   `SHIPYARD_TEST_ROOTLESS=required`, so a rootless test that can't run fails instead
   of skipping;
 - the tests again as root on Linux and macOS (see below);
@@ -72,9 +72,13 @@ thread in that test binary.**
 ### Running the Linux tests in a container
 
 `scripts/test-linux.sh` runs what CI runs on Linux, in a container (Docker, OrbStack
-or any compatible engine). The image is `rust:1-bookworm` plus what the
-user-namespace tests need (`scripts/test-image/Dockerfile`: the `uidmap` package, and a
-`tester` user with subordinate IDs in `/etc/subuid`). The script builds it the first
+or any compatible engine). The image is `rust:1-trixie` plus what the
+rootless tests need (`scripts/test-image/Dockerfile`: the `uidmap` package, `passt`
+for rootless networking, and a `tester` user with subordinate IDs in
+`/etc/subuid`). It's Debian 13, not 12: bookworm's pasta (from 2023) can't carry
+connections to a published port into a container. The rootless networking tests
+(`tests/pasta.rs`) run as root and start `shipyard` as `tester`, in a network
+namespace of their own with an `Upstream` world. The script builds it the first
 time, which needs network, and again only when the Dockerfile changes. The steps:
 
 1. clippy with warnings as errors;
@@ -139,7 +143,7 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   docker run --rm --privileged --platform linux/amd64 -v "$PWD":/src:ro \
     -v shipyard-amd64-target:/target -v shipyard-amd64-cargo:/usr/local/cargo \
     -v shipyard-amd64-rustup:/usr/local/rustup -e CARGO_TARGET_DIR=/target -w /src \
-    rust:1-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq procps >/dev/null \
+    rust:1-trixie bash -c 'apt-get update -qq && apt-get install -y -qq procps >/dev/null \
       && cg=/sys/fs/cgroup && mkdir -p $cg/init \
       && for p in $(cat $cg/cgroup.procs); do echo $p > $cg/init/cgroup.procs 2>/dev/null || true; done \
       && for c in $(cat $cg/cgroup.controllers); do echo +$c > $cg/cgroup.subtree_control || true; done \
@@ -151,8 +155,13 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   (cgroup v2's no-internal-processes rule), so Shipyard refuses limits there.
 - **Fuzzing:** `fuzz/` holds cargo-fuzz targets for what Shipyard reads from outside:
   `manifest` (manifests, indexes, configs), `challenge` (`WWW-Authenticate` headers and
-  token answers), `reference`, `tar` (the tar reader) and `unpack` (a layer extracted
-  beside a canary directory, which must not change). It's its own workspace, built on
+  token answers), `reference`, `tar` (the tar reader), `unpack` (a layer extracted
+  beside a canary directory, which must not change), `netlink` (what the kernel
+  sends over a netlink socket: messages, attributes, errors, links, addresses,
+  routes, nf_tables objects and conntrack entries), `ports` (`-p` specs and an
+  image's exposed ports), `dns` (DNS messages, as a network's DNS server reads
+  them, and its answers, which must read back) and `proc_net` (a container's
+  `/proc/<pid>/net` socket tables). It's its own workspace, built on
   nightly, so it's not in CI. `scripts/test-linux.sh --fuzz` installs nightly and
   cargo-fuzz into the toolchain volumes once (that needs network), writes starting
   corpora with `scripts/fuzz-seeds.py`, and runs each target as `tester` (an escape
@@ -162,7 +171,9 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   `cargo +nightly fuzz run manifest`.
 - **Kernel probes:** `scripts/probes/*.c` check the kernel behaviour a stage relies on,
   before it's built on. Each file's header says how to run it, usually in the privileged
-  container. The stage notes record the results.
+  container. The stage notes record the results. `scripts/probes/pasta.sh` does the same
+  for pasta (rootless networking), in a throwaway Debian container it installs `passt`
+  into.
 - **Mutation checks:** to prove a test catches a bug, break a scratch copy of the repo,
   never the working tree. Build it in its **own** cargo target volume (for example
   `shipyard-mutation-target`). Cargo decides what to rebuild by timestamps, so a mutated
@@ -191,14 +202,26 @@ next `test-linux.sh` stays fast. Run the default after a mutation or review sess
 
 Tests that switch user or groups are marked `#[ignore]`, so a normal
 `cargo test` skips them. To run them (in the Lima VM, never on your Mac), let
-cargo run the test binaries through `sudo`, so the build itself isn't root:
+cargo run the test binaries through `scripts/ci-netns.sh`, so the build itself
+isn't root:
 
 ```sh
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="sudo -E" \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/ci-netns.sh" \
   cargo test --workspace -- --include-ignored
 ```
 
 (Use `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER` on an Intel machine.)
+
+The script runs each test binary with `sudo`, in a network namespace of its own
+(`unshare --net`, `lo` up), with the networks' state in a scratch directory
+(`SHIPYARD_NETWORK_DIR`). It matters: as root, `shipyard run` puts containers on
+the default bridge network, so it makes the bridge `shipyard0`, adds nftables
+rules (the table `inet shipyard`) and turns on IPv4 forwarding. Run through plain
+`sudo -E`, the root tests would do that to the machine's own network. CI's root
+job uses the same script; `scripts/test-linux.sh` runs in a throwaway container
+already. The network tests make their interfaces in namespaces of their own
+(`in_new_netns`), with an `Upstream` namespace standing in for the internet
+(`shipyard_test_support::net`).
 
 ## Running Linux-only stages on macOS: Lima VM
 

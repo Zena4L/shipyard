@@ -627,7 +627,8 @@ fn spawn_container(
         gate: Some(gate.as_raw_fd()),
         cgroup,
     };
-    let mut child = spawn(&bundle.spec, &options, |_| {}).map_err(|err| format!("{err:#}"))?;
+    let mut child =
+        spawn(&bundle.spec, &options, None, |_| {}).map_err(|err| format!("{err:#}"))?;
     drop(gate);
     // The report pipe's end-of-file means "set up, at the gate" — or that
     // the init died, which also closes it.

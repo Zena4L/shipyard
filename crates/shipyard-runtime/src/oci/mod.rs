@@ -7,13 +7,14 @@
 //!
 //! - **supported**: the process, its capabilities, `noNewPrivileges` and
 //!   seccomp profile, the root filesystem, the hostname and domain name, the
-//!   PID, mount, UTS, IPC, user and cgroup namespaces, masked and read-only
-//!   paths, bind and tmpfs mounts, the cgroup mount, the IPC sysctls, and
-//!   `linux.resources` and `cgroupsPath` (`resources.rs`), and the hooks
-//!   (`hooks.rs`);
+//!   PID, mount, UTS, IPC, network, user and cgroup namespaces (a network
+//!   one joined by its `path` too), the host's network devices moved in
+//!   (`netDevices`), masked and read-only paths, bind and tmpfs mounts, the
+//!   cgroup mount, the IPC and network sysctls, and `linux.resources` and
+//!   `cgroupsPath` (`resources.rs`), and the hooks (`hooks.rs`);
 //! - **refused**: anything whose absence would leave the container *less
-//!   confined than asked*: a network namespace, device rules, limits cgroup
-//!   v2 can't apply, extra devices, and so on. Running without them would be
+//!   confined than asked*: a namespace of another kind joined by its path,
+//!   limits cgroup v2 can't apply, and so on. Running without them would be
 //!   a silent security downgrade, so the bundle is refused, with every such
 //!   field named at once;
 //! - **ignored, with a warning**: what doesn't confine, and what can't
@@ -31,7 +32,7 @@ use serde_json::Value;
 
 use crate::devices::{DeviceKind, DeviceNode};
 use crate::isolation::{
-    CgroupMount, IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root,
+    CgroupMount, IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, NetDevice, Root,
 };
 use crate::process::{Env, ProcessSpec, Rlimit, RlimitValue, User};
 use crate::security::seccomp::Profile;
@@ -357,7 +358,7 @@ struct LinuxConfig {
     intel_rdt: Option<Value>,
     memory_policy: Option<Value>,
     personality: Option<Value>,
-    /// Device names to move in: a name with `{}` still asks for its device.
+    /// The host's network devices to move in, by name.
     net_devices: Option<serde_json::Map<String, Value>>,
     time_offsets: Option<Value>,
 }
@@ -566,13 +567,14 @@ impl Reader<'_> {
         let spec = self.process(process)?;
         let mut linux = config.linux.unwrap_or_default();
         let mut isolation = Isolation::standard();
-        isolation.namespaces = self.namespaces(&linux.namespaces)?;
+        (isolation.namespaces, isolation.network_path) = self.namespaces(&linux.namespaces)?;
         isolation.id_maps = self.id_maps(&linux, isolation.has(Namespace::User))?;
         isolation.security = security;
         isolation.security.seccomp = self.seccomp(linux.seccomp.take())?;
         isolation.hostname = config.hostname.filter(|name| !name.is_empty());
         isolation.domainname = config.domainname.filter(|name| !name.is_empty());
         isolation.sysctls = self.sysctls(linux.sysctl.as_ref())?;
+        isolation.net_devices = self.net_devices(linux.net_devices.as_ref())?;
         let mut root = Root::new(self.root_path(&root_config.path)?);
         root.read_only = root_config.readonly;
         // As the spec says: what the config lists, and nothing else.
@@ -742,26 +744,37 @@ impl Reader<'_> {
         Ok(spec)
     }
 
-    /// The namespaces to create. One the spec knows but Shipyard can't make
-    /// yet is refused; an unknown type is an error (the spec says so).
-    fn namespaces(&mut self, listed: &[NamespaceConfig]) -> Result<Vec<Namespace>, BundleError> {
+    /// The namespaces to create, and a network namespace to join (its
+    /// `path`) instead of creating one. One the spec knows but Shipyard can't
+    /// make yet, or a path to another kind, is refused; an unknown type is an
+    /// error (the spec says so).
+    fn namespaces(
+        &mut self,
+        listed: &[NamespaceConfig],
+    ) -> Result<(Vec<Namespace>, Option<PathBuf>), BundleError> {
         let mut namespaces = Vec::new();
+        let mut network_path = None;
         for namespace in listed {
-            if namespace.path.as_ref().is_some_and(|path| !path.is_empty()) {
-                self.refuse(
-                    &format!("linux.namespaces ({}, path)", namespace.kind),
-                    "joining an existing namespace comes in a later version",
-                );
-                continue;
+            let path = namespace.path.as_ref().filter(|path| !path.is_empty());
+            if let Some(path) = path {
+                if namespace.kind != "network" {
+                    self.refuse(
+                        &format!("linux.namespaces ({}, path)", namespace.kind),
+                        "joining an existing namespace of this kind comes in a later version",
+                    );
+                    continue;
+                }
+                network_path = Some(PathBuf::from(path));
             }
             match namespace.kind.as_str() {
                 "pid" => namespaces.push(Namespace::Pid),
                 "mount" => namespaces.push(Namespace::Mount),
                 "uts" => namespaces.push(Namespace::Uts),
                 "ipc" => namespaces.push(Namespace::Ipc),
+                "network" => namespaces.push(Namespace::Network),
                 "user" => namespaces.push(Namespace::User),
                 "cgroup" => namespaces.push(Namespace::Cgroup),
-                later @ ("network" | "time") => self.refuse(
+                later @ "time" => self.refuse(
                     &format!("linux.namespaces ({later})"),
                     "this namespace comes in a later version",
                 ),
@@ -772,7 +785,35 @@ impl Reader<'_> {
                 }
             }
         }
-        Ok(namespaces)
+        Ok((namespaces, network_path))
+    }
+
+    /// `linux.netDevices`: `{"HOST NAME": {"name": "NAME INSIDE"}}`, the name
+    /// inside being the host's when it's left out.
+    fn net_devices(
+        &self,
+        devices: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Vec<NetDevice>, BundleError> {
+        let Some(devices) = devices else {
+            return Ok(Vec::new());
+        };
+        devices
+            .iter()
+            .map(|(host, device)| {
+                let invalid = || {
+                    self.invalid(format!(
+                        "linux.netDevices.{host}: must be {{\"name\": \"…\"}}"
+                    ))
+                };
+                let device = device.as_object().ok_or_else(invalid)?;
+                let name = match device.get("name") {
+                    None => host.clone(),
+                    Some(Value::String(name)) if !name.is_empty() => name.clone(),
+                    Some(_) => return Err(invalid()),
+                };
+                Ok(NetDevice::new(host.clone(), name))
+            })
+            .collect()
     }
 
     /// `linux.uidMappings` and `linux.gidMappings`, which a `user` namespace
@@ -857,13 +898,6 @@ impl Reader<'_> {
             ("linux.personality", &linux.personality),
             ("linux.timeOffsets", &linux.time_offsets),
         ]);
-        if linux
-            .net_devices
-            .as_ref()
-            .is_some_and(|devices| !devices.is_empty())
-        {
-            self.refuse("linux.netDevices", "networking comes in a later version");
-        }
     }
 
     /// `linux.sysctl`: its values must be strings. Which keys are allowed is
@@ -1365,6 +1399,83 @@ mod tests {
     }
 
     #[test]
+    fn a_network_namespace_is_made_or_joined_by_path() {
+        let made = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [{"type": "pid"}, {"type": "mount"}, {"type": "network"}],
+                "sysctl": {"net.ipv4.ip_forward": "1"}
+            }
+        })))
+        .load()
+        .unwrap();
+        assert!(made.isolation.makes_network_namespace());
+        assert_eq!(made.isolation.network_path, None);
+        assert_eq!(
+            made.isolation.sysctls,
+            [("net.ipv4.ip_forward".to_owned(), "1".to_owned())]
+        );
+        let joined = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [
+                    {"type": "pid"}, {"type": "mount"},
+                    {"type": "network", "path": "/var/run/netns/blue"}
+                ]
+            }
+        })))
+        .load()
+        .unwrap();
+        assert!(joined.isolation.has(Namespace::Network));
+        assert_eq!(
+            joined.isolation.network_path.as_deref(),
+            Some(Path::new("/var/run/netns/blue"))
+        );
+        // A path to another kind stays refused.
+        let fields = refused(&config(&json!({
+            "linux": {"namespaces": [{"type": "mount"}, {"type": "ipc", "path": "/proc/1/ns/ipc"}]}
+        })));
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.starts_with("linux.namespaces (ipc, path)")),
+            "{fields:#?}"
+        );
+    }
+
+    #[test]
+    fn network_devices_are_moved_in_by_name() {
+        let loaded = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [{"type": "pid"}, {"type": "mount"}, {"type": "network"}],
+                "netDevices": {"eth1": {"name": "eth0"}, "veth9": {}}
+            }
+        })))
+        .load()
+        .unwrap();
+        assert_eq!(
+            loaded.isolation.net_devices,
+            [
+                NetDevice::new("eth1", "eth0"),
+                NetDevice::new("veth9", "veth9")
+            ]
+        );
+        for bad in [
+            json!({"eth1": "eth0"}),
+            json!({"eth1": {"name": 5}}),
+            json!({"eth1": {"name": ""}}),
+        ] {
+            let mut config = config(&json!({}));
+            config["linux"]["namespaces"] = json!([{"type": "mount"}, {"type": "network"}]);
+            config["linux"]["netDevices"] = bad.clone();
+            assert!(invalid(&config).contains("linux.netDevices.eth1"), "{bad}");
+        }
+        // Without a network namespace to move them into: an error.
+        let mut config = config(&json!({}));
+        config["linux"]["namespaces"] = json!([{"type": "mount"}]);
+        config["linux"]["netDevices"] = json!({"eth1": {}});
+        assert!(invalid(&config).contains("network namespace"));
+    }
+
+    #[test]
     fn the_domain_name_and_ipc_sysctls_are_applied() {
         let loaded = TestBundle::new(&config(&json!({
             "domainname": "example.com",
@@ -1384,7 +1495,8 @@ mod tests {
                 ("kernel.shmmax".to_owned(), "1048576".to_owned())
             ]
         );
-        // One that would change the host: an error, never ignored.
+        // One that would change the host (no network namespace): an error,
+        // never ignored.
         let mut host = config(&json!({}));
         host["linux"]["namespaces"] = json!([{"type": "mount"}, {"type": "ipc"}]);
         host["linux"]["sysctl"] = json!({"net.ipv4.ip_forward": "1"});
@@ -1420,7 +1532,7 @@ mod tests {
             },
             "linux": {
                 "namespaces": [
-                    {"type": "pid"}, {"type": "mount"}, {"type": "network"},
+                    {"type": "pid"}, {"type": "mount"}, {"type": "time"},
                     {"type": "uts", "path": "/proc/1/ns/uts"}
                 ],
                 "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"},
@@ -1431,7 +1543,6 @@ mod tests {
                 "intelRdt": {"closID": "c"},
                 "memoryPolicy": {"mode": "MPOL_BIND", "nodes": "0"},
                 "personality": {"domain": "LINUX32"},
-                "netDevices": {"eth1": {}},
                 "timeOffsets": {"monotonic": {"secs": 1}}
             },
             "mounts": [
@@ -1449,9 +1560,8 @@ mod tests {
             "linux.intelRdt",
             "linux.memoryPolicy",
             "linux.personality",
-            "linux.netDevices",
             "linux.timeOffsets",
-            "linux.namespaces (network)",
+            "linux.namespaces (time)",
             "linux.namespaces (uts, path)",
             "linux.resources",
             "linux.devices",

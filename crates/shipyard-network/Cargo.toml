@@ -1,0 +1,27 @@
+[package]
+name = "shipyard-network"
+description = "Container networking: netlink (rtnetlink), bridges, veth pairs, addresses and routes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# netlink's own socket options (`SOL_NETLINK`), which `nix` doesn't wrap.
+libc.workspace = true
+# Netlink sockets (`socket`, `bind`, `sendto`, `recvmsg`, the receive
+# timeout), and `setns`.
+nix.workspace = true
+# Networks' configs and leases on disk.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
