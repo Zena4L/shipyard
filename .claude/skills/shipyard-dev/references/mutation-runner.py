@@ -83,6 +83,8 @@ if [ "$(cat /proc/self/cgroup)" = '0::/' ]; then
   done
 fi
 if [ {where} = tester ]; then
+  # In tester's delegated cgroup, as test-linux.sh runs its tests.
+  echo $$ >$cg/user.slice/tester/session/cgroup.procs
   setpriv --reuid tester --regid tester --init-groups env HOME=/home/tester PATH=$PATH \
 CARGO_HOME=$CARGO_HOME RUSTUP_HOME=$RUSTUP_HOME CARGO_TARGET_DIR=/target/m-{name} bash -c '{cmd}'
 else

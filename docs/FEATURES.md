@@ -339,7 +339,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 **Security process**
 
-- `SECURITY.md` and a written threat model.
+- `SECURITY.md` (done in v0.1, with a summary of what's defended) and a written threat
+  model.
 - `cargo-deny` and `cargo-audit` in CI.
 - A software bill of materials (SBOM), signed releases, and reproducible builds.
 
@@ -350,8 +351,8 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 **Open source**
 
-- `CONTRIBUTING.md`, a code of conduct, issue and PR templates.
-- A CHANGELOG, semantic versioning, and a docs site.
+- `CONTRIBUTING.md` (done in v0.1), a code of conduct, issue and PR templates.
+- A CHANGELOG and semantic versioning (done in v0.1), and a docs site.
 
 ## Out of scope (on purpose)
 

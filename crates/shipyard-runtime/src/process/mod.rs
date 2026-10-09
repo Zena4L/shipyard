@@ -20,6 +20,8 @@ mod join;
 mod network;
 mod plan;
 #[cfg(target_os = "linux")]
+pub mod probe;
+#[cfg(target_os = "linux")]
 mod resolve;
 mod rlimit;
 mod rootfs;
@@ -40,7 +42,7 @@ mod sysctl;
 mod user_namespace;
 
 pub use env::{DEFAULT_PATH, Env, EnvError};
-pub use failure::{SpawnError, SpawnErrorKind};
+pub use failure::{SpawnError, SpawnErrorKind, overlay_refusal};
 pub use identity::{LookupError, Which};
 pub use rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
 #[cfg(target_os = "linux")]
@@ -58,7 +60,7 @@ pub(crate) use user_namespace::bundle_user_namespace;
 #[cfg(target_os = "linux")]
 pub use user_namespace::{
     become_namespace_root, current_id_maps, map_user_namespace, rootless_id_maps,
-    unshare_user_namespace,
+    unshare_user_namespace, userns_restriction,
 };
 
 /// The hidden argument that makes the shipyard binary run as a container's

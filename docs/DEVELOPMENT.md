@@ -247,6 +247,33 @@ export CARGO_TARGET_DIR="$HOME/.cache/shipyard-target"
 cargo run -- doctor
 ```
 
+**Testing a real distribution** (a host the test container can't stand for: Ubuntu's
+AppArmor, its cgroup layout): a VM with Ubuntu's own kernel, and a static build copied
+in, saves installing Rust there. Build `shipyard` for musl in the test container:
+
+```sh
+apt-get install -y musl-tools
+CC_aarch64_unknown_linux_musl=musl-gcc cargo build --release -p shipyard-cli --bins \
+    --target aarch64-unknown-linux-musl
+```
+
+Then, from the Mac:
+
+```sh
+limactl start --name=shipyard-ubuntu --cpus=2 --memory=3 template:ubuntu-24.04
+limactl copy target/aarch64-unknown-linux-musl/release/shipyard shipyard-ubuntu:/tmp/
+limactl shell shipyard-ubuntu -- sudo install -m 0755 /tmp/shipyard /usr/local/bin/
+limactl shell shipyard-ubuntu -- sudo apt-get install -y uidmap passt
+limactl shell shipyard-ubuntu -- shipyard doctor
+limactl delete --force shipyard-ubuntu                  # when done
+```
+
+(The test container's target directory is a Docker volume: copy the build out of it
+first.) On Ubuntu 23.10 and later, rootless runs need `contrib/apparmor/shipyard`
+installed (see [Requirements](user/README.md#requirements)); it attaches to
+`/usr/local/bin`, hence the install there. An SSH session's cgroup isn't delegated:
+run Shipyard under `systemd-run --user --scope` there for limits.
+
 Lima mounts your Mac's home directory at the same path (`/Users/<you>`), not
 at the VM's own `~`. Edit on macOS, build and run in the VM. Many later stages need root (or user
 namespaces), so expect to use `sudo` inside the VM — never on your Mac.

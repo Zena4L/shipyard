@@ -24,8 +24,6 @@ use serde::{Deserialize, Serialize};
 
 pub use bpf::Instruction;
 pub use compile::{Filter, Target, compile};
-#[cfg(target_os = "linux")]
-pub(crate) use profile::kernel_version;
 pub use profile::{Action, ArchMap, Arg, Condition, Operator, Profile, Rule, SeccompError};
 
 use super::syscalls;

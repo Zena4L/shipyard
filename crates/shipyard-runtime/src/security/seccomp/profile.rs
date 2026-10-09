@@ -459,7 +459,8 @@ fn check_rule(rule: &Rule) -> Result<(), SeccompError> {
             cap.parse::<Capability>()?;
         }
         if let Some(version) = &condition.min_kernel {
-            kernel_version(version).ok_or_else(|| SeccompError::MinKernel(version.clone()))?;
+            crate::kernel::version(version)
+                .ok_or_else(|| SeccompError::MinKernel(version.clone()))?;
         }
     }
     Ok(())
@@ -480,18 +481,6 @@ pub(super) fn check_action(action: Action, errno: Option<u32>) -> Result<(), Sec
             _ => Ok(()),
         },
     }
-}
-
-/// `MAJOR.MINOR` from a version or a kernel release (`6.12.0-1-arm64` is
-/// 6.12; `5.10` is 5.10). Docker compares only those two numbers.
-pub(crate) fn kernel_version(text: &str) -> Option<(u32, u32)> {
-    let mut parts = text.splitn(3, '.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?;
-    let digits = minor
-        .find(|c: char| !c.is_ascii_digit())
-        .map_or(minor, |end| &minor[..end]);
-    Some((major, digits.parse().ok()?))
 }
 
 /// Removes from `value` (an object) every field not in `known`, adding each
@@ -770,16 +759,5 @@ mod tests {
             Action::Allow
         );
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn kernel_versions_are_major_and_minor() {
-        assert_eq!(kernel_version("4.8"), Some((4, 8)));
-        assert_eq!(kernel_version("6.12.0-1-arm64"), Some((6, 12)));
-        assert_eq!(kernel_version("5.15-rc5"), Some((5, 15)));
-        assert_eq!(kernel_version("6.10.14-linuxkit"), Some((6, 10)));
-        assert_eq!(kernel_version("6"), None);
-        assert_eq!(kernel_version("six.1"), None);
-        assert_eq!(kernel_version("6.x"), None);
     }
 }

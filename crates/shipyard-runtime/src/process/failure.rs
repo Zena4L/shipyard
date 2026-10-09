@@ -508,7 +508,7 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::SeccompCompile
         | ChildStep::NamespaceRoot
         | ChildStep::UnmappedId
-        | ChildStep::GroupsDenied => describe_confinement(step, errno, detail),
+        | ChildStep::GroupsDenied => describe_confinement(step, errno, detail, ctx),
         ChildStep::BindRoot
         | ChildStep::MountOverlay
         | ChildStep::AttachOverlay
@@ -592,7 +592,12 @@ fn describe_hook(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
 
 /// The command's confinement (stage 4): its capabilities, `no_new_privs` and
 /// seccomp filter. `detail` names the capability, or the filter's length.
-fn describe_confinement(step: ChildStep, errno: Errno, detail: u64) -> SpawnError {
+fn describe_confinement(
+    step: ChildStep,
+    errno: Errno,
+    detail: u64,
+    ctx: &FailureContext,
+) -> SpawnError {
     let message = match step {
         ChildStep::KeepCaps => doing("keeping capabilities across the switch of user", errno),
         ChildStep::BoundingDrop => doing(
@@ -638,7 +643,9 @@ fn describe_confinement(step: ChildStep, errno: Errno, detail: u64) -> SpawnErro
             doing("installing the seccomp filter", errno)
         ),
         ChildStep::Seccomp => doing("installing the seccomp filter", errno),
-        ChildStep::NamespaceRoot => doing(NamespaceRootStep::doing(detail), errno),
+        ChildStep::NamespaceRoot => {
+            with_userns_restriction(doing(NamespaceRootStep::doing(detail), errno), errno, ctx)
+        }
         ChildStep::UnmappedId => describe_unmapped(detail),
         ChildStep::GroupsDenied => format!(
             "supplementary group {detail} can't be set: the container's user namespace denies \
@@ -713,6 +720,25 @@ impl NamespaceRootStep {
     }
 }
 
+/// `message`, with the host setting that confines unprivileged user
+/// namespaces, when a rootless container's namespace refused its root a
+/// step (`EPERM`, or AppArmor's `EACCES`): AppArmor's restriction can let
+/// one be made, then take its capabilities away, so this is where it shows.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(unused_variables, reason = "user namespaces are Linux's")
+)]
+fn with_userns_restriction(message: String, errno: Errno, ctx: &FailureContext) -> String {
+    #[cfg(target_os = "linux")]
+    if !ctx.root
+        && matches!(errno, Errno::EPERM | Errno::EACCES)
+        && let Some(restriction) = super::user_namespace::userns_restriction()
+    {
+        return format!("{message}: {restriction}");
+    }
+    message
+}
+
 /// An ID the container's user namespace doesn't map.
 fn describe_unmapped(detail: u64) -> String {
     let (which, id) = UnmappedId::from_detail(detail);
@@ -766,7 +792,7 @@ fn describe_container(
     ctx: &FailureContext,
 ) -> SpawnError {
     match step {
-        ChildStep::MountOverlay => describe_overlay(errno, detail, ctx, &kernel_release()),
+        ChildStep::MountOverlay => describe_overlay(errno, detail, ctx, &crate::kernel::release()),
         ChildStep::AttachOverlay => isolation_setup(
             "attaching the image's overlay in the container (made for its user namespace)",
             errno,
@@ -996,8 +1022,32 @@ fn on_noexec_mount(path: &Path) -> bool {
 /// `uname -r` prints it, if known).
 fn describe_overlay(errno: Errno, detail: u64, ctx: &FailureContext, release: &str) -> SpawnError {
     const DOING: &str = "mounting the image's overlay as the root filesystem";
-    let rootless = !ctx.root;
-    let why = match errno {
+    let Some(why) = overlay_reason(errno, detail, !ctx.root, release) else {
+        return isolation_setup(DOING, errno, ctx);
+    };
+    SpawnError::new(
+        SpawnErrorKind::Isolation,
+        format!("{DOING}: {}: {why}", errno.desc()),
+        errno,
+    )
+}
+
+/// Why an overlay mount failed with `errno`, and what to do, as a
+/// container's would be told (`shipyard doctor`'s probe tries one): the
+/// errno's own description, and the reason where it's known. (Not for
+/// `E2BIG`, too many layers, which a probe's one layer can't hit.)
+#[must_use]
+pub fn overlay_refusal(errno: Errno, rootless: bool) -> String {
+    match overlay_reason(errno, 0, rootless, &crate::kernel::release()) {
+        Some(why) => format!("{}: {why}", errno.desc()),
+        None => errno.desc().to_owned(),
+    }
+}
+
+/// The reason behind an overlay mount's `errno` (`detail`: its layer
+/// count), where it's known.
+fn overlay_reason(errno: Errno, detail: u64, rootless: bool, release: &str) -> Option<String> {
+    Some(match errno {
         Errno::E2BIG => format!(
             "the image has {detail} layers, more than this kernel can stack in one mount \
              (Linux 6.8 or later stacks up to 500)"
@@ -1016,7 +1066,7 @@ fn describe_overlay(errno: Errno, detail: u64, ctx: &FailureContext, release: &s
                  set SHIPYARD_IMAGE_STORE to a directory on a disk filesystem"
             )
         }
-        Errno::EPERM | Errno::EACCES if rootless => match kernel_version(release) {
+        Errno::EPERM | Errno::EACCES if rootless => match crate::kernel::version(release) {
             Some(version) if version < (5, 11) => format!(
                 "a rootless overlay needs Linux 5.11 or later, and this is {release}: run as \
                  root, or on a newer kernel"
@@ -1026,29 +1076,8 @@ fn describe_overlay(errno: Errno, detail: u64, ctx: &FailureContext, release: &s
                   as root, or lift the policy"
                 .to_owned(),
         },
-        _ => return isolation_setup(DOING, errno, ctx),
-    };
-    SpawnError::new(
-        SpawnErrorKind::Isolation,
-        format!("{DOING}: {}: {why}", errno.desc()),
-        errno,
-    )
-}
-
-/// The running kernel's release, as `uname -r` prints it (empty if it
-/// can't be read).
-fn kernel_release() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|release| release.trim().to_owned())
-        .unwrap_or_default()
-}
-
-/// A kernel release's major and minor version (`5.10.0-26-amd64`: 5, 10).
-fn kernel_version(release: &str) -> Option<(u32, u32)> {
-    let mut parts = release.split(['.', '-']);
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
+        _ => return None,
+    })
 }
 
 /// A namespace setup step that failed. EPERM there means missing privileges:
@@ -1211,8 +1240,6 @@ mod tests {
         let mut root = rootless.clone();
         root.root = true;
         assert!(!message(Errno::EPERM, "5.10.0", &root).contains("5.11"));
-        assert_eq!(kernel_version("7.0.14-orbstack-00380"), Some((7, 0)));
-        assert_eq!(kernel_version("garbage"), None);
     }
 
     #[test]

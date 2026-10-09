@@ -37,6 +37,36 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | [Exit codes](exit-codes.md) | What each exit code means, for scripts that check them |
 | [Command reference](cli.md) | Every command and flag, generated from the CLI itself |
 
+## Requirements
+
+On Linux:
+
+- **Linux 5.11 or later** (6.8 or later for root's `--uidmap` with an image), with
+  **cgroup v2** (every current distribution).
+- **For rootless containers** (running without root, the default for a normal user):
+  - `uidmap` (`newuidmap` and `newgidmap`) and a range of subordinate IDs for you in
+    `/etc/subuid` and `/etc/subgid` (most distributions give new users one; see
+    [Rootless](run.md#rootless));
+  - `passt`, for the container's network (pasta);
+  - user namespaces allowed: on Ubuntu 23.10 and later, Shipyard's AppArmor profile
+    ([below](#ubuntu-2310-and-later-apparmor));
+  - for resource limits (`--memory`, `--cpus`, …), a cgroup subtree delegated to you:
+    a desktop session has one; from an SSH login, run Shipyard under your user manager
+    (`systemd-run --user --scope shipyard run …`; see [Cgroup](run.md#cgroup)).
+- **For root's bridge networks:** nf_tables (every current kernel).
+
+```sh
+sudo apt-get install uidmap passt        # Debian, Ubuntu
+sudo dnf install shadow-utils passt      # Fedora
+```
+
+`shipyard doctor` checks most of this on your machine, by trying it (user namespaces,
+mounts, overlayfs where the image store goes, a cgroup), and says what to fix. It finds
+pasta, but doesn't start it.
+
+On macOS, Shipyard builds and runs, but doesn't isolate yet (see
+[Limitations](#limitations-in-v01)).
+
 ## Install from source
 
 You need [Rust](https://rustup.rs). The repository pins the exact toolchain
@@ -59,26 +89,88 @@ sudo install -m 0755 target/release/shipyard-runtime /usr/local/bin/shipyard-run
 Install it with mode `0755` as shown. Shipyard refuses to run if it is installed
 setuid or setgid.
 
+### Ubuntu 23.10 and later: AppArmor
+
+Ubuntu restricts unprivileged user namespaces with AppArmor
+(`kernel.apparmor_restrict_unprivileged_userns=1`), so a rootless container is
+refused until Shipyard is allowed them. Its profile allows them through Shipyard's two
+binaries, as Podman's and Chrome's profiles do through theirs:
+
+```sh
+sudo install -m 0644 contrib/apparmor/shipyard /etc/apparmor.d/shipyard
+sudo apparmor_parser -r /etc/apparmor.d/shipyard
+```
+
+The profile needs AppArmor 4 (Ubuntu 23.10 and later), and matches `/usr/local/bin`
+and `/usr/bin`: installed elsewhere, add your path to it (`shipyard doctor` says when
+it doesn't attach).
+
+What it grants: the restriction exists to keep unprivileged users from the kernel code
+user namespaces expose. Anyone who can run Shipyard gets user namespaces through it,
+which is what Shipyard is for, so for them that protection is lifted, as with Podman's
+profile. The alternative, `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`,
+lifts it for every program on the machine.
+
 ## Quick start
 
-Check how your host will run containers:
+Check that your machine can run containers:
 
 ```sh
 shipyard doctor
 ```
 
 ```text
-host:    macos / aarch64
-backend: linux-vm (not implemented yet)
+host:     linux / aarch64 (kernel 6.8.0-142-generic)
+backend:  native (host kernel)
+user:     1000 (rootless)
+
+ok    user namespaces  allowed (probed)
+ok    ID mapping       your ID and 65536 more from /etc/subuid and /etc/subgid (newuidmap and newgidmap)
+ok    cgroups          v2, delegated at /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service
+ok    images           overlayfs works where the store will be (/home/alice/.local/share/shipyard/images, not made yet: probed in /home/alice/.local/share)
+ok    network          pasta (/usr/bin/pasta)
+ok    runtime state    /run/user/1000/shipyard
+
+containers run here
 ```
 
-On Linux, containers run directly on the host kernel. On macOS they will run
-inside a lightweight Linux VM that Shipyard manages.
+Each line is `ok`, `warn` (something is limited, such as resource limits, but
+containers run) or `fail` (a plain `shipyard run`, or `run --image`, would fail),
+with what to do. The
+exit code is 1 if anything failed. `doctor` tries what a run needs: it makes a user
+namespace, a mount and an overlay next to the image store, and removes them again.
 
-Run a command:
+Run a shell in Alpine Linux, pulled from Docker Hub:
 
 ```sh
-shipyard run -e GREETING=hello sh -c 'echo "$GREETING from PID $$"; exit 3'
+shipyard run --image alpine sh
+```
+
+```text
+Pulling docker.io/library/alpine:latest
+…: downloaded (3.9 MiB)
+/ # id
+uid=0(root) gid=0(root)
+/ # wget -qO- example.com | grep -o '<title>.*</title>'
+<title>Example Domain</title>
+/ # exit
+```
+
+It's **rootless**: root inside is you, in a user namespace (see
+[Rootless](run.md#rootless)). It has its own processes, hostname, files and network,
+and with `--memory 512m` (or `--cpus`, `--pids-limit`, …) its own limits. See
+[Running commands](run.md) for everything `run` accepts, and [Images](images.md)
+for pulling and the image store.
+
+Until v0.2 brings a terminal of the container's own (`-it`), a shell runs on
+yours without it being its *controlling* terminal: `sudo` and `ssh` can't prompt
+for a password, `tty` says "not a tty" with an image, and Ctrl-Z stops Shipyard,
+not the shell (see [On a terminal, isolated](run.md#on-a-terminal-isolated)).
+
+A command, and its exit code:
+
+```sh
+shipyard run --image alpine sh -c 'echo "hello from PID $$"; exit 3'
 echo $?
 ```
 
@@ -87,13 +179,24 @@ hello from PID 2
 3
 ```
 
-PID 2: on Linux the command sees only its own processes, under Shipyard's small
-init (PID 1). Without root, the container is **rootless**: its root is you, in a
-user namespace (see [Running commands](run.md#rootless) for what your
-system needs). On macOS commands aren't isolated yet, so the PID is an ordinary
-one.
+PID 2: the command sees only its own processes, under Shipyard's small init (PID 1).
 
-See [Running commands](run.md) for everything `run` accepts.
+## Limitations in v0.1
+
+- **No terminal of the container's own** (`-it`), **no detached containers**, no
+  `exec` and no logs: v0.2. A container lives as long as its
+  `shipyard run`.
+- **macOS doesn't isolate yet:** commands run as ordinary processes until Shipyard runs
+  them in a Linux VM of its own (v0.4).
+- **Rootless containers have no shared networks:** each gets its own (pasta); bridge
+  networks, and names between containers, are root's
+  (see [Networking](networking.md#rootless-containers-pasta)).
+- **Firewalls can drop forwarded traffic:** firewalld, ufw or Docker's rules on the
+  same host can keep root's containers from the outside
+  (see [Other firewalls](networking.md#other-firewalls)).
+- **Not a hardened security boundary yet:** containers are confined (namespaces,
+  capabilities, seccomp, cgroups), but don't run code you wouldn't run as your own
+  user. See [SECURITY.md](https://github.com/Zena4L/shipyard/blob/main/SECURITY.md).
 
 ## Getting more output
 

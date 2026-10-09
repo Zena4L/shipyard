@@ -945,11 +945,8 @@ fn an_image_of_sixty_layers_runs() {
     let (stdout, stderr) = text(&run);
     // Before Linux 6.8, one mount stacks about 50 such layers: refused,
     // saying so.
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-    let mut version = release
-        .split(['.', '-'])
-        .filter_map(|part| part.parse::<u32>().ok());
-    if (version.next().unwrap_or(0), version.next().unwrap_or(0)) < (6, 8) {
+    let release = shipyard_runtime::kernel::release();
+    if shipyard_runtime::kernel::version(&release).unwrap_or_default() < (6, 8) {
         assert!(
             stderr.contains("more than this kernel can stack"),
             "{stderr}"

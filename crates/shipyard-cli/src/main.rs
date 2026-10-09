@@ -5,6 +5,7 @@
 
 mod devices;
 mod dns_helper;
+mod doctor;
 mod image;
 #[allow(
     dead_code,
@@ -21,7 +22,6 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use shipyard_runtime::Backend;
 use shipyard_runtime::process::{self, EXIT_ENGINE_ERROR};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::{Format, Writer};
@@ -103,7 +103,7 @@ enum Command {
     /// System-wide information and maintenance.
     #[command(subcommand)]
     System(SystemCommand),
-    /// Show how this host will run containers.
+    /// Check whether this host can run containers, and what to fix.
     Doctor,
 }
 
@@ -211,6 +211,8 @@ fn main() -> ExitCode {
     storage_helper::entry_point();
     // A network's DNS server is this binary too, started by a run.
     dns_helper::entry_point();
+    // So is `doctor`'s probe (it makes a user namespace: single-threaded).
+    doctor::probe_entry_point();
     // Before anything else: a privileged start must not get any further.
     if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into());
@@ -240,7 +242,7 @@ fn main() -> ExitCode {
         Command::Volume(command) => volume_command(&command),
         Command::Network(command) => network_command(&command),
         Command::System(SystemCommand::Df) => system_df(),
-        Command::Doctor => doctor(),
+        Command::Doctor => doctor::run(),
     };
     result.unwrap_or_else(|err| fail(&err))
 }
@@ -664,24 +666,6 @@ fn report(err: &dyn std::fmt::Display, code: u8) -> ExitCode {
     // Not `eprintln!`: it panics if stderr is a closed pipe.
     let _ = writeln!(std::io::stderr().lock(), "shipyard: {err:#}");
     ExitCode::from(code)
-}
-
-fn doctor() -> Result<ExitCode> {
-    let backend = match shipyard_runtime::host_backend() {
-        Backend::Native => "native (host kernel)",
-        Backend::LinuxVm => "linux-vm (not implemented yet)",
-        _ => "unknown",
-    };
-    // `writeln!` instead of `println!`: a closed stdout becomes an error, not a panic.
-    let mut out = std::io::stdout().lock();
-    writeln!(
-        out,
-        "host:    {} / {}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )?;
-    writeln!(out, "backend: {backend}")?;
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Flags win over `RUST_LOG`, which wins over the default (`warn`).
