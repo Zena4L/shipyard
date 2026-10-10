@@ -58,10 +58,14 @@ jobs:
           fi
           scripts/ci/rootless-setup.sh
       - run: cargo clippy --locked --workspace --all-targets
+      # On Linux: built first, then run with a time limit and the output in a
+      # file (scripts/ci/run-logged.sh), so a hang ends the step with its log.
       - name: cargo test
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            systemd-run --user --scope --quiet cargo test --locked --workspace
+            cargo test --locked --workspace --no-run
+            scripts/ci/run-logged.sh 600 tests \
+              systemd-run --user --scope --quiet cargo test --locked --workspace
           else
             cargo test --locked --workspace
           fi
@@ -128,11 +132,19 @@ jobs:
       # step's own time limit fails it before the job's, so its log is kept.
       - name: terminal tests, on their own
         if: runner.os == 'Linux'
-        timeout-minutes: 5
         continue-on-error: true
-        run: cargo test --locked -p shipyard-cli --test terminal -- --include-ignored
-      - run: cargo test --locked --workspace -- --include-ignored
-        timeout-minutes: 12
+        run: |
+          cargo test --locked -p shipyard-cli --test terminal --no-run
+          scripts/ci/run-logged.sh 240 terminal \
+            cargo test --locked -p shipyard-cli --test terminal -- --include-ignored
+      - name: cargo test
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            cargo test --locked --workspace --no-run
+            scripts/ci/run-logged.sh 600 tests cargo test --locked --workspace -- --include-ignored
+          else
+            cargo test --locked --workspace -- --include-ignored
+          fi
         env:
           # ip, nft and dig are installed above: the differential tests
           # (H5) must run, not skip.
@@ -177,16 +189,20 @@ jobs:
       # The terminal tests first, on their own (temporary, to diagnose): a
       # step's own time limit fails it before the job's, so its log is kept.
       - name: terminal tests, on their own, against the installed binaries
-        timeout-minutes: 6
         continue-on-error: true
-        run: systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli --test terminal
+        run: |
+          cargo test --locked -p shipyard-cli --test terminal --no-run
+          scripts/ci/run-logged.sh 240 terminal \
+            systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli --test terminal
         env:
           SHIPYARD_TEST_BIN_DIR: /usr/local/bin
           SHIPYARD_TEST_ROOTLESS: required
           SHIPYARD_TEST_DELEGATED: required
       - name: cargo test, against the installed binaries
-        timeout-minutes: 15
-        run: systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli
+        run: |
+          cargo test --locked -p shipyard-cli --no-run
+          scripts/ci/run-logged.sh 600 tests \
+            systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli
         env:
           SHIPYARD_TEST_BIN_DIR: /usr/local/bin
           SHIPYARD_TEST_ROOTLESS: required
