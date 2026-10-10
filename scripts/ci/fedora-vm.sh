@@ -29,7 +29,19 @@ cache=${VM_CACHE:-$HOME/.cache/shipyard-vm}
 work=$(mktemp -d)
 port=${VM_SSH_PORT:-2222}
 trap 'cleanup' EXIT
+# A cancelled job gets SIGINT, then SIGTERM: stop at once (the EXIT trap then
+# stops the VM, which `-daemonize` took out of the job's processes).
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cleanup() {
+    # What was running in the background (see `interruptible`): ssh into
+    # the VM, a build.
+    local job
+    for job in $(jobs -p); do
+        # A function's job is a subshell: its command (ssh, cargo) first.
+        pkill -P "$job" 2>/dev/null || true
+        kill "$job" 2>/dev/null || true
+    done
     if [ -f "$work/qemu.pid" ]; then
         kill "$(cat "$work/qemu.pid")" 2>/dev/null || true
     fi
@@ -38,6 +50,14 @@ cleanup() {
         tail -n 40 "$work/console.log" || true
     fi
     rm -rf "$work"
+}
+
+# Runs "$@" in the background and waits for it: bash runs a trap only once
+# its foreground command ends, but `wait` returns at once on a signal, so a
+# cancel isn't held up by an hour of tests. Returns the command's status.
+interruptible() {
+    "$@" &
+    wait "$!"
 }
 
 # --- KVM: without it the suite would crawl under emulation for hours.
@@ -61,12 +81,16 @@ fi
 
 # --- 1. Build here.
 cd "$repo"
-cargo build --locked --bins
+interruptible cargo build --locked --bins
 # (json-render-diagnostics: a compile error still prints, as itself.)
-cargo test --locked --workspace --no-run --message-format=json-render-diagnostics |
-    jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
-           | "\(.manifest_path | rtrimstr("/Cargo.toml"))\t\(.executable)"' \
-    > "$repo/target/test-binaries.txt"
+list_test_binaries() {
+    set -o pipefail
+    cargo test --locked --workspace --no-run --message-format=json-render-diagnostics |
+        jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
+               | "\(.manifest_path | rtrimstr("/Cargo.toml"))\t\(.executable)"' \
+        > "$repo/target/test-binaries.txt"
+}
+interruptible list_test_binaries
 count=$(wc -l < "$repo/target/test-binaries.txt")
 echo "$count test executables"
 [ "$count" -gt 0 ]
@@ -124,13 +148,13 @@ vm() {
 echo "waiting for the VM"
 for _ in $(seq 60); do vm true 2>/dev/null && break; sleep 5; done
 vm true
-vm cloud-init status --wait >/dev/null || true
+interruptible vm cloud-init status --wait >/dev/null || true
 vm 'cat /etc/fedora-release; getenforce'
 
 # --- 3. The workspace, and what was built, at the same path.
 vm "sudo mkdir -p '$repo' && sudo chown tester: '$repo'"
 export RSYNC_RSH="ssh -q -i $work/key -p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-rsync -a --exclude /target --exclude /.git --exclude /fuzz/target "$repo/" "tester@127.0.0.1:$repo/"
+interruptible rsync -a --exclude /target --exclude /.git --exclude /fuzz/target "$repo/" "tester@127.0.0.1:$repo/"
 {
     echo target/debug/shipyard
     echo target/debug/shipyard-runtime
@@ -138,7 +162,7 @@ rsync -a --exclude /target --exclude /.git --exclude /fuzz/target "$repo/" "test
     echo target/probes/terminal
     cut -f2 "$repo/target/test-binaries.txt" | sed "s|^$repo/||"
 } > "$work/files"
-rsync -a --files-from="$work/files" "$repo/" "tester@127.0.0.1:$repo/"
+interruptible rsync -a --files-from="$work/files" "$repo/" "tester@127.0.0.1:$repo/"
 
 # --- 4. Both passes, in the VM.
-vm "sudo '$repo/scripts/ci/run-test-binaries.sh' '$repo'"
+interruptible vm "sudo '$repo/scripts/ci/run-test-binaries.sh' '$repo'"
