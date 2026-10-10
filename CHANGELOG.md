@@ -30,6 +30,11 @@ behaviour; each change is listed here).
   so `vi`, `top`, password prompts (`su`, `sudo`) and job control inside work;
   it's put back when the run ends or Shipyard is stopped. `-t` works without
   isolation (and on macOS) too.
+- **OCI terminals** (stage 8): bundles that ask for a terminal
+  (`process.terminal`, as every `runc spec` config does) run. `shipyard run
+  --bundle` gives them one as `-t` does, sized by `process.consoleSize` when there's
+  no window to copy; `shipyard-runtime create --console-socket` sends it to the
+  caller's socket as runc does, so containerd's and Podman's shims can use it.
 
 ### Fixed
 

@@ -541,12 +541,6 @@ impl CleanImageFiles {
             Some(super::stdio::ChildTerminal::Socket { fd, size }) => Some((fd, size)),
             Some(super::stdio::ChildTerminal::Slave(_)) | None => None,
         };
-        // The init waits for shipyard to say the terminal is relayed before
-        // starting the command: a runtime container waiting at its gate has
-        // no shipyard to say so (its console socket comes with 8.3).
-        if terminal.is_some() && options.gate.is_some() {
-            return Err(Error::TerminalAtGate);
-        }
         Ok(Self {
             status_read,
             status_write,
@@ -566,6 +560,10 @@ impl CleanImageFiles {
                     socket: fd,
                     rows: size.0,
                     cols: size.1,
+                    // A container waiting at its gate sends the master to an
+                    // OCI console socket, which never answers (runc's
+                    // protocol); Shipyard's relay does.
+                    acknowledged: options.gate.is_none(),
                 });
                 setup.to_memfd()?
             },

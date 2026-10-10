@@ -76,6 +76,10 @@ pub struct Pty {
     /// Shipyard's own terminal goes into raw mode while it's relayed, so every
     /// key reaches the command's terminal as a byte (`-it` on a terminal).
     pub raw: bool,
+    /// Its size (rows, columns) when none of Shipyard's stdout, stdin and
+    /// stderr is a terminal to copy it from: a bundle's
+    /// `process.consoleSize`. Without either, 24x80.
+    pub size: Option<(u16, u16)>,
 }
 
 impl Stdio {
@@ -150,7 +154,10 @@ pub(crate) fn prepare(stdio: Stdio, isolated: bool) -> Result<(ChildEnds, Option
     let mut ends = ChildEnds::default();
     let mut relay = Relay::default();
     if let Some(request) = stdio.terminal {
-        let size = super::terminal::host_size();
+        // The user's terminal's size, else the one asked for (a bundle's).
+        let size = super::terminal::terminal_size()
+            .or(request.size)
+            .unwrap_or(super::terminal::DEFAULT_SIZE);
         let state = if isolated {
             let (ours, theirs) = super::terminal::socket_pair()
                 .map_err(|e| Error::sys("making a socket for the container's terminal", e))?;
@@ -718,7 +725,11 @@ impl Relay {
         else {
             return;
         };
-        let _ = super::terminal::set_window_size(master.as_raw_fd(), super::terminal::host_size());
+        // The user's terminal may have changed size meanwhile. (Without one,
+        // the size it was made with stands: a bundle's, or 24x80.)
+        if let Some(size) = super::terminal::terminal_size() {
+            let _ = super::terminal::set_window_size(master.as_raw_fd(), size);
+        }
         match self::connect(&master, pty.request) {
             Ok((output, input)) => {
                 if let Some(socket) = socket {
@@ -759,9 +770,9 @@ impl Relay {
             state: PtyState::Connected(master),
             ..
         }) = &self.pty
+            && let Some(size) = super::terminal::terminal_size()
         {
-            let _ =
-                super::terminal::set_window_size(master.as_raw_fd(), super::terminal::host_size());
+            let _ = super::terminal::set_window_size(master.as_raw_fd(), size);
         }
     }
 

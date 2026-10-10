@@ -98,6 +98,7 @@ const ISOLATED_TESTS: &[(&str, fn())] = tests![
     kill_of_a_run_stopped_for_input_ends_it,
     an_isolated_command_never_holds_the_host_terminal,
     a_bundle_run_never_holds_the_host_terminal,
+    a_terminal_bundle_runs_on_its_own_terminal,
     a_bundle_without_a_pid_namespace_cant_reach_shipyards_descriptors,
     a_poststart_hook_doesnt_hold_up_the_output,
     a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request,
@@ -975,6 +976,39 @@ fn a_bundle_run_never_holds_the_host_terminal() {
         session.transcript()
     );
     assert_eq!(session.count("a tty"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// A bundle that asks for a terminal (`process.terminal`) gets one of its
+/// own, as `-t` gives, with the user's typing under `-i`.
+fn a_terminal_bundle_runs_on_its_own_terminal() {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!([
+        "sh",
+        "-c",
+        "tty; echo re\"\"ady; read line; echo \"got $line\""
+    ]);
+    config["process"]["terminal"] = serde_json::json!(true);
+    bundle.write(&config);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(BUNDLE_VAR, bundle.arg()) };
+    let mut session = session(|shell| {
+        let bundle = std::env::var(BUNDLE_VAR).expect("the test sets the bundle");
+        let job = shell.spawn(Mode::Foreground, &["run", "-i", "--bundle", &bundle]);
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("/dev/pts/0");
+    session.expect("ready");
+    session.type_keys(b"typed\n");
+    session.expect("got typed");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
     session.finish();
 }
 

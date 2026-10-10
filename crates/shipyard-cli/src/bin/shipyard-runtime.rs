@@ -17,6 +17,9 @@ mod limits;
 mod runtime_commands;
 
 use std::io::Write as _;
+use std::os::fd::AsFd;
+use std::os::unix::fs::FileTypeExt as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -65,7 +68,9 @@ enum Command {
         /// Write the container's init PID to FILE.
         #[arg(long, value_name = "FILE")]
         pid_file: Option<PathBuf>,
-        /// A socket for the container's terminal (not supported yet).
+        /// A UNIX socket to send the container's terminal to (its
+        /// pseudo-terminal's master), as runc does; needed when the bundle
+        /// asks for a terminal (`process.terminal`).
         #[arg(long, value_name = "SOCKET")]
         console_socket: Option<PathBuf>,
         /// The container's ID.
@@ -178,10 +183,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             console_socket,
             id,
         } => {
-            if console_socket.is_some() {
-                anyhow::bail!("--console-socket: terminals come in a later version");
-            }
-            let created = container::create(root, id, bundle)?;
+            let console = console_socket.as_deref().map(connect_console).transpose()?;
+            let created = container::create(root, id, bundle, console.as_ref().map(AsFd::as_fd))?;
+            // The init has already sent the master on its copy and closed it.
+            // Closing ours too lets the receiver see end-of-file.
+            drop(console);
             for warning in &created.warnings {
                 report(cli, Level::Warning, warning);
             }
@@ -252,6 +258,58 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The most a socket's path can be, with its terminating NUL
+/// (`sizeof(sun_path)`, TLPI §57.2).
+const SUN_PATH_MAX: usize = 108;
+
+/// Connects to the console socket at `path` (`--console-socket`), as the
+/// caller: the container's init sends its terminal there.
+///
+/// A path too long for a socket address is reached through its directory:
+/// opened, then named as `/proc/self/fd/N/NAME`, which is short.
+fn connect_console(path: &Path) -> anyhow::Result<UnixStream> {
+    use anyhow::Context as _;
+    let named = || format!("--console-socket {}", path.display());
+    let metadata = std::fs::metadata(path).with_context(named)?;
+    if !metadata.file_type().is_socket() {
+        anyhow::bail!("{}: not a socket", named());
+    }
+    let connected = if path.as_os_str().len() < SUN_PATH_MAX {
+        UnixStream::connect(path)
+    } else {
+        connect_through_directory(path)
+    };
+    connected.with_context(named)
+}
+
+/// Connects to the socket at the long path `path` through its directory.
+#[cfg(target_os = "linux")]
+fn connect_through_directory(path: &Path) -> std::io::Result<UnixStream> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return UnixStream::connect(path);
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(parent)?;
+    let mut short = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    short.push(name);
+    UnixStream::connect(short)
+}
+
+/// Connects to the socket at `path` (no `/proc` to shorten it with here).
+#[cfg(not(target_os = "linux"))]
+fn connect_through_directory(path: &Path) -> std::io::Result<UnixStream> {
+    UnixStream::connect(path)
 }
 
 /// Writes the PID whole or not at all (a reader may poll for the file).

@@ -34,7 +34,7 @@ pub(crate) mod spawn;
 mod spec;
 mod startup;
 mod status;
-mod stdio;
+pub(crate) mod stdio;
 mod stop;
 mod supervisor;
 #[cfg(target_os = "linux")]

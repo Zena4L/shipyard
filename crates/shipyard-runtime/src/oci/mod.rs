@@ -63,6 +63,17 @@ pub struct Bundle {
     /// (`linux.cgroupsPath`), if the config says: honored by
     /// `shipyard-runtime`; a `shipyard run`'s cgroup is always its own.
     pub cgroups_path: Option<PathBuf>,
+    /// A terminal of the container's own (`process.terminal`), if asked
+    /// for: its size, rows and columns (`process.consoleSize`).
+    pub terminal: Option<BundleTerminal>,
+}
+
+/// What a bundle asks of its terminal (`process.terminal: true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BundleTerminal {
+    /// `process.consoleSize`, as rows and columns, if it gives both.
+    pub size: Option<(u16, u16)>,
 }
 
 /// Why a bundle can't be run.
@@ -283,6 +294,8 @@ struct RootConfig {
 struct ProcessConfig {
     #[serde(default)]
     terminal: bool,
+    /// Read only with a terminal: the spec says it's ignored otherwise.
+    console_size: Option<Value>,
     user: UserConfig,
     #[serde(default)]
     args: Vec<String>,
@@ -301,6 +314,13 @@ struct ProcessConfig {
     io_priority: Option<Value>,
     #[serde(rename = "execCPUAffinity")]
     exec_cpu_affinity: Option<Value>,
+}
+
+/// `process.consoleSize`: the terminal's size (read only with a terminal).
+#[derive(Deserialize)]
+struct ConsoleSizeConfig {
+    height: u32,
+    width: u32,
 }
 
 /// `process.capabilities`: the five sets, by name (`CAP_KILL`).
@@ -564,10 +584,19 @@ impl Reader<'_> {
         let hooks = config.hooks;
         hooks.check().map_err(|why| self.invalid(why))?;
         let security = self.security(&process)?;
+        let terminal = self.terminal(&process)?;
         let spec = self.process(process)?;
         let mut linux = config.linux.unwrap_or_default();
         let mut isolation = Isolation::standard();
         (isolation.namespaces, isolation.network_path) = self.namespaces(&linux.namespaces)?;
+        // Its terminal is made from the container's own devpts, which would
+        // otherwise be mounted over the host's.
+        if terminal.is_some() && !isolation.has(Namespace::Mount) {
+            self.refuse(
+                "process.terminal",
+                "a terminal needs a mount namespace of the container's own",
+            );
+        }
         isolation.id_maps = self.id_maps(&linux, isolation.has(Namespace::User))?;
         isolation.security = security;
         isolation.security.seccomp = self.seccomp(linux.seccomp.take())?;
@@ -612,6 +641,7 @@ impl Reader<'_> {
                 annotations,
                 hooks,
                 cgroups_path,
+                terminal,
             });
         }
         isolation
@@ -626,7 +656,38 @@ impl Reader<'_> {
             annotations: annotations.clone(),
             hooks,
             cgroups_path,
+            terminal,
         })
+    }
+
+    /// `process.terminal` and `process.consoleSize`. A size with a zero in
+    /// it is no size (runc's rule); one past a terminal's 65535 is refused.
+    /// Without a terminal, the size isn't read at all (the spec's rule).
+    fn terminal(&self, process: &ProcessConfig) -> Result<Option<BundleTerminal>, BundleError> {
+        if !process.terminal {
+            return Ok(None);
+        }
+        let console_size = process
+            .console_size
+            .clone()
+            .map(serde_json::from_value::<ConsoleSizeConfig>)
+            .transpose()
+            .map_err(|err| self.invalid(format!("process.consoleSize: {err}")))?;
+        let size = match &console_size {
+            Some(size) if size.height > 0 && size.width > 0 => {
+                let (Ok(rows), Ok(cols)) = (u16::try_from(size.height), u16::try_from(size.width))
+                else {
+                    return Err(self.invalid(format!(
+                        "process.consoleSize (height {}, width {}) is larger than a terminal can \
+                         be",
+                        size.height, size.width
+                    )));
+                };
+                Some((rows, cols))
+            }
+            _ => None,
+        };
+        Ok(Some(BundleTerminal { size }))
     }
 
     /// `process.capabilities`, exactly (an unknown name is an error), and
@@ -694,12 +755,6 @@ impl Reader<'_> {
     }
 
     fn process(&mut self, process: ProcessConfig) -> Result<ProcessSpec, BundleError> {
-        if process.terminal {
-            self.refuse(
-                "process.terminal",
-                "a terminal inside comes in a later version",
-            );
-        }
         if process.apparmor_profile.is_some_and(|p| !p.is_empty()) {
             self.refuse("process.apparmorProfile", "AppArmor isn't supported");
         }
@@ -1550,8 +1605,13 @@ mod tests {
                 {"destination": "/o", "type": "overlay", "source": "overlay"}
             ]
         })));
+        assert!(
+            !fields
+                .iter()
+                .any(|field| field.starts_with("process.terminal")),
+            "{fields:#?}"
+        );
         for expected in [
-            "process.terminal",
             "process.apparmorProfile",
             "process.selinuxLabel",
             "process.scheduler",
@@ -1575,6 +1635,74 @@ mod tests {
                 "{expected} not in {fields:#?}"
             );
         }
+    }
+
+    #[test]
+    fn a_terminal_and_its_size_are_read() {
+        let process = |extra: Value| {
+            let mut process = json!({"user": {"uid": 0, "gid": 0}, "args": ["sh"], "cwd": "/"});
+            process
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            TestBundle::new(&config(&json!({ "process": process })))
+                .load()
+                .map(|loaded| loaded.terminal)
+        };
+        assert_eq!(process(json!({})).unwrap(), None);
+        assert_eq!(
+            process(json!({"terminal": true})).unwrap(),
+            Some(BundleTerminal { size: None })
+        );
+        assert_eq!(
+            process(json!({"terminal": true, "consoleSize": {"height": 30, "width": 100}}))
+                .unwrap(),
+            Some(BundleTerminal {
+                size: Some((30, 100))
+            })
+        );
+        // A zero is no size (runc's rule); without a terminal it's nothing.
+        assert_eq!(
+            process(json!({"terminal": true, "consoleSize": {"height": 0, "width": 100}})).unwrap(),
+            Some(BundleTerminal { size: None })
+        );
+        // Without a mount namespace, no terminal: its devpts would cover
+        // the host's.
+        let without_mount = TestBundle::new(&config(&json!({
+            "process": {"user": {"uid": 0, "gid": 0}, "args": ["sh"], "cwd": "/", "terminal": true},
+            "linux": {"namespaces": [{"type": "pid"}]}
+        })))
+        .load();
+        assert!(
+            without_mount
+                .unwrap_err()
+                .to_string()
+                .contains("a terminal needs a mount namespace"),
+        );
+        // Not even read: the spec says to ignore it.
+        for ignored in [
+            json!({"height": 30, "width": 100}),
+            json!({"height": 30}),
+            json!({"height": -1, "width": 1}),
+        ] {
+            assert_eq!(process(json!({"consoleSize": ignored})).unwrap(), None);
+            assert_eq!(
+                process(json!({"terminal": false, "consoleSize": ignored})).unwrap(),
+                None
+            );
+        }
+        assert!(
+            process(json!({"terminal": true, "consoleSize": {"height": -1, "width": 1}})).is_err(),
+            "with a terminal, it's read"
+        );
+        let too_big =
+            process(json!({"terminal": true, "consoleSize": {"height": 70000, "width": 80}}));
+        assert!(
+            too_big
+                .unwrap_err()
+                .to_string()
+                .contains("larger than a terminal can be")
+        );
     }
 
     #[test]

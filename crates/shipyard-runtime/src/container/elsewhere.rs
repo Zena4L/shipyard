@@ -1,5 +1,6 @@
 //! Away from Linux there are no containers: every call says so.
 
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 
 use super::{ContainerError, Created, Result, State};
@@ -10,7 +11,12 @@ use crate::process::Signal;
 /// # Errors
 ///
 /// Always [`ContainerError::LinuxOnly`].
-pub fn create(_root: &Path, _id: &str, _bundle: &Path) -> Result<Created> {
+pub fn create(
+    _root: &Path,
+    _id: &str,
+    _bundle: &Path,
+    _console: Option<BorrowedFd<'_>>,
+) -> Result<Created> {
     Err(ContainerError::LinuxOnly)
 }
 

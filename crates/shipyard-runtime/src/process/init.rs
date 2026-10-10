@@ -218,12 +218,8 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         .user_namespace
         .as_ref()
         .and_then(|namespace| namespace.maps.host_uid(0));
-    // The command's terminal, made here from the container's own devpts,
-    // its master relayed by shipyard (`-t`).
-    let slave = setup.terminal.as_ref().map(|terminal| {
-        make_terminal(terminal, spec.user.uid, spec.user.gid)
-            .unwrap_or_else(|failure| fail(failure))
-    });
+    let slave = command_terminal(&setup, spec.user.uid, spec.user.gid)
+        .unwrap_or_else(|failure| fail(failure));
     plan.terminal = slave.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
     // With an init, its command waits until the init has confined itself
     // (`confine_self`): nothing in the container runs beside an init that
@@ -279,6 +275,33 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     become_init(command, status, report, exec_failure)
 }
 
+/// The command's pseudo-terminal's slave, if it has one: made here from the
+/// container's own devpts, its master sent back (see [`make_terminal`]).
+///
+/// On an OCI console socket (with a gate), the terminal is also the init's
+/// stdin, stdout and stderr, as runc's: `create`'s own go back to its caller
+/// once it returns (a shim reads them to their end before it calls `start`),
+/// and a failure after `start` is explained on the terminal, where it's
+/// seen. (Kept as they are if `dup2` fails.)
+fn command_terminal(
+    setup: &super::setup::Setup,
+    uid: u32,
+    gid: u32,
+) -> Result<Option<OwnedFd>, Failure> {
+    let Some(terminal) = &setup.terminal else {
+        return Ok(None);
+    };
+    let slave = make_terminal(terminal, uid, gid)?;
+    if setup.gate.is_some() {
+        for fd in 0..=2 {
+            // SAFETY: `dup2` onto the standard descriptors, which this
+            // process owns; the slave stays open.
+            unsafe { libc::dup2(slave.as_raw_fd(), fd) };
+        }
+    }
+    Ok(Some(slave))
+}
+
 /// The command's pseudo-terminal (TLPI ch. 64): made from the container's
 /// own devpts (its root filesystem's, or the one `own_terminals` mounts),
 /// sized as the user's terminal (a new one is 0x0: probe T7), its slave
@@ -286,9 +309,11 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
 /// over it: T3), and given to the command's user, as runc does, so programs
 /// that open their terminal by name can. Everything `O_NOCTTY`: this
 /// process leads a session, and opening a terminal without it would make it
-/// the init's (T2). The master goes to shipyard (`SCM_RIGHTS`, T6), which
-/// says when it's relaying it: only then may the command write to it.
-/// Returns the slave, for the command.
+/// the init's (T2). The master goes to shipyard (`SCM_RIGHTS`, T6) with its
+/// name (runc's message). Shipyard answers once it's relaying it: only then
+/// may the command write to it. On an OCI console socket nothing answers
+/// (runc's protocol): the socket is closed once the master is sent. Returns
+/// the slave, for the command.
 fn make_terminal(
     terminal: &super::setup::TerminalSetup,
     uid: u32,
@@ -325,8 +350,12 @@ fn make_terminal(
     // SAFETY: inherited across the exec (see `Setup::terminal`), and ours.
     let socket = unsafe { OwnedFd::from_raw_fd(terminal.socket) };
     let sent = |errno| Failure::at(ChildStep::TerminalSend, errno);
-    super::terminal::send_fd(socket.as_fd(), master.as_fd()).map_err(sent)?;
+    super::terminal::send_fd(socket.as_fd(), master.as_fd(), super::terminal::MASTER_NAME)
+        .map_err(sent)?;
     drop(master);
+    if !terminal.acknowledged {
+        return Ok(slave);
+    }
     // Shipyard's byte: the user's terminal is raw (if asked), and the
     // master relayed. End-of-file: shipyard is gone.
     let mut byte = [0_u8; 1];

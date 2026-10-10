@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use shipyard_test_support::bundle::Bundle;
-use shipyard_test_support::{Rootless, Shipyard, delegated_cgroup, rootless, under_rosetta};
+use shipyard_test_support::console::{Console, ConsoleSocket};
+use shipyard_test_support::{
+    Rootless, Shipyard, TIMEOUT, delegated_cgroup, rootless, under_rosetta,
+};
 
 const RUNTIME: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard-runtime"));
 
@@ -80,7 +83,7 @@ impl Runtime {
         let name = id.replace('/', "_");
         let out = self.output_dir().join(format!("{name}.out"));
         let err = self.output_dir().join(format!("{name}.err"));
-        let status = command
+        let mut create = command
             .arg("--root")
             .arg(&self.root)
             .args(["create", "--bundle", bundle.arg()])
@@ -89,8 +92,22 @@ impl Runtime {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out).unwrap())
             .stderr(std::fs::File::create(&err).unwrap())
-            .status()
+            .spawn()
             .unwrap();
+        // `create` returns once the container waits at its gate: one that
+        // waits for something else (an answer on its console socket) hangs.
+        let deadline = Instant::now() + TIMEOUT;
+        let status = loop {
+            if let Some(status) = create.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = create.kill();
+                let _ = create.wait();
+                panic!("create {id} hung");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         Call {
             code: status.code(),
             stdout: std::fs::read_to_string(&out).unwrap_or_default(),
@@ -156,6 +173,33 @@ impl Drop for Runtime {
         let _ = std::fs::remove_dir_all(&self.root);
         let _ = std::fs::remove_dir_all(self.output_dir());
     }
+}
+
+/// A bundle running `sh -c SCRIPT` on a terminal of its own
+/// (`process.terminal`), `consoleSize` big if given (rows, columns).
+fn terminal_bundle(script: &str, size: Option<(u16, u16)>) -> Bundle {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", script]);
+    config["process"]["terminal"] = json!(true);
+    if let Some((height, width)) = size {
+        config["process"]["consoleSize"] = json!({"height": height, "width": width});
+    }
+    bundle.write(&config);
+    bundle
+}
+
+/// `create`s container `id` from `bundle` with its terminal sent to a new
+/// console socket, and receives it.
+fn create_on_console(runtime: &Runtime, id: &str, bundle: &Bundle) -> Console {
+    let socket = ConsoleSocket::new();
+    let call = runtime.create(
+        id,
+        bundle,
+        &["--console-socket", socket.path().to_str().unwrap()],
+    );
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    socket.receive()
 }
 
 /// A bundle running `sh -c SCRIPT`.
@@ -442,6 +486,94 @@ fn stop_is_refused() {
     let call = Runtime::new().call(&["kill", "any", "STOP"]);
     assert_eq!(call.code, Some(1));
     assert!(call.stderr.contains("send TSTP"), "{}", call.stderr);
+}
+
+// --- Terminals: console sockets, as any user -------------------------------------
+
+/// As runc: a bundle that asks for a terminal needs a console socket to send
+/// it to, and a console socket needs a bundle that asks for one. Nothing is
+/// left either way.
+#[test]
+fn a_terminal_and_a_console_socket_go_together() {
+    let runtime = Runtime::new();
+    let call = runtime.create("tty", &terminal_bundle("true", None), &[]);
+    assert_eq!(call.code, Some(1));
+    assert!(
+        call.stderr
+            .contains("there's no console socket to send it to"),
+        "{}",
+        call.stderr
+    );
+    let socket = ConsoleSocket::new();
+    let call = runtime.create(
+        "notty",
+        &bundle_running("true"),
+        &["--console-socket", socket.path().to_str().unwrap()],
+    );
+    assert_eq!(call.code, Some(1));
+    assert!(
+        call.stderr.contains("the bundle asks for no terminal"),
+        "{}",
+        call.stderr
+    );
+    assert_eq!(runtime.state("tty"), None);
+    assert_eq!(runtime.state("notty"), None);
+}
+
+/// `--console-socket` must name a socket: a plain file (or nothing) is
+/// refused, naming the path.
+#[test]
+fn a_console_socket_that_isnt_one_is_refused() {
+    let runtime = Runtime::new();
+    let bundle = terminal_bundle("true", None);
+    let file = bundle.path().join("not-a-socket");
+    std::fs::write(&file, "").unwrap();
+    let call = runtime.create(
+        "tty",
+        &bundle,
+        &["--console-socket", file.to_str().unwrap()],
+    );
+    assert_eq!(call.code, Some(1));
+    assert!(
+        call.stderr.contains(&format!(
+            "--console-socket {}: not a socket",
+            file.display()
+        )),
+        "{}",
+        call.stderr
+    );
+    let missing = bundle.path().join("missing");
+    let call = runtime.create(
+        "tty",
+        &bundle,
+        &["--console-socket", missing.to_str().unwrap()],
+    );
+    assert_eq!(call.code, Some(1));
+    assert!(
+        call.stderr
+            .contains(&format!("--console-socket {}", missing.display())),
+        "{}",
+        call.stderr
+    );
+    assert_eq!(runtime.state("tty"), None);
+}
+
+/// A rootless container gets its terminal on its console socket too, and
+/// types and prints through it.
+#[test]
+fn a_rootless_container_gets_its_console() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let runtime = Runtime::new();
+    let bundle = terminal_bundle("tty; read line; echo got-$line", None);
+    let mut console = create_on_console(&runtime, "rootless-tty", &bundle);
+    assert_eq!(console.name, b"/dev/ptmx");
+    assert_eq!(runtime.call(&["start", "rootless-tty"]).code, Some(0));
+    console.expect("/dev/pts/0");
+    console.type_keys(b"hello\n");
+    console.expect("got-hello");
+    runtime.wait_for("rootless-tty", "stopped");
 }
 
 // --- As root: the lifecycle ------------------------------------------------------
@@ -2155,4 +2287,151 @@ fn an_unsafe_state_root_is_refused() {
         "{}",
         call.stderr
     );
+}
+
+// --- As root: terminals ------------------------------------------------------------
+
+/// With a console socket, `create` returns (no answer is awaited at the
+/// gate, as runc's protocol has none) once the master is sent: a
+/// pseudo-terminal's, named `/dev/ptmx` (runc names it too), with the
+/// connection closed after it. Nothing runs before `start`; then what's
+/// typed reaches the container and its output comes back.
+#[test]
+#[ignore = "needs root"]
+fn create_with_a_console_socket_sends_the_master() {
+    let runtime = Runtime::new();
+    let bundle = terminal_bundle("echo ready; read line; echo got-$line", None);
+    let mut console = create_on_console(&runtime, "tty", &bundle);
+    let _ = console.pty_number();
+    assert_eq!(console.name, b"/dev/ptmx");
+    assert!(
+        console.connection_closed(),
+        "the runtime and the init let go of the console socket"
+    );
+    assert_eq!(runtime.status("tty"), "created");
+    console.read_for(Duration::from_millis(200));
+    assert_eq!(console.output(), "", "nothing runs before start");
+    assert_eq!(runtime.call(&["start", "tty"]).code, Some(0));
+    console.expect("ready");
+    console.type_keys(b"hello\n");
+    console.expect("got-hello");
+    runtime.wait_for("tty", "stopped");
+    assert_eq!(
+        runtime.output_of("tty"),
+        "",
+        "the output went to the terminal"
+    );
+}
+
+/// With a terminal, `create`'s caller gets its output back when `create`
+/// returns, before `start`: a shim (go-runc) reads `create`'s stdout and
+/// stderr to their end before it calls `start`. The terminal is the
+/// container's stdio instead, as runc's.
+#[test]
+#[ignore = "needs root"]
+fn create_on_a_console_lets_go_of_its_callers_output() {
+    use std::io::Read as _;
+    let runtime = Runtime::new();
+    let bundle = terminal_bundle("echo ran", None);
+    let socket = ConsoleSocket::new();
+    let mut create = Command::new(RUNTIME.path())
+        .arg("--root")
+        .arg(&runtime.root)
+        .args(["create", "--bundle", bundle.arg(), "--console-socket"])
+        .arg(socket.path())
+        .arg("piped")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut stdout, mut stderr) = (create.stdout.take().unwrap(), create.stderr.take().unwrap());
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        let _ = stderr.read_to_string(&mut text);
+        let _ = done.send(text);
+    });
+    let output = ended
+        .recv_timeout(Duration::from_secs(10))
+        .expect("create's output never reached its end: something still holds it");
+    assert!(create.wait().unwrap().success(), "{output}");
+    assert_eq!(runtime.status("piped"), "created");
+    let mut console = socket.receive();
+    assert_eq!(runtime.call(&["start", "piped"]).code, Some(0));
+    console.expect("ran");
+}
+
+/// A command that can't be executed, found out after `start`: explained on
+/// the terminal, where whoever holds it sees it.
+#[test]
+#[ignore = "needs root"]
+fn a_failure_after_start_is_told_on_the_console() {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    // A plain file, not executable.
+    config["process"]["args"] = json!(["/marker"]);
+    config["process"]["terminal"] = json!(true);
+    bundle.write(&config);
+    let mut console = create_on_console(&runtime, "noexec", &bundle);
+    assert_eq!(runtime.call(&["start", "noexec"]).code, Some(0));
+    console.expect("shipyard: ");
+    console.expect("/marker");
+    runtime.wait_for("noexec", "stopped");
+}
+
+/// The terminal is `consoleSize` big, else 24x80 (where runc leaves it 0x0).
+#[test]
+#[ignore = "needs root"]
+fn the_console_size_is_the_terminals() {
+    let runtime = Runtime::new();
+    for (id, size, expected) in [
+        ("sized", Some((30, 100)), "30 100"),
+        ("default", None, "24 80"),
+    ] {
+        let bundle = terminal_bundle("stty size", size);
+        let mut console = create_on_console(&runtime, id, &bundle);
+        assert_eq!(runtime.call(&["start", id]).code, Some(0));
+        console.expect(expected);
+    }
+}
+
+/// The container's command holds its terminal and nothing else: neither
+/// the master nor the console socket.
+#[test]
+#[ignore = "needs root"]
+fn a_console_containers_descriptors_are_its_terminal_only() {
+    let runtime = Runtime::new();
+    let bundle = terminal_bundle("ls -l /proc/self/fd/; echo do''ne", None);
+    let mut console = create_on_console(&runtime, "fds", &bundle);
+    assert_eq!(runtime.call(&["start", "fds"]).code, Some(0));
+    console.expect("done");
+    let output = console.output();
+    assert!(output.contains("/dev/pts/0"), "{output}");
+    for held in ["ptmx", "socket:", "pipe:"] {
+        assert!(!output.contains(held), "{held}: {output}");
+    }
+}
+
+/// A console socket at a path longer than a socket address can hold is
+/// reached through its directory.
+#[test]
+#[ignore = "needs root"]
+fn a_long_console_socket_path_is_reached() {
+    let runtime = Runtime::new();
+    let bundle = terminal_bundle("echo long-ok", None);
+    let socket = ConsoleSocket::with_a_long_path();
+    // Longer than `sun_path` (108 bytes, with its NUL) holds.
+    assert!(socket.path().as_os_str().len() > 108);
+    let call = runtime.create(
+        "long",
+        &bundle,
+        &["--console-socket", socket.path().to_str().unwrap()],
+    );
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let mut console = socket.receive();
+    assert_eq!(runtime.call(&["start", "long"]).code, Some(0));
+    console.expect("long-ok");
 }

@@ -16,10 +16,26 @@ which `runc`, Podman and other tools read too.
 config has no such settings. `-i` works too: as for any container, the bundle's
 process never gets your terminal, and gets your input only with `-i` (see [Input,
 output and terminals](run.md#input-output-and-terminals)). `-t` doesn't: a bundle
-asks for a terminal itself (`process.terminal`), which isn't supported yet. It needs Linux. Run as root, the container is rootful;
+asks for a terminal itself, in its config (see [A terminal](#a-terminal)). It needs
+Linux. Run as root, the container is rootful;
 run as anyone else, it's rootless (see [Rootless bundles](#rootless-bundles)). A run is
 the container's whole life, as with `runc run`: all of its [hooks](#hooks) run, from
 `prestart` to `poststop`.
+
+## A terminal
+
+A bundle whose config sets `process.terminal` to `true` runs on a terminal of its own,
+as `-t` gives any container: a pseudo-terminal made inside the container, its
+controlling terminal and its standard input, output and error. With `-i`, what you
+type reaches it, and your terminal is raw while it runs (as with `-it`, `-i` then
+needs your input to be a terminal).
+
+Its size is your window's, and follows it. With no terminal to copy it from (output
+to a pipe), it's `process.consoleSize` (`height` rows, `width` columns), or 24 by 80
+without one.
+
+Under the [runtime](runtime.md#terminals), the terminal is sent to the caller's
+console socket instead, as `runc` does.
 
 ## An example
 
@@ -266,7 +282,8 @@ leave the container **less confined than the config asks**, so the bundle is ref
   `blockIO.leafWeight` and `weightDevice`, `hugepageLimits`, `network` and `rdma`;
 - FIFOs in `linux.devices` (`"type": "p"`);
 - `linux.cgroupsPath` in systemd's `slice:prefix:name` form;
-- `process.terminal: true`;
+- `process.terminal: true` without a `mount` namespace (the container's terminals
+  would cover the host's);
 - `process.scheduler`, `process.ioPriority` and `process.execCPUAffinity`;
 - `linux.intelRdt`, `linux.memoryPolicy`, `linux.personality` and
   `linux.timeOffsets`;
@@ -275,9 +292,8 @@ leave the container **less confined than the config asks**, so the bundle is ref
   comes later;
 - mounts of any type but `bind` and `tmpfs`.
 
-A config made by `runc spec` asks for a terminal, so it's refused until that arrives.
-Set `terminal` to `false` to run it with what Shipyard has now. Its capabilities,
-`noNewPrivileges`, device rule and network namespace are applied.
+A config made by `runc spec` runs as it is: its terminal, capabilities,
+`noNewPrivileges`, device rule and network namespace are all applied.
 
 ## What's ignored
 
@@ -295,8 +311,8 @@ unsafely: no `process.capabilities` (none given), a `user` namespace added for a
 rootless run, only your own ID mapped (no `newuidmap` or range), and mappings that
 include host ID 0.
 
-`process.consoleSize` is ignored silently: it only applies with a terminal, which is
-refused. Fields the specification doesn't define are ignored silently, as it requires.
+`process.consoleSize` without `process.terminal` is ignored silently, as it is by
+`runc`. Fields the specification doesn't define are ignored silently, as it requires.
 
 ## Errors
 

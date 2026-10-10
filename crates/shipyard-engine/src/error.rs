@@ -13,9 +13,6 @@ pub enum StreamsError {
     InputNotATerminal,
     /// `-t` with an OCI bundle: the bundle says whether it wants a terminal
     /// (`process.terminal` in its `config.json`).
-    #[error(
-        "-t: a bundle says whether it wants a terminal in its config.json (process.terminal), \
-         which isn't supported yet"
-    )]
+    #[error("-t: a bundle says whether it wants a terminal, in its config.json (process.terminal)")]
     TerminalFromBundle,
 }

@@ -58,13 +58,12 @@ pub(crate) fn set_window_size(fd: RawFd, (rows, cols): Size) -> Result<(), Errno
     Errno::result(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &raw const size) }).map(drop)
 }
 
-/// The size of Shipyard's own terminal: its output's, else its input's or
-/// its error's, else [`DEFAULT_SIZE`].
-pub(crate) fn host_size() -> Size {
+/// The size of Shipyard's own terminal (its output's, else its input's or
+/// its error's), if it has one.
+pub(crate) fn terminal_size() -> Option<Size> {
     [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO]
         .into_iter()
         .find_map(window_size)
-        .unwrap_or(DEFAULT_SIZE)
 }
 
 /// Whether Shipyard's process group is the foreground group of the
@@ -105,15 +104,29 @@ pub(crate) fn host_hung_up() -> bool {
         })
 }
 
-/// Sends `fd` over the UNIX socket `socket` (`SCM_RIGHTS`, TLPI §61.13.3):
-/// the receiver gets a descriptor of its own for the same open file, across
-/// namespaces (probe T6).
+/// What a pseudo-terminal's master is sent with: a name, as runc sends one
+/// on a console socket (`SendRawFd(socket, pty.Name(), …)`: the path it
+/// opened, `/dev/pts/ptmx` in runc 1.5), which a receiver may use as the
+/// file's name and otherwise ignores.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn send_fd(socket: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
+pub(crate) const MASTER_NAME: &[u8] = b"/dev/ptmx";
+
+/// The most a descriptor's name may take ([`receive_fd`] reads it; runc's
+/// `MaxNameLen`).
+const MAX_NAME_LEN: usize = 4096;
+
+/// Sends `fd` over the UNIX socket `socket` (`SCM_RIGHTS`, TLPI §61.13.3),
+/// with `name` as the message's bytes: the receiver gets a descriptor of its
+/// own for the same open file, across namespaces (probe T6).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn send_fd(
+    socket: BorrowedFd<'_>,
+    fd: BorrowedFd<'_>,
+    name: &[u8],
+) -> Result<(), Errno> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
     let fds = [fd.as_raw_fd()];
-    let byte = *b"m";
-    let iov = [std::io::IoSlice::new(&byte)];
+    let iov = [std::io::IoSlice::new(name)];
     loop {
         match sendmsg::<()>(
             socket.as_raw_fd(),
@@ -132,11 +145,12 @@ pub(crate) fn send_fd(socket: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> Result<(), 
 /// Receives a descriptor [`send_fd`] sent, without blocking. `Ok(None)`:
 /// nothing yet. `Err(Errno::ENODATA)`: the other end closed without sending
 /// (it failed). The descriptor is close-on-exec; any more than one, or a
-/// truncated message, is refused (and what came is closed).
+/// truncated message, is refused (and what came is closed). Its name is
+/// read with it, and not used.
 pub(crate) fn receive_fd(socket: BorrowedFd<'_>) -> Result<Option<OwnedFd>, Errno> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
-    let mut byte = [0_u8; 1];
-    let mut iov = [std::io::IoSliceMut::new(&mut byte)];
+    let mut name = [0_u8; MAX_NAME_LEN];
+    let mut iov = [std::io::IoSliceMut::new(&mut name)];
     let mut space = nix::cmsg_space!([RawFd; 2]);
     #[cfg(target_os = "linux")]
     let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC;
@@ -543,6 +557,7 @@ mod tests {
         send_fd(
             std::os::fd::AsFd::as_fd(&a),
             std::os::fd::AsFd::as_fd(&master),
+            MASTER_NAME,
         )
         .unwrap();
         let received = receive_fd(std::os::fd::AsFd::as_fd(&b)).unwrap().unwrap();

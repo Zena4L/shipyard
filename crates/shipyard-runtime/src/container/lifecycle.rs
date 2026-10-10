@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::io::Write as _;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use crate::hooks::{ContainerHooks, Phase};
 use crate::isolation::Namespace;
 use crate::oci::load_bundle_for_caller;
 use crate::process::spawn::{Placement, SpawnOptions, spawn};
+use crate::process::stdio::ChildTerminal;
 use crate::process::{ExitStatus, Signal};
 
 /// The monitor's hidden first argument (see [`monitor_entry_point`]).
@@ -35,6 +36,11 @@ const EXIT_FILE: &str = "exit";
 /// container's end is theirs, not the OOM killer's, even if it struck
 /// earlier (a process it killed, and the container went on).
 const KILLED_FILE: &str = "killed";
+
+/// A console's size when the bundle gives none (`process.consoleSize`):
+/// rows, columns. runc leaves it 0x0, which full-screen programs can't
+/// draw in; a shim resizes it anyway.
+const DEFAULT_CONSOLE_SIZE: (u16, u16) = (24, 80);
 
 /// How long `start` waits for the init's answer at the gate, and `delete`
 /// for a killed container to stop.
@@ -149,6 +155,12 @@ impl Record {
 /// waiting for [`start`]. The container's standard input, output and error
 /// are the caller's.
 ///
+/// A bundle that asks for a terminal (`process.terminal`) needs `console`,
+/// a connected UNIX socket (runc's `--console-socket`): the container's init
+/// makes the pseudo-terminal inside the container and sends its master there
+/// (`SCM_RIGHTS`, with the name `/dev/ptmx`, no answer awaited), then closes
+/// the socket. The container's stdio is then that terminal.
+///
 /// Starts a monitor process (this program again: its `main` must call
 /// [`monitor_entry_point`] first), which stays the container's parent. A
 /// long-lived caller should reap it once it exits.
@@ -156,16 +168,25 @@ impl Record {
 /// # Errors
 ///
 /// A bad ID, a taken one, a bundle that can't be run (or has no PID
-/// namespace), or a setup failure (with its message).
+/// namespace), a terminal without a console socket or the reverse
+/// ([`ContainerError::TerminalWithoutConsoleSocket`],
+/// [`ContainerError::ConsoleSocketWithoutTerminal`]), or a setup failure
+/// (with its message).
 ///
 /// Without root, the container is rootless: a bundle without a user
 /// namespace gets one (with a warning), as `shipyard run --bundle` does.
-pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
+pub fn create(
+    root: &Path,
+    id: &str,
+    bundle: &Path,
+    console: Option<BorrowedFd<'_>>,
+) -> Result<Created> {
     validate_id(id)?;
     let bundle =
         std::fs::canonicalize(bundle).map_err(io(format!("the bundle {}", bundle.display())))?;
     // Everything a bundle can get wrong, before anything exists.
     let loaded = load_bundle_for_caller(&bundle)?;
+    console_matches(loaded.terminal.is_some(), console.is_some())?;
     // The container gets a cgroup below this process's part of the tree
     // (root's, or the user's delegated subtree). Without a PID namespace,
     // it's what finds and kills every process of the container, so then
@@ -235,7 +256,7 @@ pub fn create(root: &Path, id: &str, bundle: &Path) -> Result<Created> {
     } else {
         None
     };
-    match start_monitor(id, &dir_fd, record) {
+    match start_monitor(id, &dir_fd, record, console) {
         Ok(pid) => Ok(Created { pid, warnings }),
         Err(err) => {
             // As the spec has it: a create that fails is a container
@@ -380,12 +401,17 @@ enum Answer {
 /// while, and meanwhile `state` must say "creating", and `delete` must be
 /// able to remove a container whose setup hangs (it kills the monitor
 /// recorded here, and the container with it).
-fn start_monitor(id: &str, dir: &OwnedFd, mut record: Record) -> Result<i32> {
+fn start_monitor(
+    id: &str,
+    dir: &OwnedFd,
+    mut record: Record,
+    console: Option<BorrowedFd<'_>>,
+) -> Result<i32> {
     let (answers, mut monitor) = {
         let _lock = lock_at(dir).map_err(locking(id))?;
         nix::unistd::mkfifoat(dir, FIFO, Mode::S_IRUSR | Mode::S_IWUSR)
             .map_err(errno_io("making the exec FIFO"))?;
-        let (answers, mut monitor) = spawn_monitor(dir, &record.bundle)?;
+        let (answers, mut monitor) = spawn_monitor(dir, &record.bundle, console)?;
         let pid = i32::try_from(monitor.id()).unwrap_or(-1);
         // Our child: its PID can't be reused before we reap it.
         record.monitor = start_time(pid).map(|started| (pid, started));
@@ -407,19 +433,25 @@ fn start_monitor(id: &str, dir: &OwnedFd, mut record: Record) -> Result<i32> {
 }
 
 /// Starts the monitor for the state directory open at `dir`, with the
-/// bundle at `bundle`. Returns the pipe its answer comes on.
-fn spawn_monitor(dir: &OwnedFd, bundle: &Path) -> Result<(OwnedFd, std::process::Child)> {
+/// bundle at `bundle` (and the console socket `console`, for its terminal).
+/// Returns the pipe its answer comes on.
+fn spawn_monitor(
+    dir: &OwnedFd,
+    bundle: &Path,
+    console: Option<BorrowedFd<'_>>,
+) -> Result<(OwnedFd, std::process::Child)> {
     let (answers, answer_end) =
         nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(errno_io("making the monitor's pipe"))?;
     // Its ends must survive its exec: copies without close-on-exec, closed
     // as soon as it's spawned. (Another thread spawning meanwhile could
     // inherit them, which is why `read_answer` watches the monitor, not
     // end-of-file.)
-    let inheritable = |fd: &OwnedFd| {
+    let inheritable = |fd: BorrowedFd<'_>| {
         nix::unistd::dup(fd).map_err(errno_io("passing the monitor its descriptors"))
     };
-    let answer_end = inheritable(&answer_end)?;
-    let dir = inheritable(dir)?;
+    let answer_end = inheritable(answer_end.as_fd())?;
+    let dir = inheritable(dir.as_fd())?;
+    let console = console.map(inheritable).transpose()?;
     let mut command = std::process::Command::new("/proc/self/exe");
     // A session of its own (and so a process group) from the start, before
     // it runs any code: the caller's terminal closing, or a Ctrl-C meant for
@@ -442,6 +474,7 @@ fn spawn_monitor(dir: &OwnedFd, bundle: &Path) -> Result<(OwnedFd, std::process:
         .arg(bundle)
         .arg(dir.as_raw_fd().to_string())
         .arg(answer_end.as_raw_fd().to_string())
+        .args(console.as_ref().map(|fd| fd.as_raw_fd().to_string()))
         .spawn()
         .map_err(io("starting the container's monitor"))?;
     Ok((answers, monitor))
@@ -506,13 +539,28 @@ pub fn monitor_entry_point() {
             .and_then(|fd| fd.to_str()?.parse::<RawFd>().ok())
             .filter(|&fd| fd > 2)
     };
-    if let ([_, _, bundle, ..], Some(dir), Some(ready)) = (args.as_slice(), fd(3), fd(4))
+    // The console socket, the fifth, is there when the bundle asks for a
+    // terminal.
+    let console = match args.get(5) {
+        None => Some(None),
+        Some(_) => fd(5).map(Some),
+    };
+    if let ([_, _, bundle, ..], Some(dir), Some(ready), Some(console)) =
+        (args.as_slice(), fd(3), fd(4), console)
         && dir != ready
+        && console.is_none_or(|console| console != dir && console != ready)
+        && args.len() <= 6
     {
-        // SAFETY: both passed by `create` across the exec; this process
-        // owns them.
-        let (dir, ready) = unsafe { (OwnedFd::from_raw_fd(dir), OwnedFd::from_raw_fd(ready)) };
-        monitor(&dir, Path::new(bundle), ready);
+        // SAFETY: all passed by `create` across the exec, and distinct; this
+        // process owns them.
+        let (dir, ready, console) = unsafe {
+            (
+                OwnedFd::from_raw_fd(dir),
+                OwnedFd::from_raw_fd(ready),
+                console.map(|fd| OwnedFd::from_raw_fd(fd)),
+            )
+        };
+        monitor(&dir, Path::new(bundle), ready, console);
     }
     let _ = std::io::stderr()
         .write_all(b"shipyard: this is a container monitor's internal entry point\n");
@@ -526,13 +574,15 @@ pub fn monitor_entry_point() {
 /// path: once `delete` has removed it, a path could name a newer
 /// container's directory (same ID), and this one's records would land
 /// there. Through the descriptor, writing into a removed directory fails.
-fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
+fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd, console: Option<OwnedFd>) -> ! {
     // (A session of its own already: `spawn_monitor` made it one.)
     // Whatever the caller left open (not close-on-exec) would be held for
     // the container's whole life: a pipe whose reader waits for end-of-file,
     // say. The container gets the caller's stdio; the monitor keeps nothing
-    // else but the directory and the answer pipe.
-    close_inherited(&[dir.as_raw_fd(), ready.as_raw_fd()]);
+    // else but the directory, the answer pipe and the console socket.
+    let mut keep = vec![dir.as_raw_fd(), ready.as_raw_fd()];
+    keep.extend(console.as_ref().map(AsRawFd::as_raw_fd));
+    close_inherited(&keep);
     // An ignored SIGCHLD survives `exec`: a caller that ignores it (`trap ''
     // CHLD`) would pass it on, and the kernel would then reap the
     // container's init (and the map helpers) itself, leaving nothing to
@@ -545,8 +595,16 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
             nix::sys::signal::SigHandler::SigDfl,
         )
     };
-    // Neither is the container's or its hooks'.
-    for fd in [dir.as_fd(), ready.as_fd()] {
+    // None is the container's or its hooks'. (The init gets the console
+    // socket its own way: the spawn passes it on.)
+    for fd in [
+        Some(dir.as_fd()),
+        Some(ready.as_fd()),
+        console.as_ref().map(AsFd::as_fd),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let _ = nix::fcntl::fcntl(
             fd,
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
@@ -578,7 +636,7 @@ fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd) -> ! {
             remove_cgroup_at(dir, cgroup);
         }
     };
-    let (mut child, pid) = match spawn_container(dir, bundle, cgroup.clone(), hooks) {
+    let (mut child, pid) = match spawn_container(dir, bundle, cgroup.clone(), hooks, console) {
         Ok(created) => created,
         Err(message) => {
             remove_cgroup();
@@ -635,6 +693,16 @@ fn container_setup(dir: &OwnedFd) -> Result<(Option<cgroup::Cgroup>, Option<Cont
     Ok((cgroup, record.hooks))
 }
 
+/// As runc: a terminal (the bundle's `process.terminal`) goes to a console
+/// socket, and a console socket is for a terminal.
+fn console_matches(terminal: bool, console: bool) -> Result<()> {
+    match (terminal, console) {
+        (true, false) => Err(ContainerError::TerminalWithoutConsoleSocket),
+        (false, true) => Err(ContainerError::ConsoleSocketWithoutTerminal),
+        _ => Ok(()),
+    }
+}
+
 /// Refuses `isolation` for a container without a cgroup (for the reason
 /// `why`), if it needs one: without a PID namespace, nothing else can find
 /// all its processes; and limits need one to be written in.
@@ -651,14 +719,28 @@ fn without_cgroup(isolation: &crate::isolation::Isolation, why: &str) -> Result<
 /// Spawns the container held at the start gate (running `create`'s hooks,
 /// as `hooks` lists them, on the way), and waits until it's set up. A
 /// failure is the message for `create`.
+///
+/// With a terminal, its init sends the master to `console` once it has made
+/// the pseudo-terminal; this process's copy of the socket is closed once the
+/// spawn has passed it on, so the receiver sees end-of-file when the init
+/// closes its own.
 fn spawn_container(
     dir: &OwnedFd,
     bundle: &Path,
     cgroup: Option<cgroup::Cgroup>,
     hooks: Option<ContainerHooks>,
+    console: Option<OwnedFd>,
 ) -> std::result::Result<(crate::process::spawn::Child, i32), String> {
-    let mut bundle = load_bundle_for_caller(bundle).map_err(|err| err.to_string())?;
     // Read again, it may have changed since `create` checked it.
+    let mut bundle = load_bundle_for_caller(bundle).map_err(|err| err.to_string())?;
+    console_matches(bundle.terminal.is_some(), console.is_some()).map_err(|err| err.to_string())?;
+    let terminal = bundle
+        .terminal
+        .zip(console.as_ref())
+        .map(|(terminal, console)| ChildTerminal::Socket {
+            fd: console.as_raw_fd(),
+            size: terminal.size.unwrap_or(DEFAULT_CONSOLE_SIZE),
+        });
     if cgroup.is_none() {
         without_cgroup(&bundle.isolation, "none could be made when it was created")
             .map_err(|err| err.to_string())?;
@@ -677,14 +759,16 @@ fn spawn_container(
         placement: Placement::New(Box::new(bundle.isolation)),
         gate: Some(gate.as_raw_fd()),
         cgroup,
-        // The OCI runtime's: the container keeps the caller's stdio.
+        // The OCI runtime's: the container keeps the caller's stdio, or
+        // takes its terminal's.
         stdio: [None; 3],
-        terminal: None,
-        takes_terminal: false,
+        terminal,
+        takes_terminal: terminal.is_some(),
     };
     let mut child =
         spawn(&bundle.spec, &options, None, |_| {}).map_err(|err| format!("{err:#}"))?;
     drop(gate);
+    drop(console);
     // The report pipe's end-of-file means "set up, at the gate" — or that
     // the init died, which also closes it.
     let created = wait_for_report(&mut child);

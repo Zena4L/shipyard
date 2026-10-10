@@ -157,6 +157,47 @@ before `poststop` runs.
 be found then, for example, writes `shipyard: … command not found` there, and the
 container stops with exit code 127.
 
+## Terminals
+
+A bundle that asks for a terminal (`process.terminal: true`, as every config `runc spec`
+writes does) gets one the way `runc` gives it, which is what containerd's and Podman's
+shims expect:
+
+```sh
+shipyard-runtime create --bundle ./mybundle --console-socket /run/my-shim/console.sock web
+```
+
+- **You listen on a UNIX socket** and name it with `--console-socket`.
+  `shipyard-runtime` connects to it, as you.
+- **The container's terminal is made inside it,** from its own `/dev/pts`, during
+  `create`.
+- **Its master is sent to the socket** as a passed file descriptor (`SCM_RIGHTS`),
+  with a name as the message's bytes (`/dev/ptmx`; `runc` sends the path it opened,
+  which receivers may use as the file's name and otherwise ignore). Nothing is
+  awaited back; the connection is closed once it's sent. Whatever is written to the
+  master is typed into the container, and its output comes out of it. Resize it
+  with `TIOCSWINSZ`.
+- **The terminal is the program's standard input, output and error,** and its
+  controlling terminal, from `start`. `create`'s own standard input, output and
+  error aren't the container's: they reach their end when `create` returns. A
+  failure after `start` (a program that can't be executed, say) is explained on the
+  terminal.
+- **Its size** is `process.consoleSize` (`height` rows, `width` columns), or 24 by
+  80 without one (`runc` leaves it 0 by 0, which full-screen programs can't draw
+  in).
+
+A socket path longer than a socket address can hold (108 bytes) works too: it's
+reached through its directory.
+
+These are refused, before anything is made:
+
+- a bundle that asks for a terminal, without `--console-socket` ("there's no
+  console socket to send it to");
+- `--console-socket` for a bundle that asks for none ("the bundle asks for no
+  terminal");
+- a `--console-socket` path that isn't a socket ("not a socket"), or that nothing
+  listens on.
+
 ## The state directory
 
 Each container has a directory `ROOT/ID` (only its owner can read it):
@@ -217,6 +258,5 @@ most 255 characters.
 - **A `pid` namespace is required** where the container can't have a cgroup, and
   rootless (see above).
 - **Not yet:**
-  - terminals (`--console-socket`);
   - `exec`;
   - `list` and `run`.

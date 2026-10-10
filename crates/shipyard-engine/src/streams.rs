@@ -31,7 +31,13 @@ pub enum Runs {
     Isolated,
     /// In a container from an OCI bundle, which asks for a terminal in its
     /// own `config.json`.
-    Bundle,
+    Bundle {
+        /// It does (`process.terminal`): as if `-t` were given.
+        terminal: bool,
+        /// The terminal's size (rows, columns) when there's none to copy it
+        /// from (`process.consoleSize`).
+        size: Option<(u16, u16)>,
+    },
 }
 
 /// What the run asked for.
@@ -75,7 +81,8 @@ impl Terminals {
 ///
 /// [`StreamsError::InputNotATerminal`] for `-it` when stdin isn't a
 /// terminal (Docker's rule: there'd be nothing to type with), and
-/// [`StreamsError::TerminalFromBundle`] for `-t` with a bundle.
+/// [`StreamsError::TerminalFromBundle`] for `-t` with a bundle (whose
+/// `process.terminal` says, and is then taken as `-t`).
 pub fn plan(request: Request, host: Terminals) -> Result<Stdio, StreamsError> {
     let passed_on = |terminal: bool| {
         if terminal {
@@ -84,7 +91,12 @@ pub fn plan(request: Request, host: Terminals) -> Result<Stdio, StreamsError> {
             Stream::Inherit
         }
     };
-    if request.tty {
+    let (tty, size) = match request.runs {
+        Runs::Bundle { .. } if request.tty => return Err(StreamsError::TerminalFromBundle),
+        Runs::Bundle { terminal, size } => (terminal, size),
+        Runs::Unisolated | Runs::Isolated => (request.tty, None),
+    };
+    if tty {
         if request.interactive && !host.stdin {
             return Err(StreamsError::InputNotATerminal);
         }
@@ -94,6 +106,7 @@ pub fn plan(request: Request, host: Terminals) -> Result<Stdio, StreamsError> {
         let terminal = Some(Pty {
             input: request.interactive,
             raw: request.interactive,
+            size,
         });
         return Ok(match request.runs {
             Runs::Unisolated => Stdio {
@@ -102,13 +115,12 @@ pub fn plan(request: Request, host: Terminals) -> Result<Stdio, StreamsError> {
             },
             // Before the command takes its terminal, the container's setup
             // (its init's messages) still never holds the user's: D16.
-            Runs::Isolated => Stdio {
+            Runs::Isolated | Runs::Bundle { .. } => Stdio {
                 stdin: Stream::Null,
                 stdout: passed_on(host.stdout),
                 stderr: passed_on(host.stderr),
                 terminal,
             },
-            Runs::Bundle => return Err(StreamsError::TerminalFromBundle),
         });
     }
     if request.runs == Runs::Unisolated {
@@ -243,15 +255,73 @@ mod tests {
 
     #[test]
     fn a_bundle_asks_for_its_terminal_itself() {
-        let request = Request {
-            tty: true,
-            runs: Runs::Bundle,
-            ..isolated(false)
+        for terminal in [false, true] {
+            let request = Request {
+                tty: true,
+                runs: Runs::Bundle {
+                    terminal,
+                    size: None,
+                },
+                ..isolated(false)
+            };
+            assert_eq!(
+                plan(request, TERMINAL),
+                Err(StreamsError::TerminalFromBundle)
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundles_terminal_is_taken_as_t() {
+        let size = Some((30, 100));
+        let bundle = |interactive| Request {
+            interactive,
+            runs: Runs::Bundle {
+                terminal: true,
+                size,
+            },
+            ..Request::default()
         };
         assert_eq!(
-            plan(request, TERMINAL),
-            Err(StreamsError::TerminalFromBundle)
+            plan(bundle(true), TERMINAL),
+            Ok(Stdio {
+                stdin: Stream::Null,
+                stdout: Stream::Relay,
+                stderr: Stream::Relay,
+                terminal: Some(Pty {
+                    input: true,
+                    raw: true,
+                    size,
+                }),
+            })
         );
+        assert_eq!(
+            plan(bundle(false), PIPES),
+            Ok(Stdio {
+                stdin: Stream::Null,
+                stdout: Stream::Inherit,
+                stderr: Stream::Inherit,
+                terminal: Some(Pty {
+                    size,
+                    ..Pty::default()
+                }),
+            })
+        );
+        assert_eq!(
+            plan(bundle(true), PIPES),
+            Err(StreamsError::InputNotATerminal),
+            "-i with a terminal bundle is -it: something to type on"
+        );
+        // Without a terminal, a bundle is any container.
+        let without = Request {
+            interactive: true,
+            runs: Runs::Bundle {
+                terminal: false,
+                size,
+            },
+            ..Request::default()
+        };
+        assert_eq!(plan(without, TERMINAL), plan(isolated(true), TERMINAL));
     }
 
     #[test]
@@ -269,6 +339,7 @@ mod tests {
                 terminal: Some(Pty {
                     input: true,
                     raw: true,
+                    size: None,
                 }),
             })
         );
@@ -299,6 +370,7 @@ mod tests {
                 terminal: Some(Pty {
                     input: true,
                     raw: true,
+                    size: None,
                 }),
                 ..Stdio::default()
             })

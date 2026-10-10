@@ -187,14 +187,6 @@ pub enum Error {
     #[error("a terminal of the container's own (-t) needs a mount namespace of its own")]
     TerminalNeedsMount,
 
-    /// A pseudo-terminal for a container that waits at a start gate
-    /// (`shipyard-runtime create`): the init would wait for a relay that
-    /// isn't there. (The OCI console socket comes with step 8.3.) A guard:
-    /// nothing asks for both yet (`container::create` never passes a
-    /// terminal).
-    #[error("a terminal can't be relayed for a container that waits to be started")]
-    TerminalAtGate,
-
     /// `/proc` belongs to another PID namespace than shipyard's, so a PID
     /// can't be looked up in it safely.
     #[error(

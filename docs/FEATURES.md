@@ -250,6 +250,9 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Pseudoterminals** for `-it`, with resize via `SIGWINCH` and the `TIOCSWINSZ` ioctl
   (built in step 8.2: made inside the container, its master passed back with
   `SCM_RIGHTS`; the user's terminal raw and restored).
+- **OCI terminals** (built in step 8.3a): `process.terminal` and `consoleSize` in
+  bundles; `shipyard-runtime create --console-socket`, runc's protocol (the master
+  sent with `SCM_RIGHTS` and a name, no answer awaited).
 - **`attach` / detach:** with detach keys.
 - **`exec` sessions:** each with its own terminal.
 - **`exec` joins the container's cgroup** (moved from stage 5): its limits, device rules

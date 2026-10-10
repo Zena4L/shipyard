@@ -15,6 +15,8 @@
 
 pub mod bundle;
 #[cfg(target_os = "linux")]
+pub mod console;
+#[cfg(target_os = "linux")]
 pub mod net;
 pub mod pty;
 pub mod registry;

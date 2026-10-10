@@ -88,9 +88,13 @@ pub(crate) struct Setup {
 pub(crate) struct TerminalSetup {
     /// The socket to send its master back to shipyard on, inherited.
     pub(crate) socket: RawFd,
-    /// Its size, the user's terminal's.
+    /// Its size, the user's terminal's (or the bundle's `consoleSize`).
     pub(crate) rows: u16,
     pub(crate) cols: u16,
+    /// Whether the receiver answers once it relays the master (Shipyard's
+    /// own relay, which the command waits for), or not (an OCI console
+    /// socket, at a start gate: runc's protocol has no answer).
+    pub(crate) acknowledged: bool,
 }
 
 /// The hooks part of the setup: where to wait for the runtime's, and the

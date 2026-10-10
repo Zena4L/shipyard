@@ -234,6 +234,19 @@ pub enum ContainerError {
          program, or pause the whole container"
     )]
     StopSignal(String),
+    /// The bundle asks for a terminal (`process.terminal`), and no console
+    /// socket was given to send it to.
+    #[error(
+        "the bundle asks for a terminal (process.terminal), and there's no console socket to \
+         send it to: give one with --console-socket"
+    )]
+    TerminalWithoutConsoleSocket,
+    /// A console socket was given, and the bundle asks for no terminal.
+    #[error(
+        "a console socket was given, and the bundle asks for no terminal (process.terminal is \
+         false)"
+    )]
+    ConsoleSocketWithoutTerminal,
     /// Another call has held the container's lock too long (stopped, or
     /// stuck on a hung file system).
     #[error("container {0} is busy: another call has held its lock for over 15 seconds")]

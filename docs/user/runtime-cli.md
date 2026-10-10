@@ -67,7 +67,7 @@ Create a container from a bundle, set up and waiting for `start`
 
   Default value: `.`
 * `--pid-file <FILE>` — Write the container's init PID to FILE
-* `--console-socket <SOCKET>` — A socket for the container's terminal (not supported yet)
+* `--console-socket <SOCKET>` — A UNIX socket to send the container's terminal to (its pseudo-terminal's master), as runc does; needed when the bundle asks for a terminal (`process.terminal`)
 
 
 

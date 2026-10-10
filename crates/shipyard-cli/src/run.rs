@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
-use shipyard_engine::streams;
+use shipyard_engine::{StreamsError, streams};
 use shipyard_runtime::hooks::ContainerHooks;
 use shipyard_runtime::isolation::{
     HOST_WIDE_NET_SYSCTLS, IdMap, IdMaps, Isolation, IsolationError, Mount, Namespace, Root,
@@ -375,8 +375,20 @@ impl RunArgs {
         };
         stop.validate()?;
         if let Some(dir) = &self.bundle {
-            let stdio = self.stdio(streams::Runs::Bundle)?;
-            return Ok(Checked::Bundle(Box::new(from_bundle(dir, stop, stdio)?)));
+            // Refused before the bundle is read: `-t` is wrong whatever its
+            // config says (a bundle asks for a terminal itself).
+            if self.streams.tty {
+                return Err(StreamsError::TerminalFromBundle.into());
+            }
+            let bundle = load_bundle(dir)?;
+            // Its own `process.terminal` is `-t`.
+            let stdio = self.stdio(streams::Runs::Bundle {
+                terminal: bundle.terminal.is_some(),
+                size: bundle.terminal.and_then(|terminal| terminal.size),
+            })?;
+            return Ok(Checked::Bundle(Box::new(from_bundle(
+                dir, bundle, stop, stdio,
+            )?)));
         }
         if self.image.is_some() && !cfg!(target_os = "linux") {
             bail!(
@@ -689,9 +701,8 @@ fn hold_volumes(names: &[String]) -> Result<Vec<VolumeHold>> {
         .collect()
 }
 
-/// A run of the OCI bundle in `dir`: everything but the stop policy comes
-/// from its `config.json`.
-fn from_bundle(dir: &Path, stop: StopPolicy, stdio: process::Stdio) -> Result<Invocation> {
+/// Loads the bundle in `dir` for `run --bundle`.
+fn load_bundle(dir: &Path) -> Result<shipyard_runtime::oci::Bundle> {
     if !cfg!(target_os = "linux") {
         bail!(
             "--bundle needs Linux namespaces, which aren't available on {} yet",
@@ -703,6 +714,17 @@ fn from_bundle(dir: &Path, stop: StopPolicy, stdio: process::Stdio) -> Result<In
     let bundle = shipyard_runtime::oci::load_bundle_for_caller(dir)?;
     #[cfg(not(target_os = "linux"))]
     let bundle = shipyard_runtime::oci::load_bundle(dir)?;
+    Ok(bundle)
+}
+
+/// A run of `bundle`, the OCI bundle in `dir`: everything but the stop
+/// policy and the streams comes from its `config.json`.
+fn from_bundle(
+    dir: &Path,
+    bundle: shipyard_runtime::oci::Bundle,
+    stop: StopPolicy,
+    stdio: process::Stdio,
+) -> Result<Invocation> {
     let mut warnings = bundle.warnings;
     if let Some(path) = &bundle.cgroups_path {
         warnings.push(format!(
