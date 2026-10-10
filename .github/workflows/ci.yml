@@ -39,7 +39,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-latest is off for now: its run takes too long. The Linux
+        # tests still run in the `apparmor` and `fedora` jobs below.
+        # os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     # A hung supervisor test must fail the job, not hold a runner for hours.
     timeout-minutes: 20
@@ -90,9 +93,11 @@ jobs:
           # On Linux, each test binary runs in a network namespace of its
           # own (scripts/ci-netns.sh): as root, `shipyard run` makes a bridge,
           # firewall rules and turns on forwarding, never on the runner.
-          - os: ubuntu-latest
-            runner_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER
-            runner: ci-netns
+          # Off for now: its run takes too long (the `fedora` job runs the
+          # root tests on Linux).
+          # - os: ubuntu-latest
+          #   runner_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER
+          #   runner: ci-netns
           - os: macos-latest
             runner_var: CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER
             runner: sudo -E
