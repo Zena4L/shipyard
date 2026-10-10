@@ -552,7 +552,9 @@ fn raw_datagram_arrives(
     vlan_tags: usize,
 ) -> bool {
     use std::net::UdpSocket;
-    let receiver = in_netns(listener, || UdpSocket::bind((to, 9998))).unwrap();
+    // A port the kernel picks: a fixed one may be taken in a busy run.
+    let receiver = in_netns(listener, || UdpSocket::bind((to, 0))).unwrap();
+    let port = receiver.local_addr().unwrap().port();
     receiver
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
@@ -578,7 +580,7 @@ fn raw_datagram_arrives(
     frame.extend([0x08, 0x00]);
     frame.extend(ip);
     frame.extend(1234_u16.to_be_bytes());
-    frame.extend(9998_u16.to_be_bytes());
+    frame.extend(port.to_be_bytes());
     frame.extend(udp_len.to_be_bytes());
     frame.extend([0, 0]);
     frame.extend(payload);

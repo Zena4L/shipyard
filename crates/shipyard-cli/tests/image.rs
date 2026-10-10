@@ -148,6 +148,28 @@ fn layers(store: &Scratch) -> Vec<String> {
         .collect()
 }
 
+/// Waits (up to 10 s) until no run's area in the store is locked: every
+/// process that held one is gone.
+fn wait_until_unlocked(store: &Scratch) {
+    use nix::fcntl::{Flock, FlockArg};
+    let containers = store.store().join("containers");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    for name in areas(store) {
+        loop {
+            let dir = std::fs::File::open(containers.join(&name)).unwrap();
+            // Taken and let go at once: only whether it can be.
+            if Flock::lock(dir, FlockArg::LockExclusiveNonblock).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name} is still locked: a process of the killed run is left"
+            );
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 /// The runs' areas in the store (not leftovers).
 fn runs(store: &Scratch) -> usize {
     areas(store)
@@ -344,6 +366,12 @@ fn an_image_in_use_is_kept_until_its_container_ends() {
 }
 
 /// A run killed outright leaves its area unlocked: the next run sweeps it.
+///
+/// Unlocked once all its processes are gone, which is a moment after
+/// `shipyard` itself: its children (the container's, not yet re-executed)
+/// hold the lock's descriptor until their parent-death signal ends them. A
+/// sweep in that moment rightly leaves the area alone, so the next run
+/// starts once it's free.
 #[test]
 fn a_killed_runs_writable_layer_is_swept_by_the_next() {
     let Some((_serving, image, store)) = ready() else {
@@ -353,6 +381,7 @@ fn a_killed_runs_writable_layer_is_swept_by_the_next() {
     killed.kill().unwrap();
     killed.wait().unwrap();
     assert_eq!(runs(&store), 1, "the killed run's area stays");
+    wait_until_unlocked(&store);
     let next = shipyard(&store, &["run", "--image", &image, "sh", "-c", "exit 0"]);
     assert!(
         next.status.success(),
