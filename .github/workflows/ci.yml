@@ -124,11 +124,29 @@ jobs:
           uname -r
           ldd --version | head -1
           findmnt -no PROPAGATION /
+      # The terminal tests first, on their own (temporary, to diagnose): a
+      # step's own time limit fails it before the job's, so its log is kept.
+      - name: terminal tests, on their own
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        continue-on-error: true
+        run: cargo test --locked -p shipyard-cli --test terminal -- --include-ignored
       - run: cargo test --locked --workspace -- --include-ignored
+        timeout-minutes: 12
         env:
           # ip, nft and dig are installed above: the differential tests
           # (H5) must run, not skip.
           SHIPYARD_TEST_TOOLS: required
+      # Diagnostics (temporary): what pasta and AppArmor said, kept even when
+      # a test step fails or times out.
+      - name: diagnostics (pasta, AppArmor denials)
+        if: always() && runner.os == 'Linux'
+        run: |
+          uname -rm
+          pasta --version 2>&1 | head -1 || true
+          ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
+          sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
+          sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true
 
   # A real host (H4): Ubuntu as users have it, the AppArmor restriction on
   # user namespaces left on, and Shipyard installed in /usr/local/bin with
@@ -156,12 +174,33 @@ jobs:
       # shipyard-cli's tests: the end-to-end ones run the installed binaries.
       # (The runtime's in-process tests make user namespaces from their own
       # test binary, which no profile covers: they run in `check`.)
+      # The terminal tests first, on their own (temporary, to diagnose): a
+      # step's own time limit fails it before the job's, so its log is kept.
+      - name: terminal tests, on their own, against the installed binaries
+        timeout-minutes: 6
+        continue-on-error: true
+        run: systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli --test terminal
+        env:
+          SHIPYARD_TEST_BIN_DIR: /usr/local/bin
+          SHIPYARD_TEST_ROOTLESS: required
+          SHIPYARD_TEST_DELEGATED: required
       - name: cargo test, against the installed binaries
+        timeout-minutes: 15
         run: systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli
         env:
           SHIPYARD_TEST_BIN_DIR: /usr/local/bin
           SHIPYARD_TEST_ROOTLESS: required
           SHIPYARD_TEST_DELEGATED: required
+      # Diagnostics (temporary): what pasta and AppArmor said, kept even when
+      # a test step fails or times out.
+      - name: diagnostics (pasta, AppArmor denials)
+        if: always()
+        run: |
+          uname -rm
+          pasta --version 2>&1 | head -1 || true
+          ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
+          sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
+          sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true
 
   # Another real host (H4): Fedora, SELinux enforcing, in a QEMU/KVM VM on
   # the runner. Both passes (rootless, then root), from executables built
