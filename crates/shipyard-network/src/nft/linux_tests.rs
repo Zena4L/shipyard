@@ -445,6 +445,18 @@ fn json_type(names: &[&str]) -> serde_json::Value {
     }
 }
 
+/// A type as `nft -j` wrote it, in the list form: nftables before 1.1 (Ubuntu
+/// 24.04's 1.0.9) writes a map's concatenated value type as one string,
+/// `"ipv4_addr . inet_service"`; later ones as a list of names.
+fn their_type(value: &serde_json::Value) -> serde_json::Value {
+    match value.as_str() {
+        Some(names) if names.contains(" . ") => {
+            names.split(" . ").map(serde_json::Value::from).collect()
+        }
+        _ => value.clone(),
+    }
+}
+
 /// `nft -j` describes Shipyard's base chains and sets as Shipyard made
 /// them (`ruleset::chains` and `ruleset::sets`): each chain's type, hook,
 /// priority and policy; each set's key type, a map's value type, and
@@ -506,13 +518,18 @@ fn nft_json_describes_shipyards_chains_and_sets() {
                 None => find("set", set.name),
             };
             assert_eq!(
-                theirs["type"],
+                their_type(&theirs["type"]),
                 json_type(&type_names(set.key.0)),
                 "{}",
                 set.name
             );
             if let Some((data, _)) = set.data {
-                assert_eq!(theirs["map"], json_type(&type_names(data)), "{}", set.name);
+                assert_eq!(
+                    their_type(&theirs["map"]),
+                    json_type(&type_names(data)),
+                    "{}",
+                    set.name
+                );
             }
             let interval = theirs["flags"]
                 .as_array()

@@ -10,15 +10,14 @@ set -euo pipefail
 profile=/etc/apparmor.d/shipyard
 # The installed one, where the profile attaches (not another on PATH).
 shipyard=/usr/local/bin/shipyard
-userns() {
-    "$shipyard" doctor 2>/dev/null | awk '$2 == "user" && $3 == "namespaces" { print $1 }' || true
-}
 expect() {
-    local got
-    got=$(userns)
+    local report got
+    report=$("$shipyard" doctor 2>&1 || true)
+    got=$(awk '$2 == "user" && $3 == "namespaces" { print $1 }' <<<"$report")
     if [ "$got" != "$1" ]; then
-        echo "user namespaces: expected '$1' $2, got '$got'" >&2
-        "$shipyard" doctor >&2 || true
+        # The report that said so (another run could say otherwise).
+        echo "user namespaces: expected '$1' $2, got '$got'; doctor said:" >&2
+        echo "$report" >&2
         exit 1
     fi
     echo "user namespaces: $got $2"

@@ -187,8 +187,9 @@ mod linux {
     const PROBE_ARG: &str = "__shipyard-probe";
 
     /// How long the probe may take: it makes namespaces and mounts, which
-    /// take milliseconds.
-    const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+    /// take milliseconds, but a first start on a busy machine with a cold
+    /// page cache (a large binary read from disk again) can take seconds.
+    const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 
     /// The controllers limits need (`cpuset` is only for `--cpuset-*`).
     const LIMITS_NEED: [Controller; 4] = [
