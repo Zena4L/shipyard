@@ -16,7 +16,9 @@
 //! is read and its target walked in turn, from the root if it's absolute.
 //!
 //! Missing components are made as they're met (a mount target must exist):
-//! directories, and the last one as a directory or an empty file.
+//! directories, and the last one as a directory or an empty file. Or, for
+//! `cp`'s helper ([`open_in_root`]), nothing is made: a missing component is
+//! `ENOENT`.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -42,10 +44,33 @@ pub(crate) enum Leaf {
     File,
 }
 
+/// What a resolution wants at its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// Made if missing (and the components on the way), of this kind.
+    Make(Leaf),
+    /// Only what's there, of any kind; the last component followed if it's
+    /// a symlink, or opened itself.
+    Existing { follow_last: bool },
+}
+
 /// Opens `path` inside `root` (`O_PATH`), resolved as the container will
 /// see it, making what's missing on the way.
 pub(crate) fn resolve_in_root(root: &OwnedFd, path: &Path, leaf: Leaf) -> nix::Result<OwnedFd> {
-    resolve(root, path, leaf, Method::Openat2First)
+    resolve(root, path, Want::Make(leaf), Method::Openat2First)
+}
+
+/// Opens what's at `path` inside `root` (`O_PATH`), resolved as the
+/// container sees it, making nothing: a missing component is `ENOENT`. A
+/// symlink as the last component is followed (inside the root) if
+/// `follow_last`, or opened itself.
+pub(crate) fn open_in_root(root: &OwnedFd, path: &Path, follow_last: bool) -> nix::Result<OwnedFd> {
+    resolve(
+        root,
+        path,
+        Want::Existing { follow_last },
+        Method::Openat2First,
+    )
 }
 
 /// How to resolve: the kernel first, or only the walk (for tests: the walk
@@ -57,29 +82,43 @@ enum Method {
     WalkOnly,
 }
 
-fn resolve(root: &OwnedFd, path: &Path, leaf: Leaf, method: Method) -> nix::Result<OwnedFd> {
+fn resolve(root: &OwnedFd, path: &Path, want: Want, method: Method) -> nix::Result<OwnedFd> {
     if method == Method::Openat2First {
+        let mut flags = OFlag::O_PATH | OFlag::O_CLOEXEC;
+        if want == (Want::Existing { follow_last: false }) {
+            flags |= OFlag::O_NOFOLLOW;
+        }
         let how = OpenHow::new()
-            .flags(OFlag::O_PATH | OFlag::O_CLOEXEC)
+            .flags(flags)
             .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
         match openat2(root, relative(path), how) {
-            Ok(fd) => return checked(fd, leaf),
-            // Not there yet (the walk makes it), or no `openat2` here: the
-            // walk. Anything else is a real answer.
+            Ok(fd) => return checked(fd, want),
+            // Not there: the walk makes it, unless nothing is to be made.
+            Err(Errno::ENOENT) if matches!(want, Want::Existing { .. }) => {
+                return Err(Errno::ENOENT);
+            }
+            // Not there yet, or no `openat2` here: the walk. Anything else
+            // is a real answer.
             Err(Errno::ENOENT | Errno::ENOSYS | Errno::EPERM | Errno::EAGAIN | Errno::EXDEV) => {}
             Err(errno) => return Err(errno),
         }
     }
-    walk(root, path, leaf)
+    walk(root, path, want)
 }
 
-/// `path` without its leading `/`: relative to the root's descriptor.
+/// `path` without its leading `/`: relative to the root's descriptor (the
+/// root itself is `.`).
 fn relative(path: &Path) -> &Path {
-    path.strip_prefix("/").unwrap_or(path)
+    let relative = path.strip_prefix("/").unwrap_or(path);
+    if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    }
 }
 
 /// The walk: one component at a time, never following a symlink by path.
-fn walk(root: &OwnedFd, path: &Path, leaf: Leaf) -> nix::Result<OwnedFd> {
+fn walk(root: &OwnedFd, path: &Path, want: Want) -> nix::Result<OwnedFd> {
     let mut pending: VecDeque<OsString> = names(path).collect();
     // The directories above the current one, for `..`.
     let mut parents: Vec<OwnedFd> = Vec::new();
@@ -94,12 +133,18 @@ fn walk(root: &OwnedFd, path: &Path, leaf: Leaf) -> nix::Result<OwnedFd> {
             continue;
         }
         let last = pending.is_empty();
-        let next = match open_nofollow(&current, &name) {
-            Ok(next) => next,
-            Err(Errno::ENOENT) => make(&current, &name, if last { leaf } else { Leaf::Directory })?,
-            Err(errno) => return Err(errno),
+        let next = match (open_nofollow(&current, &name), want) {
+            (Ok(next), _) => next,
+            (Err(Errno::ENOENT), Want::Make(leaf)) => {
+                make(&current, &name, if last { leaf } else { Leaf::Directory })?
+            }
+            (Err(errno), _) => return Err(errno),
         };
         let kind = file_type(&next)?;
+        if kind == SFlag::S_IFLNK && last && want == (Want::Existing { follow_last: false }) {
+            // The link itself.
+            return Ok(next);
+        }
         if kind == SFlag::S_IFLNK {
             symlinks += 1;
             if symlinks > MAX_SYMLINKS {
@@ -121,7 +166,7 @@ fn walk(root: &OwnedFd, path: &Path, leaf: Leaf) -> nix::Result<OwnedFd> {
         }
         parents.push(std::mem::replace(&mut current, next));
     }
-    checked(current, leaf)
+    checked(current, want)
 }
 
 /// The names in `path`, with `..` kept (the walk handles it) and `/` and
@@ -162,8 +207,11 @@ fn make(dir: &OwnedFd, name: &OsStr, leaf: Leaf) -> nix::Result<OwnedFd> {
     }
 }
 
-/// `fd`, if it's the kind `leaf` asks for.
-fn checked(fd: OwnedFd, leaf: Leaf) -> nix::Result<OwnedFd> {
+/// `fd`, if it's the kind `want` asks for.
+fn checked(fd: OwnedFd, want: Want) -> nix::Result<OwnedFd> {
+    let Want::Make(leaf) = want else {
+        return Ok(fd);
+    };
     let is_directory = file_type(&fd)? == SFlag::S_IFDIR;
     match (leaf, is_directory) {
         (Leaf::Directory, false) => Err(Errno::ENOTDIR),
@@ -226,7 +274,82 @@ mod tests {
     const METHODS: [Method; 2] = [Method::Openat2First, Method::WalkOnly];
 
     fn resolved(root: &Scratch, path: &str, leaf: Leaf, method: Method) -> nix::Result<String> {
-        resolve(&root.fd, Path::new(path), leaf, method).map(|fd| root.inside(&fd))
+        resolve(&root.fd, Path::new(path), Want::Make(leaf), method).map(|fd| root.inside(&fd))
+    }
+
+    fn existing(
+        root: &Scratch,
+        path: &str,
+        follow_last: bool,
+        method: Method,
+    ) -> nix::Result<String> {
+        resolve(
+            &root.fd,
+            Path::new(path),
+            Want::Existing { follow_last },
+            method,
+        )
+        .map(|fd| root.inside(&fd))
+    }
+
+    #[test]
+    fn opening_what_exists_makes_nothing() {
+        for method in METHODS {
+            let root = Scratch::new(&format!("existing-{method:?}"));
+            assert_eq!(existing(&root, "/etc", false, method).unwrap(), "etc");
+            assert_eq!(
+                existing(&root, "/a/b", false, method),
+                Err(Errno::ENOENT),
+                "{method:?}"
+            );
+            assert_eq!(existing(&root, "/etc/b", true, method), Err(Errno::ENOENT));
+            assert!(!root.dir.join("a").exists() && !root.dir.join("etc/b").exists());
+        }
+    }
+
+    #[test]
+    fn the_root_itself_opens() {
+        for method in METHODS {
+            let root = Scratch::new(&format!("itself-{method:?}"));
+            assert_eq!(
+                existing(&root, "/", false, method).unwrap(),
+                "",
+                "{method:?}"
+            );
+            assert_eq!(existing(&root, "", true, method).unwrap(), "");
+        }
+    }
+
+    #[test]
+    fn the_last_link_is_followed_only_when_asked() {
+        for method in METHODS {
+            let root = Scratch::new(&format!("last-link-{method:?}"));
+            std::fs::write(root.dir.join("etc/passwd"), "the container's").unwrap();
+            // To the host's /etc, if followed naively.
+            std::os::unix::fs::symlink("/etc/passwd", root.dir.join("link")).unwrap();
+            std::os::unix::fs::symlink("/etc", root.dir.join("dir")).unwrap();
+            let fd = resolve(
+                &root.fd,
+                Path::new("/link"),
+                Want::Existing { follow_last: false },
+                method,
+            )
+            .unwrap();
+            assert_eq!(
+                file_type(&fd).unwrap(),
+                SFlag::S_IFLNK,
+                "{method:?}: the link itself"
+            );
+            assert_eq!(
+                existing(&root, "/link", true, method).unwrap(),
+                "etc/passwd"
+            );
+            // A link on the way is always followed, inside the root.
+            assert_eq!(
+                existing(&root, "/dir/passwd", false, method).unwrap(),
+                "etc/passwd"
+            );
+        }
     }
 
     #[test]

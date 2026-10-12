@@ -105,18 +105,53 @@ fn close_on_exec_again(setup: &super::setup::Setup) {
         .as_ref()
         .and_then(super::setup::RootSetup::attach);
     let terminal = setup.terminal.as_ref().map(|terminal| terminal.socket);
+    let passed = setup
+        .passing
+        .iter()
+        .flat_map(|passing| passing.sources.iter().copied());
     for fd in setup
         .gate
         .into_iter()
+        .flat_map(super::spawn::Gate::fds)
         .chain(hooks_pipe)
         .chain(attach)
         .chain(terminal)
+        .chain(passed)
     {
         let _ = nix::fcntl::fcntl(
             // SAFETY: inherited across the exec; borrowed only for this call.
             unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         );
+    }
+}
+
+/// The descriptors passed on to the command (see `passed.rs`) and their
+/// targets (3 and up), held from the start: what this process opens from
+/// then on (the report pipe made again after the gate, say) can't take one
+/// of their numbers. Dropped once the command has them: a socket it closes
+/// is then closed.
+struct Held {
+    _sources: Vec<OwnedFd>,
+    _reserved: Vec<OwnedFd>,
+}
+
+impl Held {
+    fn new(setup: &super::setup::Setup) -> Result<Self, Failure> {
+        // SAFETY: passed across the exec, this process's own (the setup
+        // names them).
+        let sources: Vec<OwnedFd> = setup
+            .passing
+            .iter()
+            .flat_map(|passing| passing.sources.iter())
+            .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect();
+        let reserved = super::passed::reserve(sources.len())
+            .map_err(|err| Failure::at(ChildStep::PassFds, err.errno().unwrap_or(Errno::EBUSY)))?;
+        Ok(Self {
+            _sources: sources,
+            _reserved: reserved,
+        })
     }
 }
 
@@ -158,6 +193,8 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     let setup =
         read_setup(setup_fd).unwrap_or_else(|errno| fail(Failure::at(ChildStep::ReadSetup, errno)));
     close_on_exec_again(&setup);
+    // Before anything is opened here (see `Held`).
+    let held = Held::new(&setup).unwrap_or_else(|failure| fail(failure));
     // The proof that this image started: without it, shipyard reports an
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);
@@ -212,6 +249,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         setup.parent,
         confinement,
         setgroups_allowed,
+        setup.passing.as_ref(),
     )
     .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
     context.namespace_root = setup
@@ -229,6 +267,10 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .unwrap_or_else(|errno| fail(Failure::at(ChildStep::Handshake, errno)))
     });
+    // Held until the command has `execve`d: see `hold_started`.
+    let started = setup.gate.and_then(|gate| gate.started).map(|fifo| {
+        hold_started(fifo).unwrap_or_else(|errno| fail(Failure::at(ChildStep::StartedFifo, errno)))
+    });
     // With a start gate (`shipyard-runtime create`): everything that can
     // fail before the command has been reported by now. Closing the report
     // pipe says "set up"; then wait for `start`. Nobody reads that pipe
@@ -238,7 +280,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         Some(gate) => {
             PANIC_REPORT.store(-1, Ordering::Relaxed);
             let _ = nix::unistd::close(report);
-            wait_at_gate(gate);
+            wait_at_gate(gate.fifo);
             match report_pipe() {
                 Ok((read, write)) => (write.into_raw_fd(), Some(read)),
                 Err(_) => (-1, None),
@@ -260,19 +302,34 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     };
     let command = start_command(&plan, report, go, last_cap)
         .unwrap_or_else(|errno| fail(Failure::at(ChildStep::InitFork, errno)));
-    // The command has its terminal: the init keeps no part of it.
-    drop(slave);
-    let (report, exec_failure) = match command_report {
+    // The command has its terminal: the init keeps no part of it. Nor of
+    // what's passed on: a socket the command closes is then closed.
+    drop((slave, held));
+    let (report, exec_failure) = await_exec(report, command_report, &context);
+    // It has `execve`d (or failed to): `start` may go on.
+    drop(started);
+    become_init(command, status, report, exec_failure)
+}
+
+/// Past a start gate (`command_report`, the report pipe made again there):
+/// waits until the command has `execve`d, or explains why it couldn't
+/// (`explain_failure`). Returns the report descriptor `become_init` is left
+/// with (-1: closed here) and the failure, if any.
+fn await_exec(
+    report: RawFd,
+    command_report: Option<OwnedFd>,
+    context: &FailureContext,
+) -> (RawFd, Option<u8>) {
+    match command_report {
         Some(read) => {
             // Our copy closed first, or the pipe never reaches end-of-file.
             let _ = nix::unistd::close(report);
             // Closed already: `become_init` must not close it (or a reused
             // descriptor number) again.
-            (-1, explain_failure(read, &context))
+            (-1, explain_failure(read, context))
         }
         None => (report, None),
-    };
-    become_init(command, status, report, exec_failure)
+    }
 }
 
 /// The command's pseudo-terminal's slave, if it has one: made here from the
@@ -320,14 +377,26 @@ fn make_terminal(
     gid: u32,
 ) -> Result<OwnedFd, Failure> {
     use nix::fcntl::OFlag;
-    let step =
-        |detail: usize| move |errno| Failure::at(ChildStep::TerminalOpen, errno).detail(detail);
     let master = nix::fcntl::open(
         "/dev/pts/ptmx",
         OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
-    .map_err(step(0))?;
+    .map_err(|errno| Failure::at(ChildStep::TerminalOpen, errno).detail(0))?;
+    terminal_from(master, terminal, uid, gid)
+}
+
+/// [`make_terminal`]'s steps from the master, opened (`exec`'s joiner opens
+/// it through the init's root: `exec.rs`): it must be a pseudo-terminal's
+/// master, or the ioctls fail (ENOTTY). Returns the slave.
+pub(super) fn terminal_from(
+    master: OwnedFd,
+    terminal: &super::setup::TerminalSetup,
+    uid: u32,
+    gid: u32,
+) -> Result<OwnedFd, Failure> {
+    let step =
+        |detail: usize| move |errno| Failure::at(ChildStep::TerminalOpen, errno).detail(detail);
     let unlock: libc::c_int = 0;
     // SAFETY: `TIOCSPTLCK` reads one int, which `unlock` is.
     Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSPTLCK, &raw const unlock) })
@@ -347,7 +416,8 @@ fn make_terminal(
         Some(nix::unistd::Gid::from_raw(gid)),
     )
     .map_err(step(4))?;
-    // SAFETY: inherited across the exec (see `Setup::terminal`), and ours.
+    // SAFETY: ours alone: inherited across the exec (see `Setup::terminal`),
+    // or, in `exec`'s joiner, its own copy.
     let socket = unsafe { OwnedFd::from_raw_fd(terminal.socket) };
     let sent = |errno| Failure::at(ChildStep::TerminalSend, errno);
     super::terminal::send_fd(socket.as_fd(), master.as_fd(), super::terminal::MASTER_NAME)
@@ -558,6 +628,21 @@ fn wait_at_gate(gate: RawFd) {
         }
     }
     let _ = nix::unistd::close(gate);
+}
+
+/// Opens the started FIFO (`O_PATH` at `fifo`, see `Gate::started`) for
+/// writing, close-on-exec, and closes `fifo`. `O_RDWR`: a FIFO opened so
+/// doesn't wait for a reader. Held until the command has `execve`d (or
+/// failed to): `start` runs its `poststart` hooks once nobody holds it.
+/// Opened before the gate, so it's held whenever `start` looks.
+fn hold_started(fifo: RawFd) -> nix::Result<OwnedFd> {
+    let opened = nix::fcntl::open(
+        format!("/proc/self/fd/{fifo}").as_str(),
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    );
+    let _ = nix::unistd::close(fifo);
+    opened
 }
 
 /// Waits until nobody has the pipe whose write end is `fifo` open for
@@ -908,7 +993,7 @@ fn join_session_keyring() -> Result<(), Errno> {
 
 /// `/proc/sys/kernel/cap_last_cap`: the number of this kernel's last
 /// capability (40 on Linux 5.9 and later).
-fn cap_last_cap() -> Result<u8, Errno> {
+pub(super) fn cap_last_cap() -> Result<u8, Errno> {
     let text = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(|err| super::io_errno(&err))?;
     text.trim().parse().map_err(|_| Errno::EINVAL)
@@ -917,12 +1002,12 @@ fn cap_last_cap() -> Result<u8, Errno> {
 /// This kernel's `(major, minor)` version, for a seccomp profile's
 /// `minKernel` conditions. `(0, 0)` if `uname` doesn't say: rules that need
 /// a newer kernel are then left out, and a filter can only get stricter.
-fn kernel_version() -> (u32, u32) {
+pub(super) fn kernel_version() -> (u32, u32) {
     crate::kernel::version(&crate::kernel::release()).unwrap_or_default()
 }
 
 /// A confinement this kernel can't apply, as a setup failure.
-fn confinement_failure(err: &ConfinementError) -> Failure {
+pub(super) fn confinement_failure(err: &ConfinementError) -> Failure {
     match err {
         ConfinementError::UnknownToKernel(capability) => {
             Failure::at(ChildStep::CapabilityUnknown, Errno::EINVAL)

@@ -30,6 +30,29 @@ use super::supervisor::NetworkHook;
 use crate::isolation::{Isolation, Join};
 use crate::{Error, Result};
 
+/// A `shipyard-runtime` container's start gate, inherited by its init
+/// (`init.rs`): descriptors `O_PATH` of FIFOs in its state directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Gate {
+    /// The exec FIFO: the init waits there until `start` takes its byte.
+    pub(crate) fifo: RawFd,
+    /// The started FIFO, if `start` runs `poststart` hooks: the init keeps
+    /// it open for writing (close-on-exec) until the command has
+    /// `execve`d, and `start` waits until nobody has it open so.
+    pub(crate) started: Option<RawFd>,
+}
+
+impl Gate {
+    /// Its descriptors.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux isolates")
+    )]
+    pub(crate) fn fds(self) -> impl Iterator<Item = RawFd> {
+        std::iter::once(self.fifo).chain(self.started)
+    }
+}
+
 /// How to start the process.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpawnOptions {
@@ -50,7 +73,7 @@ pub(crate) struct SpawnOptions {
         not(target_os = "linux"),
         allow(dead_code, reason = "only Linux isolates")
     )]
-    pub(crate) gate: Option<RawFd>,
+    pub(crate) gate: Option<Gate>,
     /// Isolated: the cgroup the container starts in (made by the caller,
     /// who removes it once the container is gone).
     #[cfg(target_os = "linux")]
@@ -58,6 +81,9 @@ pub(crate) struct SpawnOptions {
     /// The descriptors to put on the child's 0, 1 and 2 (`None`: keep
     /// shipyard's own). Open until `spawn` returns (see `stdio.rs`).
     pub(crate) stdio: [Option<RawFd>; 3],
+    /// Joined (`exec`): how.
+    #[cfg(target_os = "linux")]
+    pub(crate) exec: ExecSpawn,
     /// The command's pseudo-terminal: its slave (no isolation), or the
     /// socket the container's init sends it back on (see `stdio.rs`).
     pub(crate) terminal: Option<super::stdio::ChildTerminal>,
@@ -65,6 +91,10 @@ pub(crate) struct SpawnOptions {
     /// makes), so it starts a session of its own even on the host (see
     /// [`SpawnOptions::starts_session`]).
     pub(crate) takes_terminal: bool,
+    /// Descriptors passed on to the command (see `passed.rs`): their
+    /// numbers here (held open by the caller until `spawn` returns), and
+    /// socket activation's part.
+    pub(crate) passing: Option<super::passed::Passing>,
 }
 
 impl SpawnOptions {
@@ -75,6 +105,17 @@ impl SpawnOptions {
     pub(crate) fn starts_session(&self) -> bool {
         self.placement.has_own_session() || self.takes_terminal
     }
+}
+
+/// How a joined command (`exec`) starts.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExecSpawn {
+    /// Detached (`exec -d`): it outlives shipyard (no parent-death signal).
+    pub(crate) detach: bool,
+    /// `terminal`'s socket is an OCI console socket (`--console-socket`):
+    /// nothing answers on it (runc's protocol), unlike shipyard's relay.
+    pub(crate) console: bool,
 }
 
 /// Which namespaces the command starts in.
@@ -259,8 +300,10 @@ struct StatusPipe {
     /// There's an init (a PID namespace): otherwise the clean image became
     /// the command, and how it ended is the command's.
     has_init: bool,
-    /// A sealed copy of shipyard's binary was made for the init: checked
-    /// once the command runs (see [`warn_if_init_unsealed`]).
+    /// A sealed copy of shipyard's binary was made for the init, and the
+    /// file may stand in if the copy won't run (nobody in the container can
+    /// write it): which ran is checked once the command runs (see
+    /// [`warn_if_init_unsealed`]).
     #[cfg(target_os = "linux")]
     sealed_init: bool,
 }
@@ -279,6 +322,10 @@ pub(crate) fn spawn(
     network: Option<NetworkHook<'_>>,
     started: impl FnOnce(Pid),
 ) -> Result<Child> {
+    #[cfg(target_os = "linux")]
+    if let Placement::Join(join) = &options.placement {
+        return spawn_joined(spec, options, join, started);
+    }
     let (report_read, report_write) = report_pipe()?;
     let report = ReportReader::new(report_read)?;
     let (go_read, go_write) = go_pipe()?;
@@ -306,11 +353,6 @@ pub(crate) fn spawn(
         .map(|files| files.fds(report_write.as_raw_fd()));
     #[cfg(not(target_os = "linux"))]
     let reexec_fds = None;
-    #[cfg(target_os = "linux")]
-    let joining = match &options.placement {
-        Placement::Join(join) => Some(super::join::Joining::open(join)?),
-        Placement::Host | Placement::New(_) => None,
-    };
     // The container's cgroup, open, for the clone (before the plan, which
     // lists every descriptor the child must not keep).
     #[cfg(target_os = "linux")]
@@ -319,14 +361,7 @@ pub(crate) fn spawn(
         _ => None,
     };
     // Last, so its list of open descriptors includes the pipes above.
-    let (plan, context) = ChildPlan::new(
-        spec,
-        options,
-        handshake,
-        reexec_fds,
-        #[cfg(target_os = "linux")]
-        joining.as_ref().map(super::join::Joining::setup),
-    )?;
+    let (plan, context) = ChildPlan::new(spec, options, handshake, reexec_fds)?;
     let plan = ChildPlan {
         stdio: options.stdio,
         terminal: options.slave(),
@@ -341,8 +376,6 @@ pub(crate) fn spawn(
     let (pid, in_cgroup) = match unsafe {
         launch(
             options,
-            #[cfg(target_os = "linux")]
-            joining.as_ref(),
             #[cfg(target_os = "linux")]
             network_join.as_ref(),
             #[cfg(target_os = "linux")]
@@ -394,6 +427,208 @@ pub(crate) fn spawn(
         context,
         reaped: false,
     })
+}
+
+/// How long the joiner may take to start `exec`'s command (it takes
+/// milliseconds; a host under heavy load, more).
+#[cfg(target_os = "linux")]
+const JOINER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`spawn`] for a command joining a running container (`exec`; see
+/// `exec.rs`): the joiner starts it, in the container's namespaces and
+/// cgroup, as shipyard's own child.
+#[cfg(target_os = "linux")]
+fn spawn_joined(
+    spec: &ProcessSpec,
+    options: &SpawnOptions,
+    join: &Join,
+    started: impl FnOnce(Pid),
+) -> Result<Child> {
+    use super::exec::{joiner_files, read_record, start_joiner};
+    super::internal::refuse_unsafe_dumpable("exec")?;
+    // A joined command's terminal is made in the container, never on the
+    // host: never run it without the one it asked for.
+    if let Some(super::stdio::ChildTerminal::Slave(_)) = options.terminal {
+        return Err(Error::sys(
+            "a joined command's terminal is made in the container, not on the host",
+            Errno::EINVAL,
+        ));
+    }
+    let (report_read, report_write) = report_pipe()?;
+    let mut report = ReportReader::new(report_read)?;
+    let (go_read, go_write) = go_pipe()?;
+    let (record_read, record_write) = report_pipe()?;
+    let joining = super::join::Joining::open(join)?;
+    let cgroup = join
+        .cgroup
+        .as_ref()
+        .map(crate::cgroup::Cgroup::open_dir)
+        .transpose()?;
+    // The one recorded, checked on the descriptor the clone uses: not a
+    // directory made in its place since.
+    if let (Some(dir), Some(expected)) = (&cgroup, join.cgroup_inode)
+        && nix::sys::stat::fstat(dir).map(|stat| stat.st_ino).ok() != Some(expected)
+    {
+        return Err(Error::sys(
+            "the container's cgroup isn't the one it was given (made again since)",
+            Errno::ESTALE,
+        ));
+    }
+    // What explains the command's failures: the plan the joiner builds.
+    let context = super::plan::exec_failure_context(spec, join, options.passing.as_ref())?;
+    let files = joiner_files(
+        spec,
+        &options.keep_ignored,
+        &join.security,
+        &joining,
+        super::exec::JoinerPipes {
+            cgroup: cgroup.as_ref().map(AsRawFd::as_raw_fd),
+            report: report_write.as_raw_fd(),
+            go: go_read.as_raw_fd(),
+            record: record_write.as_raw_fd(),
+            terminal: exec_terminal(options, &joining),
+        },
+        options.exec.detach,
+        options.passing.as_ref(),
+    )?;
+    let mask = BlockAllSignals::new()?;
+    let mut joiner = start_joiner(&joining, &files, options.stdio)?;
+    // The joiner and its clone have their copies.
+    drop((report_write, go_read, record_write, files, joining, cgroup));
+    let record = read_record(&record_read, JOINER_WAIT);
+    if record.is_none() {
+        let _ = joiner.kill();
+    }
+    let _ = joiner.wait();
+    let Some((pid, in_cgroup)) = record else {
+        // A command it may have started waits for go: with our end
+        // closed, it gives up. What the joiner (or it) reported says why.
+        drop(go_write);
+        let failure = joiner_failure(&mut report, &context);
+        reap_stray_exec();
+        drop(mask);
+        return Err(failure);
+    };
+    let placed = match &join.cgroup {
+        Some(cgroup) if !in_cgroup => cgroup.add(pid).map_err(|err| match err {
+            crate::cgroup::CgroupError::Io {
+                errno: errno @ (Errno::EBUSY | Errno::EACCES | Errno::ENOENT),
+                ..
+            } => describe(
+                super::failure::ChildFailure {
+                    step: super::failure::ChildStep::ExecClone,
+                    errno,
+                    detail: 0,
+                },
+                &context,
+            )
+            .into(),
+            _ => Error::from(err),
+        }),
+        _ => Ok(()),
+    };
+    if let Err(err) = placed {
+        let _ = nix::sys::signal::kill(pid, NixSignal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(pid, None);
+        return Err(err);
+    }
+    started(pid);
+    drop(mask);
+    send_go(&go_write);
+    tracing::debug!(pid = pid.as_raw(), program = %context.program.display(), "joined");
+    Ok(Child {
+        pid,
+        // A session of its own.
+        group: Some(pid),
+        report: Some(report),
+        go: Some(go_write),
+        status: None,
+        hooks: None,
+        context,
+        reaped: false,
+    })
+}
+
+/// Reaps a command the joiner cloned before it failed, which it couldn't
+/// tell us about: with `CLONE_PARENT` it's our child (named after the
+/// joiner), gone by now (its go pipe closed). Unreaped, it would hold up the
+/// end of the container's PID namespace.
+#[cfg(target_os = "linux")]
+fn reap_stray_exec() {
+    let me = std::process::id().to_string();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        if field("PPid:") == Some(me.as_str()) && field("Name:") == Some("shipyard-exec") {
+            let _ = nix::sys::signal::kill(Pid::from_raw(pid), NixSignal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(Pid::from_raw(pid), None);
+        }
+    }
+}
+
+/// The joined command's terminal, if it has one (`exec -t`): the socket its
+/// master goes to (shipyard's relay, which answers, or a console socket,
+/// which doesn't), and the init's `/proc` directory, through whose root the
+/// joiner reaches the container's devpts.
+#[cfg(target_os = "linux")]
+fn exec_terminal(
+    options: &SpawnOptions,
+    joining: &super::join::Joining,
+) -> Option<(super::setup::TerminalSetup, RawFd)> {
+    match options.terminal {
+        Some(super::stdio::ChildTerminal::Socket { fd, size }) => Some((
+            super::setup::TerminalSetup {
+                socket: fd,
+                rows: size.0,
+                cols: size.1,
+                acknowledged: !options.exec.console,
+            },
+            joining.directory.as_raw_fd(),
+        )),
+        // (A slave made on the host: refused by `spawn_joined` already.)
+        Some(super::stdio::ChildTerminal::Slave(_)) | None => None,
+    }
+}
+
+/// Why the joiner gave up: the failure it (or the command) reported, once
+/// both are gone.
+#[cfg(target_os = "linux")]
+fn joiner_failure(report: &mut ReportReader, context: &FailureContext) -> Error {
+    let deadline = std::time::Instant::now() + JOINER_WAIT;
+    loop {
+        match report.read() {
+            Ok(Report::Failed(failure)) => return describe(failure, context).into(),
+            Ok(Report::Pending) if std::time::Instant::now() < deadline => {
+                let mut fds = [nix::poll::PollFd::new(
+                    report.fd(),
+                    nix::poll::PollFlags::POLLIN,
+                )];
+                let _ = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(100_u16));
+            }
+            Ok(_) => {
+                return Error::sys(
+                    "exec's joiner ended without starting the command",
+                    Errno::ECHILD,
+                );
+            }
+            Err(err) => return err,
+        }
+    }
 }
 
 /// Checks that our `/proc` numbers the child as we do, where the parent
@@ -511,7 +746,7 @@ struct CleanImageFiles {
     /// The setup, in a sealed memfd (see `setup.rs`).
     setup: OwnedFd,
     /// The start gate, if any (`SpawnOptions::gate`).
-    gate: Option<RawFd>,
+    gate: Option<Gate>,
     /// The hooks pipe (read, write), if the setup stops for hooks.
     hooks: Option<(OwnedFd, OwnedFd)>,
     /// An image's overlay made here (see [`prebuilt_overlay`]).
@@ -519,6 +754,8 @@ struct CleanImageFiles {
     /// The socket the init sends the container's terminal back on (the
     /// child's end: the supervisor holds it, and closes it after the spawn).
     terminal: Option<RawFd>,
+    /// The descriptors passed on to the command (the caller holds them).
+    passing: Vec<RawFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -536,7 +773,19 @@ impl CleanImageFiles {
             .then(hooks_pipe)
             .transpose()?;
         let overlay = prebuilt_overlay(isolation)?;
-        let (exe, host_exe) = own_binary()?;
+        // The binary's file, where no sealed copy can be made or run: only
+        // if nobody in the container could write it (CVE-2019-5736).
+        let maps = isolation
+            .id_maps
+            .as_ref()
+            .filter(|_| isolation.has(crate::isolation::Namespace::User));
+        let (exe, host_exe) = own_binary(
+            |file| super::internal::fallback_allowed(file, maps),
+            |why| Error::Unsealed {
+                what: "the container's init",
+                why,
+            },
+        )?;
         let terminal = match options.terminal {
             Some(super::stdio::ChildTerminal::Socket { fd, size }) => Some((fd, size)),
             Some(super::stdio::ChildTerminal::Slave(_)) | None => None,
@@ -565,12 +814,18 @@ impl CleanImageFiles {
                     // protocol); Shipyard's relay does.
                     acknowledged: options.gate.is_none(),
                 });
+                setup.passing.clone_from(&options.passing);
                 setup.to_memfd()?
             },
             gate: options.gate,
             hooks,
             overlay,
             terminal: terminal.map(|(fd, _)| fd),
+            passing: options
+                .passing
+                .as_ref()
+                .map(|passing| passing.sources.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -609,6 +864,7 @@ impl CleanImageFiles {
             hooks: self.hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
             overlay: self.overlay.as_ref().map(AsRawFd::as_raw_fd),
             terminal: self.terminal,
+            passing: self.passing.clone(),
         }
     }
 }
@@ -652,38 +908,71 @@ fn prebuilt_overlay(isolation: &Isolation) -> Result<Option<OwnedFd>> {
     Ok(Some(mounted))
 }
 
-/// The binary for the cloned child to re-exec as the container's init (see
-/// `init.rs`): a sealed in-memory copy of the running one, and the running
-/// one's file, for when a copy can't be run.
+/// Shipyard's binary for a process of its own that runs in a container (the
+/// init, `init.rs`; `exec`'s joiner; `cp`'s helper): a sealed in-memory copy
+/// of the running one, and the running one's file, for when a copy can't be
+/// run.
 ///
-/// The init runs inside the container, so the container could reach the
+/// Such a process is inside the container, so the container could reach the
 /// file it was started from (`/proc/1/exe`, with the right privileges):
 /// were that shipyard's binary on disk, container root could overwrite the
 /// program host root runs next (CVE-2019-5736). A sealed memfd can't be
 /// changed by anyone, as runc does. Both are opened before the clone, by
 /// descriptor: the file on disk may be replaced by an upgrade meanwhile.
 ///
-/// Where no copy can be made (`vm.memfd_noexec` at 2 refuses executable
-/// memfds), the file itself, with a warning: no worse than before.
+/// The file is run only where `file_allowed` says nobody in the container
+/// could write it ([`fallback_allowed`](super::internal::fallback_allowed)):
+/// it's given back for a copy that won't run only then, and where no copy
+/// can be made (`vm.memfd_noexec` at 2 refuses executable memfds) it's run
+/// in its place, with a warning, only then; else `unsealed()`.
 #[cfg(target_os = "linux")]
-fn own_binary() -> Result<(OwnedFd, Option<OwnedFd>)> {
+pub(super) fn own_binary(
+    file_allowed: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> bool,
+    unsealed: impl FnOnce(&'static str) -> Error,
+) -> Result<(OwnedFd, Option<OwnedFd>)> {
     let host = nix::fcntl::open(
         "/proc/self/exe",
         nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
-    .map_err(|e| Error::sys("opening shipyard's own binary for the container init", e))?;
-    match sealed_copy(&host) {
-        Ok(copy) => Ok((copy, Some(host))),
-        Err(errno) => {
+    .map_err(|e| Error::sys("opening shipyard's own binary", e))?;
+    let allowed = file_allowed(std::os::fd::AsFd::as_fd(&host));
+    match with_file_size_raised(|| sealed_copy(&host)) {
+        Ok(copy) => Ok((copy, allowed.then_some(host))),
+        Err(errno) if allowed => {
             tracing::warn!(
-                "couldn't make a sealed copy of shipyard's binary for the container's init \
-                 ({}); it runs the binary's file itself",
+                "couldn't make a sealed copy of shipyard's binary ({}); the binary's file \
+                 itself runs in the container",
                 errno.desc()
             );
             Ok((host, None))
         }
+        Err(Errno::EFBIG) => Err(unsealed(crate::error::UNSEALED_FILE_SIZE)),
+        Err(Errno::EACCES | Errno::EPERM | Errno::EINVAL) => {
+            Err(unsealed(crate::error::UNSEALED_POLICY))
+        }
+        // Out of memory, or of descriptors, say.
+        Err(errno) => Err(unsealed(errno.desc())),
     }
+}
+
+/// Runs `copy` with the soft file-size limit (`RLIMIT_FSIZE`) raised to the
+/// hard one, then puts it back: a caller's soft limit (`ulimit -S -f`) is
+/// meant for the files the container writes, not for the sealed copy of
+/// shipyard's binary, which would stop at it (`EFBIG`). A hard limit
+/// smaller than the binary still stops it.
+#[cfg(target_os = "linux")]
+fn with_file_size_raised<T>(copy: impl FnOnce() -> T) -> T {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let raised = getrlimit(Resource::RLIMIT_FSIZE)
+        .ok()
+        .filter(|(soft, hard)| soft < hard)
+        .filter(|&(_, hard)| setrlimit(Resource::RLIMIT_FSIZE, hard, hard).is_ok());
+    let result = copy();
+    if let Some((soft, hard)) = raised {
+        let _ = setrlimit(Resource::RLIMIT_FSIZE, soft, hard);
+    }
+    result
 }
 
 /// Warns if the container's init (`pid`) runs shipyard's binary file, not
@@ -698,8 +987,7 @@ fn warn_if_init_unsealed(pid: Pid) {
     {
         tracing::warn!(
             "the container's init runs shipyard's binary file ({}), not a sealed copy of it \
-             (this host refused to run the copy): root in the container could reach the file \
-             through /proc/1/exe",
+             (this host refused to run the copy); nobody in the container can write the file",
             exe.display()
         );
     }
@@ -772,21 +1060,9 @@ enum Launched {
 /// As for `fork`: the child may only run async-signal-safe code.
 unsafe fn launch(
     options: &SpawnOptions,
-    #[cfg(target_os = "linux")] joining: Option<&super::join::Joining>,
     #[cfg(target_os = "linux")] network_join: Option<&super::network::NetworkJoin>,
     #[cfg(target_os = "linux")] cgroup: Option<RawFd>,
 ) -> Result<Launched> {
-    #[cfg(target_os = "linux")]
-    if let Some(joining) = joining {
-        // SAFETY: the caller's contract.
-        return match unsafe { joining.fork() }? {
-            ForkResult::Child => Ok(Launched::Child),
-            ForkResult::Parent { child } => Ok(Launched::Parent {
-                pid: child,
-                in_cgroup: false,
-            }),
-        };
-    }
     #[cfg(target_os = "linux")]
     if let Some(isolation) = options.placement.isolation() {
         use super::clone::{Cloned, clone_process};
@@ -1253,7 +1529,7 @@ mod tests {
     fn the_inits_binary_is_a_sealed_copy() {
         use std::io::{Read as _, Seek as _, Write as _};
 
-        let (copy, host) = own_binary().unwrap();
+        let (copy, host) = own_binary(|_| true, |_| unreachable!()).unwrap();
         let host = host.expect("a copy, so the file itself as well");
         assert!(super::super::setup::is_sealed_setup(copy.as_raw_fd()));
         assert!(!super::super::setup::is_sealed_setup(host.as_raw_fd()));

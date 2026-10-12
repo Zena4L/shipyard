@@ -1,6 +1,6 @@
 //! A console socket, as a shim makes one for runc's `--console-socket`: a
 //! UNIX socket the runtime connects to, on which the container's init sends
-//! its terminal's master (`SCM_RIGHTS`, TLPI §61.13.3). What runc's own
+//! its terminal's master (`SCM_RIGHTS`, TLPI §61.13). What runc's own
 //! `recvtty` does, for one container.
 
 use std::io::{IoSliceMut, Read as _, Write as _};

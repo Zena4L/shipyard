@@ -356,6 +356,22 @@ impl Confinement {
         })
     }
 
+    /// A helper's confinement (see `process/helper.rs`), as root: only
+    /// [`CapabilitySet::HELPER`], and `no_new_privs`.
+    pub(crate) fn for_helper(last_cap: u8) -> Result<Self, ConfinementError> {
+        let helper = CapabilitySet::HELPER;
+        let sets = CapabilitySets {
+            bounding: helper,
+            effective: helper,
+            permitted: helper,
+            ..CapabilitySets::default()
+        };
+        Ok(Self {
+            no_new_privileges: true,
+            ..Self::from_sets(sets, last_cap)?
+        })
+    }
+
     /// The sets on a kernel whose last capability is `last_cap`; no
     /// keep-caps, no `no_new_privs` (the callers say).
     fn from_sets(sets: CapabilitySets, last_cap: u8) -> Result<Self, ConfinementError> {

@@ -45,7 +45,7 @@ pub enum RlimitKind {
 }
 
 impl RlimitKind {
-    const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::As,
         Self::Core,
         Self::Cpu,

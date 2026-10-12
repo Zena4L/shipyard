@@ -68,6 +68,12 @@ impl Failure {
         }
     }
 
+    /// Its errno (for a process that reports in its own terms: a helper).
+    #[cfg(target_os = "linux")]
+    pub(super) fn errno(&self) -> Errno {
+        self.errno
+    }
+
     /// The same failure, with a detail of its own encoding (a hook's: see
     /// `HookError::to_record`).
     #[cfg(target_os = "linux")]
@@ -128,6 +134,13 @@ pub(crate) unsafe fn child_main(plan: &ChildPlan, report: RawFd) -> ! {
 /// image, which sets the container up and starts the command (see
 /// `init.rs`).
 fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure> {
+    #[cfg(target_os = "linux")]
+    if let Some(exec) = &plan.exec {
+        // `exec`'s command: the joiner's record pipe, closed at once, so
+        // that shipyard's read of it ends with the joiner (see `exec.rs`).
+        // SAFETY: `close` is async-signal-safe; the descriptor is ours.
+        unsafe { libc::close(exec.close_first) };
+    }
     if let Some(handshake) = &plan.handshake {
         // Our copy of the parent's end of the go pipe: closed at once, so
         // that the pipe reports when the *parent's* copy closes.
@@ -143,8 +156,24 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     if let Some(join) = &plan.join {
         // Already in the container's PID namespace (see `join.rs`).
         join_namespaces(join)?;
-        // A session of its own, as an isolated command has.
+        if let Some(exec) = &plan.exec {
+            // Nothing of the host's stays open inside, not even until the
+            // exec (CVE-2016-9962): the namespace descriptors, the cgroup's,
+            // anything shipyard had open.
+            close_host_fds(exec, &plan.passed)?;
+        }
+        // A session of its own, as an isolated command has: out of the
+        // user's process group before it waits for anything (keys typed
+        // meanwhile aren't its).
         start_session()?;
+        if let Some(exec) = &plan.exec {
+            if exec.pause_ms > 0 {
+                pause_for_tests(exec.pause_ms);
+            }
+            if exec.relayed >= 0 {
+                wait_for_relay(exec.relayed)?;
+            }
+        }
         return prepare_and_exec(plan);
     }
     #[cfg(target_os = "linux")]
@@ -231,7 +260,11 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
     if let Some(slave) = plan.terminal {
         take_terminal(slave)?;
     }
-    mark_inherited_fds_cloexec(&plan.inherited_fds)?;
+    place_passed(plan)?;
+    if let Some(slot) = &plan.listen_pid {
+        slot.fill(nix::unistd::getpid().as_raw().cast_unsigned());
+    }
+    mark_inherited_fds_cloexec(&plan.inherited_fds, plan.sweep_from)?;
     apply_rlimits(plan)?;
     umask(Mode::from_bits_truncate(plan.umask));
 
@@ -249,7 +282,11 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
         confine_before_switch(confinement)?;
     }
     if let Some(credentials) = &plan.credentials {
-        switch_credentials(credentials)?;
+        #[cfg(target_os = "linux")]
+        let undumpable = plan.exec.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let undumpable = false;
+        switch_credentials(credentials, undumpable)?;
     }
     #[cfg(target_os = "linux")]
     if let Some(confinement) = &plan.confinement {
@@ -492,17 +529,39 @@ fn start_process_group() -> Result<(), Failure> {
     Err(Failure::at(ChildStep::ProcessGroup, last))
 }
 
-/// Marks every descriptor above 2 close-on-exec, so the command inherits only
-/// stdin, stdout and stderr. (Marking rather than closing keeps the report
-/// pipe usable until `exec` closes it.)
-fn mark_inherited_fds_cloexec(sweep: &FdSweep) -> Result<(), Failure> {
+/// Puts the passed descriptors (`plan.passed`) at 3, 4, … for the command
+/// (see `passed.rs`). Every one is above every target (the process that
+/// started this one made sure), so none is overwritten before it's copied;
+/// `dup2`'s copy isn't close-on-exec, so the command keeps it.
+fn place_passed(plan: &ChildPlan) -> Result<(), Failure> {
+    let mut target = super::passed::FIRST_PASSED;
+    for &source in &plan.passed {
+        // SAFETY: `dup2` is async-signal-safe; both are plain numbers.
+        if unsafe { libc::dup2(source, target) } == -1 {
+            return Err(Failure::at(ChildStep::PassFds, Errno::last()));
+        }
+        target = target.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Marks every descriptor from `from` up close-on-exec (3, or above the
+/// passed ones), so the command inherits only stdin, stdout and stderr, and
+/// what's passed on. (Marking rather than closing keeps the report pipe
+/// usable until `exec` closes it.)
+fn mark_inherited_fds_cloexec(sweep: &FdSweep, from: RawFd) -> Result<(), Failure> {
     #[cfg(target_os = "linux")]
-    if close_range_cloexec() {
+    if close_range_cloexec(from) {
         return Ok(());
     }
     match sweep {
-        FdSweep::Listed(fds) => fds.iter().try_for_each(|fd| set_cloexec(*fd)),
-        FdSweep::Below(bound) => (3..*bound).try_for_each(set_cloexec),
+        // Listed before the passed ones were put in place: what's below
+        // `from` now is theirs.
+        FdSweep::Listed(fds) => fds
+            .iter()
+            .filter(|&&fd| fd >= from)
+            .try_for_each(|fd| set_cloexec(*fd)),
+        FdSweep::Below(bound) => (from..*bound).try_for_each(set_cloexec),
     }
 }
 
@@ -510,13 +569,13 @@ fn mark_inherited_fds_cloexec(sweep: &FdSweep) -> Result<(), Failure> {
 /// (ENOSYS, or EINVAL before the flag existed) and some seccomp profiles
 /// (EPERM) need the slower loop instead.
 #[cfg(target_os = "linux")]
-fn close_range_cloexec() -> bool {
+fn close_range_cloexec(from: RawFd) -> bool {
     // SAFETY: `close_range` with CLOSE_RANGE_CLOEXEC only changes descriptor
     // flags; the arguments are plain integers.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_close_range,
-            3_u32,
+            u32::try_from(from).unwrap_or(3),
             u32::MAX,
             libc::CLOSE_RANGE_CLOEXEC,
         )
@@ -536,7 +595,7 @@ fn set_cloexec(fd: RawFd) -> Result<(), Failure> {
 
 /// Applies the resource limits. Done before switching user, because raising
 /// a hard limit needs privileges the new user may not have.
-fn apply_rlimits(plan: &ChildPlan) -> Result<(), Failure> {
+pub(super) fn apply_rlimits(plan: &ChildPlan) -> Result<(), Failure> {
     for (index, limit) in plan.rlimits.iter().enumerate() {
         let mut result = set_rlimit(limit.resource, limit.soft, limit.hard);
         if let (Err(Errno::EINVAL), Some(soft)) = (result, limit.fallback_soft) {
@@ -588,13 +647,133 @@ fn chdir(plan: &ChildPlan) -> Result<(), Errno> {
 /// parent's threads, which don't exist here: the wait never ends. (It hung,
 /// in a test binary with other threads running.) This process has one
 /// thread, so the raw call is the whole change.
-fn switch_credentials(credentials: &Credentials) -> Result<(), Failure> {
+fn switch_credentials(credentials: &Credentials, undumpable: bool) -> Result<(), Failure> {
+    // Each call is a credential change, which sets the process's
+    // dumpability to `fs.suid_dumpable`: `exec`'s command makes itself
+    // non-dumpable again after each (see `exec.rs`).
+    #[cfg(not(target_os = "linux"))]
+    let _ = undumpable;
+    let hide = || -> Result<(), Failure> {
+        #[cfg(target_os = "linux")]
+        if undumpable {
+            make_undumpable()?;
+        }
+        Ok(())
+    };
     if let Some(groups) = &credentials.groups {
         set_groups(groups)?;
+        hide()?;
     }
     set_gid(credentials.gid)?;
+    hide()?;
     set_uid(credentials.uid)?;
+    hide()?;
     verify_credentials(credentials)
+}
+
+/// `PR_SET_DUMPABLE` 0: `/proc/PID` becomes root's (the host's, for a
+/// process forked before it joined a user namespace) and ptrace is refused
+/// to anyone without `CAP_SYS_PTRACE` there (probe E4). Raw `prctl`.
+#[cfg(target_os = "linux")]
+pub(super) fn make_undumpable() -> Result<(), Failure> {
+    prctl(libc::PR_SET_DUMPABLE, 0, 0).map_err(|errno| Failure::at(ChildStep::Undumpable, errno))
+}
+
+/// Closes every descriptor from 3 up but those `exec` keeps (really closed,
+/// not only close-on-exec): `close_range` around them, or one by one up to
+/// the plan's bound where it's missing.
+#[cfg(target_os = "linux")]
+fn close_host_fds(exec: &super::plan::ExecChild, passed: &[RawFd]) -> Result<(), Failure> {
+    let as_u32 = |fd: RawFd| u32::try_from(fd).unwrap_or(0);
+    // Between the kept ones (in order; none below 3: 0, 1 and 2 stay): the
+    // plan's own, and the passed ones (ascending, checked by the joiner),
+    // merged as they're walked.
+    let mut keep = exec.keep;
+    keep.sort_unstable();
+    let (mut mine, mut theirs) = (keep.iter().peekable(), passed.iter().peekable());
+    let mut start = 3_u32;
+    loop {
+        let fd = match (mine.peek(), theirs.peek()) {
+            (Some(&&a), Some(&&b)) if a <= b => a,
+            (Some(_) | None, Some(&&b)) => b,
+            (Some(&&a), None) => a,
+            (None, None) => break,
+        };
+        if mine.peek() == Some(&&fd) {
+            mine.next();
+        } else {
+            theirs.next();
+        }
+        let fd = as_u32(fd);
+        if fd < start {
+            continue;
+        }
+        close_from(start, fd.saturating_sub(1), exec.fd_bound)?;
+        start = fd.saturating_add(1);
+    }
+    close_from(start, u32::MAX, exec.fd_bound)
+}
+
+/// Closes descriptors `start` to `end`: `close_range`, or one by one up to
+/// `bound` where it's missing (descriptors above it were never opened: the
+/// joiner is single-threaded).
+#[cfg(target_os = "linux")]
+pub(super) fn close_from(start: u32, end: u32, bound: RawFd) -> Result<(), Failure> {
+    if start > end {
+        return Ok(());
+    }
+    // SAFETY: `close_range` takes plain integers; it only closes.
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, start, end, 0_u32) };
+    if rc == -1 {
+        match Errno::last() {
+            // Before Linux 5.9, or refused by a seccomp profile.
+            Errno::ENOSYS | Errno::EPERM => {
+                let end = end.min(u32::try_from(bound).unwrap_or(u32::MAX));
+                let mut fd = start;
+                while fd <= end {
+                    // SAFETY: `close` is async-signal-safe; EBADF for a
+                    // number that isn't open is fine.
+                    unsafe { libc::close(RawFd::try_from(fd).unwrap_or(-1)) };
+                    fd = fd.saturating_add(1);
+                }
+            }
+            errno => return Err(Failure::at(ChildStep::CloseHostFds, errno)),
+        }
+    }
+    Ok(())
+}
+
+/// Waits for shipyard's relay to say it relays the terminal's master (one
+/// byte on its socket), then closes the socket: only then may the command
+/// write to its terminal. End-of-file: shipyard is gone.
+#[cfg(target_os = "linux")]
+fn wait_for_relay(socket: RawFd) -> Result<(), Failure> {
+    let mut byte = 0_u8;
+    loop {
+        // SAFETY: `read` is async-signal-safe; `byte` is one writable byte.
+        let n = unsafe { libc::read(socket, (&raw mut byte).cast(), 1) };
+        match n {
+            1 => break,
+            0 => return Err(Failure::at(ChildStep::TerminalSend, Errno::EPIPE).detail(1)),
+            _ if Errno::last() == Errno::EINTR => {}
+            _ => return Err(Failure::at(ChildStep::TerminalSend, Errno::last()).detail(1)),
+        }
+    }
+    // SAFETY: `close` is async-signal-safe; the descriptor is ours.
+    unsafe { libc::close(socket) };
+    Ok(())
+}
+
+/// Sleeps `ms` milliseconds (`nanosleep`: async-signal-safe), for tests.
+#[cfg(target_os = "linux")]
+fn pause_for_tests(ms: u32) {
+    // (`time_t` isn't named: deprecated on musl.)
+    let time = libc::timespec {
+        tv_sec: (ms / 1000).into(),
+        tv_nsec: libc::c_long::from(ms % 1000).saturating_mul(1_000_000),
+    };
+    // SAFETY: `nanosleep` reads `time`; no remainder is asked for.
+    unsafe { libc::nanosleep(&raw const time, std::ptr::null_mut()) };
 }
 
 /// A container's command, before the switch of user (TLPI ch. 39; the order
@@ -881,6 +1060,10 @@ fn groups_match(expected: &[libc::gid_t]) -> bool {
 /// running unsupervised. Set after the credential change, which clears it.
 #[cfg(target_os = "linux")]
 fn die_with_parent(plan: &ChildPlan) -> Result<(), Failure> {
+    // `exec -d`: it outlives `exec`, as the container's other processes do.
+    if plan.exec.is_some_and(|exec| exec.detach) {
+        return Ok(());
+    }
     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
         .map_err(|errno| Failure::at(ChildStep::ParentDeathSignal, errno))?;
     let Some(handshake) = &plan.handshake else {

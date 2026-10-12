@@ -2,7 +2,6 @@
 //! monitor, and the calls.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::io::Write as _;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
@@ -17,21 +16,30 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 
-use super::{ContainerError, Created, OCI_VERSION, Result, State, Status, validate_id};
+use super::{
+    ContainerError, CreateOptions, Created, LogOptions, LogsOf, OCI_VERSION, Result, State, Status,
+    StdinMode, validate_id,
+};
 use crate::cgroup;
 use crate::hooks::{ContainerHooks, Phase};
 use crate::isolation::Namespace;
+use crate::logs::info::LogSettings;
 use crate::oci::load_bundle_for_caller;
-use crate::process::spawn::{Placement, SpawnOptions, spawn};
-use crate::process::stdio::ChildTerminal;
-use crate::process::{ExitStatus, Signal};
+use crate::process::Signal;
 
 /// The monitor's hidden first argument (see [`monitor_entry_point`]).
 const MONITOR_ARG: &str = "__shipyard-monitor";
 
 const STATE_FILE: &str = "state.json";
 const FIFO: &str = "exec.fifo";
+/// Held open for writing by the container's init until its command has
+/// `execve`d (see `Gate::started`): made only for `poststart` hooks, which
+/// `start` runs after that.
+const STARTED: &str = "exec.started";
 const EXIT_FILE: &str = "exit";
+/// How the exit record gives the code, `… (exit code N)…`: written by the
+/// monitor, read by [`exit_code`].
+const EXIT_CODE: &str = "(exit code ";
 /// Left by a call that sends SIGKILL (`kill`, `kill --all`, `delete`): the
 /// container's end is theirs, not the OOM killer's, even if it struck
 /// earlier (a process it killed, and the container went on).
@@ -42,8 +50,9 @@ const KILLED_FILE: &str = "killed";
 /// draw in; a shim resizes it anyway.
 const DEFAULT_CONSOLE_SIZE: (u16, u16) = (24, 80);
 
-/// How long `start` waits for the init's answer at the gate, and `delete`
-/// for a killed container to stop.
+/// How long `start` waits for the init's answer at the gate (and, for
+/// `poststart` hooks, for the program to start, beyond its `startContainer`
+/// hooks' timeouts), and `delete` for a killed container to stop.
 const WAIT: Duration = Duration::from_secs(5);
 
 /// How often `delete` looks whether a killed container has stopped, and a
@@ -105,6 +114,27 @@ struct Record {
     /// its `create` killed before it could say so.
     #[serde(default)]
     cgroup_pending: bool,
+    /// Where its output goes (`create --log-dir`), if it's kept in logs.
+    /// Records from before 8.3b have none.
+    #[serde(default)]
+    logs: Option<RecordedLogs>,
+}
+
+/// A container's logs, as `create` made them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecordedLogs {
+    /// The directory, canonical.
+    dir: PathBuf,
+    /// Their rotation.
+    settings: LogSettings,
+    /// Whether the container takes input through attach (`--stdin`).
+    /// Records from before 8.3c have none.
+    #[serde(default)]
+    stdin: StdinMode,
+    /// The directory made, by identity: its path may come to name another.
+    /// Records from before 8.8c have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<super::DirIdentity>,
 }
 
 impl Record {
@@ -153,9 +183,12 @@ impl Record {
 /// Creates container `id` from the bundle in `bundle`, under `root`, and
 /// returns its init's PID (and the bundle's warnings) once it's set up and
 /// waiting for [`start`]. The container's standard input, output and error
-/// are the caller's.
+/// are the caller's, unless `options.logs` asks for its output to be kept
+/// in logs (`--log-dir`): then the monitor reads it, and its stdin is
+/// `/dev/null`.
 ///
-/// A bundle that asks for a terminal (`process.terminal`) needs `console`,
+/// A bundle that asks for a terminal (`process.terminal`) needs
+/// `options.console` (or logs, which then hold the terminal's output),
 /// a connected UNIX socket (runc's `--console-socket`): the container's init
 /// makes the pseudo-terminal inside the container and sends its master there
 /// (`SCM_RIGHTS`, with the name `/dev/ptmx`, no answer awaited), then closes
@@ -170,8 +203,9 @@ impl Record {
 /// A bad ID, a taken one, a bundle that can't be run (or has no PID
 /// namespace), a terminal without a console socket or the reverse
 /// ([`ContainerError::TerminalWithoutConsoleSocket`],
-/// [`ContainerError::ConsoleSocketWithoutTerminal`]), or a setup failure
-/// (with its message).
+/// [`ContainerError::ConsoleSocketWithoutTerminal`]), a console socket with
+/// logs, a log directory that exists ([`ContainerError::LogDirExists`]) or
+/// rotation out of bounds, or a setup failure (with its message).
 ///
 /// Without root, the container is rootless: a bundle without a user
 /// namespace gets one (with a warning), as `shipyard run --bundle` does.
@@ -179,14 +213,14 @@ pub fn create(
     root: &Path,
     id: &str,
     bundle: &Path,
-    console: Option<BorrowedFd<'_>>,
+    options: &CreateOptions<'_>,
 ) -> Result<Created> {
     validate_id(id)?;
     let bundle =
         std::fs::canonicalize(bundle).map_err(io(format!("the bundle {}", bundle.display())))?;
     // Everything a bundle can get wrong, before anything exists.
     let loaded = load_bundle_for_caller(&bundle)?;
-    console_matches(loaded.terminal.is_some(), console.is_some())?;
+    check_options(&loaded, options)?;
     // The container gets a cgroup below this process's part of the tree
     // (root's, or the user's delegated subtree). Without a PID namespace,
     // it's what finds and kills every process of the container, so then
@@ -238,6 +272,7 @@ pub fn create(
         hooks: hooks.clone(),
         cgroup_inode: None,
         cgroup_pending: false,
+        logs: None,
     };
     let cgroup = if let Ok(tree) = &tree {
         let path = loaded
@@ -256,21 +291,159 @@ pub fn create(
     } else {
         None
     };
-    match start_monitor(id, &dir_fd, record, console) {
+    // Made last, so that nothing before can fail and leave it behind.
+    let logs = match options.logs.as_ref().map(make_log_dir).transpose() {
+        Ok(logs) => logs,
+        Err(err) => {
+            remove_own(&dir, &dir_fd, cgroup.as_ref());
+            return Err(err);
+        }
+    };
+    record.logs = logs.as_ref().map(|made| made.recorded.clone());
+    let passed = Passed {
+        console: options.console,
+        logs: logs.as_ref().map(|made| made.dir.as_fd()),
+        fds: options.passed.filter(|passed| !passed.is_empty()),
+    };
+    match start_monitor(id, &dir_fd, record, passed, fifo_owner(&loaded.isolation)) {
         Ok(pid) => Ok(Created { pid, warnings }),
         Err(err) => {
+            let kept = logs.as_ref().and_then(keep_or_remove);
             // As the spec has it: a create that fails is a container
             // destroyed, and `poststop` follows. Not if a `delete` got here
             // first (killing a setup that hung, say): it destroyed the
             // container, and ran them.
             let removed = remove_own(&dir, &dir_fd, cgroup.as_ref());
-            let warnings = hooks
+            let mut warnings = hooks
                 .filter(|_| removed)
                 .map(|hooks| hooks.run_all(Phase::Poststop, None))
                 .unwrap_or_default();
+            warnings.extend(kept);
             Err(with_warnings(err, &warnings))
         }
     }
+}
+
+/// Refuses `options` that don't go with the bundle `loaded` (see
+/// [`console_matches`]), or rotation out of bounds.
+fn check_options(loaded: &crate::oci::Bundle, options: &CreateOptions<'_>) -> Result<()> {
+    console_matches(
+        loaded.terminal.is_some(),
+        options.console.is_some(),
+        options.logs.is_some(),
+    )?;
+    if let Some(logs) = &options.logs {
+        logs.settings.validate()?;
+        // A terminal's input has no end that closing could give: closing
+        // its master is a hang-up.
+        if logs.stdin == StdinMode::Once && loaded.terminal.is_some() {
+            return Err(ContainerError::StdinOnceWithTerminal);
+        }
+    }
+    Ok(())
+}
+
+/// After a failed `create`: its logs go too, unless something wrote to them
+/// (a hook that failed, say). Then they're kept, and this says where.
+///
+/// Through descriptors, never by its path: the parent may be anyone's to
+/// write in, and a directory renamed and a symlink put in its place there
+/// would turn a removal by path into one of whatever it leads to. Its files
+/// (there are only files) are removed in the directory itself; the
+/// directory, from its parent, only if that name is still it.
+fn keep_or_remove(made: &MadeLogDir) -> Option<String> {
+    keep_or_remove_at(&made.dir, &made.parent, &made.name, &made.recorded.dir)
+}
+
+/// After a `create` whose caller then failed it (its `--pid-file` couldn't
+/// be written, say): container `logs` kept or removed as a failed
+/// `create`'s are (kept if anything was written to them), and only the
+/// directory it made,
+/// found again by identity: one put at its path since is left as it is.
+/// Returns what's said of them (kept, or left), if anything.
+#[must_use]
+pub fn remove_failed_logs(logs: &LogsOf) -> Option<String> {
+    let left = || {
+        Some(format!(
+            "{} isn't the log directory its container was created with: left as it is",
+            logs.dir.display()
+        ))
+    };
+    let (Some(identity), Some(parent), Some(name)) =
+        (logs.identity, logs.dir.parent(), logs.dir.file_name())
+    else {
+        // Recorded before identities were (8.8c), or no name to find it by:
+        // only a path to go by.
+        return left();
+    };
+    let parent = open_directory(parent).ok()?;
+    let dir = match nix::fcntl::openat(
+        &parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(dir) => dir,
+        // Gone: nothing to remove.
+        Err(Errno::ENOENT) => return None,
+        // A link or a file in its place, say.
+        Err(_) => return left(),
+    };
+    if super::DirIdentity::of(dir.as_fd()).ok() != Some(identity) {
+        return left();
+    }
+    keep_or_remove_at(&dir, &parent, name, &logs.dir)
+}
+
+/// [`keep_or_remove`] for the directory open at `dir`, named `name` in
+/// `parent` (`path` is where it was made, for messages).
+fn keep_or_remove_at(
+    dir: &OwnedFd,
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Option<String> {
+    let written = nix::sys::stat::fstatat(
+        dir,
+        crate::logs::writer::CURRENT,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    )
+    .is_ok_and(|output| output.st_size > 0);
+    if written {
+        return Some(format!(
+            "its output so far is in {} (shipyard-runtime logs --log-dir)",
+            path.display()
+        ));
+    }
+    if let Ok(listed) = nix::dir::Dir::openat(
+        dir,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        let names: Vec<std::ffi::CString> = listed
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.file_name().to_owned())
+            .filter(|name| name.as_bytes() != b"." && name.as_bytes() != b"..")
+            .collect();
+        for name in names {
+            let _ = nix::unistd::unlinkat(
+                dir,
+                name.as_c_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            );
+        }
+    }
+    let ours = nix::sys::stat::fstat(dir).ok();
+    let there =
+        nix::sys::stat::fstatat(parent, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW).ok();
+    if let (Some(ours), Some(there)) = (ours, there)
+        && (ours.st_dev, ours.st_ino) == (there.st_dev, there.st_ino)
+    {
+        let _ = nix::unistd::unlinkat(parent, name, nix::unistd::UnlinkatFlags::RemoveDir);
+    }
+    None
 }
 
 /// `err`, with `warnings` (hooks that failed after it) added as lines of its
@@ -394,6 +567,14 @@ enum Answer {
     Failed(String),
 }
 
+/// Who the exec FIFO is given to: in a user namespace of its own, the
+/// container's root is another host user (root's container with mappings),
+/// and the FIFO it opens at its gate must be that user's, as runc's is.
+fn fifo_owner(isolation: &crate::isolation::Isolation) -> Option<(u32, u32)> {
+    let maps = isolation.id_maps.as_ref()?;
+    Some((maps.host_uid(0)?, maps.host_gid(0)?))
+}
+
 /// Fills the state directory open at `dir` in, starts the monitor and
 /// waits for its answer.
 ///
@@ -405,13 +586,32 @@ fn start_monitor(
     id: &str,
     dir: &OwnedFd,
     mut record: Record,
-    console: Option<BorrowedFd<'_>>,
+    passed: Passed<'_>,
+    fifo_owner: Option<(u32, u32)>,
 ) -> Result<i32> {
     let (answers, mut monitor) = {
         let _lock = lock_at(dir).map_err(locking(id))?;
-        nix::unistd::mkfifoat(dir, FIFO, Mode::S_IRUSR | Mode::S_IWUSR)
-            .map_err(errno_io("making the exec FIFO"))?;
-        let (answers, mut monitor) = spawn_monitor(dir, &record.bundle, console)?;
+        let poststart = record
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| !hooks.hooks.of(Phase::Poststart).is_empty());
+        for fifo in std::iter::once(FIFO).chain(poststart.then_some(STARTED)) {
+            nix::unistd::mkfifoat(dir, fifo, Mode::S_IRUSR | Mode::S_IWUSR)
+                .map_err(errno_io(format!("making {fifo}")))?;
+            if let Some((uid, gid)) = fifo_owner
+                && nix::unistd::geteuid().is_root()
+            {
+                nix::unistd::fchownat(
+                    dir,
+                    fifo,
+                    Some(nix::unistd::Uid::from_raw(uid)),
+                    Some(nix::unistd::Gid::from_raw(gid)),
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .map_err(errno_io(format!("giving {fifo} to the container's root")))?;
+            }
+        }
+        let (answers, mut monitor) = spawn_monitor(dir, &record.bundle, passed)?;
         let pid = i32::try_from(monitor.id()).unwrap_or(-1);
         // Our child: its PID can't be reused before we reap it.
         record.monitor = start_time(pid).map(|started| (pid, started));
@@ -432,13 +632,25 @@ fn start_monitor(
     }
 }
 
+/// The descriptors `create` gives the monitor besides the state directory.
+#[derive(Debug, Clone, Copy)]
+struct Passed<'a> {
+    /// The console socket, for the container's terminal.
+    console: Option<BorrowedFd<'a>>,
+    /// The log directory.
+    logs: Option<BorrowedFd<'a>>,
+    /// Descriptors for the container's process.
+    fds: Option<&'a crate::process::passed::PassedFds>,
+}
+
 /// Starts the monitor for the state directory open at `dir`, with the
-/// bundle at `bundle` (and the console socket `console`, for its terminal).
-/// Returns the pipe its answer comes on.
+/// bundle at `bundle` (and the console socket, log directory and the
+/// container's process's descriptors, `passed`). Returns the pipe its
+/// answer comes on.
 fn spawn_monitor(
     dir: &OwnedFd,
     bundle: &Path,
-    console: Option<BorrowedFd<'_>>,
+    passed: Passed<'_>,
 ) -> Result<(OwnedFd, std::process::Child)> {
     let (answers, answer_end) =
         nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(errno_io("making the monitor's pipe"))?;
@@ -451,19 +663,40 @@ fn spawn_monitor(
     };
     let answer_end = inheritable(answer_end.as_fd())?;
     let dir = inheritable(dir.as_fd())?;
-    let console = console.map(inheritable).transpose()?;
+    let console = passed.console.map(inheritable).transpose()?;
+    let logs = passed.logs.map(inheritable).transpose()?;
+    // The container's process's: their own numbers, not copies (a copy
+    // each would be a third set of them under the descriptor limit), made
+    // inheritable in the child alone.
+    let passing = passed.fds.map(crate::process::passed::PassedFds::passing);
+    let inherit: Vec<RawFd> = passing
+        .as_ref()
+        .map(|passing| passing.sources.clone())
+        .unwrap_or_default();
     let mut command = std::process::Command::new("/proc/self/exe");
+    // In `/`, not the caller's directory: it lives as long as the container,
+    // and a working directory pins its mount (unmounting it fails, busy).
+    // It needs none: the bundle's path is absolute, the rest descriptors.
+    command.current_dir("/");
     // A session of its own (and so a process group) from the start, before
     // it runs any code: the caller's terminal closing, or a Ctrl-C meant for
     // the caller, never reaches it. In the child, before the exec: `setsid`
     // fails for a process-group leader, so it can't come after
     // `process_group(0)`, nor in the monitor once something made it one.
     // SAFETY: the closure runs between `fork` and `exec`; it only calls
-    // `setsid`, which is async-signal-safe, and reads `errno`.
+    // `setsid` and `fcntl`, which are async-signal-safe, reads `errno`, and
+    // walks a list made before the fork (no allocation).
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            for &fd in &inherit {
+                // `fcntl` is async-signal-safe; the numbers were read
+                // before the fork.
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -474,7 +707,11 @@ fn spawn_monitor(
         .arg(bundle)
         .arg(dir.as_raw_fd().to_string())
         .arg(answer_end.as_raw_fd().to_string())
-        .args(console.as_ref().map(|fd| fd.as_raw_fd().to_string()))
+        .args(monitor::tagged(
+            console.as_ref().map(AsRawFd::as_raw_fd),
+            logs.as_ref().map(AsRawFd::as_raw_fd),
+            passing.as_ref(),
+        ))
         .spawn()
         .map_err(io("starting the container's monitor"))?;
     Ok((answers, monitor))
@@ -517,188 +754,27 @@ fn read_answer(answers: &OwnedFd, monitor: &mut std::process::Child) -> Result<A
     }
 }
 
-// --- The monitor -------------------------------------------------------------
+// --- The monitor (monitor.rs, capture.rs) ---------------------------------------
 
-/// Where this binary starts as a container's monitor. Does nothing unless
-/// started that way (by [`create`], with the hidden first argument);
-/// otherwise it never returns. **Call it first thing in `main`**, next to
-/// [`init_entry_point`](crate::process::init_entry_point).
-pub fn monitor_entry_point() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    if args.get(1).map(OsString::as_os_str) != Some(MONITOR_ARG.as_ref()) {
-        return;
-    }
-    // As for the CLI itself: a privileged start (setuid, file capabilities)
-    // gets no further. Anyone can start this entry point by hand.
-    if let Err(err) = crate::process::refuse_privileged_start() {
-        let _ = writeln!(std::io::stderr(), "shipyard-monitor: {err}");
-        std::process::exit(125);
-    }
-    let fd = |at: usize| {
-        args.get(at)
-            .and_then(|fd| fd.to_str()?.parse::<RawFd>().ok())
-            .filter(|&fd| fd > 2)
-    };
-    // The console socket, the fifth, is there when the bundle asks for a
-    // terminal.
-    let console = match args.get(5) {
-        None => Some(None),
-        Some(_) => fd(5).map(Some),
-    };
-    if let ([_, _, bundle, ..], Some(dir), Some(ready), Some(console)) =
-        (args.as_slice(), fd(3), fd(4), console)
-        && dir != ready
-        && console.is_none_or(|console| console != dir && console != ready)
-        && args.len() <= 6
-    {
-        // SAFETY: all passed by `create` across the exec, and distinct; this
-        // process owns them.
-        let (dir, ready, console) = unsafe {
-            (
-                OwnedFd::from_raw_fd(dir),
-                OwnedFd::from_raw_fd(ready),
-                console.map(|fd| OwnedFd::from_raw_fd(fd)),
-            )
-        };
-        monitor(&dir, Path::new(bundle), ready, console);
-    }
-    let _ = std::io::stderr()
-        .write_all(b"shipyard: this is a container monitor's internal entry point\n");
-    std::process::exit(125);
-}
+mod attach;
+mod capture;
+mod exec;
+mod helper;
+mod monitor;
 
-/// Spawns the container, answers `create`, then waits for the container to
-/// end and records how.
-///
-/// The state directory is `dir`, open since `create` made it, never a
-/// path: once `delete` has removed it, a path could name a newer
-/// container's directory (same ID), and this one's records would land
-/// there. Through the descriptor, writing into a removed directory fails.
-fn monitor(dir: &OwnedFd, bundle: &Path, ready: OwnedFd, console: Option<OwnedFd>) -> ! {
-    // (A session of its own already: `spawn_monitor` made it one.)
-    // Whatever the caller left open (not close-on-exec) would be held for
-    // the container's whole life: a pipe whose reader waits for end-of-file,
-    // say. The container gets the caller's stdio; the monitor keeps nothing
-    // else but the directory, the answer pipe and the console socket.
-    let mut keep = vec![dir.as_raw_fd(), ready.as_raw_fd()];
-    keep.extend(console.as_ref().map(AsRawFd::as_raw_fd));
-    close_inherited(&keep);
-    // An ignored SIGCHLD survives `exec`: a caller that ignores it (`trap ''
-    // CHLD`) would pass it on, and the kernel would then reap the
-    // container's init (and the map helpers) itself, leaving nothing to
-    // wait for: how the container ended would be lost (TLPI §26.3.3). The
-    // container's own processes get the default back anyway (`child.rs`).
-    // SAFETY: installing SIG_DFL runs none of our code in a signal context.
-    let _ = unsafe {
-        nix::sys::signal::signal(
-            nix::sys::signal::Signal::SIGCHLD,
-            nix::sys::signal::SigHandler::SigDfl,
-        )
-    };
-    // None is the container's or its hooks'. (The init gets the console
-    // socket its own way: the spawn passes it on.)
-    for fd in [
-        Some(dir.as_fd()),
-        Some(ready.as_fd()),
-        console.as_ref().map(AsFd::as_fd),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let _ = nix::fcntl::fcntl(
-            fd,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        );
-    }
-    let answer = |answer: &Answer| {
-        let mut line = serde_json::to_vec(answer).unwrap_or_default();
-        line.push(b'\n');
-        // One write: well under the pipe's buffer, so it lands whole.
-        let _ = nix::unistd::write(&ready, &line);
-    };
-    // `create` wrote it while holding the lock, so it's there once the lock
-    // is free. Without it, or with a cgroup that doesn't check out, the
-    // container would run without its cgroup (and limits) or its hooks:
-    // better not at all.
-    let (cgroup, hooks) = match container_setup(dir) {
-        Ok(setup) => setup,
-        Err(err) => {
-            answer(&Answer::Failed(format!(
-                "reading the container's state: {err}"
-            )));
-            std::process::exit(1);
-        }
-    };
-    // The cgroup goes with the container: the monitor removes it, killing
-    // whatever is left.
-    let remove_cgroup = || {
-        if let Some(cgroup) = &cgroup {
-            remove_cgroup_at(dir, cgroup);
-        }
-    };
-    let (mut child, pid) = match spawn_container(dir, bundle, cgroup.clone(), hooks, console) {
-        Ok(created) => created,
-        Err(message) => {
-            remove_cgroup();
-            answer(&Answer::Failed(message));
-            std::process::exit(1);
-        }
-    };
-    if let Err(err) = record_init(dir, pid) {
-        child.kill_all();
-        let _ = child.reap();
-        remove_cgroup();
-        answer(&Answer::Failed(err.to_string()));
-        std::process::exit(1);
-    }
-    answer(&Answer::Created(pid));
-    drop(ready);
-    // The container holds the caller's stdio now; the monitor lets go of
-    // it, so a reader sees end-of-file when the container closes it.
-    null_stdio();
-    let status = child.reap();
-    // Read before the cgroup goes: whether the OOM killer struck, and the
-    // SIGKILL wasn't someone's `kill`.
-    let killed =
-        nix::sys::stat::fstatat(dir, KILLED_FILE, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW).is_ok();
-    let oom = cgroup
-        .as_ref()
-        .map(cgroup::Cgroup::oom_events)
-        .filter(|events| !killed && events.kills > 0);
-    // Before "stopped" is recorded: a stopped container has nothing left.
-    remove_cgroup();
-    let ended = match status {
-        Ok(status)
-            if status.killed_by_sigkill()
-                && let Some(oom) = oom =>
-        {
-            format!("{} ({})", describe_exit(status), oom.cause())
-        }
-        Ok(status) => describe_exit(status),
-        Err(err) => format!("unknown ({err})"),
-    };
-    if let Ok(_lock) = lock_at(dir) {
-        let _ = write_atomically_at(dir, EXIT_FILE, ended.as_bytes());
-    }
-    std::process::exit(0);
-}
+pub use exec::exec;
+pub use helper::{helper_entry_point, start_helper};
 
-/// What the monitor needs from `state.json` in the state directory open at
-/// `dir`: the container's cgroup, if it has one, and its hooks.
-fn container_setup(dir: &OwnedFd) -> Result<(Option<cgroup::Cgroup>, Option<ContainerHooks>)> {
-    let _lock = lock_at(dir).map_err(errno_io("locking the state directory"))?;
-    let record = read_record_at(dir)?
-        .ok_or_else(|| ContainerError::Setup("the container was deleted".into()))?;
-    let cgroup = record.container_cgroup().transpose()?;
-    Ok((cgroup, record.hooks))
-}
+pub use monitor::monitor_entry_point;
 
 /// As runc: a terminal (the bundle's `process.terminal`) goes to a console
-/// socket, and a console socket is for a terminal.
-fn console_matches(terminal: bool, console: bool) -> Result<()> {
-    match (terminal, console) {
-        (true, false) => Err(ContainerError::TerminalWithoutConsoleSocket),
-        (false, true) => Err(ContainerError::ConsoleSocketWithoutTerminal),
+/// socket, and a console socket is for a terminal. With logs, the terminal
+/// goes into them instead, and a console socket has nothing to receive.
+fn console_matches(terminal: bool, console: bool, logs: bool) -> Result<()> {
+    match (terminal, console, logs) {
+        (_, true, true) => Err(ContainerError::ConsoleSocketWithLogs),
+        (true, false, false) => Err(ContainerError::TerminalWithoutConsoleSocket),
+        (false, true, false) => Err(ContainerError::ConsoleSocketWithoutTerminal),
         _ => Ok(()),
     }
 }
@@ -716,93 +792,6 @@ fn without_cgroup(isolation: &crate::isolation::Isolation, why: &str) -> Result<
     Ok(())
 }
 
-/// Spawns the container held at the start gate (running `create`'s hooks,
-/// as `hooks` lists them, on the way), and waits until it's set up. A
-/// failure is the message for `create`.
-///
-/// With a terminal, its init sends the master to `console` once it has made
-/// the pseudo-terminal; this process's copy of the socket is closed once the
-/// spawn has passed it on, so the receiver sees end-of-file when the init
-/// closes its own.
-fn spawn_container(
-    dir: &OwnedFd,
-    bundle: &Path,
-    cgroup: Option<cgroup::Cgroup>,
-    hooks: Option<ContainerHooks>,
-    console: Option<OwnedFd>,
-) -> std::result::Result<(crate::process::spawn::Child, i32), String> {
-    // Read again, it may have changed since `create` checked it.
-    let mut bundle = load_bundle_for_caller(bundle).map_err(|err| err.to_string())?;
-    console_matches(bundle.terminal.is_some(), console.is_some()).map_err(|err| err.to_string())?;
-    let terminal = bundle
-        .terminal
-        .zip(console.as_ref())
-        .map(|(terminal, console)| ChildTerminal::Socket {
-            fd: console.as_raw_fd(),
-            size: terminal.size.unwrap_or(DEFAULT_CONSOLE_SIZE),
-        });
-    if cgroup.is_none() {
-        without_cgroup(&bundle.isolation, "none could be made when it was created")
-            .map_err(|err| err.to_string())?;
-    }
-    bundle.isolation.hooks = hooks;
-    let gate = nix::fcntl::openat(
-        dir,
-        FIFO,
-        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| format!("opening the exec FIFO: {}", errno.desc()))?;
-    let options = SpawnOptions {
-        new_process_group: false,
-        keep_ignored: Vec::new(),
-        placement: Placement::New(Box::new(bundle.isolation)),
-        gate: Some(gate.as_raw_fd()),
-        cgroup,
-        // The OCI runtime's: the container keeps the caller's stdio, or
-        // takes its terminal's.
-        stdio: [None; 3],
-        terminal,
-        takes_terminal: terminal.is_some(),
-    };
-    let mut child =
-        spawn(&bundle.spec, &options, None, |_| {}).map_err(|err| format!("{err:#}"))?;
-    drop(gate);
-    drop(console);
-    // The report pipe's end-of-file means "set up, at the gate" — or that
-    // the init died, which also closes it.
-    let created = wait_for_report(&mut child);
-    let pid = child.pid().as_raw();
-    match created {
-        Ok(()) if !exited(pid) => Ok((child, pid)),
-        Ok(()) => {
-            let status = child
-                .reap()
-                .map_or_else(|err| err.to_string(), describe_exit);
-            Err(format!("the container ended while being set up ({status})"))
-        }
-        Err(err) => {
-            let _ = child.reap();
-            Err(err.to_string())
-        }
-    }
-}
-
-/// Waits (blocking) until the report pipe resolves. No deadline, as runc's
-/// `create` has none: a setup hung in the kernel (a mount on a dead NFS
-/// server) hangs `create` too, and `delete --force` (or a signal) ends it;
-/// one that fails reports at once, and a dead init closes the pipe.
-fn wait_for_report(child: &mut crate::process::spawn::Child) -> crate::Result<()> {
-    loop {
-        child.check_exec()?;
-        let Some(report) = child.report_fd() else {
-            return Ok(());
-        };
-        let mut fds = [PollFd::new(report, PollFlags::POLLIN)];
-        let _ = poll(&mut fds, PollTimeout::NONE);
-    }
-}
-
 /// Whether child `pid` has exited (not reaping it).
 fn exited(pid: i32) -> bool {
     let id = nix::sys::wait::Id::Pid(nix::unistd::Pid::from_raw(pid));
@@ -815,30 +804,166 @@ fn exited(pid: i32) -> bool {
     )
 }
 
-/// Records the init in `state.json`: its PID and start time. Fails if the
-/// container was deleted meanwhile.
-fn record_init(dir: &OwnedFd, pid: i32) -> Result<()> {
-    let _lock = lock_at(dir).map_err(errno_io("locking the state directory"))?;
-    let mut record = read_record_at(dir)?
-        .ok_or_else(|| ContainerError::Setup("the container was deleted".into()))?;
-    let started = start_time(pid)
-        .ok_or_else(|| ContainerError::Setup("the container's init vanished".into()))?;
-    record.init = Some((pid, started));
-    write_record_at(dir, &record)
+/// A log directory `create` made: what's recorded of it, its descriptor, and
+/// where it is (its parent's descriptor, and its name there).
+struct MadeLogDir {
+    recorded: RecordedLogs,
+    dir: OwnedFd,
+    parent: OwnedFd,
+    name: std::ffi::OsString,
 }
 
-fn describe_exit(status: ExitStatus) -> String {
-    format!("{status} (exit code {})", status.code())
-}
-
-fn null_stdio() {
-    if let Ok(null) = nix::fcntl::open("/dev/null", OFlag::O_RDWR, Mode::empty()) {
-        for fd in 0..=2 {
-            // SAFETY: `dup2` onto the standard descriptors, which nothing in
-            // this process uses any more.
-            unsafe { libc::dup2(null.as_raw_fd(), fd) };
+/// Makes the log directory `options.dir` (which mustn't exist: making it is
+/// what claims it, so no two containers share one, and nobody else has
+/// planted anything in it), 0700, and opens it. Returns what `state.json`
+/// records of it, and its descriptor for the monitor.
+fn make_log_dir(options: &LogOptions) -> Result<MadeLogDir> {
+    let path = &options.dir;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io(format!("the log directory {}", path.display()))(
+            std::io::Error::other("not a directory's path"),
+        ));
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = std::fs::canonicalize(parent).map_err(io(format!(
+        "the log directory's parent {}",
+        parent.display()
+    )))?;
+    let parent_fd = open_directory(&parent)?;
+    match nix::sys::stat::mkdirat(&parent_fd, name, Mode::S_IRWXU) {
+        Ok(()) => {}
+        Err(Errno::EEXIST) => return Err(ContainerError::LogDirExists(path.clone())),
+        Err(errno) => return Err(errno_io(format!("making {}", path.display()))(errno)),
+    }
+    let dir = parent.join(name);
+    let made = (|| {
+        let fd = nix::fcntl::openat(
+            &parent_fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(errno_io(format!("opening {}", dir.display())))?;
+        // The one made just now: not another put in its place meanwhile
+        // (the parent may be anyone's to write in).
+        let made =
+            nix::sys::stat::fstat(&fd).map_err(errno_io(format!("checking {}", dir.display())))?;
+        if made.st_uid != nix::unistd::geteuid().as_raw() {
+            return Err(io(format!("the log directory {}", dir.display()))(
+                std::io::Error::other("replaced by someone else's while it was made"),
+            ));
+        }
+        // Exactly 0700, whatever the umask made of it.
+        nix::sys::stat::fchmod(&fd, Mode::S_IRWXU)
+            .map_err(errno_io(format!("setting {}'s mode", dir.display())))?;
+        Ok((fd, super::DirIdentity::from_stat(&made)))
+    })();
+    match made {
+        Ok((fd, identity)) => Ok(MadeLogDir {
+            recorded: RecordedLogs {
+                dir,
+                settings: options.settings,
+                stdin: options.stdin,
+                identity: Some(identity),
+            },
+            dir: fd,
+            parent: parent_fd,
+            name: name.to_owned(),
+        }),
+        Err(err) => {
+            let _ = nix::unistd::unlinkat(&parent_fd, name, nix::unistd::UnlinkatFlags::RemoveDir);
+            Err(err)
         }
     }
+}
+
+/// Where container `id`'s logs are, and whether they're complete (the
+/// monitor writes the exit record once it has drained the container's
+/// output into them; or the monitor is gone).
+///
+/// # Errors
+///
+/// No such container, or [`ContainerError::NotCaptured`] for one created
+/// without logs.
+pub fn logs_of(root: &Path, id: &str) -> Result<LogsOf> {
+    let dir = existing(root, id)?;
+    let record = read_record(&dir)?.ok_or_else(|| ContainerError::NotFound(id.to_owned()))?;
+    let logs = record
+        .logs
+        .ok_or_else(|| ContainerError::NotCaptured(id.to_owned()))?;
+    // The monitor writes the exit once it has drained the output into the
+    // logs; a monitor that died (killed) writes nothing more either.
+    let finished = std::fs::symlink_metadata(dir.join(EXIT_FILE)).is_ok()
+        || record
+            .monitor
+            .is_none_or(|(pid, started)| !is_alive(pid, started));
+    Ok(LogsOf {
+        dir: logs.dir,
+        finished,
+        identity: logs.identity,
+        instance: record.monitor,
+    })
+}
+
+/// Connects to container `id`'s `attach.sock`, through its state directory
+/// (the path may be longer than a socket address holds).
+///
+/// # Errors
+///
+/// No such container, one created without logs
+/// ([`ContainerError::NotAttachable`]), one that's stopped, or a monitor
+/// that's gone.
+pub fn attach_stream(root: &Path, id: &str) -> Result<std::os::unix::net::UnixStream> {
+    let dir = existing(root, id)?;
+    let record = read_record(&dir)?.ok_or_else(|| ContainerError::NotFound(id.to_owned()))?;
+    if record.logs.is_none() {
+        return Err(ContainerError::NotAttachable(id.to_owned()));
+    }
+    let status = status_of(&dir)?;
+    if status == Status::Stopped {
+        return Err(wrong(id, status, "attach", LIVE_WANTED));
+    }
+    let fd = nix::fcntl::open(
+        &dir,
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(errno_io(format!("opening {}", dir.display())))?;
+    let path = format!("/proc/self/fd/{}/{}", fd.as_raw_fd(), attach::SOCKET);
+    std::os::unix::net::UnixStream::connect(path).map_err(|err| match err.kind() {
+        // Created by a Shipyard before attach: no socket.
+        std::io::ErrorKind::NotFound => ContainerError::NotAttachable(id.to_owned()),
+        // The socket is there, nobody listens: its monitor was killed, or
+        // has just let go of it as the container ended (see `exit_code`).
+        std::io::ErrorKind::ConnectionRefused => ContainerError::MonitorGone(id.to_owned()),
+        _ => io(format!("connecting to container {id}'s monitor"))(err),
+    })
+}
+
+/// Container `id`'s exit code, if it has ended (as its monitor recorded it).
+///
+/// # Errors
+///
+/// No such container.
+pub fn exit_code(root: &Path, id: &str) -> Result<Option<i32>> {
+    let dir = existing(root, id)?;
+    let Ok(ended) = std::fs::read_to_string(dir.join(EXIT_FILE)) else {
+        return Ok(None);
+    };
+    Ok(recorded_code(&ended))
+}
+
+/// The code in an exit record (none in one that doesn't know it).
+fn recorded_code(ended: &str) -> Option<i32> {
+    ended
+        .split(EXIT_CODE)
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|code| code.parse().ok())
 }
 
 // --- start, state, kill, delete -----------------------------------------------
@@ -896,9 +1021,71 @@ pub fn start(root: &Path, id: &str) -> Result<Vec<String>> {
     // Not under the lock: a hook may well ask for the container's state.
     drop(lock);
     if let Some((hooks, pid)) = record.and_then(|record| Some((record.hooks?, record.init?.0))) {
+        // After the program has started, as the spec says: once nobody
+        // holds the started FIFO for writing (the init's command has
+        // `execve`d, or it's gone).
+        // Its `startContainer` hooks run first: their time is theirs.
+        let hooks_time: u64 = hooks
+            .hooks
+            .of(Phase::StartContainer)
+            .iter()
+            .filter_map(|hook| hook.timeout)
+            .map(u64::from)
+            .sum();
+        warnings.extend(wait_started(
+            &dir,
+            id,
+            WAIT + Duration::from_secs(hooks_time),
+        ));
         warnings.extend(hooks.run_all(Phase::Poststart, Some(pid)));
     }
     Ok(warnings)
+}
+
+/// Waits until container `id`'s command has `execve`d: until nobody has
+/// its started FIFO open for writing (its init holds it till then; see
+/// `Gate::started`), up to `allowed`, then removes it. On a FIFO with no
+/// writer left, a read gives end of file; with one, `EAGAIN` (non-blocking).
+/// `poll` would report the hang-up here too (a writer was there when this
+/// opened it), but not for a non-blocking reader opened with no writer yet:
+/// a read has no such exception. A warning past `allowed`: the hooks run
+/// anyway.
+fn wait_started(dir: &Path, id: &str, allowed: Duration) -> Option<String> {
+    let path = dir.join(STARTED);
+    let fifo = match nix::fcntl::open(
+        &path,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fifo) => fifo,
+        // None made (no `poststart` hooks when it was created).
+        Err(Errno::ENOENT) => return None,
+        Err(errno) => return Some(format!("opening the started FIFO: {}", errno.desc())),
+    };
+    let _ = std::fs::remove_file(&path);
+    let deadline = std::time::Instant::now() + allowed;
+    let mut byte = [0_u8; 1];
+    loop {
+        match nix::unistd::read(fifo.as_fd(), &mut byte) {
+            Ok(0) => return None,
+            // A writer is left (or wrote, which nobody should: ignored).
+            Ok(_) | Err(Errno::EAGAIN | Errno::EINTR) => {}
+            Err(errno) => {
+                return Some(format!(
+                    "waiting for the program to start: {}",
+                    errno.desc()
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(format!(
+                "container {id}'s program hadn't started after {} s: its poststart hooks ran \
+                 anyway",
+                allowed.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// Container `id`'s state.
@@ -1192,6 +1379,39 @@ pub fn delete(root: &Path, id: &str, force: bool) -> Result<Vec<String>> {
 
 // --- The state directory -------------------------------------------------------
 
+/// Which of `kinds` process `target` has that this process doesn't share
+/// (one it shares is joined already). One it has exited from reads as none.
+///
+/// # Errors
+///
+/// Its namespaces aren't this user's to look at
+/// ([`crate::Error::JoinNotYours`], or as root, [`crate::Error::JoinRefused`]).
+fn unshared(
+    target: u32,
+    kinds: &[crate::isolation::Namespace],
+) -> std::result::Result<Vec<crate::isolation::Namespace>, crate::Error> {
+    use std::os::unix::fs::MetadataExt as _;
+    let inode = |pid: &str, kind: crate::isolation::Namespace| match std::fs::metadata(format!(
+        "/proc/{pid}/ns/{}",
+        kind.proc_name()
+    )) {
+        Ok(meta) => Ok(Some(meta.ino())),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(crate::process::join::permission_denied())
+        }
+        Err(_) => Ok(None),
+    };
+    let target = target.to_string();
+    let mut found = Vec::new();
+    for &kind in kinds {
+        let theirs = inode(&target, kind)?;
+        if theirs.is_some() && theirs != inode("self", kind)? {
+            found.push(kind);
+        }
+    }
+    Ok(found)
+}
+
 /// `ROOT/ID`, which must exist: a directory, not a symlink to one.
 fn existing(root: &Path, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
@@ -1419,22 +1639,7 @@ fn write_atomically_at(dir: &OwnedFd, name: &str, bytes: &[u8]) -> nix::Result<(
 /// hasn't exited (a zombie counts as gone).
 fn start_time(pid: i32) -> Option<u64> {
     let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat(&stat)
-}
-
-/// The start time in a `/proc/PID/stat` line, unless the process is a
-/// zombie. The command name (field 2) can hold anything, spaces and `)`
-/// included, so the fields after it are counted from its last `)`.
-fn parse_stat(stat: &[u8]) -> Option<u64> {
-    let after = stat.iter().rposition(|&b| b == b')')?;
-    let rest = std::str::from_utf8(stat.get(after + 1..)?).ok()?;
-    let mut fields = rest.split_whitespace();
-    // Fields 3 (the state) to 22 (the start time).
-    let state = fields.next()?;
-    if state == "Z" || state == "X" {
-        return None;
-    }
-    fields.nth(18)?.parse().ok()
+    crate::process::start_time_in(&stat)
 }
 
 /// Whether `pid` is still the process (an init or a monitor) recorded with
@@ -1484,6 +1689,55 @@ fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()
 mod tests {
     use super::*;
 
+    /// A failed create's logs, removed after it (`--pid-file`), only if the
+    /// directory at their path is still the one made: one put there since,
+    /// with its own files, is left as it is, and the empty one made goes.
+    #[test]
+    fn failed_logs_are_removed_only_from_the_directory_made() {
+        let base =
+            std::env::temp_dir().join(format!("shipyard-failed-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let path = base.join("logs");
+        std::fs::create_dir(&path).unwrap();
+        let made = open_directory(&path).unwrap();
+        let logs = LogsOf {
+            dir: path.clone(),
+            finished: true,
+            identity: Some(super::super::DirIdentity::of(made.as_fd()).unwrap()),
+            instance: None,
+        };
+        drop(made);
+        // Another put in its place: kept, with what's in it.
+        std::fs::rename(&path, base.join("moved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("theirs"), "keep me").unwrap();
+        let said = remove_failed_logs(&logs).unwrap();
+        assert!(said.contains("isn't the log directory"), "{said}");
+        assert!(path.join("theirs").exists());
+        // The one made, back at its path: removed.
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::rename(base.join("moved"), &path).unwrap();
+        assert_eq!(remove_failed_logs(&logs), None);
+        assert!(!path.exists());
+        // A link in its place: left, and nothing removed through it.
+        std::fs::create_dir(base.join("moved")).unwrap();
+        std::os::unix::fs::symlink(base.join("moved"), &path).unwrap();
+        assert!(remove_failed_logs(&logs).is_some());
+        assert!(base.join("moved").exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(base.join("moved")).unwrap();
+        // A record from before identities: only a path, so left.
+        std::fs::create_dir(&path).unwrap();
+        let unknown = LogsOf {
+            identity: None,
+            ..logs
+        };
+        assert!(remove_failed_logs(&unknown).is_some());
+        assert!(path.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn the_start_time_is_found_after_any_command_name() {
         // Fields 3 (the state) to 21, then the start time, then more.
@@ -1492,10 +1746,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let line = format!("42 (a ) b (c) {fields_after} 777 23\n");
-        assert_eq!(parse_stat(line.as_bytes()), Some(777));
+        assert_eq!(crate::process::start_time_in(line.as_bytes()), Some(777));
         let zombie = line.replacen(") S", ") Z", 1);
-        assert_eq!(parse_stat(zombie.as_bytes()), None, "a zombie is gone");
-        assert_eq!(parse_stat(b"garbage"), None);
+        assert_eq!(
+            crate::process::start_time_in(zombie.as_bytes()),
+            None,
+            "a zombie is gone"
+        );
+        assert_eq!(crate::process::start_time_in(b"garbage"), None);
     }
 
     #[test]
@@ -1528,6 +1786,7 @@ mod tests {
             hooks: None,
             cgroup_inode: None,
             cgroup_pending: false,
+            logs: None,
         };
         let fd = open_directory(&dir).unwrap();
         let write_record = |_: &Path, record: &Record| write_record_at(&fd, record);

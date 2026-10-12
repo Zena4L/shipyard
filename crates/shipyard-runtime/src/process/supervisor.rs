@@ -8,8 +8,9 @@
 //! shipyard's process group: Ctrl-C, Ctrl-Z and hangup reach both from the
 //! kernel, and the shell's job control works on the pair. Without one (CI,
 //! services, scripts), the command gets its own group, so everything it
-//! starts can be killed together. Handing the host terminal to the command is
-//! deliberately not done: containers get their own pseudo-terminal in stage 8.
+//! starts can be killed together. An isolated command never gets the host
+//! terminal (stage 8): it gets pipes, or with `-t` a pseudo-terminal of its
+//! own (made inside the container), whose session it leads.
 //!
 //! **Which signals are forwarded.** In its own group, the command can only
 //! get a signal sent to shipyard if shipyard forwards it, so everything is
@@ -90,6 +91,12 @@ pub struct Supervisor {
     inherited: Vec<libc::pid_t>,
     /// The command's standard descriptors (see [`set_stdio`](Self::set_stdio)).
     stdio: Stdio,
+    /// Called once the command's `exec` has succeeded, during a run of
+    /// [`supervise_exec`](Self::supervise_exec).
+    running: Option<Box<dyn FnOnce()>>,
+    /// Descriptors to pass on to the next command (see
+    /// [`pass`](Self::pass)): closed once it has its own.
+    passed: Option<super::passed::PassedFds>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -99,6 +106,19 @@ impl std::fmt::Debug for Supervisor {
 }
 
 impl Supervisor {
+    /// Passes `passed` on to the next command started (`--preserve-fds`,
+    /// socket activation: see `passed.rs`), at 3 and up. This keeps them
+    /// until then, and closes them once it has its own.
+    pub fn pass(&mut self, passed: super::passed::PassedFds) {
+        self.passed = Some(passed);
+    }
+
+    /// The descriptors to pass on to the next command, taken: held by the
+    /// caller until it's spawned, then dropped.
+    fn take_passed(&mut self) -> Option<super::passed::PassedFds> {
+        self.passed.take().filter(|passed| !passed.is_empty())
+    }
+
     /// Installs the signal handlers (see [`Supervisor`]) and, on Linux, makes
     /// shipyard a *child subreaper*: processes the command leaves behind are
     /// re-parented to shipyard instead of init, so it can clean them up.
@@ -115,6 +135,8 @@ impl Supervisor {
             signals,
             inherited,
             stdio: Stdio::default(),
+            running: None,
+            passed: None,
         })
     }
 
@@ -122,9 +144,9 @@ impl Supervisor {
     /// input, output and error: shipyard's own by default. A
     /// [`Relay`](super::Stream::Relay) stream is a pipe, relayed to or from
     /// shipyard's own descriptor for as long as the command runs, and then
-    /// until its last output is written out (see `stdio.rs`). A joined
-    /// command ([`supervise_joined`](Self::supervise_joined)) keeps
-    /// shipyard's own.
+    /// until its last output is written out (see `stdio.rs`), for a joined
+    /// command too (`exec`'s, where one of shipyard's is a terminal: see
+    /// `Stdio::sparing_terminals`).
     pub fn set_stdio(&mut self, stdio: Stdio) {
         self.stdio = stdio;
     }
@@ -161,7 +183,7 @@ impl Supervisor {
         let placement = isolation.map_or(Placement::Host, |isolation| {
             Placement::New(Box::new(isolation.clone()))
         });
-        self.run(spec, stop, placement, None)
+        self.run(spec, stop, placement, None, RunExtras::default())
     }
 
     /// Like [`supervise`](Self::supervise), with `network` called once the
@@ -191,13 +213,17 @@ impl Supervisor {
             ));
         }
         let placement = Placement::New(Box::new(isolation.clone()));
-        self.run(spec, stop, placement, Some(network))
+        self.run(spec, stop, placement, Some(network), RunExtras::default())
     }
 
     /// Like [`supervise`](Self::supervise), but the command starts inside
     /// the namespaces of a process that's already running (`join.target`,
-    /// normally a container's init), as `exec` into a container does
-    /// (Linux).
+    /// normally a container's init) (Linux).
+    ///
+    /// The primitive under `exec`: `shipyard-runtime exec` goes through
+    /// `supervise_exec`, which adds the container's confinement from its
+    /// snapshot, its `running` check, and what's said when the command never
+    /// ran (`Error::ExecHeldUp`). This joins and supervises, nothing more.
     ///
     /// The command is shipyard's own child, supervised exactly like an
     /// isolated one: a session of its own, signals forwarded, the same stop
@@ -210,19 +236,142 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// An invalid `join`, Linux only, root only ([`Error::JoinNeedsRoot`], or
+    /// An invalid `join`, Linux only, not this user's ([`Error::JoinNotYours`], or
     /// [`Error::JoinRefused`] as root), no such process
     /// ([`Error::NoSuchProcess`]), a container that is exiting
     /// ([`Error::ContainerExiting`]), a `/proc` of another PID namespace
-    /// ([`Error::ForeignProc`]), standard descriptors other than shipyard's
-    /// own ([`Error::StdioForJoin`]), or a failure to start the command.
+    /// ([`Error::ForeignProc`]), or a failure to start the command.
     pub fn supervise_joined(
         &mut self,
         spec: &ProcessSpec,
         stop: StopPolicy,
         join: &Join,
     ) -> Result<ExitStatus> {
-        self.run(spec, stop, Placement::Join(join.clone()), None)
+        self.run(
+            spec,
+            stop,
+            Placement::Join(join.clone()),
+            None,
+            RunExtras::default(),
+        )
+    }
+
+    /// `exec`: like [`supervise_joined`](Self::supervise_joined), with the
+    /// command's environment exactly as `spec` has it (no `TERM` added), and
+    /// `running` called once its `exec` has succeeded (the container's lock
+    /// is released then: see `container::exec`). With a terminal: relayed
+    /// as [`set_stdio`](Self::set_stdio)'s says, or, with `console` (an OCI
+    /// console socket, open, and the terminal's size), its master sent there
+    /// and nothing relayed.
+    ///
+    /// # Errors
+    ///
+    /// As [`supervise_joined`](Self::supervise_joined).
+    pub fn supervise_exec(
+        &mut self,
+        spec: &ProcessSpec,
+        stop: StopPolicy,
+        join: &Join,
+        console: Option<(std::os::fd::RawFd, (u16, u16))>,
+        running: impl FnOnce() + 'static,
+    ) -> Result<ExitStatus> {
+        self.running = Some(Box::new(running));
+        let result = self.run(
+            spec,
+            stop,
+            Placement::Join(join.clone()),
+            None,
+            RunExtras {
+                exact_env: true,
+                console,
+            },
+        );
+        // Not called (the command never ran): dropped now.
+        self.running = None;
+        result
+    }
+
+    /// `exec -d`: starts `spec` in `join`'s namespaces and returns its PID
+    /// once its `exec` has succeeded, leaving it running: it outlives
+    /// shipyard (no parent-death signal), and whoever inherits it reaps it
+    /// (the caller, while it lives: it's the caller's child).
+    ///
+    /// # Errors
+    ///
+    /// As [`supervise_joined`](Self::supervise_joined): the command never
+    /// ran (it's been reaped).
+    pub fn start_detached(
+        &mut self,
+        spec: &ProcessSpec,
+        join: &Join,
+        console: Option<(std::os::fd::RawFd, (u16, u16))>,
+    ) -> Result<u32> {
+        // Taken first: a refusal below lets go of them too.
+        let held = self.take_passed();
+        check_join(join)?;
+        let placement = Placement::Join(join.clone());
+        check_stdio(&placement, self.stdio)?;
+        // Nobody relays once this returns: `/dev/null`, not a relay, in
+        // place of a terminal (see `Stdio::sparing_terminals`, which never
+        // asks for one here; this guards other callers).
+        if [self.stdio.stdin, self.stdio.stdout, self.stdio.stderr].contains(&super::Stream::Relay)
+        {
+            return Err(Error::sys(
+                "a detached command's standard descriptors can't be relayed",
+                Errno::EINVAL,
+            ));
+        }
+        let (child_ends, _) = super::stdio::prepare(self.stdio, true)?;
+        let spec = resolve_names(Cow::Borrowed(spec), &placement)?;
+        let options = SpawnOptions {
+            stdio: child_ends.targets(),
+            placement,
+            keep_ignored: self.keep_ignored(),
+            #[cfg(target_os = "linux")]
+            exec: super::spawn::ExecSpawn {
+                detach: true,
+                console: console.is_some(),
+            },
+            // Its terminal, if it has one, goes to the console socket.
+            terminal: console.map(|(fd, size)| super::stdio::ChildTerminal::Socket { fd, size }),
+            takes_terminal: console.is_some(),
+            passing: held.as_ref().map(super::passed::PassedFds::passing),
+            ..SpawnOptions::default()
+        };
+        let spawned = spawn(&spec, &options, None, |_| {});
+        // The command has its own copies now (or there's no command).
+        drop((held, child_ends));
+        let mut child = spawned?;
+        let by = Instant::now() + EXEC_WAIT;
+        loop {
+            if let Err(err) = child.check_exec().and_then(|()| match child.report_fd() {
+                Some(_) => exec_not_held_up(&child, by),
+                None => Ok(()),
+            }) {
+                child.kill_all();
+                reap_killed(&mut child);
+                return Err(err);
+            }
+            if child.report_fd().is_none() {
+                // Run, unless it was killed before its exec (by the container,
+                // or with it).
+                if let Ok(
+                    nix::sys::wait::WaitStatus::Exited(..)
+                    | nix::sys::wait::WaitStatus::Signaled(..),
+                ) =
+                    nix::sys::wait::waitpid(child.pid(), Some(nix::sys::wait::WaitPidFlag::WNOHANG))
+                {
+                    return Err(Error::ExecHeldUp(
+                        "it ended before it ran (killed by the container, or with it)",
+                    ));
+                }
+                return Ok(child.pid().as_raw().cast_unsigned());
+            }
+            if let Some(report) = child.report_fd() {
+                let mut fds = [PollFd::new(report, PollFlags::POLLIN)];
+                let _ = poll(&mut fds, PollTimeout::from(100_u16));
+            }
+        }
     }
 
     fn run(
@@ -231,6 +380,7 @@ impl Supervisor {
         stop: StopPolicy,
         placement: Placement,
         network: Option<NetworkHook<'_>>,
+        extras: RunExtras,
     ) -> Result<ExitStatus> {
         stop.validate()?;
         match &placement {
@@ -256,37 +406,36 @@ impl Supervisor {
                 "giving the command its own process group"
             }
         );
-        let spec = self.with_term(spec, terminal.is_some());
+        let spec = self.with_term_unless(spec, terminal.is_some(), extras.exact_env);
         let spec = resolve_names(spec, &placement)?;
         // Before the run's cgroup: a failure here leaves nothing to remove.
         let (child_ends, mut relay) =
-            super::stdio::prepare(self.stdio, matches!(placement, Placement::New(_)))?;
+            super::stdio::prepare(self.stdio, !matches!(placement, Placement::Host))?;
         #[cfg(target_os = "linux")]
         let cgroup = make_run_cgroup(&placement)?;
-        #[cfg(target_os = "linux")]
-        let hooks = placement
-            .isolation()
-            .and_then(|isolation| isolation.hooks.clone());
-        #[cfg(not(target_os = "linux"))]
-        let hooks = None;
+        let hooks = container_hooks(&placement);
+        let held = self.take_passed();
         let options = SpawnOptions {
             stdio: child_ends.targets(),
-            terminal: child_ends.terminal(),
-            takes_terminal: pty,
+            terminal: extras
+                .console
+                .map(|(fd, size)| super::stdio::ChildTerminal::Socket { fd, size })
+                .or(child_ends.terminal()),
+            takes_terminal: pty || extras.console.is_some(),
             placement,
             // A command taking a terminal starts its own session: it mustn't
             // be made a group leader first.
             new_process_group: job_terminal.is_none() && !pty,
-            keep_ignored: self
-                .signals
-                .ignored_at_startup()
-                .iter()
-                .copied()
-                .filter(|signal| KEEP_IGNORED.contains(signal))
-                .collect(),
+            keep_ignored: self.keep_ignored(),
             gate: None,
             #[cfg(target_os = "linux")]
             cgroup: cgroup.as_ref().map(|run| run.cgroup().clone()),
+            #[cfg(target_os = "linux")]
+            exec: super::spawn::ExecSpawn {
+                detach: false,
+                console: extras.console.is_some(),
+            },
+            passing: held.as_ref().map(super::passed::PassedFds::passing),
         };
         let started = |pid: Pid| self.signals.set_child(pid.as_raw());
         // Whether shipyard itself killed the command (its stop timeout): then
@@ -301,9 +450,9 @@ impl Supervisor {
         // would take.
         let mut stop_requested = false;
         let spawned = spawn(&spec, &options, network, started);
-        // The child has its copies (or there's no child): with ours closed,
-        // the command's stdin reads end-of-file when the relay closes it.
-        drop(child_ends);
+        // The child has its copies (or there's none): with ours closed, its
+        // stdin ends when the relay closes it, and so do passed sockets.
+        drop((child_ends, held));
         let result = spawned.and_then(|mut child| {
             let result = self.watch(
                 &mut child,
@@ -364,8 +513,18 @@ impl Supervisor {
         mut relay: Option<&mut Relay>,
     ) -> Result<Ended> {
         let mut timers = StopTimers::default();
+        // `exec`'s command must run (exec) by then: until it does, it holds
+        // the container's lock.
+        let exec_by = self.running.is_some().then(|| Instant::now() + EXEC_WAIT);
         loop {
-            self.wait_for_event(child, timers.next_wake(), relay.as_deref())?;
+            let wake = match (
+                timers.next_wake(),
+                exec_by.filter(|_| child.report_fd().is_some()),
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            self.wait_for_event(child, wake, relay.as_deref())?;
             let mut continued = false;
             // With a pseudo-terminal relayed, the user's terminal's own
             // signals are for it, not the command: a resize resizes it (the
@@ -408,12 +567,19 @@ impl Supervisor {
             // reported as such, not as an ordinary exit.
             let resolving = child.report_fd().is_some();
             child.check_exec()?;
-            if resolving
-                && child.report_fd().is_none()
-                && let Some(hooks) = hooks
+            if let Some(by) = exec_by
+                && child.report_fd().is_some()
             {
-                // The command runs: failures are only warnings now.
-                run_warning(hooks, Phase::Poststart, Some(child.pid().as_raw()));
+                exec_not_held_up(child, by)?;
+            }
+            if resolving && child.report_fd().is_none() {
+                if let Some(running) = self.running.take() {
+                    running();
+                }
+                if let Some(hooks) = hooks {
+                    // The command runs: failures are only warnings now.
+                    run_warning(hooks, Phase::Poststart, Some(child.pid().as_raw()));
+                }
             }
             if let Some(status) = reap_children(child, &mut self.inherited)? {
                 return Ok(Ended {
@@ -437,6 +603,32 @@ impl Supervisor {
                 // SIGCONT.)
                 child.continue_all();
             }
+        }
+    }
+
+    /// The signals the command keeps ignoring: those shipyard was told to
+    /// ignore (`nohup`, a script's `&`) that matter to it.
+    fn keep_ignored(&self) -> Vec<c_int> {
+        self.signals
+            .ignored_at_startup()
+            .iter()
+            .copied()
+            .filter(|signal| KEEP_IGNORED.contains(signal))
+            .collect()
+    }
+
+    /// [`with_term`](Self::with_term), unless the spec's environment is to
+    /// be kept exactly (`exec`).
+    fn with_term_unless<'a>(
+        &self,
+        spec: &'a ProcessSpec,
+        shipyard_has_one: bool,
+        exact: bool,
+    ) -> Cow<'a, ProcessSpec> {
+        if exact {
+            Cow::Borrowed(spec)
+        } else {
+            self.with_term(spec, shipyard_has_one)
         }
     }
 
@@ -518,7 +710,12 @@ impl Supervisor {
         let Some(signal) = relay.stop_needed() else {
             return;
         };
-        if stopping || !under_job_control() {
+        // `exec`'s command, not yet started: it holds the container's lock
+        // until then, and a stopped shipyard would hold it for as long as
+        // the job sits in the background. Its terminal is relayed without
+        // raw mode or input instead (`exec -t … &`).
+        let exec_pending = self.running.is_some();
+        if stopping || exec_pending || !under_job_control() {
             relay.give_up_held_back();
             if !stopping {
                 // At once: a terminal given up on is relayed now, and its
@@ -570,6 +767,35 @@ impl Supervisor {
     }
 }
 
+/// How long `exec`'s command may take to run (exec) once started: it takes
+/// milliseconds, but until then `exec` holds the container's lock.
+const EXEC_WAIT: Duration = Duration::from_secs(10);
+
+/// Fails `exec`'s command if something holds it up before it runs: stopped
+/// (the container may signal it: it's in its PID namespace), or not run by
+/// `by` (its cgroup frozen from inside, say). It would hold the container's
+/// lock meanwhile.
+fn exec_not_held_up(child: &Child, by: Instant) -> Result<()> {
+    if child.stopped().is_some() {
+        return Err(Error::ExecHeldUp("it was stopped before it ran"));
+    }
+    if Instant::now() >= by {
+        return Err(Error::ExecHeldUp("it didn't run in time (frozen?)"));
+    }
+    Ok(())
+}
+
+/// What a run does beyond the usual (see [`Supervisor::supervise_exec`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct RunExtras {
+    /// The command's environment exactly as its spec has it: no `TERM`
+    /// added.
+    exact_env: bool,
+    /// `exec`'s terminal goes to this OCI console socket (open, and the
+    /// terminal's size), not to a relay.
+    console: Option<(std::os::fd::RawFd, (u16, u16))>,
+}
+
 /// Rejects a join that can't work here, before anything starts.
 fn check_join(join: &Join) -> Result<()> {
     join.validate()?;
@@ -579,10 +805,9 @@ fn check_join(join: &Join) -> Result<()> {
             os: std::env::consts::OS,
         });
     }
-    // Joining namespaces needs CAP_SYS_ADMIN, as creating them does.
-    if !nix::unistd::geteuid().is_root() {
-        return Err(Error::JoinNeedsRoot);
-    }
+    // Without root, the kernel decides: joining a container whose user
+    // namespace is this user's works (exec, rootless), anything else is
+    // refused when its namespaces are opened.
     Ok(())
 }
 
@@ -1048,11 +1273,14 @@ fn with_terminal_env(
     }
 }
 
-/// Refuses standard descriptors the placement can't have: a joined command
-/// keeps shipyard's own (no relay is set up on the join path).
+/// Refuses standard descriptors the placement can't have: a terminal of the
+/// command's own needs a mount namespace of its own, whose devpts it's made
+/// in (a joined command's, `exec -t`, too).
 fn check_stdio(placement: &Placement, stdio: super::Stdio) -> Result<()> {
     match placement {
-        Placement::Join(_) if !stdio.is_inherited() => Err(Error::StdioForJoin),
+        Placement::Join(join) if stdio.terminal.is_some() && !join.has(Namespace::Mount) => {
+            Err(Error::TerminalNeedsMount)
+        }
         // The container's devpts would be mounted over the host's.
         #[cfg(target_os = "linux")]
         Placement::New(isolation)
@@ -1251,6 +1479,19 @@ fn warn_devices_without_cgroup(isolation: &Isolation, why: &impl std::fmt::Displ
     }
 }
 
+/// An isolated run's hooks (OCI bundles'), to run around it.
+fn container_hooks(placement: &Placement) -> Option<ContainerHooks> {
+    #[cfg(target_os = "linux")]
+    return placement
+        .isolation()
+        .and_then(|isolation| isolation.hooks.clone());
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = placement;
+        None
+    }
+}
+
 /// Runs `hooks`' `phase` (for the init `pid`), each failure a warning.
 fn run_warning(hooks: &ContainerHooks, phase: Phase, pid: Option<i32>) {
     for warning in hooks.run_all(phase, pid) {
@@ -1303,18 +1544,28 @@ mod tests {
     }
 
     #[test]
-    fn a_joined_command_keeps_shipyards_descriptors() {
+    fn a_joined_command_may_have_its_descriptors_relayed() {
         let join = Placement::Join(Join::standard(1));
         assert!(check_stdio(&join, crate::process::Stdio::default()).is_ok());
+        // In place of a terminal (`exec` without `-t`).
         let relayed = crate::process::Stdio {
             stdout: crate::process::Stream::Relay,
             ..crate::process::Stdio::default()
         };
-        assert!(matches!(
-            check_stdio(&join, relayed),
-            Err(Error::StdioForJoin)
-        ));
+        assert!(check_stdio(&join, relayed).is_ok());
         assert!(check_stdio(&Placement::Host, relayed).is_ok());
+        // A terminal of its own (`exec -t`): made in its mount namespace.
+        let terminal = crate::process::Stdio {
+            terminal: Some(crate::process::Pty::default()),
+            ..crate::process::Stdio::default()
+        };
+        assert!(check_stdio(&join, terminal).is_ok());
+        let mut without_mounts = Join::standard(1);
+        without_mounts.namespaces = vec![crate::isolation::Namespace::Uts];
+        assert!(matches!(
+            check_stdio(&Placement::Join(without_mounts), terminal),
+            Err(Error::TerminalNeedsMount)
+        ));
     }
 
     #[test]

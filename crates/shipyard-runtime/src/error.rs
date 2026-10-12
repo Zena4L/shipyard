@@ -5,6 +5,15 @@ use nix::errno::Errno;
 use crate::isolation::IsolationError;
 use crate::process::{EXIT_ENGINE_ERROR, SpawnError, SpecError, StopSignalError};
 
+/// Why there's no sealed copy of shipyard's binary, mostly
+/// ([`Error::Unsealed`]): the host refuses executable memfds.
+#[cfg(target_os = "linux")]
+pub(crate) const UNSEALED_POLICY: &str = "vm.memfd_noexec, or a security module's policy on memfds";
+/// Why there's no sealed copy: a hard file-size limit (`ulimit -f`, which
+/// sets it in the shell) smaller than the binary.
+#[cfg(target_os = "linux")]
+pub(crate) const UNSEALED_FILE_SIZE: &str = "a file-size limit (ulimit -f) smaller than the binary";
+
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -162,10 +171,89 @@ pub enum Error {
     )]
     InitKilledBySeccomp,
 
-    /// Joining a running process's namespaces needs privileges (root, until
-    /// rootless support with user namespaces arrives).
-    #[error("joining a container's namespaces needs root")]
-    JoinNeedsRoot,
+    /// A process that runs in a container (its init, `what`, or `exec`'s
+    /// joiner) can't use a sealed copy of shipyard's binary
+    /// (`vm.memfd_noexec` at 2, or a security module's policy on memfds),
+    /// and someone in the container could write the binary's file (its
+    /// owner, or a group that may write it, is mapped inside; or anyone
+    /// may): the container could change the program run next
+    /// (CVE-2019-5736).
+    #[error(
+        "{what} needs a sealed copy of shipyard's binary, which can't be made or run here \
+         ({why}): without one, someone in the container could write shipyard's binary file \
+         (its owner, or a group that may write it, is mapped inside, or anyone may write \
+         it; without a user namespace, root inside is host root)"
+    )]
+    Unsealed {
+        /// What would have run it: "the container's init", "exec".
+        what: &'static str,
+        /// Why there's no copy: the host's policy on memfds, or a file-size
+        /// limit.
+        why: &'static str,
+    },
+
+    /// A descriptor to pass on (`--preserve-fds`, or socket activation's
+    /// `LISTEN_FDS`) isn't open.
+    #[error(
+        "descriptor {fd} isn't open: --preserve-fds and LISTEN_FDS pass on descriptors 3 to \
+         {last}, which must all be open"
+    )]
+    FdNotOpen {
+        /// The one that isn't.
+        fd: i32,
+        /// The last one asked for.
+        last: i32,
+    },
+
+    /// More descriptors to pass on than this process may hold (its soft
+    /// descriptor limit).
+    #[error(
+        "{count} descriptors to pass on: at most {max} can be (raise the descriptor limit, \
+         `ulimit -n`, to pass more)"
+    )]
+    TooManyFds {
+        /// How many were asked for.
+        count: usize,
+        /// The most.
+        max: usize,
+    },
+
+    /// The command's own descriptor limit (its `RLIMIT_NOFILE`, the
+    /// bundle's) leaves it no room above the passed descriptors: every
+    /// `open` it made would fail.
+    #[error(
+        "{count} descriptors passed on, and the process's own descriptor limit is {soft}: it \
+         needs at least {needed} (raise its RLIMIT_NOFILE)"
+    )]
+    NofileTooLow {
+        /// How many are passed on.
+        count: usize,
+        /// The process's soft limit.
+        soft: u64,
+        /// The least it needs.
+        needed: u64,
+    },
+
+    /// `exec`'s command was held up before it ran (the reason): stopped or
+    /// frozen from inside the container, or killed. It's been killed.
+    #[error("exec's command never ran: {0}")]
+    ExecHeldUp(&'static str),
+
+    /// `exec` or `cp` on a host where a credential change makes a process
+    /// dumpable (`fs.suid_dumpable` 1).
+    #[error(
+        "{what} can't hide its process from the container on this host (fs.suid_dumpable is \
+         1): set it to 0 or 2 (sysctl fs.suid_dumpable=2)"
+    )]
+    UnsafeDumpable {
+        /// Which command: `exec` or `cp`.
+        what: &'static str,
+    },
+
+    /// Without root, the namespaces can't be opened: they're another
+    /// user's container's (its user namespace isn't this user's).
+    #[error("the container's namespaces aren't this user's to join (another user's container?)")]
+    JoinNotYours,
 
     /// Running as root, the system still refused to let us join the
     /// namespaces.
@@ -175,11 +263,6 @@ pub enum Error {
          AppArmor, SELinux)"
     )]
     JoinRefused,
-
-    /// A joined command keeps shipyard's own standard descriptors: there's
-    /// no relay for one yet (see `Supervisor::set_stdio`).
-    #[error("a command joining a container can't have its standard input and output relayed yet")]
-    StdioForJoin,
 
     /// A pseudo-terminal (`-t`) for an isolated command needs a mount
     /// namespace of its own: the container's devpts would otherwise cover
@@ -248,6 +331,18 @@ pub enum Error {
 }
 
 impl Error {
+    /// The errno of a system error (`None` for any other).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the init and the joiner")
+    )]
+    pub(crate) fn errno(&self) -> Option<Errno> {
+        match self {
+            Self::Sys { source, .. } => Some(*source),
+            _ => None,
+        }
+    }
+
     pub(crate) fn sys(op: impl Into<Cow<'static, str>>, source: Errno) -> Self {
         Self::Sys {
             op: op.into(),

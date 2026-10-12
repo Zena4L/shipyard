@@ -47,6 +47,8 @@ libc.workspace = true
 nix = { workspace = true, features = ["hostname", "term"] }
 proptest.workspace = true
 shipyard-test-support.workspace = true
+# `cp`'s tar streams (tests/runtime.rs).
+tar.workspace = true
 
 # Terminal (pseudo-terminal) tests. Not on libtest: the harness forks a fake
 # shell that keeps running Rust code, which is only sound in a single-threaded

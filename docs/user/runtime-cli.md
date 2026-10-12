@@ -9,6 +9,10 @@ This document contains the help content for the `shipyard-runtime` command-line 
 
 * [`shipyard-runtime`↴](#shipyard-runtime)
 * [`shipyard-runtime create`↴](#shipyard-runtime-create)
+* [`shipyard-runtime logs`↴](#shipyard-runtime-logs)
+* [`shipyard-runtime attach`↴](#shipyard-runtime-attach)
+* [`shipyard-runtime exec`↴](#shipyard-runtime-exec)
+* [`shipyard-runtime cp`↴](#shipyard-runtime-cp)
 * [`shipyard-runtime start`↴](#shipyard-runtime-start)
 * [`shipyard-runtime state`↴](#shipyard-runtime-state)
 * [`shipyard-runtime kill`↴](#shipyard-runtime-kill)
@@ -28,6 +32,10 @@ Runs containers from OCI bundles, one lifecycle step per call
 ###### **Subcommands:**
 
 * `create` — Create a container from a bundle, set up and waiting for `start`
+* `logs` — Print a container's logs (one created with --log-dir): what it wrote on stdout to stdout, on stderr to stderr
+* `attach` — Attach to a container created with --log-dir: its output from now on, and your typing (with `create --stdin`). Ctrl-P Ctrl-Q detaches; otherwise it ends with the container, with its exit code
+* `exec` — Run a command inside a created or running container: in its namespaces and cgroup, confined as its own process is (what isn't given is its process's). Exits with the command's code, or 255 if it couldn't run
+* `cp` — Copy files into or out of a created, running or paused container: `cp ID:SRC DEST`, `cp SRC ID:DEST`, with `-` for a tar stream on stdout or stdin. Directories are copied whole
 * `start` — Run a created container's program
 * `state` — Print a container's state as JSON
 * `kill` — Send a signal to a container (default TERM)
@@ -68,6 +76,101 @@ Create a container from a bundle, set up and waiting for `start`
   Default value: `.`
 * `--pid-file <FILE>` — Write the container's init PID to FILE
 * `--console-socket <SOCKET>` — A UNIX socket to send the container's terminal to (its pseudo-terminal's master), as runc does; needed when the bundle asks for a terminal (`process.terminal`)
+* `--log-dir <DIR>` — Keep the container's output in logs in DIR, read with `logs`: CRI-format files, rotated. `create` makes DIR (it mustn't exist); it outlives the container. The container then doesn't get `create`'s stdout and stderr, and its stdin is empty unless --stdin keeps it open
+* `--log-max-size <SIZE>` — The most a log file holds before it's rotated (64k to 1g) [default: 10m]
+* `--log-max-files <N>` — How many log files are kept, the newest among them (2 to 100) [default: 5]
+* `--stdin` — Keep the container's stdin open for `attach` to type into, instead of empty (/dev/null). Needs --log-dir
+* `--stdin-once` — Close the container's stdin when the first client to type goes (detaches, its input ends, or it's dropped), once what it typed has been written
+* `--preserve-fds <N>` — Pass N more descriptors on to the container's process, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as runc does
+
+  Default value: `0`
+
+
+
+## `shipyard-runtime logs`
+
+Print a container's logs (one created with --log-dir): what it wrote on stdout to stdout, on stderr to stderr
+
+**Usage:** `shipyard-runtime logs [OPTIONS] [ID]`
+
+###### **Arguments:**
+
+* `<ID>` — The container's ID
+
+###### **Options:**
+
+* `-f`, `--follow` — Then print more as it comes, until the container has ended (with --log-dir, until interrupted)
+* `--tail <N>` — Only the last N lines
+* `--since <TIME>` — Only lines from TIME on: RFC 3339 (2026-10-10T06:16:19Z), or a duration ago (10m, 2h, 30s)
+* `-t`, `--timestamps` — Start each line with the time it was written (RFC 3339)
+* `--log-dir <DIR>` — Read the logs in DIR instead of a container's (one deleted since, say)
+
+
+
+## `shipyard-runtime attach`
+
+Attach to a container created with --log-dir: its output from now on, and your typing (with `create --stdin`). Ctrl-P Ctrl-Q detaches; otherwise it ends with the container, with its exit code
+
+**Usage:** `shipyard-runtime attach [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — The container's ID
+
+###### **Options:**
+
+* `--detach-keys <KEYS>` — The keys that detach, Docker's way: `ctrl-` and a letter (or one of @[\]^_), or a character, separated by commas; empty: none
+
+  Default value: `ctrl-p,ctrl-q`
+* `--no-stdin` — Don't pass your input on (only watch the output)
+
+
+
+## `shipyard-runtime exec`
+
+Run a command inside a created or running container: in its namespaces and cgroup, confined as its own process is (what isn't given is its process's). Exits with the command's code, or 255 if it couldn't run
+
+**Usage:** `shipyard-runtime exec [OPTIONS] <ID> [COMMAND]...`
+
+###### **Arguments:**
+
+* `<ID>` — The container's ID
+* `<COMMAND>` — The command and its arguments
+
+###### **Options:**
+
+* `-p`, `--process <FILE>` — A runc process.json: the whole process, instead of COMMAND
+* `-d`, `--detach` — Return once the command runs, leaving it running (it isn't stopped with this one)
+* `-t`, `--tty` — Give the command a terminal, made in the container: relayed to this one (raw, and sized as it), or with --console-socket sent there
+* `--console-socket <SOCKET>` — Send the command's terminal's master to this UNIX socket (runc's protocol), instead of relaying it; needs a terminal (-t, or the process.json's). With -d -t, required
+* `--pid-file <FILE>` — With --detach, write the command's PID (as the host sees it) to FILE
+* `--cwd <DIR>` — The working directory, inside the container
+* `-e`, `--env <KEY=VALUE>` — Set an environment variable (KEY=VALUE) over the container's; may be given more than once
+* `-u`, `--user <UID[:GID]>` — The user, UID or UID:GID, as the container numbers them
+* `-g`, `--additional-gids <GID>` — A supplementary group, instead of the container's; may be given more than once
+* `-c`, `--cap <CAP>` — Add a capability (`SYS_PTRACE`, or `CAP_SYS_PTRACE`), within the container's bounding set; may be given more than once
+* `--no-new-privs` — Set `no_new_privs` (on anyway if the container has it)
+* `--preserve-fds <N>` — Pass N more descriptors on to the command, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as runc does
+
+  Default value: `0`
+
+
+
+## `shipyard-runtime cp`
+
+Copy files into or out of a created, running or paused container: `cp ID:SRC DEST`, `cp SRC ID:DEST`, with `-` for a tar stream on stdout or stdin. Directories are copied whole
+
+**Usage:** `shipyard-runtime cp [OPTIONS] <SRC> <DEST>`
+
+###### **Arguments:**
+
+* `<SRC>` — ID:PATH, a host path, or - (a tar stream on stdin)
+* `<DEST>` — ID:PATH, a host path, or - (a tar stream on stdout)
+
+###### **Options:**
+
+* `-a`, `--archive` — Files copied in keep their owners (where the container has those IDs), instead of becoming the container's root's
+* `-L`, `--follow-link` — Follow SRC if it's a symlink
 
 
 

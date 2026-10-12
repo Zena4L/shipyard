@@ -88,6 +88,9 @@ Run a command in a container: on Linux, isolated in namespaces, optionally with 
 
   Default value: `10`
 * `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname, IPC and network, as you. On Linux, commands are isolated by default (rootless, in a user namespace, without root); on macOS they always run like this for now
+* `--preserve-fds <N>` — Pass N more descriptors on to the command, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as Podman does
+
+  Default value: `0`
 * `--hostname <NAME>` — Hostname inside the container (Linux)
 * `--domainname <NAME>` — NIS domain name inside the container (Linux)
 * `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host)

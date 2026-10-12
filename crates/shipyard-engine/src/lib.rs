@@ -26,7 +26,10 @@
 #[cfg(not(unix))]
 compile_error!("shipyard-engine only supports UNIX platforms (Linux, macOS)");
 
+pub mod attach;
+pub mod cp;
 mod error;
+pub mod logs;
 pub mod streams;
 
 pub use error::StreamsError;

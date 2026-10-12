@@ -1,6 +1,6 @@
 //! Containers through the runtime's API, end to end: joining a running one
 //! (`Supervisor::supervise_joined`), and isolation without a PID namespace.
-//! Linux; root only, except for the "needs root" check.
+//! Linux; root only, except for the check that joining root's needs root.
 //!
 //! Not on libtest (`harness = false`): this binary is also its own container
 //! runtime. It plays the part the CLI will (stage 8+):
@@ -144,8 +144,8 @@ fn tests() -> &'static [(&'static str, fn())] {
         ]
     } else {
         &[(
-            "without_root_joining_is_refused",
-            without_root_joining_is_refused,
+            "without_root_joining_roots_is_refused",
+            without_root_joining_roots_is_refused,
         )]
     }
 }
@@ -740,10 +740,16 @@ fn an_init_that_cannot_start_is_reported_without_a_pid_namespace() {
     );
 }
 
-fn without_root_joining_is_refused() {
+/// Without root, the host's init (root's) can't be joined: its namespaces
+/// aren't this user's (a rootless container's would be).
+fn without_root_joining_roots_is_refused() {
     let joined = run(me().command(&["join", "1", "true"]));
     assert_eq!(joined.code, Some(125));
-    assert!(joined.stderr.contains("needs root"), "{}", joined.stderr);
+    assert!(
+        joined.stderr.contains("aren't this user's to join"),
+        "{}",
+        joined.stderr
+    );
 }
 
 fn joining_needs_linux() {

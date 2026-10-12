@@ -220,7 +220,23 @@ pub fn run(command: Command) -> Run {
 /// The same, with `input` piped to shipyard's stdin (then end-of-file)
 /// instead of `/dev/null`.
 #[must_use]
-pub fn run_with_input(mut command: Command, input: Option<&[u8]>) -> Run {
+pub fn run_with_input(command: Command, input: Option<&[u8]>) -> Run {
+    let output = run_raw(command, input);
+    Run {
+        code: output.status.code(),
+        signal: output.status.signal(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// [`run_with_input`], its output as it is (bytes: a tar stream, say).
+///
+/// # Panics
+///
+/// If it takes longer than `TIMEOUT` (it's killed), or can't be started.
+#[must_use]
+pub fn run_raw(mut command: Command, input: Option<&[u8]>) -> std::process::Output {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -246,13 +262,7 @@ pub fn run_with_input(mut command: Command, input: Option<&[u8]>) -> Run {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("shipyard did not finish within {TIMEOUT:?}");
     };
-    let output = output.expect("waiting for shipyard");
-    Run {
-        code: output.status.code(),
-        signal: output.status.signal(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    output.expect("waiting for shipyard")
 }
 
 /// Whether this test runs under Rosetta, the x86-64 emulator Linux VMs on

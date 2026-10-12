@@ -2,22 +2,30 @@
 //! supervise it, and report how it ended.
 //!
 //! This is POSIX-only code (TLPI ch. 6, 20–28), so it runs on macOS and Linux.
-//! Later stages wrap the same pipeline in namespaces (stage 2) and reuse the
-//! supervisor in the per-container monitor (stage 8).
+//! Later stages wrap the same pipeline in namespaces (stage 2); the
+//! per-container monitor (stage 8, `container/lifecycle/monitor.rs`) spawns
+//! through it too, with an event loop of its own.
 
 mod channel;
 mod child;
 #[cfg(target_os = "linux")]
 mod clone;
 mod env;
+#[cfg(target_os = "linux")]
+mod exec;
 mod failure;
+#[cfg(target_os = "linux")]
+pub(crate) mod helper;
 mod identity;
 #[cfg(target_os = "linux")]
 mod init;
 #[cfg(target_os = "linux")]
-mod join;
+mod internal;
+#[cfg(target_os = "linux")]
+pub(crate) mod join;
 #[cfg(target_os = "linux")]
 mod network;
+pub mod passed;
 mod plan;
 #[cfg(target_os = "linux")]
 pub mod probe;
@@ -39,18 +47,26 @@ mod stop;
 mod supervisor;
 #[cfg(target_os = "linux")]
 mod sysctl;
-mod terminal;
+pub(crate) mod terminal;
 #[cfg(target_os = "linux")]
 mod user_namespace;
 
 pub use env::{DEFAULT_PATH, Env, EnvError};
 pub use failure::{SpawnError, SpawnErrorKind, overlay_refusal};
 pub use identity::{LookupError, Which};
+#[cfg(target_os = "linux")]
+pub(crate) use plan::current_rlimits;
+#[cfg(target_os = "linux")]
+pub(crate) use resolve::open_in_root;
 pub use rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
+#[cfg(target_os = "linux")]
+pub(crate) use setup::{SpecSetup, container_security};
 #[cfg(target_os = "linux")]
 pub(crate) use signal::discard_pending;
 pub(crate) use signal::is_pending;
 pub use signal::{Signal, SignalError};
+#[cfg(target_os = "linux")]
+pub(crate) use spawn::ExecSpawn;
 pub use spawn::die_from;
 pub use spec::{MAX_GROUPS, Names, ProcessSpec, SpecError, User};
 pub use startup::refuse_privileged_start;
@@ -95,6 +111,7 @@ pub fn init_entry_point() {
     #[cfg(target_os = "linux")]
     {
         init::entry_point();
+        exec::entry_point();
         INIT_ENTRY_POINT_CALLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -109,6 +126,22 @@ pub(crate) fn proc_is_ours() -> bool {
         .ok()
         .and_then(|link| link.to_str()?.parse::<u32>().ok())
         == Some(std::process::id())
+}
+
+/// The start time in a `/proc/PID/stat` line (field 22), unless the process
+/// is a zombie. The command name (field 2) can hold anything, spaces and `)`
+/// included, so the fields after it are counted from its last `)`.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_time_in(stat: &[u8]) -> Option<u64> {
+    let after = stat.iter().rposition(|&b| b == b')')?;
+    let rest = std::str::from_utf8(stat.get(after + 1..)?).ok()?;
+    let mut fields = rest.split_whitespace();
+    // Fields 3 (the state) to 22 (the start time).
+    let state = fields.next()?;
+    if state == "Z" || state == "X" {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
 }
 
 /// Whether [`init_entry_point`] has run in this process.

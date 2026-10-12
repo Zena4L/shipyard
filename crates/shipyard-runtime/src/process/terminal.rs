@@ -9,7 +9,16 @@
 //! once Shipyard is done, so it's put back on every way out Shipyard sees:
 //! the end of the run, a stop (Ctrl-Z can't reach Shipyard in raw mode, but
 //! `kill -TSTP` can, and job control stops it to read or write the terminal
-//! from the background), and a panic. Not `kill -9`: nothing can.
+//! from the background), a panic, and a signal that would end Shipyard (a
+//! `kill`, a hang-up) where nothing else catches it: `attach`'s case; `run`'s
+//! supervisor has handlers of its own. Not `kill -9`: nothing can.
+//!
+//! **Flow control off, only.** `attach` to a container without a terminal
+//! keeps the user's terminal as it is (they type lines, with their editing),
+//! but its flow control (`IXON`) takes Ctrl-Q for itself (resume output):
+//! the detach keys, Ctrl-P Ctrl-Q, could never reach attach. So there only
+//! `IXON` and `IXOFF` are turned off, put back the same ways (Ctrl-C, which
+//! keys still make there, among them).
 //!
 //! **Restoring from a signal handler.** A stop leaves the terminal to the
 //! shell, so it must be put back before the stop, and raw again once
@@ -33,6 +42,7 @@ pub(crate) type Size = (u16, u16);
 pub(crate) const DEFAULT_SIZE: Size = (24, 80);
 
 /// The size of the terminal on `fd`, if it's one.
+#[must_use]
 pub(crate) fn window_size(fd: RawFd) -> Option<Size> {
     let mut size = MaybeUninit::<libc::winsize>::zeroed();
     // SAFETY: `TIOCGWINSZ` fills in the `winsize` it's given; it's read only
@@ -60,7 +70,8 @@ pub(crate) fn set_window_size(fd: RawFd, (rows, cols): Size) -> Result<(), Errno
 
 /// The size of Shipyard's own terminal (its output's, else its input's or
 /// its error's), if it has one.
-pub(crate) fn terminal_size() -> Option<Size> {
+#[must_use]
+pub fn terminal_size() -> Option<Size> {
     [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO]
         .into_iter()
         .find_map(window_size)
@@ -69,6 +80,7 @@ pub(crate) fn terminal_size() -> Option<Size> {
 /// Whether Shipyard's process group is the foreground group of the
 /// terminal on `fd`. One that can't say (hung up) counts as foreground:
 /// reading or writing it then fails, which ends what was waiting for it.
+#[must_use]
 pub(crate) fn in_foreground(fd: RawFd) -> bool {
     // SAFETY: `tcgetpgrp` only reads the terminal's state.
     let foreground = unsafe { libc::tcgetpgrp(fd) };
@@ -115,7 +127,7 @@ pub(crate) const MASTER_NAME: &[u8] = b"/dev/ptmx";
 /// `MaxNameLen`).
 const MAX_NAME_LEN: usize = 4096;
 
-/// Sends `fd` over the UNIX socket `socket` (`SCM_RIGHTS`, TLPI §61.13.3),
+/// Sends `fd` over the UNIX socket `socket` (`SCM_RIGHTS`, TLPI §61.13),
 /// with `name` as the message's bytes: the receiver gets a descriptor of its
 /// own for the same open file, across namespaces (probe T6).
 #[cfg(any(target_os = "linux", test))]
@@ -246,13 +258,24 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Whether the terminal should be raw: the SIGTSTP handler sets it raw again
 /// on resuming only while this holds.
 static RAW: AtomicBool = AtomicBool::new(false);
+/// Whether only flow control is turned off ([`RawMode::without_flow_control`]),
+/// not raw: what `save_and_go_raw` makes of the terminal.
+static FLOW_ONLY: AtomicBool = AtomicBool::new(false);
+/// The signals that end Shipyard: the terminal is put back before they do
+/// (from a key, while only flow control is off; from outside, `kill` or a
+/// hang-up, in either mode). Only where they'd end it as they are, at their
+/// default action: a handler of the caller's (a supervisor's) is its own.
+const ENDING: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM];
 
 /// The user's terminal in raw mode, put back when dropped (see the module's
 /// documentation).
-pub(crate) struct RawMode {
+pub struct RawMode {
     /// SIGTSTP's disposition before ours, to put back; `None` if it was
     /// ignored (then no handler: Shipyard wasn't stoppable that way).
     previous_tstp: Option<libc::sigaction>,
+    /// The [`ENDING`] signals' dispositions before ours, to put back: those
+    /// that were at their default action.
+    previous_ending: Vec<(libc::c_int, libc::sigaction)>,
 }
 
 impl std::fmt::Debug for RawMode {
@@ -266,7 +289,24 @@ impl RawMode {
     /// foreground. `Ok(None)` if it isn't: setting it from the background
     /// would change it under the user's shell (the caller stops for job
     /// control, or goes without).
-    pub(crate) fn set(fd: RawFd) -> Result<Option<Self>, Errno> {
+    pub fn set(fd: RawFd) -> Result<Option<Self>, Errno> {
+        Self::enter(fd, false)
+    }
+
+    /// Turns off only the terminal's flow control on `fd` (`IXON`, `IXOFF`),
+    /// keeping its line editing, echo and signals, if Shipyard is in its
+    /// foreground: Ctrl-Q (and Ctrl-S) then reach Shipyard, as an `attach`'s
+    /// detach keys must. Put back as [`set`](Self::set)'s is, and before
+    /// Shipyard ends of a signal a key makes (Ctrl-C).
+    ///
+    /// # Errors
+    ///
+    /// As [`set`](Self::set).
+    pub fn without_flow_control(fd: RawFd) -> Result<Option<Self>, Errno> {
+        Self::enter(fd, true)
+    }
+
+    fn enter(fd: RawFd, flow_only: bool) -> Result<Option<Self>, Errno> {
         if ACTIVE.swap(true, Ordering::AcqRel) {
             return Err(Errno::EBUSY);
         }
@@ -275,9 +315,28 @@ impl RawMode {
             return Ok(None);
         }
         TTY.store(fd, Ordering::Release);
+        FLOW_ONLY.store(flow_only, Ordering::Release);
+        // Held off from going raw until their handlers are in place: one
+        // that came in between would end Shipyard with the terminal raw. One
+        // that came meanwhile is handled once they're unblocked, below.
+        let mut held = sigset(&[
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGHUP,
+            libc::SIGTERM,
+            libc::SIGTSTP,
+        ]);
+        let mut old = sigset(&[]);
+        // SAFETY: changing this thread's mask; both sets are valid.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw mut held, &raw mut old) };
+        // SAFETY: the mask as it was.
+        let unblock = || unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+        };
         if let Err(errno) = save_and_go_raw() {
             TTY.store(-1, Ordering::Release);
             ACTIVE.store(false, Ordering::Release);
+            unblock();
             return Err(errno);
         }
         RAW.store(true, Ordering::Release);
@@ -287,7 +346,20 @@ impl RawMode {
         if previous_tstp.is_some() {
             set_tstp_handler();
         }
-        Ok(Some(Self { previous_tstp }))
+        let previous_ending = ENDING
+            .iter()
+            .filter_map(|&signal| {
+                let previous =
+                    current_action(signal).filter(|action| action.sa_sigaction == libc::SIG_DFL)?;
+                set_handler(signal, put_back_and_end);
+                Some((signal, previous))
+            })
+            .collect();
+        unblock();
+        Ok(Some(Self {
+            previous_tstp,
+            previous_ending,
+        }))
     }
 
     /// Stops Shipyard with `signal` (job control), the terminal put back
@@ -324,6 +396,10 @@ impl Drop for RawMode {
             // SAFETY: putting back the action read before ours.
             unsafe { libc::sigaction(libc::SIGTSTP, previous, std::ptr::null_mut()) };
         }
+        for (signal, previous) in &self.previous_ending {
+            // SAFETY: as above.
+            unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+        }
         TTY.store(-1, Ordering::Release);
         ACTIVE.store(false, Ordering::Release);
         // SAFETY: the mask as it was.
@@ -344,7 +420,11 @@ fn save_and_go_raw() -> Result<(), Errno> {
     }
     // SAFETY: filled in just above.
     let mut raw = unsafe { saved.assume_init() };
-    make_raw(&mut raw);
+    if FLOW_ONLY.load(Ordering::Acquire) {
+        raw.c_iflag &= !(libc::IXON | libc::IXOFF);
+    } else {
+        make_raw(&mut raw);
+    }
     // SAFETY: `raw` is a complete `termios`.
     Errno::result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) }).map(drop)
 }
@@ -434,12 +514,29 @@ pub(crate) fn current_action(signal: libc::c_int) -> Option<libc::sigaction> {
 }
 
 fn set_tstp_handler() {
+    set_handler(libc::SIGTSTP, on_tstp);
+}
+
+/// Installs `handler` for `signal` (restarting interrupted calls).
+fn set_handler(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     // SAFETY: a zeroed `sigaction` is valid; the handler is filled in.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = on_tstp as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    action.sa_sigaction = handler as libc::sighandler_t;
     action.sa_flags = libc::SA_RESTART;
     // SAFETY: installing a handler that only makes async-signal-safe calls.
-    unsafe { libc::sigaction(libc::SIGTSTP, &raw const action, std::ptr::null_mut()) };
+    unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) };
+}
+
+/// A signal that ends Shipyard, while the terminal isn't as it was: the
+/// terminal put back, then the signal's own end (its default action, sent
+/// again: it's delivered once this handler returns).
+extern "C" fn put_back_and_end(signal: libc::c_int) {
+    restore_saved();
+    // SAFETY: async-signal-safe calls only.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::kill(libc::getpid(), signal);
+    }
 }
 
 /// SIGTSTP while raw: the terminal is put back, Shipyard stops as it would

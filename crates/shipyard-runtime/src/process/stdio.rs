@@ -8,7 +8,8 @@
 //! the terminal. A pipe can't be used that way. So the caller can ask for a
 //! [`Stream::Relay`]: the command gets a pipe, and Shipyard copies bytes
 //! between the pipe and its own descriptor (TLPI ch. 44). (Which streams
-//! are relayed is the caller's decision: the engine's, for `shipyard run`.)
+//! are relayed is the caller's decision: the engine's, for `shipyard run`;
+//! the runtime's own for `exec`, [`Stdio::sparing_terminals`].)
 //!
 //! **Never blocking the supervisor.** The copying happens in the
 //! supervisor's own `poll` loop (TLPI §63.2), on non-blocking descriptors.
@@ -83,9 +84,37 @@ pub struct Pty {
 }
 
 impl Stdio {
-    /// Whether the command just keeps Shipyard's own descriptors.
-    pub(crate) fn is_inherited(self) -> bool {
-        self == Self::default()
+    /// A joined command's (`exec` without a terminal of its own): Shipyard's
+    /// own descriptors, as runc passes them, but never one that's a terminal
+    /// (D16): a process left behind in the container would keep it after
+    /// `exec` returns, and could read what's typed to the shell, or change
+    /// the terminal's settings. Relayed instead while Shipyard supervises the
+    /// command, `/dev/null` for one it doesn't (`detached`). Files and pipes
+    /// (a shim's) are passed on as they are. A terminal stdin, when Shipyard
+    /// isn't in the terminal's foreground (`exec … &`), is `/dev/null` too:
+    /// relaying it would stop Shipyard (SIGTTIN), and the command's output
+    /// with it, until `fg`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sparing_terminals(detached: bool) -> Self {
+        use std::io::IsTerminal as _;
+        let instead = if detached {
+            Stream::Null
+        } else {
+            Stream::Relay
+        };
+        let each = |terminal: bool| if terminal { instead } else { Stream::Inherit };
+        let stdin = std::io::stdin().is_terminal();
+        let background = stdin && !super::terminal::in_foreground(libc::STDIN_FILENO);
+        Self {
+            stdin: if background {
+                Stream::Null
+            } else {
+                each(stdin)
+            },
+            stdout: each(std::io::stdout().is_terminal()),
+            stderr: each(std::io::stderr().is_terminal()),
+            terminal: None,
+        }
     }
 }
 
@@ -120,8 +149,10 @@ pub(crate) struct ChildEnds {
 pub(crate) enum ChildTerminal {
     /// The slave, made here (no isolation): the command takes it.
     Slave(RawFd),
-    /// A socket for the container's init to send the master back on, once
-    /// it has made the pseudo-terminal inside, `size` big.
+    /// A socket for the process that makes the pseudo-terminal inside the
+    /// container (the init, or `exec`'s joiner) to send the master back on,
+    /// `size` big: to shipyard's relay, or to an OCI console socket's
+    /// caller.
     Socket {
         fd: RawFd,
         size: super::terminal::Size,

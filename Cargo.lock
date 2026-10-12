@@ -931,6 +931,7 @@ dependencies = [
  "shipyard-runtime",
  "shipyard-storage",
  "shipyard-test-support",
+ "tar",
  "tracing",
  "tracing-subscriber",
 ]
@@ -939,7 +940,13 @@ dependencies = [
 name = "shipyard-engine"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+ "shipyard-image",
  "shipyard-runtime",
+ "tar",
  "thiserror",
 ]
 

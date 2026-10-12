@@ -1,6 +1,7 @@
-//! `shipyard-runtime`'s cgroup commands (stage 5, step 5): `ps`, `events`
-//! and `update`, the output and input runc gives them. `pause`, `resume` and
-//! `kill --all` need nothing of their own here.
+//! The `shipyard-runtime` commands that need more than a call: the cgroup
+//! ones (stage 5, step 5: `ps`, `events` and `update`, the output and input
+//! runc gives them; `pause`, `resume` and `kill --all` need nothing here),
+//! and `logs` (stage 8, read by the engine).
 
 use std::io::{Read as _, Write as _};
 use std::path::Path;
@@ -117,13 +118,120 @@ pub(crate) fn events(root: &Path, id: &str, once: bool, interval: Duration) -> R
     }
 }
 
+/// Whose logs `logs` reads.
+#[derive(Debug, Clone)]
+pub(crate) enum LogsSource {
+    /// A container's, by ID.
+    Container(String),
+    /// Those in a directory (a container deleted since).
+    Dir(std::path::PathBuf),
+}
+
+/// `logs`: prints the logs `target` names, as `options` say; the program's
+/// stdout to stdout, its stderr to stderr. Returns how many lines weren't
+/// records (skipped).
+///
+/// # Errors
+///
+/// No such container, one without logs, logs that can't be read, or
+/// stdout or stderr.
+pub(crate) fn logs(
+    root: &Path,
+    target: &LogsSource,
+    options: &shipyard_engine::logs::Options,
+    timestamps: bool,
+) -> Result<usize> {
+    use shipyard_runtime::logs::cri::Stream;
+    let (dir, identity, instance) = match target {
+        LogsSource::Container(id) => {
+            let logs = container::logs_of(root, id)?;
+            (logs.dir, logs.identity, logs.instance)
+        }
+        LogsSource::Dir(dir) => (dir.clone(), None, None),
+    };
+    // Only the directory the container was created with: not another put
+    // at its path since.
+    let options = shipyard_engine::logs::Options {
+        identity,
+        ..*options
+    };
+    // Done once the monitor has written the exit: everything is in. A
+    // container deleted meanwhile is done too, and so is one whose ID now
+    // names another container's logs (deleted and created again, at the
+    // same path or another: another monitor, whatever inode its directory
+    // got). Logs read by directory have nothing to say
+    // when they're done: followed until interrupted.
+    let finished = || match target {
+        LogsSource::Container(id) => container::logs_of(root, id).map_or(true, |logs| {
+            logs.finished
+                || logs.dir != dir
+                || logs.identity != identity
+                || logs.instance != instance
+        }),
+        LogsSource::Dir(_) => false,
+    };
+    let (mut stdout, mut stderr) = (std::io::stdout().lock(), std::io::stderr().lock());
+    // Whether each stream is in the middle of a line (a piece printed, its
+    // rest to come): a time starts lines only.
+    let mut midline = [false, false];
+    let read = shipyard_engine::logs::read(&dir, &options, finished, |entry| {
+        let out: &mut dyn std::io::Write = match entry.stream {
+            Stream::Stdout => &mut stdout,
+            Stream::Stderr => &mut stderr,
+        };
+        let midline = &mut midline[entry.stream.index()];
+        if timestamps && !*midline {
+            write!(out, "{} ", entry.time)?;
+        }
+        out.write_all(&entry.text)?;
+        if entry.complete {
+            out.write_all(b"\n")?;
+        }
+        *midline = !entry.complete;
+        out.flush()
+    });
+    match read {
+        Ok(read) => Ok(read.skipped),
+        // `logs ID | head`: the reader has seen what it wanted.
+        Err(shipyard_engine::logs::LogsError::Sink(err))
+            if err.kind() == std::io::ErrorKind::BrokenPipe =>
+        {
+            Ok(0)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// `--since`: RFC 3339, or a duration ago (`10m`, `2h`, `30s`).
+pub(crate) fn parse_since(text: &str) -> Result<shipyard_runtime::logs::time::Timestamp, String> {
+    use shipyard_runtime::logs::time::Timestamp;
+    if let Ok(time) = Timestamp::parse(text) {
+        return Ok(time);
+    }
+    let bad = || format!("{text:?} is neither a time (2026-10-10T06:16:19Z) nor a duration (10m)");
+    let (number, unit) = number_and_unit(text);
+    let number: i64 = number.parse().map_err(|_| bad())?;
+    let seconds = match unit {
+        "s" => number,
+        "m" => number.saturating_mul(60),
+        "h" => number.saturating_mul(3600),
+        _ => return Err(bad()),
+    };
+    let now = Timestamp::now();
+    Timestamp::from_unix(now.secs().saturating_sub(seconds), now.nanos()).ok_or_else(bad)
+}
+
+/// `text`'s leading digits, and the rest (`10m`: `10`, `m`).
+fn number_and_unit(text: &str) -> (&str, &str) {
+    text.find(|c: char| !c.is_ascii_digit())
+        .map_or((text, ""), |at| text.split_at(at))
+}
+
 /// `--interval`: a number of seconds or milliseconds, as runc's (Go)
 /// durations most often are: `5s`, `500ms`, `1m`.
 pub(crate) fn parse_interval(text: &str) -> Result<Duration, String> {
     let bad = || format!("{text:?} isn't a duration (such as 5s or 500ms)");
-    let (number, unit) = text
-        .find(|c: char| !c.is_ascii_digit())
-        .map_or((text, ""), |at| text.split_at(at));
+    let (number, unit) = number_and_unit(text);
     let number: u64 = number.parse().map_err(|_| bad())?;
     let interval = match unit {
         "ms" => Duration::from_millis(number),

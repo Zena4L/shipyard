@@ -318,6 +318,36 @@ fn the_init_does_not_hold_leaked_descriptors() {
     assert_eq!(run.stdout.trim(), "closed");
 }
 
+/// Socket activation through an isolated `run`: the command (PID 2 or
+/// later, Shipyard's init is 1) gets the descriptor at 3 and its own PID as
+/// `LISTEN_PID`; the init holds no copy once it runs.
+#[test]
+#[ignore = "needs root"]
+fn an_isolated_run_passes_socket_activation_on() {
+    let mut command = std::process::Command::new("sh");
+    command
+        .args([
+            "-c",
+            "exec 3</etc/hostname; LISTEN_PID=$$ LISTEN_FDS=1; export LISTEN_PID LISTEN_FDS; \
+             exec \"$@\"",
+            "sh",
+        ])
+        .arg(SHIPYARD.path())
+        .args([
+            "run",
+            "--cap-add",
+            "SYS_PTRACE",
+            "sh",
+            "-c",
+            "echo $LISTEN_FDS $([ \"$LISTEN_PID\" = $$ ] && echo own-pid) \
+             $(readlink /proc/1/fd/* | grep -c hostname); cat <&3",
+        ]);
+    let run = run(command);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let hostname = std::fs::read_to_string("/etc/hostname").unwrap();
+    assert_eq!(run.stdout, format!("1 own-pid 0\n{hostname}"));
+}
+
 /// A parent that ignored or blocked SIGCHLD doesn't stop the init from
 /// noticing the command's exit.
 #[test]

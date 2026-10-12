@@ -12,6 +12,9 @@
 //! - `rootless.rs`: `relaying_adds_little_to_a_run` (a terminal relayed)
 //!   and `a_terminal_adds_little_to_a_run` (`-t`);
 //! - `security.rs`: `an_isolated_run_still_starts_quickly` (root).
+//! - `runtime.rs`: `the_monitor_stays_small_while_it_logs` (root: a
+//!   monitor's own memory, and the time a flood takes to log).
+//! - `runtime.rs`: `an_exec_starts_and_ends_quickly` (`exec`, rootless).
 //!
 //! Linux only: these are isolated runs.
 

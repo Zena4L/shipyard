@@ -101,6 +101,12 @@ pub(crate) struct RunArgs {
     #[arg(long, conflicts_with = "limits")]
     no_isolation: bool,
 
+    /// Pass N more descriptors on to the command, from 3 up (after socket
+    /// activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as
+    /// Podman does.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    preserve_fds: usize,
+
     /// Hostname inside the container (Linux).
     #[arg(long, value_name = "NAME", conflicts_with = "no_isolation")]
     hostname: Option<String>,
@@ -1271,8 +1277,14 @@ fn parse_security_opt(s: &str) -> Result<SecurityOpt, String> {
 /// exit code, or `128 + N` if signal N killed it. Failures to start it exit
 /// 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
+    // First, before anything is opened or started (the network's helpers):
+    // what this process was given to pass on is 3 and up, and nothing it
+    // starts in between may inherit it.
+    let passed = process::passed::PassedFds::from_caller(args.preserve_fds)?;
     let planned = match args.check()? {
-        Checked::Bundle(invocation) => return Ok(run_invocation(*invocation, None)?.exit()),
+        Checked::Bundle(invocation) => {
+            return Ok(run_invocation(*invocation, None, passed)?.exit());
+        }
         Checked::Command(planned) => planned,
     };
     // The flags checked, the image is made ready: pulled if it must be, its
@@ -1314,7 +1326,7 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
     let hook = connect
         .as_mut()
         .map(|connect| connect as process::NetworkHook<'_>);
-    let ended = run_invocation(invocation, hook)?;
+    let ended = run_invocation(invocation, hook, passed)?;
     drop(connect);
     // Its address given back and its veth gone before it ends, as the rest.
     drop(network);
@@ -1394,6 +1406,7 @@ impl Ended {
 fn run_invocation(
     invocation: Invocation,
     network: Option<process::NetworkHook<'_>>,
+    passed: process::passed::PassedFds,
 ) -> Result<Ended> {
     let Invocation {
         spec,
@@ -1418,6 +1431,7 @@ fn run_invocation(
     tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;
     supervisor.set_stdio(stdio);
+    supervisor.pass(passed);
     let supervised = match (network, isolation.as_ref()) {
         (Some(network), Some(isolation)) => {
             supervisor.supervise_with_network(&spec, stop, isolation, network)

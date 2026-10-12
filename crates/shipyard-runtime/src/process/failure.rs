@@ -117,6 +117,24 @@ pub(crate) enum ChildStep {
     ControllingTerminal = 67,
     /// Putting the terminal on the command's 0, 1 or 2 (the detail) failed.
     TerminalStdio = 68,
+    /// Making `exec`'s process non-dumpable failed (see `exec.rs`).
+    Undumpable = 69,
+    /// Closing every descriptor `exec`'s process inherited but doesn't need
+    /// failed.
+    CloseHostFds = 70,
+    /// `exec`'s joiner couldn't set the command's OOM score adjustment.
+    OomScoreAdj = 71,
+    /// `exec`'s joiner couldn't start the command in the container (its
+    /// clone into the container's PID namespace and cgroup).
+    ExecClone = 72,
+    /// `exec`'s joiner couldn't tell shipyard the command's PID.
+    ExecRecord = 73,
+    /// The descriptors passed on (`--preserve-fds`, socket activation)
+    /// couldn't be put in place, from 3.
+    PassFds = 74,
+    /// The started FIFO (for `poststart` hooks: see `Gate::started`)
+    /// couldn't be opened.
+    StartedFifo = 75,
 }
 
 impl ChildStep {
@@ -193,6 +211,13 @@ impl ChildStep {
             66 => Self::TerminalSession,
             67 => Self::ControllingTerminal,
             68 => Self::TerminalStdio,
+            69 => Self::Undumpable,
+            70 => Self::CloseHostFds,
+            71 => Self::OomScoreAdj,
+            72 => Self::ExecClone,
+            73 => Self::ExecRecord,
+            74 => Self::PassFds,
+            75 => Self::StartedFifo,
             _ => return None,
         })
     }
@@ -265,6 +290,16 @@ impl FilterStart {
             Seccomp::Unconfined => None,
             _ if security.no_new_privileges => Some(Self::BeforeExec),
             _ => Some(Self::BeforeSetup),
+        }
+    }
+
+    /// When `confinement`'s filter goes on, if it has one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_confinement(confinement: &crate::security::Confinement) -> Option<Self> {
+        if confinement.filter_before_setup().is_some() {
+            Some(Self::BeforeSetup)
+        } else {
+            confinement.filter_before_exec().map(|_| Self::BeforeExec)
         }
     }
 
@@ -375,6 +410,14 @@ pub enum SpawnErrorKind {
     /// Setting up the container's namespaces (or joining them) failed
     /// before exec (exit 125): the steps a run without isolation skips.
     Isolation,
+    /// `exec` couldn't start its command in the container's cgroup: it has
+    /// sub-cgroups with controllers (made inside the container), and a
+    /// cgroup like that holds no processes itself (exit 125).
+    CgroupBusy,
+    /// `exec` couldn't start its command in the container's cgroup: this
+    /// user may not move processes there from the cgroup it runs in (a
+    /// rootless `exec` from a login whose cgroup isn't delegated) (exit 125).
+    CgroupDenied,
 }
 
 /// A command that was started but never ran, with a message saying why.
@@ -425,7 +468,10 @@ impl SpawnError {
         match self.kind {
             SpawnErrorKind::NotFound => EXIT_NOT_FOUND,
             SpawnErrorKind::CannotExecute => EXIT_CANNOT_EXECUTE,
-            SpawnErrorKind::Setup | SpawnErrorKind::Isolation => EXIT_ENGINE_ERROR,
+            SpawnErrorKind::Setup
+            | SpawnErrorKind::Isolation
+            | SpawnErrorKind::CgroupBusy
+            | SpawnErrorKind::CgroupDenied => EXIT_ENGINE_ERROR,
         }
     }
 }
@@ -490,6 +536,25 @@ fn stdio_name(fd: u64) -> &'static str {
     }
 }
 
+/// What a [`ChildStep::TerminalOpen`] failure was doing (its detail).
+fn opening_the_terminal(detail: u64, errno: Errno) -> &'static str {
+    match detail {
+        0 => "opening the container's /dev/pts/ptmx for its terminal",
+        1 => "unlocking the container's terminal",
+        2 => "sizing the container's terminal",
+        3 => "opening the container's terminal",
+        4 if errno == Errno::EINVAL => {
+            "giving the container's terminal to its user (that user isn't mapped in the \
+                     container's user namespace)"
+        }
+        4 => "giving the container's terminal to its user",
+        _ => {
+            "the container's /dev/pts/ptmx isn't its devpts's terminal multiplexer \
+                     (replaced inside the container): refused"
+        }
+    }
+}
+
 /// What failed at `failure`'s step, and why.
 fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
     use SpawnErrorKind::Setup;
@@ -504,6 +569,8 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         ChildStep::Exec => describe_exec(errno, detail, ctx),
         ChildStep::ResetSignals => setup("resetting signal handlers".into()),
         ChildStep::CloseFds => setup("closing inherited file descriptors".into()),
+        ChildStep::PassFds => setup("putting the passed descriptors in place, from 3".into()),
+        ChildStep::StartedFifo => setup("opening the started FIFO, for the poststart hooks".into()),
         ChildStep::Stdio => setup(format!("giving the command its {}", stdio_name(detail))),
         ChildStep::TerminalSession | ChildStep::ControllingTerminal | ChildStep::TerminalStdio => {
             setup(taking_the_terminal(step, detail))
@@ -528,22 +595,14 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         ChildStep::CgroupNamespace => {
             isolation_setup("giving the container a cgroup namespace", errno, ctx)
         }
-        ChildStep::InitFork => {
-            let doing = match (errno, ctx.pids_max) {
-                (Errno::EAGAIN, Some(limit)) => format!(
-                    "starting the command inside the container (its process limit is {limit}, \
-                     its init included)"
-                ),
-                _ => "starting the command inside the container".to_owned(),
-            };
-            isolation_setup(&doing, errno, ctx)
-        }
+        ChildStep::InitFork => init_fork(errno, ctx),
         ChildStep::JoinNamespace => join_setup(errno, detail, ctx),
-        ChildStep::Reexec => isolation_setup(
-            "starting the container's init (re-executing shipyard's own binary)",
-            errno,
-            ctx,
-        ),
+        ChildStep::Undumpable
+        | ChildStep::CloseHostFds
+        | ChildStep::OomScoreAdj
+        | ChildStep::ExecClone
+        | ChildStep::ExecRecord => exec_step(step, errno, ctx),
+        ChildStep::Reexec => describe_reexec(errno, ctx),
         ChildStep::ReadSetup => {
             isolation_setup("the container's init reading its setup", errno, ctx)
         }
@@ -596,6 +655,20 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
 }
 
 /// A device node that couldn't be made (`detail`: which).
+/// The container's init couldn't re-exec shipyard's binary: refused (no
+/// sealed copy runs here, and the file may not stand in), or another
+/// failure.
+fn describe_reexec(errno: Errno, ctx: &FailureContext) -> SpawnError {
+    let doing = if matches!(errno, Errno::EACCES | Errno::EPERM) {
+        "starting the container's init: this host refused to run shipyard's binary for it (a \
+         sealed copy: vm.memfd_noexec, or a security module's policy on memfds; the binary's \
+         file stands in only where nobody in the container could write it)"
+    } else {
+        "starting the container's init (re-executing shipyard's own binary)"
+    };
+    isolation_setup(doing, errno, ctx)
+}
+
 fn describe_device(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
     let node = usize::try_from(detail)
         .ok()
@@ -924,20 +997,10 @@ fn describe_container(
         ChildStep::OwnTerminals => {
             isolation_setup("mounting the container's own /dev/pts", errno, ctx)
         }
-        ChildStep::TerminalOpen => isolation_setup(
-            match detail {
-                0 => "opening the container's /dev/pts/ptmx for its terminal",
-                1 => "unlocking the container's terminal",
-                2 => "sizing the container's terminal",
-                3 => "opening the container's terminal",
-                _ => "giving the container's terminal to its user",
-            },
-            errno,
-            ctx,
-        ),
+        ChildStep::TerminalOpen => isolation_setup(opening_the_terminal(detail, errno), errno, ctx),
         ChildStep::TerminalSend => isolation_setup(
             if detail == 0 {
-                "passing the container's terminal to shipyard"
+                "passing the container's terminal on (to shipyard, or to the console socket)"
             } else {
                 "waiting for shipyard to relay the container's terminal"
             },
@@ -1054,6 +1117,84 @@ fn container_path(ctx: &FailureContext, detail: u64, list: impl Fn(&Root) -> &[P
         .map_or_else(|| "a path".to_owned(), |path| path.display().to_string())
 }
 
+/// The init couldn't start the command (its fork, inside the container).
+fn init_fork(errno: Errno, ctx: &FailureContext) -> SpawnError {
+    let doing = match (errno, ctx.pids_max) {
+        (Errno::EAGAIN, Some(limit)) => format!(
+            "starting the command inside the container (its process limit is {limit}, its \
+             init included)"
+        ),
+        _ => "starting the command inside the container".to_owned(),
+    };
+    isolation_setup(&doing, errno, ctx)
+}
+
+/// The steps only `exec`'s joiner and command take (see `exec.rs`).
+fn exec_step(step: ChildStep, errno: Errno, ctx: &FailureContext) -> SpawnError {
+    let doing = match step {
+        ChildStep::ExecClone => return exec_clone(errno, ctx),
+        ChildStep::Undumpable => "hiding the command from the container until it runs",
+        ChildStep::CloseHostFds => "closing the descriptors the command mustn't keep",
+        ChildStep::OomScoreAdj if errno == Errno::EACCES => {
+            "setting the command's OOM score adjustment (lowering it needs root: \
+             CAP_SYS_RESOURCE)"
+        }
+        ChildStep::OomScoreAdj => "setting the command's OOM score adjustment",
+        ChildStep::ExecRecord => "telling shipyard the command's process ID",
+        _ => "starting the command in the container",
+    };
+    SpawnError::new(
+        SpawnErrorKind::Setup,
+        format!("{doing}: {}", errno.desc()),
+        errno,
+    )
+}
+
+/// `exec`'s joiner couldn't start the command in the container: into its
+/// cgroup (`CLONE_INTO_CGROUP`), its PID namespace, or past its limits.
+fn exec_clone(errno: Errno, ctx: &FailureContext) -> SpawnError {
+    match errno {
+        Errno::EBUSY => SpawnError::new(
+            SpawnErrorKind::CgroupBusy,
+            "starting the command in the container's cgroup: it has sub-cgroups with \
+             controllers enabled (made inside the container), and such a cgroup takes no \
+             process itself",
+            errno,
+        ),
+        Errno::EACCES | Errno::ENOENT => SpawnError::new(
+            SpawnErrorKind::CgroupDenied,
+            "starting the command in the container's cgroup: this user may not move processes \
+             there from the cgroup this runs in (a login whose cgroup isn't delegated to you, \
+             such as an SSH session's: run it in your user session's, with \
+             `systemd-run --user --scope shipyard-runtime exec …`)",
+            errno,
+        ),
+        Errno::EAGAIN => SpawnError::new(
+            SpawnErrorKind::Isolation,
+            match ctx.pids_max {
+                Some(limit) => format!(
+                    "starting the command in the container: it has reached its process limit \
+                     ({limit})"
+                ),
+                None => {
+                    "starting the command in the container: a process limit is reached".to_owned()
+                }
+            },
+            errno,
+        ),
+        Errno::ENOMEM => SpawnError::new(
+            SpawnErrorKind::Isolation,
+            "starting the command in the container: it is ending (its init has exited)",
+            errno,
+        ),
+        _ => SpawnError::new(
+            SpawnErrorKind::Isolation,
+            format!("starting the command in the container: {}", errno.desc()),
+            errno,
+        ),
+    }
+}
+
 /// Joining one of a running container's namespaces failed; `detail` says
 /// which (its index in `Namespace::ALL`).
 fn join_setup(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
@@ -1065,7 +1206,12 @@ fn join_setup(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
         None => format!("joining the container's namespaces: {}", errno.desc()),
     };
     if errno == Errno::EPERM {
-        message.push_str(&permission_hint(ctx.root, "joining a container"));
+        message.push_str(if ctx.root {
+            " (the system refused it: inside a container without privileges, or under a \
+             security policy)"
+        } else {
+            " (not this user's container: its user namespace isn't yours)"
+        });
     }
     SpawnError::new(SpawnErrorKind::Isolation, message, errno)
 }
@@ -1436,12 +1582,37 @@ mod tests {
         )
     }
 
+    /// The init's re-exec refused (no sealed copy runs here, and the file
+    /// may not stand in) says why; another failure there says only what
+    /// failed.
+    #[test]
+    fn a_refused_reexec_names_the_sealed_copy() {
+        let reexec = |errno| {
+            describe(
+                ChildFailure {
+                    step: ChildStep::Reexec,
+                    errno,
+                    detail: 0,
+                },
+                &ctx("sh", &[]),
+            )
+            .to_string()
+        };
+        assert!(reexec(Errno::EACCES).contains("refused to run shipyard's binary"));
+        let other = reexec(Errno::ENOMEM);
+        assert!(
+            other.contains("re-executing shipyard's own binary"),
+            "{other}"
+        );
+        assert!(!other.contains("sealed copy"), "{other}");
+    }
+
     #[test]
     fn steps_round_trip_through_their_numbers() {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 68, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 75, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }
@@ -1830,7 +2001,7 @@ mod tests {
         assert_eq!(
             join.to_string(),
             "joining the container's mnt namespace: Operation not permitted \
-             (joining a container needs root)"
+             (not this user's container: its user namespace isn't yours)"
         );
         let refused = describe(
             ChildFailure {

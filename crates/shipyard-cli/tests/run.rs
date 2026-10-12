@@ -225,6 +225,53 @@ fn leaked_descriptors_do_not_reach_the_command() {
     assert_eq!(run.stdout, "closed\n", "fd 9 leaked into the command");
 }
 
+/// `--preserve-fds 1`: the command gets 3, and still not another leaked
+/// descriptor.
+#[test]
+fn preserved_descriptors_reach_the_command() {
+    let run = hostile(
+        &[
+            "--preserve-fds",
+            "1",
+            "sh",
+            "-c",
+            "if true 2>/dev/null <&3; then echo three; fi; \
+             if true 2>/dev/null <&9; then echo nine; else echo no-nine; fi",
+        ],
+        || {
+            // SAFETY: `dup2` is async-signal-safe.
+            if unsafe { libc::dup2(0, 3) } == -1 || unsafe { libc::dup2(2, 9) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "three\nno-nine\n");
+}
+
+/// A descriptor to pass that isn't open: refused, the command never runs.
+#[test]
+fn preserving_a_closed_descriptor_is_refused() {
+    let run = hostile(&["--preserve-fds", "2", "sh", "-c", "echo ran"], || {
+        // SAFETY: `dup2` and `close` are async-signal-safe.
+        unsafe {
+            if libc::dup2(0, 3) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(4);
+        }
+        Ok(())
+    });
+    assert_eq!(run.code, Some(125), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("descriptor 4 isn't open"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stdout.is_empty());
+}
+
 #[test]
 fn ignored_signals_are_reset_for_the_command() {
     // A shell can't un-ignore a signal ignored at startup, so if the reset

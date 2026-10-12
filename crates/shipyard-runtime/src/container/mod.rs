@@ -35,19 +35,24 @@ use crate::oci::BundleError;
 
 #[cfg(not(target_os = "linux"))]
 mod elsewhere;
+mod helper;
 #[cfg(target_os = "linux")]
 mod lifecycle;
 
 #[cfg(not(target_os = "linux"))]
 pub use elsewhere::{
-    create, delete, kill, kill_all, memory_limit, monitor_entry_point, pause, ps, resume, start,
+    attach_stream, create, delete, exec, exit_code, helper_entry_point, kill, kill_all, logs_of,
+    memory_limit, monitor_entry_point, pause, ps, remove_failed_logs, resume, start, start_helper,
     state, stats, update,
 };
 #[cfg(target_os = "linux")]
 pub use lifecycle::{
-    create, delete, kill, kill_all, memory_limit, monitor_entry_point, pause, ps, resume, start,
+    attach_stream, create, delete, exec, exit_code, helper_entry_point, kill, kill_all, logs_of,
+    memory_limit, monitor_entry_point, pause, ps, remove_failed_logs, resume, start, start_helper,
     state, stats, update,
 };
+
+pub use helper::{Helper, HelperFailure, HelperIo, RunningHelper};
 
 /// Where root's state directories go unless told otherwise (runc's is
 /// `/run/runc`).
@@ -108,6 +113,162 @@ fn choose_root(
 
 /// The version of the OCI runtime spec the state follows.
 pub const OCI_VERSION: &str = "1.2.0";
+
+/// What [`create`] does besides what the bundle says.
+#[derive(Debug, Default)]
+pub struct CreateOptions<'a> {
+    /// A connected UNIX socket to send the container's terminal to (runc's
+    /// `--console-socket`), for a bundle that asks for one.
+    pub console: Option<std::os::fd::BorrowedFd<'a>>,
+    /// Capture the container's output into logs (`--log-dir`), instead of
+    /// giving it the caller's stdio.
+    pub logs: Option<LogOptions>,
+    /// Descriptors to pass on to the container's process, at 3 and up
+    /// (`--preserve-fds`, socket activation): see
+    /// [`PassedFds`](crate::process::passed::PassedFds). The container's
+    /// init holds them from `create` until its program starts.
+    pub passed: Option<&'a crate::process::passed::PassedFds>,
+}
+
+/// What [`exec`] runs in a container, and how (runc's `exec` flags). What
+/// isn't given is the container's own process's: its environment, working
+/// directory, user, capabilities, `no_new_privs`, limits; its seccomp
+/// filter always. None of it may widen what the container has.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ExecOptions {
+    /// The command and its arguments (`exec ID CMD…`); empty with
+    /// [`process`](Self::process).
+    pub args: Vec<std::ffi::OsString>,
+    /// A runc `process.json` (`--process`): the whole process instead.
+    pub process: Option<PathBuf>,
+    /// The working directory (`--cwd`), inside the container.
+    pub cwd: Option<PathBuf>,
+    /// `KEY=VALUE` entries (`--env`) added to (or replacing ones of) the
+    /// container's environment.
+    pub env: Vec<std::ffi::OsString>,
+    /// The user (`--user UID[:GID]`): numeric, as the container sees them.
+    pub user: Option<(u32, Option<u32>)>,
+    /// Supplementary groups (`--additional-gids`), instead of the
+    /// container's process's.
+    pub additional_gids: Vec<u32>,
+    /// Capabilities to add (`--cap`), within the container's bounding set.
+    pub capabilities: Vec<crate::security::Capability>,
+    /// Set `no_new_privs` (`--no-new-privs`).
+    pub no_new_privileges: bool,
+    /// Return once it runs (`-d`), leaving it running.
+    pub detach: bool,
+    /// A pseudo-terminal for it (`-t`), made in the container: relayed to
+    /// this process's own descriptors (raw if its stdin is a terminal), or,
+    /// with [`console`](Self::console), sent there.
+    pub terminal: bool,
+    /// An OCI console socket (`--console-socket`), connected, open for the
+    /// whole call: the terminal's master goes there (runc's protocol).
+    pub console: Option<std::os::fd::RawFd>,
+}
+
+impl ExecOptions {
+    /// Runs `args`, the rest as the container's process has it.
+    #[must_use]
+    pub fn new(args: Vec<std::ffi::OsString>) -> Self {
+        Self {
+            args,
+            ..Self::default()
+        }
+    }
+}
+
+/// How an [`exec`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecOutcome {
+    /// The command ran and ended so.
+    Exited(crate::process::ExitStatus),
+    /// Detached (`-d`): running, with this PID (as the host sees it).
+    Detached {
+        /// Its PID.
+        pid: u32,
+    },
+}
+
+/// Whether a container takes input through attach (`create --stdin`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StdinMode {
+    /// `/dev/null`: attach is output only.
+    #[default]
+    Closed,
+    /// A pipe (or the terminal) the monitor holds open; attached clients
+    /// type into it, and detaching leaves it open.
+    Open,
+    /// As [`Open`](Self::Open), closed when the first client to type goes
+    /// or its input ends, once what it typed is written (`--stdin-once`).
+    Once,
+}
+
+/// Where and how a container's output is kept ([`CreateOptions::logs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogOptions {
+    /// A directory that doesn't exist yet: `create` makes it (0700), and
+    /// the logs outlive the container (they're the caller's to remove).
+    pub dir: PathBuf,
+    /// Their rotation.
+    pub settings: crate::logs::info::LogSettings,
+    /// Whether the container takes input through attach.
+    pub stdin: StdinMode,
+}
+
+/// A container's logs ([`logs_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LogsOf {
+    /// Their directory.
+    pub dir: PathBuf,
+    /// Whether they're complete: the container has ended, and everything it
+    /// wrote is in them.
+    pub finished: bool,
+    /// The directory `create` made, by identity: what's at [`dir`](Self::dir)
+    /// now may be another, put there since. `None` for a container created
+    /// before 8.8c, which recorded only the path.
+    pub identity: Option<DirIdentity>,
+    /// Which container wrote them: its monitor's PID and start time. A
+    /// directory deleted and made again can get the same identity (ext4 and
+    /// xfs hand an inode number on), but never the same monitor.
+    pub instance: Option<(i32, u64)>,
+}
+
+/// A directory's identity: its device and inode. No other directory has it
+/// while this one exists, whereas a path can come to name another (removed
+/// and made again, or renamed and replaced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirIdentity {
+    /// Its filesystem's device (`st_dev`).
+    pub dev: u64,
+    /// Its inode there (`st_ino`).
+    pub ino: u64,
+}
+
+impl DirIdentity {
+    /// The identity of the directory open at `fd`.
+    ///
+    /// # Errors
+    ///
+    /// What `fstat` gives.
+    #[cfg(target_os = "linux")]
+    pub fn of(fd: std::os::fd::BorrowedFd<'_>) -> nix::Result<Self> {
+        nix::sys::stat::fstat(fd).map(|stat| Self::from_stat(&stat))
+    }
+
+    /// The identity `stat` describes.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn from_stat(stat: &nix::sys::stat::FileStat) -> Self {
+        Self {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        }
+    }
+}
 
 /// A container `create` made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +399,7 @@ pub enum ContainerError {
     /// socket was given to send it to.
     #[error(
         "the bundle asks for a terminal (process.terminal), and there's no console socket to \
-         send it to: give one with --console-socket"
+         send it to: give one with --console-socket (or keep its output in logs with --log-dir)"
     )]
     TerminalWithoutConsoleSocket,
     /// A console socket was given, and the bundle asks for no terminal.
@@ -247,6 +408,92 @@ pub enum ContainerError {
          false)"
     )]
     ConsoleSocketWithoutTerminal,
+    /// A console socket and logs both: a terminal goes to one or the other.
+    #[error(
+        "a console socket and a log directory both: the container's terminal goes either to the \
+         console socket or into the logs"
+    )]
+    ConsoleSocketWithLogs,
+    /// The log directory exists already: logs never go into one that may be
+    /// another container's.
+    #[error("the log directory {} exists: give one that doesn't (create makes it)", .0.display())]
+    LogDirExists(PathBuf),
+    /// Rotation settings out of bounds.
+    #[error(transparent)]
+    LogSettings(#[from] crate::logs::info::SettingsError),
+    /// `--stdin-once` for a container with a terminal.
+    #[error(
+        "--stdin-once can't go with a terminal (process.terminal): closing a terminal is a \
+         hang-up, not an end of input"
+    )]
+    StdinOnceWithTerminal,
+    /// The container can't be attached to: created without `--log-dir`, or
+    /// by a Shipyard before attach.
+    #[error("container {0} can't be attached to: create it with --log-dir")]
+    NotAttachable(String),
+    /// Nothing answers on the container's attach socket: its monitor was
+    /// killed, or let go as the container ended.
+    #[error("container {0}'s monitor is gone: nothing can be attached to")]
+    MonitorGone(String),
+    /// `exec` can't run in this container (the reason): made by a Shipyard
+    /// before `exec`, or without PID and mount namespaces of its own.
+    #[error("container {id} can't be exec'd into: {why}")]
+    NotExecutable {
+        /// Its ID.
+        id: String,
+        /// Why.
+        why: String,
+    },
+    /// `exec`'s process would have more than the container's own (what):
+    /// a capability outside its bounding set, `no_new_privs` off, a higher
+    /// limit or a lower OOM score adjustment.
+    #[error("exec can't give the process more than the container has: {0}")]
+    ExecBeyondContainer(String),
+    /// The container's cgroup has sub-cgroups with controllers (made inside
+    /// it): `exec` can't start a process in it.
+    #[error(
+        "container {0}'s cgroup has sub-cgroups with controllers enabled (made inside the \
+         container), and takes no process itself: exec can't run there"
+    )]
+    ExecCgroupBusy(String),
+    /// A rootless `exec` from a cgroup that isn't delegated to the user (an
+    /// SSH session's, say).
+    #[error(
+        "exec can't move its process into container {0}'s cgroup from the cgroup it runs in (a \
+         login whose cgroup isn't delegated to you, such as an SSH session's): run it in your \
+         user session's, with `systemd-run --user --scope shipyard-runtime exec …`"
+    )]
+    ExecCgroupDenied(String),
+    /// `exec --console-socket` without a terminal (`-t`, or the
+    /// `process.json`'s `terminal`).
+    #[error("a console socket was given, and exec has no terminal (give -t)")]
+    ExecConsoleWithoutTerminal,
+    /// `exec -d -t` without a console socket: nothing would hold the
+    /// terminal (runc's rule).
+    #[error("exec -d -t needs --console-socket: nothing else would hold the terminal")]
+    ExecTerminalNeedsConsole,
+    /// `exec` failed (its process never ran): the reason.
+    #[error(transparent)]
+    Exec(Box<crate::Error>),
+    /// A helper (`cp`'s) needs the container's own filesystem view, and it
+    /// has no mount namespace of its own.
+    #[error(
+        "container {0} has no mount namespace of its own: its files are the host's, not its own"
+    )]
+    HelperNeedsMount(String),
+    /// A helper couldn't be started (the reason).
+    #[error(transparent)]
+    Helper(Box<crate::Error>),
+    /// A helper said what went wrong.
+    #[error(transparent)]
+    HelperFailed(HelperFailure),
+    /// A helper ended without saying why.
+    #[error("the helper ended without saying why ({0})")]
+    HelperEnded(String),
+    /// The container's output isn't captured (it was created without
+    /// `--log-dir`): there are no logs to read.
+    #[error("container {0} has no logs: it was created without --log-dir")]
+    NotCaptured(String),
     /// Another call has held the container's lock too long (stopped, or
     /// stuck on a hung file system).
     #[error("container {0} is busy: another call has held its lock for over 15 seconds")]

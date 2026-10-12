@@ -1,4 +1,6 @@
-//! The engine's errors (H6: tests match the variant, not the wording).
+//! The errors of the engine's stream setup (H6: tests match the variant,
+//! not the wording). The other operations' are in their modules
+//! (`attach::AttachError`, `logs::LogsError`, `cp::CpError`).
 
 /// Why a run's standard input and output can't be set up as asked (see
 /// [`streams::plan`](crate::streams::plan)).

@@ -33,6 +33,7 @@ use serde_json::Value;
 use crate::devices::{DeviceKind, DeviceNode};
 use crate::isolation::{
     CgroupMount, IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, NetDevice, Root,
+    StandardMount,
 };
 use crate::process::{Env, ProcessSpec, Rlimit, RlimitValue, User};
 use crate::security::seccomp::Profile;
@@ -260,6 +261,70 @@ pub fn resources_from_json(
     }
 }
 
+/// A runc `process.json` (`exec --process`, stage 8.4a): a bundle's
+/// `process` object on its own, read as a bundle's is, with the same
+/// refusals.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExecProcess {
+    /// What to run, as whom, where.
+    pub spec: ProcessSpec,
+    /// Its capabilities, if it lists them (`None`: the container's).
+    pub capabilities: Option<CapabilitySets>,
+    /// `noNewPrivileges` (absent: false).
+    pub no_new_privileges: bool,
+    /// Whether it lists rlimits (`false`: the container's apply).
+    pub rlimits_given: bool,
+    /// Its terminal (`terminal: true`, with `consoleSize` if it gives one).
+    pub terminal: Option<BundleTerminal>,
+}
+
+/// Reads a runc `process.json` (see [`ExecProcess`]). `source` names it in
+/// errors.
+///
+/// # Errors
+///
+/// Not JSON, a value that can't work, or a field that can't be applied.
+pub fn process_from_json(text: &str, source: &Path) -> Result<ExecProcess, BundleError> {
+    let value: Value = serde_json::from_str(text).map_err(|err| json_error(source, &err))?;
+    let mut reader = Reader {
+        dir: source.parent().unwrap_or(Path::new(".")),
+        path: source,
+        refused: Vec::new(),
+        warnings: Vec::new(),
+        cgroup_mount: None,
+    };
+    let process: ProcessConfig = serde_json::from_value(value)
+        .map_err(|err| reader.invalid(format!("the process: {err}")))?;
+    let terminal = reader.terminal(&process)?;
+    let capabilities = process
+        .capabilities
+        .is_some()
+        .then(|| reader.security(&process))
+        .transpose()?
+        .and_then(|security| match security.capabilities {
+            Capabilities::Exact(sets) => Some(sets),
+            Capabilities::Default { .. } => None,
+        });
+    let no_new_privileges = process.no_new_privileges;
+    let rlimits_given = !process.rlimits.is_empty();
+    let spec = reader.process(process)?;
+    if reader.refused.is_empty() {
+        Ok(ExecProcess {
+            spec,
+            capabilities,
+            no_new_privileges,
+            rlimits_given,
+            terminal,
+        })
+    } else {
+        Err(BundleError::Unsupported {
+            path: source.to_owned(),
+            fields: reader.refused,
+        })
+    }
+}
+
 // --- The parts of the config Shipyard knows ----------------------------------
 //
 // Fields Shipyard refuses or ignores are `Option<Value>`: only their
@@ -437,15 +502,20 @@ struct MountConfig {
 }
 
 /// The mounts every container gets from Shipyard (`rootfs.rs`): listed in
-/// a config, they're accepted and Shipyard's own are used.
-const STANDARD_MOUNTS: [(&str, &str); 6] = [
-    ("/proc", "proc"),
-    ("/sys", "sysfs"),
-    ("/dev", "tmpfs"),
-    ("/dev/pts", "devpts"),
-    ("/dev/shm", "tmpfs"),
-    ("/dev/mqueue", "mqueue"),
+/// a config, they're made where they're listed, with Shipyard's own
+/// options. (The cgroup mount is read apart: its `ro` counts.)
+const STANDARD_MOUNTS: [(StandardMount, &str); 6] = [
+    (StandardMount::Proc, "proc"),
+    (StandardMount::Sys, "sysfs"),
+    (StandardMount::Dev, "tmpfs"),
+    (StandardMount::Devpts, "devpts"),
+    (StandardMount::Shm, "tmpfs"),
+    (StandardMount::Mqueue, "mqueue"),
 ];
+
+/// The standard mounts' places, and the container's own mounts (see
+/// [`Root::standard_at`]).
+type StandardAndOwn = (Vec<(StandardMount, usize)>, Vec<Mount>);
 
 /// Whether a config value asks for nothing: null, or an empty list or
 /// object, or an object of such values (`{"devices": []}`).
@@ -610,7 +680,7 @@ impl Reader<'_> {
         root.masked_paths = linux.masked_paths.clone().unwrap_or_default();
         root.readonly_paths = linux.readonly_paths.clone().unwrap_or_default();
         self.linux(&linux);
-        root.mounts = self.mounts(config.mounts)?;
+        (root.standard_at, root.mounts) = self.mounts(config.mounts)?;
         isolation.root = Some(root);
         let (resources, rules) = self.resources(linux.resources.as_ref())?;
         isolation.resources = resources;
@@ -972,17 +1042,36 @@ impl Reader<'_> {
             .collect()
     }
 
-    /// The config's mounts: the standard ones are Shipyard's own, binds and
-    /// tmpfs are the container's, anything else is refused.
-    fn mounts(&mut self, listed: Vec<MountConfig>) -> Result<Vec<Mount>, BundleError> {
+    /// The config's mounts: binds and tmpfs are the container's; the
+    /// standard ones are Shipyard's own, made where they're listed (their
+    /// places among the others: see [`Root::standard_at`]); anything else
+    /// is refused.
+    fn mounts(&mut self, listed: Vec<MountConfig>) -> Result<StandardAndOwn, BundleError> {
         let mut mounts = Vec::new();
+        let mut standard_at = Vec::new();
         for entry in listed {
             let destination = entry.destination.to_string_lossy().into_owned();
             let kind = entry.kind.as_deref().unwrap_or("");
-            if STANDARD_MOUNTS.contains(&(destination.as_str(), kind)) {
+            // `runc spec --rootless` binds the host's `/sys` there: Shipyard
+            // makes `/sys` itself, binding the host's only where it must
+            // (rootless, without a network of its own).
+            let host_sys = destination == "/sys"
+                && entry.source.as_deref() == Some(Path::new("/sys"))
+                && entry
+                    .options
+                    .iter()
+                    .any(|option| option == "rbind" || option == "bind");
+            if let Some(standard) = STANDARD_MOUNTS
+                .iter()
+                .find(|&&(standard, of)| standard.destination() == destination && of == kind)
+                .map(|&(standard, _)| standard)
+                .or(host_sys.then_some(StandardMount::Sys))
+            {
+                standard_at.push((standard, mounts.len()));
                 continue;
             }
             if destination == "/sys/fs/cgroup" && ["cgroup", "cgroup2"].contains(&kind) {
+                standard_at.push((StandardMount::Cgroup, mounts.len()));
                 // The container's own cgroup (v2 only: `cgroup` means it
                 // too), `nosuid`, `nodev` and `noexec` whatever the options
                 // say. Mounted only if the container has a cgroup of its own.
@@ -1028,7 +1117,7 @@ impl Reader<'_> {
             self.mount_options(&destination, &entry.options, &mut mount)?;
             mounts.push(mount);
         }
-        Ok(mounts)
+        Ok((standard_at, mounts))
     }
 
     /// Applies a mount's OCI options (`mount(8)` names) to `mount`.
@@ -1040,6 +1129,7 @@ impl Reader<'_> {
     ) -> Result<(), BundleError> {
         let is_tmpfs = mount.kind == MountKind::Tmpfs;
         let mut data = Vec::new();
+        let mut ignored = Vec::new();
         for option in options {
             if let Some(&(_, flag, on)) = FLAG_OPTIONS.iter().find(|(name, ..)| name == option) {
                 mount.flags.retain(|&set| set != flag);
@@ -1081,6 +1171,11 @@ impl Reader<'_> {
                     {
                         data.push(other.to_owned());
                     }
+                    // A tmpfs's options on a bind: `mount(2)` ignores them
+                    // there (runc passes them on), so they're ignored, said.
+                    Some((key, _)) if !is_tmpfs && TMPFS_OPTIONS.contains(&key) => {
+                        ignored.push(other.to_owned());
+                    }
                     _ => {
                         return Err(self.invalid(format!(
                             "mounts: unknown option \"{other}\" for {destination}"
@@ -1091,6 +1186,14 @@ impl Reader<'_> {
         }
         if !data.is_empty() {
             mount.data = Some(data.join(","));
+        }
+        if !ignored.is_empty() {
+            self.warnings.push(format!(
+                "{}: the options {} of {destination} are ignored (they're a tmpfs's, and \
+                 mean nothing on a bind)",
+                self.path.display(),
+                ignored.join(", "),
+            ));
         }
         Ok(())
     }
@@ -1813,6 +1916,50 @@ mod tests {
         assert!(err.contains("linux.resources.devices"), "{err}");
     }
 
+    /// A runc `process.json` is read as a bundle's `process` is: what it
+    /// lists, and what it leaves to the container, its terminal too.
+    #[test]
+    fn a_process_json_is_read_as_a_bundles_process() {
+        let read = |text: &str| process_from_json(text, Path::new("process.json"));
+        let full = read(
+            r#"{"args": ["ls", "-l"], "env": ["A=1"], "cwd": "/tmp",
+                "user": {"uid": 7, "gid": 8, "additionalGids": [9]},
+                "capabilities": {"bounding": ["CAP_KILL"], "effective": ["CAP_KILL"],
+                                 "permitted": ["CAP_KILL"]},
+                "noNewPrivileges": true,
+                "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 64, "soft": 32}],
+                "oomScoreAdj": 50}"#,
+        )
+        .unwrap();
+        assert_eq!(full.spec.args, ["ls", "-l"]);
+        assert_eq!(full.spec.cwd, Path::new("/tmp"));
+        assert_eq!((full.spec.user.uid, full.spec.user.gid), (7, 8));
+        assert_eq!(full.spec.user.additional_gids, [9]);
+        assert!(full.no_new_privileges && full.rlimits_given);
+        assert_eq!(full.spec.oom_score_adj, Some(50));
+        let caps = full.capabilities.unwrap();
+        assert!(caps.bounding.contains(Capability::KILL));
+        assert_eq!(caps.bounding.iter().count(), 1);
+        let bare = read(r#"{"args": ["true"], "cwd": "/", "user": {"uid": 0, "gid": 0}}"#).unwrap();
+        assert_eq!(bare.capabilities, None, "absent: the container's");
+        assert!(!bare.rlimits_given && !bare.no_new_privileges);
+        assert_eq!(bare.terminal, None);
+        // A terminal (8.4b), with its size if it gives one.
+        let terminal = read(
+            r#"{"args": ["sh"], "cwd": "/", "user": {"uid": 0, "gid": 0}, "terminal": true,
+                "consoleSize": {"height": 30, "width": 100}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            terminal.terminal,
+            Some(BundleTerminal {
+                size: Some((30, 100))
+            })
+        );
+        assert!(read(r#"{"args": [], "cwd": "/", "user": {"uid": 0, "gid": 0}}"#).is_err());
+        assert!(read("not json").is_err());
+    }
+
     #[test]
     fn hooks_are_read_and_checked() {
         let with = |hooks: Value| TestBundle::new(&config(&json!({"hooks": hooks}))).load();
@@ -2113,12 +2260,14 @@ mod tests {
             "{:?}",
             loaded.warnings
         );
-        let mounts = loaded.isolation.root.unwrap().mounts;
+        let root = loaded.isolation.root.unwrap();
+        // The standard ones are Shipyard's own, where they're listed.
         assert_eq!(
-            mounts.len(),
-            4,
-            "the standard ones are Shipyard's own: {mounts:#?}"
+            root.standard_at,
+            [(StandardMount::Proc, 0), (StandardMount::Devpts, 0)]
         );
+        let mounts = root.mounts;
+        assert_eq!(mounts.len(), 4, "{mounts:#?}");
         let data = std::fs::canonicalize(bundle.dir.join("data")).unwrap();
         let mut expected = Mount::bind(&data, "/data");
         expected.flags = vec![MountFlag::ReadOnly, MountFlag::NoSuid];
@@ -2144,6 +2293,68 @@ mod tests {
         ));
     }
 
+    /// A tmpfs's options on a bind mean nothing to the kernel (runc passes
+    /// them on, as runtime-tools' configs do): ignored, with a warning.
+    #[test]
+    fn a_tmpfs_option_on_a_bind_is_ignored_and_said() {
+        let bundle = TestBundle::new(&config(&json!({
+            "mounts": [
+                {"destination": "/one", "source": "data", "options": ["bind", "mode=755", "size=1k"]},
+                {"destination": "/sys", "type": "sysfs", "source": "sysfs"},
+                {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup", "options": ["ro"]}
+            ]
+        })));
+        let loaded = bundle.load().unwrap();
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("the options mode=755, size=1k of /one are ignored")),
+            "{:?}",
+            loaded.warnings
+        );
+        let root = loaded.isolation.root.unwrap();
+        assert_eq!(
+            root.mounts.first().and_then(|mount| mount.data.as_ref()),
+            None
+        );
+        // The cgroup mount has its place too.
+        assert_eq!(
+            root.standard_at,
+            [(StandardMount::Sys, 1), (StandardMount::Cgroup, 1)]
+        );
+    }
+
+    /// `runc spec --rootless`'s `/sys`, a bind of the host's, is the
+    /// standard `/sys`, at its place.
+    #[test]
+    fn a_bound_host_sys_is_the_standard_one() {
+        let bundle = TestBundle::new(&config(&json!({"mounts": [
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+            {"destination": "/sys", "type": "none", "source": "/sys",
+             "options": ["rbind", "nosuid", "noexec", "nodev", "ro"]}
+        ]})));
+        let root = bundle.load().unwrap().isolation.root.unwrap();
+        assert_eq!(
+            root.standard_at,
+            [(StandardMount::Proc, 0), (StandardMount::Sys, 0)]
+        );
+        assert!(root.mounts.is_empty());
+    }
+
+    /// An order that can't work is refused when the bundle is read.
+    #[test]
+    fn an_order_that_cant_work_is_refused() {
+        let reason = invalid(&config(&json!({"mounts": [
+            {"destination": "/sys/fs/cgroup", "type": "cgroup2", "source": "cgroup"},
+            {"destination": "/sys", "type": "sysfs", "source": "sysfs"}
+        ]})));
+        assert!(
+            reason.contains("/sys/fs/cgroup is listed before /sys"),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn bad_mounts_are_errors() {
         let with = |mount: Value| invalid(&config(&json!({"mounts": [mount]})));
@@ -2156,7 +2367,8 @@ mod tests {
             with(json!({"destination": "/x", "type": "tmpfs", "options": ["bogus"]}))
                 .contains("bogus")
         );
-        assert!(with(json!({"destination": "/x", "type": "bind", "source": "data", "options": ["size=1m"]})).contains("size=1m"));
+        // A key no tmpfs has either: still an error on a bind.
+        assert!(with(json!({"destination": "/x", "type": "bind", "source": "data", "options": ["huge=always"]})).contains("huge=always"));
         assert!(with(json!({"destination": "/proc/x", "type": "tmpfs"})).contains("/proc"));
         // A comma in a value would pass another option to the kernel.
         assert!(

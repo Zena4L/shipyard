@@ -99,6 +99,12 @@ const ISOLATED_TESTS: &[(&str, fn())] = tests![
     an_isolated_command_never_holds_the_host_terminal,
     a_bundle_run_never_holds_the_host_terminal,
     a_terminal_bundle_runs_on_its_own_terminal,
+    attach_to_a_terminal_container,
+    attach_from_a_terminal_to_a_plain_container,
+    a_killed_attach_puts_the_terminal_back,
+    exec_t_on_a_terminal,
+    exec_from_a_terminal_never_gets_it,
+    exec_t_in_the_background_starts_its_command,
     a_bundle_without_a_pid_namespace_cant_reach_shipyards_descriptors,
     a_poststart_hook_doesnt_hold_up_the_output,
     a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request,
@@ -957,7 +963,9 @@ fn a_bundle_run_never_holds_the_host_terminal() {
     config["process"]["args"] = serde_json::json!([
         "sh",
         "-c",
-        "for fd in 0 1 2; do [ -t $fd ] && echo \"fd $fd: a t\"\"ty\"; done; echo do\"\"ne"
+        "for fd in 0 1 2; do [ -t $fd ] && echo \"fd $fd: a t\"\"ty\"; done; \
+         stty raw 2>/dev/null || echo cannot-change; \
+         echo \"fd1=$(readlink /proc/self/fd/1)\"; echo do\"\"ne"
     ]);
     bundle.write(&config);
     // SAFETY: this test binary is single-threaded (see the module docs).
@@ -968,6 +976,9 @@ fn a_bundle_run_never_holds_the_host_terminal() {
         shell.wait(job);
     });
     session.job();
+    // What it has instead: pipes, and no terminal to change.
+    session.expect("cannot-change");
+    session.expect("fd1=pipe:");
     session.expect("done");
     assert_eq!(
         session.status(),
@@ -976,6 +987,453 @@ fn a_bundle_run_never_holds_the_host_terminal() {
         session.transcript()
     );
     assert_eq!(session.count("a tty"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// `shipyard-runtime attach` to a container with a terminal (`create
+/// --log-dir --stdin`): the user's terminal goes raw, what's typed reaches
+/// the container's terminal (Ctrl-C too, as a byte), a resize follows,
+/// Ctrl-P Ctrl-Q detaches (exit 0), and the terminal is put back as it was.
+fn attach_to_a_terminal_container() {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!([
+        "sh",
+        "-c",
+        // (Ctrl-C interrupts `read`: the loop goes on.)
+        "trap 'echo caught-int' INT; while :; do read line && echo got-$line && stty size; done"
+    ]);
+    config["process"]["terminal"] = serde_json::json!(true);
+    bundle.write(&config);
+    let state =
+        StateRoot(std::env::temp_dir().join(format!("shipyard-attach-{}", std::process::id())));
+    let logs = state.0.with_extension("logs");
+    let runtime = |args: &[&str]| {
+        let status = std::process::Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&state.0)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{args:?}");
+    };
+    runtime(&[
+        "create",
+        "--bundle",
+        bundle.arg(),
+        "--log-dir",
+        logs.to_str().unwrap(),
+        "--stdin",
+        ON_A_TTY,
+    ]);
+    runtime(&["start", ON_A_TTY]);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(STATE_ROOT_VAR, &state.0) };
+    let mut session = session(|shell| {
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let before = shell.terminal_settings();
+        let job = shell.spawn_program(
+            Mode::Foreground,
+            RUNTIME.path(),
+            &["--root", &root, "attach", ON_A_TTY],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.type_keys(b"one\r");
+    session.expect("got-one");
+    session.resize(33, 99);
+    session.type_keys(b"two\r");
+    session.expect("got-two");
+    session.expect("33 99");
+    // Ctrl-C is a byte in raw mode: it reaches the container's terminal,
+    // which interrupts its shell, and `attach` goes on.
+    session.type_keys(b"\x03");
+    session.expect("caught-int");
+    session.type_keys(b"three\r");
+    session.expect("got-three");
+    session.type_keys(b"\x10\x11");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+    let _ = std::fs::remove_dir_all(&logs);
+}
+
+/// `shipyard-runtime attach` from a terminal to a container without one: the
+/// user types lines, as their terminal edits them, but Ctrl-Q reaches
+/// attach (the terminal's flow control is off while attached: it would take
+/// the key for itself), so Ctrl-P Ctrl-Q and Enter detach (exit 0); the
+/// terminal is put back as it was, and so it is when Ctrl-C ends attach.
+fn attach_from_a_terminal_to_a_plain_container() {
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] =
+        serde_json::json!(["sh", "-c", "while read line; do echo got-$line; done"]);
+    bundle.write(&config);
+    let state = StateRoot(
+        std::env::temp_dir().join(format!("shipyard-attach-plain-{}", std::process::id())),
+    );
+    let logs = state.0.with_extension("logs");
+    let runtime = |args: &[&str]| {
+        let status = std::process::Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&state.0)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{args:?}");
+    };
+    runtime(&[
+        "create",
+        "--bundle",
+        bundle.arg(),
+        "--log-dir",
+        logs.to_str().unwrap(),
+        "--stdin",
+        PLAIN_ON_A_TTY,
+    ]);
+    runtime(&["start", PLAIN_ON_A_TTY]);
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(STATE_ROOT_VAR, &state.0) };
+    let attach = |shell: &mut Shell| {
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let before = shell.terminal_settings();
+        let job = shell.spawn_program(
+            Mode::Foreground,
+            RUNTIME.path(),
+            &["--root", &root, "attach", PLAIN_ON_A_TTY],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    };
+    let mut detaching = session(attach);
+    detaching.job();
+    detaching.type_keys(b"one\r");
+    detaching.expect("got-one");
+    detaching.type_keys(b"\x10\x11\r");
+    assert_eq!(
+        detaching.status(),
+        Status::Exited(0),
+        "{}",
+        detaching.transcript()
+    );
+    detaching.expect("settings unchanged");
+    detaching.finish();
+    // Ctrl-C ends attach (a signal, from its terminal's own keys): the
+    // terminal is put back first.
+    let mut interrupted = session(attach);
+    interrupted.job();
+    interrupted.type_keys(b"two\r");
+    interrupted.expect("got-two");
+    interrupted.type_keys(CTRL_C);
+    assert_eq!(
+        interrupted.status(),
+        Status::Signaled(libc::SIGINT),
+        "{}",
+        interrupted.transcript()
+    );
+    interrupted.expect("settings unchanged");
+    interrupted.finish();
+    runtime(&["delete", "--force", PLAIN_ON_A_TTY]);
+    let _ = std::fs::remove_dir_all(&logs);
+}
+
+/// `shipyard-runtime attach` ended by a signal from outside (a `kill`, a
+/// hang-up), not a key: the user's terminal is put back first, raw (a
+/// container with a terminal) or with only its flow control off (one
+/// without), and attach ends of that signal.
+fn a_killed_attach_puts_the_terminal_back() {
+    fn attach(shell: &mut Shell, id: &str) {
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let before = shell.terminal_settings();
+        let job = shell.spawn_program(
+            Mode::Foreground,
+            RUNTIME.path(),
+            &["--root", &root, "attach", id],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    }
+    let make = |terminal: bool| {
+        let bundle = Bundle::new();
+        let mut config = bundle.config();
+        config["process"]["args"] =
+            serde_json::json!(["sh", "-c", "while read line; do echo got-$line; done"]);
+        config["process"]["terminal"] = serde_json::json!(terminal);
+        bundle.write(&config);
+        bundle
+    };
+    let state = StateRoot(
+        std::env::temp_dir().join(format!("shipyard-attach-killed-{}", std::process::id())),
+    );
+    let logs = state.0.with_extension("logs");
+    let runtime = |args: &[&str]| {
+        let status = std::process::Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&state.0)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{args:?}");
+    };
+    let bundles = [make(true), make(false)];
+    for (bundle, id) in bundles.iter().zip([KILLED_ON_A_TTY, KILLED_PLAIN]) {
+        let dir = logs.join(id);
+        std::fs::create_dir_all(&logs).unwrap();
+        runtime(&[
+            "create",
+            "--bundle",
+            bundle.arg(),
+            "--log-dir",
+            dir.to_str().unwrap(),
+            "--stdin",
+            id,
+        ]);
+        runtime(&["start", id]);
+    }
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(STATE_ROOT_VAR, &state.0) };
+    let cases: [(Script, libc::c_int, &str); 3] = [
+        (
+            |shell| attach(shell, KILLED_ON_A_TTY),
+            libc::SIGTERM,
+            "raw, SIGTERM",
+        ),
+        (
+            |shell| attach(shell, KILLED_ON_A_TTY),
+            libc::SIGHUP,
+            "raw, SIGHUP",
+        ),
+        (
+            |shell| attach(shell, KILLED_PLAIN),
+            libc::SIGTERM,
+            "flow control off, SIGTERM",
+        ),
+    ];
+    for (script, signal, what) in cases {
+        let mut session = session(script);
+        let pid = session.job();
+        session.type_keys(b"one\r");
+        session.expect("got-one");
+        // SAFETY: `kill` has no memory-safety conditions; `pid` is the
+        // session's attach.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "{what}");
+        assert_eq!(
+            session.status(),
+            Status::Signaled(signal),
+            "{what}: {}",
+            session.transcript()
+        );
+        session.expect("settings unchanged");
+        session.finish();
+    }
+    runtime(&["delete", "--force", KILLED_ON_A_TTY]);
+    runtime(&["delete", "--force", KILLED_PLAIN]);
+    let _ = std::fs::remove_dir_all(&logs);
+}
+
+/// `shipyard-runtime exec` (no `-t`) from a terminal: the command never
+/// gets the user's terminal (D16), not even as a descriptor a process left
+/// behind would keep: its 0, 1 and 2 are pipes Shipyard relays, and what's
+/// typed still reaches it, and its output the user.
+fn exec_from_a_terminal_never_gets_it() {
+    const ID: &str = "exec-plain-on-a-tty";
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!(["sh", "-c", "exec sleep 120"]);
+    bundle.write(&config);
+    let state =
+        StateRoot(std::env::temp_dir().join(format!("shipyard-exec-plain-{}", std::process::id())));
+    let runtime = |args: &[&str]| {
+        std::process::Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&state.0)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+    };
+    assert!(runtime(&["create", "--bundle", bundle.arg(), ID]).success());
+    assert!(runtime(&["start", ID]).success());
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(STATE_ROOT_VAR, &state.0) };
+    let mut session = session(|shell| {
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let before = shell.terminal_settings();
+        let job = shell.spawn_program(
+            Mode::Foreground,
+            RUNTIME.path(),
+            &[
+                "--root",
+                &root,
+                "exec",
+                ID,
+                "sh",
+                "-c",
+                "tty; for fd in 0 1 2; do echo fd$fd=$(readlink /proc/self/fd/$fd); done; \
+                 read line; echo got-$line; exit 4",
+            ],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("not a tty");
+    for fd in 0..3 {
+        session.expect(&format!("fd{fd}=pipe:"));
+    }
+    session.type_keys(b"typed\r");
+    session.expect("got-typed");
+    assert_eq!(
+        session.status(),
+        Status::Exited(4),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+    let _ = runtime(&["delete", "--force", ID]);
+}
+
+/// `shipyard-runtime exec -t` from a terminal: the command gets a terminal
+/// of its own, made in the container (its `/dev/pts/0`), the user's goes raw
+/// (Ctrl-C reaches the command as a byte), follows a resize, and is put back
+/// as it was; exec ends with the command's code.
+fn exec_t_on_a_terminal() {
+    const ID: &str = "exec-on-a-tty";
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!(["sh", "-c", "exec sleep 120"]);
+    bundle.write(&config);
+    let state =
+        StateRoot(std::env::temp_dir().join(format!("shipyard-exec-t-{}", std::process::id())));
+    let runtime = |args: &[&str]| {
+        std::process::Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&state.0)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+    };
+    assert!(runtime(&["create", "--bundle", bundle.arg(), ID]).success());
+    assert!(runtime(&["start", ID]).success());
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(STATE_ROOT_VAR, &state.0) };
+    let mut session = session(|shell| {
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let before = shell.terminal_settings();
+        let job = shell.spawn_program(
+            Mode::Foreground,
+            RUNTIME.path(),
+            &[
+                "--root",
+                &root,
+                "exec",
+                "-t",
+                ID,
+                "sh",
+                "-c",
+                // (Ctrl-C interrupts `read`: the loop goes on.)
+                "tty; trap 'echo caught-int' INT; \
+                 while :; do read line && echo got-$line && stty size; \
+                 [ \"$line\" = bye ] && exit 3; done",
+            ],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("/dev/pts/0");
+    session.type_keys(b"one\r");
+    session.expect("got-one");
+    session.resize(33, 99);
+    session.type_keys(b"two\r");
+    session.expect("got-two");
+    session.expect("33 99");
+    session.type_keys(b"\x03");
+    session.expect("caught-int");
+    session.type_keys(b"bye\r");
+    assert_eq!(
+        session.status(),
+        Status::Exited(3),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+    let _ = runtime(&["delete", "--force", ID]);
+}
+
+/// `exec -t … &`: started in the background, it doesn't stop for the
+/// terminal before its command starts (exec holds the container's lock
+/// until then): its terminal is relayed without raw mode or input, and the
+/// command runs to its end.
+fn exec_t_in_the_background_starts_its_command() {
+    const ID: &str = "exec-in-the-background";
+    let bundle = Bundle::new();
+    let mut config = bundle.config();
+    config["process"]["args"] = serde_json::json!(["sh", "-c", "exec sleep 120"]);
+    bundle.write(&config);
+    let state =
+        StateRoot(std::env::temp_dir().join(format!("shipyard-exec-bg-{}", std::process::id())));
+    let runtime = |args: &[&str]| {
+        std::process::Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&state.0)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+    };
+    assert!(runtime(&["create", "--bundle", bundle.arg(), ID]).success());
+    assert!(runtime(&["start", ID]).success());
+    // SAFETY: this test binary is single-threaded (see the module docs).
+    unsafe { std::env::set_var(STATE_ROOT_VAR, &state.0) };
+    let mut session = session(|shell| {
+        let root = std::env::var(STATE_ROOT_VAR).expect("the test sets the state root");
+        let job = shell.spawn_program(
+            Mode::Background,
+            RUNTIME.path(),
+            &[
+                "--root",
+                &root,
+                "exec",
+                "-t",
+                ID,
+                "sh",
+                "-c",
+                "echo ran-$((40+2))",
+            ],
+        );
+        shell.wait(job);
+    });
+    session.job();
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.expect("ran-42");
     session.finish();
 }
 
@@ -1348,6 +1806,11 @@ const STATE_ROOT_VAR: &str = "SHIPYARD_TEST_STATE_ROOT";
 
 /// The container [`a_container_created_from_a_terminal_keeps_it`] makes.
 const ON_A_TTY: &str = "on-a-tty";
+const PLAIN_ON_A_TTY: &str = "plain-on-a-tty";
+const KILLED_ON_A_TTY: &str = "killed-on-a-tty";
+const KILLED_PLAIN: &str = "killed-plain";
+/// What a test's fake shell runs.
+type Script = fn(&mut Shell);
 
 /// A state root, its containers deleted and itself removed when dropped,
 /// so a failed test leaves no container running.
@@ -1355,14 +1818,19 @@ struct StateRoot(std::path::PathBuf);
 
 impl Drop for StateRoot {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(RUNTIME.path())
-            .arg("--root")
-            .arg(&self.0)
-            .args(["delete", "--force", ON_A_TTY])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Every container in it, whichever test made it.
+        for entry in std::fs::read_dir(&self.0).into_iter().flatten().flatten() {
+            let _ = std::process::Command::new(RUNTIME.path())
+                .arg("--root")
+                .arg(&self.0)
+                .arg("delete")
+                .arg("--force")
+                .arg(entry.file_name())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
