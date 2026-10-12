@@ -77,10 +77,10 @@ pub enum TarError {
         limit: u64,
     },
     /// The archive has more headers than the limit.
-    #[error("the layer has more than {0} entries")]
+    #[error("the archive has more than {0} entries")]
     TooManyEntries(u64),
     /// A path climbs out of the layer, or is too long or too deep.
-    #[error("the layer entry `{0}` has an unsafe path")]
+    #[error("the archive's entry `{0}` has an unsafe path")]
     UnsafePath(String),
 }
 
@@ -145,6 +145,9 @@ pub struct TarReader<R> {
     /// Global PAX headers ignored.
     ignored_globals: u64,
     done: bool,
+    /// Whether the archive ended with its end-of-archive marker (a zero
+    /// block), not by the stream ending between entries.
+    marked_end: bool,
 }
 
 /// Extensions collected for the next entry.
@@ -170,12 +173,20 @@ impl<R: Read> TarReader<R> {
             headers: 0,
             ignored_globals: 0,
             done: false,
+            marked_end: false,
         }
     }
 
     /// How many POSIX global headers were ignored.
     pub fn ignored_globals(&self) -> u64 {
         self.ignored_globals
+    }
+
+    /// Whether the archive ended with its end-of-archive marker: a stream
+    /// that ended between entries (cut off) didn't.
+    #[must_use]
+    pub fn marked_end(&self) -> bool {
+        self.marked_end
     }
 
     /// The underlying stream, positioned after the end-of-archive marker.
@@ -331,6 +342,7 @@ impl<R: Read> TarReader<R> {
                     "data after the end-of-archive marker".to_owned(),
                 ));
             }
+            self.marked_end = true;
             return Ok(None);
         }
         self.headers += 1;
