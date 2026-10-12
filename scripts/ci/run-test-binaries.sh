@@ -24,8 +24,8 @@ uid=$(id -u "$user")
 # quietly).
 fail() { echo "$*" >&2; exit 1; }
 [ "$(getenforce)" = Enforcing ] || fail "SELinux isn't enforcing here"
-if systemctl is-active --quiet firewalld; then fail "firewalld runs (it's stage 8.6's)"; fi
-for tool in ip nft dig pasta newuidmap newgidmap script perl; do
+systemctl is-active --quiet firewalld || fail "firewalld isn't running here"
+for tool in ip nft iptables dig pasta newuidmap newgidmap script perl; do
     command -v "$tool" >/dev/null || fail "no $tool here"
 done
 [ -s "$list" ] || fail "no test executables listed in $list"

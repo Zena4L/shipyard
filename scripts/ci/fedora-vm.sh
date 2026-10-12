@@ -9,7 +9,8 @@
 #      compiles: it wouldn't fit the job's time);
 #   2. boots Fedora Cloud Base (pinned by SHA-256) with a cloud-init seed:
 #      the user `tester` with a subordinate range and lingering, the packages
-#      the tests use, firewalld stopped (F14 is stage 8.6's);
+#      the tests use, firewalld running (as Fedora has it: the root tests
+#      run in network namespaces of their own, out of its reach);
 #   3. copies the workspace and the executables to the same absolute path
 #      in the VM (the test executables hold compile-time paths);
 #   4. runs scripts/ci/run-test-binaries.sh there: both passes, as
@@ -117,6 +118,8 @@ users:
 packages:
   - passt
   - nftables
+  - firewalld
+  - iptables-nft
   - rsync
   - iproute
   - bind-utils
@@ -126,7 +129,7 @@ packages:
   - perl
   - audit
 runcmd:
-  - [sh, -c, "systemctl disable --now firewalld 2>/dev/null || true"]
+  - [systemctl, enable, --now, firewalld]
   - [sh, -c, "grep -q '^tester:' /etc/subuid || usermod --add-subuids 100000-165535 tester"]
   - [sh, -c, "grep -q '^tester:' /etc/subgid || usermod --add-subgids 100000-165535 tester"]
   - [loginctl, enable-linger, tester]

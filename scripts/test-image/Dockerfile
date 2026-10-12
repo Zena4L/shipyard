@@ -8,6 +8,8 @@
 # - `nftables`: `nft`, for the firewall tests to look at Shipyard's table and
 #   to make another program's chains, and the differential tests (H5) to
 #   rebuild it (Shipyard itself never runs it);
+# - `iptables` (iptables-nft): to make Docker's firewall as Docker does, and
+#   run the fix Shipyard prints for it (stage 8.6);
 # - `iproute2` and `bind9-dnsutils`: `ip` and `dig`, for the differential
 #   tests of Shipyard's own netlink and DNS server (H5, H8);
 # - `tester`, the normal user the tests run as, with 65536 subordinate IDs
@@ -18,7 +20,7 @@
 FROM rust:1-trixie
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends uidmap passt nftables iproute2 bind9-dnsutils \
+    && apt-get install -y --no-install-recommends uidmap passt nftables iptables iproute2 bind9-dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home tester \

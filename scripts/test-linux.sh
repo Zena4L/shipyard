@@ -9,6 +9,8 @@
 #   scripts/test-linux.sh --shell        # a shell in the same container, to debug
 #   scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
 #   scripts/test-linux.sh --fuzz [SECONDS]  # each fuzz target (fuzz/) for SECONDS (300)
+#   scripts/test-linux.sh --conformance [NAME…]  # the OCI conformance suite, as
+#                                        # scripts/conformance/expected.txt expects
 #
 # The container is privileged: creating namespaces and mounting need
 # CAP_SYS_ADMIN, and Docker's default seccomp profile blocks `clone3` and
@@ -43,8 +45,9 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
     docker build --quiet --tag "$image" - <"$dockerfile" >/dev/null
 fi
 
-mode=test
+mode="test"
 fuzz_seconds=300
+conformance_tests=""
 case "${1:-}" in
     "") ;;
     --shell) mode=shell ;;
@@ -53,8 +56,28 @@ case "${1:-}" in
         mode=fuzz
         fuzz_seconds=${2:-300}
         ;;
+    --conformance)
+        mode=conformance
+        shift
+        conformance_tests="$*"
+        # Its own image, on top of the test image: runtime-tools and its
+        # root filesystem (scripts/conformance/Dockerfile), tagged by both
+        # files' hash.
+        conformance_dockerfile="$repo/scripts/conformance/Dockerfile"
+        if command -v sha256sum >/dev/null; then
+            chash=$(cat "$dockerfile" "$conformance_dockerfile" | sha256sum)
+        else
+            chash=$(cat "$dockerfile" "$conformance_dockerfile" | shasum -a 256)
+        fi
+        if ! docker image inspect "shipyard-conformance:${chash:0:12}" >/dev/null 2>&1; then
+            echo "building the conformance image (once; needs network)" >&2
+            docker build --quiet --build-arg BASE="$image" \
+                --tag "shipyard-conformance:${chash:0:12}" - <"$conformance_dockerfile" >/dev/null
+        fi
+        image="shipyard-conformance:${chash:0:12}"
+        ;;
     *)
-        echo "usage: $0 [--shell | --root-shell | --fuzz [SECONDS]]" >&2
+        echo "usage: $0 [--shell | --root-shell | --fuzz [SECONDS] | --conformance [NAME…]]" >&2
         exit 2
         ;;
 esac
@@ -167,7 +190,7 @@ case "$MODE" in
             rm -rf /target/fuzz/crate
             cp -r fuzz /target/fuzz/crate
             sed -i "s|path = \"../crates/|path = \"/src/crates/|" /target/fuzz/crate/Cargo.toml
-            for target in manifest challenge reference tar unpack netlink ports dns proc_net; do
+            for target in manifest challenge reference tar unpack netlink ports dns proc_net cri_record logs_dir attach_frames process_json cp_unpack; do
                 echo "== fuzz $target, $FUZZ_SECONDS s"
                 mkdir -p "/target/fuzz/crashes/$target"
                 cargo +nightly fuzz run --fuzz-dir /target/fuzz/crate --target-dir /target/fuzz/build \
@@ -177,6 +200,15 @@ case "$MODE" in
             done
             echo "== no fuzz target crashed"
         '
+        exit
+        ;;
+    conformance)
+        # Built as `tester`, run as root: the suite runs containers as root.
+        as_tester cargo build --locked -p shipyard-cli --bin shipyard-runtime
+        as_root
+        # Not `exec`: as_root's trap gives tester its files back on exit.
+        # shellcheck disable=SC2086 # the test names, split
+        scripts/conformance/run.sh $CONFORMANCE_TESTS
         exit
         ;;
 esac
@@ -213,5 +245,6 @@ exec docker run --rm --privileged --init ${tty_flags[@]+"${tty_flags[@]}"} \
     --env CARGO_TARGET_DIR=/target \
     --env MODE="$mode" \
     --env FUZZ_SECONDS="$fuzz_seconds" \
+    --env CONFORMANCE_TESTS="$conformance_tests" \
     --workdir /src \
     "$image" bash -c "$inside"

@@ -1,0 +1,68 @@
+# What the OCI runtime conformance suite (runtime-tools' validation/, pinned in
+# scripts/conformance/Dockerfile) gives against shipyard-runtime, test by test:
+#   NAME pass             it must pass
+#   NAME fail /PATTERN/ REASON   it fails, for REASON (a finding, or a refusal by
+#                         design): PATTERN (grep -E) must match its TAP or stderr
+#   NAME skip REASON      not run (the suite's own problem, or the host can't)
+#   NAME@ARCH …           for that architecture (amd64, arm64) only
+# scripts/conformance/run.sh fails on any difference, both ways: keep it true.
+
+config_updates_without_affect fail /^exit status 1$/ refused by design: its config asks for `shared` root propagation (bundles.md#whats-refused); the suite drops the runtime's message, checked by hand
+create pass
+default pass
+delete fail /MUST generate an error/ by design, as runc and crun: deleting a *created* container works (the spec says it MUST fail); engines rely on it
+delete_only_create_resources skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+delete_resources skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+hooks fail /MUST be called in the listed order/ the suite's own: it expects "post-start1" where its hooks write "post-start1 called" (validation/hooks/hooks.go), so no runtime passes it
+hooks_stdin fail /wrong status ..creating/ as runc: prestart hooks get "creating" (runc libcontainer/process_linux.go: s.Status = specs.StateCreating); the test wants "created"
+hostname pass
+kill pass
+kill_no_effect pass
+killsig pass
+linux_cgroups_blkio skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_cpus skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_devices skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_hugetlb skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_memory skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_network skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_pids skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_blkio skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_cpus skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_devices skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_hugetlb skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_memory skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_network skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_cgroups_relative_pids skip runtime-tools reads cgroup v1 only (#807; PRs #812, #816); Shipyard is cgroup v2 only
+linux_devices fail /a FIFO/ refused by design: a FIFO in linux.devices (bundles.md#whats-refused)
+linux_masked_paths pass
+linux_mount_label fail /SELinux/ refused by design: SELinux labels (bundles.md#whats-refused)
+linux_ns_itype fail /a root filesystem needs a mount namespace/ refused by design: it removes every namespace, `mount` too, which a root filesystem needs (bundles.md); upstream it also hangs in its cleanup (https://github.com/opencontainers/runtime-tools/issues/698)
+linux_ns_nopath pass
+linux_ns_path fail /joining an existing namespace/ F34 (stage 10): joining an existing pid, ipc, uts or mount namespace by its path is refused (network only for now)
+linux_ns_path_type pass
+linux_process_apparmor_profile fail /AppArmor/ refused by design: AppArmor profiles (bundles.md#whats-refused); the test also needs a profile installed
+linux_readonly_paths pass
+linux_rootfs_propagation fail /rootfsPropagation/ refused by design: `shared` root propagation, and `unbindable` for now (bundles.md#whats-refused); its slave and private cases pass
+linux_seccomp pass
+linux_sysctl pass
+linux_uid_mappings pass
+misc_props pass
+mounts fail /the container.s mounts would reach the host/ refused by design: `shared` propagation on its mounts, and `unbindable` for now (bundles.md#whats-refused)
+pidfile pass
+poststart pass
+poststart_fail pass
+poststop pass
+poststop_fail pass
+prestart fail /MUST be called after the .start. operation/ as runc, and as the spec (v1.3) says: prestart hooks run during create; the test wants them after start
+prestart_fail pass
+process pass
+process_capabilities pass
+process_capabilities_fail pass
+process_oom_score_adj pass
+process_rlimits pass
+process_rlimits@arm64 skip the suite's own: its runtimetest (Go) prints nothing under the test's 1 GiB soft RLIMIT_AS on arm64 (`ulimit -v 1048576; runtimetest --help` is silent too)
+process_rlimits_fail pass
+process_user pass
+root_readonly_true pass
+start fail /^not ok 7 - exit status 1/ stricter than the test: create refuses a config without `process` (the test wants start to); runc does too (youki issue #56)
+state pass

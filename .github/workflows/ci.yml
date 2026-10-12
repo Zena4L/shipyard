@@ -1,9 +1,15 @@
 name: CI
 
+# Manual only for now: the repository's Actions billing is off, so GitHub starts
+# no job ("recent account payments have failed or your spending limit needs to
+# be increased"), and every push would show a red run. Run it by hand
+# (`gh workflow run CI --ref BRANCH`) once billing is back; until then the checks
+# run locally (`scripts/test-linux.sh`, and the commands in CLAUDE.md).
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  # pull_request:
 
 # Read-only token: CI never needs to write to the repository.
 permissions:
@@ -225,7 +231,7 @@ jobs:
 
   # Another real host (H4): Fedora, SELinux enforcing, in a QEMU/KVM VM on
   # the runner. Both passes (rootless, then root), from executables built
-  # here. firewalld is stopped until stage 8.6 (F14).
+  # here. firewalld runs, as Fedora has it.
   fedora:
     name: Fedora VM (SELinux enforcing)
     runs-on: ubuntu-latest
@@ -242,6 +248,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
       - run: scripts/ci/fedora-vm.sh
+
+  # The OCI runtime conformance suite (runtime-tools, pinned in
+  # scripts/conformance/Dockerfile) against shipyard-runtime, in the same
+  # privileged container as the local runs: each test's outcome must be what
+  # scripts/conformance/expected.txt says (H5).
+  conformance:
+    name: OCI conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: scripts/test-linux.sh --conformance
 
   # musl (static, Alpine-style builds) has different libc types and wrappers;
   # make sure the code compiles there too.
