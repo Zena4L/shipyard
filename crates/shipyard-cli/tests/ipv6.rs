@@ -373,14 +373,16 @@ fn a_container_sends_only_as_itself_over_ipv6() {
         });
         // No duplicate address detection in the container: usable at once.
         let arrives = |from: Ipv6Addr| {
-            let receiver = in_netns(&two_netns, || UdpSocket::bind((theirs, 9999))).unwrap();
+            // A port the kernel picks: a fixed one may be taken in a busy run.
+            let receiver = in_netns(&two_netns, || UdpSocket::bind((theirs, 0))).unwrap();
+            let port = receiver.local_addr().unwrap().port();
             receiver
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
             in_netns(&one_netns, || {
                 let sender = UdpSocket::bind((from, 0)).unwrap();
                 for _ in 0..3 {
-                    let _ = sender.send_to(b"hello", (theirs, 9999));
+                    let _ = sender.send_to(b"hello", (theirs, port));
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });

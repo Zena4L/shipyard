@@ -19,6 +19,7 @@ pub mod attach;
 pub mod conntrack;
 pub mod dns;
 pub mod files;
+pub mod firewalls;
 pub mod ipnet;
 mod netlink;
 pub mod nft;

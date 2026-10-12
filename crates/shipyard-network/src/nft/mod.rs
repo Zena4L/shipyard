@@ -38,7 +38,7 @@ mod ruleset;
 )]
 mod spoofing;
 
-pub use decode::Chain;
+pub use decode::{Chain, FIREWALLD, Rule, Verdict};
 pub use objects::Element;
 pub use ruleset::{ClosedRouting, NetworkRules, PortRule, TABLE};
 pub use spoofing::PortGuard;
@@ -147,9 +147,9 @@ mod linux {
     };
     use super::consts::{
         NFPROTO_UNSPEC, NFT_MSG_GETCHAIN, NFT_MSG_GETRULE, NFT_MSG_GETSETELEM, NFT_MSG_GETTABLE,
-        NFTA_RULE_TABLE,
+        NFTA_RULE_CHAIN, NFTA_RULE_TABLE,
     };
-    use super::decode::{self, Chain};
+    use super::decode::{self, Chain, Rule};
     use super::objects::{self, Element, delete_elements, delete_table};
     use super::ruleset::{self, ClosedRouting, FAMILY, NetworkRules, PortRule, TABLE};
     use super::spoofing::{self, PortGuard};
@@ -416,6 +416,35 @@ mod linux {
                 .dump("listing shipyard's rules", &message, |part| {
                     decode::rule_chain(part).map(Some)
                 })
+        }
+
+        /// The rules of another program's `chain` (or of its whole `table`),
+        /// in `family`: what they let through (see [`Rule`]). Empty if
+        /// there's no such table or chain (another program may have just
+        /// removed it).
+        ///
+        /// # Errors
+        ///
+        /// The kernel refused the listing.
+        pub fn rules(
+            &mut self,
+            family: u8,
+            table: &str,
+            chain: Option<&str>,
+        ) -> Result<Vec<Rule>, NetlinkError> {
+            let mut message = objects::message(NFT_MSG_GETRULE, 0, family);
+            message.attr_str(NFTA_RULE_TABLE, table);
+            if let Some(chain) = chain {
+                message.attr_str(NFTA_RULE_CHAIN, chain);
+            }
+            match self.socket.dump(
+                &format!("listing the table {table}'s rules"),
+                &message,
+                |part| decode::rule(part).map(Some),
+            ) {
+                Err(error) if error.errno() == Some(Errno::ENOENT) => Ok(Vec::new()),
+                other => other,
+            }
         }
 
         /// Every chain of every table, in every family: Shipyard's and

@@ -560,41 +560,115 @@ fn release_lease(
     }
 }
 
-/// Warns about other programs' firewall chains that would drop the
-/// containers' traffic on `config`'s network: what the host forwards, for a
-/// network with a way out ([`other_firewalls`]); what comes in to the host,
-/// for one with a DNS server (`dns`: [`closed_dns`]).
+/// Warns about other programs' firewalls that would drop the containers'
+/// traffic on `config`'s network (firewalld, Docker's, ufw, any chain
+/// dropping by default), each with the fix in that firewall's own terms.
+/// Shipyard never changes them: see `shipyard_network::firewalls`.
 #[cfg(target_os = "linux")]
 fn warn_about_other_firewalls(
     nft: &mut shipyard_network::nft::Nftables,
     config: &shipyard_network::store::NetworkConfig,
-    dns: bool,
 ) {
-    if config.internal && !dns {
-        return;
-    }
-    if let Ok(chains) = nft.chains() {
-        let mut warnings = Vec::new();
-        if !config.internal {
-            let uplink = default_route_interface();
-            warnings.extend(other_firewalls(&chains, &config.bridge, uplink.as_deref()));
+    let (uplink, uplink6) = if config.internal {
+        (None, None)
+    } else {
+        (
+            default_route_interface(shipyard_network::Family::V4),
+            default_route_interface(shipyard_network::Family::V6),
+        )
+    };
+    let view = shipyard_network::firewalls::NetworkView {
+        bridge: &config.bridge,
+        uplink: uplink.as_deref(),
+        uplink6: uplink6.as_deref(),
+        outward: !config.internal,
+        ipv6: config.subnet6.is_some(),
+        bridged: bridged_traffic_filtered(),
+        dns: config.has_dns().then_some(config.gateway),
+    };
+    match shipyard_network::firewalls::conflicts(nft, &view) {
+        Ok(conflicts) => {
+            for conflict in conflicts.iter().filter(|conflict| !conflict.fixed) {
+                crate::warning(&describe_conflict(conflict));
+            }
         }
-        if dns {
-            warnings.extend(closed_dns(&chains, config));
-        }
-        for warning in warnings {
-            crate::warning(&warning);
-        }
+        // A warning that can't be given isn't the run's failure.
+        Err(error) => tracing::debug!("couldn't read the other firewalls: {error}"),
     }
 }
 
-/// The interface of the host's IPv4 default route: its way out, if it has
-/// one.
+/// What to tell the user about another firewall in the way: whose, what it
+/// keeps from the containers, and the fix.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "networks are Linux's")
+)]
+pub(crate) fn describe_conflict(conflict: &shipyard_network::firewalls::Conflict) -> String {
+    use shipyard_network::firewalls::Firewall;
+    let blocks = conflict.blocks;
+    let drops = if blocks.way_out || blocks.ports || blocks.each_other {
+        "drops forwarded traffic by default"
+    } else {
+        "drops what comes in to the host by default"
+    };
+    let who = match &conflict.firewall {
+        Firewall::Firewalld => {
+            "firewalld rejects what comes from an interface it doesn't trust".to_owned()
+        }
+        Firewall::Docker { ipv6: true } => {
+            "Docker's firewall drops IPv6 forwarded traffic by default".to_owned()
+        }
+        Firewall::Docker { .. } => {
+            "Docker's firewall drops forwarded traffic by default".to_owned()
+        }
+        Firewall::Ufw => format!("ufw {drops}"),
+        Firewall::Chain { at } => format!("the firewall's chain {at} {drops}"),
+        _ => format!("another firewall {drops}"),
+    };
+    let mut kept = Vec::new();
+    if blocks.way_out {
+        kept.push("would have no way out".to_owned());
+    }
+    if blocks.ports {
+        kept.push("wouldn't be reached on their published ports".to_owned());
+    }
+    if blocks.each_other {
+        kept.push("couldn't reach each other".to_owned());
+    }
+    if blocks.dns {
+        kept.push(conflict.dns.map_or_else(
+            || "would get no answer from their DNS server".to_owned(),
+            |dns| format!("would get no answer from their DNS server (on {dns}:53)"),
+        ));
+    }
+    let kept = match kept.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    let how = match &conflict.firewall {
+        Firewall::Firewalld => "to put the bridge in firewalld's trusted zone",
+        Firewall::Docker { .. } => {
+            "to let them through (in DOCKER-USER, the chain Docker keeps for this)"
+        }
+        Firewall::Ufw => "to let them through with ufw's own rules",
+        _ => "to let them through",
+    };
+    format!(
+        "{who}: containers on {} {kept}; {how}: {}",
+        conflict.bridge,
+        conflict.fix.join("; ")
+    )
+}
+
+/// The interface of the host's default route for `family`: its way out,
+/// if it has one (in the main routing table: a VPN routing by policy goes
+/// unseen).
 #[cfg(target_os = "linux")]
-fn default_route_interface() -> Option<String> {
+pub(crate) fn default_route_interface(family: shipyard_network::Family) -> Option<String> {
     let mut rtnetlink = shipyard_network::route::Rtnetlink::new().ok()?;
     let index = rtnetlink
-        .routes(shipyard_network::Family::V4)
+        .routes(family)
         .ok()?
         .into_iter()
         .find(|route| route.destination.prefix() == 0)?
@@ -607,95 +681,13 @@ fn default_route_interface() -> Option<String> {
         .map(|link| link.name)
 }
 
-/// A warning for each of other programs' chains in `chains` that drop what
-/// comes in to the host by default (ufw's `INPUT`, firewalld's): they'd
-/// drop the queries `config`'s containers send its DNS server, on the
-/// gateway. Each names the chain and gives the fix.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "networks are Linux's")
-)]
-fn closed_dns(
-    chains: &[shipyard_network::nft::Chain],
-    config: &shipyard_network::store::NetworkConfig,
-) -> Vec<String> {
-    let bridge = &config.bridge;
-    chains
-        .iter()
-        // The server is on IPv4: an IPv6 chain (ufw makes one of each)
-        // drops nothing it gets.
-        .filter(|chain| {
-            chain.drops_input()
-                && !chain.is_shipyards()
-                && matches!(chain.family_name(), "ip" | "inet")
-        })
-        .map(|chain| {
-            let at = format!("{} {} {}", chain.family_name(), chain.table, chain.name);
-            let fix = if chain.family_name() == "ip" && chain.table == "filter" {
-                format!(
-                    "iptables -I {} -i {bridge} -p udp --dport 53 -j ACCEPT; iptables -I {} -i \
-                     {bridge} -p tcp --dport 53 -j ACCEPT",
-                    chain.name, chain.name
-                )
-            } else {
-                format!("nft insert rule {at} iifname {bridge} meta l4proto {{ udp, tcp }} th dport 53 accept")
-            };
-            format!(
-                "the firewall's chain {at} drops what comes in to the host by default, so \
-                 containers on {bridge} may get no answer from the network's DNS server (on \
-                 {}:53); to let them through: {fix}",
-                config.gateway
-            )
-        })
-        .collect()
-}
-
-/// A warning for each of other programs' chains in `chains` that drop what
-/// the host forwards by default (Docker's or ufw's `FORWARD`, firewalld's):
-/// they'd drop the containers' traffic on `bridge` too, after Shipyard's
-/// rules let it through. Each names the chain and gives the fix: Docker's
-/// own way (its `DOCKER-USER` chain) where it's Docker's table.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "networks are Linux's")
-)]
-fn other_firewalls(
-    chains: &[shipyard_network::nft::Chain],
-    bridge: &str,
-    uplink: Option<&str>,
-) -> Vec<String> {
-    // Out to the world only (the host's default route's interface), not into
-    // another program's bridges (Docker's), whose containers its own rules
-    // keep apart.
-    let out = uplink.map_or_else(String::new, |uplink| format!(" -o {uplink}"));
-    let nft_out = uplink.map_or_else(String::new, |uplink| format!(" oifname {uplink}"));
-    chains
-        .iter()
-        .filter(|chain| chain.drops_forwarded() && !chain.is_shipyards())
-        .map(|chain| {
-            let at = format!("{} {} {}", chain.family_name(), chain.table, chain.name);
-            let docker = chains.iter().any(|other| {
-                other.family == chain.family
-                    && other.table == chain.table
-                    && other.name == "DOCKER-USER"
-            });
-            let fix = if docker {
-                format!(
-                    "iptables -I DOCKER-USER -i {bridge}{out} -j ACCEPT; iptables -I DOCKER-USER \
-                     -o {bridge} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
-                )
-            } else {
-                format!(
-                    "nft insert rule {at} iifname {bridge}{nft_out} accept; nft insert rule {at} \
-                     oifname {bridge} ct state related,established accept"
-                )
-            };
-            format!(
-                "the firewall's chain {at} drops forwarded traffic by default, so containers on \
-                 {bridge} may have no way out; to let them through: {fix}"
-            )
-        })
-        .collect()
+/// Whether bridged traffic meets the IP hooks here (`br_netfilter`, which
+/// Docker loads): then a chain dropping what's forwarded keeps containers on
+/// one bridge from each other too.
+#[cfg(target_os = "linux")]
+pub(crate) fn bridged_traffic_filtered() -> bool {
+    std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
+        .is_ok_and(|value| value.trim() == "1")
 }
 
 /// A run's place on a network: its lease (its address, held while the run
@@ -793,8 +785,9 @@ impl Attachment {
             // Under the network's lock, with the lease held: see `ensure`.
             crate::dns_helper::ensure(&networks, &attachment.config)?;
         }
-        warn_about_other_firewalls(&mut nft, &attachment.config, has_dns);
         drop(network);
+        // Out of the network's lock: other runs needn't wait for it.
+        warn_about_other_firewalls(&mut nft, &attachment.config);
         Ok(attachment)
     }
 
@@ -1712,7 +1705,6 @@ pub(crate) fn prune() -> Result<Pruned> {
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-    use shipyard_network::nft::Chain;
 
     /// A pasta run's files never go in the image store (under `~/.local`,
     /// out of SELinux-confined pasta's reach: F32); other runs' may.
@@ -1812,15 +1804,61 @@ mod tests {
         );
     }
 
-    fn chain(family: u8, table: &str, name: &str, policy: Option<u32>) -> Chain {
-        Chain {
-            family,
-            table: table.into(),
-            name: name.into(),
-            kind: Some("filter".into()),
-            hook: policy.map(|_| 2),
-            policy,
-        }
+    #[test]
+    fn another_firewall_is_described_by_what_it_keeps_from_the_containers() {
+        use shipyard_network::firewalls::{Blocks, Conflict, Firewall};
+        let conflict = |firewall, blocks| Conflict {
+            firewall,
+            bridge: "shy-x".to_owned(),
+            blocks,
+            dns: Some("10.89.0.1".parse().unwrap()),
+            fixed: false,
+            fix: vec!["sudo a".to_owned(), "sudo b".to_owned()],
+        };
+        let everything = Blocks {
+            way_out: true,
+            ports: true,
+            each_other: true,
+            dns: false,
+        };
+        assert_eq!(
+            describe_conflict(&conflict(Firewall::Docker { ipv6: false }, everything)),
+            "Docker's firewall drops forwarded traffic by default: containers on shy-x would \
+             have no way out, wouldn't be reached on their published ports, and couldn't reach \
+             each other; to let them through (in DOCKER-USER, the chain Docker keeps for this): \
+             sudo a; sudo b"
+        );
+        // An internal network: only each other is at stake.
+        let internal = Blocks {
+            each_other: true,
+            ..Blocks::default()
+        };
+        assert_eq!(
+            describe_conflict(&conflict(
+                Firewall::Chain {
+                    at: "ip filter FORWARD".to_owned()
+                },
+                internal
+            )),
+            "the firewall's chain ip filter FORWARD drops forwarded traffic by default: \
+             containers on shy-x couldn't reach each other; to let them through: sudo a; sudo b"
+        );
+        let dns = Blocks {
+            dns: true,
+            ..Blocks::default()
+        };
+        assert_eq!(
+            describe_conflict(&conflict(Firewall::Ufw, dns)),
+            "ufw drops what comes in to the host by default: containers on shy-x would get no \
+             answer from their DNS server (on 10.89.0.1:53); to let them through with ufw's own \
+             rules: sudo a; sudo b"
+        );
+        assert!(
+            describe_conflict(&conflict(Firewall::Firewalld, dns)).starts_with(
+                "firewalld rejects what comes from an interface it doesn't trust: containers on \
+                 shy-x would get no answer"
+            )
+        );
     }
 
     fn config(name: &str, internal: bool, gateway: &str) -> shipyard_network::store::NetworkConfig {
@@ -1866,92 +1904,5 @@ mod tests {
         // a container with a way out elsewhere.
         assert_eq!(resolver(&[&bridge, &quiet]), ip("10.89.0.1"));
         assert_eq!(resolver(&[&bridge]), None);
-    }
-
-    #[test]
-    fn another_firewalls_input_drop_is_named_for_ipv4_only() {
-        let input = |family: u8, table: &str, name: &str| Chain {
-            hook: Some(1),
-            ..chain(family, table, name, Some(0))
-        };
-        let config = shipyard_network::store::NetworkConfig {
-            name: "app".into(),
-            subnet: "10.89.0.0/24".parse().unwrap(),
-            gateway: "10.89.0.1".parse().unwrap(),
-            bridge: "shy-x".into(),
-            internal: false,
-            created: 0,
-            subnet6: None,
-            gateway6: None,
-        };
-        // ufw's: one for each family. The server is on IPv4.
-        let warnings = closed_dns(
-            &[
-                input(2, "filter", "INPUT"),
-                input(10, "filter", "INPUT"),
-                input(1, "shipyard", "input"),
-                // A forward chain isn't one that drops what comes in.
-                chain(1, "firewalld", "filter_FORWARD", Some(0)),
-            ],
-            &config,
-        );
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("iptables -I INPUT -i shy-x -p udp --dport 53 -j ACCEPT"),
-            "{}",
-            warnings[0]
-        );
-        assert!(warnings[0].contains("10.89.0.1:53"), "{}", warnings[0]);
-        let nft = closed_dns(&[input(1, "firewalld", "filter_INPUT")], &config);
-        assert!(
-            nft[0].contains("nft insert rule inet firewalld filter_INPUT iifname shy-x"),
-            "{}",
-            nft[0]
-        );
-    }
-
-    #[test]
-    fn another_firewalls_forward_drop_is_named_with_its_fix() {
-        // Ours, and an accepting one, are fine.
-        assert!(
-            other_firewalls(
-                &[
-                    chain(1, "shipyard", "forward", Some(0)),
-                    chain(1, "filter", "forward", Some(1)),
-                ],
-                "shipyard0",
-                None
-            )
-            .is_empty()
-        );
-        // Docker's: its own way out.
-        let docker = other_firewalls(
-            &[
-                chain(2, "filter", "FORWARD", Some(0)),
-                chain(2, "filter", "DOCKER-USER", None),
-            ],
-            "shipyard0",
-            Some("eth0"),
-        );
-        assert_eq!(docker.len(), 1);
-        assert!(docker[0].contains("ip filter FORWARD"), "{}", docker[0]);
-        assert!(
-            // Out to the world, not into Docker's bridges.
-            docker[0].contains("iptables -I DOCKER-USER -i shipyard0 -o eth0 -j ACCEPT"),
-            "{}",
-            docker[0]
-        );
-        // Anyone else's: nft's.
-        let firewalld = other_firewalls(
-            &[chain(1, "firewalld", "filter_FORWARD", Some(0))],
-            "shy-x",
-            None,
-        );
-        assert!(
-            firewalld[0]
-                .contains("nft insert rule inet firewalld filter_FORWARD iifname shy-x accept"),
-            "{}",
-            firewalld[0]
-        );
     }
 }
