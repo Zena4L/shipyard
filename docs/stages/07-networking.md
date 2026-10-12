@@ -288,7 +288,7 @@ and is killed explicitly.
 | `br_netfilter` hosts filtering traffic on one bridge | `same_bridge` accepted | `only_dnated_traffic_reaches_a_bridge_and_internal_networks_are_closed` (the module isn't loaded in the test container) |
 | `nft flush ruleset` while containers run | the table is noticed missing or emptied (rule count) and rebuilt by the next run | `the_ruleset_installs_is_current_and_is_rebuilt`, `only_this_versions_whole_table_is_current` |
 | An answer bigger than one ACK datagram (thousands of ports) | ports go one request per map, in chunks of 256 | `networks_and_ports_come_and_go` |
-| Another firewall's forward chain with a drop policy (Docker, ufw, firewalld) | detected and warned about with the exact fix; never changed | `root_runs_on_the_bridge_network_with_a_way_out` |
+| Another firewall's forward chain with a drop policy (Docker, ufw, firewalld) | detected and warned about with the exact fix; never changed | `another_firewalls_drop_policies_are_warned_about_with_their_fixes` (completed in 8.6: `dockers_firewall_is_warned_about_and_its_printed_fix_works`, `firewalld_is_warned_about_until_the_bridge_is_trusted`) |
 | A spoofed DNS client (reflection out of a network) | only the network's containers' addresses are answered | `only_the_networks_containers_are_answered` |
 | A DNS pointer loop | each pointer must point before the last jump's target | `pointers_that_loop_are_refused`; the `dns` fuzz target |
 | One container hogging the DNS server | per-client caps (16 of 64 forwards, 8 of 64 TCP connections), a 5 s TCP frame deadline, a 4 s forward | `places_run_out_in_all_and_for_one_client`, `a_tcp_frame_must_come_whole_and_in_time` |
@@ -306,7 +306,7 @@ and is killed explicitly.
 | A firewall flush leaving the host's loopback reachable through `route_localnet`, and internal networks routed out (review) | `route_localnet` only on a bridge whose containers publish; internal bridges' own IPv4 `forwarding=0`, set again whenever Shipyard turns forwarding on (which resets every interface's); the docs say what a flush undoes | `published_ports_reach_the_container_from_everywhere`, `an_internal_network_has_no_way_out_and_publishes_nothing` |
 | Any local user locking a lease file (kept live forever: names, addresses and ports pinned) (review) | the store's files root's and `nogroup`'s (the DNS servers'), 0640, directories 0750 | `a_lease_directory_lists_live_leases_through_its_descriptor` |
 | A stray file among the networks breaking every network command (review) | only directories are networks; a corrupt config's error says how to forget it | `a_stray_file_among_the_networks_is_no_network` |
-| The Docker fix accepting Shipyard's containers into Docker's own bridges (review) | the fix names the host's way out (`-o eth0`) | `another_firewalls_forward_drop_is_named_with_its_fix`, `another_firewalls_drop_policies_are_warned_about_with_their_fixes` |
+| The Docker fix accepting Shipyard's containers into Docker's own bridges (review) | the fix names the host's way out (`-o eth0`) | `firewalls::tests::docker_gets_the_whole_fix_in_docker_user` (moved in 8.6), `dockers_firewall_is_warned_about_and_its_printed_fix_works` |
 | A container on an IPv4-only network and an IPv6 one with no IPv6 default route (review) | each family's default route through the first network with it and a way out | `ipv6s_route_goes_through_a_network_with_ipv6`, `each_familys_default_route_goes_through_a_network_that_has_it` |
 | `network rm` racing a firewall rebuild that put its rules back (review) | rules removed under the store's lock | (by review) |
 | Every pasta run ending a second late (found writing the book) | an already-reaped pasta (`ECHILD`) counts as reaped | `a_rootless_run_ends_as_soon_as_its_command_does` |
@@ -379,7 +379,8 @@ million (and stage 6's five, 29 million more).
 
 ## Tests
 
-(Filled in at the end of step 8.)
+Not counted at the stage's end. [Stage 8's notes](08-terminals.md#tests) give the
+counts per file after stage 8, which include stage 7's tests.
 
 ## Review history
 

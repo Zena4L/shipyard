@@ -15,7 +15,10 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > a way out, and can **publish ports** (`-p`): a bridge network as root, pasta
 > without; on a network you make, they find each other **by name** (`--name`),
 > a container can be on **several networks** at once, and with `--ipv6` they have
-> IPv6 too.
+> IPv6 too. With `-t`, a container gets a **terminal of its own** (`-it` to type into
+> it: job control, full-screen programs, password prompts); it never gets yours. `shipyard-runtime`
+> keeps a container's **logs**, lets you **attach** to it, **exec** into it and **cp**
+> files in and out, by its runtime ID.
 > It isn't a hardened boundary yet. It starts the command the way a container
 > runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
@@ -32,7 +35,7 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | [Networking](networking.md) | `--network`, `-p`, `--name`, `shipyard network …`: networks, addresses, names, published ports, other firewalls, the hostname and the `/etc` files |
 | [Volumes](volumes.md) | `shipyard volume …` and `--volume`: named volumes and bind mounts |
 | [OCI bundles](bundles.md) | `shipyard run --bundle`: a container described by a `config.json`, what's supported, refused and ignored |
-| [The OCI runtime](runtime.md) | `shipyard-runtime`: `create`, `start`, `state`, `kill` and `delete`, one step at a time, as `runc` |
+| [The OCI runtime](runtime.md) | `shipyard-runtime`, as `runc`: a container's life one step at a time (`create`, `start`, `state`, `kill`, `delete`), its terminals, logs, `attach`, `exec`, `cp`, passing descriptors, and its cgroup (`pause`, `update`, `ps`, `events`) |
 | [Runtime reference](runtime-cli.md) | Every `shipyard-runtime` command and flag, generated from the binary itself |
 | [Exit codes](exit-codes.md) | What each exit code means, for scripts that check them |
 | [Command reference](cli.md) | Every command and flag, generated from the CLI itself |
@@ -139,6 +142,8 @@ containers run) or `fail` (a plain `shipyard run`, or `run --image`, would fail)
 with what to do. The
 exit code is 1 if anything failed. `doctor` tries what a run needs: it makes a user
 namespace, a mount and an overlay next to the image store, and removes them again.
+As root, its `firewall` line says whether another program's firewall (firewalld's,
+Docker's) would keep the containers from the outside, and how to let them through.
 
 Run a shell in Alpine Linux, pulled from Docker Hub:
 
@@ -183,15 +188,18 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
 
 ## Limitations in v0.1
 
-- **No detached containers**, no `exec` and no logs: v0.2. A container lives as
-  long as its `shipyard run`.
+- **No detached containers by name:** a `shipyard run` container lives as long as its
+  `shipyard run`, and `shipyard` has no `logs`, `attach`, `exec` or `cp` yet (v0.2).
+  `shipyard-runtime` has them all, by a container's runtime ID (see
+  [The OCI runtime](runtime.md)).
 - **macOS doesn't isolate yet:** commands run as ordinary processes until Shipyard runs
   them in a Linux VM of its own (v0.4).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge
   networks, and names between containers, are root's
   (see [Networking](networking.md#rootless-containers-pasta)).
-- **Firewalls can drop forwarded traffic:** firewalld, ufw or Docker's rules on the
-  same host can keep root's containers from the outside
+- **Other firewalls are left to you:** firewalld, ufw or Docker's rules on the same
+  host can keep root's containers from the outside. Shipyard warns, with the exact
+  fix, but never changes another program's firewall
   (see [Other firewalls](networking.md#other-firewalls)).
 - **Not a hardened security boundary yet:** containers are confined (namespaces,
   capabilities, seccomp, cgroups), but don't run code you wouldn't run as your own

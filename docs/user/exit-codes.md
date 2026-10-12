@@ -47,9 +47,12 @@ esac
 
 ## `shipyard-runtime`
 
-The [OCI runtime](runtime.md) runs no command itself, so its codes are simpler: `0`
-when the call did what was asked, `1` when it failed (the message says why), and `2`
-for a command line it can't parse. How a container's program ended is in its state
+The [OCI runtime](runtime.md)'s codes are simpler: `0` when the call did what was
+asked, `1` when it failed (the message says why), and `2` for a command line it can't
+parse. **`exec`** and **`attach`** are the exceptions, as runc's: `exec` exits with
+the command's own code (128 plus the signal's number, for one killed), or `255` when it
+couldn't run it; `attach` with the container's code when it ends, `0` when you detach,
+or `255` when attach itself fails. How a container's program ended is in its state
 directory, not in these codes; it ends in "(out of memory)" when the kernel's OOM
 killer ended it, or "(the host or a parent cgroup ran out of memory)" when the
 container hadn't reached its own memory limit.

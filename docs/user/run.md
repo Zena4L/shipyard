@@ -58,6 +58,20 @@ sees the host's network.
   container started without privileges, or by a security policy (seccomp,
   AppArmor, SELinux). `run` then exits with 125 and says why; use `--no-isolation`
   there.
+- **Shipyard's binary stays out of reach.** The container's init runs a sealed
+  in-memory copy of Shipyard, never the file it was started from, so nothing in the
+  container can change the program run next (CVE-2019-5736). On a host that won't make
+  or run one (`vm.memfd_noexec` at 2, or a security module's policy on memfds), the
+  file itself is run, with a warning, only where nobody in the container could write
+  it: on a read-only mount (a Nix store, say), or with its owner not a user inside, no
+  group that may write it a group inside or one of yours (a rootless container with a
+  single ID mapped keeps your groups), and no write for others. Otherwise the run is refused, saying it "needs a sealed copy of
+  shipyard's binary": always as root (root inside is host root), and rootless when
+  Shipyard is installed in your home (it's yours, and root inside is you); install it
+  where root owns it (`/usr/local/bin`). A file-size limit makes no copy either: one
+  set with `ulimit -f` (the hard limit too) smaller than Shipyard's binary; the error
+  then says so. A soft limit alone (`ulimit -S -f`) is fine: it's lifted for the copy,
+  and still applies to the container.
 - **`--no-isolation`** runs the command without namespaces, as you: it shares the
   host's processes, mounts, hostname, IPC and network.
 - **`--hostname NAME`** sets the hostname inside: letters, digits and hyphens in
@@ -1008,8 +1022,17 @@ The command starts clean, whatever state Shipyard was started in:
   and `shipyard run … &` in a script keep protecting the command from hangups
   and Ctrl-C.
 - **File descriptors:** only stdin, stdout and stderr are passed on (isolated,
-  as [Input, output and terminals](#input-output-and-terminals) says). Any other
-  open descriptor is closed when the command starts.
+  as [Input, output and terminals](#input-output-and-terminals) says), unless you pass
+  more: `--preserve-fds N` passes N more descriptors on, at the same numbers (3 to
+  3+N-1, or the N after socket activation's; each must be open; at most 1024, and about
+  half your soft limit, `ulimit -n`). Socket
+  activation too, as Podman does: with `LISTEN_FDS=n` and `LISTEN_PID` set to
+  Shipyard's own PID, descriptors 3 to 3+n-1 go first, and the command gets
+  `LISTEN_FDS`, `LISTEN_FDNAMES` and `LISTEN_PID` set to its own PID (as
+  `sd_listen_fds` expects; with isolation, Shipyard's init is PID 1). So a systemd
+  socket unit can start `ExecStart=/usr/local/bin/shipyard run --image … app`
+  directly. Any other open descriptor is closed when the command starts, and Shipyard
+  closes its own copies once the command has them.
 - **umask:** `022`.
 - **`TERM`:** when the command has a terminal (`-t`, or `--no-isolation` in a
   terminal), your `TERM` is passed on, or `xterm` with `-t` if you have none

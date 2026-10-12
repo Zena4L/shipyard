@@ -84,7 +84,8 @@ Shipyard has three layers, mirroring how the established tools split up:
   `net.*` once containers have their own network namespace (stage 7).
 - **Moved to the stages that give them meaning:**
   - a terminal inside (`process.terminal`, `--console-socket`): stage 8;
-  - names for commands run in an existing container (`exec`): with `exec`, stage 8;
+  - names for commands run in an existing container (`exec`): numeric in 8.4a (runc's),
+    names with stage 9;
   - hooks, `oomScoreAdj`, cgroup mounts and `linux.resources`: stage 5 (cgroups);
   - bundles without a `pid` namespace in `shipyard-runtime`, `kill STOP`, `pause` and
     `resume`: stage 5 (cgroups find and freeze every process);
@@ -221,8 +222,10 @@ Shipyard has three layers, mirroring how the established tools split up:
   `-p`/`-P` through DNAT maps (host ports held by bound sockets), hairpin, localhost
   clients with the 127/8 guard, isolation between networks, internal (no-egress)
   networks, routing closed to all but containers; other firewalls detected and warned
-  about with the fix.
-- **Rootless networking:** pasta, one per container, attached by PID: outbound traffic,
+  about with the fix (firewalld and Docker's completed in stage 8.6, with `doctor`'s
+  `firewall` line).
+- **Rootless networking:** pasta, one per container, given the container's network
+  namespace as a file (not attached by PID, which SELinux refuses): outbound traffic,
   published ports, the host's DNS through `169.254.1.1`, IPv6 where the host has it;
   never the host's loopback. (`slirp4netns` isn't supported.)
 - **Name resolution:**
@@ -253,16 +256,31 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **OCI terminals** (built in step 8.3a): `process.terminal` and `consoleSize` in
   bundles; `shipyard-runtime create --console-socket`, runc's protocol (the master
   sent with `SCM_RIGHTS` and a name, no answer awaited).
-- **`attach` / detach:** with detach keys.
-- **`exec` sessions:** each with its own terminal.
-- **`exec` joins the container's cgroup** (moved from stage 5): its limits, device rules
-  and freezing cover what it runs, and a cgroup kill catches it.
-- **`exec` joins the container's network namespace** (moved from stage 7), whatever its
-  network mode.
+- **`attach` / detach:** with detach keys (built in step 8.3c, by runtime ID:
+  `shipyard-runtime attach`, `create --stdin [--stdin-once]`; the monitor serves
+  `attach.sock`, `SO_PEERCRED`, 16 clients × 256 KiB, a versioned protocol; by name with
+  stage 9). The monitor's own memory stays under 1 MiB idle; up to 4 MiB more with 16
+  clients behind.
+- **`exec`, confined** (built in step 8.4a, by runtime ID: `shipyard-runtime exec`, root
+  and rootless; a terminal for it in 8.4b; by name with stage 9): it joins every
+  namespace the container has (the user one first) and starts in its cgroup
+  (`clone3(CLONE_INTO_CGROUP)`, moved from stage 5: its limits, device rules and freezing
+  cover it, a cgroup kill catches it; its network namespace, moved from stage 7,
+  whatever the network mode). Confined as the container's process from a versioned
+  snapshot (`exec.json`), narrowed never widened; non-dumpable and holding no host
+  descriptor until it runs, a clone of the sealed binary (F6).
+- **`exec` sessions:** each with its own terminal (built in step 8.4b: `exec -t`, made
+  in the container's own devpts by exec's joiner, relayed, or sent to
+  `--console-socket`).
 - **File-descriptor passing:** `--preserve-fds` and systemd-style socket activation
-  (`LISTEN_FDS`).
-- **Logs:** log files with rotation; `logs --follow --tail --since --timestamps`.
-- **`cp`:** copy files into and out of a container.
+  (`LISTEN_FDS`) (built in step 8.5b: `shipyard-runtime create`/`exec` and `shipyard
+  run`; `LISTEN_PID` is the process's own PID, Shipyard's init being PID 1).
+- **Logs:** log files with rotation; `logs --follow --tail --since --timestamps` (built
+  in step 8.3b, by runtime ID: `shipyard-runtime create --log-dir`, CRI files with a
+  versioned `log.json`, the monitor's poll loop; `logs` by name comes with stage 9).
+- **`cp`:** copy files into and out of a container (built in step 8.5a, by runtime ID:
+  `shipyard-runtime cp`, Docker's forms and path rules, `-` for tar streams; done inside
+  the container by a helper of Shipyard's own; `cp` by name comes with stage 9).
 
 ## 9. Engine state (daemonless) — stage 9
 
@@ -333,14 +351,16 @@ Shipyard has three layers, mirroring how the established tools split up:
 
 - Unit tests per stage, and integration tests run in a Linux VM in CI.
 - Pass the OCI runtime-spec conformance suite
-  ([`runtime-tools`](https://github.com/opencontainers/runtime-tools)).
+  ([`runtime-tools`](https://github.com/opencontainers/runtime-tools)): it runs since
+  stage 8 (H5), gated by `scripts/conformance/expected.txt`. By v1.0, every test is
+  `pass`, or a refusal by design.
 - Fuzzing of every parser: manifests, tar, compose, config.
 
 **Performance targets** (benchmarked in CI)
 
 - Container start in under 100 ms, excluding image pull.
 - Idle cost of zero processes besides the per-container monitors.
-- Monitor memory under 1 MB RSS each.
+- Monitor memory under 1 MiB each (its own memory, idle; shared libraries not counted).
 
 **Security process**
 

@@ -420,25 +420,86 @@ next `shipyard run` rebuilds the table whole:
 So after a flush, run any container on a network at once: `sudo shipyard run
 true` (on the default network) puts the table back.
 
-Another firewall can still drop what Shipyard lets through: Docker, ufw and
-firewalld make the host drop forwarded traffic by default. Shipyard finds such
-a chain and warns, with the fix. For Docker:
+Another firewall can still drop what Shipyard lets through. A rule of
+Shipyard's that accepts a packet ends only Shipyard's own chain, while a drop in
+any other firewall's is final. So when a container joins a network, Shipyard
+reads the other firewalls. It warns about each one in the way, says what it
+would keep from the containers, and gives the fix in that firewall's own terms.
+It never changes them itself. Once the fix is in, the warning stops: each rule
+it printed has to be there, in the right direction. A rule for a former way out
+doesn't count, nor one narrowed to a port. `shipyard doctor` shows the same thing
+for the default network, on its `firewall` line.
+
+**firewalld** (Fedora, RHEL, openSUSE) puts an interface that's in no zone in its
+default zone, which rejects what it doesn't allow:
+
+- the questions a network's containers ask its DNS server, always;
+- their way out, where the zone doesn't forward. Fedora's does (firewalld 1.0
+  and later); firewalld before 1.0, or a zone with `forward: no`, doesn't.
+
+So on Fedora the default network, which has no DNS server, works as it is. A
+network of your own needs its bridge in firewalld's `trusted` zone:
 
 ```sh
-sudo iptables -I DOCKER-USER -i shipyard0 -o eth0 -j ACCEPT
-sudo iptables -I DOCKER-USER -o shipyard0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+sudo firewall-cmd --permanent --zone=trusted --add-interface=shy-1a2b3c4d5e && sudo firewall-cmd --reload
 ```
 
-where `eth0` is the host's way out (its default route's interface, which the
-warning names): only out to the world, never into Docker's own bridges.
+The binding is kept across reboots and holds even while the bridge doesn't exist.
+Each network's bridge needs its own line: `shipyard network inspect NAME` names
+it, and the warning gives the line in full.
 
-A firewall that drops what comes in to the host by default (ufw's `INPUT`
-chain, say) also drops the questions a network's containers ask its DNS server,
-on the gateway. Shipyard warns about such a chain too, with the fix: letting in
-port 53 from the network's bridge.
+**Docker** drops forwarded traffic by default, and keeps its `DOCKER-USER` chain for
+your own rules. Add three:
 
-Rules made with the older iptables (iptables-legacy rather than iptables-nft)
-can't be seen, so they get no warning.
+```sh
+sudo iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT
+sudo iptables -I DOCKER-USER -i shipyard0 -o eth0 -j ACCEPT
+sudo iptables -I DOCKER-USER -o shipyard0 -m conntrack --ctstate RELATED,ESTABLISHED,DNAT -j ACCEPT
+```
+
+- The first is for containers on the network reaching each other. Docker makes
+  the kernel filter bridged traffic too (`br_netfilter`).
+- The second is for their way out. `eth0` is the host's way out (its default
+  route's interface), as the warning names it: only out to the world, never into
+  Docker's own bridges.
+- The third is for replies, and connections to published ports.
+
+A network with IPv6 also needs the same three with `ip6tables`, naming IPv6's way
+out; the warning gives them. Docker rewrites its own chains when it restarts, but
+leaves `DOCKER-USER` alone. The rules last until a reboot unless you save them
+(`iptables-save`, or your distribution's way). If the host's way out changes (a
+dock, Wi-Fi instead of Ethernet), the warning comes back with the new name.
+
+**ufw** (Ubuntu) drops forwarded traffic by default once it's enabled. Its own rules
+let the containers through, and ufw keeps them:
+
+```sh
+sudo ufw route allow in on shipyard0 out on shipyard0
+sudo ufw route allow in on shipyard0 out on eth0
+sudo ufw route allow out on shipyard0
+```
+
+The last is for published ports: ufw lets replies through itself. A network of
+your own also needs `sudo ufw allow in on BRIDGE to any port 53` for its DNS server. With Docker on the
+same host, these are the rules given too: Docker's chains hand what isn't
+Docker's on to ufw's, and ufw keeps its rules across reboots (Docker's three
+rules in `DOCKER-USER` work as well, and count).
+
+**Any other chain** that drops forwarded traffic by default (`policy drop`), or
+ends in a rule that drops or rejects everything (RHEL's `iptables-services` ends
+its `FORWARD` with `-j REJECT`), gets the same rules as Docker's, inserted in that
+chain:
+
+- with `iptables` (or `ip6tables`) for an `ip filter` (`ip6 filter`) table;
+- with `nft` for any other, four lines, since nft writes a connection's state
+  and its address translation apart.
+
+A chain that drops what comes in to the host by default also drops the questions
+a network's containers ask its DNS server, on the gateway. The warning gives the
+rules that let in port 53 from the network's bridge.
+
+Rules made with the older iptables (iptables-legacy rather than iptables-nft) live
+outside nftables, where Shipyard can't read them: they get no warning.
 
 ## The hostname and `/etc` files
 

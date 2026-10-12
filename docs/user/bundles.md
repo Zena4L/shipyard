@@ -100,13 +100,20 @@ Too many containers for one user can run into the kernel's key quota
 
 ## Mounts
 
+Mounts are made in the order the config lists them, the standard ones included (see
+below), as the specification asks. An order that can't work is refused (exit 125),
+saying what to move: a mount below a standard one listed before it, which that one
+would hide (below `/dev`, or `/dev/shm`, …); `/dev/pts`, `/dev/shm` or `/dev/mqueue`
+before `/dev`; `/sys/fs/cgroup` before `/sys`; or a standard mount listed twice.
+
 - **`bind`:** a host file or directory, seen inside too. The `source` is the host path:
   a relative path is relative to the bundle, and it must exist. Use the option `rbind`
   to include the mounts below the source. Otherwise (the option `bind`, or none) only
   the source's own mount is bound, as with `runc`.
 - **`tmpfs`:** a fresh, empty file system in memory. The options `size=`, `mode=`,
   `nr_inodes=`, `nr_blocks=`, `uid=` and `gid=` are passed on to it (one value each:
-  no commas).
+  no commas). On a bind they mean nothing, and are ignored with a warning (`runc`
+  passes them to the kernel, which ignores them there).
 - **Options for both:** `ro`/`rw`, `nosuid`/`suid`, `nodev`/`dev`, `noexec`/`exec`.
   - `ro` with `rbind` makes the mounts below read-only too.
   - A bind keeps the restrictions of the host mounts it comes from: `exec` doesn't
@@ -129,7 +136,10 @@ Too many containers for one user can run into the kernel's key quota
   `/dev/mqueue` directly is fine.
 - **The standard mounts** (`/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`,
   `/dev/mqueue`), which most configs list, are accepted. Shipyard always mounts them
-  itself, with its own options.
+  itself, with its own options, where the config lists them. Those it doesn't list
+  come first, except one below a listed one (`/dev/pts` below `/dev`), which comes
+  right after it. A bind of the host's `/sys` at `/sys` (as `runc spec --rootless`
+  writes it) counts as the standard `/sys`.
 - **The cgroup mount,** type `cgroup` or `cgroup2` at `/sys/fs/cgroup` (as `runc spec`
   writes it), mounts the container's own cgroup there, read-only if its options
   include `ro`, and always `nosuid`, `nodev` and `noexec`; its other options are
@@ -293,7 +303,9 @@ leave the container **less confined than the config asks**, so the bundle is ref
 - mounts of any type but `bind` and `tmpfs`.
 
 A config made by `runc spec` runs as it is: its terminal, capabilities,
-`noNewPrivileges`, device rule and network namespace are all applied.
+`noNewPrivileges`, device rule and network namespace are all applied. So does one made
+by `runc spec --rootless`, run without root: its `/sys`, a bind of the host's, is
+taken as the standard `/sys` (Shipyard binds the host's only where it must).
 
 ## What's ignored
 

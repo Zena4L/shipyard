@@ -391,7 +391,7 @@ reuse inode numbers (64-bit inode numbers, since about Linux 5.5); a user namesp
 |---|---|
 | 8 (`exec`) | Placing joined processes in the container's cgroup. |
 | 9 (named containers) | `shipyard stats`, `top`, `pause`, `update`. |
-| 14 (hardening) | Removing the device program from inside needs `CAP_SYS_ADMIN` (to get its descriptor by ID; before 5.8 `CAP_NET_ADMIN` too), not a default; BFQ's `io.bfq.weight` as `--blkio-weight`'s fallback, as runc does; fuzzing the OCI resources reader; the OCI conformance suite. |
+| 14 (hardening) | Removing the device program from inside needs `CAP_SYS_ADMIN` (to get its descriptor by ID; before 5.8 `CAP_NET_ADMIN` too), not a default; BFQ's `io.bfq.weight` as `--blkio-weight`'s fallback, as runc does; fuzzing the OCI resources reader; the OCI conformance suite (moved to stage 8, H5). |
 
 **Resolved from stage 4:** device access control (eBPF on the cgroup), and the cgroup
 namespace.
