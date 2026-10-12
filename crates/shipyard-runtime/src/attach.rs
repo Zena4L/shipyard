@@ -1,0 +1,652 @@
+//! The attach protocol (stage 8, step 8.3c): what goes over a container's
+//! `attach.sock` between its monitor and `shipyard-runtime attach`.
+//!
+//! A stream socket carries a byte stream, not messages: frames give it
+//! boundaries. Each is a kind (one byte), a length (four bytes, big-endian),
+//! and that many bytes of payload, at most [`MAX_PAYLOAD`]:
+//!
+//! - the client sends [`Frame::Hello`] first (its version, its detach keys),
+//!   then [`Frame::Stdin`], [`Frame::Resize`] and, when its own input ends,
+//!   [`Frame::StdinEnd`];
+//! - the monitor answers [`Frame::Welcome`] (or [`Frame::Refused`]), then
+//!   sends the container's output ([`Frame::Stdout`], [`Frame::Stderr`]) as
+//!   it comes, and at the end [`Frame::Detached`], [`Frame::Dropped`] or
+//!   [`Frame::Exited`].
+//!
+//! **Versions** (H2): a monitor lives as long as its container, so a client
+//! may be newer than it. The hello carries the client's highest version; the
+//! monitor answers with the one they'll use ([`negotiate`]), and a client
+//! skips frame kinds it doesn't know ([`FrameError::Kind`], after which the
+//! stream goes on). The header (kind, length) never changes.
+//!
+//! **Detach keys** (Ctrl-P Ctrl-Q by default, Docker's) are the client's to
+//! name and the monitor's to watch for in what the client types
+//! ([`DetachKeys::matcher`]), so every client detaches the same way.
+
+/// The protocol's version: what [`Frame::Hello`] and [`Frame::Welcome`] carry.
+pub const VERSION: u32 = 1;
+
+/// The version a monitor of this protocol uses with a client whose highest is
+/// `client`: the lower of the two, if both know it (none below 1).
+#[must_use]
+pub fn negotiate(client: u32) -> Option<u32> {
+    (client >= 1).then(|| client.min(VERSION))
+}
+
+/// The most one frame carries: longer output goes in several.
+pub const MAX_PAYLOAD: usize = 32 * 1024;
+
+/// A frame's kind, length: the bytes before its payload.
+const HEADER: usize = 5;
+
+/// One message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Frame {
+    /// Client, first: its version, and the keys that detach it.
+    Hello {
+        /// The client's protocol version.
+        version: u32,
+        /// The bytes that detach it (empty: no keys detach it).
+        detach_keys: Vec<u8>,
+    },
+    /// Client: what it typed, for the container's stdin.
+    Stdin(Vec<u8>),
+    /// Client: its own input has ended (`attach < file`): it types no more.
+    /// With `create --stdin-once`, the container's stdin is then closed,
+    /// once what the client typed has been written.
+    StdinEnd,
+    /// Client: its terminal's size, for the container's.
+    Resize {
+        /// Rows.
+        rows: u16,
+        /// Columns.
+        cols: u16,
+    },
+    /// Monitor, to a client let in.
+    Welcome {
+        /// The monitor's protocol version.
+        version: u32,
+        /// Whether the container has a terminal (its output is one stream,
+        /// and raw mode makes sense).
+        terminal: bool,
+        /// Whether it takes input (`create --stdin`).
+        stdin: bool,
+    },
+    /// Monitor, to a client not let in, then closed.
+    Refused(String),
+    /// Monitor: the container's standard output (or its terminal's).
+    Stdout(Vec<u8>),
+    /// Monitor: its standard error.
+    Stderr(Vec<u8>),
+    /// Monitor: the client typed its detach keys; then closed.
+    Detached,
+    /// Monitor: the client fell too far behind the output; then closed.
+    Dropped(String),
+    /// Monitor: the container ended, with this exit code; then closed.
+    Exited(i32),
+}
+
+/// A frame that can't be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FrameError {
+    /// A kind this protocol doesn't have.
+    #[error("an attach frame of unknown kind {0}")]
+    Kind(u8),
+    /// Longer than [`MAX_PAYLOAD`].
+    #[error("an attach frame of {0} bytes, more than {MAX_PAYLOAD}")]
+    TooLong(u32),
+    /// A payload of the wrong size for its kind, or text that isn't UTF-8.
+    #[error("a malformed attach frame (kind {0})")]
+    Malformed(u8),
+}
+
+mod kind {
+    pub(super) const HELLO: u8 = 1;
+    pub(super) const STDIN: u8 = 2;
+    pub(super) const RESIZE: u8 = 3;
+    pub(super) const STDIN_END: u8 = 4;
+    pub(super) const WELCOME: u8 = 16;
+    pub(super) const REFUSED: u8 = 17;
+    pub(super) const STDOUT: u8 = 18;
+    pub(super) const STDERR: u8 = 19;
+    pub(super) const DETACHED: u8 = 20;
+    pub(super) const DROPPED: u8 = 21;
+    pub(super) const EXITED: u8 = 22;
+}
+
+impl Frame {
+    /// Appends the frame to `out`. A payload longer than [`MAX_PAYLOAD`]
+    /// (output, input) goes as several frames of the same kind.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Hello {
+                version,
+                detach_keys,
+            } => {
+                let mut payload = version.to_be_bytes().to_vec();
+                payload.extend_from_slice(detach_keys);
+                put(out, kind::HELLO, &payload);
+            }
+            Self::Stdin(bytes) => put_split(out, kind::STDIN, bytes),
+            Self::Resize { rows, cols } => {
+                let mut payload = rows.to_be_bytes().to_vec();
+                payload.extend_from_slice(&cols.to_be_bytes());
+                put(out, kind::RESIZE, &payload);
+            }
+            Self::Welcome {
+                version,
+                terminal,
+                stdin,
+            } => {
+                let mut payload = version.to_be_bytes().to_vec();
+                payload.push(u8::from(*terminal) | (u8::from(*stdin) << 1));
+                put(out, kind::WELCOME, &payload);
+            }
+            Self::Refused(reason) => put(out, kind::REFUSED, truncated(reason)),
+            Self::Stdout(bytes) => put_split(out, kind::STDOUT, bytes),
+            Self::Stderr(bytes) => put_split(out, kind::STDERR, bytes),
+            Self::StdinEnd => put(out, kind::STDIN_END, &[]),
+            Self::Detached => put(out, kind::DETACHED, &[]),
+            Self::Dropped(reason) => put(out, kind::DROPPED, truncated(reason)),
+            Self::Exited(code) => put(out, kind::EXITED, &code.to_be_bytes()),
+        }
+    }
+
+    /// Appends output (`stderr` or not) as frames, without making a frame
+    /// first: what the monitor does for every read of the container.
+    pub fn encode_output(stderr: bool, bytes: &[u8], out: &mut Vec<u8>) {
+        put_split(out, if stderr { kind::STDERR } else { kind::STDOUT }, bytes);
+    }
+
+    fn decode(kind: u8, payload: &[u8]) -> Result<Self, FrameError> {
+        let malformed = || FrameError::Malformed(kind);
+        let text = || {
+            std::str::from_utf8(payload)
+                .map(str::to_owned)
+                .map_err(|_| malformed())
+        };
+        Ok(match kind {
+            kind::HELLO => {
+                let (version, keys) = payload.split_first_chunk::<4>().ok_or_else(malformed)?;
+                if keys.len() > DetachKeys::MAX {
+                    return Err(malformed());
+                }
+                Self::Hello {
+                    version: u32::from_be_bytes(*version),
+                    detach_keys: keys.to_vec(),
+                }
+            }
+            kind::STDIN => Self::Stdin(payload.to_vec()),
+            kind::RESIZE => {
+                let [r0, r1, c0, c1] = payload else {
+                    return Err(malformed());
+                };
+                Self::Resize {
+                    rows: u16::from_be_bytes([*r0, *r1]),
+                    cols: u16::from_be_bytes([*c0, *c1]),
+                }
+            }
+            kind::WELCOME => {
+                let [v0, v1, v2, v3, flags] = payload else {
+                    return Err(malformed());
+                };
+                if flags & !0b11 != 0 {
+                    return Err(malformed());
+                }
+                Self::Welcome {
+                    version: u32::from_be_bytes([*v0, *v1, *v2, *v3]),
+                    terminal: flags & 1 != 0,
+                    stdin: flags & 2 != 0,
+                }
+            }
+            kind::REFUSED => Self::Refused(text()?),
+            kind::STDOUT => Self::Stdout(payload.to_vec()),
+            kind::STDERR => Self::Stderr(payload.to_vec()),
+            kind::STDIN_END if payload.is_empty() => Self::StdinEnd,
+            kind::DETACHED if payload.is_empty() => Self::Detached,
+            kind::DROPPED => Self::Dropped(text()?),
+            kind::EXITED => {
+                let code: [u8; 4] = payload.try_into().map_err(|_| malformed())?;
+                Self::Exited(i32::from_be_bytes(code))
+            }
+            kind::DETACHED | kind::STDIN_END => return Err(malformed()),
+            other => return Err(FrameError::Kind(other)),
+        })
+    }
+}
+
+/// A reason, cut to what one frame holds (on a character boundary).
+fn truncated(reason: &str) -> &[u8] {
+    let mut end = reason.len().min(MAX_PAYLOAD);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason.as_bytes().get(..end).unwrap_or_default()
+}
+
+fn put(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    out.push(kind);
+    // (At most MAX_PAYLOAD: it fits.)
+    out.extend_from_slice(
+        &u32::try_from(payload.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(payload);
+}
+
+fn put_split(out: &mut Vec<u8>, kind: u8, bytes: &[u8]) {
+    for chunk in bytes.chunks(MAX_PAYLOAD) {
+        put(out, kind, chunk);
+    }
+}
+
+/// Reads frames from a byte stream as it comes. Holds at most one frame's
+/// bytes (and what was pushed after them) at a time.
+#[derive(Debug, Default)]
+pub struct Decoder {
+    buffer: Vec<u8>,
+}
+
+impl Decoder {
+    /// A decoder with nothing read yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes bytes read from the stream.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// How many bytes are held, not yet a whole frame.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// The next whole frame, if one is there.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError`]. The frame's bytes are taken either way: after
+    /// [`FrameError::Kind`] (a newer peer's frame) the stream goes on; after
+    /// the others it isn't this protocol, and nothing after can be trusted.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
+        let Some((&kind, rest)) = self.buffer.split_first() else {
+            return Ok(None);
+        };
+        let Some((length, _)) = rest.split_first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let length = u32::from_be_bytes(*length);
+        let size = usize::try_from(length).unwrap_or(usize::MAX);
+        if size > MAX_PAYLOAD {
+            return Err(FrameError::TooLong(length));
+        }
+        let Some(payload) = self.buffer.get(HEADER..HEADER + size) else {
+            return Ok(None);
+        };
+        let frame = Frame::decode(kind, payload);
+        self.buffer.drain(..HEADER + size);
+        frame.map(Some)
+    }
+}
+
+/// The keys that detach a client, as bytes typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachKeys(Vec<u8>);
+
+/// Detach keys that can't be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "detach keys {0:?}: give keys separated by commas, each a character or ctrl- and a \
+     letter or one of @[\\]^_ (like ctrl-p,ctrl-q), at most 8"
+)]
+pub struct DetachKeysError(pub String);
+
+impl DetachKeys {
+    /// The most keys.
+    pub const MAX: usize = 8;
+
+    /// Ctrl-P Ctrl-Q, Docker's.
+    #[must_use]
+    pub fn default_keys() -> Self {
+        Self(vec![0x10, 0x11])
+    }
+
+    /// Reads Docker's form: keys separated by commas, each a single
+    /// character or `ctrl-` and a letter or one of `@[\]^_`. Empty: no keys,
+    /// nothing detaches (Podman's).
+    ///
+    /// # Errors
+    ///
+    /// [`DetachKeysError`]: anything else, or more than [`MAX`](Self::MAX).
+    pub fn parse(text: &str) -> Result<Self, DetachKeysError> {
+        let bad = || DetachKeysError(text.to_owned());
+        if text.is_empty() {
+            return Ok(Self(Vec::new()));
+        }
+        let mut keys = Vec::new();
+        for key in text.split(',') {
+            let byte = if let Some(name) = key.strip_prefix("ctrl-") {
+                let [byte] = name.as_bytes() else {
+                    return Err(bad());
+                };
+                match byte.to_ascii_uppercase() {
+                    upper @ (b'@' | b'A'..=b'Z' | b'[' | b'\\' | b']' | b'^' | b'_') => {
+                        upper - b'@'
+                    }
+                    _ => return Err(bad()),
+                }
+            } else {
+                match key.as_bytes() {
+                    [byte] if byte.is_ascii() && !byte.is_ascii_control() => *byte,
+                    _ => return Err(bad()),
+                }
+            };
+            keys.push(byte);
+        }
+        if keys.len() > Self::MAX {
+            return Err(bad());
+        }
+        Ok(Self(keys))
+    }
+
+    /// The keys, as typed.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Keys a client sent ([`Frame::Hello`]): any bytes, at most
+    /// [`MAX`](Self::MAX); none means nothing detaches it.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        (bytes.len() <= Self::MAX).then(|| Self(bytes.to_vec()))
+    }
+
+    /// A matcher watching a stream of typing for these keys.
+    #[must_use]
+    pub fn matcher(&self) -> Matcher {
+        Matcher {
+            keys: self.0.clone(),
+            matched: 0,
+        }
+    }
+}
+
+/// Watches what a client types for its detach keys.
+#[derive(Debug, Clone)]
+pub struct Matcher {
+    keys: Vec<u8>,
+    /// How many of the keys the latest typing ends with, held back.
+    matched: usize,
+}
+
+impl Matcher {
+    /// Takes `typed`, appending to `out` what goes to the container. Returns
+    /// whether the keys were typed: then `out` has what came before them,
+    /// and nothing of them (nor what came after, in `typed`). Keys that
+    /// begin to match are held back, across calls, until they match or not.
+    pub fn feed(&mut self, typed: &[u8], out: &mut Vec<u8>) -> bool {
+        if self.keys.is_empty() {
+            out.extend_from_slice(typed);
+            return false;
+        }
+        // What's held back is always the keys' first `matched` bytes. On a
+        // mismatch, the held bytes and the new one are given up from the
+        // front only until what's left begins the keys again (so `a,a,b`
+        // typed as `a a a b` still detaches). The keys are at most 8 bytes:
+        // the simple search is enough.
+        let mut held = [0_u8; DetachKeys::MAX];
+        for &byte in typed {
+            let mut len = self.matched;
+            held[..len].copy_from_slice(&self.keys[..len]);
+            let Some(slot) = held.get_mut(len) else {
+                return false;
+            };
+            *slot = byte;
+            len += 1;
+            let mut start = 0;
+            while !self.keys.starts_with(&held[start..len]) {
+                out.push(held[start]);
+                start += 1;
+            }
+            self.matched = len - start;
+            if self.matched == self.keys.len() {
+                self.matched = 0;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn all() -> Vec<Frame> {
+        vec![
+            Frame::Hello {
+                version: VERSION,
+                detach_keys: vec![0x10, 0x11],
+            },
+            Frame::Stdin(b"typed".to_vec()),
+            Frame::StdinEnd,
+            Frame::Resize {
+                rows: 30,
+                cols: 100,
+            },
+            Frame::Welcome {
+                version: VERSION,
+                terminal: true,
+                stdin: false,
+            },
+            Frame::Refused("16 clients already".to_owned()),
+            Frame::Stdout(b"out".to_vec()),
+            Frame::Stderr(b"err".to_vec()),
+            Frame::Detached,
+            Frame::Dropped("behind".to_owned()),
+            Frame::Exited(-9),
+        ]
+    }
+
+    #[test]
+    fn frames_round_trip_whole_or_in_pieces() {
+        let mut stream = Vec::new();
+        for frame in all() {
+            frame.encode(&mut stream);
+        }
+        // One byte at a time: frames come out as they're completed.
+        let mut decoder = Decoder::new();
+        let mut read = Vec::new();
+        for byte in &stream {
+            decoder.push(std::slice::from_ref(byte));
+            while let Some(frame) = decoder.next_frame().unwrap() {
+                read.push(frame);
+            }
+        }
+        assert_eq!(read, all());
+        assert_eq!(decoder.held(), 0);
+    }
+
+    #[test]
+    fn long_output_goes_in_several_frames() {
+        let mut stream = Vec::new();
+        Frame::encode_output(false, &vec![b'x'; MAX_PAYLOAD * 2 + 1], &mut stream);
+        let mut decoder = Decoder::new();
+        decoder.push(&stream);
+        let mut sizes = Vec::new();
+        while let Some(Frame::Stdout(bytes)) = decoder.next_frame().unwrap() {
+            sizes.push(bytes.len());
+        }
+        assert_eq!(sizes, [MAX_PAYLOAD, MAX_PAYLOAD, 1]);
+    }
+
+    #[test]
+    fn what_isnt_the_protocol_is_refused() {
+        let decode = |bytes: &[u8]| {
+            let mut decoder = Decoder::new();
+            decoder.push(bytes);
+            decoder.next_frame()
+        };
+        assert_eq!(decode(&[99, 0, 0, 0, 0]), Err(FrameError::Kind(99)));
+        assert_eq!(
+            decode(&[kind::STDOUT, 0, 0, 0x80, 1]),
+            Err(FrameError::TooLong(0x8001))
+        );
+        assert_eq!(
+            decode(&[kind::RESIZE, 0, 0, 0, 1, 7]),
+            Err(FrameError::Malformed(kind::RESIZE))
+        );
+        assert_eq!(
+            decode(&[kind::DETACHED, 0, 0, 0, 1, 7]),
+            Err(FrameError::Malformed(kind::DETACHED))
+        );
+        assert_eq!(
+            decode(&[kind::REFUSED, 0, 0, 0, 1, 0xff]),
+            Err(FrameError::Malformed(kind::REFUSED))
+        );
+        let mut hello = vec![kind::HELLO, 0, 0, 0, 13, 0, 0, 0, 1];
+        hello.extend([1; 9]);
+        assert_eq!(
+            decode(&hello),
+            Err(FrameError::Malformed(kind::HELLO)),
+            "more than 8 keys"
+        );
+        // A newer peer's kind is skipped: what follows is read.
+        let mut decoder = Decoder::new();
+        decoder.push(&[99, 0, 0, 0, 2, 7, 7, kind::DETACHED, 0, 0, 0, 0]);
+        assert_eq!(decoder.next_frame(), Err(FrameError::Kind(99)));
+        assert_eq!(decoder.next_frame(), Ok(Some(Frame::Detached)));
+        assert_eq!(negotiate(VERSION + 3), Some(VERSION));
+        assert_eq!(negotiate(1), Some(1));
+        assert_eq!(negotiate(0), None);
+        // Not all there yet: nothing, and no error.
+        assert_eq!(decode(&[kind::STDOUT, 0, 0, 0, 9, 1]), Ok(None));
+    }
+
+    #[test]
+    fn detach_keys_are_read_as_docker_writes_them() {
+        assert_eq!(
+            DetachKeys::parse("ctrl-p,ctrl-q").unwrap(),
+            DetachKeys::default_keys()
+        );
+        assert_eq!(DetachKeys::parse("ctrl-a").unwrap().bytes(), [1]);
+        assert_eq!(
+            DetachKeys::parse("ctrl-@,ctrl-_,ctrl-\\").unwrap().bytes(),
+            [0, 0x1f, 0x1c]
+        );
+        assert_eq!(DetachKeys::parse("a,ctrl-B").unwrap().bytes(), [b'a', 2]);
+        assert_eq!(
+            DetachKeys::parse("").unwrap().bytes(),
+            b"",
+            "none: never detaches"
+        );
+        for bad in ["ctrl-", "ctrl-1", "ab", "ctrl-p,", "é", "a,a,a,a,a,a,a,a,a"] {
+            assert!(DetachKeys::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn feed_all(keys: &[u8], typed: &[&[u8]]) -> (Vec<u8>, bool) {
+        let mut matcher = DetachKeys(keys.to_vec()).matcher();
+        let mut out = Vec::new();
+        for piece in typed {
+            if matcher.feed(piece, &mut out) {
+                return (out, true);
+            }
+        }
+        (out, false)
+    }
+
+    #[test]
+    fn detach_keys_are_found_and_never_passed_on() {
+        let keys = [0x10, 0x11];
+        assert_eq!(feed_all(&keys, &[b"ab\x10\x11cd"]), (b"ab".to_vec(), true));
+        // Across reads.
+        assert_eq!(
+            feed_all(&keys, &[b"ab\x10", b"\x11"]),
+            (b"ab".to_vec(), true)
+        );
+        // The first key alone, then something else: passed on, nothing held.
+        assert_eq!(
+            feed_all(&keys, &[b"a\x10", b"b"]),
+            (b"a\x10b".to_vec(), false)
+        );
+        // The first key twice: the second may start the keys.
+        assert_eq!(
+            feed_all(&keys, &[b"\x10\x10\x11"]),
+            (b"\x10".to_vec(), true)
+        );
+        // No keys: everything goes on.
+        assert_eq!(feed_all(&[], &[b"\x10\x11"]), (b"\x10\x11".to_vec(), false));
+        assert_eq!(feed_all(b"q", &[b"abq"]), (b"ab".to_vec(), true));
+        // A mismatch keeps what can still begin the keys: `a a a b` holds
+        // `a a` after the third `a`, and detaches on the `b`.
+        assert_eq!(feed_all(b"aab", &[b"xaaab"]), (b"xa".to_vec(), true));
+        assert_eq!(
+            feed_all(b"aab", &[b"a", b"a", b"a", b"b"]),
+            (b"a".to_vec(), true)
+        );
+        assert_eq!(feed_all(b"abac", &[b"ababac"]), (b"ab".to_vec(), true));
+    }
+
+    /// What the matcher must do, the slow way: everything before the keys'
+    /// first appearance goes on; without them, all but the longest end that
+    /// begins the keys (held back, waiting).
+    fn reference(keys: &[u8], typed: &[u8]) -> (Vec<u8>, bool) {
+        if let Some(at) = typed.windows(keys.len()).position(|window| window == keys) {
+            return (typed[..at].to_vec(), true);
+        }
+        let held = (0..keys.len().min(typed.len() + 1))
+            .rev()
+            .find(|&len| typed.ends_with(&keys[..len]))
+            .unwrap_or(0);
+        (typed[..typed.len() - held].to_vec(), false)
+    }
+
+    proptest! {
+        #[test]
+        fn any_bytes_are_read_or_refused(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
+            let mut decoder = Decoder::new();
+            decoder.push(&bytes);
+            while let Ok(Some(_)) = decoder.next_frame() {}
+        }
+
+        /// Without the keys in it, typing goes on whole, however it's cut.
+        #[test]
+        fn typing_without_the_keys_goes_on_whole(
+            typed in proptest::collection::vec(any::<u8>().prop_filter("not ctrl-q", |b| *b != 0x11), 0..100),
+            cut in 0..100_usize,
+        ) {
+            let cut = cut.min(typed.len());
+            let (out, detached) = feed_all(&[0x10, 0x11], &[&typed[..cut], &typed[cut..]]);
+            // A trailing ctrl-p is held back, waiting for its ctrl-q.
+            let expected = typed.strip_suffix(&[0x10]).unwrap_or(&typed);
+            prop_assert!(!detached);
+            prop_assert_eq!(out, expected.to_vec());
+        }
+
+        /// Over a small alphabet (so the keys repeat themselves), however
+        /// the typing is cut, the matcher does what the slow way does.
+        #[test]
+        fn the_matcher_finds_the_keys_wherever_they_are(
+            keys in proptest::collection::vec(0..3_u8, 1..=DetachKeys::MAX),
+            typed in proptest::collection::vec(0..3_u8, 0..60),
+            cut in 0..60_usize,
+        ) {
+            let cut = cut.min(typed.len());
+            prop_assert_eq!(
+                feed_all(&keys, &[&typed[..cut], &typed[cut..]]),
+                reference(&keys, &typed)
+            );
+        }
+    }
+}

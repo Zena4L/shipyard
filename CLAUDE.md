@@ -16,12 +16,19 @@ the previous one. Don't jump ahead or build later stages early.
 
 ## Repository map
 
-- `crates/shipyard-cli/`: the `shipyard` binary (clap, anyhow, tracing).
-- `crates/shipyard-runtime/`: low-level primitives (processes, namespaces, mounts, cgroups).
+- `crates/shipyard-cli/`: the `shipyard` and `shipyard-runtime` binaries (clap, anyhow,
+  tracing).
+- `crates/shipyard-runtime/`: low-level primitives (processes, namespaces, mounts, cgroups,
+  terminals); the OCI runtime's containers (`container/`: the per-container monitor,
+  logs, attach, `exec`'s joiner and `cp`'s helper as internal processes).
 - `crates/shipyard-image/`: images: the registry client, the content-addressed store, safe
   layer unpacking.
 - `crates/shipyard-network/`: networking: Shipyard's own netlink (rtnetlink, nf_tables,
   conntrack), networks and leases, pasta, the DNS server, reading a container's sockets.
+- `crates/shipyard-storage/`: named volumes.
+- `crates/shipyard-engine/`: the engine (H1): orchestration behind typed APIs that
+  return data, above the runtime (logs, attach, `cp`, streams). Only `shipyard-cli` may
+  depend on it (`deny.toml`).
 - `crates/shipyard-test-support/`: helpers for the end-to-end tests (running the binary,
   hostile parents, the pseudo-terminal harness). Dev-only, never published.
   Library errors use `thiserror`.
@@ -32,8 +39,10 @@ the previous one. Don't jump ahead or build later stages early.
   container via `scripts/test-linux.sh`, or the Lima VM).
 - `docs/stages/`: stage notes, the engineering record of each finished stage (decisions,
   failure modes, platform differences, items carried forward).
-- `scripts/`: developer scripts (`test-linux.sh`) and kernel probes (`probes/`) that check
-  the kernel behaviour a stage relies on.
+- `scripts/`: developer scripts (`test-linux.sh`, with `--conformance` for the OCI
+  conformance suite: `conformance/`, its image and `expected.txt`), CI's scripts (`ci/`:
+  the AppArmor control, the Fedora VM job) and kernel probes (`probes/`) that check the
+  kernel behaviour a stage relies on.
 - `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
   - `cli.md` is generated from the clap definitions; never edit it by hand.
   - Describe only what works in the current version.
@@ -99,7 +108,9 @@ supervises isolated commands must call `process::init_entry_point()` first thing
 `main`**; isolated runs are refused otherwise. A binary that creates containers with
 `container::create` (`shipyard-runtime`) must also call
 `container::monitor_entry_point()` there: the per-container monitor is the same
-binary, re-executed.
+binary, re-executed. One that copies files with the engine's `cp` must call
+`shipyard_engine::cp::helper_entry_point()` too: `cp`'s helper in the container is
+also the same binary.
 
 The terminal tests (`crates/shipyard-cli/tests/terminal.rs`, `harness = false`)
 fork a fake shell that keeps running Rust code, so that test binary must stay

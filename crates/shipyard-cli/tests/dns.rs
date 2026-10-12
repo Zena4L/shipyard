@@ -359,3 +359,118 @@ fn only_a_created_networks_containers_are_told_about_its_server() {
         );
     });
 }
+
+/// What `dig` (BIND's resolver library: another implementation of the
+/// protocol) makes of the server's answer to `NAME TYPE`, asked from
+/// `netns`: the status, whether it's authoritative, and the answers' data.
+fn dig(netns: &std::fs::File, server: Ipv4Addr, args: &[&str]) -> (String, bool, Vec<String>) {
+    let output = shipyard_test_support::net::in_netns(netns, || {
+        std::process::Command::new("dig")
+            .arg(format!("@{server}"))
+            .args(["+tries=1", "+time=2", "+noall", "+comments", "+answer"])
+            .args(args)
+            .output()
+    })
+    .expect("running dig");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    // What dig says when it can't parse a message.
+    for trouble in ["malformed", "bad packet", ";; WARNING", "FORMERR"] {
+        assert!(!text.contains(trouble), "dig {args:?}:\n{text}");
+    }
+    let status = text
+        .split("status: ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or_else(|| panic!("no status from dig {args:?}:\n{text}"))
+        .to_owned();
+    let authoritative = text
+        .lines()
+        .find_map(|line| line.strip_prefix(";; flags: "))
+        .is_some_and(|flags| {
+            flags
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .any(|flag| flag == "aa")
+        });
+    let answers = text
+        .lines()
+        .filter(|line| !line.starts_with(';') && !line.trim().is_empty())
+        .map(|line| {
+            line.split_whitespace()
+                .last()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    (status, authoritative, answers)
+}
+
+/// `dig` reads the server's answers as Shipyard means them (H5, H8): a
+/// container's name and alias, any case, authoritative; another type for
+/// it, empty but no error; its address's name; over TCP too; another name
+/// from upstream, not authoritative; a refusal from an internal network.
+#[test]
+#[ignore = "needs root"]
+fn dig_reads_the_servers_answers_as_meant() {
+    if !shipyard_test_support::reference_tool("dig") {
+        return;
+    }
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        let _world = FakeResolver::start(upstream.netns(), WORLD);
+        networks.create(&["app"]);
+        networks.create(&["--internal", "quiet"]);
+        let (db, _) = networks.sleeping(&[
+            "--network",
+            "app",
+            "--name",
+            "db",
+            "--network-alias",
+            "database",
+        ]);
+        let (client, netns) = networks.sleeping(&["--network", "app"]);
+        let server = networks.gateway("app");
+        let (db_ip, _) = container(&networks, "app", "db");
+        let db_ip = db_ip.to_string();
+        assert_eq!(
+            dig(&netns, server, &["db", "A"]),
+            ("NOERROR".to_owned(), true, vec![db_ip.clone()])
+        );
+        for args in [
+            &["DATABASE", "A"][..],
+            &["+tcp", "database", "A"],
+            &["db.", "A"],
+        ] {
+            assert_eq!(
+                dig(&netns, server, args),
+                ("NOERROR".to_owned(), true, vec![db_ip.clone()]),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            dig(&netns, server, &["db", "AAAA"]),
+            ("NOERROR".to_owned(), true, vec![])
+        );
+        let reverse = dig(&netns, server, &["-x", &db_ip]);
+        assert_eq!(
+            reverse,
+            ("NOERROR".to_owned(), true, vec!["db.".to_owned()])
+        );
+        let (status, authoritative, answers) = dig(&netns, server, &["example.com", "A"]);
+        assert_eq!(
+            (status.as_str(), authoritative, answers),
+            ("NOERROR", false, vec![WORLD.to_string()])
+        );
+
+        let (lonely, quiet_netns) = networks.sleeping(&["--network", "quiet", "--name", "lonely"]);
+        let quiet = networks.gateway("quiet");
+        let (status, _, answers) = dig(&quiet_netns, quiet, &["example.com", "A"]);
+        assert_eq!((status.as_str(), answers.len()), ("REFUSED", 0));
+        db.stop();
+        client.stop();
+        lonely.stop();
+    });
+}

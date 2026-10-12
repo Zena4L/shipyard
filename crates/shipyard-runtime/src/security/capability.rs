@@ -166,6 +166,17 @@ impl CapabilitySet {
         31, // CAP_SETFCAP
     ]);
 
+    /// A helper's (`cp`'s): reading and writing any file, and giving it
+    /// its owner and mode; nothing else.
+    #[cfg(target_os = "linux")]
+    pub(crate) const HELPER: Self = Self::of(&[
+        0, // CAP_CHOWN
+        1, // CAP_DAC_OVERRIDE
+        2, // CAP_DAC_READ_SEARCH
+        3, // CAP_FOWNER
+        4, // CAP_FSETID
+    ]);
+
     const fn of(numbers: &[u8]) -> Self {
         let mut bits = 0_u64;
         let mut i = 0;

@@ -30,6 +30,7 @@ libc.workspace = true
 nix = { workspace = true, features = ["poll", "user"] }
 serde.workspace = true
 serde_json.workspace = true
+shipyard-engine.workspace = true
 shipyard-image.workspace = true
 # Networks: their store, bridges and veth pairs, a run's /etc files.
 shipyard-network.workspace = true
@@ -40,13 +41,13 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 clap-markdown.workspace = true
-flate2.workspace = true
 libc.workspace = true
 # `hostname` for the isolation tests; `term` for the v0.1 milestone's
 # pseudo-terminal (tests/image.rs).
 nix = { workspace = true, features = ["hostname", "term"] }
 proptest.workspace = true
 shipyard-test-support.workspace = true
+# `cp`'s tar streams (tests/runtime.rs).
 tar.workspace = true
 
 # Terminal (pseudo-terminal) tests. Not on libtest: the harness forks a fake

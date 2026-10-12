@@ -711,6 +711,25 @@ impl TestUser {
                 .iter()
                 .find_map(|child| walk(child, uid, depth - 1))
         }
-        walk(Path::new("/sys/fs/cgroup"), self.uid, 4)
+        let found = walk(Path::new("/sys/fs/cgroup"), self.uid, 4)?;
+        // One with controllers on for its children can hold no process
+        // (cgroup v2's no-internal-processes rule: EBUSY), as a systemd
+        // host's user slices: a leaf of the tests' own under it, the user's.
+        let busy = std::fs::read_to_string(found.join("cgroup.subtree_control"))
+            .is_ok_and(|controllers| !controllers.trim().is_empty());
+        if !busy {
+            return Some(found);
+        }
+        let leaf = found.join("shipyard-tests");
+        let _ = std::fs::create_dir(&leaf);
+        for file in [
+            "",
+            "cgroup.procs",
+            "cgroup.subtree_control",
+            "cgroup.threads",
+        ] {
+            std::os::unix::fs::chown(leaf.join(file), Some(self.uid), Some(self.gid)).ok()?;
+        }
+        Some(leaf)
     }
 }

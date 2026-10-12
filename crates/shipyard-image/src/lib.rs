@@ -52,8 +52,8 @@ pub use store::{
     map_id,
 };
 pub use unpack::{
-    IdRanges, LayerReport, LayerSpec, Limits, Ownership, Shift, UnpackError, UnpackOptions,
-    unpack_layer,
+    CopyOptions, IdRanges, LayerReport, LayerSpec, Limits, Ownership, Shift, Top, UnpackError,
+    UnpackOptions, unpack_layer, unpack_tar,
 };
 
 /// Entry points for the fuzz targets (`fuzz/`) into what isn't public: built

@@ -493,8 +493,14 @@ pub struct Root {
     pub masked_paths: Vec<PathBuf>,
     /// Paths inside the container made read-only. Missing ones are skipped.
     pub readonly_paths: Vec<PathBuf>,
-    /// More mounts, in order, after `/proc`, `/sys` and `/dev`.
+    /// More mounts, in order.
     pub mounts: Vec<Mount>,
+    /// Where the standard mounts go among [`mounts`](Self::mounts), as an
+    /// OCI config lists them: each just before `mounts[index]` (or after
+    /// them all, at their length), in this order. Those not listed come
+    /// first, in [`StandardMount::ORDER`]; one below a listed one
+    /// (`/dev/pts` below `/dev`) right after it. Empty: all first.
+    pub standard_at: Vec<(StandardMount, usize)>,
     /// If set, the root is an overlay of an image's layers: mounted at
     /// [`path`](Self::path) *inside the container's namespaces*, where the
     /// kernel permits it (rootless overlay needs the container's user
@@ -594,6 +600,74 @@ pub enum MountKind {
     Tmpfs,
 }
 
+/// A mount Shipyard makes in every container itself, with its own options
+/// (`rootfs.rs`): a config that lists one only says where it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum StandardMount {
+    /// `/proc`.
+    Proc,
+    /// `/sys`, read-only.
+    Sys,
+    /// The container's own cgroup at `/sys/fs/cgroup`, where asked for.
+    Cgroup,
+    /// `/dev`, a tmpfs with the device nodes and links in it.
+    Dev,
+    /// `/dev/pts`, the container's own terminals.
+    Devpts,
+    /// `/dev/shm`.
+    Shm,
+    /// `/dev/mqueue`, with an `ipc` namespace of the container's own.
+    Mqueue,
+}
+
+impl StandardMount {
+    /// Their order when nothing says otherwise: each after the one it's
+    /// mounted in.
+    pub const ORDER: [Self; 7] = [
+        Self::Proc,
+        Self::Sys,
+        Self::Cgroup,
+        Self::Dev,
+        Self::Devpts,
+        Self::Shm,
+        Self::Mqueue,
+    ];
+
+    /// Where it's mounted.
+    #[must_use]
+    pub fn destination(self) -> &'static str {
+        match self {
+            Self::Proc => "/proc",
+            Self::Sys => "/sys",
+            Self::Cgroup => "/sys/fs/cgroup",
+            Self::Dev => "/dev",
+            Self::Devpts => "/dev/pts",
+            Self::Shm => "/dev/shm",
+            Self::Mqueue => "/dev/mqueue",
+        }
+    }
+
+    /// The standard mount it's made in, which must come first.
+    #[must_use]
+    pub fn parent(self) -> Option<Self> {
+        match self {
+            Self::Cgroup => Some(Self::Sys),
+            Self::Devpts | Self::Shm | Self::Mqueue => Some(Self::Dev),
+            Self::Proc | Self::Sys | Self::Dev => None,
+        }
+    }
+}
+
+/// One step of making a root's mounts, in order (see [`Root::mount_order`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MountStep {
+    /// A standard mount.
+    Standard(StandardMount),
+    /// `mounts[index]`.
+    Mount(usize),
+}
+
 /// A restriction on a [`Mount`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -679,6 +753,101 @@ impl Mount {
 }
 
 impl Root {
+    /// Every mount, in the order made: the standard ones not listed in
+    /// [`standard_at`](Self::standard_at) first (or, below a listed one,
+    /// right after it), then the listed ones and [`mounts`](Self::mounts) in
+    /// their order.
+    pub(crate) fn mount_order(&self) -> Vec<MountStep> {
+        let listed = |kind: StandardMount| self.standard_at.iter().any(|&(at, _)| at == kind);
+        let missing: Vec<StandardMount> = StandardMount::ORDER
+            .into_iter()
+            .filter(|&kind| !listed(kind))
+            .collect();
+        let mut steps: Vec<MountStep> = missing
+            .iter()
+            .filter(|kind| !kind.parent().is_some_and(listed))
+            .map(|&kind| MountStep::Standard(kind))
+            .collect();
+        for index in 0..=self.mounts.len() {
+            for &(kind, _) in self.standard_at.iter().filter(|&&(_, at)| at == index) {
+                steps.push(MountStep::Standard(kind));
+                steps.extend(
+                    missing
+                        .iter()
+                        .filter(|child| child.parent() == Some(kind))
+                        .map(|&child| MountStep::Standard(child)),
+                );
+            }
+            if index < self.mounts.len() {
+                steps.push(MountStep::Mount(index));
+            }
+        }
+        steps
+    }
+
+    /// Rejects an order that can't work: a mount below a standard one made
+    /// after it (`/dev`'s tmpfs, or `/dev/shm`'s, would hide it), a standard
+    /// one before the one it's in (`/sys/fs/cgroup` before `/sys`), or one
+    /// listed twice.
+    ///
+    /// # Errors
+    ///
+    /// [`IsolationError::MountOrder`], saying what to move.
+    pub fn check_mount_order(&self) -> Result<(), IsolationError> {
+        for (index, &(kind, at)) in self.standard_at.iter().enumerate() {
+            if at > self.mounts.len() {
+                return Err(IsolationError::MountOrder(format!(
+                    "{} is placed after the last mount",
+                    kind.destination()
+                )));
+            }
+            if self
+                .standard_at
+                .iter()
+                .take(index)
+                .any(|&(other, _)| other == kind)
+            {
+                return Err(IsolationError::MountOrder(format!(
+                    "{} is listed twice",
+                    kind.destination()
+                )));
+            }
+        }
+        let mut made = Vec::new();
+        for step in self.mount_order() {
+            match step {
+                MountStep::Standard(kind) => {
+                    if let Some(parent) = kind.parent()
+                        && !made.contains(&parent)
+                    {
+                        return Err(IsolationError::MountOrder(format!(
+                            "{} is listed before {}, which it's mounted in: list it after",
+                            kind.destination(),
+                            parent.destination()
+                        )));
+                    }
+                    made.push(kind);
+                }
+                MountStep::Mount(index) => {
+                    let Some(mount) = self.mounts.get(index) else {
+                        continue;
+                    };
+                    if let Some(over) = StandardMount::ORDER.into_iter().find(|standard| {
+                        mount.destination.starts_with(standard.destination())
+                            && !made.contains(standard)
+                    }) {
+                        return Err(IsolationError::MountOrder(format!(
+                            "{} is listed before {}, which would hide it: list it after",
+                            mount.destination.display(),
+                            over.destination()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `path` as the root, writable, with the default masked and read-only
     /// paths ([`DEFAULT_MASKED_PATHS`], [`DEFAULT_READONLY_PATHS`]).
     #[must_use]
@@ -689,6 +858,7 @@ impl Root {
             masked_paths: DEFAULT_MASKED_PATHS.map(PathBuf::from).to_vec(),
             readonly_paths: DEFAULT_READONLY_PATHS.map(PathBuf::from).to_vec(),
             mounts: Vec::new(),
+            standard_at: Vec::new(),
             overlay: None,
         }
     }
@@ -712,7 +882,8 @@ impl Root {
         if let Some(overlay) = &self.overlay {
             overlay.validate()?;
         }
-        self.mounts.iter().try_for_each(Mount::validate)
+        self.mounts.iter().try_for_each(Mount::validate)?;
+        self.check_mount_order()
     }
 }
 
@@ -732,7 +903,8 @@ fn is_plain_absolute(path: &Path) -> bool {
             .any(|part| part == b".")
 }
 
-/// Which running process's namespaces a command joins, and which of them.
+/// Which running process's namespaces a command joins, which of them, and
+/// how the command is confined there (`exec`).
 ///
 /// The target is normally a container's init (PID 1 inside, seen from the
 /// host). Start from [`Join::standard`]: like [`Isolation`], it will gain
@@ -743,17 +915,40 @@ pub struct Join {
     /// The process whose namespaces to join, by its PID as shipyard sees it
     /// (in shipyard's own PID namespace; on a plain host, the host's PID).
     pub target: u32,
-    /// The namespaces to join. Each kind at most once.
+    /// The namespaces to join. Each kind at most once. A user namespace is
+    /// joined first, the mount namespace last.
     pub namespaces: Vec<Namespace>,
+    /// The target's start time (`/proc/PID/stat` field 22), if known: a
+    /// process with its PID that started at another time isn't joined.
+    pub start_time: Option<u64>,
+    /// The command's capabilities, `no_new_privs` and seccomp filter: the
+    /// container's (default: [`Security::standard`](crate::security::Security::standard),
+    /// Docker's).
+    pub security: crate::security::Security,
+    /// The cgroup it's started in (`clone3`'s `CLONE_INTO_CGROUP`): the
+    /// container's, if it has one (Linux).
+    #[cfg(target_os = "linux")]
+    pub cgroup: Option<crate::cgroup::Cgroup>,
+    /// The cgroup's inode, as recorded when it was made: the directory
+    /// opened for the clone must be that one (not one made in its place).
+    #[cfg(target_os = "linux")]
+    pub cgroup_inode: Option<u64>,
 }
 
 impl Join {
-    /// Joins every namespace a [standard](Isolation::standard) container has.
+    /// Joins every namespace a [standard](Isolation::standard) container has,
+    /// confined as Docker's defaults say, in no cgroup.
     #[must_use]
     pub fn standard(target: u32) -> Self {
         Self {
             target,
             namespaces: Isolation::standard().namespaces,
+            start_time: None,
+            security: crate::security::Security::standard(),
+            #[cfg(target_os = "linux")]
+            cgroup: None,
+            #[cfg(target_os = "linux")]
+            cgroup_inode: None,
         }
     }
 
@@ -779,9 +974,6 @@ impl Join {
             return Err(IsolationError::NothingToJoin);
         }
         check_kinds(&self.namespaces)?;
-        if self.has(Namespace::User) {
-            return Err(IsolationError::JoinUser);
-        }
         // In the container's PID namespace but with the host's /proc, the
         // process would see the wrong processes: `ps`, `kill $(pidof …)` and
         // `/proc/self` would all mislead it.
@@ -1000,6 +1192,9 @@ pub enum IsolationError {
         /// What's wrong with it.
         reason: &'static str,
     },
+    /// Mounts in an order that can't work (see [`Root::check_mount_order`]).
+    #[error("mounts: {0}")]
+    MountOrder(String),
     /// A domain name was given, but no UTS namespace to set it in.
     #[error("setting the domain name needs a UTS namespace")]
     DomainnameNeedsUts,
@@ -1063,9 +1258,6 @@ pub enum IsolationError {
     /// ID maps the kernel would refuse.
     #[error(transparent)]
     IdMap(#[from] IdMapError),
-    /// A [`Join`] of a user namespace.
-    #[error("joining a user namespace isn't supported yet (it comes with exec)")]
-    JoinUser,
     /// The hostname isn't valid.
     #[error("invalid hostname \"{hostname}\": {reason}")]
     InvalidHostname {
@@ -1492,8 +1684,8 @@ mod tests {
     fn joins_are_checked_like_isolations() {
         assert_eq!(Join::standard(42).validate(), Ok(()));
         let join = |namespaces: Vec<Namespace>| Join {
-            target: 42,
             namespaces,
+            ..Join::standard(42)
         };
         assert_eq!(
             join(Vec::new()).validate(),
@@ -1515,7 +1707,7 @@ mod tests {
         assert_eq!(join(vec![Namespace::Uts]).validate(), Ok(()));
         assert_eq!(
             join(vec![Namespace::User, Namespace::Uts]).validate(),
-            Err(IsolationError::JoinUser)
+            Ok(())
         );
     }
 
@@ -1647,6 +1839,129 @@ mod tests {
             for b in &flags[i + 1..] {
                 assert_eq!(a & b, 0, "{a:#x} and {b:#x} overlap");
             }
+        }
+    }
+
+    mod mount_order {
+        use super::*;
+
+        fn root(standard_at: &[(StandardMount, usize)], mounts: &[&str]) -> Root {
+            let mut root = Root::new("/r");
+            root.mounts = mounts.iter().map(|&path| Mount::tmpfs(path)).collect();
+            root.standard_at = standard_at.to_vec();
+            root
+        }
+
+        use MountStep::{Mount as M, Standard as S};
+        use StandardMount::{Cgroup, Dev, Devpts, Mqueue, Proc, Shm, Sys};
+
+        #[test]
+        fn nothing_listed_is_the_standard_order_first() {
+            assert_eq!(
+                root(&[], &["/mnt"]).mount_order(),
+                [
+                    S(Proc),
+                    S(Sys),
+                    S(Cgroup),
+                    S(Dev),
+                    S(Devpts),
+                    S(Shm),
+                    S(Mqueue),
+                    M(0)
+                ]
+            );
+        }
+
+        #[test]
+        fn a_configs_order_is_kept() {
+            // runtime-tools' default config, with a bind after /dev/mqueue.
+            let listed = [
+                (Proc, 0),
+                (Dev, 0),
+                (Devpts, 0),
+                (Shm, 0),
+                (Mqueue, 0),
+                (Sys, 1),
+            ];
+            let root = root(&listed, &["/mnt"]);
+            assert_eq!(
+                root.mount_order(),
+                // The cgroup isn't listed: right after /sys.
+                [
+                    S(Proc),
+                    S(Dev),
+                    S(Devpts),
+                    S(Shm),
+                    S(Mqueue),
+                    M(0),
+                    S(Sys),
+                    S(Cgroup)
+                ]
+            );
+            assert!(root.check_mount_order().is_ok());
+        }
+
+        #[test]
+        fn what_isnt_listed_follows_its_parent() {
+            // Only /dev listed, late: its /dev/pts, /dev/shm and /dev/mqueue
+            // must come after it, not first (its tmpfs would hide them).
+            let root = root(&[(Dev, 1)], &["/a"]);
+            assert_eq!(
+                root.mount_order(),
+                [
+                    S(Proc),
+                    S(Sys),
+                    S(Cgroup),
+                    M(0),
+                    S(Dev),
+                    S(Devpts),
+                    S(Shm),
+                    S(Mqueue)
+                ]
+            );
+            assert!(root.check_mount_order().is_ok());
+        }
+
+        #[test]
+        fn an_order_that_hides_a_mount_is_refused() {
+            let hidden = root(&[(Dev, 1)], &["/dev/foo"]);
+            assert!(matches!(
+                hidden.check_mount_order(),
+                Err(IsolationError::MountOrder(why)) if why.contains("/dev/foo is listed before /dev,")
+            ));
+            // Below a mount in /dev, listed before it (after /dev): hidden
+            // by its own file system.
+            let shm = root(&[(Dev, 0), (Shm, 1)], &["/dev/shm/x"]);
+            assert!(matches!(
+                shm.check_mount_order(),
+                Err(IsolationError::MountOrder(why)) if why.contains("/dev/shm/x is listed before /dev/shm,")
+            ));
+            // Not one that only shares the start of its name.
+            assert!(
+                root(&[(Dev, 0), (Shm, 1)], &["/dev/shmem"])
+                    .check_mount_order()
+                    .is_ok()
+            );
+            let orphan = root(&[(Devpts, 0), (Dev, 0)], &[]);
+            assert!(matches!(
+                orphan.check_mount_order(),
+                Err(IsolationError::MountOrder(why)) if why.contains("/dev/pts is listed before /dev")
+            ));
+            let cgroup = root(&[(Cgroup, 0), (Sys, 0)], &[]);
+            assert!(cgroup.check_mount_order().is_err());
+            let twice = root(&[(Proc, 0), (Proc, 0)], &[]);
+            assert!(twice.check_mount_order().is_err());
+            let beyond = root(&[(Proc, 2)], &[]);
+            assert!(beyond.check_mount_order().is_err());
+            // A mount below /dev after it is fine; so is one with /dev unlisted
+            // (first).
+            assert!(root(&[(Dev, 0)], &["/dev/foo"]).check_mount_order().is_ok());
+            assert!(root(&[], &["/dev/foo"]).check_mount_order().is_ok());
+            // And validation refuses it too.
+            assert!(matches!(
+                hidden.validate(),
+                Err(IsolationError::MountOrder(_))
+            ));
         }
     }
 }

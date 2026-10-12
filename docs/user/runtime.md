@@ -18,6 +18,19 @@ for what its `config.json` may contain. What the bundle asks
 for that is ignored is said on stderr (`shipyard-runtime: warning: …`) and in the
 `--log`. It needs Linux: on macOS, `shipyard-runtime` says so and exits.
 
+**Conformance.** The OCI runtime conformance suite
+([runtime-tools](https://github.com/opencontainers/runtime-tools)) is part of
+`shipyard-runtime`'s tests. Each of its tests passes, or fails for a stated reason:
+- a field Shipyard refuses rather than half-applies (see
+  [What's refused](bundles.md#whats-refused));
+- runc's behaviour where the suite expects otherwise;
+- a bug in the test itself;
+- or a known gap still to fix.
+
+A few aren't run: the cgroup tests read cgroup v1 only (Shipyard is cgroup v2), and
+some hang or race in the suite itself. The list, test by test, is
+[`scripts/conformance/expected.txt`](https://github.com/Zena4L/shipyard/blob/main/scripts/conformance/expected.txt).
+
 **Without root, containers are rootless**, as with `shipyard run`: the bundle runs in
 a user namespace (added if it has none, with a warning). See
 [Rootless bundles](bundles.md#rootless-bundles).
@@ -54,7 +67,11 @@ in the container.
 
 | Command | What it does |
 |---|---|
-| `create [--bundle DIR] [--pid-file FILE] ID` | Sets the container up from the bundle in DIR (default: the current directory) and stops just before its program runs. Returns once it's *created*. `--pid-file` writes the PID of its init (its PID 1, as seen from the host); if it can't be written, `create` fails and the container is removed. |
+| `create [--bundle DIR] [--pid-file FILE] [--console-socket SOCKET] [--log-dir DIR [--log-max-size SIZE] [--log-max-files N] [--stdin [--stdin-once]]] [--preserve-fds N] ID` | Sets the container up from the bundle in DIR (default: the current directory) and stops just before its program runs. Returns once it's *created*. `--pid-file` writes the PID of its init (its PID 1, as seen from the host); if it can't be written, `create` fails and the container is removed. `--console-socket`: see [Terminals](#terminals); `--log-dir`: see [Logs](#logs). |
+| `logs [--follow] [--tail N] [--since TIME] [--timestamps] ID` | Prints a container's logs (one created with `--log-dir`; see [Logs](#logs)). |
+| `attach [--detach-keys KEYS] [--no-stdin] ID` | Attaches to a container created with `--log-dir`: its output from now on, and your typing (see [Attach](#attach)). |
+| `exec [-d] [-t] [--console-socket SOCK] [-p FILE] [--cwd DIR] [-e K=V]… [-u UID[:GID]] [-g GID]… [-c CAP]… [--no-new-privs] [--pid-file FILE] ID [COMMAND…]` | Runs a command inside a *created* or *running* container, confined as its own process is (see [Exec](#exec)). |
+| `cp [-a] [-L] SRC DEST` | Copies files into or out of a *created*, *running* or *paused* container: `ID:PATH` on one side, a host path or `-` (a tar stream) on the other (see [Copying files](#copying-files)). |
 | `start ID` | Lets a *created* container's program run. |
 | `state ID` | Prints the container's state as JSON (below). |
 | `kill [--all] ID [SIGNAL]` | Sends a signal (default `TERM`; a name like `KILL` or `SIGKILL`, or a number) to a *created*, *running* or *paused* container: to its init, which passes it on to the program, or with `--all` (`-a`) to every process in its cgroup. Not `STOP` (see below). |
@@ -75,7 +92,8 @@ guess a place. So `sudo shipyard-runtime …` and
 container with ID …" from the other). `--log FILE` and `--log-format text|json` also
 write errors and warnings to FILE, as `runc`'s callers expect.
 
-A command that fails prints `shipyard-runtime: …` and exits with code 1. A command
+A command that fails prints `shipyard-runtime: …` and exits with code 1 (`exec` and
+`attach`: with 255, see [Exec](#exec) and [Attach](#attach)). A command
 line it can't parse (an unknown option, a missing ID, a signal it doesn't know)
 prints `error: …` and the usage, and exits with code 2, before anything is logged.
 
@@ -112,21 +130,26 @@ Shipyard has no daemon. `create` starts a small **monitor** process for the cont
 - **It stays the container's parent** after `create` returns.
 - **It records how the container ended,** for `state`.
 - **It takes the container down with it if it's killed.** So don't kill a monitor
-  unless you mean to stop its container.
+  unless you mean to stop its container. (A process that escaped the container's
+  init, in a bundle without a `pid` namespace, lives on; with logs, its next write
+  fails with a broken pipe, as nothing reads its output any more.)
+- **With `--log-dir`, it keeps the container's output** in logs (see [Logs](#logs)).
 - **It runs in a session of its own:** closing the terminal `create` ran in doesn't
   affect it, and neither does a Ctrl-C meant for `create`.
 - **It keeps nothing else of `create`'s:** files or pipes `create` was given (other
-  than its standard input, output and error) are closed. A program reading such a
+  than its standard input, output and error, and those passed on with
+  `--preserve-fds` or socket activation: see
+  [Passing descriptors](#passing-descriptors)) are closed. A program reading such a
   pipe sees its end when `create` exits.
 
-The container's **standard input, output and error are `create`'s**. Redirect them
-when you create it:
+The container's **standard input, output and error are `create`'s** (unless its
+output goes into logs: see [Logs](#logs)). Redirect them when you create it:
 
 ```sh
 shipyard-runtime create --bundle ./mybundle web > web.log 2>&1
 ```
 
-**Created from a terminal, a container keeps that terminal.** Its program writes to
+**Created from a terminal, a container keeps that terminal** (without `--log-dir`). Its program writes to
 it, and reads from it, after `create` and `start` have returned and your shell has the
 terminal back: you and the container then take turns at the keys you type. Redirect
 its input too (`< /dev/null`) unless it should read the terminal.
@@ -138,7 +161,10 @@ makes `create` fail, and leaves nothing behind.
 **A bundle's hooks run at their phases** (see [Hooks](bundles.md#hooks)):
 `prestart`, `createRuntime` and `createContainer` during `create`, before it returns;
 `startContainer` in the container once `start` lets it go; `poststart` from `start`,
-after that; `poststop` from `delete`, once the container is gone (and from a `create`
+once the program has started (after the `startContainer` hooks: `start` waits for the
+program's `execve`, up to 5 seconds plus those hooks' timeouts, then runs them anyway
+with a warning; a `startContainer` hook without a timeout can make it run them before
+the program starts); `poststop` from `delete`, once the container is gone (and from a `create`
 that fails). They're the ones `create` read: changing the bundle afterwards changes
 nothing. A failing `poststart` or `poststop` hook is a warning
 (`shipyard-runtime: warning: the poststart hook …`), and the command still succeeds.
@@ -157,15 +183,413 @@ before `poststop` runs.
 be found then, for example, writes `shipyard: … command not found` there, and the
 container stops with exit code 127.
 
+## Terminals
+
+A bundle that asks for a terminal (`process.terminal: true`, as every config `runc spec`
+writes does) gets one the way `runc` gives it, which is what containerd's and Podman's
+shims expect (or, with `--log-dir`, its terminal's output goes into the logs: see
+[Logs](#logs)):
+
+```sh
+shipyard-runtime create --bundle ./mybundle --console-socket /run/my-shim/console.sock web
+```
+
+- **You listen on a UNIX socket** and name it with `--console-socket`.
+  `shipyard-runtime` connects to it, as you.
+- **The container's terminal is made inside it,** from its own `/dev/pts`, during
+  `create`.
+- **Its master is sent to the socket** as a passed file descriptor (`SCM_RIGHTS`),
+  with a name as the message's bytes (`/dev/ptmx`; `runc` sends the path it opened,
+  which receivers may use as the file's name and otherwise ignore). Nothing is
+  awaited back; the connection is closed once it's sent. Whatever is written to the
+  master is typed into the container, and its output comes out of it. Resize it
+  with `TIOCSWINSZ`.
+- **The terminal is the program's standard input, output and error,** and its
+  controlling terminal, from `start`. `create`'s own standard input, output and
+  error aren't the container's: they reach their end when `create` returns. A
+  failure after `start` (a program that can't be executed, say) is explained on the
+  terminal.
+- **Its size** is `process.consoleSize` (`height` rows, `width` columns), or 24 by
+  80 without one (`runc` leaves it 0 by 0, which full-screen programs can't draw
+  in).
+
+A socket path longer than a socket address can hold (108 bytes) works too: it's
+reached through its directory.
+
+These are refused, before anything is made:
+
+- a bundle that asks for a terminal, without `--console-socket` or `--log-dir`
+  ("there's no console socket to send it to");
+- `--console-socket` with `--log-dir` ("a console socket and a log directory both");
+- `--console-socket` for a bundle that asks for none ("the bundle asks for no
+  terminal");
+- a `--console-socket` path that isn't a socket ("not a socket"), or that nothing
+  listens on.
+
+## Logs
+
+Instead of `create`'s own standard output and error, a container's output can be kept
+in logs, which `logs` reads back:
+
+```sh
+shipyard-runtime create --bundle ./mybundle --log-dir /var/lib/myengine/web-logs web
+shipyard-runtime start web
+shipyard-runtime logs --follow web
+```
+
+- **`--log-dir DIR` turns it on.** `create` makes DIR, so it must not exist yet (its
+  parent must): no two containers ever share one, and nothing else can be in it. It's
+  yours alone (mode 0700, its files 0600). **The logs outlive the container:** `delete`
+  leaves them, and `logs --log-dir DIR` reads them after it. Removing them is yours to
+  do. Keep DIR where the container can't reach it (not inside its root filesystem or
+  its mounts).
+- **What the container gets:** its standard output and error go to the logs, not to
+  `create`'s, which reach their end when `create` returns. Its standard input is
+  empty (`/dev/null`), unless `--stdin` keeps it open for `attach` (see
+  [Attach](#attach)). A bundle that asks for a terminal needs no console socket: the
+  terminal's output goes into the logs, as its standard output (with the terminal's
+  `\r` before each newline). `--console-socket` and `--log-dir` can't go together.
+- **Rotation:** at most `--log-max-files N` files (default 5, from 2 to 100), each of at
+  most `--log-max-size SIZE` (default `10m`, from `64k` to `1g`), plus one line: at
+  most about 50 MiB per container by default. The oldest goes first.
+- **The files** are `container.log` (the newest) and `container.log.1` …
+  `container.log.N-1` (older and older), in the CRI format Kubernetes uses (as
+  containerd and Podman write it), which `crictl`, fluent-bit's `cri` parser and the
+  like read as they are. Each line is `TIME STREAM TAG TEXT`:
+
+  ```text
+  2026-10-10T06:16:19.123456789Z stdout F hello
+  2026-10-10T06:16:19.123500000Z stderr P a line longer than 16 KiB is cut,
+  ```
+
+  `TIME` is when Shipyard read it (UTC, nanoseconds), `STREAM` `stdout` or `stderr`,
+  `TAG` `F` for a line's end or `P` for part of one (a line longer than 16 KiB, or one
+  the program hasn't ended for a second, a prompt say). Beside them, `log.json` says
+  the format, its version and the rotation; a Shipyard that doesn't know the version
+  refuses to read them rather than misread them.
+- **`logs ID`** prints the container's output: what it wrote on stdout to stdout, on
+  stderr to stderr, lines cut into parts joined again.
+  - `--follow` (`-f`) goes on printing as more comes (parts of lines too, as they're
+    written), across rotations, and ends once the container has ended and everything
+    it wrote is printed.
+  - `--tail N`: only the last N lines.
+  - `--since TIME`: only lines from TIME on, RFC 3339 (`2026-10-10T06:16:19Z`) or a
+    duration ago (`10m`, `2h`, `30s`).
+  - `--timestamps` (`-t`): each line starts with its time.
+  - `--log-dir DIR` instead of an ID reads the logs in DIR (a container deleted since);
+    `--follow` then goes on until interrupted. It needs no state root.
+
+  `--follow` looks for more five times a second: output that rotates through every
+  file in between (more than the files hold, written in under a fifth of a second) is
+  gone before it's read, as with any follower; the rest is printed in order. Give
+  the logs more room (`--log-max-size`, `--log-max-files`) for a container that
+  writes that fast.
+
+  `--follow` also ends if the monitor has died (nothing more can come), or if the ID
+  now names another container (deleted and created again, even with the same
+  `--log-dir`). If `container.log` was deleted by hand, it waits for the new one the
+  next rotation makes. `logs | head` ends quietly when `head` has had enough.
+
+  `logs ID` reads only the directory the container was created with: one put at its
+  path since (the real one moved or deleted) is refused, saying it "isn't the log
+  directory its container was created with", rather than shown as the container's.
+
+  Times are the host's clock when each line was read: a clock set back meanwhile
+  makes later lines look older, and `--since` judges each line by its own time.
+
+  A line that isn't a record (torn by a crash, say) is skipped, with a warning saying
+  how many.
+- **What can be lost:** a line written while the disk is full (it's dropped, the files
+  are left as they are, and each stays whole; when a new file can't be made, the logs
+  go on in the one they have), and whatever is written after the monitor has died.
+  What was written before is there, whole. A file-size limit (`ulimit -f`) lower than
+  `--log-max-size` rotates early instead: the line goes into a new file.
+- **A `create` that fails** (its `--pid-file` included) removes the log directory it
+  made, unless something was written to it (a hook that failed, say): then it's kept,
+  and the error says where. Only that directory: one put at its path since is left
+  alone.
+
+## Attach
+
+A container created with `--log-dir` can be attached to: its output from the moment you
+attach (the past is in `logs`), and, if it takes input, your typing.
+
+```sh
+shipyard-runtime create --bundle ./mybundle --log-dir ./web-logs --stdin web
+shipyard-runtime start web
+shipyard-runtime attach web        # Ctrl-P Ctrl-Q to detach
+```
+
+- **`create --stdin`** keeps the container's standard input open (a pipe, or its
+  terminal) for attached clients to type into; without it, attach only shows output.
+  Several clients may type: what they type is interleaved. **Detaching leaves stdin
+  open**, so you can attach again; **`--stdin-once`** closes it when the first client
+  to type goes (it detaches, its input ends, or it's dropped), once what it typed has
+  been written, so the program sees the end of its input: `shipyard-runtime attach web <
+  input.txt` feeds a file through. A client that only watches (`--no-stdin`) doesn't
+  count. `--stdin-once` can't go with a terminal (closing a terminal is a hang-up, not
+  an end of input).
+- **A container with a terminal:** your terminal goes raw while attached (every key,
+  Ctrl-C included, goes to the container's terminal), is sized as your window and
+  follows it, and is put back as it was when you detach or the container ends. The
+  detach keys work one key at a time only there; with a container without a terminal,
+  your terminal sends what you type a line at a time, so the keys reach the container's
+  monitor when you press Enter (as with Docker). Its flow control is off while you're
+  attached (otherwise it would take Ctrl-Q for itself, and Ctrl-P Ctrl-Q could never
+  detach), and back on when attach ends, Ctrl-C included. Your terminal is put back
+  however attach ends, killed (`kill`, a hang-up) too; only `kill -9` can't be
+  caught.
+- **Detaching:** Ctrl-P Ctrl-Q, or the keys `--detach-keys` gives: `ctrl-` and a letter
+  or one of `@[\]^_`, or a character, separated by commas (`ctrl-a,d`); empty
+  (`--detach-keys ""`) turns detaching off. The keys never reach the container; keys
+  that start them and then don't are passed on.
+- **`attach` ends** with the container, with its exit code (128 plus the signal's
+  number, for one killed), even if it ended just as you attached; with 0 when you
+  detach; with **255** when attach itself fails (no such container, one that can't be
+  attached to, the monitor killed: the container goes with it), as `exec`'s own
+  failures. `attach ID | head` ends quietly.
+- **`--no-stdin`** only watches the output.
+- **Who may attach:** only the container's owner (or root). The socket (`attach.sock` in
+  the state directory) is the owner's alone, and the container's monitor checks who
+  connected (`SO_PEERCRED`) whatever the socket's mode.
+- **Limits:** at most 16 clients at once (a 17th is refused, saying so), and as many
+  connections waiting to be let in (one more is refused, saying so). A client that falls
+  more than 256 KiB behind the container's output (a slow link, a stopped `attach`, or a
+  terminal slower than a flood) is let go, told so, so that no client ever slows the
+  container. Typing beyond 64 KiB that the container hasn't read yet is dropped, so that
+  detaching always works: a container that reads slowly may lose some of a large file
+  piped into `attach`. A connection that doesn't say hello within 5 seconds is closed;
+  `attach` gives up if the monitor doesn't answer within 10 (it's still running the
+  container's setup hooks, say).
+- **Versions:** a newer `shipyard-runtime` attaches to a container an older one created
+  (they agree on the older protocol).
+
+## Exec
+
+`exec` runs a command inside a container that's *created* or *running*, as runc's
+does:
+
+```sh
+shipyard-runtime exec web ps        # in the container's namespaces and cgroup
+shipyard-runtime exec -d web sleep 1000
+shipyard-runtime exec --process process.json web
+```
+
+- **It joins everything the container has:** its user, PID, mount, UTS, IPC, network
+  and cgroup namespaces, and it starts in the container's cgroup, so the container's
+  limits, device rules, `pause` and `kill --all` cover it. It dies with the container.
+- **It's confined as the container's own process is:** the same capabilities,
+  `no_new_privs`, seccomp filter, limits, environment, working directory and user,
+  unless you change them. These come from the container's process as it was started
+  (`exec.json`, below), not from `config.json` again: editing the bundle afterwards
+  changes nothing.
+- **You can narrow it, never widen it.** `--env`, `--cwd`, `--user`,
+  `--additional-gids`, `--no-new-privs`, `--cap`, or a runc `process.json`
+  (`--process`) replace the container's values. But a capability outside the
+  container's bounding set, `noNewPrivileges` off when the container has it on, a
+  limit above the container's, or a lower OOM score adjustment is refused (the
+  container's are what its process really has, the limits it inherited included). A
+  `process.json` that lists some limits keeps the container's for the others. The
+  seccomp filter is always the container's. As with runc, `--cap` adds to the
+  bounding, effective and permitted sets; a user other than root keeps it across its
+  program's start only if the container's process has inheritable capabilities.
+- **Supplementary groups** (`--additional-gids`) are refused in a container whose user
+  namespace doesn't allow setting them (a rootless one with a single mapping).
+- **Users are numbers** (`--user 1000:1000`), as the container numbers them.
+- **Exit codes:** the command's own (128 plus the signal's number, for one killed);
+  **255** when `exec` itself fails (no such container, a refused option, a program
+  that isn't there), as runc. (A command that itself exits 255 looks the same.)
+  `--detach` (`-d`) returns 0 once the command runs and leaves it running: it keeps
+  `exec`'s standard input and output, files and pipes (with `-t`, its terminal
+  instead; give it others if nothing should wait for it), and whoever inherits it must
+  reap it (a shell or init does). `--pid-file` (with `-d`) names it.
+- **Never your terminal** (without `-t`): where `exec`'s standard input, output or
+  error is a terminal, the command gets a pipe that `exec` relays instead (`/dev/null`
+  with `-d`, where nothing relays), so nothing it leaves behind in the container can
+  keep your terminal, to read what you type to your shell later or change its
+  settings. Files and pipes are passed on as they are, as runc does. (runc passes a
+  terminal on too.) For a terminal, use `-t`. Started in the background (`exec … &`),
+  the command's stdin is `/dev/null`, so `exec` never stops to read your terminal; in
+  the foreground, what you type goes to the command a line at a time.
+- **Refused:** a *paused* container (the command would be frozen before it ran; `exec`
+  holds the container's lock until it runs, so a `pause` waits that long), a *stopped*
+  one, one whose cgroup isn't the one made for it, and one created by a Shipyard from
+  before `exec` (recreate it). A command stopped or frozen from inside the container
+  before it runs, or not running within 10 seconds, is killed: `exec` fails rather
+  than hold the container's lock.
+- **Rootless:** your containers' `exec` joins their user namespace (root inside is
+  you). Your login's cgroup must be delegated to you, as a desktop session's is: from
+  an SSH session it's refused, saying to run it as `systemd-run --user --scope
+  shipyard-runtime exec …`.
+- **Hidden until it runs:** until the command starts, nothing in the container can read
+  `exec`'s memory, its descriptors or its environment, nor trace it, and it holds no
+  descriptor of the host's but those passed on with `--preserve-fds` (CVE-2016-9962,
+  CVE-2024-21626). Its program is a sealed
+  copy of Shipyard's, not the file itself (CVE-2019-5736): on a host that won't make
+  or run one (`vm.memfd_noexec` at 2, or a security module's policy), it runs the file,
+  with a warning, only where nobody in the container could write it: on a read-only
+  mount, or with its owner not a user inside, no group that may write it a group inside
+  or one of yours (a rootless container with a single ID mapped keeps your groups), and
+  no write for others;
+  else `exec` is refused, saying it "needs a sealed copy of shipyard's binary". A
+  root container without a user namespace of its own (its root is host root) is
+  always refused there, and so is a rootless one when Shipyard is installed in your
+  home (it's yours, and root inside is you): install it where root owns it
+  (`/usr/local/bin`). A hard file-size limit (`ulimit -f`) smaller than Shipyard's
+  binary makes no copy either (as for `create`: see [Running commands](run.md)). A host
+  with `fs.suid_dumpable` set to 1 is refused (set it to 0 or 2).
+- **Into a *created* container:** what the command leaves behind is reaped only once
+  the container has started (its init waits at the gate until then).
+- **A terminal** (`-t`, or a `process.json` with `terminal: true`): one of the
+  command's own, made inside the container from its own `/dev/pts`, as runc does.
+  Without `--console-socket` it's relayed to `exec`'s own: your terminal goes raw (every
+  key, Ctrl-C included, reaches the command) and is put back after; the command's
+  terminal follows your window's size (else the `process.json`'s `consoleSize`, else
+  24x80). If `exec`'s input isn't a terminal, it's relayed as it is (a terminal never
+  sees an end of input there, as with runc: `exec -t ID cat < file` doesn't end by
+  itself). Started in the background (`exec -t … &`), it relays output only, so that
+  its command starts at once (it holds the container's lock until then). With
+  `--console-socket SOCK`, the terminal goes to that socket instead (runc's protocol:
+  the master, named `/dev/ptmx`, nothing answered), whose receiver holds it; `-d -t`
+  needs one, as runc does, and a console socket needs a terminal. A container that
+  replaced its `/dev/pts/ptmx` with anything but its devpts's own (a link, a file,
+  another device) gets no terminal: `exec` refuses, without opening it.
+- **Not yet:** user and group names.
+- **Descriptors:** `--preserve-fds N`, and socket activation (see
+  [Passing descriptors](#passing-descriptors)).
+
+## Passing descriptors
+
+A container's process gets only its standard input, output and error (or its
+terminal) of what its caller has open, unless the caller passes more on, as runc's
+callers do:
+
+```sh
+shipyard-runtime create --preserve-fds 2 web 3<config.json 4>>audit.log
+shipyard-runtime exec --preserve-fds 1 web ./reload 3<new.conf
+```
+
+- **`--preserve-fds N`** (`create` and `exec`) passes N more descriptors on, at the
+  same numbers: 3 to 3+N-1, or the N after socket activation's. Every one must be open, or the command is refused before
+  anything is made ("descriptor N isn't open"). At most 1024, and about half the
+  caller's soft descriptor limit (`ulimit -n`): raise it to pass more.
+- **Socket activation** (systemd's `sd_listen_fds`): when the caller's environment
+  has `LISTEN_FDS=n` and `LISTEN_PID` is the caller's own PID, descriptors 3 to
+  3+n-1 are passed on first (then `--preserve-fds`'s), and the container's process
+  gets `LISTEN_FDS=n`, `LISTEN_FDNAMES` (if set), and `LISTEN_PID` set to **its own
+  PID**, as `sd_listen_fds` expects. Its own `LISTEN_*` variables (the bundle's) are
+  replaced. A `LISTEN_PID` that isn't the caller's (inherited from a shell, say) is
+  ignored: nothing is passed. A bundle that says `LISTEN_FDS` itself, with its sockets
+  given by `--preserve-fds` (as Podman does it), gets its own PID as `LISTEN_PID` too,
+  in place of the bundle's.
+- **Only the container's process holds them** once it runs: `create`, the monitor
+  and the container's init close their copies (a socket the process closes is then
+  closed, unless something else holds it: a service manager keeps its own). Between
+  `create` and `start`, the init holds them. Hooks never get them.
+- **Under systemd,** `LISTEN_PID` names the unit's main process, so that must be the
+  runtime itself, not a shell around it:
+
+  ```ini
+  [Service]
+  Type=forking
+  PIDFile=/run/web.pid
+  ExecStart=/usr/local/bin/shipyard-runtime create --bundle /srv/web --pid-file /run/web.pid web
+  ExecStartPost=/usr/local/bin/shipyard-runtime start web
+  ExecStopPost=/usr/local/bin/shipyard-runtime delete --force web
+  ```
+
+  (`shipyard run` can be `ExecStart` itself: see [run](run.md).)
+
+## Copying files
+
+`cp` copies files into and out of a container that's *created*, *running* or *paused*,
+with Docker's forms:
+
+```sh
+shipyard-runtime cp web:/etc/nginx/nginx.conf .     # out
+shipyard-runtime cp ./site web:/usr/share/nginx/    # in: a directory, whole
+shipyard-runtime cp web:/var/log - | tar -t         # out, as a tar stream on stdout
+tar -c data | shipyard-runtime cp - web:/srv         # in, from a tar stream on stdin
+```
+
+- **Which side is which:** `ID:PATH` is the container's (its path from its root,
+  whether or not it starts with `/`); anything else is a host path, and `-` a tar
+  stream. A host path with a colon in it needs `./` or `/` in front (`./a:b`).
+- **Docker's path rules:**
+
+  | Source | Destination | Result |
+  |---|---|---|
+  | a file | doesn't exist | made, with the destination's name (its directory must exist; a destination ending in `/` must be an existing directory) |
+  | a file | a file | overwritten |
+  | a file | a directory | copied into it |
+  | a directory | doesn't exist | made, with the destination's name |
+  | a directory | a file | an error |
+  | a directory | a directory | copied into it; `SRC/.` copies what's in it instead |
+
+  A destination ending in `/.` is a directory, as one ending in `/`. A tar stream given
+  with `-` is extracted into the destination directory, as it is, and must end with
+  tar's end-of-archive marker (one cut off is refused, though what came before it
+  stays). Out to `-`, the stream holds the source under its own name (`cp web:/var/log
+  -`: `log/…`), and isn't written to a terminal. What's there already is replaced, a
+  directory merged; a directory never replaces a file, nor the other way round, and a
+  device, FIFO or socket is never replaced at all (`cp web:/f /dev/null` is refused,
+  where an unlink would replace the device with a file). A
+  destination that's a symlink is replaced by the copy, not followed (Docker follows
+  it). A copy that fails leaves what it copied so far, but not an empty directory it
+  made for it.
+- **Owners:** files copied in belong to the container's root, unless `--archive`
+  (`-a`) keeps their owners (an owner the container has no ID for becomes its root,
+  and the file loses its setuid and setgid bits). Files copied out belong to you,
+  without setuid or setgid bits; in a stream (`-`) they keep the container's owners and
+  modes.
+- **Links:** a symlink is copied as a symlink, unless it's the source itself and you
+  give `--follow-link` (`-L`), or the source ends with `/` or `/.`. Inside the
+  container, a link is resolved as the container sees it: `/data -> /etc` is the
+  container's `/etc`, never the host's, even if it's swapped while the copy runs
+  (CVE-2018-15664). Hard links within what's copied stay hard links.
+- **What isn't copied:** device nodes (in either direction: a warning says how many
+  were left out), sockets, extended attributes (so no file capabilities: but a `-`
+  stream's own `user.*` attributes and file capabilities are applied in the
+  container), and what's in the kernel's own filesystems (`/proc`, `/sys`, `/dev/pts`, cgroupfs and the like: a
+  directory there is copied empty). A FIFO is copied as a FIFO, never read. A file that
+  grows while it's copied is copied at the size it had. Nothing is ever written into
+  an existing file in place: a file is replaced by a new one, so writing into
+  `/proc/sys` is refused.
+- **Who does the work:** inside the container, a short-lived helper: Shipyard's own
+  binary (a sealed copy, as for [Exec](#exec)), never one of the container's
+  (CVE-2019-14271), joined to the container's user and mount namespaces, as root
+  there with only the capabilities that read and write files, `no_new_privs`, and
+  non-dumpable. It holds no descriptor of the host's but its standard streams, the
+  pipe it reports on, and its own `/proc/self/fd`, and dies with `cp`. It isn't in the
+  container's PID namespace or cgroup: nothing in a container with a PID namespace of
+  its own can see or signal it (one sharing the host's can signal it, so stop a copy,
+  never trace it), and a *paused* container can be copied. On the
+  host, `cp` only opens your paths, and extracts what comes out of the container with
+  the same safe extraction as an image's layers.
+- **Rootless:** the helper is root in your container's user namespace, so files owned
+  by your subordinate IDs, which you can't read from the host, are copied too.
+- **Refused:** a *stopped* container (its files go with it until stage 9's state
+  keeps them), one with no mount namespace of its own (its files are the host's), and
+  copying between two containers.
+- **Limits:** a directory of more than a million names, or a tree more than 256
+  directories deep, is refused; files that are mostly holes (sparse) are copied whole;
+  memory for what a copy keeps track of is capped at 1 GiB (some ten million entries).
+- **Not yet:** user names in `--archive` (owners are numbers), and copying from a
+  stopped container.
+
 ## The state directory
 
 Each container has a directory `ROOT/ID` (only its owner can read it):
 
 | File | What it is |
 |---|---|
-| `state.json` | The bundle, the init's PID, the annotations, the cgroup and the hooks. |
+| `state.json` | The bundle, the init's PID, the annotations, the cgroup, the hooks, and where the logs are (`--log-dir`). |
 | `exec.fifo` | Where `start` signals the waiting container; removed once started. |
+| `exec.started` | Made only for a bundle with `poststart` hooks: held open by the container until its command has started, so `start` runs them after that. |
 | `exit` | How the container ended, once it has. |
+| `killed` | Left by `kill` with SIGKILL, `kill --all` or `delete`: the container's end was theirs, not the out-of-memory killer's. |
+| `attach.sock` | Where `attach` connects (a container created with `--log-dir`). |
+| `exec.json` | The container's process as it was started: what `exec` starts from. |
 
 Commands on the same container take turns: each locks the directory while it reads
 and changes it. `create` holds the lock only while it fills the directory in, not while
@@ -200,8 +624,10 @@ most 255 characters.
 - **The commands that use the cgroup** (`pause`, `resume`, `update`, `ps`, `events`,
   `kill --all`) need the container to have one: where it has none (rootless without a
   delegated subtree, cgroup v1, a read-only tree), they're refused, saying so.
-- **`startContainer` hooks run after `start` returns,** in the container, before its
-  program: `poststart` may run while they still do. A failing `startContainer` hook
+- **`startContainer` hooks run after `start` lets the container go,** in the
+  container, before its program. With `poststart` hooks, `start` returns only once they
+  have run (it waits for the program to start); without, it may return while they still
+  run. A failing `startContainer` hook
   doesn't fail `start`; the container ends with exit code 125 instead, the hook's
   failure on its standard error. (`runc` runs them before `start` returns.)
   They run as the container's root with no capability but `CAP_KILL`, not as
@@ -216,7 +642,7 @@ most 255 characters.
   container shows in its exit record instead.
 - **A `pid` namespace is required** where the container can't have a cgroup, and
   rootless (see above).
-- **Not yet:**
-  - terminals (`--console-socket`);
-  - `exec`;
-  - `list` and `run`.
+- **`LISTEN_PID`** is the container's process's own PID, not runc's `1`: Shipyard's
+  init is PID 1 in the container, and `sd_listen_fds` compares `LISTEN_PID` with the
+  process's PID.
+- **Not yet:** `list` and `run`.

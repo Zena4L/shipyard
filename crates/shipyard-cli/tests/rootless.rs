@@ -58,9 +58,19 @@ fn me() -> (u32, u32) {
 /// This user's first subordinate uid, read from `/etc/subuid` here rather
 /// than through the runtime's parser: the test checks that parser's work.
 fn first_subordinate_uid() -> u32 {
+    first_subordinate("/etc/subuid")
+}
+
+/// This user's first subordinate gid (`/etc/subgid`: its range needn't
+/// start where the uids' does).
+fn first_subordinate_gid() -> u32 {
+    first_subordinate("/etc/subgid")
+}
+
+fn first_subordinate(file: &str) -> u32 {
     let name = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
     let uid = me().0.to_string();
-    std::fs::read_to_string("/etc/subuid")
+    std::fs::read_to_string(file)
         .unwrap()
         .lines()
         .find_map(|line| {
@@ -68,7 +78,7 @@ fn first_subordinate_uid() -> u32 {
             let owner = fields.next()?;
             (owner == name.trim() || owner == uid).then(|| fields.next()?.parse().ok())?
         })
-        .expect("a range in /etc/subuid")
+        .unwrap_or_else(|| panic!("a range in {file}"))
 }
 
 /// A world-writable directory, removed on drop.
@@ -188,6 +198,17 @@ fn in_a_namespace_denying_setgroups(map: &str, args: &[&str]) -> Run {
 #[test]
 fn an_inherited_setgroups_deny_is_respected() {
     if !rootless(Rootless::Single) {
+        return;
+    }
+    // The outer namespace is `unshare`'s, not Shipyard's: where AppArmor
+    // restricts user namespaces (Ubuntu's default), only Shipyard's own
+    // binaries are allowed them, and this can't be set up.
+    let unshare = Command::new("unshare")
+        .args(["--user", "--map-root-user", "true"])
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !unshare.is_ok_and(|status| status.success()) {
+        eprintln!("skipping: `unshare` can't map a user namespace here (AppArmor's restriction)");
         return;
     }
     // `--uidmap` too: a user namespace made inside inherits the denial, and
@@ -403,13 +424,26 @@ fn bundle_run(script: &str, change: impl FnOnce(&mut serde_json::Value)) -> Run 
 }
 
 /// Adds a user namespace and `uid`/`gid` mappings to a config.
+/// Gives the bundle a user namespace with the uid `mappings`, and the same
+/// for gids: the caller's uid is its gid there, and its first subordinate
+/// uid its first subordinate gid (a user's gid needn't be its uid, nor its
+/// ranges start together).
 fn with_mappings(config: &mut serde_json::Value, mappings: &serde_json::Value) {
     config["linux"]["namespaces"]
         .as_array_mut()
         .unwrap()
         .push(serde_json::json!({"type": "user"}));
     config["linux"]["uidMappings"] = mappings.clone();
-    config["linux"]["gidMappings"] = mappings.clone();
+    let mut gids = mappings.clone();
+    for mapping in gids.as_array_mut().unwrap() {
+        let host = mapping["hostID"].as_u64().unwrap();
+        if host == u64::from(me().0) {
+            mapping["hostID"] = me().1.into();
+        } else if host != 0 && host == u64::from(first_subordinate_uid()) {
+            mapping["hostID"] = first_subordinate_gid().into();
+        }
+    }
+    config["linux"]["gidMappings"] = gids;
 }
 
 /// A bundle without a user namespace gets one, rootless: root inside is you.
@@ -502,5 +536,136 @@ fn a_rootless_command_can_only_raise_its_oom_score() {
         lowered.stderr.contains("CAP_SYS_RESOURCE"),
         "{}",
         lowered.stderr
+    );
+}
+
+// --- Standard input and output (stage 8, step 8.2a) ---
+
+/// `shipyard run ARGS… sh -c SCRIPT`, with `input` on its stdin.
+fn run_fed(args: &[&str], script: &str, input: &[u8]) -> Run {
+    shipyard_test_support::run_with_input(
+        SHIPYARD.command(&[&["run"], args, &["sh", "-c", script]].concat()),
+        Some(input),
+    )
+}
+
+/// With `-i`, piped input reaches the command (as it is: a pipe can't be
+/// used against a terminal, so it isn't relayed).
+#[test]
+fn with_i_piped_input_reaches_the_command() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let run = run_fed(&["-i"], "cat", b"hello\n");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "hello\n");
+}
+
+/// Without `-i`, an isolated command's stdin is empty (D17, as Docker's):
+/// what was meant for something else isn't taken.
+#[test]
+fn without_i_stdin_is_empty() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let run = run_fed(&[], "read x; echo \"read $? [$x]\"", b"hello\n");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "read 1 []\n");
+}
+
+/// H7: on a terminal, relaying the command's output adds little to a run:
+/// an isolated `true` through `script` (a terminal), against the same run
+/// with its streams sent elsewhere (nothing relayed). The best of a few
+/// runs each, so a slow moment doesn't decide it.
+#[test]
+fn relaying_adds_little_to_a_run() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let args = shipyard_test_support::for_this_kernel(&["run", "--network", "none", "true"]);
+    let shipyard = format!("{} {}", SHIPYARD.path(), args.join(" "));
+    let best = |command: &str| {
+        (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let mut script = Command::new("script");
+                script.args(["-qec", command, "/dev/null"]);
+                let run = run(script);
+                assert_eq!(run.code, Some(0), "{command}: {}{}", run.stdout, run.stderr);
+                started.elapsed()
+            })
+            .min()
+            .expect("five runs")
+    };
+    let relayed = best(&shipyard);
+    let plain = best(&format!("{shipyard} </dev/null >/dev/null 2>&1"));
+    assert!(
+        relayed < plain + std::time::Duration::from_millis(100),
+        "relayed {relayed:?}, plain {plain:?}"
+    );
+}
+
+/// `-t` alone, with input and output piped (Docker allows it): the command
+/// still gets a terminal of its own, sized 24 by 80 since there's no
+/// terminal to copy (a new one would be 0 by 0), its output relayed.
+#[test]
+fn t_alone_with_piped_input_gives_a_terminal() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let run = run_fed(&["-t"], "tty; stty size", b"");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "/dev/pts/0\r\n24 80\r\n");
+}
+
+/// `shipyard run -t … >> file` appends: the relay writes through the file
+/// as it was opened, not one opened again (at offset 0, without
+/// `O_APPEND`), and the init's messages and the terminal's output share it.
+#[test]
+fn t_appends_to_its_output_file() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("shipyard-t-append-{}", std::process::id()));
+    std::fs::write(&path, "header\n").expect("writing the file");
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("opening the file");
+    let output = SHIPYARD
+        .command(&["run", "-t", "--network", "none", "echo", "body"])
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .output()
+        .expect("running shipyard");
+    let written = std::fs::read_to_string(&path).expect("reading the file");
+    std::fs::remove_file(&path).expect("removing the file");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(written, "header\nbody\r\n");
+}
+
+/// H7: a terminal of the container's own adds little to a run (`-t` against
+/// none, piped, the best of a few runs each).
+#[test]
+fn a_terminal_adds_little_to_a_run() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    let best = |args: &[&str]| {
+        (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let run = run_fed(args, "true", b"");
+                assert_eq!(run.code, Some(0), "{}", run.stderr);
+                started.elapsed()
+            })
+            .min()
+            .expect("five runs")
+    };
+    let with = best(&["-t", "--network", "none"]);
+    let without = best(&["--network", "none"]);
+    assert!(
+        with < without + std::time::Duration::from_millis(100),
+        "with -t {with:?}, without {without:?}"
     );
 }

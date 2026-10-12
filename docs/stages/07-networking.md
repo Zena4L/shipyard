@@ -46,7 +46,7 @@ what could go wrong), mutation-checked and run by hand on Linux, then reviewed a
 | The firewall: one `inet shipyard` table, masquerade, published ports through DNAT maps, hairpin, the 127/8 guard, isolation between networks, internal networks, routing closed to all but containers | `shipyard-network/nft/` (`ruleset.rs`, `expr.rs`, `objects`, `decode.rs`) | `nft/ruleset.rs`'s 10 tests, `nft/linux_tests.rs`, `tests/firewall.rs` (9) |
 | `-p`/`-P`: parsing, ports held by bound sockets, kernel-chosen ports printed | `shipyard-network/ports.rs` | `the_forms_of_p`, `what_p_refuses`, `a_held_port_is_taken_and_a_free_one_is_chosen`, `a_published_port_is_held_while_its_run_lives`; the `ports` fuzz target |
 | conntrack: a freed address's connections flushed | `shipyard-network/conntrack.rs` | `a_flush_forgets_an_addresses_connections`, `a_killed_runs_ports_and_connections_are_swept_by_the_next` |
-| Rootless with pasta, attached by PID | `shipyard-network/pasta.rs`, `pidfd.rs` | `tests/pasta.rs` (8), `nothing_published_means_no_port_forwarded_either_way` |
+| Rootless with pasta, attached by PID (by a namespace file since stage 8.1c; `tests/pasta.rs` has 10 tests since) | `shipyard-network/pasta.rs`, `pidfd.rs` | `tests/pasta.rs` (8), `nothing_published_means_no_port_forwarded_either_way` |
 | A DNS server per network: names, aliases, run IDs; A, AAAA, PTR; forwarding; across networks | `shipyard-network/dns/`, the CLI's `dns_helper.rs` | `dns/*.rs`'s 25 tests, `tests/dns.rs` (7); the `dns` fuzz target |
 | Several networks per container | the CLI's `network.rs` (`take_all`, `route_network`, `resolver`), `run.rs` (`parse_long_network`, `combine_networks`) | `tests/networks.rs` (7), `a_second_network_is_another_interface_without_the_default_route` |
 | IPv6: ULA prefixes, NAT66, published ports on both families, router advertisements kept | `store.rs`, `attach.rs`, `nft/ruleset.rs`, `ports.rs` | `tests/ipv6.rs` (6), `only_the_hosts_own_interfaces_keep_taking_router_advertisements`, `ipv6_is_dnated_and_masqueraded_through_its_own_maps` |
@@ -90,7 +90,9 @@ shipyard run (CLI, single-threaded at every fork)            (shipyard-cli/run.r
                 socket made there: address(es), routes, MTU, up; accept_ra/autoconf/
                 accept_dad off
         pasta:  pasta … PID (it joins the user and network namespaces); pdeathsig;
-                ready when its pid file appears
+                ready when its pid file appears. (Since 8.1c: a launcher joins
+                the user namespace and bind-mounts the network namespace on a
+                file, which pasta gets with --netns.)
     init: lo up; its own sysfs when its user namespace owns its network namespace;
           net.* sysctls (ip_forward=0, IPv6 forwarding=0, ping range, port 0 start)
   the run ends: nft elements, veth, conntrack, lease, port sockets, pasta, run dir
@@ -137,7 +139,7 @@ maps, so rules are never edited:
 | Set or map | Holds |
 |---|---|
 | `bridges`, `same_bridge`, `internal` | Shipyard's bridges; internal networks' bridges |
-| `masquerade`, `masquerade6` | subnets with a way out |
+| `masquerade4`, `masquerade6` | subnets with a way out (`masquerade4` was `masquerade` until stage 8: a keyword of nft's language, which kept `nft -f` from reading the table back) |
 | `ports`, `ports_addr`, `ports6`, `ports6_addr` | `-p` maps: protocol and port (and host address) → container address and port |
 | `closed`, `uplinks` | the families whose forwarding Shipyard turned on, and the host's own interfaces then: routing between those stays closed |
 
@@ -209,8 +211,15 @@ maps, so rules are never edited:
   network, even an internal one).
 - **Locks are taken one network at a time,** never two at once, so runs joining `a, b` and
   `b, a` can't deadlock.
-- **pasta is attached by PID** (it joins the user and network namespaces itself: no bind
-  mount, which a rootless CLI couldn't make), in a process group of its own (Ctrl-C at the
+- **pasta was attached by PID until stage 8.1c** (it joined the user and network
+  namespaces itself: no bind mount, which a rootless CLI couldn't make in the host's mount
+  namespace). *Changed in 8.1c:* under
+  SELinux, Fedora's `pasta_t` may not open an unconfined process's `/proc/<pid>/ns`, so a
+  launcher (Shipyard re-executed) joins the container's user namespace, where it may make
+  a private mount namespace and bind-mount the network namespace on a file, and execs
+  pasta with `--netns FILE`, as Podman does, staying as its parent (under SELinux pasta's
+  exec clears its parent-death signal).
+- pasta runs in a process group of its own (Ctrl-C at the
   terminal doesn't kill it), with pdeathsig and an explicit kill at the end (bookworm's
   pasta never quits by itself).
 - **The test image moved to Debian trixie:** bookworm's 2023 pasta drops connections to
@@ -279,7 +288,7 @@ and is killed explicitly.
 | `br_netfilter` hosts filtering traffic on one bridge | `same_bridge` accepted | `only_dnated_traffic_reaches_a_bridge_and_internal_networks_are_closed` (the module isn't loaded in the test container) |
 | `nft flush ruleset` while containers run | the table is noticed missing or emptied (rule count) and rebuilt by the next run | `the_ruleset_installs_is_current_and_is_rebuilt`, `only_this_versions_whole_table_is_current` |
 | An answer bigger than one ACK datagram (thousands of ports) | ports go one request per map, in chunks of 256 | `networks_and_ports_come_and_go` |
-| Another firewall's forward chain with a drop policy (Docker, ufw, firewalld) | detected and warned about with the exact fix; never changed | `root_runs_on_the_bridge_network_with_a_way_out` |
+| Another firewall's forward chain with a drop policy (Docker, ufw, firewalld) | detected and warned about with the exact fix; never changed | `another_firewalls_drop_policies_are_warned_about_with_their_fixes` (completed in 8.6: `dockers_firewall_is_warned_about_and_its_printed_fix_works`, `firewalld_is_warned_about_until_the_bridge_is_trusted`) |
 | A spoofed DNS client (reflection out of a network) | only the network's containers' addresses are answered | `only_the_networks_containers_are_answered` |
 | A DNS pointer loop | each pointer must point before the last jump's target | `pointers_that_loop_are_refused`; the `dns` fuzz target |
 | One container hogging the DNS server | per-client caps (16 of 64 forwards, 8 of 64 TCP connections), a 5 s TCP frame deadline, a 4 s forward | `places_run_out_in_all_and_for_one_client`, `a_tcp_frame_must_come_whole_and_in_time` |
@@ -297,7 +306,7 @@ and is killed explicitly.
 | A firewall flush leaving the host's loopback reachable through `route_localnet`, and internal networks routed out (review) | `route_localnet` only on a bridge whose containers publish; internal bridges' own IPv4 `forwarding=0`, set again whenever Shipyard turns forwarding on (which resets every interface's); the docs say what a flush undoes | `published_ports_reach_the_container_from_everywhere`, `an_internal_network_has_no_way_out_and_publishes_nothing` |
 | Any local user locking a lease file (kept live forever: names, addresses and ports pinned) (review) | the store's files root's and `nogroup`'s (the DNS servers'), 0640, directories 0750 | `a_lease_directory_lists_live_leases_through_its_descriptor` |
 | A stray file among the networks breaking every network command (review) | only directories are networks; a corrupt config's error says how to forget it | `a_stray_file_among_the_networks_is_no_network` |
-| The Docker fix accepting Shipyard's containers into Docker's own bridges (review) | the fix names the host's way out (`-o eth0`) | `another_firewalls_forward_drop_is_named_with_its_fix`, `another_firewalls_drop_policies_are_warned_about_with_their_fixes` |
+| The Docker fix accepting Shipyard's containers into Docker's own bridges (review) | the fix names the host's way out (`-o eth0`) | `firewalls::tests::docker_gets_the_whole_fix_in_docker_user` (moved in 8.6), `dockers_firewall_is_warned_about_and_its_printed_fix_works` |
 | A container on an IPv4-only network and an IPv6 one with no IPv6 default route (review) | each family's default route through the first network with it and a way out | `ipv6s_route_goes_through_a_network_with_ipv6`, `each_familys_default_route_goes_through_a_network_that_has_it` |
 | `network rm` racing a firewall rebuild that put its rules back (review) | rules removed under the store's lock | (by review) |
 | Every pasta run ending a second late (found writing the book) | an already-reaped pasta (`ECHILD`) counts as reaped | `a_rootless_run_ends_as_soon_as_its_command_does` |
@@ -370,7 +379,8 @@ million (and stage 6's five, 29 million more).
 
 ## Tests
 
-(Filled in at the end of step 8.)
+Not counted at the stage's end. [Stage 8's notes](08-terminals.md#tests) give the
+counts per file after stage 8, which include stage 7's tests.
 
 ## Review history
 

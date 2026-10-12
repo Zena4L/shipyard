@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{ContainerError, Created, Result, State};
+use super::{ContainerError, CreateOptions, Created, LogsOf, Result, State};
 use crate::process::Signal;
 
 /// Containers need Linux.
@@ -10,7 +10,12 @@ use crate::process::Signal;
 /// # Errors
 ///
 /// Always [`ContainerError::LinuxOnly`].
-pub fn create(_root: &Path, _id: &str, _bundle: &Path) -> Result<Created> {
+pub fn create(
+    _root: &Path,
+    _id: &str,
+    _bundle: &Path,
+    _options: &CreateOptions<'_>,
+) -> Result<Created> {
     Err(ContainerError::LinuxOnly)
 }
 
@@ -67,6 +72,21 @@ pub fn monitor_entry_point() {}
 /// # Errors
 ///
 /// Always [`ContainerError::LinuxOnly`].
+pub fn logs_of(_root: &Path, _id: &str) -> Result<LogsOf> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux: there are no logs to remove.
+#[must_use]
+pub fn remove_failed_logs(_logs: &LogsOf) -> Option<String> {
+    None
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
 pub fn pause(_root: &Path, _id: &str) -> Result<()> {
     Err(ContainerError::LinuxOnly)
 }
@@ -117,5 +137,57 @@ pub fn stats(_root: &Path, _id: &str) -> Result<(crate::cgroup::Stats, u64)> {
 ///
 /// Always [`ContainerError::LinuxOnly`].
 pub fn memory_limit(_root: &Path, _id: &str) -> Result<Option<u64>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn attach_stream(_root: &Path, _id: &str) -> Result<std::os::unix::net::UnixStream> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn exec(
+    _root: &Path,
+    _id: &str,
+    _options: &super::ExecOptions,
+    _passed: Option<crate::process::passed::PassedFds>,
+) -> Result<super::ExecOutcome> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn exit_code(_root: &Path, _id: &str) -> Result<Option<i32>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Helpers need Linux: nothing to run.
+pub fn helper_entry_point(_helpers: &[super::Helper]) {}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn start_helper(
+    _root: &Path,
+    _id: &str,
+    _name: &str,
+    _action: &'static str,
+    _args: &[u8],
+    _stdin: &std::os::fd::OwnedFd,
+    _stdout: &std::os::fd::OwnedFd,
+) -> Result<super::RunningHelper> {
     Err(ContainerError::LinuxOnly)
 }

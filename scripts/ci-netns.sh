@@ -11,5 +11,9 @@
 # usage (as a cargo runner): ci-netns.sh TEST_BINARY [ARGS...]
 set -euo pipefail
 networks=$(mktemp -d)
-trap 'sudo rm -rf "$networks"' EXIT
-sudo -E env SHIPYARD_NETWORK_DIR="$networks" unshare --net sh -c 'ip link set lo up 2>/dev/null || true; exec "$@"' -- "$@"
+trap 'rm -rf "$networks" 2>/dev/null || sudo rm -rf "$networks"' EXIT
+# Already root (the Fedora VM's runner): no sudo, which would also make
+# SUDO_UID root's.
+sudo=(sudo -E)
+[ "$(id -u)" = 0 ] && sudo=()
+"${sudo[@]}" env SHIPYARD_NETWORK_DIR="$networks" unshare --net sh -c 'ip link set lo up 2>/dev/null || true; exec "$@"' -- "$@"

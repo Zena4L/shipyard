@@ -537,7 +537,11 @@ fn shipyards_own_kill_is_not_an_oom_kill() {
             "1",
             "sh",
             "-c",
-            "sh -c 'x=$(head -c 200m /dev/urandom)'; trap '' TERM; echo ready; sleep 300",
+            // The inner shell asks to be the OOM killer's victim (raising
+            // one's own score needs no privilege): left to the kernel, a
+            // bash `sh` (Fedora's) is big enough to be picked itself.
+            "sh -c 'echo 1000 >/proc/self/oom_score_adj; x=$(head -c 200m /dev/urandom)'; \
+             trap '' TERM; echo ready; sleep 300",
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

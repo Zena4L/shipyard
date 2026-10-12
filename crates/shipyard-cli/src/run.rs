@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, value_parser};
+use shipyard_engine::{StreamsError, streams};
 use shipyard_runtime::hooks::ContainerHooks;
 use shipyard_runtime::isolation::{
     HOST_WIDE_NET_SYSCTLS, IdMap, IdMaps, Isolation, IsolationError, Mount, Namespace, Root,
@@ -31,6 +32,10 @@ pub(crate) struct RunArgs {
     /// The run's default network, worked out once (see `default_network`).
     #[arg(skip)]
     default_mode: std::cell::OnceCell<NetworkMode>,
+
+    /// `-i` and `-t`.
+    #[command(flatten)]
+    streams: StreamArgs,
 
     /// Set an environment variable, or copy KEY from your shell if no value is given.
     #[arg(short, long, value_name = "KEY[=VALUE]", value_parser = value_parser!(OsString))]
@@ -95,6 +100,12 @@ pub(crate) struct RunArgs {
     /// run like this for now.
     #[arg(long, conflicts_with = "limits")]
     no_isolation: bool,
+
+    /// Pass N more descriptors on to the command, from 3 up (after socket
+    /// activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as
+    /// Podman does.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    preserve_fds: usize,
 
     /// Hostname inside the container (Linux).
     #[arg(long, value_name = "NAME", conflicts_with = "no_isolation")]
@@ -292,12 +303,30 @@ pub(crate) struct RunArgs {
     command: Vec<OsString>,
 }
 
+/// What the command's standard input and output are: Docker's `-i` and `-t`.
+#[derive(Debug, Args)]
+pub(crate) struct StreamArgs {
+    /// Pass your input on to the command. Without it, an isolated command's
+    /// stdin is empty (/dev/null), so it can't take keys meant for your
+    /// shell.
+    #[arg(short, long)]
+    interactive: bool,
+
+    /// Give the command a terminal of the container's own (a pseudo-terminal):
+    /// full-screen programs, password prompts and job control work. With -i,
+    /// what you type goes to it.
+    #[arg(short, long)]
+    tty: bool,
+}
+
 /// Everything a `shipyard run` needs, checked.
 #[derive(Debug)]
 pub(crate) struct Invocation {
     spec: ProcessSpec,
     stop: StopPolicy,
     isolation: Option<Isolation>,
+    /// Its standard input, output and error.
+    stdio: process::Stdio,
     /// What a bundle asks for that's ignored, to show the user.
     warnings: Vec<String>,
     /// What its isolation has that the user didn't ask for.
@@ -331,6 +360,8 @@ pub(crate) struct Planned {
     stop: StopPolicy,
     /// Without its root yet, for an image.
     isolation: Option<Isolation>,
+    /// Its standard input, output and error.
+    stdio: process::Stdio,
     /// Why a rootless caller's maps are short, if they are.
     short_maps: Option<String>,
     /// The `--volume`s, parsed: a host path absolute and found.
@@ -350,7 +381,20 @@ impl RunArgs {
         };
         stop.validate()?;
         if let Some(dir) = &self.bundle {
-            return Ok(Checked::Bundle(Box::new(from_bundle(dir, stop)?)));
+            // Refused before the bundle is read: `-t` is wrong whatever its
+            // config says (a bundle asks for a terminal itself).
+            if self.streams.tty {
+                return Err(StreamsError::TerminalFromBundle.into());
+            }
+            let bundle = load_bundle(dir)?;
+            // Its own `process.terminal` is `-t`.
+            let stdio = self.stdio(streams::Runs::Bundle {
+                terminal: bundle.terminal.is_some(),
+                size: bundle.terminal.and_then(|terminal| terminal.size),
+            })?;
+            return Ok(Checked::Bundle(Box::new(from_bundle(
+                dir, bundle, stop, stdio,
+            )?)));
         }
         if self.image.is_some() && !cfg!(target_os = "linux") {
             bail!(
@@ -360,6 +404,11 @@ impl RunArgs {
         }
         let run = RunId::new()?;
         let (isolation, short_maps) = self.isolation(&run)?;
+        let stdio = self.stdio(if isolation.is_some() {
+            streams::Runs::Isolated
+        } else {
+            streams::Runs::Unisolated
+        })?;
         let network = isolation
             .as_ref()
             .map(|_| self.network_plan(run))
@@ -379,10 +428,23 @@ impl RunArgs {
             args: self,
             stop,
             isolation,
+            stdio,
             short_maps,
             volumes,
             network,
         })))
+    }
+
+    /// The command's standard input, output and error, as `-i` and `-t` ask
+    /// and the engine decides for a container on a terminal (see
+    /// `shipyard_engine::streams`).
+    fn stdio(&self, runs: streams::Runs) -> Result<process::Stdio> {
+        let request = streams::Request {
+            tty: self.streams.tty,
+            interactive: self.streams.interactive,
+            runs,
+        };
+        Ok(streams::plan(request, streams::Terminals::detect())?)
     }
 
     /// The process as far as the flags give it, checked (the image's
@@ -451,6 +513,7 @@ impl Planned {
             args,
             stop,
             mut isolation,
+            stdio,
             short_maps,
             volumes,
             network: _,
@@ -540,6 +603,7 @@ impl Planned {
                 spec,
                 stop,
                 isolation,
+                stdio,
                 warnings,
                 generated,
             },
@@ -643,9 +707,8 @@ fn hold_volumes(names: &[String]) -> Result<Vec<VolumeHold>> {
         .collect()
 }
 
-/// A run of the OCI bundle in `dir`: everything but the stop policy comes
-/// from its `config.json`.
-fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
+/// Loads the bundle in `dir` for `run --bundle`.
+fn load_bundle(dir: &Path) -> Result<shipyard_runtime::oci::Bundle> {
     if !cfg!(target_os = "linux") {
         bail!(
             "--bundle needs Linux namespaces, which aren't available on {} yet",
@@ -657,6 +720,17 @@ fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
     let bundle = shipyard_runtime::oci::load_bundle_for_caller(dir)?;
     #[cfg(not(target_os = "linux"))]
     let bundle = shipyard_runtime::oci::load_bundle(dir)?;
+    Ok(bundle)
+}
+
+/// A run of `bundle`, the OCI bundle in `dir`: everything but the stop
+/// policy and the streams comes from its `config.json`.
+fn from_bundle(
+    dir: &Path,
+    bundle: shipyard_runtime::oci::Bundle,
+    stop: StopPolicy,
+    stdio: process::Stdio,
+) -> Result<Invocation> {
     let mut warnings = bundle.warnings;
     if let Some(path) = &bundle.cgroups_path {
         warnings.push(format!(
@@ -690,6 +764,7 @@ fn from_bundle(dir: &Path, stop: StopPolicy) -> Result<Invocation> {
         spec: bundle.spec,
         stop,
         isolation: Some(isolation),
+        stdio,
         warnings,
         generated: Generated::default(),
     })
@@ -1202,8 +1277,14 @@ fn parse_security_opt(s: &str) -> Result<SecurityOpt, String> {
 /// exit code, or `128 + N` if signal N killed it. Failures to start it exit
 /// 125, 126 or 127.
 pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
+    // First, before anything is opened or started (the network's helpers):
+    // what this process was given to pass on is 3 and up, and nothing it
+    // starts in between may inherit it.
+    let passed = process::passed::PassedFds::from_caller(args.preserve_fds)?;
     let planned = match args.check()? {
-        Checked::Bundle(invocation) => return Ok(run_invocation(*invocation, None)?.exit()),
+        Checked::Bundle(invocation) => {
+            return Ok(run_invocation(*invocation, None, passed)?.exit());
+        }
         Checked::Command(planned) => planned,
     };
     // The flags checked, the image is made ready: pulled if it must be, its
@@ -1245,7 +1326,7 @@ pub(crate) fn run(args: RunArgs) -> Result<ExitCode> {
     let hook = connect
         .as_mut()
         .map(|connect| connect as process::NetworkHook<'_>);
-    let ended = run_invocation(invocation, hook)?;
+    let ended = run_invocation(invocation, hook, passed)?;
     drop(connect);
     // Its address given back and its veth gone before it ends, as the rest.
     drop(network);
@@ -1325,11 +1406,13 @@ impl Ended {
 fn run_invocation(
     invocation: Invocation,
     network: Option<process::NetworkHook<'_>>,
+    passed: process::passed::PassedFds,
 ) -> Result<Ended> {
     let Invocation {
         spec,
         stop,
         isolation,
+        stdio,
         warnings,
         generated,
     } = invocation;
@@ -1347,6 +1430,8 @@ fn run_invocation(
     }
     tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;
+    supervisor.set_stdio(stdio);
+    supervisor.pass(passed);
     let supervised = match (network, isolation.as_ref()) {
         (Some(network), Some(isolation)) => {
             supervisor.supervise_with_network(&spec, stop, isolation, network)

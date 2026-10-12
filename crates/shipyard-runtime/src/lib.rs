@@ -20,6 +20,7 @@ compile_error!("shipyard only supports UNIX platforms (Linux, macOS)");
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("shipyard only supports 64-bit platforms");
 
+pub mod attach;
 pub mod cgroup;
 pub mod container;
 pub mod devices;
@@ -28,10 +29,19 @@ pub mod hooks;
 mod id_map;
 pub mod isolation;
 pub mod kernel;
+pub mod logs;
 pub mod oci;
 pub mod process;
 pub mod resources;
 pub mod security;
+
+/// The user's terminal, for a front end in another crate (an attach
+/// client): its size, and raw mode, put back on every way out (`run -it`'s
+/// guard, stage 8).
+#[cfg(unix)]
+pub mod terminal {
+    pub use crate::process::terminal::{RawMode, terminal_size};
+}
 mod small_file;
 
 pub use error::{Error, Result};

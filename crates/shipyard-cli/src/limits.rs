@@ -240,7 +240,8 @@ fn block_device(path: &Path) -> Result<(u32, u32)> {
     Ok(numbers)
 }
 
-fn parse_size(text: &str) -> Result<u64, String> {
+/// A size (`64k`, `10m`, `1g`), as `--memory` takes it.
+pub(crate) fn parse_size(text: &str) -> Result<u64, String> {
     resources::parse_size(text).map_err(|err| err.to_string())
 }
 

@@ -2,9 +2,15 @@
 //! `mount_namespaces(7)`). Run by the container's clean image (`init.rs`),
 //! in its new mount namespace, after `/` was made a slave.
 //!
-//! **Mounts first, then the pivot** (runc's order). `/proc`, `/sys` and
-//! `/dev` are mounted into the root filesystem while the host's tree is
-//! still there: under a user namespace (stage 4), the kernel only lets a
+//! **Mounts first, then the pivot** (runc's order). Every mount is made in
+//! one pass, in the order a config lists them (the spec's "MUST"): the
+//! standard ones (`/proc`, `/sys`, `/dev` and those in it) wherever listed,
+//! with Shipyard's own options, those not listed first (`Root::mount_order`),
+//! and the container's own (`Root::mounts`: binds from the host and tmpfs)
+//! between them, each at a destination resolved inside the root
+//! (`resolve.rs`), never by a path that could lead out of it. Sysctls are
+//! set after the pass, through the `/proc` made in it. `/proc` and `/sys`
+//! are mounted while the host's tree is still there: under a user namespace (stage 4), the kernel only lets a
 //! container mount `proc` or `sysfs` while a fully visible one is mounted
 //! in its mount namespace, which stops being true once the host's tree is
 //! gone.
@@ -25,10 +31,6 @@
 //! as a chroot often has the host's `/dev` or `/proc` mounted in it: left
 //! underneath the container's own, root inside could unmount the
 //! container's and reach the host's devices and processes.
-//!
-//! **Then the container's own mounts** (`Root::mounts`: binds from the
-//! host and tmpfs), each at a destination resolved inside the root
-//! (`resolve.rs`), never by a path that could lead out of it.
 //!
 //! **Then the pivot:** `pivot_root(".", ".")` stacks the old root on top of
 //! the new one, and a lazy unmount detaches it, so the host's tree is
@@ -101,7 +103,7 @@ mod linux {
     use nix::unistd::{fchdir, pivot_root, symlinkat};
 
     use super::{DEV_ENTRIES, Target, overlay};
-    use crate::isolation::CgroupMount;
+    use crate::isolation::{CgroupMount, MountStep, StandardMount};
     use crate::process::child::Failure;
     use crate::process::failure::ChildStep;
     use crate::process::io_errno;
@@ -178,17 +180,30 @@ mod linux {
             }
             bind_root(root.path())?
         };
-        mount_standard(&root_fd, root, cgroup)?;
+        // In the order given: a config's listed order (the spec's "MUST"),
+        // the standard ones it doesn't list first (`Root::mount_order`).
+        for step in &root.order {
+            match *step {
+                MountStep::Standard(standard) => {
+                    mount_standard(&root_fd, root, standard, cgroup)?;
+                }
+                MountStep::Mount(index) => {
+                    let (Some(mount), source) = (
+                        root.mounts.get(index),
+                        cloned.get(index).and_then(Option::as_ref),
+                    ) else {
+                        continue;
+                    };
+                    add_mount(&root_fd, mount, source)
+                        .map_err(|(step, errno)| Failure::at(step, errno).detail(index))?;
+                }
+            }
+        }
         if !sysctls.is_empty() {
-            // Through the `/proc` just mounted in the root filesystem.
+            // Through the `/proc` mounted in the root filesystem.
             let proc = open_directory(&root_fd, Target::Proc.name())
                 .map_err(|errno| Failure::at(ChildStep::Sysctl, errno))?;
             sysctl::apply(&proc, sysctls)?;
-        }
-        for (index, mount) in root.mounts.iter().enumerate() {
-            let source = cloned.get(index).and_then(Option::as_ref);
-            add_mount(&root_fd, mount, source)
-                .map_err(|(step, errno)| Failure::at(step, errno).detail(index))?;
         }
         for (index, device) in root.devices.iter().enumerate() {
             make_device(&root_fd, device, root.user_namespace)
@@ -357,12 +372,80 @@ mod linux {
         })
     }
 
-    /// `/proc`, a read-only `/sys` (with the container's cgroup at
-    /// `/sys/fs/cgroup`, if asked), and `/dev` with what's in it.
-    fn mount_standard(root: &OwnedFd, setup: &RootSetup, cgroup: Option<CgroupMount>) -> Step {
-        let on = target(root, Target::Proc)?;
-        mount_on(&on, "proc", "proc", NOSUID_NODEV_NOEXEC, None)
-            .map_err(|errno| Failure::at(ChildStep::MountProc, errno))?;
+    /// One of the mounts Shipyard makes in every container, with its own
+    /// options: `/proc`, a read-only `/sys`, the container's cgroup at
+    /// `/sys/fs/cgroup` (if asked), `/dev` with its nodes and links, and
+    /// each mount in `/dev`.
+    fn mount_standard(
+        root: &OwnedFd,
+        setup: &RootSetup,
+        standard: StandardMount,
+        cgroup: Option<CgroupMount>,
+    ) -> Step {
+        match standard {
+            StandardMount::Proc => {
+                let on = target(root, Target::Proc)?;
+                mount_on(&on, "proc", "proc", NOSUID_NODEV_NOEXEC, None)
+                    .map_err(|errno| Failure::at(ChildStep::MountProc, errno))
+            }
+            StandardMount::Sys => mount_sys(root, setup),
+            StandardMount::Cgroup => match cgroup {
+                Some(cgroup) => mount_cgroup(root, cgroup)
+                    .map_err(|errno| Failure::at(ChildStep::MountCgroup, errno)),
+                None => Ok(()),
+            },
+            StandardMount::Dev => {
+                let on = target(root, Target::Dev)?;
+                // Not `nodev`: its device nodes must open (probe 10).
+                mount_on(
+                    &on,
+                    "tmpfs",
+                    "tmpfs",
+                    MsFlags::MS_NOSUID,
+                    Some("mode=755,size=65536k"),
+                )
+                .map_err(|errno| Failure::at(ChildStep::MountDev, errno))?;
+                fill_dev(root, setup)
+            }
+            StandardMount::Devpts => {
+                // Its own instance of devpts (probe 5): the container's
+                // terminals only. `ptmxmode` makes its `ptmx` usable (the
+                // `/dev/ptmx` link). Its terminals' group, if any, is
+                // `pts_gid` (see `RootSetup`).
+                let options = match setup.pts_gid {
+                    Some(gid) => format!("newinstance,ptmxmode=0666,mode=0620,gid={gid}"),
+                    None => "newinstance,ptmxmode=0666,mode=0620".to_owned(),
+                };
+                mount_in_dev(
+                    root,
+                    "pts",
+                    ("devpts", "devpts"),
+                    MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+                    Some(&options),
+                )
+            }
+            StandardMount::Shm => mount_in_dev(
+                root,
+                "shm",
+                ("shm", "tmpfs"),
+                NOSUID_NODEV_NOEXEC,
+                Some("mode=1777,size=65536k"),
+            ),
+            // POSIX message queues show the IPC namespace of whoever mounts
+            // them (probe 6): only with the container's own.
+            StandardMount::Mqueue if setup.mqueue => mount_in_dev(
+                root,
+                "mqueue",
+                ("mqueue", "mqueue"),
+                NOSUID_NODEV_NOEXEC,
+                None,
+            ),
+            StandardMount::Mqueue => Ok(()),
+        }
+    }
+
+    /// A read-only `/sys`.
+    fn mount_sys(root: &OwnedFd, setup: &RootSetup) -> Step {
         // Read-only: it's the host's kernel and devices. Its network devices
         // are the ones of the network namespace it's mounted in: the
         // container's own, or the host's when the container shares them
@@ -386,22 +469,7 @@ mod linux {
             },
             SysSetup::HostBind => bind_host_sys(root, &on),
         };
-        sys.map_err(|errno| Failure::at(ChildStep::MountSys, errno))?;
-        if let Some(cgroup) = cgroup {
-            mount_cgroup(root, cgroup)
-                .map_err(|errno| Failure::at(ChildStep::MountCgroup, errno))?;
-        }
-        let on = target(root, Target::Dev)?;
-        // Not `nodev`: its device nodes must open (probe 10).
-        mount_on(
-            &on,
-            "tmpfs",
-            "tmpfs",
-            MsFlags::MS_NOSUID,
-            Some("mode=755,size=65536k"),
-        )
-        .map_err(|errno| Failure::at(ChildStep::MountDev, errno))?;
-        fill_dev(root, setup)
+        sys.map_err(|errno| Failure::at(ChildStep::MountSys, errno))
     }
 
     /// In a user namespace, `sysfs` can only be mounted with a network
@@ -525,8 +593,8 @@ mod linux {
         mount(Some(source), ".", Some(fstype), flags, data)
     }
 
-    /// Device nodes, symlinks, `/dev/pts`, `/dev/shm` and `/dev/mqueue`,
-    /// made relative to the new tmpfs.
+    /// Device nodes and symlinks, made relative to the new tmpfs (the
+    /// mounts in it are steps of their own: `mount_standard`).
     fn fill_dev(root: &OwnedFd, setup: &RootSetup) -> Step {
         // Through the mount just made on it.
         let dev = open_directory(root, "dev").map_err(dev_failure("/dev"))?;
@@ -547,38 +615,6 @@ mod linux {
         for (name, target) in LINKS {
             symlinkat(target, &dev, name).map_err(dev_failure(name))?;
         }
-        // Its own instance of devpts (probe 5): the container's terminals
-        // only. `ptmxmode` makes its `ptmx` usable (the `/dev/ptmx` link).
-        // Its terminals' group, if any, is `pts_gid` (see `RootSetup`).
-        let pts_options = match setup.pts_gid {
-            Some(gid) => format!("newinstance,ptmxmode=0666,mode=0620,gid={gid}"),
-            None => "newinstance,ptmxmode=0666,mode=0620".to_owned(),
-        };
-        mount_in(
-            &dev,
-            "pts",
-            ("devpts", "devpts"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-            Some(&pts_options),
-        )?;
-        mount_in(
-            &dev,
-            "shm",
-            ("shm", "tmpfs"),
-            NOSUID_NODEV_NOEXEC,
-            Some("mode=1777,size=65536k"),
-        )?;
-        // POSIX message queues show the IPC namespace of whoever mounts them
-        // (probe 6): only with the container's own.
-        if setup.mqueue {
-            mount_in(
-                &dev,
-                "mqueue",
-                ("mqueue", "mqueue"),
-                NOSUID_NODEV_NOEXEC,
-                None,
-            )?;
-        }
         Ok(())
     }
 
@@ -594,6 +630,19 @@ mod linux {
             Mode::from_bits_truncate(0o666),
         )?;
         bind(&file, Leaf::File, &Path::new("/dev").join(name), false)
+    }
+
+    /// [`mount_in`] the root's `/dev`, mounted already (the order's checked:
+    /// `Root::check_mount_order`).
+    fn mount_in_dev(
+        root: &OwnedFd,
+        name: &str,
+        what: (&str, &str),
+        flags: MsFlags,
+        data: Option<&str>,
+    ) -> Step {
+        let dev = open_directory(root, "dev").map_err(dev_failure("/dev"))?;
+        mount_in(&dev, name, what, flags, data)
     }
 
     /// Makes the directory `name` in `/dev` (a fresh tmpfs), and mounts

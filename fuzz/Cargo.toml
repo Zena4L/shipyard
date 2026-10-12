@@ -1,6 +1,6 @@
 # Fuzz targets for what Shipyard reads from untrusted sources: registries'
 # documents and headers, image references, layer archives, what the kernel
-# sends over netlink, and `-p`. Built on
+# sends over netlink, `-p`, and containers' logs. Built on
 # nightly with cargo-fuzz, outside the main workspace; run them with
 # `scripts/test-linux.sh --fuzz` (docs/DEVELOPMENT.md).
 [package]
@@ -16,6 +16,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 shipyard-image = { path = "../crates/shipyard-image" }
 shipyard-network = { path = "../crates/shipyard-network" }
+shipyard-runtime = { path = "../crates/shipyard-runtime" }
+shipyard-engine = { path = "../crates/shipyard-engine" }
 
 # Its own workspace: not one of Shipyard's crates.
 [workspace]
@@ -79,6 +81,41 @@ bench = false
 [[bin]]
 name = "proc_net"
 path = "fuzz_targets/proc_net.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cri_record"
+path = "fuzz_targets/cri_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "logs_dir"
+path = "fuzz_targets/logs_dir.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attach_frames"
+path = "fuzz_targets/attach_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "process_json"
+path = "fuzz_targets/process_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cp_unpack"
+path = "fuzz_targets/cp_unpack.rs"
 test = false
 doc = false
 bench = false

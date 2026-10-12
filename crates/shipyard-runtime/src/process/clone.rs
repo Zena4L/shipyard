@@ -77,6 +77,7 @@ pub(crate) enum Cloned {
 /// must not be used (see the module docs). `flags` must not contain
 /// `CLONE_VM`, `CLONE_THREAD` or other flags that share the parent's memory,
 /// nor `CLONE_NEWTIME` (it can't go through the `clone` fallback).
+/// `CLONE_PARENT` (exec's joiner) makes the child its parent's sibling.
 pub(crate) unsafe fn clone_process(
     flags: libc::c_int,
     cgroup: Option<RawFd>,
@@ -98,10 +99,17 @@ pub(crate) unsafe fn clone_process(
 /// As for [`clone_process`].
 unsafe fn clone3(flags: libc::c_int, cgroup: Option<RawFd>) -> Result<Cloned, Errno> {
     // Bit for bit: the flags are a bit set, not a number.
+    let parent = flags & libc::CLONE_PARENT != 0;
     let flags = u64::from(flags.cast_unsigned());
     let args = CloneArgs {
         flags: cgroup.map_or(flags, |_| flags | CLONE_INTO_CGROUP),
-        exit_signal: u64::from(libc::SIGCHLD.cast_unsigned()),
+        // With `CLONE_PARENT` the child takes its parent's exit signal:
+        // `clone3` refuses one of its own (EINVAL; probe E1).
+        exit_signal: if parent {
+            0
+        } else {
+            u64::from(libc::SIGCHLD.cast_unsigned())
+        },
         cgroup: cgroup.map_or(0, |fd| u64::from(fd.cast_unsigned())),
         ..CloneArgs::default()
     };

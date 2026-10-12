@@ -920,12 +920,12 @@ dependencies = [
  "anyhow",
  "clap",
  "clap-markdown",
- "flate2",
  "libc",
  "nix",
  "proptest",
  "serde",
  "serde_json",
+ "shipyard-engine",
  "shipyard-image",
  "shipyard-network",
  "shipyard-runtime",
@@ -934,6 +934,20 @@ dependencies = [
  "tar",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "shipyard-engine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+ "shipyard-image",
+ "shipyard-runtime",
+ "tar",
+ "thiserror",
 ]
 
 [[package]]
@@ -993,10 +1007,13 @@ dependencies = [
 name = "shipyard-test-support"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "libc",
  "nix",
  "serde_json",
+ "sha2",
  "shipyard-network",
+ "tar",
 ]
 
 [[package]]

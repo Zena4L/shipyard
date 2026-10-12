@@ -358,15 +358,7 @@ fn a_permission_error_names_the_mapped_user() {
 #[ignore = "needs root"]
 fn a_foreign_proc_is_refused() {
     let mut command = std::process::Command::new("unshare");
-    command.args([
-        "-p",
-        "-f",
-        env!("CARGO_BIN_EXE_shipyard"),
-        "run",
-        "--uidmap",
-        MAP,
-        "true",
-    ]);
+    command.args(["-p", "-f", SHIPYARD.path(), "run", "--uidmap", MAP, "true"]);
     let run = run(command);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(

@@ -469,33 +469,13 @@ pub fn become_namespace_root() -> Result<()> {
 ///
 /// [`Error::Sys`] if a map can't be read or parsed.
 pub fn current_id_maps() -> Result<IdMaps> {
-    let read = |kind: &str| -> Result<Vec<IdMap>> {
+    let read = |kind: &str| -> Result<String> {
         let path = format!("/proc/self/{kind}");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|err| Error::sys(format!("reading {path}"), super::io_errno(&err)))?;
-        text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                let numbers: Vec<u32> = line
-                    .split_whitespace()
-                    .map(str::parse)
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(|_| Error::sys(format!("parsing {path}"), Errno::EINVAL))?;
-                match numbers[..] {
-                    [container, host, size] => Ok(IdMap {
-                        container,
-                        host,
-                        size,
-                    }),
-                    _ => Err(Error::sys(format!("parsing {path}"), Errno::EINVAL)),
-                }
-            })
-            .collect()
+        std::fs::read_to_string(&path)
+            .map_err(|err| Error::sys(format!("reading {path}"), super::io_errno(&err)))
     };
-    Ok(IdMaps {
-        uids: read("uid_map")?,
-        gids: read("gid_map")?,
-    })
+    IdMaps::from_proc(&read("uid_map")?, &read("gid_map")?)
+        .ok_or_else(|| Error::sys("parsing /proc/self/uid_map and gid_map", Errno::EINVAL))
 }
 
 /// Why the kernel refuses user namespaces to an unprivileged caller, from

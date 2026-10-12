@@ -17,9 +17,12 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use shipyard_network::dns::message::rtype;
 use shipyard_network::nft::Nftables;
 use shipyard_network::route::{Route, Rtnetlink};
-use shipyard_test_support::net::{NetworkDir, Server, Upstream, fetch, fetch_from, in_netns};
+use shipyard_test_support::net::{
+    NetworkDir, Server, Upstream, fetch, fetch_from, in_netns, resolve,
+};
 use shipyard_test_support::{Rootless, Shipyard, in_new_netns, is_root, rootless};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
@@ -434,76 +437,468 @@ fn setting(path: &str) -> String {
 /// namespace: its stdout, or `None` where nft isn't installed (the test
 /// skips; the test image and CI have it).
 fn nft(args: &[&str]) -> Option<String> {
-    let output = match std::process::Command::new("nft").args(args).output() {
+    tool("nft", args)
+}
+
+/// `iptables ARGS` (iptables-nft, as Docker runs it), as [`nft`].
+fn iptables(args: &[&str]) -> Option<String> {
+    tool("iptables", args)
+}
+
+/// `program ARGS`, which must work: its stdout, or `None` where it isn't
+/// installed.
+fn tool(program: &str, args: &[&str]) -> Option<String> {
+    let output = match std::process::Command::new(program).args(args).output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("nft isn't installed; skipping");
+            eprintln!("{program} isn't installed; skipping");
             return None;
         }
-        Err(error) => panic!("running nft: {error}"),
+        Err(error) => panic!("running {program}: {error}"),
     };
     assert!(
         output.status.success(),
-        "nft {args:?}: {}",
+        "{program} {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     Some(String::from_utf8(output.stdout).unwrap())
 }
 
-/// Another program's firewall that drops what the host forwards (Docker's
-/// or ufw's `FORWARD`), and what comes in to it: a run is warned about
-/// each, with the commands that let its containers through. Shipyard never
-/// changes another program's rules.
+/// The fix a run's warning starting `opening` printed: its commands, each
+/// run as printed (but for `sudo`: the tests are root already).
+fn apply_printed_fix(stderr: &str, opening: &str) {
+    let warning = stderr
+        .lines()
+        .find(|line| line.starts_with(&format!("shipyard: warning: {opening}")))
+        .unwrap_or_else(|| panic!("no warning about {opening}: {stderr}"));
+    // The fix is the warning's end, from its first command.
+    let (_, fix) = warning.split_once(": sudo ").unwrap();
+    for command in format!("sudo {fix}").split("; ") {
+        let command = command.strip_prefix("sudo ").unwrap();
+        let command = command.replace(" && sudo ", " && ");
+        let status = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+    }
+}
+
+/// Whether the container in `netns` gets an answer from the DNS server of
+/// its network (at `server`) for its own name, `name`.
+fn answered(netns: &std::fs::File, server: Ipv4Addr, name: &str) -> bool {
+    resolve(netns, server, name, rtype::A).is_some_and(|answer| !answer.answers.is_empty())
+}
+
+/// Another program's firewall that drops what the host forwards and what
+/// comes in to it (a distribution's iptables service, ufw's without ufw):
+/// a run is warned about each, with the commands that let its containers
+/// through, in iptables' terms (the tables are iptables'); run as printed,
+/// they let the containers out, and reach their DNS server, and the next
+/// run isn't warned. Shipyard never changes another program's rules.
 #[test]
 #[ignore = "needs root"]
 fn another_firewalls_drop_policies_are_warned_about_with_their_fixes() {
     in_new_netns(|| {
-        for command in [
-            "add table ip filter",
-            "add chain ip filter FORWARD { type filter hook forward priority 0; policy drop; }",
-            "add chain ip filter INPUT { type filter hook input priority 0; policy drop; }",
-        ] {
-            if nft(&[command]).is_none() {
+        for args in [&["-P", "FORWARD", "DROP"][..], &["-P", "INPUT", "DROP"]] {
+            if iptables(args).is_none() {
                 return;
             }
         }
+        let upstream = Upstream::new();
+        upstream.route_default();
+        upstream.route_back();
         let networks = NetworkDir::new(SHIPYARD);
         networks.create(&["app"]);
         let bridge = networks.inspect("app")["Bridge"]
             .as_str()
             .unwrap()
             .to_owned();
-        let run = networks.run(&["run", "--network", "app", "true"]);
-        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let gateway = networks.gateway("app");
+        let theirs = nft(&["list", "table", "ip", "filter"]).unwrap();
+        let warned = networks.run(&["run", "--network", "app", "true"]);
+        assert_eq!(warned.code, Some(0), "{}", warned.stderr);
+        let forward = "the firewall's chain ip filter FORWARD drops forwarded traffic by default";
+        let input =
+            "the firewall's chain ip filter INPUT drops what comes in to the host by default";
         assert!(
-            run.stderr.contains(&format!(
-                "the firewall's chain ip filter FORWARD drops forwarded traffic by default, so \
-                 containers on {bridge} may have no way out; to let them through: nft insert \
-                 rule ip filter FORWARD iifname {bridge} accept"
+            warned.stderr.contains(&format!(
+                "{forward}: containers on {bridge} would have no way out, wouldn't be reached \
+                 on their published ports, and couldn't reach each other; to let them through: \
+                 sudo iptables -I FORWARD -i {bridge} -o {bridge} -j ACCEPT; sudo iptables -I \
+                 FORWARD -i {bridge} -o up0 -j ACCEPT; sudo iptables -I FORWARD -o {bridge} -m \
+                 conntrack --ctstate RELATED,ESTABLISHED,DNAT -j ACCEPT"
             )),
             "{}",
-            run.stderr
+            warned.stderr
         );
         assert!(
-            run.stderr.contains(&format!(
-                "the firewall's chain ip filter INPUT drops what comes in to the host by \
-                 default, so containers on {bridge} may get no answer from the network's DNS \
-                 server"
+            warned.stderr.contains(&format!(
+                "{input}: containers on {bridge} would get no answer from their DNS server (on \
+                 {gateway}:53); to let them through: sudo iptables -I INPUT -i {bridge} -p udp \
+                 --dport 53 -j ACCEPT; sudo iptables -I INPUT -i {bridge} -p tcp --dport 53 -j \
+                 ACCEPT"
             )),
             "{}",
-            run.stderr
-        );
-        assert!(
-            run.stderr.contains(&format!(
-                "iptables -I INPUT -i {bridge} -p udp --dport 53 -j ACCEPT"
-            )),
-            "{}",
-            run.stderr
+            warned.stderr
         );
         // Theirs, untouched.
-        let theirs = nft(&["list", "table", "ip", "filter"]).unwrap();
-        assert!(!theirs.contains(&bridge), "{theirs}");
-        assert_eq!(theirs.matches("policy drop").count(), 2, "{theirs}");
+        assert_eq!(nft(&["list", "table", "ip", "filter"]).unwrap(), theirs);
+        let _out = Server::start(upstream.netns(), 7000, "out");
+        let world = SocketAddr::from((Upstream::ADDRESS, 7000));
+        let (running, netns) = networks.sleeping(&["--network", "app", "--name", "web"]);
+        assert_eq!(fetch_from(&netns, world), None);
+        assert!(!answered(&netns, gateway, "web"));
+        apply_printed_fix(&warned.stderr, forward);
+        apply_printed_fix(&warned.stderr, input);
+        assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
+        assert!(answered(&netns, gateway, "web"));
+        running.stop();
+        let again = networks.run(&["run", "--network", "app", "true"]);
+        assert_eq!(again.code, Some(0), "{}", again.stderr);
+        assert!(
+            !again.stderr.contains("the firewall's chain"),
+            "{}",
+            again.stderr
+        );
+    });
+}
+
+/// The same with a table of nftables' own (not iptables'): the fix is `nft`
+/// lines, which work as printed.
+#[test]
+#[ignore = "needs root"]
+fn an_nftables_chains_printed_fix_works() {
+    in_new_netns(|| {
+        for command in [
+            "add table inet custom",
+            "add chain inet custom forward { type filter hook forward priority 0; policy drop; }",
+            "add chain inet custom input { type filter hook input priority 0; policy drop; }",
+        ] {
+            if nft(&[command]).is_none() {
+                return;
+            }
+        }
+        let upstream = Upstream::new();
+        upstream.route_default();
+        let networks = NetworkDir::new(SHIPYARD);
+        networks.create(&["app"]);
+        let gateway = networks.gateway("app");
+        let warned = networks.run(&["run", "--network", "app", "-p", "8080:80", "true"]);
+        assert_eq!(warned.code, Some(0), "{}", warned.stderr);
+        let forward = "the firewall's chain inet custom forward drops";
+        let input = "the firewall's chain inet custom input drops";
+        assert!(
+            warned
+                .stderr
+                .contains(r"sudo nft 'insert rule inet custom forward oifname "),
+            "{}",
+            warned.stderr
+        );
+        let _out = Server::start(upstream.netns(), 7000, "out");
+        let world = SocketAddr::from((Upstream::ADDRESS, 7000));
+        let (running, netns) =
+            networks.sleeping(&["--network", "app", "--name", "web", "-p", "8080:80"]);
+        let _published = Server::start(&netns, 80, "published");
+        let port = SocketAddr::from((Upstream::HOST, 8080));
+        assert_eq!(fetch_from(&netns, world), None);
+        assert_eq!(fetch_from(upstream.netns(), port), None);
+        assert!(!answered(&netns, gateway, "web"));
+        apply_printed_fix(&warned.stderr, forward);
+        apply_printed_fix(&warned.stderr, input);
+        assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
+        assert_eq!(
+            fetch_from(upstream.netns(), port).as_deref(),
+            Some("published")
+        );
+        assert!(answered(&netns, gateway, "web"));
+        running.stop();
+        let again = networks.run(&["run", "--network", "app", "true"]);
+        assert!(
+            !again.stderr.contains("the firewall's chain"),
+            "{}",
+            again.stderr
+        );
+    });
+}
+
+/// A second link from the host, made after Shipyard turned routing on (so
+/// only the other firewall governs it): `up1`, the far side `198.51.100.2`
+/// routing back through the host.
+fn another_link() -> Upstream {
+    let link = Upstream::with("up1", [198, 51, 100, 1], [198, 51, 100, 2]);
+    let mut far = Rtnetlink::in_namespace(std::os::fd::AsFd::as_fd(link.netns())).unwrap();
+    far.add_route(&Route::default_via(IpAddr::V4(Ipv4Addr::new(
+        198, 51, 100, 1,
+    ))))
+    .unwrap();
+    link
+}
+
+const OTHER_FAR: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 2);
+
+/// Turns `br_netfilter` on in this namespace, as Docker does (bridged
+/// frames then meet the IP hooks, and Docker's `FORWARD`): whether it could
+/// (the module is loaded).
+fn bridged_frames_filtered() -> bool {
+    std::fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "1").is_ok()
+}
+
+/// Docker's firewall (its `FORWARD` dropping by default, its `DOCKER-USER`
+/// chain, made with iptables as Docker makes them): a run is warned, with
+/// the whole fix; the printed commands, run as printed, let the containers
+/// out, reach each other, and be reached on a published port, while
+/// Docker's drop still holds for everything else; and the next run isn't
+/// warned again. Shipyard never changes Docker's rules.
+#[test]
+#[ignore = "needs root"]
+fn dockers_firewall_is_warned_about_and_its_printed_fix_works() {
+    in_new_netns(|| {
+        for args in [
+            &["-P", "FORWARD", "DROP"][..],
+            &["-N", "DOCKER-USER"],
+            &["-A", "DOCKER-USER", "-j", "RETURN"],
+            &["-A", "FORWARD", "-j", "DOCKER-USER"],
+        ] {
+            if iptables(args).is_none() {
+                return;
+            }
+        }
+        let bridged = bridged_frames_filtered();
+        let upstream = Upstream::new();
+        upstream.route_default();
+        upstream.route_back();
+        let networks = NetworkDir::new(SHIPYARD);
+        let docker = nft(&["list", "table", "ip", "filter"]).unwrap();
+        let warned = networks.run(&["run", "true"]);
+        assert_eq!(warned.code, Some(0), "{}", warned.stderr);
+        let opening = "Docker's firewall drops forwarded traffic by default";
+        assert!(
+            warned.stderr.contains(
+                "to let them through (in DOCKER-USER, the chain Docker keeps for this): sudo \
+                 iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT; sudo iptables -I \
+                 DOCKER-USER -i shipyard0 -o up0 -j ACCEPT; sudo iptables -I DOCKER-USER -o \
+                 shipyard0 -m conntrack --ctstate RELATED,ESTABLISHED,DNAT -j ACCEPT"
+            ),
+            "{}",
+            warned.stderr
+        );
+        assert_eq!(
+            nft(&["list", "table", "ip", "filter"]).unwrap(),
+            docker,
+            "Docker's rules, untouched"
+        );
+        let other = another_link();
+        let _out = Server::start(upstream.netns(), 7000, "out");
+        let (first, netns) = networks.sleeping(&["-p", "8080:80"]);
+        let _published = Server::start(&netns, 80, "published");
+        let (second, other_netns) = networks.sleeping(&[]);
+        let (ip, other_ip) = (
+            container_ip(&networks, "bridge", 0),
+            container_ip(&networks, "bridge", 1),
+        );
+        let world = SocketAddr::from((Upstream::ADDRESS, 7000));
+        let port = SocketAddr::from((Upstream::HOST, 8080));
+        // Docker's drop holds, until the fix.
+        assert_eq!(fetch_from(&netns, world), None);
+        assert_eq!(fetch_from(upstream.netns(), port), None);
+        if bridged {
+            assert!(!datagram_arrives(&netns, ip, &other_netns, other_ip));
+        }
+        apply_printed_fix(&warned.stderr, opening);
+        assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
+        assert_eq!(
+            fetch_from(upstream.netns(), port).as_deref(),
+            Some("published")
+        );
+        assert!(datagram_arrives(&netns, ip, &other_netns, other_ip));
+        // Nothing else: not into another link (Docker's bridges), nor
+        // between the host's other links.
+        let up_far = Upstream::ADDRESS;
+        assert!(!datagram_arrives(&netns, ip, other.netns(), OTHER_FAR));
+        assert!(!datagram_arrives(
+            other.netns(),
+            OTHER_FAR,
+            upstream.netns(),
+            up_far
+        ));
+        // (Both get through where Docker's drop doesn't hold: the checks
+        // above aren't vacuous.)
+        iptables(&["-P", "FORWARD", "ACCEPT"]).unwrap();
+        assert!(datagram_arrives(&netns, ip, other.netns(), OTHER_FAR));
+        assert!(datagram_arrives(
+            other.netns(),
+            OTHER_FAR,
+            upstream.netns(),
+            up_far
+        ));
+        iptables(&["-P", "FORWARD", "DROP"]).unwrap();
+        first.stop();
+        second.stop();
+        // Fixed: no warning again.
+        let again = networks.run(&["run", "true"]);
+        assert_eq!(again.code, Some(0), "{}", again.stderr);
+        assert!(!again.stderr.contains(opening), "{}", again.stderr);
+    });
+}
+
+/// firewalld's table, laid out as firewalld 2.4 writes it (read from a
+/// real one on Fedora 44) for an uplink `up0` in its default zone,
+/// `public`, which forwards (`forward: yes`) or not.
+fn firewalld_table(forwards: bool) -> Option<()> {
+    let mut commands = vec![
+        "add table inet firewalld",
+        "add chain inet firewalld filter_FORWARD { type filter hook forward priority filter + \
+         10; policy accept; }",
+        "add chain inet firewalld filter_INPUT { type filter hook input priority filter + 10; \
+         policy accept; }",
+        "add chain inet firewalld filter_FORWARD_POLICIES",
+        "add chain inet firewalld filter_INPUT_POLICIES",
+        "add chain inet firewalld filter_FWD_public",
+        "add chain inet firewalld filter_FWD_public_allow",
+        "add chain inet firewalld filter_FWD_trusted",
+        "add chain inet firewalld filter_IN_public",
+        "add chain inet firewalld filter_IN_trusted",
+        "add rule inet firewalld filter_FORWARD ct state established,related accept",
+        "add rule inet firewalld filter_FORWARD ct status dnat accept",
+        "add rule inet firewalld filter_FORWARD iifname \"lo\" accept",
+        "add rule inet firewalld filter_FORWARD jump filter_FORWARD_POLICIES",
+        "add rule inet firewalld filter_FORWARD reject with icmpx admin-prohibited",
+        "add rule inet firewalld filter_FORWARD_POLICIES oifname \"up0\" jump filter_FWD_public",
+        "add rule inet firewalld filter_FORWARD_POLICIES jump filter_FWD_public",
+        "add rule inet firewalld filter_FORWARD_POLICIES reject with icmpx admin-prohibited",
+        "add rule inet firewalld filter_FWD_public jump filter_FWD_public_allow",
+        "add rule inet firewalld filter_FWD_trusted accept",
+        "add rule inet firewalld filter_INPUT ct state established,related accept",
+        "add rule inet firewalld filter_INPUT iifname \"lo\" accept",
+        "add rule inet firewalld filter_INPUT jump filter_INPUT_POLICIES",
+        "add rule inet firewalld filter_INPUT reject with icmpx admin-prohibited",
+        "add rule inet firewalld filter_INPUT_POLICIES jump filter_IN_public",
+        "add rule inet firewalld filter_INPUT_POLICIES reject with icmpx admin-prohibited",
+        "add rule inet firewalld filter_IN_public tcp dport 22 accept",
+        "add rule inet firewalld filter_IN_trusted accept",
+    ];
+    if forwards {
+        commands.push("add rule inet firewalld filter_FWD_public_allow oifname \"up0\" accept");
+    }
+    for command in commands {
+        nft(&[command])?;
+    }
+    Some(())
+}
+
+/// What `firewall-cmd --zone=trusted --add-interface=BRIDGE` adds (firewalld
+/// 2.4's rules, as on Fedora 44).
+fn firewalld_trusts(bridge: &str) {
+    for command in [
+        format!(
+            "insert rule inet firewalld filter_FORWARD_POLICIES iifname \"{bridge}\" oifname \
+             \"up0\" jump filter_FWD_trusted"
+        ),
+        format!(
+            "insert rule inet firewalld filter_FORWARD_POLICIES iifname \"{bridge}\" jump \
+             filter_FWD_trusted"
+        ),
+        format!(
+            "insert rule inet firewalld filter_INPUT_POLICIES iifname \"{bridge}\" jump \
+             filter_IN_trusted"
+        ),
+    ] {
+        nft(&[&command]).unwrap();
+    }
+}
+
+/// firewalld as Fedora has it (its default zone forwards): the default
+/// network gets out and isn't warned about; a network with a DNS server is,
+/// as firewalld rejects its queries, with firewalld's own fix; once the
+/// bridge is in the trusted zone, the server answers and the warning stops.
+/// Shipyard never changes firewalld's rules.
+#[test]
+#[ignore = "needs root"]
+fn firewalld_is_warned_about_until_the_bridge_is_trusted() {
+    in_new_netns(|| {
+        if firewalld_table(true).is_none() {
+            return;
+        }
+        let upstream = Upstream::new();
+        upstream.route_default();
+        let networks = NetworkDir::new(SHIPYARD);
+        let firewalld = nft(&["list", "table", "inet", "firewalld"]).unwrap();
+        let _out = Server::start(upstream.netns(), 7000, "out");
+        let world = SocketAddr::from((Upstream::ADDRESS, 7000));
+        // The default network: no DNS server, and the zone forwards.
+        let quiet = networks.run(&["run", "true"]);
+        assert!(!quiet.stderr.contains("firewalld"), "{}", quiet.stderr);
+        let (running, netns) = networks.sleeping(&[]);
+        assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
+        running.stop();
+        // A network with a DNS server.
+        networks.create(&["app"]);
+        let bridge = networks.inspect("app")["Bridge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let gateway = networks.gateway("app");
+        let warned = networks.run(&["run", "--network", "app", "true"]);
+        assert!(
+            warned.stderr.contains(&format!(
+                "firewalld rejects what comes from an interface it doesn't trust: containers on \
+                 {bridge} would get no answer from their DNS server (on {gateway}:53); to put \
+                 the bridge in firewalld's trusted zone: sudo firewall-cmd --permanent \
+                 --zone=trusted --add-interface={bridge} && sudo firewall-cmd --reload"
+            )),
+            "{}",
+            warned.stderr
+        );
+        assert_eq!(
+            nft(&["list", "table", "inet", "firewalld"]).unwrap(),
+            firewalld,
+            "firewalld's rules, untouched"
+        );
+        let (running, netns) = networks.sleeping(&["--network", "app", "--name", "web"]);
+        assert!(
+            !answered(&netns, gateway, "web"),
+            "firewalld's reject holds"
+        );
+        firewalld_trusts(&bridge);
+        assert!(answered(&netns, gateway, "web"));
+        running.stop();
+        let again = networks.run(&["run", "--network", "app", "true"]);
+        assert!(!again.stderr.contains("firewalld"), "{}", again.stderr);
+    });
+}
+
+/// firewalld whose default zone doesn't forward (before firewalld 1.0, or
+/// `forward: no`): the default network has no way out, and is warned; the
+/// trusted zone lets it out.
+#[test]
+#[ignore = "needs root"]
+fn firewalld_that_doesnt_forward_keeps_the_way_out_until_trusted() {
+    in_new_netns(|| {
+        if firewalld_table(false).is_none() {
+            return;
+        }
+        let upstream = Upstream::new();
+        upstream.route_default();
+        let networks = NetworkDir::new(SHIPYARD);
+        let opening = "firewalld rejects what comes from an interface it doesn't trust";
+        let warned = networks.run(&["run", "true"]);
+        assert!(
+            warned.stderr.contains(&format!(
+                "{opening}: containers on shipyard0 would have no way out; to put the bridge"
+            )),
+            "{}",
+            warned.stderr
+        );
+        let _out = Server::start(upstream.netns(), 7000, "out");
+        let world = SocketAddr::from((Upstream::ADDRESS, 7000));
+        let (running, netns) = networks.sleeping(&[]);
+        assert_eq!(fetch_from(&netns, world), None, "firewalld's reject holds");
+        firewalld_trusts("shipyard0");
+        assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
+        running.stop();
+        let again = networks.run(&["run", "true"]);
+        assert!(!again.stderr.contains(opening), "{}", again.stderr);
     });
 }
 
@@ -516,7 +911,9 @@ fn datagram_arrives(
     to: Ipv4Addr,
 ) -> bool {
     use std::net::UdpSocket;
-    let receiver = in_netns(listener, || UdpSocket::bind((to, 9999))).unwrap();
+    // A port the kernel picks: a fixed one may be taken in a busy run.
+    let receiver = in_netns(listener, || UdpSocket::bind((to, 0))).unwrap();
+    let port = receiver.local_addr().unwrap().port();
     receiver
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
@@ -524,7 +921,7 @@ fn datagram_arrives(
         let sender = UdpSocket::bind((from, 0)).unwrap();
         // A few: the first may wait for the neighbour's hardware address.
         for _ in 0..3 {
-            let _ = sender.send_to(b"hello", (to, 9999));
+            let _ = sender.send_to(b"hello", (to, port));
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
@@ -552,7 +949,9 @@ fn raw_datagram_arrives(
     vlan_tags: usize,
 ) -> bool {
     use std::net::UdpSocket;
-    let receiver = in_netns(listener, || UdpSocket::bind((to, 9998))).unwrap();
+    // A port the kernel picks: a fixed one may be taken in a busy run.
+    let receiver = in_netns(listener, || UdpSocket::bind((to, 0))).unwrap();
+    let port = receiver.local_addr().unwrap().port();
     receiver
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
@@ -578,7 +977,7 @@ fn raw_datagram_arrives(
     frame.extend([0x08, 0x00]);
     frame.extend(ip);
     frame.extend(1234_u16.to_be_bytes());
-    frame.extend(9998_u16.to_be_bytes());
+    frame.extend(port.to_be_bytes());
     frame.extend(udp_len.to_be_bytes());
     frame.extend([0, 0]);
     frame.extend(payload);

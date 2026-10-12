@@ -115,13 +115,15 @@ fn bad_json_says_where() {
     assert!(run.stderr.contains("line 3"), "{}", run.stderr);
 }
 
-/// What `runc spec` writes asks for what Shipyard can't give yet (a
-/// terminal): the bundle is refused, naming the field, before anything
-/// starts. Its device rule and its network namespace are applied.
+/// What `runc spec` writes runs as it is: its terminal (`process.terminal`)
+/// is the command's own, as `-t` gives (output to a pipe here: no input),
+/// and its device rule and network namespace are applied, with nothing
+/// warned about.
 #[test]
-fn a_runc_spec_config_is_refused_with_its_reasons() {
+#[ignore = "needs root"]
+fn a_runc_spec_config_runs() {
     let bundle = Bundle::new();
-    let mut config = bundle.config();
+    let mut config = running(&bundle, "tty; echo spec-\"\"ok");
     config["process"]["terminal"] = json!(true);
     config["process"]["capabilities"] = json!({"bounding": ["CAP_KILL"]});
     config["process"]["noNewPrivileges"] = json!(true);
@@ -129,11 +131,13 @@ fn a_runc_spec_config_is_refused_with_its_reasons() {
         json!([{"type": "pid"}, {"type": "network"}, {"type": "mount"}]);
     config["linux"]["resources"] = json!({"devices": [{"allow": false, "access": "rwm"}]});
     let run = run_bundle(&bundle, &config);
-    assert_eq!(run.code, Some(125), "{}", run.stderr);
-    assert!(run.stderr.contains("process.terminal"), "{}", run.stderr);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stdout.contains("/dev/pts/0"), "{}", run.stdout);
+    assert!(run.stdout.contains("spec-ok"), "{}", run.stdout);
     // Applied since stage 4 (the device rules since stage 5, the network
-    // namespace since stage 7), so not among the reasons any more.
+    // namespace since stage 7, the terminal since 8.3a): nothing said.
     for applied in [
+        "process.terminal",
         "process.capabilities",
         "process.noNewPrivileges",
         "linux.resources",
@@ -166,6 +170,26 @@ fn a_missing_bind_source_is_named() {
 }
 
 // --- As root: running bundles -------------------------------------------------
+
+/// A terminal bundle's terminal is its `consoleSize` when there's no
+/// terminal to copy the size from (output to a pipe), else 24x80.
+#[test]
+#[ignore = "needs root"]
+fn a_terminal_bundle_takes_its_console_size_when_piped() {
+    let bundle = Bundle::new();
+    for (size, expected) in [
+        (Some(json!({"height": 30, "width": 100})), "30 100"),
+        (None, "24 80"),
+    ] {
+        let out = ok(&bundle, "stty size", |config| {
+            config["process"]["terminal"] = json!(true);
+            if let Some(size) = size {
+                config["process"]["consoleSize"] = size;
+            }
+        });
+        assert_eq!(out.trim(), expected);
+    }
+}
 
 /// The process's arguments, environment, working directory, user, umask,
 /// groups, limits and hostname are the config's.

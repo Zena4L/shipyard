@@ -1,9 +1,15 @@
 name: CI
 
+# Manual only for now: the repository's Actions billing is off, so GitHub starts
+# no job ("recent account payments have failed or your spending limit needs to
+# be increased"), and every push would show a red run. Run it by hand
+# (`gh workflow run CI --ref BRANCH`) once billing is back; until then the checks
+# run locally (`scripts/test-linux.sh`, and the commands in CLAUDE.md).
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  # pull_request:
 
 # Read-only token: CI never needs to write to the repository.
 permissions:
@@ -39,45 +45,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-latest is off for now: its run takes too long. The Linux
+        # tests still run in the `apparmor` and `fedora` jobs below.
+        # os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     # A hung supervisor test must fail the job, not hold a runner for hours.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Rootless containers (stage 4) run as this normal user: Ubuntu restricts
-      # unprivileged user namespaces with AppArmor (since 23.10), and the full
-      # ID map needs newuidmap/newgidmap and a subordinate range for the user.
-      # Their network is pasta (passt, stage 7).
+      # Rootless containers (stage 4) run as this normal user. Here they run
+      # the binaries cargo built (in target/), which Shipyard's AppArmor
+      # profile doesn't attach to, so Ubuntu's restriction on user namespaces
+      # (since 23.10) is turned off; the `apparmor` job below tests with it on.
       - name: allow rootless containers
         if: runner.os == 'Linux'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq uidmap passt
-          me=$(id -un)
-          grep -q "^$me:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$me"
-          grep -q "^$me:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$me"
-      # Rootless cgroups (stage 5) need a cgroup delegated to this user, as
-      # systemd's user manager (user@UID.service) is: start it (lingering),
-      # and run the tests in a scope inside it.
-      - name: a delegated cgroup (the user's systemd manager)
-        if: runner.os == 'Linux'
-        run: |
-          sudo loginctl enable-linger "$(id -un)"
-          bus="/run/user/$(id -u)/bus"
-          for _ in $(seq 50); do [ -S "$bus" ] && break; sleep 0.2; done
-          [ -S "$bus" ]
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" >> "$GITHUB_ENV"
+          scripts/ci/rootless-setup.sh
       - run: cargo clippy --locked --workspace --all-targets
+      # On Linux: built first, then run with a time limit and the output in a
+      # file (scripts/ci/run-logged.sh), so a hang ends the step with its log.
       - name: cargo test
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            systemd-run --user --scope --quiet cargo test --locked --workspace
+            cargo test --locked --workspace --no-run
+            scripts/ci/run-logged.sh 600 tests \
+              systemd-run --user --scope --quiet cargo test --locked --workspace
           else
             cargo test --locked --workspace
           fi
@@ -102,9 +99,11 @@ jobs:
           # On Linux, each test binary runs in a network namespace of its
           # own (scripts/ci-netns.sh): as root, `shipyard run` makes a bridge,
           # firewall rules and turns on forwarding, never on the runner.
-          - os: ubuntu-latest
-            runner_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER
-            runner: ci-netns
+          # Off for now: its run takes too long (the `fedora` job runs the
+          # root tests on Linux).
+          # - os: ubuntu-latest
+          #   runner_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER
+          #   runner: ci-netns
           - os: macos-latest
             runner_var: CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER
             runner: sudo -E
@@ -123,22 +122,144 @@ jobs:
       # The pasta tests run shipyard as the runner's user (SUDO_UID) from
       # root: pasta for it, and rootless user namespaces allowed.
       # nft (nftables) only for the firewall tests to look with, and to make
-      # another program's chains: Shipyard never runs it.
-      - name: pasta, for rootless networking; nft, for the firewall tests
+      # another program's chains: Shipyard never runs it. nft, ip and dig are
+      # also the references Shipyard's own nf_tables, netlink and DNS server
+      # are tested against (H5).
+      - name: pasta, for rootless networking; nft and dig, for the tests
         if: runner.os == 'Linux'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           sudo apt-get update -qq
-          sudo apt-get install -y -qq passt uidmap nftables
+          sudo apt-get install -y -qq passt uidmap nftables bind9-dnsutils
       - name: host facts for the container tests
         if: runner.os == 'Linux'
         run: |
           uname -r
           ldd --version | head -1
           findmnt -no PROPAGATION /
-      - run: cargo test --locked --workspace -- --include-ignored
+      # The terminal tests first, on their own (temporary, to diagnose): a
+      # step's own time limit fails it before the job's, so its log is kept.
+      - name: terminal tests, on their own
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          cargo test --locked -p shipyard-cli --test terminal --no-run
+          scripts/ci/run-logged.sh 240 terminal \
+            cargo test --locked -p shipyard-cli --test terminal -- --include-ignored
+      - name: cargo test
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            cargo test --locked --workspace --no-run
+            scripts/ci/run-logged.sh 600 tests cargo test --locked --workspace -- --include-ignored
+          else
+            cargo test --locked --workspace -- --include-ignored
+          fi
+        env:
+          # ip, nft and dig are installed above: the differential tests
+          # (H5) must run, not skip.
+          SHIPYARD_TEST_TOOLS: required
+      # Diagnostics (temporary): what pasta and AppArmor said, kept even when
+      # a test step fails or times out.
+      - name: diagnostics (pasta, AppArmor denials)
+        if: always() && runner.os == 'Linux'
+        run: |
+          uname -rm
+          pasta --version 2>&1 | head -1 || true
+          ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
+          sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
+          sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true
+
+  # A real host (H4): Ubuntu as users have it, the AppArmor restriction on
+  # user namespaces left on, and Shipyard installed in /usr/local/bin with
+  # its profile, as docs/user/README.md says. The end-to-end tests run the
+  # installed binaries (SHIPYARD_TEST_BIN_DIR). A control proves the profile
+  # is what lets them through.
+  apparmor:
+    name: rootless (Ubuntu, AppArmor on)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the restriction is on, as it is on users' machines
+        run: test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+      - run: scripts/ci/rootless-setup.sh
+      - run: cargo build --locked --bins
+      - name: install shipyard and its AppArmor profile, as a user would
+        run: |
+          sudo install -m 0755 target/debug/shipyard target/debug/shipyard-runtime /usr/local/bin/
+          sudo install -m 0644 contrib/apparmor/shipyard /etc/apparmor.d/shipyard
+          sudo apparmor_parser -r /etc/apparmor.d/shipyard
+      - name: the profile is what lets it make user namespaces (control)
+        run: scripts/ci/apparmor-control.sh
+      # shipyard-cli's tests: the end-to-end ones run the installed binaries.
+      # (The runtime's in-process tests make user namespaces from their own
+      # test binary, which no profile covers: they run in `check`.)
+      # The terminal tests first, on their own (temporary, to diagnose): a
+      # step's own time limit fails it before the job's, so its log is kept.
+      - name: terminal tests, on their own, against the installed binaries
+        continue-on-error: true
+        run: |
+          cargo test --locked -p shipyard-cli --test terminal --no-run
+          scripts/ci/run-logged.sh 240 terminal \
+            systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli --test terminal
+        env:
+          SHIPYARD_TEST_BIN_DIR: /usr/local/bin
+          SHIPYARD_TEST_ROOTLESS: required
+          SHIPYARD_TEST_DELEGATED: required
+      - name: cargo test, against the installed binaries
+        run: |
+          cargo test --locked -p shipyard-cli --no-run
+          scripts/ci/run-logged.sh 600 tests \
+            systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli
+        env:
+          SHIPYARD_TEST_BIN_DIR: /usr/local/bin
+          SHIPYARD_TEST_ROOTLESS: required
+          SHIPYARD_TEST_DELEGATED: required
+      # Diagnostics (temporary): what pasta and AppArmor said, kept even when
+      # a test step fails or times out.
+      - name: diagnostics (pasta, AppArmor denials)
+        if: always()
+        run: |
+          uname -rm
+          pasta --version 2>&1 | head -1 || true
+          ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
+          sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
+          sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true
+
+  # Another real host (H4): Fedora, SELinux enforcing, in a QEMU/KVM VM on
+  # the runner. Both passes (rootless, then root), from executables built
+  # here. firewalld runs, as Fedora has it.
+  fedora:
+    name: Fedora VM (SELinux enforcing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/shipyard-vm
+          # The image is pinned in the script: a new pin, a new cache.
+          key: fedora-cloud-${{ hashFiles('scripts/ci/fedora-vm.sh') }}
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
+      - run: scripts/ci/fedora-vm.sh
+
+  # The OCI runtime conformance suite (runtime-tools, pinned in
+  # scripts/conformance/Dockerfile) against shipyard-runtime, in the same
+  # privileged container as the local runs: each test's outcome must be what
+  # scripts/conformance/expected.txt says (H5).
+  conformance:
+    name: OCI conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: scripts/test-linux.sh --conformance
 
   # musl (static, Alpine-style builds) has different libc types and wrappers;
   # make sure the code compiles there too.

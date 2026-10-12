@@ -96,7 +96,7 @@ state / kill / delete → lock ROOT/ID (checked to still be the same directory)
   build a tiny root filesystem from host binaries, with no network.
 - **A runc-compatible binary, `shipyard-runtime`,** for the OCI lifecycle: `create
   --bundle DIR ID`, `start`, `state`, `kill`, `delete`, state under `/run/shipyard`
-  (`--root`). The conformance suite (stage 14) and later the engine call it exactly like
+  (`--root`). The conformance suite (planned for stage 14; it runs since stage 8, H5) and later the engine call it exactly like
   runc. It's a second `[[bin]]` in `crates/shipyard-cli`, over a library module
   (`shipyard_runtime::container`) for the engine. `shipyard run` stays the all-in-one
   command.
@@ -472,7 +472,7 @@ room for bind-mounting the host's device nodes and `/sys` instead.
 | 6 (images) | Root filesystems from images. |
 | 7 (networking) | `/sys` without the host's network devices; `net.*` sysctls; `netDevices`. |
 | 8 (terminals, `exec`) | A terminal inside (`process.terminal`, `--console-socket`). Names for joined commands (a read-only safe resolver). |
-| 14 (conformance) | runc's global flags and `--preserve-fds`; the OCI conformance suite against `shipyard-runtime`. |
+| 14 (conformance) | runc's global flags and `--preserve-fds`; the OCI conformance suite against `shipyard-runtime` (moved to stage 8, H5). |
 | Housekeeping | Not caught by any mutation: a shared instead of exclusive lock (no test can cause the interleavings it guards). Not observable: the memfd's sealing (nothing else holds it), `O_NOFOLLOW` on the sysctl write (`/proc/sys` holds no symlinks). |
 
 **Resolved from stage 2:** `pivot_root` (the host's `/proc` no longer under ours, and

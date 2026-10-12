@@ -104,12 +104,54 @@ fn close_on_exec_again(setup: &super::setup::Setup) {
         .root
         .as_ref()
         .and_then(super::setup::RootSetup::attach);
-    for fd in setup.gate.into_iter().chain(hooks_pipe).chain(attach) {
+    let terminal = setup.terminal.as_ref().map(|terminal| terminal.socket);
+    let passed = setup
+        .passing
+        .iter()
+        .flat_map(|passing| passing.sources.iter().copied());
+    for fd in setup
+        .gate
+        .into_iter()
+        .flat_map(super::spawn::Gate::fds)
+        .chain(hooks_pipe)
+        .chain(attach)
+        .chain(terminal)
+        .chain(passed)
+    {
         let _ = nix::fcntl::fcntl(
             // SAFETY: inherited across the exec; borrowed only for this call.
             unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         );
+    }
+}
+
+/// The descriptors passed on to the command (see `passed.rs`) and their
+/// targets (3 and up), held from the start: what this process opens from
+/// then on (the report pipe made again after the gate, say) can't take one
+/// of their numbers. Dropped once the command has them: a socket it closes
+/// is then closed.
+struct Held {
+    _sources: Vec<OwnedFd>,
+    _reserved: Vec<OwnedFd>,
+}
+
+impl Held {
+    fn new(setup: &super::setup::Setup) -> Result<Self, Failure> {
+        // SAFETY: passed across the exec, this process's own (the setup
+        // names them).
+        let sources: Vec<OwnedFd> = setup
+            .passing
+            .iter()
+            .flat_map(|passing| passing.sources.iter())
+            .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect();
+        let reserved = super::passed::reserve(sources.len())
+            .map_err(|err| Failure::at(ChildStep::PassFds, err.errno().unwrap_or(Errno::EBUSY)))?;
+        Ok(Self {
+            _sources: sources,
+            _reserved: reserved,
+        })
     }
 }
 
@@ -151,6 +193,8 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     let setup =
         read_setup(setup_fd).unwrap_or_else(|errno| fail(Failure::at(ChildStep::ReadSetup, errno)));
     close_on_exec_again(&setup);
+    // Before anything is opened here (see `Held`).
+    let held = Held::new(&setup).unwrap_or_else(|failure| fail(failure));
     // The proof that this image started: without it, shipyard reports an
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);
@@ -199,18 +243,22 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     // kernel.
     let confinement = Confinement::new(&setup.security, spec.user.uid, last_cap, kernel_version())
         .unwrap_or_else(|err| fail(confinement_failure(&err)));
-    let (plan, mut context) = ChildPlan::for_container_command(
+    let (mut plan, mut context) = ChildPlan::for_container_command(
         &spec,
         setup.keep_ignored.clone(),
         setup.parent,
         confinement,
         setgroups_allowed,
+        setup.passing.as_ref(),
     )
     .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
     context.namespace_root = setup
         .user_namespace
         .as_ref()
         .and_then(|namespace| namespace.maps.host_uid(0));
+    let slave = command_terminal(&setup, spec.user.uid, spec.user.gid)
+        .unwrap_or_else(|failure| fail(failure));
+    plan.terminal = slave.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
     // With an init, its command waits until the init has confined itself
     // (`confine_self`): nothing in the container runs beside an init that
     // still has root's power. (Made before the start gate, so a failure is
@@ -218,6 +266,10 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     let go = setup.init.then(|| {
         nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .unwrap_or_else(|errno| fail(Failure::at(ChildStep::Handshake, errno)))
+    });
+    // Held until the command has `execve`d: see `hold_started`.
+    let started = setup.gate.and_then(|gate| gate.started).map(|fifo| {
+        hold_started(fifo).unwrap_or_else(|errno| fail(Failure::at(ChildStep::StartedFifo, errno)))
     });
     // With a start gate (`shipyard-runtime create`): everything that can
     // fail before the command has been reported by now. Closing the report
@@ -228,7 +280,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         Some(gate) => {
             PANIC_REPORT.store(-1, Ordering::Relaxed);
             let _ = nix::unistd::close(report);
-            wait_at_gate(gate);
+            wait_at_gate(gate.fifo);
             match report_pipe() {
                 Ok((read, write)) => (write.into_raw_fd(), Some(read)),
                 Err(_) => (-1, None),
@@ -250,17 +302,174 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     };
     let command = start_command(&plan, report, go, last_cap)
         .unwrap_or_else(|errno| fail(Failure::at(ChildStep::InitFork, errno)));
-    let (report, exec_failure) = match command_report {
+    // The command has its terminal: the init keeps no part of it. Nor of
+    // what's passed on: a socket the command closes is then closed.
+    drop((slave, held));
+    let (report, exec_failure) = await_exec(report, command_report, &context);
+    // It has `execve`d (or failed to): `start` may go on.
+    drop(started);
+    become_init(command, status, report, exec_failure)
+}
+
+/// Past a start gate (`command_report`, the report pipe made again there):
+/// waits until the command has `execve`d, or explains why it couldn't
+/// (`explain_failure`). Returns the report descriptor `become_init` is left
+/// with (-1: closed here) and the failure, if any.
+fn await_exec(
+    report: RawFd,
+    command_report: Option<OwnedFd>,
+    context: &FailureContext,
+) -> (RawFd, Option<u8>) {
+    match command_report {
         Some(read) => {
             // Our copy closed first, or the pipe never reaches end-of-file.
             let _ = nix::unistd::close(report);
             // Closed already: `become_init` must not close it (or a reused
             // descriptor number) again.
-            (-1, explain_failure(read, &context))
+            (-1, explain_failure(read, context))
         }
         None => (report, None),
+    }
+}
+
+/// The command's pseudo-terminal's slave, if it has one: made here from the
+/// container's own devpts, its master sent back (see [`make_terminal`]).
+///
+/// On an OCI console socket (with a gate), the terminal is also the init's
+/// stdin, stdout and stderr, as runc's: `create`'s own go back to its caller
+/// once it returns (a shim reads them to their end before it calls `start`),
+/// and a failure after `start` is explained on the terminal, where it's
+/// seen. (Kept as they are if `dup2` fails.)
+fn command_terminal(
+    setup: &super::setup::Setup,
+    uid: u32,
+    gid: u32,
+) -> Result<Option<OwnedFd>, Failure> {
+    let Some(terminal) = &setup.terminal else {
+        return Ok(None);
     };
-    become_init(command, status, report, exec_failure)
+    let slave = make_terminal(terminal, uid, gid)?;
+    if setup.gate.is_some() {
+        for fd in 0..=2 {
+            // SAFETY: `dup2` onto the standard descriptors, which this
+            // process owns; the slave stays open.
+            unsafe { libc::dup2(slave.as_raw_fd(), fd) };
+        }
+    }
+    Ok(Some(slave))
+}
+
+/// The command's pseudo-terminal (TLPI ch. 64): made from the container's
+/// own devpts (its root filesystem's, or the one `own_terminals` mounts),
+/// sized as the user's terminal (a new one is 0x0: probe T7), its slave
+/// opened from the master, never by path (another devpts could be mounted
+/// over it: T3), and given to the command's user, as runc does, so programs
+/// that open their terminal by name can. Everything `O_NOCTTY`: this
+/// process leads a session, and opening a terminal without it would make it
+/// the init's (T2). The master goes to shipyard (`SCM_RIGHTS`, T6) with its
+/// name (runc's message). Shipyard answers once it's relaying it: only then
+/// may the command write to it. On an OCI console socket nothing answers
+/// (runc's protocol): the socket is closed once the master is sent. Returns
+/// the slave, for the command.
+fn make_terminal(
+    terminal: &super::setup::TerminalSetup,
+    uid: u32,
+    gid: u32,
+) -> Result<OwnedFd, Failure> {
+    use nix::fcntl::OFlag;
+    let master = nix::fcntl::open(
+        "/dev/pts/ptmx",
+        OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|errno| Failure::at(ChildStep::TerminalOpen, errno).detail(0))?;
+    terminal_from(master, terminal, uid, gid)
+}
+
+/// [`make_terminal`]'s steps from the master, opened (`exec`'s joiner opens
+/// it through the init's root: `exec.rs`): it must be a pseudo-terminal's
+/// master, or the ioctls fail (ENOTTY). Returns the slave.
+pub(super) fn terminal_from(
+    master: OwnedFd,
+    terminal: &super::setup::TerminalSetup,
+    uid: u32,
+    gid: u32,
+) -> Result<OwnedFd, Failure> {
+    let step =
+        |detail: usize| move |errno| Failure::at(ChildStep::TerminalOpen, errno).detail(detail);
+    let unlock: libc::c_int = 0;
+    // SAFETY: `TIOCSPTLCK` reads one int, which `unlock` is.
+    Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSPTLCK, &raw const unlock) })
+        .map_err(step(1))?;
+    super::terminal::set_window_size(master.as_raw_fd(), (terminal.rows, terminal.cols))
+        .map_err(step(2))?;
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `TIOCGPTPEER` takes the open flags and returns a new
+    // descriptor, which nothing else owns.
+    let slave = Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) })
+        .map_err(step(3))?;
+    // SAFETY: just returned by the kernel, ours alone.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    nix::unistd::fchown(
+        &slave,
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+    )
+    .map_err(step(4))?;
+    // SAFETY: ours alone: inherited across the exec (see `Setup::terminal`),
+    // or, in `exec`'s joiner, its own copy.
+    let socket = unsafe { OwnedFd::from_raw_fd(terminal.socket) };
+    let sent = |errno| Failure::at(ChildStep::TerminalSend, errno);
+    super::terminal::send_fd(socket.as_fd(), master.as_fd(), super::terminal::MASTER_NAME)
+        .map_err(sent)?;
+    drop(master);
+    if !terminal.acknowledged {
+        return Ok(slave);
+    }
+    // Shipyard's byte: the user's terminal is raw (if asked), and the
+    // master relayed. End-of-file: shipyard is gone.
+    let mut byte = [0_u8; 1];
+    loop {
+        match nix::unistd::read(&socket, &mut byte) {
+            Ok(1) => return Ok(slave),
+            Ok(_) => return Err(sent(Errno::EPIPE).detail(1)),
+            Err(Errno::EINTR) => {}
+            Err(errno) => return Err(sent(errno).detail(1)),
+        }
+    }
+}
+
+/// Without a root filesystem of its own, the container sees the host's
+/// `/dev`: its `/dev/pts` would name the host's terminals, the user's among
+/// them, which the container could open by path (and change, or read keys
+/// from) though it was never given one (D16). A devpts instance of its own
+/// over it shows only the container's, as a root filesystem's `/dev` does
+/// (`rootfs.rs`); and its `ptmx` over `/dev/ptmx`, so programs that make a
+/// terminal (`script`, `tmux`) make it there. Only in this mount namespace:
+/// the host's are untouched.
+fn own_terminals() -> Result<(), Errno> {
+    let mount_devpts = |options: &str| {
+        mount(
+            Some("devpts"),
+            "/dev/pts",
+            Some("devpts"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some(options),
+        )
+    };
+    // The `tty` group, where the user namespace maps it (probe T1: EINVAL
+    // where it doesn't).
+    match mount_devpts("newinstance,ptmxmode=0666,mode=0620,gid=5") {
+        Err(Errno::EINVAL) => mount_devpts("newinstance,ptmxmode=0666,mode=0620")?,
+        result => result?,
+    }
+    mount(
+        Some("/dev/pts/ptmx"),
+        "/dev/ptmx",
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
 }
 
 /// Forks the command, PID 2. It waits on the go pipe (read, write ends)
@@ -421,6 +630,21 @@ fn wait_at_gate(gate: RawFd) {
     let _ = nix::unistd::close(gate);
 }
 
+/// Opens the started FIFO (`O_PATH` at `fifo`, see `Gate::started`) for
+/// writing, close-on-exec, and closes `fifo`. `O_RDWR`: a FIFO opened so
+/// doesn't wait for a reader. Held until the command has `execve`d (or
+/// failed to): `start` runs its `poststart` hooks once nobody holds it.
+/// Opened before the gate, so it's held whenever `start` looks.
+fn hold_started(fifo: RawFd) -> nix::Result<OwnedFd> {
+    let opened = nix::fcntl::open(
+        format!("/proc/self/fd/{fifo}").as_str(),
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    );
+    let _ = nix::unistd::close(fifo);
+    opened
+}
+
 /// Waits until nobody has the pipe whose write end is `fifo` open for
 /// reading (POLLERR on a write end).
 fn wait_for_no_reader(fifo: &impl AsFd) {
@@ -501,6 +725,9 @@ fn set_up(setup: &super::setup::Setup, report: RawFd) -> Result<Option<State>, F
             .map_err(at(ChildStep::MountProc))?;
         }
         sysctl::apply_at(Path::new("/proc"), &setup.sysctls)?;
+        if setup.private_mounts {
+            own_terminals().map_err(at(ChildStep::OwnTerminals))?;
+        }
         if let Some(cgroup) = setup.cgroup.mount {
             mount_cgroup_over_the_hosts(cgroup).map_err(at(ChildStep::MountCgroup))?;
         }
@@ -766,7 +993,7 @@ fn join_session_keyring() -> Result<(), Errno> {
 
 /// `/proc/sys/kernel/cap_last_cap`: the number of this kernel's last
 /// capability (40 on Linux 5.9 and later).
-fn cap_last_cap() -> Result<u8, Errno> {
+pub(super) fn cap_last_cap() -> Result<u8, Errno> {
     let text = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(|err| super::io_errno(&err))?;
     text.trim().parse().map_err(|_| Errno::EINVAL)
@@ -775,12 +1002,12 @@ fn cap_last_cap() -> Result<u8, Errno> {
 /// This kernel's `(major, minor)` version, for a seccomp profile's
 /// `minKernel` conditions. `(0, 0)` if `uname` doesn't say: rules that need
 /// a newer kernel are then left out, and a filter can only get stricter.
-fn kernel_version() -> (u32, u32) {
+pub(super) fn kernel_version() -> (u32, u32) {
     crate::kernel::version(&crate::kernel::release()).unwrap_or_default()
 }
 
 /// A confinement this kernel can't apply, as a setup failure.
-fn confinement_failure(err: &ConfinementError) -> Failure {
+pub(super) fn confinement_failure(err: &ConfinementError) -> Failure {
     match err {
         ConfinementError::UnknownToKernel(capability) => {
             Failure::at(ChildStep::CapabilityUnknown, Errno::EINVAL)

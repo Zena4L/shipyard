@@ -341,7 +341,7 @@ impl Copies {
         std::fs::create_dir_all(&dir).unwrap();
         assert_setuid_works_in(&dir);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for binary in [SHIPYARD_BINARY, RUNTIME_BINARY] {
+        for binary in [shipyard_binary(), runtime_binary()] {
             let copy = dir.join(std::path::Path::new(binary).file_name().unwrap());
             std::fs::copy(binary, &copy).unwrap();
             std::os::unix::fs::chown(&copy, Some(owner), None).unwrap();
@@ -368,8 +368,12 @@ impl Drop for Copies {
     }
 }
 
-const SHIPYARD_BINARY: &str = env!("CARGO_BIN_EXE_shipyard");
-const RUNTIME_BINARY: &str = env!("CARGO_BIN_EXE_shipyard-runtime");
+fn shipyard_binary() -> &'static str {
+    shipyard_test_support::binary(env!("CARGO_BIN_EXE_shipyard"))
+}
+fn runtime_binary() -> &'static str {
+    shipyard_test_support::binary(env!("CARGO_BIN_EXE_shipyard-runtime"))
+}
 
 /// What a refused privileged start says (`Error::PrivilegedStart`).
 const PRIVILEGED: &str = "started with elevated privileges";
@@ -383,27 +387,31 @@ const PRIVILEGED: &str = "started with elevated privileges";
 #[ignore = "needs root"]
 fn a_privileged_start_is_refused_at_every_entry_point() {
     let starts: [(&str, &[&str], &str); 8] = [
-        (SHIPYARD_BINARY, &["doctor"], ""),
-        (SHIPYARD_BINARY, &["__shipyard-probe"], "bad arguments"),
+        (shipyard_binary(), &["doctor"], ""),
+        (shipyard_binary(), &["__shipyard-probe"], "bad arguments"),
         (
-            SHIPYARD_BINARY,
+            shipyard_binary(),
             &["__shipyard-init"],
             "internal entry point",
         ),
-        (SHIPYARD_BINARY, &["__shipyard-storage"], "bad arguments"),
+        (shipyard_binary(), &["__shipyard-storage"], "bad arguments"),
         (
-            SHIPYARD_BINARY,
+            shipyard_binary(),
             &["__shipyard-dns"],
             "without its four arguments",
         ),
         (
-            RUNTIME_BINARY,
+            runtime_binary(),
             &["state", "no-such-container"],
             "no-such-container",
         ),
-        (RUNTIME_BINARY, &["__shipyard-init"], "internal entry point"),
         (
-            RUNTIME_BINARY,
+            runtime_binary(),
+            &["__shipyard-init"],
+            "internal entry point",
+        ),
+        (
+            runtime_binary(),
             &["__shipyard-monitor"],
             "internal entry point",
         ),
@@ -922,5 +930,11 @@ fn a_bundles_seccomp_is_its_own() {
         });
     });
     assert_ne!(refused.code, Some(0), "{}", refused.stdout);
-    assert!(refused.stderr.contains("can't cd"), "{}", refused.stderr);
+    // (dash says "can't cd", bash "cd: /tmp: Not a directory": the errno
+    // the filter returned.)
+    assert!(
+        refused.stderr.contains("can't cd") || refused.stderr.contains("Not a directory"),
+        "{}",
+        refused.stderr
+    );
 }

@@ -8,7 +8,7 @@
 //! | `bridges`     | every network's bridge                                       |
 //! | `same_bridge` | `bridge . bridge` for each: traffic within one network       |
 //! | `internal`    | the bridges of networks with no way out (`--internal`)       |
-//! | `masquerade`  | the subnets of networks with a way out                       |
+//! | `masquerade4` | the subnets of networks with a way out                       |
 //! | `masquerade6` | their IPv6 prefixes                                          |
 //! | `ports`       | `protocol . port` → `container address . port` (any address) |
 //! | `ports_addr`  | `address . protocol . port` → the same (one host address)    |
@@ -79,7 +79,10 @@ pub const TABLE: &str = "shipyard";
 /// Its family: IPv4 and IPv6 (`inet`).
 pub(crate) const FAMILY: u8 = NFPROTO_INET;
 /// Its user data: what version of these rules it holds.
-pub(crate) const VERSION: &[u8] = b"shipyard ruleset 5";
+// (6: `masquerade` became `masquerade4`: `masquerade` is a keyword of
+// nft's language, so `nft -f` couldn't read back a listing of the table,
+// and a host saving and restoring its firewall with nft would fail on it.)
+pub(crate) const VERSION: &[u8] = b"shipyard ruleset 6";
 /// The most elements one request adds or removes: each is answered alone,
 /// and a batch must fit the socket's buffers.
 const ELEMENTS_PER_REQUEST: usize = 256;
@@ -104,7 +107,7 @@ pub(crate) mod set {
     pub(crate) const INTERNAL: &str = "internal";
     pub(crate) const CLOSED: &str = "closed";
     pub(crate) const UPLINKS: &str = "uplinks";
-    pub(crate) const MASQUERADE: &str = "masquerade";
+    pub(crate) const MASQUERADE: &str = "masquerade4";
     pub(crate) const MASQUERADE6: &str = "masquerade6";
     pub(crate) const PORTS: &str = "ports";
     pub(crate) const PORTS_ADDR: &str = "ports_addr";
@@ -151,7 +154,7 @@ const fn reg(n: u32) -> u32 {
     NFT_REG32_00 + n
 }
 
-fn sets() -> [SetSpec; 11] {
+pub(super) fn sets() -> [SetSpec; 11] {
     let ifname_len = u32::try_from(IFNAMSIZ).unwrap_or(16);
     let ifname = (TYPE_IFNAME, ifname_len);
     let target = Some((concat_type(&[TYPE_IPADDR, TYPE_INET_SERVICE]), 8));
@@ -233,7 +236,7 @@ fn sets() -> [SetSpec; 11] {
     ]
 }
 
-fn chains() -> [BaseChain; 5] {
+pub(super) fn chains() -> [BaseChain; 5] {
     [
         BaseChain {
             name: chain::GUARD,

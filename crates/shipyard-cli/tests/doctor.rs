@@ -283,5 +283,33 @@ fn a_ready_host_is_ready_as_root() {
             .map(|entry| entry.file_name())
             .collect();
         assert!(left.is_empty(), "left behind: {left:?}");
+        assert_eq!(report.line("firewall").0, "ok", "{}", report.stdout);
+        // Docker's firewall: a warning (a run works; its containers can't
+        // get out), with Docker's fix.
+        for command in [
+            "add table ip filter",
+            "add chain ip filter FORWARD { type filter hook forward priority 0; policy drop; }",
+            "add chain ip filter DOCKER-USER",
+        ] {
+            let made = std::process::Command::new("nft").arg(command).status();
+            if !made.is_ok_and(|status| status.success()) {
+                eprintln!("nft couldn't make Docker's chains; skipping the rest");
+                return;
+            }
+        }
+        let report = doctor(|command| {
+            command.env("SHIPYARD_IMAGE_STORE", scratch.0.join("store"));
+        });
+        let (level, text) = report.line("firewall");
+        assert_eq!(level, "warn", "{}", report.stdout);
+        assert!(
+            text.starts_with("Docker's firewall drops forwarded traffic"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sudo iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT"),
+            "{text}"
+        );
+        assert_eq!(report.code, Some(0), "a warning only: {}", report.stdout);
     });
 }

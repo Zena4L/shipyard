@@ -13,10 +13,29 @@ which `runc`, Podman and other tools read too.
 `--bundle` takes no command and none of the options that describe the container
 (`-e`, `-w`, `-u`, `--group-add`, `--ulimit`, `--hostname`, `--domainname`,
 `--sysctl`, `--rootfs`, `--read-only`, `--no-isolation`). `--stop-signal` and `--stop-timeout` still work: a
-config has no such settings. It needs Linux. Run as root, the container is rootful;
+config has no such settings. `-i` works too: as for any container, the bundle's
+process never gets your terminal, and gets your input only with `-i` (see [Input,
+output and terminals](run.md#input-output-and-terminals)). `-t` doesn't: a bundle
+asks for a terminal itself, in its config (see [A terminal](#a-terminal)). It needs
+Linux. Run as root, the container is rootful;
 run as anyone else, it's rootless (see [Rootless bundles](#rootless-bundles)). A run is
 the container's whole life, as with `runc run`: all of its [hooks](#hooks) run, from
 `prestart` to `poststop`.
+
+## A terminal
+
+A bundle whose config sets `process.terminal` to `true` runs on a terminal of its own,
+as `-t` gives any container: a pseudo-terminal made inside the container, its
+controlling terminal and its standard input, output and error. With `-i`, what you
+type reaches it, and your terminal is raw while it runs (as with `-it`, `-i` then
+needs your input to be a terminal).
+
+Its size is your window's, and follows it. With no terminal to copy it from (output
+to a pipe), it's `process.consoleSize` (`height` rows, `width` columns), or 24 by 80
+without one.
+
+Under the [runtime](runtime.md#terminals), the terminal is sent to the caller's
+console socket instead, as `runc` does.
 
 ## An example
 
@@ -81,13 +100,20 @@ Too many containers for one user can run into the kernel's key quota
 
 ## Mounts
 
+Mounts are made in the order the config lists them, the standard ones included (see
+below), as the specification asks. An order that can't work is refused (exit 125),
+saying what to move: a mount below a standard one listed before it, which that one
+would hide (below `/dev`, or `/dev/shm`, …); `/dev/pts`, `/dev/shm` or `/dev/mqueue`
+before `/dev`; `/sys/fs/cgroup` before `/sys`; or a standard mount listed twice.
+
 - **`bind`:** a host file or directory, seen inside too. The `source` is the host path:
   a relative path is relative to the bundle, and it must exist. Use the option `rbind`
   to include the mounts below the source. Otherwise (the option `bind`, or none) only
   the source's own mount is bound, as with `runc`.
 - **`tmpfs`:** a fresh, empty file system in memory. The options `size=`, `mode=`,
   `nr_inodes=`, `nr_blocks=`, `uid=` and `gid=` are passed on to it (one value each:
-  no commas).
+  no commas). On a bind they mean nothing, and are ignored with a warning (`runc`
+  passes them to the kernel, which ignores them there).
 - **Options for both:** `ro`/`rw`, `nosuid`/`suid`, `nodev`/`dev`, `noexec`/`exec`.
   - `ro` with `rbind` makes the mounts below read-only too.
   - A bind keeps the restrictions of the host mounts it comes from: `exec` doesn't
@@ -110,7 +136,10 @@ Too many containers for one user can run into the kernel's key quota
   `/dev/mqueue` directly is fine.
 - **The standard mounts** (`/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`,
   `/dev/mqueue`), which most configs list, are accepted. Shipyard always mounts them
-  itself, with its own options.
+  itself, with its own options, where the config lists them. Those it doesn't list
+  come first, except one below a listed one (`/dev/pts` below `/dev`), which comes
+  right after it. A bind of the host's `/sys` at `/sys` (as `runc spec --rootless`
+  writes it) counts as the standard `/sys`.
 - **The cgroup mount,** type `cgroup` or `cgroup2` at `/sys/fs/cgroup` (as `runc spec`
   writes it), mounts the container's own cgroup there, read-only if its options
   include `ro`, and always `nosuid`, `nodev` and `noexec`; its other options are
@@ -207,6 +236,11 @@ A failing `poststart` or `poststop` hook is only a warning, as specification 1.2
 (1.3 makes a failing `poststart` stop the container): the rest of its phase
 runs, and so does the container.
 
+**While a `poststart` hook runs** under `shipyard run --bundle`, the container's output
+(on a terminal) and your input wait for it: Shipyard passes them on between its own
+steps. A container with a lot to say meanwhile waits once its pipe is full, so a
+`poststart` hook that waits for the container's output should have a `timeout`.
+
 **Hooks run with Shipyard's privileges:** as root, a bundle's hooks run as root on the
 host, outside the container. A bundle with hooks is code you run: only use bundles you
 trust. Rootless, they run as you.
@@ -258,7 +292,8 @@ leave the container **less confined than the config asks**, so the bundle is ref
   `blockIO.leafWeight` and `weightDevice`, `hugepageLimits`, `network` and `rdma`;
 - FIFOs in `linux.devices` (`"type": "p"`);
 - `linux.cgroupsPath` in systemd's `slice:prefix:name` form;
-- `process.terminal: true`;
+- `process.terminal: true` without a `mount` namespace (the container's terminals
+  would cover the host's);
 - `process.scheduler`, `process.ioPriority` and `process.execCPUAffinity`;
 - `linux.intelRdt`, `linux.memoryPolicy`, `linux.personality` and
   `linux.timeOffsets`;
@@ -267,9 +302,10 @@ leave the container **less confined than the config asks**, so the bundle is ref
   comes later;
 - mounts of any type but `bind` and `tmpfs`.
 
-A config made by `runc spec` asks for a terminal, so it's refused until that arrives.
-Set `terminal` to `false` to run it with what Shipyard has now. Its capabilities,
-`noNewPrivileges`, device rule and network namespace are applied.
+A config made by `runc spec` runs as it is: its terminal, capabilities,
+`noNewPrivileges`, device rule and network namespace are all applied. So does one made
+by `runc spec --rootless`, run without root: its `/sys`, a bind of the host's, is
+taken as the standard `/sys` (Shipyard binds the host's only where it must).
 
 ## What's ignored
 
@@ -287,8 +323,8 @@ unsafely: no `process.capabilities` (none given), a `user` namespace added for a
 rootless run, only your own ID mapped (no `newuidmap` or range), and mappings that
 include host ID 0.
 
-`process.consoleSize` is ignored silently: it only applies with a terminal, which is
-refused. Fields the specification doesn't define are ignored silently, as it requires.
+`process.consoleSize` without `process.terminal` is ignored silently, as it is by
+`runc`. Fields the specification doesn't define are ignored silently, as it requires.
 
 ## Errors
 

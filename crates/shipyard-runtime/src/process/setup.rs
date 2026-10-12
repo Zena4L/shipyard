@@ -30,14 +30,15 @@ use nix::mount::MsFlags;
 
 use crate::hooks::Hook;
 use crate::isolation::{
-    CgroupMount, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, Root,
+    CgroupMount, IdMaps, Isolation, Mount, MountFlag, MountKind, MountStep, Namespace, Root,
 };
 use crate::security::Capability;
 use crate::{Error, Result};
 
-/// The container's setup, as the clean image receives it.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Setup {
+/// A [`ProcessSpec`] as it travels: to the container's clean image, to
+/// `exec`'s joiner, and in a container's `exec.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SpecSetup {
     args: Vec<Vec<u8>>,
     env: Vec<(Vec<u8>, Vec<u8>)>,
     cwd: Vec<u8>,
@@ -49,6 +50,13 @@ pub(crate) struct Setup {
     /// `(name, soft, hard)`; `None` is unlimited.
     rlimits: Vec<(String, Option<u64>, Option<u64>)>,
     oom_score_adj: Option<i32>,
+}
+
+/// The container's setup, as the clean image receives it.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Setup {
+    #[serde(flatten)]
+    spec: SpecSetup,
     /// Signals the command keeps ignoring (see `SpawnOptions::keep_ignored`).
     pub(crate) keep_ignored: Vec<libc::c_int>,
     /// Change `/`'s propagation first: a new mount namespace.
@@ -68,9 +76,9 @@ pub(crate) struct Setup {
     pub(crate) parent: Option<libc::pid_t>,
     /// A root filesystem of the container's own (see `rootfs.rs`).
     pub(crate) root: Option<RootSetup>,
-    /// The start gate's descriptor (`SpawnOptions::gate`), inherited: wait
-    /// for it to be opened for reading before starting the command.
-    pub(crate) gate: Option<RawFd>,
+    /// The start gate (`SpawnOptions::gate`), inherited: wait there for
+    /// `start` before starting the command.
+    pub(crate) gate: Option<super::spawn::Gate>,
     /// The command's capabilities and `no_new_privs` ([`Isolation::security`]).
     pub(crate) security: crate::security::Security,
     /// The user namespace, if there's one.
@@ -79,6 +87,26 @@ pub(crate) struct Setup {
     pub(crate) cgroup: CgroupSetup,
     /// Hooks to stop for while setting up, if there are any.
     pub(crate) hooks: Option<HooksSetup>,
+    /// A pseudo-terminal to make for the command (`-t`).
+    pub(crate) terminal: Option<TerminalSetup>,
+    /// Descriptors passed on to the command (see `passed.rs`), inherited.
+    #[serde(default)]
+    pub(crate) passing: Option<super::passed::Passing>,
+}
+
+/// The command's pseudo-terminal, made inside the container (see `init.rs`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct TerminalSetup {
+    /// The socket to send its master back on, inherited: shipyard's relay,
+    /// or an OCI console socket.
+    pub(crate) socket: RawFd,
+    /// Its size, the user's terminal's (or the bundle's `consoleSize`).
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    /// Whether the receiver answers once it relays the master (Shipyard's
+    /// own relay, which the command waits for), or not (an OCI console
+    /// socket, at a start gate or for `exec`: runc's protocol has no answer).
+    pub(crate) acknowledged: bool,
 }
 
 /// The hooks part of the setup: where to wait for the runtime's, and the
@@ -151,8 +179,11 @@ pub(crate) struct RootSetup {
     /// The group `/dev/pts`'s terminals belong to: `tty` (5), unless a user
     /// namespace leaves it unmapped (the mount would be refused).
     pub(crate) pts_gid: Option<u32>,
-    /// More mounts, in order ([`Root::mounts`]).
+    /// More mounts ([`Root::mounts`]).
     pub(crate) mounts: Vec<MountSetup>,
+    /// Every mount, standard and more, in the order made
+    /// ([`Root::mount_order`]).
+    pub(crate) order: Vec<MountStep>,
     /// Device nodes to make, in order (`Isolation::devices`).
     pub(crate) devices: Vec<DeviceSetup>,
     /// If set, mount this overlay at `path` before binding (an image root).
@@ -299,6 +330,7 @@ impl RootSetup {
                 None => Some(TTY),
             },
             mounts: root.mounts.iter().map(MountSetup::new).collect(),
+            order: root.mount_order(),
             devices: devices.iter().map(DeviceSetup::new).collect(),
             attach,
             overlay: root
@@ -353,7 +385,7 @@ impl RootSetup {
 }
 
 /// [`Names`], to be resolved in the container.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NamesSetup {
     user: Option<String>,
     group: Option<String>,
@@ -387,34 +419,10 @@ fn as_path(bytes: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(bytes))
 }
 
-impl Setup {
-    /// The command's working directory (inside the container's root, if
-    /// it has one).
-    pub(crate) fn cwd(&self) -> &Path {
-        as_path(&self.cwd)
-    }
-
-    /// The setup for running `spec` isolated as `isolation` says, in a
-    /// cgroup of its own if `own_cgroup`, stopping for hooks on `hooks_pipe`
-    /// if it's given.
-    pub(crate) fn new(
-        spec: &ProcessSpec,
-        keep_ignored: &[libc::c_int],
-        isolation: &Isolation,
-        gate: Option<RawFd>,
-        own_cgroup: bool,
-        hooks_pipe: Option<RawFd>,
-        attach: Option<RawFd>,
-    ) -> Self {
+impl SpecSetup {
+    /// `spec`, ready to travel.
+    pub(crate) fn new(spec: &ProcessSpec) -> Self {
         let bytes = |s: &OsStr| s.as_bytes().to_vec();
-        // Nothing else would keep it from making the host's disks' nodes
-        // and opening them (see `devices_unguarded`). A cgroup here always
-        // has the device program, for real root: `enforce_devices` fails
-        // the run otherwise.
-        let mut security = isolation.security.clone();
-        if crate::cgroup::devices_unguarded(isolation, own_cgroup) {
-            security.capabilities = security.capabilities.without(Capability::MKNOD);
-        }
         Self {
             args: spec.args.iter().map(|arg| bytes(arg)).collect(),
             env: spec.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect(),
@@ -436,6 +444,73 @@ impl Setup {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    /// The spec, rebuilt (and its environment validated).
+    pub(crate) fn spec(&self) -> Result<ProcessSpec> {
+        let mut env = Env::new();
+        for (key, value) in &self.env {
+            env.set(OsStr::from_bytes(key), OsStr::from_bytes(value))
+                // Validated when shipyard built it: only a corrupt setup gets here.
+                .map_err(|e| {
+                    Error::sys(
+                        format!("the container's setup: {e}"),
+                        nix::errno::Errno::EINVAL,
+                    )
+                })?;
+        }
+        let rlimits = self
+            .rlimits
+            .iter()
+            .map(|(name, soft, hard)| {
+                Rlimit::new(
+                    name.parse()?,
+                    unlimited_if_none(*soft),
+                    unlimited_if_none(*hard),
+                )
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(super::spec::SpecError::from)?;
+        Ok(ProcessSpec {
+            args: self.args.iter().cloned().map(OsString::from_vec).collect(),
+            env,
+            cwd: PathBuf::from(OsString::from_vec(self.cwd.clone())),
+            user: User {
+                uid: self.uid,
+                gid: self.gid,
+                umask: self.umask,
+                additional_gids: self.additional_gids.clone(),
+                names: Names::from(&self.names),
+            },
+            rlimits,
+            oom_score_adj: self.oom_score_adj,
+        })
+    }
+}
+
+impl Setup {
+    /// The command's working directory (inside the container's root, if
+    /// it has one).
+    pub(crate) fn cwd(&self) -> &Path {
+        as_path(&self.spec.cwd)
+    }
+
+    /// The setup for running `spec` isolated as `isolation` says, in a
+    /// cgroup of its own if `own_cgroup`, stopping for hooks on `hooks_pipe`
+    /// if it's given.
+    pub(crate) fn new(
+        spec: &ProcessSpec,
+        keep_ignored: &[libc::c_int],
+        isolation: &Isolation,
+        gate: Option<super::spawn::Gate>,
+        own_cgroup: bool,
+        hooks_pipe: Option<RawFd>,
+        attach: Option<RawFd>,
+    ) -> Self {
+        let security = container_security(isolation, own_cgroup);
+        Self {
+            spec: SpecSetup::new(spec),
             keep_ignored: keep_ignored.to_vec(),
             private_mounts: isolation.has(Namespace::Mount),
             network: if isolation.makes_network_namespace() {
@@ -479,6 +554,8 @@ impl Setup {
                     .cgroup_mount
                     .filter(|_| own_cgroup && isolation.has(Namespace::Mount)),
             },
+            terminal: None,
+            passing: None,
             hooks: hooks_pipe.map(|pipe| {
                 let hooks = isolation
                     .hooks
@@ -496,69 +573,52 @@ impl Setup {
 
     /// The command's spec, rebuilt (and its environment validated).
     pub(crate) fn spec(&self) -> Result<ProcessSpec> {
-        let mut env = Env::new();
-        for (key, value) in &self.env {
-            env.set(OsStr::from_bytes(key), OsStr::from_bytes(value))
-                // Validated when shipyard built it: only a corrupt setup gets here.
-                .map_err(|e| {
-                    Error::sys(
-                        format!("the container's setup: {e}"),
-                        nix::errno::Errno::EINVAL,
-                    )
-                })?;
-        }
-        let rlimits = self
-            .rlimits
-            .iter()
-            .map(|(name, soft, hard)| {
-                Rlimit::new(
-                    name.parse()?,
-                    unlimited_if_none(*soft),
-                    unlimited_if_none(*hard),
-                )
-            })
-            .collect::<std::result::Result<_, _>>()
-            .map_err(super::spec::SpecError::from)?;
-        Ok(ProcessSpec {
-            args: self.args.iter().cloned().map(OsString::from_vec).collect(),
-            env,
-            cwd: PathBuf::from(OsString::from_vec(self.cwd.clone())),
-            user: User {
-                uid: self.uid,
-                gid: self.gid,
-                umask: self.umask,
-                additional_gids: self.additional_gids.clone(),
-                names: Names::from(&self.names),
-            },
-            rlimits,
-            oom_score_adj: self.oom_score_adj,
-        })
+        self.spec.spec()
     }
 
     /// Writes the setup to a new memfd, sealed so nothing can change it.
     pub(crate) fn to_memfd(&self) -> Result<OwnedFd> {
-        let json = serde_json::to_vec(self).map_err(|e| {
-            Error::sys(
-                format!("encoding the container's setup: {e}"),
-                nix::errno::Errno::EINVAL,
-            )
-        })?;
-        let fd = memfd_create(
-            c"shipyard-setup",
-            MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
-        )
-        .map_err(|e| Error::sys("creating the container's setup file (memfd)", e))?;
-        let mut file = std::fs::File::from(fd);
-        file.write_all(&json)
-            .map_err(|e| Error::sys("writing the container's setup", io_errno(&e)))?;
-        let fd = OwnedFd::from(file);
-        fcntl(
-            &fd,
-            FcntlArg::F_ADD_SEALS(SealFlag::from_bits_retain(SEALS)),
-        )
-        .map_err(|e| Error::sys("sealing the container's setup", e))?;
-        Ok(fd)
+        sealed_json(self, c"shipyard-setup", "the container's setup")
     }
+}
+
+/// The container's command's confinement: `isolation`'s, without MKNOD
+/// where no device rules guard it. Nothing else would keep it from making
+/// the host's disks' nodes and opening them (see `devices_unguarded`). A
+/// cgroup here always has the device program, for real root:
+/// `enforce_devices` fails the run otherwise. (`exec` confines its commands
+/// the same: `exec.json`.)
+pub(crate) fn container_security(
+    isolation: &Isolation,
+    own_cgroup: bool,
+) -> crate::security::Security {
+    let mut security = isolation.security.clone();
+    if crate::cgroup::devices_unguarded(isolation, own_cgroup) {
+        security.capabilities = security.capabilities.without(Capability::MKNOD);
+    }
+    security
+}
+
+/// `value` as JSON in a new memfd, sealed so nothing can change it.
+pub(crate) fn sealed_json<T: Serialize>(
+    value: &T,
+    name: &std::ffi::CStr,
+    what: &str,
+) -> Result<OwnedFd> {
+    let json = serde_json::to_vec(value)
+        .map_err(|e| Error::sys(format!("encoding {what}: {e}"), nix::errno::Errno::EINVAL))?;
+    let fd = memfd_create(name, MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING)
+        .map_err(|e| Error::sys(format!("creating {what} (memfd)"), e))?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(&json)
+        .map_err(|e| Error::sys(format!("writing {what}"), io_errno(&e)))?;
+    let fd = OwnedFd::from(file);
+    fcntl(
+        &fd,
+        FcntlArg::F_ADD_SEALS(SealFlag::from_bits_retain(SEALS)),
+    )
+    .map_err(|e| Error::sys(format!("sealing {what}"), e))?;
+    Ok(fd)
 }
 
 /// The seals `to_memfd` adds (and `spawn.rs` to the init's binary): no
@@ -582,10 +642,16 @@ pub(crate) fn is_sealed_setup(fd: RawFd) -> bool {
 /// closes it. A setup that doesn't decode is EINVAL. (Not a method: `Setup`
 /// derives `Deserialize`, and the descriptor handling here is `unsafe`.)
 pub(crate) fn read_setup(fd: RawFd) -> nix::Result<Setup> {
+    read_sealed_json(fd)
+}
+
+/// Reads JSON from the memfd at `fd` (inherited across an exec), and closes
+/// it. JSON that doesn't decode is EINVAL.
+pub(crate) fn read_sealed_json<T: serde::de::DeserializeOwned>(fd: RawFd) -> nix::Result<T> {
     // SAFETY: the descriptor was passed by number across the exec; this
     // process owns it, and nothing else in it uses it.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    // The offset is shared with shipyard's copy, which left it at the end.
+    // The offset is shared with the sender's copy, which left it at the end.
     file.seek(SeekFrom::Start(0)).map_err(|e| io_errno(&e))?;
     let mut json = Vec::new();
     file.read_to_end(&mut json).map_err(|e| io_errno(&e))?;
@@ -662,7 +728,10 @@ mod tests {
             &spec,
             &[libc::SIGHUP],
             &isolation,
-            Some(7),
+            Some(crate::process::spawn::Gate {
+                fifo: 7,
+                started: None,
+            }),
             true,
             Some(9),
             None,
@@ -677,7 +746,13 @@ mod tests {
         assert_eq!(back.keep_ignored, [libc::SIGHUP]);
         assert_eq!(back.hostname.as_deref(), Some("box"));
         assert!(back.init && back.mount_proc && back.private_mounts);
-        assert_eq!(back.gate, Some(7));
+        assert_eq!(
+            back.gate,
+            Some(crate::process::spawn::Gate {
+                fifo: 7,
+                started: None
+            })
+        );
         let back_hooks = back.hooks.unwrap();
         assert_eq!(back_hooks.pipe, 9);
         assert!(back_hooks.create_container.is_empty());

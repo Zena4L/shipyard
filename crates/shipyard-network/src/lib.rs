@@ -19,6 +19,7 @@ pub mod attach;
 pub mod conntrack;
 pub mod dns;
 pub mod files;
+pub mod firewalls;
 pub mod ipnet;
 mod netlink;
 pub mod nft;
@@ -55,6 +56,25 @@ pub(crate) mod linux_test {
     /// This thread's network namespace.
     pub(crate) fn this_netns() -> File {
         File::open("/proc/thread-self/ns/net").unwrap()
+    }
+
+    /// Whether `name`, a reference tool the differential tests compare
+    /// Shipyard with (`ip`, `nft`), is installed. When not, the test says so
+    /// and returns; with `SHIPYARD_TEST_TOOLS=required` (CI, `test-linux.sh`)
+    /// it fails instead. (As `shipyard-test-support`'s `reference_tool`,
+    /// which this crate can't use: that crate depends on this one.)
+    pub(crate) fn reference_tool(name: &str) -> bool {
+        let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .chain(["/usr/sbin".into(), "/sbin".into()])
+            .any(|dir| dir.join(name).is_file());
+        if !found {
+            assert!(
+                std::env::var("SHIPYARD_TEST_TOOLS").as_deref() != Ok("required"),
+                "`{name}` is required here (SHIPYARD_TEST_TOOLS), but isn't installed"
+            );
+            eprintln!("skipping: no `{name}` here");
+        }
+        found
     }
 }
 

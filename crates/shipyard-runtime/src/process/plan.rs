@@ -17,6 +17,7 @@ use super::env::DEFAULT_PATH;
 use super::failure::FailureContext;
 #[cfg(target_os = "linux")]
 use super::failure::FilterStart;
+use super::passed::Passing;
 use super::rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
 use super::spawn::SpawnOptions;
 use super::spec::{ProcessSpec, SpecError, User};
@@ -49,6 +50,14 @@ pub(crate) struct ChildPlan {
     /// The setup handshake with shipyard (see `channel.rs`). `None` for the
     /// command a container's init starts, which has no handshake.
     pub(crate) handshake: Option<Handshake>,
+    /// Descriptors to `dup2` onto 0, 1 and 2 once the parent says go,
+    /// before the rest of the setup (`None` keeps what's there). Above 2 and
+    /// close-on-exec, so only the copies survive the exec.
+    pub(crate) stdio: [Option<RawFd>; 3],
+    /// A pseudo-terminal's slave for the command to take: a session of its
+    /// own, the slave its controlling terminal, and its 0, 1 and 2 (see
+    /// `child::take_terminal`).
+    pub(crate) terminal: Option<RawFd>,
     /// Isolated: how the cloned child re-execs into the container's clean
     /// image, which does the rest (see `init.rs`).
     #[cfg(target_os = "linux")]
@@ -64,6 +73,57 @@ pub(crate) struct ChildPlan {
     /// around the credential switch (see `child.rs`). `None` otherwise.
     #[cfg(target_os = "linux")]
     pub(crate) confinement: Option<Confinement>,
+    /// `exec`'s command (see `exec.rs`): what it does beyond a joined
+    /// command's steps.
+    #[cfg(target_os = "linux")]
+    pub(crate) exec: Option<ExecChild>,
+    /// Descriptors passed on (see `passed.rs`), in target order: each is
+    /// put at 3, 4, … (`child::place_passed`). All above the targets.
+    pub(crate) passed: Vec<RawFd>,
+    /// Where the sweep of what the command mustn't keep starts: above the
+    /// passed descriptors' targets (3 without any).
+    pub(crate) sweep_from: RawFd,
+    /// Socket activation's `LISTEN_PID=` entry, its PID written in after
+    /// the fork.
+    pub(crate) listen_pid: Option<PidSlot>,
+}
+
+/// Where [`ExecChild::keep`] holds the terminal's slave.
+#[cfg(target_os = "linux")]
+pub(crate) const KEEP_SLAVE: usize = 2;
+/// Where [`ExecChild::keep`] holds the relay's socket.
+#[cfg(target_os = "linux")]
+pub(crate) const KEEP_RELAYED: usize = 3;
+
+/// What `exec`'s command does beyond a joined command's steps (see
+/// `exec.rs`): it's a clone of the joiner, inside the container.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecChild {
+    /// The joiner's record pipe (its write end): closed first thing, so
+    /// shipyard's read of it ends when the joiner does.
+    pub(crate) close_first: RawFd,
+    /// Kept when every other descriptor from 3 up is closed (really closed:
+    /// nothing of the host's stays open in the container, even until the
+    /// exec): the report pipe, the go pipe's read end, the terminal's slave
+    /// and the relay's socket ([`KEEP_SLAVE`], [`KEEP_RELAYED`]; -1: none).
+    pub(crate) keep: [RawFd; 4],
+    /// With shipyard's relay: the terminal's socket, kept to wait on for
+    /// the relay's answer (it's relaying the master) before the command
+    /// runs (-1: none). The relay starts only once the command exists, so
+    /// the joiner can't wait for it.
+    pub(crate) relayed: RawFd,
+    /// Above every descriptor open when the plan was made (a single-threaded
+    /// joiner opens no others): how far to close where `close_range` is
+    /// missing.
+    pub(crate) fd_bound: RawFd,
+    /// Detached (`exec -d`): no parent-death signal, it outlives `exec`.
+    pub(crate) detach: bool,
+    /// Tests only (`SHIPYARD_TEST_EXEC_PAUSE`): wait this many milliseconds
+    /// once inside the container, before the credential switch (the most
+    /// it's exposed: still with every capability), so a test can look at
+    /// the process from inside the container.
+    pub(crate) pause_ms: u32,
 }
 
 /// The namespaces the child joins (see `join.rs`), in order. The PID
@@ -120,7 +180,8 @@ pub(crate) struct Reexec {
     /// Its environment: empty.
     pub(crate) env: CStringArray,
     /// The descriptors the clean image inherits (setup, status, report, and
-    /// the gate and hooks pipe if there are):
+    /// those there are of the gate's FIFOs, the hooks pipe, an overlay to
+    /// attach, the terminal's socket, and what's passed on):
     /// their close-on-exec flag is cleared just before the exec.
     pub(crate) passed: Vec<RawFd>,
     /// Every other descriptor from 3 up is closed before the exec: these
@@ -134,7 +195,7 @@ pub(crate) struct Reexec {
 }
 
 /// The descriptors an isolated spawn opens for the re-exec (see `Reexec`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only Linux isolates")
@@ -147,12 +208,18 @@ pub(crate) struct ReexecFds {
     /// Shipyard's binary file, when `exe` is a copy of it.
     pub(crate) host_exe: Option<RawFd>,
     /// The start gate (`SpawnOptions::gate`), passed on too.
-    pub(crate) gate: Option<RawFd>,
+    pub(crate) gate: Option<super::spawn::Gate>,
     /// The hooks pipe's read end, if the setup stops for hooks: passed on
     /// too.
     pub(crate) hooks: Option<RawFd>,
     /// An overlay real root made: passed on too.
     pub(crate) overlay: Option<RawFd>,
+    /// The socket the init sends the container's terminal back on: passed
+    /// on too.
+    pub(crate) terminal: Option<RawFd>,
+    /// Descriptors passed on to the command (see `passed.rs`): passed on
+    /// too, for the init to place.
+    pub(crate) passing: Vec<RawFd>,
 }
 
 /// The user and groups to switch to.
@@ -181,6 +248,14 @@ pub(crate) enum UserSwitch {
     /// User and group, but not the supplementary groups: a user namespace
     /// that denies `setgroups`. None may be asked for.
     WithoutGroups,
+    /// Always, whoever the caller is: `exec`'s command, inside the
+    /// container's user namespace with every capability there. The groups
+    /// too, where the namespace allows `setgroups`.
+    #[cfg(target_os = "linux")]
+    Always {
+        /// The namespace allows `setgroups`.
+        groups: bool,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -221,6 +296,69 @@ pub(crate) enum FdSweep {
     Below(RawFd),
 }
 
+/// The `LISTEN_PID=` entry of a command's environment, its PID written in
+/// after the fork (see `passed.rs`): built before it, as a buffer of its
+/// own on the heap (it never moves), behind an `UnsafeCell` so the child may
+/// write it through the plan it's given. Only the child's own copy of its
+/// memory is written: no command is ever cloned with `CLONE_VM`.
+pub(crate) struct PidSlot(Box<std::cell::UnsafeCell<[u8; PID_SLOT_LEN]>>);
+
+/// `LISTEN_PID=`, ten digits (any PID fits: at most 2^22), and a NUL.
+const PID_SLOT_LEN: usize = LISTEN_PID_PREFIX.len() + 10 + 1;
+const LISTEN_PID_PREFIX: &[u8] = b"LISTEN_PID=";
+
+impl PidSlot {
+    pub(crate) fn new() -> Self {
+        let mut entry = [0_u8; PID_SLOT_LEN];
+        entry[..LISTEN_PID_PREFIX.len()].copy_from_slice(LISTEN_PID_PREFIX);
+        // Until it's written: an empty value, never a stale number.
+        Self(Box::new(std::cell::UnsafeCell::new(entry)))
+    }
+
+    fn as_ptr(&self) -> *const c_char {
+        self.0.get().cast::<c_char>().cast_const()
+    }
+
+    /// Writes `pid` in. Called in the child, after the fork: no
+    /// allocation, no panic.
+    pub(crate) fn fill(&self, pid: u32) {
+        let mut digits = [0_u8; 10];
+        let mut at = digits.len();
+        let mut rest = pid;
+        loop {
+            at = at.saturating_sub(1);
+            if let Some(digit) = digits.get_mut(at) {
+                // `rest % 10` is below 10: it fits a byte.
+                *digit = b'0'.saturating_add(u8::try_from(rest % 10).unwrap_or(0));
+            }
+            rest /= 10;
+            if rest == 0 || at == 0 {
+                break;
+            }
+        }
+        // SAFETY: the buffer is this slot's own (behind the `UnsafeCell`),
+        // and nothing reads it until `execve`, in this same thread.
+        let entry = unsafe { &mut *self.0.get() };
+        let start = LISTEN_PID_PREFIX.len();
+        let used = digits.get(at..).unwrap_or_default();
+        if let Some(value) = entry.get_mut(start..start.saturating_add(used.len())) {
+            value.copy_from_slice(used);
+        }
+        if let Some(end) = entry.get_mut(start.saturating_add(used.len())) {
+            *end = 0;
+        }
+    }
+
+    /// The entry as it stands (tests).
+    #[cfg(test)]
+    fn entry(&self) -> &[u8] {
+        // SAFETY: tests only, single-threaded, nothing writes meanwhile.
+        let entry = unsafe { &*self.0.get() };
+        let end = entry.iter().position(|&b| b == 0).unwrap_or(entry.len());
+        &entry[..end]
+    }
+}
+
 /// C strings plus the NULL-terminated pointer array that `execve` takes.
 ///
 /// The pointers point into the strings' heap buffers, which don't move when
@@ -232,9 +370,15 @@ pub(crate) struct CStringArray {
 
 impl CStringArray {
     fn new(strings: Vec<CString>) -> Self {
+        Self::with_slot(strings, None)
+    }
+
+    /// The array, with `slot`'s entry last, if given.
+    fn with_slot(strings: Vec<CString>, slot: Option<&PidSlot>) -> Self {
         let pointers = strings
             .iter()
             .map(|s| s.as_ptr())
+            .chain(slot.map(PidSlot::as_ptr))
             .chain(std::iter::once(std::ptr::null()))
             .collect();
         Self {
@@ -252,6 +396,10 @@ impl ChildPlan {
     /// Builds the plan, plus what the parent needs to explain a failure.
     ///
     /// Build it right before `fork`: it lists the descriptors open *now*.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::needless_pass_by_value, reason = "only Linux isolates")
+    )]
     pub(crate) fn new(
         spec: &ProcessSpec,
         options: &SpawnOptions,
@@ -261,7 +409,6 @@ impl ChildPlan {
             allow(unused_variables, reason = "only Linux isolates")
         )]
         reexec: Option<ReexecFds>,
-        #[cfg(target_os = "linux")] join: Option<JoinSetup>,
     ) -> Result<(Self, FailureContext)> {
         // An isolated run's child re-execs; the command's credentials are
         // worked out inside, where its user is.
@@ -275,12 +422,21 @@ impl ChildPlan {
         };
         #[cfg(not(target_os = "linux"))]
         let switch = UserSwitch::Full;
+        // Isolated, the command is the init's to start: it places them.
+        #[cfg(target_os = "linux")]
+        let passing = options
+            .passing
+            .as_ref()
+            .filter(|_| options.placement.isolation().is_none());
+        #[cfg(not(target_os = "linux"))]
+        let passing = options.passing.as_ref();
         let (plan, context) = Self::for_command(
             spec,
             options.keep_ignored.clone(),
             options.new_process_group,
             Some(handshake),
             switch,
+            passing,
         )?;
         #[cfg(target_os = "linux")]
         let (plan, context) = (
@@ -291,10 +447,9 @@ impl ChildPlan {
                             .placement
                             .isolation()
                             .is_some_and(|isolation| isolation.id_maps.is_some());
-                        reexec_plan(fds, namespace_root)
+                        reexec_plan(&fds, namespace_root)
                     })
                     .transpose()?,
-                join,
                 ..plan
             },
             FailureContext {
@@ -349,16 +504,11 @@ impl ChildPlan {
         parent: Option<libc::pid_t>,
         confinement: Confinement,
         setgroups_allowed: bool,
+        passing: Option<&Passing>,
     ) -> Result<(Self, FailureContext)> {
         let switch = UserSwitch::as_namespace_allows(setgroups_allowed);
-        let (plan, context) = Self::for_command(spec, keep_ignored, false, None, switch)?;
-        let seccomp = if confinement.filter_before_setup().is_some() {
-            Some(FilterStart::BeforeSetup)
-        } else {
-            confinement
-                .filter_before_exec()
-                .map(|_| FilterStart::BeforeExec)
-        };
+        let (plan, context) = Self::for_command(spec, keep_ignored, false, None, switch, passing)?;
+        let seccomp = FilterStart::of_confinement(&confinement);
         Ok((
             Self {
                 parent,
@@ -369,30 +519,58 @@ impl ChildPlan {
         ))
     }
 
+    /// The plan for `exec`'s command (see `exec.rs`), built by the joiner:
+    /// it joins `join`'s namespaces (the joiner has joined the user and PID
+    /// ones), switches to the command's user inside them whoever the caller
+    /// is, and is confined as the container's command. Its limits are the
+    /// joiner's to set (before it joins the user namespace): it applies them
+    /// to itself, then clears them from the plan.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn for_exec(
+        spec: &ProcessSpec,
+        keep_ignored: Vec<libc::c_int>,
+        handshake: Handshake,
+        confinement: Confinement,
+        setgroups_allowed: bool,
+        (join, exec): (JoinSetup, ExecChild),
+        passing: Option<&Passing>,
+    ) -> Result<(Self, FailureContext)> {
+        let switch = UserSwitch::Always {
+            groups: setgroups_allowed,
+        };
+        let (plan, context) =
+            Self::for_command(spec, keep_ignored, false, Some(handshake), switch, passing)?;
+        let seccomp = FilterStart::of_confinement(&confinement);
+        Ok((
+            Self {
+                confinement: Some(confinement),
+                join: Some(join),
+                exec: Some(exec),
+                ..plan
+            },
+            // Inside the container's user namespace, with every capability
+            // there: an EPERM isn't about privileges.
+            FailureContext {
+                seccomp,
+                root: true,
+                ..context
+            },
+        ))
+    }
+
     fn for_command(
         spec: &ProcessSpec,
         keep_ignored: Vec<libc::c_int>,
         new_process_group: bool,
         handshake: Option<Handshake>,
         switch: UserSwitch,
+        passing: Option<&Passing>,
     ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
-        let credentials = match switch {
-            UserSwitch::None => None,
-            UserSwitch::Full => credentials_for(&spec.user)?,
-            UserSwitch::WithoutGroups => {
-                // First what the caller may do at all: without root, adding
-                // groups needs root before it needs `setgroups`.
-                let credentials = credentials_for(&spec.user)?;
-                if let Some(&gid) = spec.user.additional_gids.first() {
-                    return Err(Error::GroupsDenied { gid });
-                }
-                credentials.map(|credentials| Credentials {
-                    groups: None,
-                    ..credentials
-                })
-            }
-        };
+        if let Some(passing) = passing {
+            check_room(spec, passing)?;
+        }
+        let credentials = credentials_by(switch, &spec.user)?;
 
         let program = spec.args.first().ok_or(SpecError::EmptyArgs)?;
         let path_var = spec
@@ -406,18 +584,39 @@ impl ChildPlan {
             .iter()
             .map(|arg| c_string(arg.as_bytes(), "an argument"))
             .collect::<Result<_, _>>()?;
+        // Socket activation's, in place of any the command has of its own.
+        // Or the command's own (a bundle's `LISTEN_FDS`, with the sockets
+        // passed by `--preserve-fds`, as Podman does it), but `LISTEN_PID`:
+        // its own PID, never the bundle's (1, where it isn't PID 1).
+        let listening = passing.is_some_and(|passing| passing.listen.is_some());
+        let own_listen = !listening
+            && passing.is_some_and(|passing| !passing.sources.is_empty())
+            && spec.env.get(OsStr::new("LISTEN_FDS")).is_some();
         let envp = spec
             .env
             .iter()
+            .filter(|(key, _)| {
+                let key = key.as_bytes();
+                !(listening && super::passed::LISTEN_NAMES.contains(&key)
+                    || own_listen && key == b"LISTEN_PID")
+            })
+            .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .chain(passing.map(Passing::listen_env).unwrap_or_default())
             .map(|(key, value)| {
-                let entry = [key.as_bytes(), b"=", value.as_bytes()].concat();
+                let entry = [key.as_slice(), b"=", value.as_slice()].concat();
                 c_string(&entry, "an environment variable")
             })
             .collect::<Result<_, _>>()?;
+        let listen_pid = (listening || own_listen).then(PidSlot::new);
 
         let plan = Self {
             argv: CStringArray::new(argv),
-            envp: CStringArray::new(envp),
+            envp: CStringArray::with_slot(envp, listen_pid.as_ref()),
+            passed: passing
+                .map(|passing| passing.sources.clone())
+                .unwrap_or_default(),
+            sweep_from: passing.map_or(super::passed::FIRST_PASSED, Passing::above),
+            listen_pid,
             candidates: candidates
                 .iter()
                 .map(|c| c_string(c, "the program path"))
@@ -440,6 +639,8 @@ impl ChildPlan {
             new_process_group,
             keep_ignored,
             handshake,
+            stdio: [None; 3],
+            terminal: None,
             #[cfg(target_os = "linux")]
             reexec: None,
             #[cfg(target_os = "linux")]
@@ -448,6 +649,8 @@ impl ChildPlan {
             parent: None,
             #[cfg(target_os = "linux")]
             confinement: None,
+            #[cfg(target_os = "linux")]
+            exec: None,
         };
         let context = FailureContext {
             program: PathBuf::from(program),
@@ -473,9 +676,93 @@ impl ChildPlan {
     }
 }
 
+/// Refuses a command whose own descriptor limit leaves it no room above the
+/// passed descriptors: every `open` it made would fail (EMFILE). (`exec`'s
+/// joiner holds the targets and the copies under that limit too, and opens
+/// a terminal after them.)
+fn check_room(spec: &ProcessSpec, passing: &Passing) -> Result<()> {
+    let count = passing.sources.len();
+    let needed = u64::try_from(
+        usize::try_from(passing.above())
+            .unwrap_or(usize::MAX)
+            .saturating_add(count)
+            .saturating_add(super::passed::SLACK),
+    )
+    .unwrap_or(u64::MAX);
+    for limit in &spec.rlimits {
+        if limit.kind == RlimitKind::Nofile
+            && let RlimitValue::Finite(soft) = limit.soft
+            && soft < needed
+        {
+            return Err(Error::NofileTooLow {
+                count,
+                soft,
+                needed,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The credentials `switch` asks for, for `user`.
+fn credentials_by(switch: UserSwitch, user: &User) -> Result<Option<Credentials>> {
+    Ok(match switch {
+        UserSwitch::None => None,
+        UserSwitch::Full => credentials_for(user)?,
+        UserSwitch::WithoutGroups => {
+            // First what the caller may do at all: without root, adding
+            // groups needs root before it needs `setgroups`.
+            let credentials = credentials_for(user)?;
+            if let Some(&gid) = user.additional_gids.first() {
+                return Err(Error::GroupsDenied { gid });
+            }
+            credentials.map(|credentials| Credentials {
+                groups: None,
+                ..credentials
+            })
+        }
+        #[cfg(target_os = "linux")]
+        UserSwitch::Always { groups } => {
+            if !groups && let Some(&gid) = user.additional_gids.first() {
+                return Err(Error::GroupsDenied { gid });
+            }
+            Some(Credentials {
+                uid: Uid::from_raw(user.uid),
+                gid: Gid::from_raw(user.gid),
+                groups: groups.then(|| group_list(user.gid, &user.additional_gids)),
+            })
+        }
+    })
+}
+
+/// What explains a failure of `exec`'s command: what its plan's would (the
+/// joiner builds the plan itself, see `exec.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) fn exec_failure_context(
+    spec: &ProcessSpec,
+    join: &crate::isolation::Join,
+    passing: Option<&Passing>,
+) -> Result<FailureContext> {
+    let switch = UserSwitch::Always { groups: true };
+    let (_, context) = ChildPlan::for_command(spec, Vec::new(), false, None, switch, passing)?;
+    Ok(FailureContext {
+        seccomp: FilterStart::of(&join.security),
+        // The joiner's first joins are made with the caller's powers.
+        root: geteuid().is_root(),
+        // The command's paths are the container's: as seen from here, under
+        // its process's root (not the host's files, which a "not found"
+        // would otherwise be checked against).
+        container_root: join
+            .namespaces
+            .contains(&crate::isolation::Namespace::Mount)
+            .then(|| crate::isolation::Root::new(format!("/proc/{}/root", join.target))),
+        ..context
+    })
+}
+
 /// The re-exec plan for the descriptors in `fds`.
 #[cfg(target_os = "linux")]
-fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
+fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
     let number = |fd: RawFd, field| c_string(fd.to_string().as_bytes(), field);
     let argv = vec![
         // What `ps -f` shows for PID 1 (its name is set too).
@@ -487,9 +774,11 @@ fn reexec_plan(fds: ReexecFds, namespace_root: bool) -> Result<Reexec> {
     ];
     let passed: Vec<RawFd> = [fds.setup, fds.status, fds.report]
         .into_iter()
-        .chain(fds.gate)
+        .chain(fds.gate.into_iter().flat_map(super::spawn::Gate::fds))
         .chain(fds.hooks)
         .chain(fds.overlay)
+        .chain(fds.terminal)
+        .chain(fds.passing.iter().copied())
         .collect();
     let kept: Vec<u32> = passed
         .iter()
@@ -636,6 +925,36 @@ fn raw_limit(limit: &Rlimit) -> Result<RawLimit, SpecError> {
     })
 }
 
+/// This process's own limits, every kind this platform has: what a process
+/// it starts gets for the kinds its spec doesn't list (`exec.json` records
+/// them, so that `exec` gives no more).
+#[cfg(target_os = "linux")]
+pub(crate) fn current_rlimits() -> Vec<Rlimit> {
+    let value = |raw: libc::rlim_t| {
+        if raw == libc::RLIM_INFINITY {
+            RlimitValue::Unlimited
+        } else {
+            RlimitValue::Finite(raw)
+        }
+    };
+    RlimitKind::ALL
+        .into_iter()
+        .filter(|kind| kind.is_supported())
+        .filter_map(|kind| {
+            let resource = resource_of(kind)?;
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `current` is a valid `rlimit` for the kernel to fill.
+            if unsafe { libc::getrlimit(resource, &raw mut current) } == -1 {
+                return None;
+            }
+            Rlimit::new(kind, value(current.rlim_cur), value(current.rlim_max)).ok()
+        })
+        .collect()
+}
+
 /// The kernel's number for a resource, if this platform has it. libc's
 /// constants, not nix's enum: nix leaves out `MEMLOCK` and `NPROC` on macOS,
 /// though macOS has both.
@@ -774,6 +1093,143 @@ fn sweep_bound() -> RawFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command `sh` with `env` (`KEY=VALUE` entries) and `limits`.
+    fn spec_with(env: &[&str], limits: Vec<Rlimit>) -> ProcessSpec {
+        let mut spec = ProcessSpec::new(vec![std::ffi::OsString::from("sh")]);
+        for entry in env {
+            spec.env.push_entry(OsStr::new(entry)).unwrap();
+        }
+        spec.rlimits = limits;
+        spec
+    }
+
+    /// The plan's environment, as strings (the `LISTEN_PID` slot as it
+    /// stands).
+    fn environment(plan: &ChildPlan) -> Vec<String> {
+        let mut at = plan.envp.as_ptr();
+        let mut entries = Vec::new();
+        // SAFETY: a NULL-terminated array of C strings the plan owns.
+        unsafe {
+            while !(*at).is_null() {
+                entries.push(std::ffi::CStr::from_ptr(*at).to_string_lossy().into_owned());
+                at = at.add(1);
+            }
+        }
+        entries
+    }
+
+    fn plan_for(spec: &ProcessSpec, passing: &Passing) -> Result<ChildPlan> {
+        ChildPlan::for_command(
+            spec,
+            Vec::new(),
+            false,
+            None,
+            UserSwitch::None,
+            Some(passing),
+        )
+        .map(|(plan, _)| plan)
+    }
+
+    #[test]
+    fn socket_activation_replaces_the_commands_own_listen_variables() {
+        let spec = spec_with(
+            &[
+                "PATH=/bin",
+                "LISTEN_FDS=9",
+                "LISTEN_PID=1",
+                "LISTEN_FDNAMES=old",
+            ],
+            Vec::new(),
+        );
+        let activated = Passing {
+            sources: vec![10, 11],
+            listen: Some((1, Some(b"web".to_vec()))),
+        };
+        let plan = plan_for(&spec, &activated).unwrap();
+        assert_eq!(
+            environment(&plan),
+            [
+                "PATH=/bin",
+                "LISTEN_FDS=1",
+                "LISTEN_FDNAMES=web",
+                "LISTEN_PID="
+            ]
+        );
+        assert_eq!(plan.passed, [10, 11]);
+        assert_eq!(plan.sweep_from, 5, "above 3 and 4");
+    }
+
+    #[test]
+    fn a_commands_own_listen_fds_get_its_own_pid() {
+        // Podman's way: the bundle says LISTEN_FDS (and LISTEN_PID=1), the
+        // sockets come by --preserve-fds. The command isn't PID 1 here.
+        let spec = spec_with(&["LISTEN_FDS=1", "LISTEN_PID=1"], Vec::new());
+        let preserved = Passing {
+            sources: vec![10],
+            listen: None,
+        };
+        let plan = plan_for(&spec, &preserved).unwrap();
+        assert_eq!(environment(&plan), ["LISTEN_FDS=1", "LISTEN_PID="]);
+        // Without passed descriptors, a bundle's variables are its own.
+        let none = plan_for(&spec, &Passing::default()).unwrap();
+        assert_eq!(environment(&none), ["LISTEN_FDS=1", "LISTEN_PID=1"]);
+        assert!(none.listen_pid.is_none());
+    }
+
+    #[test]
+    fn a_descriptor_limit_with_no_room_above_the_passed_ones_is_refused() {
+        let nofile = |soft| {
+            vec![
+                Rlimit::new(
+                    RlimitKind::Nofile,
+                    RlimitValue::Finite(soft),
+                    RlimitValue::Finite(4096),
+                )
+                .unwrap(),
+            ]
+        };
+        let passing = Passing {
+            sources: (100..120).collect(),
+            listen: None,
+        };
+        // 3 + 20 targets, 20 copies, and room to spare.
+        let result = plan_for(&spec_with(&[], nofile(40)), &passing);
+        assert!(
+            matches!(
+                result,
+                Err(Error::NofileTooLow {
+                    count: 20,
+                    soft: 40,
+                    ..
+                })
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(plan_for(&spec_with(&[], nofile(1024)), &passing).is_ok());
+    }
+
+    #[test]
+    fn a_pid_slot_holds_the_pid_written_in() {
+        let slot = PidSlot::new();
+        assert_eq!(slot.entry(), b"LISTEN_PID=", "empty until written");
+        slot.fill(1);
+        assert_eq!(slot.entry(), b"LISTEN_PID=1");
+        slot.fill(4_194_304);
+        assert_eq!(slot.entry(), b"LISTEN_PID=4194304");
+        slot.fill(u32::MAX);
+        assert_eq!(slot.entry(), b"LISTEN_PID=4294967295");
+        // Shorter again: the rest is cut by the NUL.
+        slot.fill(42);
+        assert_eq!(slot.entry(), b"LISTEN_PID=42");
+        let array = CStringArray::with_slot(vec![CString::new("A=b").unwrap()], Some(&slot));
+        // SAFETY: the array holds two entries and a NULL.
+        let second = unsafe { std::ffi::CStr::from_ptr(*array.as_ptr().add(1)) };
+        assert_eq!(second.to_bytes(), b"LISTEN_PID=42");
+        // SAFETY: as above.
+        assert!(unsafe { *array.as_ptr().add(2) }.is_null());
+    }
 
     #[test]
     fn ranges_leave_out_only_the_kept_descriptors() {

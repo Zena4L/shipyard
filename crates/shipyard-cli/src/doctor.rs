@@ -67,6 +67,16 @@ impl Check {
     }
 }
 
+/// A report line's columns: the level, the check's name; a text's next
+/// lines start under its first.
+const LEVEL_WIDTH: usize = 5;
+const NAME_WIDTH: usize = 16;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the checks are Linux's")
+)]
+const INDENT: usize = LEVEL_WIDTH + 1 + NAME_WIDTH + 1;
+
 /// The report's last line, and the exit code: 1 if any check failed.
 fn verdict(checks: &[Check]) -> (String, ExitCode) {
     let count = |level| checks.iter().filter(|check| check.level == level).count();
@@ -123,7 +133,7 @@ pub(crate) fn run() -> Result<ExitCode> {
     for check in &checks {
         writeln!(
             out,
-            "{:<5} {:<16} {}",
+            "{:<LEVEL_WIDTH$} {:<NAME_WIDTH$} {}",
             check.level.label(),
             check.name,
             check.text
@@ -181,14 +191,15 @@ mod linux {
     use shipyard_runtime::cgroup::{self, Controller};
     use shipyard_runtime::process::probe::{Probe, Step};
 
-    use super::{Check, Level};
+    use super::{Check, INDENT, Level};
 
     /// The hidden first argument the probe helper is started with.
     const PROBE_ARG: &str = "__shipyard-probe";
 
     /// How long the probe may take: it makes namespaces and mounts, which
-    /// take milliseconds.
-    const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+    /// take milliseconds, but a first start on a busy machine with a cold
+    /// page cache (a large binary read from disk again) can take seconds.
+    const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 
     /// The controllers limits need (`cpuset` is only for `--cpuset-*`).
     const LIMITS_NEED: [Controller; 4] = [
@@ -244,6 +255,7 @@ mod linux {
         checks.push(cgroups(rootless));
         checks.extend(images(&store, place.as_ref(), probed.as_ref(), rootless));
         checks.push(network(rootless));
+        checks.extend(firewall(rootless));
         checks.push(state());
         Ok(checks)
     }
@@ -514,6 +526,60 @@ mod linux {
                      --network host or --network none run without"
                 ),
             ),
+        }
+    }
+
+    /// Other programs' firewalls that would drop the default network's
+    /// traffic (root's bridge network: a rootless one's goes through pasta,
+    /// the host's own sockets). Nothing where there's no bridge network.
+    fn firewall(rootless: bool) -> Option<Check> {
+        if rootless || !crate::network::host_root() || crate::network::why_no_network().is_some() {
+            return None;
+        }
+        let uplink = crate::network::default_route_interface(shipyard_network::Family::V4);
+        // The default network as `shipyard network create` would make it:
+        // IPv4 only, with no DNS server of its own.
+        let view = shipyard_network::firewalls::NetworkView {
+            bridge: shipyard_network::store::DEFAULT_BRIDGE,
+            uplink: uplink.as_deref(),
+            uplink6: None,
+            outward: true,
+            ipv6: false,
+            bridged: crate::network::bridged_traffic_filtered(),
+            dns: None,
+        };
+        let conflicts = shipyard_network::nft::Nftables::new()
+            .and_then(|mut nft| shipyard_network::firewalls::conflicts(&mut nft, &view))
+            .map_err(|err| err.to_string());
+        Some(firewall_check(conflicts.as_deref().map_err(String::as_str)))
+    }
+
+    pub(super) fn firewall_check(
+        conflicts: Result<&[shipyard_network::firewalls::Conflict], &str>,
+    ) -> Check {
+        const NAME: &str = "firewall";
+        let conflicts = match conflicts {
+            Ok(conflicts) => conflicts,
+            Err(err) => {
+                return Check::new(Level::Warn, NAME, format!("couldn't be read: {err}"));
+            }
+        };
+        let open: Vec<String> = conflicts
+            .iter()
+            .filter(|conflict| !conflict.fixed)
+            .map(crate::network::describe_conflict)
+            .collect();
+        if open.is_empty() {
+            Check::new(
+                Level::Ok,
+                NAME,
+                "no other firewall in nftables drops the containers' traffic (iptables-legacy's \
+                 rules can't be read)",
+            )
+        } else {
+            // A plain run works; its containers can't reach out. One
+            // finding per line, under the first one's text.
+            Check::new(Level::Warn, NAME, open.join(&format!("\n{:INDENT$}", "")))
         }
     }
 
@@ -794,11 +860,11 @@ mod tests {
         use shipyard_runtime::cgroup::Controller;
         use shipyard_runtime::process::probe::Probe;
 
-        use super::super::Level;
         use super::super::linux::{
-            ProbedAt, controllers_check, decode, encode, left_by_gone, mounts, overlay_check,
-            pasta_check, user_namespaces,
+            ProbedAt, controllers_check, decode, encode, firewall_check, left_by_gone, mounts,
+            overlay_check, pasta_check, user_namespaces,
         };
+        use super::super::{INDENT, Level};
 
         /// A refused mount fails doctor, whoever runs it, unless it's a
         /// rootless user namespace's want of privileges (that line's).
@@ -991,6 +1057,43 @@ mod tests {
             let check = pasta_check(None);
             assert_eq!(check.level, Level::Fail);
             assert!(check.text.contains("passt"), "{}", check.text);
+        }
+
+        #[test]
+        fn another_firewall_in_the_way_is_a_warning_until_fixed() {
+            use shipyard_network::firewalls::{Blocks, Conflict, Firewall};
+            let firewalld = |fixed| Conflict {
+                firewall: Firewall::Firewalld,
+                bridge: "shipyard0".to_owned(),
+                blocks: Blocks {
+                    way_out: true,
+                    ..Blocks::default()
+                },
+                dns: None,
+                fixed,
+                fix: vec!["sudo firewall-cmd --reload".to_owned()],
+            };
+            assert_eq!(firewall_check(Ok(&[])).level, Level::Ok);
+            assert_eq!(firewall_check(Ok(&[firewalld(true)])).level, Level::Ok);
+            let check = firewall_check(Ok(&[firewalld(false), firewalld(false)]));
+            assert_eq!(check.level, Level::Warn);
+            assert_eq!(
+                check.text.lines().count(),
+                2,
+                "one per line: {}",
+                check.text
+            );
+            assert!(
+                check
+                    .text
+                    .lines()
+                    .nth(1)
+                    .unwrap()
+                    .starts_with(&" ".repeat(INDENT)),
+                "{}",
+                check.text
+            );
+            assert_eq!(firewall_check(Err("EPERM")).level, Level::Warn);
         }
     }
 }

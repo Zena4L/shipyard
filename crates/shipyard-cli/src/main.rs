@@ -213,6 +213,11 @@ fn main() -> ExitCode {
     dns_helper::entry_point();
     // So is `doctor`'s probe (it makes a user namespace: single-threaded).
     doctor::probe_entry_point();
+    // And pasta's launcher (a rootless run's network: it joins the
+    // container's user namespace, single-threaded too).
+    shipyard_network::pasta::entry_point(|| {
+        process::refuse_privileged_start().map_err(|error| error.to_string())
+    });
     // Before anything else: a privileged start must not get any further.
     if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into());

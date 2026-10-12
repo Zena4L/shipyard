@@ -427,7 +427,7 @@ children itself, and survives `exec` (TLPI §26.3.3).
 | 6 (images) | Idmapped mounts, so an image's root filesystem belongs to the user namespace's range. |
 | 7 (networking) | A `sysfs` of the container's own, which makes the `/sys` covers moot; `net.*` sysctls. |
 | 8 (`exec`) | Joining a user namespace; capabilities, `no_new_privs`, a filter and the keyring for joined processes. |
-| 14 (hardening) | Opening `/dev` and `/etc/passwd` through descriptors (`O_PATH`, check, reopen); distinct messages for the rare seccomp errors; fuzzing the profile parser and the compiler; the OCI conformance suite. |
+| 14 (hardening) | Opening `/dev` and `/etc/passwd` through descriptors (`O_PATH`, check, reopen); distinct messages for the rare seccomp errors; fuzzing the profile parser and the compiler; the OCI conformance suite (moved to stage 8, H5). |
 
 **Resolved from stage 3:**
 

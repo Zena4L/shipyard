@@ -275,15 +275,21 @@ pub fn remove_tree_at(dir: &OwnedFd, name: &OsStr) -> nix::Result<()> {
 }
 
 /// Opens a directory to empty it, giving its owner `rwx` first if it can't
-/// be read.
+/// be read, or after, if it can be read but not searched or written (listing
+/// it goes through its `.`, which takes search; removing what's in it takes
+/// write).
 fn open_for_removal(parent: &OwnedFd, name: &OsStr) -> nix::Result<OwnedFd> {
-    match open_dir_at(parent, name) {
+    let dir = match open_dir_at(parent, name) {
         Err(Errno::EACCES) => {
             make_searchable(parent, name)?;
-            open_dir_at(parent, name)
+            open_dir_at(parent, name)?
         }
-        other => other,
+        other => other?,
+    };
+    if fstat(&dir)?.st_mode & 0o700 != 0o700 {
+        fchmod(&dir, Mode::from_bits_truncate(0o700))?;
     }
+    Ok(dir)
 }
 
 /// Gives the owner of directory `name` in `parent` `rwx`, never through a
@@ -674,6 +680,14 @@ mod tests {
         std::fs::write(tree.join("locked/inside"), "").unwrap();
         std::fs::set_permissions(tree.join("locked"), std::fs::Permissions::from_mode(0o000))
             .unwrap();
+        // Ones it can read but not search, or not write (the fuzzer's: a
+        // copied archive's `tmp` with mode 3651).
+        for (name, mode) in [("unsearchable", 0o3651), ("readonly", 0o555)] {
+            std::fs::create_dir(tree.join(name)).unwrap();
+            std::fs::write(tree.join(name).join("inside"), "").unwrap();
+            std::fs::set_permissions(tree.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
         remove_tree_at(&scratch.fd(), OsStr::new("tree")).unwrap();
         assert!(!tree.exists());
         assert_eq!(

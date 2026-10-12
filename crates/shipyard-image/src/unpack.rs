@@ -139,6 +139,19 @@ const SPACE_CHECK_EVERY: u64 = 64 * 1024 * 1024;
 /// and a block. So a layer of many of them is checked too: every 1024
 /// entries at the most.
 const ENTRY_COST: u64 = SPACE_CHECK_EVERY / 1024;
+/// The most entries placed between two checks of the free inodes.
+const ENTRIES_PER_CHECK: u64 = 1024;
+
+/// How many entries may be placed before the free inodes are checked again,
+/// given `files` (free, and the reserve to keep): half the margin above
+/// the reserve, between 1 and [`ENTRIES_PER_CHECK`]. (An entry takes one
+/// inode or a little more: see `Unpacker::count_entry`.)
+fn entries_until_check(files: Option<(u64, u64)>) -> u64 {
+    files.map_or(ENTRIES_PER_CHECK, |(available, reserve)| {
+        (available.saturating_sub(reserve) / 2).clamp(1, ENTRIES_PER_CHECK)
+    })
+}
+
 /// The most inodes (files) left free, when 5 % of a filesystem's are more.
 const MAX_FILES_RESERVE: u64 = 1_000_000;
 
@@ -404,13 +417,15 @@ pub enum UnpackError {
     },
     /// A symlink in the layer stands where a directory is needed: writing
     /// through it could leave the layer.
-    #[error("the layer entry `{0}` would be reached through a symlink")]
+    #[error("the archive's entry `{0}` would be reached through a symlink")]
     ThroughSymlink(String),
     /// A non-directory stands where a directory is needed.
-    #[error("the layer entry `{0}` is under something that isn't a directory")]
+    #[error("the archive's entry `{0}` is under something that isn't a directory")]
     NotADirectory(String),
     /// A hard link to something this layer didn't create.
-    #[error("the hard link `{link}` points to `{target}`, which isn't a file earlier in the layer")]
+    #[error(
+        "the hard link `{link}` points to `{target}`, which isn't a file earlier in the archive"
+    )]
     HardlinkTarget {
         /// The link.
         link: String,
@@ -424,13 +439,30 @@ pub enum UnpackError {
     )]
     LowerSymlink(String),
     /// More bookkeeping than the limit (a layer of very many entries).
-    #[error("the layer needs more than {limit} bytes of memory to extract (too many entries)")]
+    #[error("the archive needs more than {limit} bytes of memory to extract (too many entries)")]
     TooMuchRetained {
         /// The limit.
         limit: u64,
     },
+    /// A copied directory where a non-directory is, or the other way
+    /// round: never replaced (`cp`'s rule).
+    #[error(
+        "`{0}` can't replace a directory with a non-directory, or a non-directory with a directory"
+    )]
+    KindClash(String),
+    /// A copy where a device, FIFO or socket is: never replaced.
+    #[error("`{0}` is a device, FIFO or socket: a copy never replaces one")]
+    Special(String),
+    /// A copied archive's entry outside the one name it was to hold.
+    #[error("the archive's entry `{entry}` isn't under `{top}`, the one name it was to hold")]
+    OutsideTop {
+        /// The entry.
+        entry: String,
+        /// The name.
+        top: String,
+    },
     /// More decompressed bytes than the limit.
-    #[error("the layer is larger than the {limit}-byte limit")]
+    #[error("the archive is larger than the {limit}-byte limit")]
     TooLarge {
         /// The limit.
         limit: u64,
@@ -529,6 +561,143 @@ pub fn unpack_layer(
     unpacker.finish()
 }
 
+/// How to extract a copied archive ([`unpack_tar`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyOptions {
+    /// Whose files they become.
+    pub ownership: Ownership,
+    /// One owner for everything, in place of the archive's (`cp`'s default:
+    /// the container's root), within `ownership`'s rules.
+    pub owner: Option<(u32, u32)>,
+    /// The limits.
+    pub limits: Limits,
+    /// The one top-level name every entry must be under, if there is one
+    /// (and what it becomes).
+    pub top: Option<Top>,
+}
+
+/// The one top-level name a copied archive's entries must be under
+/// (`cp`'s source), and what it becomes (`cp`'s destination name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Top {
+    /// The name in the archive.
+    pub name: OsString,
+    /// What it's extracted as, if not itself.
+    pub rename: Option<OsString>,
+    /// Whether it must be a directory.
+    pub directory: bool,
+}
+
+impl Top {
+    /// `path` (an entry's), checked to be under the top name, and renamed.
+    fn rebase(&self, path: &Path) -> Result<PathBuf, UnpackError> {
+        let mut parts = path.iter();
+        if parts.next() != Some(self.name.as_os_str()) {
+            return Err(UnpackError::OutsideTop {
+                entry: path.display().to_string(),
+                top: Path::new(&self.name).display().to_string(),
+            });
+        }
+        let mut rebased = PathBuf::from(self.rename.as_ref().unwrap_or(&self.name));
+        rebased.extend(parts);
+        Ok(rebased)
+    }
+}
+
+/// Extracts a plain tar archive read from `stream` into the existing
+/// directory `dest`, as `cp` does: the same walk as [`unpack_layer`]'s (no
+/// symlink followed, nothing written outside `dest`, hard links only to what
+/// the archive made), but not a layer's rules:
+///
+/// - `.wh.` names are ordinary files, never deletions;
+/// - nothing is implied: an entry whose directory is missing fails;
+/// - what's there already is replaced, except that a directory never
+///   replaces a non-directory, nor the other way round
+///   ([`UnpackError::KindClash`]); a directory is merged;
+/// - the archive's root entry (`./`) leaves `dest` as it is;
+/// - with [`CopyOptions::top`], every entry must be under that name, which
+///   is renamed;
+/// - device nodes are never made, and, unless the owners are applied, no
+///   file capability is set (`security.capability`).
+///
+/// # Errors
+///
+/// An [`UnpackError`]; what was extracted before it stays.
+pub fn unpack_tar(
+    stream: impl Read,
+    dest: &OwnedFd,
+    options: &CopyOptions,
+) -> Result<LayerReport, UnpackError> {
+    let unpack = UnpackOptions {
+        ownership: options.ownership.clone(),
+        limits: options.limits,
+        trusted_xattrs: false,
+    };
+    let bounded = Bounded::new(stream, options.limits.max_bytes);
+    let mut tar = TarReader::new(bounded, options.limits.tar);
+    let root = dest
+        .try_clone()
+        .map_err(|source| io_error("opening the destination", source))?;
+    let mut unpacker = Unpacker::new(root, &[], &unpack);
+    unpacker.copy = Some(Copying {
+        owner: options.owner,
+    });
+    unpacker.check_space()?;
+    let placed = place_all(&mut unpacker, &mut tar, options);
+    if let Err(err) = placed {
+        // What was made gets its mode and owner even so: a directory left
+        // as it was made (0700, the caller's) would be a surprise.
+        unpacker.settle();
+        return Err(err);
+    }
+    unpacker.report.global_headers_ignored = tar.ignored_globals();
+    unpacker.finish()
+}
+
+/// Places every entry of a copied archive (see [`unpack_tar`]).
+fn place_all<R: Read>(
+    unpacker: &mut Unpacker<'_>,
+    tar: &mut TarReader<Bounded<R>>,
+    options: &CopyOptions,
+) -> Result<(), UnpackError> {
+    while let Some(mut entry) = tar
+        .next_entry()
+        .map_err(|err| tar_error(err, &options.limits))?
+    {
+        if let Some(top) = &options.top
+            && !entry.path.as_os_str().is_empty()
+        {
+            if top.directory && entry.path == Path::new(&top.name) && entry.kind != Kind::Directory
+            {
+                return Err(UnpackError::NotADirectory(entry.path.display().to_string()));
+            }
+            entry.path = top.rebase(&entry.path)?;
+            if entry.kind == Kind::Hardlink
+                && let Some(link) = &entry.link
+            {
+                entry.link = Some(top.rebase(Path::new(link))?.into_os_string());
+            }
+        }
+        unpacker.place(&entry, tar)?;
+    }
+    // A layer that's cut off fails its digests; a copy has none.
+    if !tar.marked_end() {
+        return Err(TarError::Malformed(
+            "the archive ends without its end-of-archive marker (cut off?)".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// An extraction of a copied archive rather than a layer (see
+/// [`unpack_tar`]).
+#[derive(Debug, Clone, Copy)]
+struct Copying {
+    /// The one owner, if the archive's isn't kept.
+    owner: Option<(u32, u32)>,
+}
+
 /// What this layer created at a path.
 #[derive(Debug)]
 enum Created {
@@ -588,7 +757,12 @@ struct Unpacker<'a> {
     report: LayerReport,
     /// Bytes written since the free space was last checked.
     unchecked: u64,
+    /// Entries still to place before the free space is checked again
+    /// (see [`Unpacker::count_entry`]).
+    entries_left: u64,
     buffer: Vec<u8>,
+    /// A copied archive's rules instead of a layer's.
+    copy: Option<Copying>,
 }
 
 /// What one more recorded path costs in memory, besides its bytes (the
@@ -607,7 +781,9 @@ impl<'a> Unpacker<'a> {
             options,
             report: LayerReport::default(),
             unchecked: 0,
+            entries_left: ENTRIES_PER_CHECK,
             buffer: vec![0; 64 * 1024],
+            copy: None,
         }
     }
 
@@ -633,6 +809,7 @@ impl<'a> Unpacker<'a> {
     /// Places one entry; a file's data is read from `data`.
     fn place(&mut self, entry: &Entry, data: &mut impl Read) -> Result<(), UnpackError> {
         self.report.entries += 1;
+        self.count_entry()?;
         self.charge(ENTRY_COST)?;
         let Some(name) = entry.path.file_name() else {
             // The layer root itself (`./`).
@@ -640,23 +817,26 @@ impl<'a> Unpacker<'a> {
         };
         let parent = entry.path.parent().unwrap_or(Path::new(""));
         let bytes = name.as_bytes();
-        if bytes == OPAQUE_MARKER {
-            self.retain(parent)?;
-            self.opaque.insert(parent.to_owned());
-            return Ok(());
-        }
-        if bytes.starts_with(AUFS_PREFIX) {
-            self.report.aufs_ignored += 1;
-            return Ok(());
-        }
-        if let Some(target) = bytes.strip_prefix(WHITEOUT_PREFIX) {
-            if target.is_empty() || target == b"." || target == b".." {
-                return Err(TarError::UnsafePath(entry.path.display().to_string()).into());
+        // A copy's names are only names.
+        if self.copy.is_none() {
+            if bytes == OPAQUE_MARKER {
+                self.retain(parent)?;
+                self.opaque.insert(parent.to_owned());
+                return Ok(());
             }
-            let path = parent.join(OsStr::from_bytes(target));
-            self.retain(&path)?;
-            self.whiteouts.insert(path);
-            return Ok(());
+            if bytes.starts_with(AUFS_PREFIX) {
+                self.report.aufs_ignored += 1;
+                return Ok(());
+            }
+            if let Some(target) = bytes.strip_prefix(WHITEOUT_PREFIX) {
+                if target.is_empty() || target == b"." || target == b".." {
+                    return Err(TarError::UnsafePath(entry.path.display().to_string()).into());
+                }
+                let path = parent.join(OsStr::from_bytes(target));
+                self.retain(&path)?;
+                self.whiteouts.insert(path);
+                return Ok(());
+            }
         }
         match entry.kind {
             Kind::CharDevice | Kind::BlockDevice => {
@@ -674,7 +854,14 @@ impl<'a> Unpacker<'a> {
     /// The layer root's own entry: its attributes now, the rest at the end.
     fn place_root(&mut self, entry: &Entry) -> Result<(), UnpackError> {
         if entry.kind != Kind::Directory {
-            return Err(TarError::Malformed("the layer root isn't a directory".to_owned()).into());
+            return Err(TarError::Malformed(
+                "the archive's root entry isn't a directory".to_owned(),
+            )
+            .into());
+        }
+        // A copy's destination is the caller's directory, not the archive's.
+        if self.copy.is_some() {
+            return Ok(());
         }
         let root = self
             .walker
@@ -706,6 +893,9 @@ impl<'a> Unpacker<'a> {
             .is_some_and(|stat| fsat::kind(stat) == SFlag::S_IFDIR);
         if !is_dir {
             if existing.is_some() {
+                if self.copy.is_some() {
+                    return Err(UnpackError::KindClash(path.display().to_string()));
+                }
                 self.remove(&dir, path, name)?;
             }
             mkdirat(&dir, name, Mode::from_bits_truncate(0o700))
@@ -875,7 +1065,10 @@ impl<'a> Unpacker<'a> {
     /// Opens the directory `dir` (for the entry at `path`), making what's
     /// missing (as implied directories) if `create`, and returns a
     /// descriptor for it.
+    ///
+    /// A copy implies nothing: it never creates.
     fn enter(&mut self, dir: &Path, create: bool, path: &Path) -> Result<OwnedFd, UnpackError> {
+        let create = create && self.copy.is_none();
         let mut made = Vec::new();
         let opened = self
             .walker
@@ -953,11 +1146,19 @@ impl<'a> Unpacker<'a> {
 
     /// Makes room for a non-directory at `path`: whatever is there (a file,
     /// a symlink, a directory tree) goes, as tar's last entry wins.
+    ///
+    /// A copy never replaces a directory with anything else, nor a device,
+    /// FIFO or socket at all (`cp … /dev/null` must never unlink the host's
+    /// `/dev/null`).
     fn clear(&mut self, dir: &OwnedFd, path: &Path, name: &OsStr) -> Result<(), UnpackError> {
-        if fsat::stat_at(dir, name)
-            .map_err(failed("reading", path))?
-            .is_some()
-        {
+        if let Some(stat) = fsat::stat_at(dir, name).map_err(failed("reading", path))? {
+            let kind = fsat::kind(&stat);
+            if self.copy.is_some() && kind == SFlag::S_IFDIR {
+                return Err(UnpackError::KindClash(path.display().to_string()));
+            }
+            if self.copy.is_some() && kind != SFlag::S_IFREG && kind != SFlag::S_IFLNK {
+                return Err(UnpackError::Special(path.display().to_string()));
+            }
             self.remove(dir, path, name)?;
         }
         Ok(())
@@ -965,8 +1166,17 @@ impl<'a> Unpacker<'a> {
 
     /// Removes `path` (`name` in `dir`) and forgets everything recorded at
     /// and below it.
+    ///
+    /// A copy only ever replaces a non-directory, and never changes the
+    /// directory's mode to do it (the destination is the caller's: one it
+    /// can't write in is an error, as `cp`'s).
     fn remove(&mut self, dir: &OwnedFd, path: &Path, name: &OsStr) -> Result<(), UnpackError> {
-        fsat::remove_tree_at(dir, name).map_err(failed("replacing", path))?;
+        if self.copy.is_some() {
+            nix::unistd::unlinkat(dir, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+                .map_err(failed("replacing", path))?;
+        } else {
+            fsat::remove_tree_at(dir, name).map_err(failed("replacing", path))?;
+        }
         self.walker.forget(path);
         let below: Vec<PathBuf> = self
             .created
@@ -984,6 +1194,7 @@ impl<'a> Unpacker<'a> {
     /// whether an ID had to give way to 0 (it loses setuid and setgid
     /// then); `None`: the caller (no `chown`).
     fn owner(&mut self, uid: u32, gid: u32) -> Option<((u32, u32), bool)> {
+        let (uid, gid) = self.copy.and_then(|copy| copy.owner).unwrap_or((uid, gid));
         match &self.options.ownership {
             Ownership::Keep => None,
             Ownership::Apply { uids, gids, shift } => {
@@ -1047,6 +1258,14 @@ impl<'a> Unpacker<'a> {
                 self.report.xattrs_refused += 1;
             } else if bytes == b"security.selinux" {
                 // Labels are the host's to give; every Fedora file has one.
+            } else if bytes == b"security.capability"
+                && self.copy.is_some()
+                && self.options.ownership == Ownership::Keep
+            {
+                // A copy that keeps the caller as owner gives no powers
+                // either (as it drops setuid): a container's file can't
+                // become a host program with capabilities.
+                self.report.xattrs_refused += 1;
             } else if bytes == b"security.capability" || bytes.starts_with(b"user.") {
                 if !set_xattr(fd, name, value) {
                     self.report.xattrs_not_applied += 1;
@@ -1062,18 +1281,34 @@ impl<'a> Unpacker<'a> {
     fn charge(&mut self, bytes: u64) -> Result<(), UnpackError> {
         self.unchecked += bytes;
         if self.unchecked >= SPACE_CHECK_EVERY {
-            self.unchecked = 0;
+            self.check_space()?;
+        }
+        Ok(())
+    }
+
+    /// Counts one entry toward the next check of the free inodes. Each
+    /// takes at least one (more where its extended attributes are charged
+    /// to the inode budget: tmpfs since Linux 6.6, every file labelled under
+    /// SELinux), so the next check comes before the entries placed since
+    /// the last could use up what was left above the reserve: after half of
+    /// it at most (and every [`ENTRIES_PER_CHECK`] anyway).
+    fn count_entry(&mut self) -> Result<(), UnpackError> {
+        self.entries_left = self.entries_left.saturating_sub(1);
+        if self.entries_left == 0 {
             self.check_space()?;
         }
         Ok(())
     }
 
     /// Refuses to go on if the filesystem is nearly full: of bytes, or of
-    /// inodes.
-    fn check_space(&self) -> Result<(), UnpackError> {
+    /// inodes. Re-arms both counters.
+    fn check_space(&mut self) -> Result<(), UnpackError> {
         let space = FreeSpace::of(self.walker.root())
             .map_err(failed("checking the free space under", Path::new("/")))?;
-        space.check(self.options.limits.min_free)
+        space.check(self.options.limits.min_free)?;
+        self.unchecked = 0;
+        self.entries_left = entries_until_check(space.files);
+        Ok(())
     }
 
     /// After the last entry: the whiteouts and opaque directories, then the
@@ -1097,6 +1332,18 @@ impl<'a> Unpacker<'a> {
             self.make_opaque(path)?;
         }
 
+        self.directories_metadata()?;
+        Ok(self.report)
+    }
+
+    /// After a failure: the directories' metadata, as far as it goes.
+    fn settle(&mut self) {
+        let _ = self.directories_metadata();
+    }
+
+    /// Gives the directories made their owner, mode and time, deepest
+    /// first.
+    fn directories_metadata(&mut self) -> Result<(), UnpackError> {
         // Children before parents: in reverse order, `a/b` comes before `a`.
         let directories: Vec<(PathBuf, Meta, (u64, u64))> = self
             .created
@@ -1114,7 +1361,7 @@ impl<'a> Unpacker<'a> {
                 self.apply(&fd, meta, &path)?;
             }
         }
-        Ok(self.report)
+        Ok(())
     }
 
     /// A whiteout for `path`: a `0:0` character device, which overlayfs
@@ -1497,7 +1744,6 @@ pub(crate) mod tests {
             self.append(header, data)
         }
 
-        #[cfg(target_os = "linux")]
         fn file_owned(&mut self, name: &str, mode: u32, owner: (u64, u64)) -> &mut Self {
             let mut header = Self::header(name.as_bytes(), tar::EntryType::Regular, 0, mode);
             header.set_uid(owner.0);
@@ -1887,6 +2133,22 @@ pub(crate) mod tests {
         assert!(dest.join("f").is_file());
     }
 
+    /// The free inodes are checked again before the entries placed since
+    /// could use up the margin above the reserve: after half of it at most.
+    #[test]
+    fn inodes_are_checked_before_the_margin_can_go() {
+        assert_eq!(entries_until_check(None), ENTRIES_PER_CHECK);
+        assert_eq!(
+            entries_until_check(Some((1_000_000, 50_000))),
+            ENTRIES_PER_CHECK
+        );
+        // A small filesystem: 1025 free over a reserve of 1000 (the case a
+        // check every 1024 entries ran past, on tmpfs under SELinux).
+        assert_eq!(entries_until_check(Some((1025, 1000))), 12);
+        // At the reserve: checked at the next entry.
+        assert_eq!(entries_until_check(Some((1000, 1000))), 1);
+    }
+
     /// Directories and empty files write no data, but each takes an inode:
     /// they count toward the free-space checks too, so a layer of nothing
     /// else stops short of a filesystem's last inodes (here a tmpfs of
@@ -2252,6 +2514,392 @@ pub(crate) mod tests {
         assert_eq!((outside.uid(), outside.gid()), (0, 1000));
         assert_eq!(outside.mode() & 0o7777, 0o755, "setuid and setgid dropped");
         assert_eq!(report.ids_collapsed, 1);
+    }
+
+    // --- Copies (`unpack_tar`, cp's)
+
+    fn copy_keep() -> CopyOptions {
+        CopyOptions {
+            ownership: Ownership::Keep,
+            owner: None,
+            limits: keep().limits,
+            top: None,
+        }
+    }
+
+    /// Extracts `layer`'s plain tar into `dest` (existing), as cp does.
+    fn copy_into(
+        dest: &Path,
+        layer: &Layer,
+        options: &CopyOptions,
+    ) -> Result<LayerReport, UnpackError> {
+        let fd = fsat::open_dir(dest).unwrap();
+        unpack_tar(layer.tar().as_slice(), &fd, options)
+    }
+
+    /// A fresh destination directory under `scratch`.
+    fn destination(scratch: &Scratch) -> PathBuf {
+        destination_named(scratch, "dest")
+    }
+
+    fn destination_named(scratch: &Scratch, name: &str) -> PathBuf {
+        let dest = scratch.0.join(name);
+        std::fs::create_dir(&dest).unwrap();
+        dest
+    }
+
+    #[test]
+    fn a_copy_extracts_files_directories_and_links() {
+        let scratch = Scratch::new("copy-basic");
+        let dest = destination(&scratch);
+        let mut layer = Layer::default();
+        layer
+            .dir("app", 0o750)
+            .file_mode(b"app/tool", b"run\n", 0o755)
+            .symlink("app/alias", "tool")
+            .hardlink("app/again", "app/tool");
+        let report = copy_into(&dest, &layer, &copy_keep()).unwrap();
+        assert_eq!(report.entries, 4);
+        let mode = |path: &str| std::fs::symlink_metadata(dest.join(path)).unwrap().mode() & 0o7777;
+        assert_eq!(mode("app"), 0o750);
+        assert_eq!(mode("app/tool"), 0o755);
+        assert_eq!(std::fs::read(dest.join("app/again")).unwrap(), b"run\n");
+        assert_eq!(
+            std::fs::read_link(dest.join("app/alias")).unwrap(),
+            Path::new("tool")
+        );
+    }
+
+    #[test]
+    fn a_copy_keeps_whiteout_names_as_files() {
+        let scratch = Scratch::new("copy-wh");
+        let dest = destination(&scratch);
+        std::fs::write(dest.join("kept"), "still here").unwrap();
+        std::fs::create_dir(dest.join("dir")).unwrap();
+        std::fs::write(dest.join("dir/inside"), "still here").unwrap();
+        let mut layer = Layer::default();
+        layer
+            .file(".wh.kept", b"a name")
+            .file("dir/.wh..wh..opq", b"another")
+            .file(".wh..wh.aufs", b"a third");
+        let report = copy_into(&dest, &layer, &copy_keep()).unwrap();
+        assert_eq!(
+            (report.whiteouts, report.opaque_dirs, report.aufs_ignored),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("kept")).unwrap(),
+            "still here"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("dir/inside")).unwrap(),
+            "still here"
+        );
+        assert_eq!(std::fs::read(dest.join(".wh.kept")).unwrap(), b"a name");
+        assert_eq!(
+            std::fs::read(dest.join("dir/.wh..wh..opq")).unwrap(),
+            b"another"
+        );
+        assert_eq!(
+            std::fs::read(dest.join(".wh..wh.aufs")).unwrap(),
+            b"a third"
+        );
+    }
+
+    #[test]
+    fn a_copy_implies_no_directory() {
+        let scratch = Scratch::new("copy-implied");
+        let dest = destination(&scratch);
+        let mut layer = Layer::default();
+        layer.file("missing/file", b"x");
+        let result = copy_into(&dest, &layer, &copy_keep());
+        assert!(
+            matches!(&result, Err(UnpackError::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT)),
+            "{result:?}"
+        );
+        assert!(!dest.join("missing").exists());
+    }
+
+    #[test]
+    fn a_copy_replaces_files_merges_directories_and_never_swaps_kinds() {
+        let scratch = Scratch::new("copy-replace");
+        let dest = destination(&scratch);
+        std::fs::write(dest.join("file"), "old").unwrap();
+        std::fs::create_dir(dest.join("dir")).unwrap();
+        std::fs::write(dest.join("dir/old"), "kept").unwrap();
+        let mut layer = Layer::default();
+        layer
+            .file("file", b"new")
+            .dir("dir", 0o755)
+            .file("dir/new", b"added");
+        copy_into(&dest, &layer, &copy_keep()).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("file")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("dir/old")).unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("dir/new")).unwrap(),
+            "added"
+        );
+
+        // A file onto a directory, a link onto one, a directory onto a file.
+        for layer in [
+            Layer::default().file("dir", b"x").tar(),
+            Layer::default().symlink("dir", "/").tar(),
+            Layer::default().dir("file", 0o755).tar(),
+        ] {
+            let fd = fsat::open_dir(&dest).unwrap();
+            let result = unpack_tar(layer.as_slice(), &fd, &copy_keep());
+            assert!(
+                matches!(result, Err(UnpackError::KindClash(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dest.join("dir/old")).unwrap(),
+            "kept"
+        );
+        assert_eq!(std::fs::read_to_string(dest.join("file")).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_copys_root_entry_leaves_the_destination_alone() {
+        let scratch = Scratch::new("copy-root");
+        let dest = destination(&scratch);
+        std::fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o751))
+            .unwrap();
+        let mut layer = Layer::default();
+        layer.dir("./", 0o777).file("f", b"x");
+        copy_into(&dest, &layer, &copy_keep()).unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().mode() & 0o7777, 0o751);
+    }
+
+    #[test]
+    fn a_copy_never_leaves_its_destination() {
+        let scratch = Scratch::new("copy-escape");
+        let outside = canary(&scratch);
+        let target = outside.to_str().unwrap();
+        let cases = [
+            Layer::default()
+                .file_mode(b"../outside/canary", b"overwritten", 0o644)
+                .tar(),
+            Layer::default()
+                .symlink("link", target)
+                .file("link/canary", b"overwritten")
+                .tar(),
+            Layer::default()
+                .hardlink("stolen", "../outside/canary")
+                .tar(),
+            Layer::default()
+                .hardlink("stolen", &format!("{target}/canary"))
+                .tar(),
+        ];
+        for (n, tar) in cases.iter().enumerate() {
+            let dest = scratch.0.join(format!("dest{n}"));
+            std::fs::create_dir(&dest).unwrap();
+            let fd = fsat::open_dir(&dest).unwrap();
+            let result = unpack_tar(tar.as_slice(), &fd, &copy_keep());
+            assert!(
+                matches!(
+                    result,
+                    Err(UnpackError::Tar(TarError::UnsafePath(_))
+                        | UnpackError::ThroughSymlink(_)
+                        | UnpackError::HardlinkTarget { .. })
+                ),
+                "case {n}: {result:?}"
+            );
+            assert_alive(&outside);
+        }
+    }
+
+    #[test]
+    fn a_copy_makes_no_device_and_kept_owners_get_no_powers() {
+        let scratch = Scratch::new("copy-powers");
+        let dest = destination(&scratch);
+        let mut layer = Layer::default();
+        let mut header = Layer::header(b"disk", tar::EntryType::Block, 0, 0o666);
+        header.set_device_major(8).unwrap();
+        header.set_device_minor(0).unwrap();
+        layer
+            .append(header, b"")
+            .pax(&[(
+                "SCHILY.xattr.security.capability",
+                [1_u8, 0, 0, 2].as_slice(),
+            )])
+            .file_mode(b"tool", b"x", 0o4755);
+        let report = copy_into(&dest, &layer, &copy_keep()).unwrap();
+        assert_eq!(report.devices_skipped, 1);
+        assert!(!dest.join("disk").exists());
+        assert_eq!(report.xattrs_refused, 1, "the file capability isn't set");
+        assert_eq!(
+            std::fs::metadata(dest.join("tool")).unwrap().mode() & 0o7777,
+            0o755,
+            "setuid dropped"
+        );
+    }
+
+    #[test]
+    fn a_copys_one_owner_replaces_the_archives() {
+        // The caller's own IDs: what an unprivileged test may own files as.
+        let (uid, gid) = (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        );
+        let only = |id: u32| IdRanges(vec![(id, 1)]);
+        let options = |owner| CopyOptions {
+            ownership: Ownership::Apply {
+                uids: only(uid),
+                gids: only(gid),
+                shift: None,
+            },
+            owner,
+            limits: keep().limits,
+            top: None,
+        };
+        let mut layer = Layer::default();
+        layer.file_owned(
+            "f",
+            0o644,
+            (uid.wrapping_add(1).into(), gid.wrapping_add(1).into()),
+        );
+
+        let scratch = Scratch::new("copy-owner");
+        let dest = destination(&scratch);
+        let report = copy_into(&dest, &layer, &options(Some((uid, gid)))).unwrap();
+        assert_eq!(report.ids_collapsed, 0, "the one owner, not the archive's");
+        let meta = std::fs::metadata(dest.join("f")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+
+        // The control: the archive's owner is outside the ranges.
+        if uid != 0 {
+            let dest = scratch.0.join("control");
+            std::fs::create_dir(&dest).unwrap();
+            let result = copy_into(&dest, &layer, &options(None));
+            assert!(
+                result.is_err(),
+                "the archive's owner (collapsed to root): {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_copys_top_name_is_renamed_and_holds_every_entry() {
+        let scratch = Scratch::new("copy-top");
+        let dest = destination(&scratch);
+        let mut layer = Layer::default();
+        layer
+            .dir("data", 0o755)
+            .file("data/a", b"x")
+            .hardlink("data/b", "data/a");
+        let options = CopyOptions {
+            top: Some(Top {
+                name: "data".into(),
+                rename: Some("copy".into()),
+                directory: true,
+            }),
+            ..copy_keep()
+        };
+        copy_into(&dest, &layer, &options).unwrap();
+        assert_eq!(std::fs::read(dest.join("copy/b")).unwrap(), b"x");
+        assert!(!dest.join("data").exists());
+
+        // An entry beside it (`.bashrc` in a home directory) is refused.
+        let mut stray = Layer::default();
+        stray.dir("data", 0o755).file(".bashrc", b"evil");
+        let result = copy_into(&dest, &stray, &options);
+        assert!(
+            matches!(result, Err(UnpackError::OutsideTop { .. })),
+            "{result:?}"
+        );
+        assert!(!dest.join(".bashrc").exists());
+
+        // Nor may a hard link reach outside it.
+        let mut out = Layer::default();
+        out.file("other", b"x")
+            .dir("data", 0o755)
+            .hardlink("data/l", "other");
+        let fd = fsat::open_dir(&dest).unwrap();
+        let result = unpack_tar(out.tar().as_slice(), &fd, &options);
+        assert!(
+            matches!(result, Err(UnpackError::OutsideTop { .. })),
+            "{result:?}"
+        );
+
+        // A directory was asked for: a file is refused before anything.
+        let mut file = Layer::default();
+        file.file("data", b"x");
+        let result = copy_into(&dest, &file, &options);
+        assert!(
+            matches!(result, Err(UnpackError::NotADirectory(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_off_copy_is_refused_and_its_directories_settled() {
+        let scratch = Scratch::new("copy-cut");
+        let dest = destination(&scratch);
+        let mut layer = Layer::default();
+        layer.dir("d", 0o751).file("d/f", b"x");
+        let whole = layer.tar();
+        // Without its end-of-archive marker: cut between entries.
+        let cut = &whole[..whole.len() - 1024];
+        let fd = fsat::open_dir(&dest).unwrap();
+        let result = unpack_tar(cut, &fd, &copy_keep());
+        assert!(
+            matches!(result, Err(UnpackError::Tar(TarError::Malformed(_)))),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(dest.join("d")).unwrap().mode() & 0o7777,
+            0o751,
+            "its mode, not the 0700 it was made with"
+        );
+        // The control: whole, it's fine.
+        let again = destination_named(&scratch, "whole");
+        let fd = fsat::open_dir(&again).unwrap();
+        unpack_tar(whole.as_slice(), &fd, &copy_keep()).unwrap();
+    }
+
+    #[test]
+    fn a_copy_never_changes_its_destinations_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = Scratch::new("copy-readonly");
+        let dest = destination(&scratch);
+        std::fs::write(dest.join("f"), "old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut layer = Layer::default();
+        layer.file("f", b"new");
+        let result = copy_into(&dest, &layer, &copy_keep());
+        let root = nix::unistd::geteuid().is_root();
+        // Root may write anywhere; anyone else can't replace it, as cp can't.
+        assert_eq!(result.is_ok(), root, "{result:?}");
+        assert_eq!(std::fs::metadata(&dest).unwrap().mode() & 0o7777, 0o555);
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_copy_never_replaces_a_fifo() {
+        let scratch = Scratch::new("copy-special");
+        let dest = destination(&scratch);
+        nix::unistd::mkfifo(&dest.join("null"), Mode::from_bits_truncate(0o600)).unwrap();
+        let mut layer = Layer::default();
+        layer.file("null", b"replaced");
+        let result = copy_into(&dest, &layer, &copy_keep());
+        assert!(matches!(result, Err(UnpackError::Special(_))), "{result:?}");
+        let kind = std::fs::symlink_metadata(dest.join("null"))
+            .unwrap()
+            .file_type();
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(&kind),
+            "still the FIFO"
+        );
+        // The control: a file is replaced.
+        std::fs::write(dest.join("file"), "old").unwrap();
+        let mut layer = Layer::default();
+        layer.file("file", b"new");
+        copy_into(&dest, &layer, &copy_keep()).unwrap();
     }
 
     proptest::proptest! {

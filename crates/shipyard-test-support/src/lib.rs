@@ -15,8 +15,11 @@
 
 pub mod bundle;
 #[cfg(target_os = "linux")]
+pub mod console;
+#[cfg(target_os = "linux")]
 pub mod net;
 pub mod pty;
+pub mod registry;
 pub mod rootfs;
 
 use std::io::{BufRead, BufReader};
@@ -60,7 +63,67 @@ pub fn ignore(signal: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The `shipyard` binary under test. Each test file names it once:
+/// Where the binaries under test are installed, to test them there instead of
+/// where cargo built them: CI's AppArmor job installs them in
+/// `/usr/local/bin`, one of the paths Shipyard's profile attaches to.
+pub const BIN_DIR_VAR: &str = "SHIPYARD_TEST_BIN_DIR";
+
+/// The binary cargo built at `compiled` (a `CARGO_BIN_EXE_*` path), or the
+/// file of the same name in [`BIN_DIR_VAR`]'s directory when that's set.
+#[must_use]
+pub fn binary(compiled: &'static str) -> &'static str {
+    // Each path made once, kept for the process (the paths are `'static`).
+    static RESOLVED: std::sync::Mutex<Vec<(&str, &str)>> = std::sync::Mutex::new(Vec::new());
+    let dir = std::env::var_os(BIN_DIR_VAR);
+    if dir.is_none() {
+        return compiled;
+    }
+    let mut resolved = RESOLVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&(_, path)) = resolved.iter().find(|(from, _)| *from == compiled) {
+        return path;
+    }
+    let path: &'static str =
+        Box::leak(resolve(dir.as_deref().map(std::path::Path::new), compiled).into_boxed_str());
+    resolved.push((compiled, path));
+    path
+}
+
+/// `compiled`, or the file of the same name in `dir`.
+fn resolve(dir: Option<&std::path::Path>, compiled: &str) -> String {
+    let Some(dir) = dir else {
+        return compiled.to_owned();
+    };
+    let name = std::path::Path::new(compiled)
+        .file_name()
+        .expect("a binary's path ends in its name");
+    dir.join(name).to_string_lossy().into_owned()
+}
+
+/// Whether a reference tool the differential tests compare Shipyard with
+/// (`ip`, `nft`, `dig`) is installed. When not, the test should say so and
+/// return; with `SHIPYARD_TEST_TOOLS=required` (CI, `test-linux.sh`, where
+/// they're installed), it fails instead: there a skip would hide that the
+/// comparison never ran.
+#[must_use]
+pub fn reference_tool(name: &str) -> bool {
+    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .chain(["/usr/sbin".into(), "/sbin".into()])
+        .any(|dir| dir.join(name).is_file());
+    if !found {
+        assert!(
+            std::env::var("SHIPYARD_TEST_TOOLS").as_deref() != Ok("required"),
+            "`{name}` is required here (SHIPYARD_TEST_TOOLS), but isn't installed"
+        );
+        eprintln!("skipping: no `{name}` here");
+    }
+    found
+}
+
+/// A binary under test (`shipyard`, or `shipyard-runtime`: [`Shipyard::path`]
+/// resolves either through [`BIN_DIR_VAR`]; [`Shipyard::command`] and the
+/// other commands are `shipyard`'s). Each test file names it once:
 ///
 /// ```ignore
 /// const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
@@ -80,10 +143,11 @@ impl Shipyard {
         Self { path }
     }
 
-    /// Its path.
+    /// Its path: the one cargo built, or the installed one (see
+    /// [`binary`]).
     #[must_use]
-    pub const fn path(self) -> &'static str {
-        self.path
+    pub fn path(self) -> &'static str {
+        binary(self.path)
     }
 
     /// `shipyard ARGS…`, started in a new session with no controlling
@@ -91,7 +155,7 @@ impl Shipyard {
     /// or in CI.
     #[must_use]
     pub fn command(self, args: &[&str]) -> Command {
-        let mut command = Command::new(self.path);
+        let mut command = Command::new(self.path());
         command.args(for_this_kernel(args));
         // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
         unsafe {
@@ -149,15 +213,48 @@ pub struct Run {
 
 /// Runs shipyard to completion, killing it if it takes longer than `TIMEOUT`.
 #[must_use]
-pub fn run(mut command: Command) -> Run {
+pub fn run(command: Command) -> Run {
+    run_with_input(command, None)
+}
+
+/// The same, with `input` piped to shipyard's stdin (then end-of-file)
+/// instead of `/dev/null`.
+#[must_use]
+pub fn run_with_input(command: Command, input: Option<&[u8]>) -> Run {
+    let output = run_raw(command, input);
+    Run {
+        code: output.status.code(),
+        signal: output.status.signal(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// [`run_with_input`], its output as it is (bytes: a tar stream, say).
+///
+/// # Panics
+///
+/// If it takes longer than `TIMEOUT` (it's killed), or can't be started.
+#[must_use]
+pub fn run_raw(mut command: Command, input: Option<&[u8]>) -> std::process::Output {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command.spawn().expect("starting shipyard");
+    let mut child = command.spawn().expect("starting shipyard");
     let pid = libc::pid_t::try_from(child.id()).expect("pid fits in pid_t");
+    let feed = child.stdin.take().zip(input.map(<[u8]>::to_vec));
     let (done, finished) = mpsc::channel();
     std::thread::spawn(move || {
+        // Written from here, so a command that never reads can't block the
+        // test; closed after, so it reads end-of-file.
+        if let Some((mut stdin, input)) = feed {
+            let _ = std::io::Write::write_all(&mut stdin, &input);
+        }
         let _ = done.send(child.wait_with_output());
     });
     let Ok(output) = finished.recv_timeout(TIMEOUT) else {
@@ -165,13 +262,7 @@ pub fn run(mut command: Command) -> Run {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("shipyard did not finish within {TIMEOUT:?}");
     };
-    let output = output.expect("waiting for shipyard");
-    Run {
-        code: output.status.code(),
-        signal: output.status.signal(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    output.expect("waiting for shipyard")
 }
 
 /// Whether this test runs under Rosetta, the x86-64 emulator Linux VMs on
@@ -223,23 +314,65 @@ pub fn rootless(needs: Rootless) -> bool {
         return true;
     };
     assert!(
-        std::env::var("SHIPYARD_TEST_ROOTLESS").as_deref() != Ok("required"),
+        !rootless_required(),
         "rootless tests are required here (SHIPYARD_TEST_ROOTLESS), but {why}"
     );
     eprintln!("skipping: {why}");
     false
 }
 
+/// Why this user can't make a user namespace here, if they can't: asked
+/// once per process. With installed binaries ([`BIN_DIR_VAR`]), the one
+/// under test is asked (`shipyard doctor` makes a user namespace and a
+/// mount, as a run does): an AppArmor profile may allow it where `unshare`
+/// isn't. Otherwise `unshare --user`.
+fn user_namespaces_unavailable() -> Option<&'static str> {
+    static VERDICT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let verdict = VERDICT.get_or_init(|| {
+        if std::env::var_os(BIN_DIR_VAR).is_some() {
+            // (The installed `shipyard`: `binary` keeps only the name.)
+            let shipyard = binary("/shipyard");
+            let doctor = Command::new(shipyard)
+                .arg("doctor")
+                .stderr(std::process::Stdio::null())
+                .output();
+            let allowed = doctor.is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+                    let mut words = line.split_whitespace();
+                    words.next() == Some("ok")
+                        && words.next() == Some("user")
+                        && words.next() == Some("namespaces")
+                })
+            });
+            (!allowed).then(|| {
+                format!("the installed shipyard ({shipyard}) can't create a user namespace here (`shipyard doctor`)")
+            })
+        } else {
+            let userns = Command::new("unshare")
+                .args(["--user", "true"])
+                .stderr(std::process::Stdio::null())
+                .status();
+            (!userns.is_ok_and(|status| status.success())).then(|| {
+                "this user can't create a user namespace here (`unshare --user`)".to_owned()
+            })
+        }
+    });
+    verdict.as_deref()
+}
+
+/// Whether rootless tests must run here (`SHIPYARD_TEST_ROOTLESS=required`:
+/// CI and `test-linux.sh`, where they're set up), so a skip is a failure.
+#[must_use]
+pub fn rootless_required() -> bool {
+    std::env::var("SHIPYARD_TEST_ROOTLESS").as_deref() == Ok("required")
+}
+
 fn rootless_unavailable(needs: Rootless) -> Option<String> {
     if is_root() {
         return Some("running as root (rootless tests run as a normal user)".to_owned());
     }
-    let userns = Command::new("unshare")
-        .args(["--user", "true"])
-        .stderr(std::process::Stdio::null())
-        .status();
-    if !userns.is_ok_and(|status| status.success()) {
-        return Some("this user can't create a user namespace here (`unshare --user`)".to_owned());
+    if let Some(why) = user_namespaces_unavailable() {
+        return Some(why.to_owned());
     }
     if needs == Rootless::Single {
         return None;
@@ -532,5 +665,31 @@ pub fn child_of(parent: libc::pid_t) -> libc::pid_t {
             "process {parent} never had a child"
         );
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_a_directory_the_binary_is_cargos() {
+        assert_eq!(
+            resolve(None, "/work/target/debug/shipyard"),
+            "/work/target/debug/shipyard"
+        );
+    }
+
+    #[test]
+    fn an_installed_binary_keeps_its_name() {
+        let dir = std::path::Path::new("/usr/local/bin");
+        assert_eq!(
+            resolve(Some(dir), "/work/target/debug/shipyard-runtime"),
+            "/usr/local/bin/shipyard-runtime"
+        );
+        assert_eq!(
+            resolve(Some(dir), "/work/target/debug/shipyard"),
+            "/usr/local/bin/shipyard"
+        );
     }
 }

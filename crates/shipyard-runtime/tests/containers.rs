@@ -1,6 +1,6 @@
 //! Containers through the runtime's API, end to end: joining a running one
 //! (`Supervisor::supervise_joined`), and isolation without a PID namespace.
-//! Linux; root only, except for the "needs root" check.
+//! Linux; root only, except for the check that joining root's needs root.
 //!
 //! Not on libtest (`harness = false`): this binary is also its own container
 //! runtime. It plays the part the CLI will (stage 8+):
@@ -144,8 +144,8 @@ fn tests() -> &'static [(&'static str, fn())] {
         ]
     } else {
         &[(
-            "without_root_joining_is_refused",
-            without_root_joining_is_refused,
+            "without_root_joining_roots_is_refused",
+            without_root_joining_roots_is_refused,
         )]
     }
 }
@@ -570,7 +570,9 @@ fn orphans_belong_to_the_init() {
 
 fn no_descriptors_reach_it() {
     let container = Container::sleeping();
-    let joined = run(join(&container, "ls -l /proc/$$/fd"));
+    // (`; true`: the shell stays, and `ls` lists its descriptors. Exec'd,
+    // `ls` would list its own, with the one it reads `/proc/N/fd` through.)
+    let joined = run(join(&container, "ls -l /proc/$$/fd; true"));
     assert_eq!(joined.code, Some(0), "{}", joined.stderr);
     for leak in ["pid:[", "mnt:[", "uts:[", "ipc:[", "/proc/"] {
         assert!(
@@ -716,6 +718,17 @@ fn an_init_that_cannot_start_is_reported_without_a_pid_namespace() {
     else {
         return;
     };
+    // A static test binary (built for musl) names no loader: run through
+    // one anyway, it isn't the case this checks.
+    let names_a_loader = std::fs::read(me().path()).is_ok_and(|binary| {
+        binary
+            .windows(8)
+            .any(|bytes| bytes == b"/lib/ld-" || bytes == b"lib64/ld")
+    });
+    if !names_a_loader {
+        eprintln!("skipping: a static test binary has no dynamic loader to run it through");
+        return;
+    }
     let mut command = std::process::Command::new(loader);
     command.args([me().path(), "container-nopid", "true"]);
     let ran = run(command);
@@ -727,10 +740,16 @@ fn an_init_that_cannot_start_is_reported_without_a_pid_namespace() {
     );
 }
 
-fn without_root_joining_is_refused() {
+/// Without root, the host's init (root's) can't be joined: its namespaces
+/// aren't this user's (a rootless container's would be).
+fn without_root_joining_roots_is_refused() {
     let joined = run(me().command(&["join", "1", "true"]));
     assert_eq!(joined.code, Some(125));
-    assert!(joined.stderr.contains("needs root"), "{}", joined.stderr);
+    assert!(
+        joined.stderr.contains("aren't this user's to join"),
+        "{}",
+        joined.stderr
+    );
 }
 
 fn joining_needs_linux() {

@@ -71,10 +71,14 @@ pub(crate) const NFT_SET_ELEM_INTERVAL_END: u32 = 0x1;
 pub(crate) const NFTA_DATA_VALUE: u16 = 1;
 pub(crate) const NFTA_DATA_VERDICT: u16 = 2;
 pub(crate) const NFTA_VERDICT_CODE: u16 = 1;
+pub(crate) const NFTA_VERDICT_CHAIN: u16 = 2;
 
 /// Verdicts (`NF_DROP`, `NF_ACCEPT`).
 pub(crate) const NF_DROP: i32 = 0;
 pub(crate) const NF_ACCEPT: i32 = 1;
+/// Verdicts that go to another chain.
+pub(crate) const NFT_JUMP: i32 = -3;
+pub(crate) const NFT_GOTO: i32 = -4;
 
 /// Registers: the verdict, and the 32-bit ones (`NFT_REG32_00` on).
 pub(crate) const NFT_REG_VERDICT: u32 = 0;
@@ -111,6 +115,9 @@ pub(crate) const NFTA_FIB_RESULT: u16 = 2;
 pub(crate) const NFTA_FIB_FLAGS: u16 = 3;
 pub(crate) const NFTA_CT_DREG: u16 = 1;
 pub(crate) const NFTA_CT_KEY: u16 = 2;
+/// iptables' own matches and targets (`nft_compat`): their names.
+pub(crate) const NFTA_MATCH_NAME: u16 = 1;
+pub(crate) const NFTA_TARGET_NAME: u16 = 1;
 
 /// Expressions' values.
 pub(crate) const NFT_META_PROTOCOL: u32 = 1;
@@ -169,7 +176,7 @@ pub(crate) const TYPE_ETHERADDR: u32 = 9;
 pub(crate) const TYPE_INET_PROTOCOL: u32 = 12;
 pub(crate) const TYPE_INET_SERVICE: u32 = 13;
 pub(crate) const TYPE_IFNAME: u32 = 41;
-const TYPE_BITS: u32 = 6;
+pub(crate) const TYPE_BITS: u32 = 6;
 
 /// The type of the concatenation of `types`, as nft computes it.
 pub(crate) fn concat_type(types: &[u32]) -> u32 {

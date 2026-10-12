@@ -95,6 +95,7 @@ scripts/test-linux.sh            # everything; exits non-zero on any failure
 scripts/test-linux.sh --shell        # a shell in the same container, to debug
 scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
 scripts/test-linux.sh --fuzz [SECONDS]   # each fuzz target for SECONDS (300)
+scripts/test-linux.sh --conformance [NAME…]  # the OCI conformance suite (below)
 ```
 
 The container's `/tmp` is a fresh tmpfs: its own root is overlayfs, which can't hold
@@ -223,6 +224,72 @@ already. The network tests make their interfaces in namespaces of their own
 (`in_new_netns`), with an `Upstream` namespace standing in for the internet
 (`shipyard_test_support::net`).
 
+### The OCI conformance suite
+
+`scripts/test-linux.sh --conformance` runs the OCI runtime conformance suite
+([runtime-tools](https://github.com/opencontainers/runtime-tools)' `validation/`)
+against `shipyard-runtime`, as root, in the same privileged container. The suite
+drives the runtime through `create`, `start`, `state`, `kill` and `delete`, and runs a
+static program (`runtimetest`) as each container's process, which compares what it
+finds inside with the config.
+
+- **Its image** (`scripts/conformance/Dockerfile`) adds Go and builds runtime-tools,
+  pinned by commit, plus a static busybox root filesystem (runtime-tools ships one for
+  amd64 and 386 only). It's built the first time, which needs network.
+- **`scripts/conformance/expected.txt`** is the gate. It lists every test of the
+  suite as `pass`, `fail /PATTERN/ REASON` or `skip REASON`, and the run fails on any
+  difference, both ways:
+  - a `fail` must fail for its reason: PATTERN (`grep -E`) must match the test's TAP
+    or stderr;
+  - if a fix makes a `fail` pass, the run fails until the line says `pass`;
+  - a timeout is always a difference.
+
+  A `fail` names a finding (ROADMAP's table), a refusal by design, runc's behaviour,
+  or a bug in the test. A `skip` names why it isn't run (cgroup v1 only, a hang or
+  race in the suite). `NAME@arm64 …` holds for one architecture only.
+- **Passing, exactly:** a test exits 0 with no failing results, none skipped, and a
+  plan that counts them. The hook tests and two `create`-refusal tests print no
+  results; for those, any diagnostic with an `"error"` is a failure.
+- **One test or a few:** `--conformance create kill`. A `skip` test runs too, when
+  named, to recheck it. Each test's TAP and stderr are kept in the build volume, under
+  `/target/conformance` (cleared at each run), and a difference prints its end.
+- **Architectures:** `expected.txt` was recorded on arm64 (Apple silicon). The CI job
+  runs amd64, which nothing has checked yet while CI is off: lines may need an
+  `@amd64` twin when it runs.
+- **A mutant of the runtime must build in a scratch copy:** `--conformance` builds into
+  the shared target volume, and cargo goes by modification times. Afterwards, run
+  `cargo clean -p shipyard-cli -p shipyard-runtime` there, or the next run tests the
+  mutant.
+
+### What CI runs
+
+`.github/workflows/ci.yml`, on every push and pull request:
+
+| Job | What it covers |
+|---|---|
+| `fmt`, `musl`, `docs`, `deny` | formatting; clippy for musl; rustdoc; dependencies |
+| `check` (Ubuntu, macOS) | clippy and every normal-user test. Rootless tests run the binaries cargo built, so the AppArmor restriction on user namespaces is turned off here |
+| `root` (Ubuntu, macOS) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
+| `apparmor` | **A real Ubuntu host** (H4): the restriction left on, `shipyard` and `shipyard-runtime` installed in `/usr/local/bin` with the profile (`contrib/apparmor/shipyard`), as users install them. `scripts/ci/apparmor-control.sh` first proves the profile is what lets them make user namespaces (unloaded, `shipyard doctor` fails); then `shipyard-cli`'s tests run the installed binaries (the runtime's in-process tests make user namespaces from their own test binary, which no profile covers: they run in `check`) |
+| `conformance` | the OCI conformance suite, as `expected.txt` expects (amd64; recorded on arm64) |
+| `fedora` | **A real Fedora host** (H4): `scripts/ci/fedora-vm.sh` boots Fedora Cloud (pinned by SHA-256) in QEMU/KVM, SELinux enforcing, firewalld running, and runs the test executables built on the runner in both passes (`scripts/ci/run-test-binaries.sh`), plus the terminal probe |
+
+**Required, not skipped.** CI and `test-linux.sh` set `SHIPYARD_TEST_ROOTLESS`,
+`SHIPYARD_TEST_DELEGATED` and `SHIPYARD_TEST_TOOLS` to `required`: a rootless test that
+can't run, a missing delegated cgroup, or a missing reference tool (`ip`, `nft`, `dig`,
+for the differential tests) then fails instead of skipping.
+
+**Testing installed binaries.** With `SHIPYARD_TEST_BIN_DIR=DIR`, the end-to-end tests
+run `DIR/shipyard` and `DIR/shipyard-runtime` instead of what cargo built
+(`shipyard_test_support::binary`), and the rootless tests ask that `shipyard doctor`
+whether user namespaces work, instead of `unshare` (which no profile covers).
+
+**The Fedora job by hand**, on an x86-64 Linux machine with KVM (`qemu-system-x86_64`,
+`qemu-img`, `cloud-localds`, `jq`, `gcc`, and `/dev/kvm` yours: the kvm group):
+`scripts/ci/fedora-vm.sh` (`VM_SSH_PORT` if 2222 is taken). It builds, boots a throwaway
+VM, runs both passes there, and removes the VM; the image stays cached in
+`~/.cache/shipyard-vm`.
+
 ## Running Linux-only stages on macOS: Lima VM
 
 Eventually Shipyard manages its own VM (roadmap stage 12). Until then,
@@ -273,6 +340,24 @@ first.) On Ubuntu 23.10 and later, rootless runs need `contrib/apparmor/shipyard
 installed (see [Requirements](user/README.md#requirements)); it attaches to
 `/usr/local/bin`, hence the install there. An SSH session's cgroup isn't delegated:
 run Shipyard under `systemd-run --user --scope` there for limits.
+
+Fedora is the host with firewalld (another program's firewall, which Shipyard warns
+about and never changes; see [Other firewalls](user/networking.md#other-firewalls)).
+The same build, checked with firewalld running:
+
+```sh
+limactl start --name=shipyard-fedora --cpus=2 --memory=3 template:fedora
+limactl copy target/aarch64-unknown-linux-musl/release/shipyard shipyard-fedora:/tmp/
+limactl shell shipyard-fedora -- sudo install -m 0755 /tmp/shipyard /usr/local/bin/
+limactl shell shipyard-fedora -- sudo dnf install -y firewalld passt
+limactl shell shipyard-fedora -- sudo systemctl enable --now firewalld
+limactl shell shipyard-fedora -- sudo shipyard doctor     # its firewall line warns
+limactl shell shipyard-fedora -- sudo shipyard run --image alpine wget -qO- example.com
+limactl delete --force shipyard-fedora                  # when done
+```
+
+Without the fix the warning names, the `wget` gets no answer. With it, the
+`wget` works and the warning stops.
 
 Lima mounts your Mac's home directory at the same path (`/Users/<you>`), not
 at the VM's own `~`. Edit on macOS, build and run in the VM. Many later stages need root (or user

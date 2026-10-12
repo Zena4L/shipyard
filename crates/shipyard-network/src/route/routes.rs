@@ -194,8 +194,7 @@ impl Route {
     }
 }
 
-/// `RTM_NEWROUTE` adding `route` to the main table (as a unicast route:
-/// the only kind Shipyard adds).
+/// `RTM_NEWROUTE` adding `route` to the main table, of its type.
 pub(crate) fn add(route: &Route) -> MessageBuilder {
     let header = RouteHeader {
         family: route.destination.family().af(),
@@ -203,13 +202,19 @@ pub(crate) fn add(route: &Route) -> MessageBuilder {
         table: RT_TABLE_MAIN,
         protocol: RTPROT_BOOT,
         // Through a gateway, it reaches past this link; without one, the
-        // destination is on the link itself.
-        scope: if route.gateway.is_some() {
+        // destination is on the link itself. One that refuses what it
+        // matches is on no link (`ip` makes them so).
+        scope: if route.gateway.is_some() || route.route_type != RouteType::Unicast {
             RT_SCOPE_UNIVERSE
         } else {
             RT_SCOPE_LINK
         },
-        route_type: RTN_UNICAST,
+        route_type: match route.route_type {
+            RouteType::Unicast => RTN_UNICAST,
+            RouteType::Blackhole => RTN_BLACKHOLE,
+            RouteType::Unreachable => RTN_UNREACHABLE,
+            RouteType::Prohibit => RTN_PROHIBIT,
+        },
         ..RouteHeader::default()
     };
     let mut message = MessageBuilder::new(RTM_NEWROUTE, flag::CREATE | flag::EXCL);
@@ -279,6 +284,52 @@ mod tests {
         );
         assert_eq!(attrs.count(), 1); // the gateway only
         assert_eq!(parsed(&message), Some(route));
+    }
+
+    /// Each type is added as itself, with the scope `ip` gives it: a route
+    /// through a gateway or one that refuses what it matches reaches past
+    /// any link (universe); one without a gateway is on its link.
+    #[test]
+    fn a_route_is_added_as_its_type_and_scope() {
+        let header = |route: &Route| {
+            let bytes = add(route).finish(1, 0).unwrap();
+            let read = Messages::new(&bytes).next().unwrap().unwrap();
+            let (header, _) = read.split(RouteHeader::LEN).unwrap();
+            RouteHeader::decode(header).unwrap()
+        };
+        let route = |gateway: Option<&str>, route_type| Route {
+            destination: "10.90.0.0/16".parse().unwrap(),
+            gateway: gateway.map(|gateway| gateway.parse().unwrap()),
+            index: None,
+            route_type,
+        };
+        for (route, kind, scope) in [
+            (
+                route(Some("10.0.0.1"), RouteType::Unicast),
+                RTN_UNICAST,
+                RT_SCOPE_UNIVERSE,
+            ),
+            (route(None, RouteType::Unicast), RTN_UNICAST, RT_SCOPE_LINK),
+            (
+                route(None, RouteType::Blackhole),
+                RTN_BLACKHOLE,
+                RT_SCOPE_UNIVERSE,
+            ),
+            (
+                route(None, RouteType::Unreachable),
+                RTN_UNREACHABLE,
+                RT_SCOPE_UNIVERSE,
+            ),
+            (
+                route(None, RouteType::Prohibit),
+                RTN_PROHIBIT,
+                RT_SCOPE_UNIVERSE,
+            ),
+        ] {
+            let added = header(&route);
+            assert_eq!((added.route_type, added.scope), (kind, scope), "{route:?}");
+            assert_eq!(parsed(&add(&route)), Some(route));
+        }
     }
 
     #[test]

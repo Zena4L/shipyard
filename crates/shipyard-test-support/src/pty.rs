@@ -275,6 +275,54 @@ impl Shell {
             .expect("the test went away");
     }
 
+    /// The terminal's settings now (what `stty -g` prints), to compare
+    /// with [`report_settings`](Self::report_settings) after a job.
+    #[must_use]
+    pub fn terminal_settings(&self) -> libc::termios {
+        // Zeroed: the C library's `termios` can have more control characters
+        // than the kernel fills in (musl's), which would differ from one
+        // call to the next.
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::zeroed();
+        // SAFETY: `tcgetattr` fills in the `termios` it's given; it's read
+        // only once the call succeeded.
+        let rc = unsafe { libc::tcgetattr(0, settings.as_mut_ptr()) };
+        assert_eq!(rc, 0, "tcgetattr: {}", std::io::Error::last_os_error());
+        // SAFETY: filled in by the successful call.
+        unsafe { settings.assume_init() }
+    }
+
+    /// Writes "settings unchanged" on the terminal if its settings are still
+    /// `before`, "settings changed" if not.
+    pub fn report_settings(&self, before: &libc::termios) {
+        let now = self.terminal_settings();
+        let same = (now.c_iflag, now.c_oflag, now.c_cflag, now.c_lflag, now.c_cc)
+            == (
+                before.c_iflag,
+                before.c_oflag,
+                before.c_cflag,
+                before.c_lflag,
+                before.c_cc,
+            );
+        say(if same {
+            "settings unchanged\n"
+        } else {
+            "settings changed\n"
+        });
+    }
+
+    /// Writes "terminal blocking" on the terminal if its open file (the
+    /// shell's, which the jobs share) has no `O_NONBLOCK`, "terminal
+    /// NON-BLOCKING" if it has.
+    pub fn report_blocking(&self) {
+        // SAFETY: `fcntl(F_GETFL)` only reads the open file's flags.
+        let flags = unsafe { libc::fcntl(0, libc::F_GETFL) };
+        say(if flags != -1 && flags & libc::O_NONBLOCK == 0 {
+            "terminal blocking\n"
+        } else {
+            "terminal NON-BLOCKING\n"
+        });
+    }
+
     /// Tells the test something. If the test is gone, there's no one to
     /// tell; the shell must not panic over it.
     fn report(&mut self, event: &str) {
@@ -436,6 +484,15 @@ impl Session {
                 "no end of line after {prefix:?}\n{}",
                 self.transcript()
             );
+            self.pump(deadline);
+        }
+    }
+
+    /// Reads whatever arrives for `how_long`: for asserting what did *not*
+    /// arrive (with [`count`](Self::count)).
+    pub fn settle(&mut self, how_long: Duration) {
+        let deadline = Instant::now() + how_long;
+        while Instant::now() < deadline {
             self.pump(deadline);
         }
     }
@@ -785,4 +842,11 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Writes `text` on the shell's terminal, in one call (no buffering in this
+/// forked process).
+fn say(text: &str) {
+    // SAFETY: `write` reads `text` for its length; fd 1 is the terminal.
+    unsafe { libc::write(1, text.as_ptr().cast(), text.len()) };
 }

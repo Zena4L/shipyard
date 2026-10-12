@@ -248,6 +248,31 @@ def done_in(datagram):
     return False
 
 
+# Lines of a container's log (CRI, stage 8): whole and partial records,
+# both streams, offsets, an empty text, and what isn't a record.
+CRI_RECORDS = {
+    "full": b"2026-10-10T06:16:19.123456789Z stdout F hello",
+    "partial": b"2026-10-10T06:16:19.5Z stderr P part of a line",
+    "empty": b"2016-10-20T18:39:20.57606443Z stdout F",
+    "offset": b"2026-10-10T08:16:19+02:00 stdout F:x more",
+    "binary": b"2026-10-10T06:16:19Z stdout F \x00\xff\x1b[31m",
+    "torn": b"2026-10-10T06:16:19.12",
+}
+
+
+def frame(kind, payload):
+    return bytes([kind]) + len(payload).to_bytes(4, "big") + payload
+
+
+# What an attach client sends (stage 8): a hello, typing with and without the
+# detach keys, a resize; the first byte is where the fuzz target cuts.
+ATTACH_FRAMES = {
+    "hello-typing": b"\x07" + frame(1, b"\0\0\0\x01\x10\x11") + frame(2, b"ls\r"),
+    "detach": b"\x03" + frame(2, b"ab\x10") + frame(2, b"\x11cd"),
+    "resize": b"\x00" + frame(3, b"\0\x1e\0\x64"),
+}
+
+
 def write(directory, name, data):
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, name), "wb") as out:
@@ -310,6 +335,31 @@ PROC_NET = {
 }
 
 
+# runc `process.json` files (`exec --process`): as runc's own tests and
+# containerd write them, and the edges (no capabilities, a terminal, limits).
+PROCESS_JSON = {
+    "runc": {
+        "terminal": False,
+        "user": {"uid": 0, "gid": 0, "additionalGids": [10]},
+        "args": ["sh", "-c", "echo hi"],
+        "env": ["PATH=/usr/sbin:/usr/bin:/sbin:/bin", "TERM=xterm"],
+        "cwd": "/",
+        "capabilities": {
+            "bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
+            "effective": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
+            "permitted": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
+            "ambient": [],
+        },
+        "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024}],
+        "noNewPrivileges": True,
+        "oomScoreAdj": 100,
+    },
+    "bare": {"args": ["true"], "cwd": "/", "user": {"uid": 7, "gid": 8}},
+    "terminal": {"args": ["sh"], "cwd": "/", "user": {"uid": 0, "gid": 0},
+                 "terminal": True, "consoleSize": {"height": 24, "width": 80}},
+}
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -323,6 +373,10 @@ def main():
     for name, layer in layer_seeds():
         write(f"{root}/tar", name, layer)
         write(f"{root}/unpack", name, layer)
+        # cp's: a first byte for its options (no top name; one; renamed;
+        # that must be a directory).
+        for choice in (0, 1, 3, 7):
+            write(f"{root}/cp_unpack", f"{name}-{choice}", bytes([choice]) + layer)
     for name, message in netlink_seeds():
         write(f"{root}/netlink", name, message)
     for n, spec in enumerate(PORTS):
@@ -331,6 +385,15 @@ def main():
         write(f"{root}/dns", name, message)
     for name, table in PROC_NET.items():
         write(f"{root}/proc_net", name, table.encode())
+    for name, line in CRI_RECORDS.items():
+        write(f"{root}/cri_record", name, line)
+    log = b"".join(line + b"\n" for line in CRI_RECORDS.values())
+    write(f"{root}/logs_dir", "records", log)
+    write(f"{root}/logs_dir", "torn", log[: len(log) // 2] + log)
+    for name, frames in ATTACH_FRAMES.items():
+        write(f"{root}/attach_frames", name, frames)
+    for name, process in PROCESS_JSON.items():
+        write(f"{root}/process_json", name, json.dumps(process).encode())
 
 
 if __name__ == "__main__":

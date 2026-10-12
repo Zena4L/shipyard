@@ -153,9 +153,7 @@ impl IdMaps {
     /// user namespace is usually there to prevent.
     #[must_use]
     pub fn maps_host_root(&self) -> bool {
-        self.each()
-            .iter()
-            .any(|(_, map)| map.iter().any(|range| range.outside().contains(&0)))
+        self.maps_host_uid(0) || self.maps_host_gid(0)
     }
 
     /// Both maps, with which each is.
@@ -173,6 +171,53 @@ impl IdMaps {
     #[must_use]
     pub fn host_gid(&self, id: u32) -> Option<u32> {
         host_id(&self.gids, id)
+    }
+
+    /// Whether host uid `id` is someone inside (some container uid maps to
+    /// it).
+    #[must_use]
+    pub fn maps_host_uid(&self, id: u32) -> bool {
+        self.uids
+            .iter()
+            .any(|range| range.outside().contains(&u64::from(id)))
+    }
+
+    /// Whether host gid `id` is some group inside.
+    #[must_use]
+    pub fn maps_host_gid(&self, id: u32) -> bool {
+        self.gids
+            .iter()
+            .any(|range| range.outside().contains(&u64::from(id)))
+    }
+
+    /// The maps as a process's `/proc/PID/uid_map` and `gid_map` show them
+    /// (`uids`, `gids`): a range a line, "inside outside count". `None` if
+    /// either isn't that, or is empty (not written yet).
+    #[must_use]
+    pub fn from_proc(uids: &str, gids: &str) -> Option<Self> {
+        let parse = |text: &str| {
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let mut fields = line.split_whitespace().map(str::parse::<u32>);
+                    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                        (Some(Ok(container)), Some(Ok(host)), Some(Ok(size)), None) => {
+                            Some(IdMap {
+                                container,
+                                host,
+                                size,
+                            })
+                        }
+                        _ => None,
+                    }
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        // Unwritten maps (a namespace just made) map nothing yet.
+        Some(Self {
+            uids: parse(uids).filter(|map| !map.is_empty())?,
+            gids: parse(gids).filter(|map| !map.is_empty())?,
+        })
     }
 }
 
@@ -333,6 +378,25 @@ pub enum IdMapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_ids_inside_and_procs_maps() {
+        let maps = IdMaps::from_proc(
+            "         0       1000          1\n         1     100000      65536\n",
+            "0 1000 1\n",
+        )
+        .unwrap();
+        assert!(maps.maps_host_uid(1000));
+        assert!(maps.maps_host_uid(100_000) && maps.maps_host_uid(165_535));
+        assert!(!maps.maps_host_uid(165_536) && !maps.maps_host_uid(0));
+        assert!(maps.maps_host_gid(1000) && !maps.maps_host_gid(100_000));
+        // The host's own (`0 0 4294967295`): every ID.
+        let host = IdMaps::from_proc("0 0 4294967295\n", "0 0 4294967295\n").unwrap();
+        assert!(host.maps_host_uid(0) && host.maps_host_uid(u32::MAX - 1));
+        for bad in ["0 1000", "0 1000 1 2", "a b c", "0 -1 1", "", "\n"] {
+            assert_eq!(IdMaps::from_proc(bad, "0 0 1"), None, "{bad}");
+        }
+    }
 
     fn map(s: &str) -> IdMap {
         s.parse().unwrap()
