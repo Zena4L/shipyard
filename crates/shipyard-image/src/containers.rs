@@ -3,8 +3,11 @@
 //!
 //! An image's layers are shared and read-only; what a container writes goes
 //! to its own area, the overlay's upper layer (with overlayfs's work
-//! directory, and the mount point). An area is made per run and removed
-//! when the run ends.
+//! directory, and the mount point). A foreground run's area (`run-…`) is
+//! made per run and removed when the run ends. A container's own
+//! (`ctr-<its ID>`, since 9.4a) is made at its first start, taken again by
+//! every later start (what it wrote is still there), and removed only with
+//! the container.
 //!
 //! **An area is alive while its directory is locked.** The process running
 //! the container holds an `flock(2)` on the area's directory for the
@@ -13,7 +16,10 @@
 //! try-lock away, never a guess from a PID (which the system reuses), and an
 //! area whose lock is free is stale: left by a run that couldn't clean up.
 //! Garbage collection keeps the layers that live areas list, and removes the
-//! stale areas.
+//! stale areas. A container's own area is never stale ([`Area::Owned`]):
+//! free, it's a stopped container's, whose layers are still needed; only
+//! its container's removal (or, for one whose container is gone, the
+//! engine, which knows the containers) removes it.
 //!
 //! **An area appears whole.** It's made under a temporary `.new-…` name,
 //! locked, filled in, and only then renamed to `run-…`: a process sweeping
@@ -42,6 +48,11 @@ pub const CONTAINERS: &str = "containers";
 const IMAGE: &str = "image";
 /// The file that lists the layer directories an area's overlay stacks.
 const LAYERS: &str = "layers";
+/// The file that names the container store a container's own area belongs
+/// to (its `store-id`): an engine sweeps only its own store's.
+const OWNER: &str = "owner";
+/// A container's own area's name: this, then its container's ID.
+const OWNED_PREFIX: &str = "ctr-";
 /// The most an area's `image` and `layers` files are read (they list at
 /// most a few hundred layer names).
 const LIST_LIMIT: u64 = 1024 * 1024;
@@ -62,6 +73,10 @@ pub enum AreaError {
     /// A name given to [`trash_areas`] isn't an area's.
     #[error("`{0}` isn't the name of a container's writable layer")]
     NotAnArea(String),
+    /// A container's own area stayed locked: its container is running (a
+    /// monitor holds it).
+    #[error("the writable layer {0} is in use (its container is running)")]
+    InUse(String),
 }
 
 /// An [`AreaError::Io`] for `action` on `name`, from an errno or an I/O
@@ -84,12 +99,32 @@ fn containers(store: &Store) -> Result<OwnedFd, AreaError> {
         .map_err(failed("opening", CONTAINERS))
 }
 
-/// A container's writable area, alive (locked) while this value is.
+/// A container's writable area, alive (locked) while this value is (or, once
+/// [given up](Self::give_up), while a copy of its [`hold`](Self::hold) is
+/// open).
 #[derive(Debug)]
 pub struct ContainerArea {
     name: String,
     path: PathBuf,
-    _lock: Flock<OwnedFd>,
+    /// The layer directories its overlay stacks: as made, or (a container's
+    /// own, taken again) as its `layers` file says: every start mounts the
+    /// same stack under the same upper layer.
+    layers: Vec<String>,
+    /// Its directory, locked (`flock`, exclusive): unlocked when this value
+    /// goes (another thread's child, forked meanwhile, may hold a copy
+    /// until it execs), unless it was given up ([`give_up`](Self::give_up)):
+    /// then this copy is only closed, and the area stays alive while a
+    /// copy (a container's monitor's) is open.
+    lock: std::fs::File,
+    given_up: bool,
+}
+
+impl Drop for ContainerArea {
+    fn drop(&mut self) {
+        if !self.given_up {
+            let _ = self.lock.unlock();
+        }
+    }
 }
 
 impl ContainerArea {
@@ -115,11 +150,8 @@ impl ContainerArea {
                 .map_err(failed("opening", &temporary))?;
             // Never contended: the name is new. Taken before anything can
             // see the area as `run-…`.
-            let lock = Flock::lock(
-                dir.try_clone().map_err(failed("opening", &temporary))?,
-                FlockArg::LockExclusiveNonblock,
-            )
-            .map_err(|(_, errno)| failed("locking", &temporary)(errno))?;
+            let lock = std::fs::File::from(dir.try_clone().map_err(failed("opening", &temporary))?);
+            lock.try_lock().map_err(failed("locking", &temporary))?;
             write_file(&dir, IMAGE, image.as_bytes())?;
             write_file(&dir, LAYERS, layers.join("\n").as_bytes())?;
             for (sub, mode) in [("upper", 0o755), ("work", 0o700), ("merged", 0o755)] {
@@ -134,7 +166,9 @@ impl ContainerArea {
             Ok(lock) => Ok(Self {
                 path: store.root().join(CONTAINERS).join(&name),
                 name,
-                _lock: lock,
+                layers: layers.to_vec(),
+                lock,
+                given_up: false,
             }),
             Err(err) => {
                 // Only this process knows the temporary name: nothing else
@@ -145,10 +179,154 @@ impl ContainerArea {
         }
     }
 
+    /// The writable area of container `id` (64 hex digits), whose container
+    /// store is `owner`: taken (locked) if it exists, its layers as its
+    /// `layers` file lists them, waiting up to `wait` for the lock (a
+    /// listing's probe holds it for an instant); else made, as
+    /// [`create`](Self::create) makes one, of `image` and `layers`, under
+    /// the name `ctr-<id>`. The caller makes sure no one else starts the
+    /// same container meanwhile (the engine's operation lock): a `.new-`
+    /// leftover of its own is then only a crash's, and removed.
+    ///
+    /// # Errors
+    ///
+    /// [`AreaError::NotAnArea`] for an ID that isn't one;
+    /// [`AreaError::InUse`] if it stays locked; an [`AreaError::Io`] if a
+    /// step fails.
+    pub fn create_or_take_owned(
+        store: &Store,
+        held: &StoreLock,
+        id: &str,
+        owner: &str,
+        image: &str,
+        layers: &[String],
+        wait: std::time::Duration,
+    ) -> Result<Self, AreaError> {
+        debug_assert_eq!(held.mode(), LockMode::Shared, "made while runs prepare");
+        let name = owned_area_name(id);
+        if !is_owned_name(&name) {
+            return Err(AreaError::NotAnArea(name));
+        }
+        if let Some(taken) = Self::take_owned(store, id, wait)? {
+            return Ok(taken);
+        }
+        let containers = containers(store)?;
+        let path = store.root().join(CONTAINERS).join(&name);
+        let temporary = format!(".new-{name}");
+        // A crash's, between its making and its naming: no one else makes
+        // this container's area (the caller's lock).
+        let _ = fsat::remove_tree_at(&containers, OsStr::new(&temporary));
+        mkdirat(
+            &containers,
+            temporary.as_str(),
+            Mode::from_bits_truncate(0o700),
+        )
+        .map_err(failed("creating", &temporary))?;
+        let made = (|| {
+            let dir = fsat::open_dir_at(&containers, temporary.as_ref())
+                .map_err(failed("opening", &temporary))?;
+            let lock = std::fs::File::from(dir.try_clone().map_err(failed("opening", &temporary))?);
+            lock.try_lock().map_err(failed("locking", &temporary))?;
+            write_file(&dir, IMAGE, image.as_bytes())?;
+            write_file(&dir, LAYERS, layers.join("\n").as_bytes())?;
+            write_file(&dir, OWNER, owner.as_bytes())?;
+            for (sub, mode) in [("upper", 0o755), ("work", 0o700), ("merged", 0o755)] {
+                mkdirat(&dir, sub, Mode::from_bits_truncate(mode))
+                    .map_err(failed("creating", format!("{name}/{sub}")))?;
+            }
+            nix::fcntl::renameat(&containers, temporary.as_str(), &containers, name.as_str())
+                .map_err(failed("naming", &name))?;
+            Ok(lock)
+        })();
+        match made {
+            Ok(lock) => Ok(Self {
+                path,
+                name,
+                layers: layers.to_vec(),
+                lock,
+                given_up: false,
+            }),
+            Err(err) => {
+                let _ = fsat::remove_tree_at(&containers, OsStr::new(&temporary));
+                Err(err)
+            }
+        }
+    }
+
+    /// Container `id`'s own area, taken (locked, waiting up to `wait`: a
+    /// listing's probe holds it for an instant), if it has one: to start
+    /// on, or to remove while held (see [`trash_areas`]).
+    ///
+    /// # Errors
+    ///
+    /// [`AreaError::NotAnArea`] for an ID that isn't one;
+    /// [`AreaError::InUse`] if it stays locked; an [`AreaError::Io`] if it
+    /// can't be opened, locked or read.
+    pub fn take_owned(
+        store: &Store,
+        id: &str,
+        wait: std::time::Duration,
+    ) -> Result<Option<Self>, AreaError> {
+        let name = owned_area_name(id);
+        if !is_owned_name(&name) {
+            return Err(AreaError::NotAnArea(name));
+        }
+        let containers = containers(store)?;
+        let dir = match fsat::open_dir_at(&containers, OsStr::new(&name)) {
+            Ok(dir) => dir,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(errno) => return Err(failed("opening", &name)(errno)),
+        };
+        let lock = std::fs::File::from(dir.try_clone().map_err(failed("opening", &name))?);
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Err(AreaError::InUse(name)),
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(failed("locking", &name)(err));
+                }
+            }
+        }
+        let Some(stack) = read_list(&dir, LAYERS, &name)? else {
+            return Err(failed("reading", format!("{name}/{LAYERS}"))(Errno::ENOENT));
+        };
+        Ok(Some(Self {
+            path: store.root().join(CONTAINERS).join(&name),
+            name,
+            layers: stack.lines().map(str::to_owned).collect(),
+            lock,
+            given_up: false,
+        }))
+    }
+
+    /// The layer directories its overlay stacks, lowest first.
+    #[must_use]
+    pub fn layers(&self) -> &[String] {
+        &self.layers
+    }
+
     /// The area's name, in `containers/`.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Its locked directory, for a process that keeps the area alive (a
+    /// container's monitor), once this value is [given up](Self::give_up).
+    #[must_use]
+    pub fn hold(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.lock)
+    }
+
+    /// Gives the area up to whoever holds a copy of its
+    /// [`hold`](Self::hold): this value's copy is closed, never unlocked,
+    /// so the area stays alive while any copy is open.
+    pub fn give_up(mut self) {
+        self.given_up = true;
     }
 
     /// The overlay's upper (writable) layer.
@@ -226,11 +404,31 @@ pub struct LiveArea {
     pub layers: Vec<String>,
 }
 
+/// A container's own area (`ctr-<id>`), as found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedArea {
+    /// Its name, in `containers/`.
+    pub name: String,
+    /// Its container's ID.
+    pub container: String,
+    /// The container store it belongs to (its `owner` file; none if it
+    /// can't be read).
+    pub owner: Option<String>,
+    /// Its image's manifest digest.
+    pub image: String,
+    /// The layer directories its overlay stacks.
+    pub layers: Vec<String>,
+    /// Locked: its container is running (or starting, or being removed).
+    pub held: bool,
+}
+
 /// An area found in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Area {
     /// Locked: its container is running.
     Live(LiveArea),
+    /// A container's own, running or not: never stale, its layers in use.
+    Owned(OwnedArea),
     /// Unlocked: left by a run that ended without removing it.
     Stale {
         /// Its name.
@@ -272,6 +470,29 @@ pub fn areas(store: &Store) -> Result<Vec<Area>, AreaError> {
             Err(errno) => return Err(failed("opening", &name)(errno)),
         };
         let probe = dir.try_clone().map_err(failed("opening", &name))?;
+        if let Some(container) = name.strip_prefix(OWNED_PREFIX) {
+            let held = match Flock::lock(probe, FlockArg::LockExclusiveNonblock) {
+                Ok(_) => false,
+                Err((_, Errno::EWOULDBLOCK)) => true,
+                Err((_, errno)) => return Err(failed("locking", &name)(errno)),
+            };
+            // Being made or removed, if its lists are gone.
+            let (Some(image), Some(layers)) = (
+                read_list(&dir, IMAGE, &name)?,
+                read_list(&dir, LAYERS, &name)?,
+            ) else {
+                continue;
+            };
+            found.push(Area::Owned(OwnedArea {
+                container: container.to_owned(),
+                owner: read_list(&dir, OWNER, &name)?,
+                image,
+                layers: layers.lines().map(str::to_owned).collect(),
+                held,
+                name,
+            }));
+            continue;
+        }
         match Flock::lock(probe, FlockArg::LockExclusiveNonblock) {
             // Free: nobody runs it. (The lock goes again at once.)
             Ok(_) => found.push(Area::Stale { name }),
@@ -357,12 +578,29 @@ pub fn remove_areas(store: &Store, names: &[String]) -> Result<(), AreaError> {
     Ok(())
 }
 
-/// Whether `name` is an area's (`run-<pid>-<hex>-<hex>`): a single name,
-/// nothing that climbs.
+/// Whether `name` is an area's (`run-<pid>-<hex>-<hex>`, or a
+/// container's own, `ctr-<64 hex>`): a single name, nothing that climbs.
 fn is_area_name(name: &str) -> bool {
-    name.strip_prefix("run-").is_some_and(|rest| {
-        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    is_owned_name(name)
+        || name.strip_prefix("run-").is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        })
+}
+
+/// Whether `name` is a container's own area's: `ctr-` and a container ID.
+fn is_owned_name(name: &str) -> bool {
+    name.strip_prefix(OWNED_PREFIX).is_some_and(|id| {
+        id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+/// A container's own area's name, for container `id`.
+#[must_use]
+pub fn owned_area_name(id: &str) -> String {
+    format!("{OWNED_PREFIX}{id}")
 }
 
 #[cfg(test)]
@@ -405,6 +643,168 @@ mod tests {
         let name = second.name().to_owned();
         drop(second);
         assert!(areas(&store).unwrap().contains(&Area::Stale { name }));
+    }
+
+    /// An area dropped (not given up) is stale at once, even while a stray
+    /// copy of its lock's descriptor is open (another thread's child,
+    /// between its fork and its exec): it's unlocked, not only closed.
+    #[test]
+    fn a_dropped_area_is_stale_despite_a_stray_copy() {
+        let scratch = Scratch::new("stray");
+        let store = store(&scratch);
+        let area = ContainerArea::create(&store, &shared(&store), "sha256:img", &["aa".to_owned()])
+            .unwrap();
+        let name = area.name().to_owned();
+        let stray = area.hold().try_clone_to_owned().unwrap();
+        drop(area);
+        assert!(
+            areas(&store).unwrap().contains(&Area::Stale { name }),
+            "stale despite the copy"
+        );
+        drop(stray);
+    }
+
+    /// An area handed over (a copy of its hold, as a container's monitor
+    /// keeps) stays live once its holder has gone, and stale once the copy
+    /// is closed: dropping the holder only closes, never unlocks.
+    #[test]
+    fn an_area_handed_over_outlives_its_holder() {
+        let scratch = Scratch::new("handed");
+        let store = store(&scratch);
+        let layers = vec!["aa".to_owned()];
+        let area = ContainerArea::create(&store, &shared(&store), "sha256:img", &layers).unwrap();
+        let name = area.name().to_owned();
+        let copy = area.hold().try_clone_to_owned().unwrap();
+        area.give_up();
+        let live = |areas: &[Area]| {
+            areas
+                .iter()
+                .any(|area| matches!(area, Area::Live(live) if live.name == name))
+        };
+        assert!(live(&areas(&store).unwrap()), "held by the copy");
+        drop(copy);
+        // Closing only (a handed-over hold is never unlocked): another
+        // test's child, between its fork and its exec, may have a copy for
+        // a moment more.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !areas(&store)
+            .unwrap()
+            .contains(&Area::Stale { name: name.clone() })
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stale once the copy is closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A container's own area: made under its ID's name, taken again (its
+    /// files and its layers as made, whatever is asked now), never stale
+    /// (free, it's a stopped container's), listed as its container's and
+    /// its store's, and held while taken.
+    #[test]
+    fn a_containers_own_area_is_made_then_taken_again() {
+        let scratch = Scratch::new("owned");
+        let store = store(&scratch);
+        let id = "ab".repeat(32);
+        let wait = std::time::Duration::from_millis(100);
+        let layers = vec!["aa".to_owned()];
+        let made = ContainerArea::create_or_take_owned(
+            &store,
+            &shared(&store),
+            &id,
+            "store-1",
+            "sha256:img",
+            &layers,
+            wait,
+        )
+        .unwrap();
+        assert_eq!(made.name(), format!("ctr-{id}"));
+        std::fs::write(made.upper().join("kept"), "x").unwrap();
+        let listed = |areas: Vec<Area>| -> Option<OwnedArea> {
+            areas.into_iter().find_map(|area| match area {
+                Area::Owned(owned) => Some(owned),
+                _ => None,
+            })
+        };
+        let owned = listed(areas(&store).unwrap()).expect("listed as owned");
+        assert!(owned.held);
+        assert_eq!(owned.container, id);
+        assert_eq!(owned.owner.as_deref(), Some("store-1"));
+        // Held: another taker waits, then gives up.
+        assert!(matches!(
+            ContainerArea::create_or_take_owned(
+                &store,
+                &shared(&store),
+                &id,
+                "store-1",
+                "sha256:img",
+                &layers,
+                wait
+            ),
+            Err(AreaError::InUse(_))
+        ));
+        drop(made);
+        let owned = listed(areas(&store).unwrap()).expect("never stale");
+        assert!(!owned.held);
+        let other_layers = vec!["bb".to_owned()];
+        let taken = ContainerArea::create_or_take_owned(
+            &store,
+            &shared(&store),
+            &id,
+            "store-1",
+            "sha256:img",
+            &other_layers,
+            wait,
+        )
+        .unwrap();
+        assert_eq!(taken.layers(), layers.as_slice(), "its own stack, as made");
+        assert_eq!(
+            std::fs::read_to_string(taken.upper().join("kept")).unwrap(),
+            "x"
+        );
+        assert!(matches!(
+            ContainerArea::create_or_take_owned(
+                &store,
+                &shared(&store),
+                "../x",
+                "s",
+                "i",
+                &[],
+                wait
+            ),
+            Err(AreaError::NotAnArea(_))
+        ));
+    }
+
+    /// A crash between an owned area's making and its naming left its
+    /// `.new-` directory: the next start (its container's alone) replaces
+    /// it, never loops on it.
+    #[test]
+    fn a_crashs_half_made_owned_area_is_replaced() {
+        let scratch = Scratch::new("owned-crash");
+        let store = store(&scratch);
+        let id = "cd".repeat(32);
+        std::fs::create_dir(store.root().join(CONTAINERS).join(format!(".new-ctr-{id}"))).unwrap();
+        let area = ContainerArea::create_or_take_owned(
+            &store,
+            &shared(&store),
+            &id,
+            "s",
+            "sha256:img",
+            &[],
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert!(area.upper().is_dir());
+        assert!(
+            !store
+                .root()
+                .join(CONTAINERS)
+                .join(format!(".new-ctr-{id}"))
+                .exists()
+        );
     }
 
     #[test]

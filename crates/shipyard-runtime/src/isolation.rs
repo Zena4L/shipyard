@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::id_map::{IdMap, IdMapError, IdMaps, MapKind, RootlessMaps};
 
 /// A kind of Linux namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Namespace {
     /// Process IDs: the first process inside is PID 1 (`pid_namespaces(7)`).
@@ -132,9 +132,14 @@ const MAX_LABEL_LEN: usize = 63;
 /// inside them.
 ///
 /// Start from [`Isolation::standard`] and change fields: it will gain more
-/// (a domain name, then OCI's namespace paths), so it can't be written out
-/// in full outside this crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (a domain name, then OCI's namespace paths), so it can't be built
+/// field by field outside this crate.
+///
+/// Its serde form (and its parts') is the runtime's own, for a planned
+/// container's `plan.json`, read by the same binary that wrote it: not a
+/// format to keep, and not one to write by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Isolation {
     /// The namespaces to create. Each kind at most once.
@@ -184,7 +189,8 @@ pub struct Isolation {
 /// A network device of the host, moved into the container's network
 /// namespace when it starts. When the namespace goes, the kernel gives a
 /// physical device back to the host's; a virtual one is destroyed with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct NetDevice {
     /// Its name on the host.
@@ -207,6 +213,7 @@ impl NetDevice {
 /// The container's view of its cgroup at `/sys/fs/cgroup` (always `nosuid`,
 /// `nodev` and `noexec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CgroupMount {
     /// Read-only, as Docker mounts it for containers that aren't privileged:
@@ -441,6 +448,13 @@ impl Isolation {
                 return Err(IsolationError::UserRootNeedsPid);
             }
         }
+        // Outside a cgroup namespace, a `cgroup2` mount shows the host's
+        // whole tree (and, writable, lets the container leave its cgroup).
+        // (Without a mount namespace of its own, none is made.)
+        if self.cgroup_mount.is_some() && self.has(Namespace::Mount) && !self.has(Namespace::Cgroup)
+        {
+            return Err(IsolationError::CgroupMountNeedsCgroup);
+        }
         Ok(())
     }
 }
@@ -480,7 +494,8 @@ pub const DEFAULT_READONLY_PATHS: [&str; 5] = [
 /// Start from [`Root::new`], which fills in the default masked and
 /// read-only paths. The shape follows the OCI runtime spec's `root`,
 /// `linux.maskedPaths` and `linux.readonlyPaths`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Root {
     /// The directory on the host. Absolute.
@@ -513,7 +528,8 @@ pub struct Root {
 /// An overlay to mount as the root filesystem: read-only lower (image) layers
 /// stacked under a writable upper layer. The engine extracts the layers to
 /// directories; see [`Root::overlay`] for who mounts them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Overlay {
     /// The read-only layer directories, base first (the init reverses them
@@ -569,7 +585,8 @@ impl Overlay {
 
 /// A mount in the container: a host directory or file bound in, or a fresh
 /// tmpfs. The shape follows the OCI runtime spec's `mounts`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Mount {
     /// Where it appears inside the container. Absolute, and not in `/proc`
@@ -585,7 +602,7 @@ pub struct Mount {
 }
 
 /// What a [`Mount`] mounts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MountKind {
     /// A host directory or file, seen at the destination too (`MS_BIND`).
@@ -669,7 +686,7 @@ pub(crate) enum MountStep {
 }
 
 /// A restriction on a [`Mount`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MountFlag {
     /// Nothing can be written (with `rbind`, the mounts below it too).
@@ -1146,6 +1163,13 @@ pub enum IsolationError {
     /// host's `/proc`.
     #[error("a PID namespace needs a mount namespace too (for its own /proc)")]
     PidNeedsMount,
+    /// A cgroup mount without a cgroup namespace: it would show the host's
+    /// whole cgroup tree.
+    #[error(
+        "a cgroup mount at /sys/fs/cgroup needs a cgroup namespace (or it would show the host's \
+         whole cgroup tree)"
+    )]
+    CgroupMountNeedsCgroup,
     /// A root filesystem in a user namespace, without a PID namespace: its
     /// `/proc` can't be mounted (only root of the user namespace owning the
     /// PID namespace may mount one, and the host's isn't).
@@ -1666,6 +1690,8 @@ mod tests {
     #[test]
     fn a_root_filesystem_in_a_user_namespace_needs_a_pid_namespace() {
         let mut isolation = Isolation::standard();
+        // No cgroup namespace below: no cgroup mount either.
+        isolation.cgroup_mount = None;
         isolation.namespaces = vec![Namespace::Mount, Namespace::User];
         isolation.id_maps = Some(crate::id_map::IdMaps::single((1000, 1000)));
         isolation.root = Some(Root::new(PathBuf::from("/srv/root")));

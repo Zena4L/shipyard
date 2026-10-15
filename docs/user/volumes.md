@@ -5,7 +5,7 @@ writable layer — which is thrown away when the container is removed — a volu
 contents outlive the container.
 
 > **Status:** named volumes and the `--volume` flag work on Linux (mounting into
-> a container needs a root filesystem, so use them with `--image` or `--rootfs`).
+> a container needs a root filesystem, so use them with an image or `--rootfs`).
 > The `volume` commands manage directories and work on macOS and Linux.
 
 ## Named volumes
@@ -15,7 +15,7 @@ shipyard volume create data              # create a named volume
 shipyard volume ls                       # list volumes
 shipyard volume inspect data             # show its mount point on the host
 shipyard volume rm data                  # remove a volume and its contents
-shipyard volume prune                    # remove every volume no running container uses
+shipyard volume prune                    # remove every volume no container uses
 ```
 
 A named volume is a directory Shipyard owns, under the store
@@ -25,8 +25,8 @@ and must start with a letter or digit — no slashes.
 ## Mounting into a container
 
 ```sh
-shipyard run --image alpine --volume data:/var/lib/data sh -c 'echo hi > /var/lib/data/f'
-shipyard run --image alpine --volume data:/var/lib/data cat /var/lib/data/f    # hi
+shipyard run --volume data:/var/lib/data alpine sh -c 'echo hi > /var/lib/data/f'
+shipyard run --volume data:/var/lib/data alpine cat /var/lib/data/f    # hi
 ```
 
 `--volume SOURCE:DEST[:ro]`:
@@ -42,25 +42,27 @@ created the first time you mount it, as Docker does.
 
 ```sh
 # A named volume, created on first use:
-shipyard run --image alpine --volume cache:/cache …
+shipyard run --volume cache:/cache alpine …
 
 # A host directory, bind-mounted read-only:
-shipyard run --image alpine --volume /etc/myapp:/config:ro …
+shipyard run --volume /etc/myapp:/config:ro alpine …
 ```
 
 Volumes mount into the container's root filesystem, so they need one — use
-`--volume` with `--image` or `--rootfs`.
+`--volume` with an image or `--rootfs`.
 
 ## Removing volumes
 
-A volume a running container uses is never removed: `volume rm` refuses it ("in
-use by a running container"), and `volume prune` leaves it and says so. Once the
-container ends, both remove it.
+A volume a container uses is never removed, whether the container is running or
+stopped (as Docker's): `volume rm` refuses it, naming the containers ("the volume
+data is in use by web, db"; "in use by a running container" if what holds it has no
+record, such as a `--no-image` run), and `volume prune` keeps it and says so. Once
+the container is removed (`shipyard rm`), both remove it.
 
 `volume prune` deletes data, so it asks first:
 
 ```text
-Remove every volume no running container uses, and its data? [y/N]
+Remove every volume no container uses, and its data? [y/N]
 ```
 
 Anything but `y` (or `yes`) keeps everything. Where there's no terminal to ask on

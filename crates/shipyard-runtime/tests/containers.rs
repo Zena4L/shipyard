@@ -39,20 +39,22 @@ use shipyard_test_support::{
 
 fn main() -> ExitCode {
     process::init_entry_point();
+    // A planned container's monitor is this binary again.
+    shipyard_runtime::container::monitor_entry_point();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = serve_if_asked(&args) {
         return code;
     }
     let tests = tests();
     if args.iter().any(|arg| arg == "--list") {
-        for (name, _) in tests {
+        for (name, _) in &tests {
             println!("{name}: test");
         }
         return ExitCode::SUCCESS;
     }
     println!("\nrunning {} tests", tests.len());
     let mut failed = Vec::new();
-    for (name, test) in tests {
+    for &(name, test) in &tests {
         print!("test {name} ... ");
         let _ = std::io::stdout().flush();
         // Last resort against a hang: SIGALRM ends this binary.
@@ -61,7 +63,7 @@ fn main() -> ExitCode {
         let passed = std::panic::catch_unwind(test).is_ok();
         println!("{}", if passed { "ok" } else { "FAILED" });
         if !passed {
-            failed.push(*name);
+            failed.push(name);
         }
     }
     // SAFETY: as above; 0 cancels it.
@@ -79,8 +81,42 @@ fn main() -> ExitCode {
     }
 }
 
-/// The tests this system can run: the root ones as root.
-fn tests() -> &'static [(&'static str, fn())] {
+/// The tests this system can run: the root ones as root, and the planned
+/// containers' either way.
+fn tests() -> Vec<(&'static str, fn())> {
+    let mut tests = joining_tests().to_vec();
+    if cfg!(target_os = "linux") {
+        tests.extend_from_slice(PLANNED);
+    }
+    tests
+}
+
+/// A planned container's tests, as root and without.
+const PLANNED: &[(&str, fn())] = &[
+    (
+        "a_planned_container_runs_its_plan",
+        a_planned_container_runs_its_plan,
+    ),
+    (
+        "a_planned_overlay_root_writes_to_its_upper",
+        a_planned_overlay_root_writes_to_its_upper,
+    ),
+    (
+        "a_plan_is_checked_as_a_bundle_is",
+        a_plan_is_checked_as_a_bundle_is,
+    ),
+    (
+        "exec_runs_as_a_planned_user_by_name",
+        exec_runs_as_a_planned_user_by_name,
+    ),
+    (
+        "a_created_containers_init_can_be_followed",
+        a_created_containers_init_can_be_followed,
+    ),
+];
+
+/// The joining tests this system can run: the root ones as root.
+fn joining_tests() -> &'static [(&'static str, fn())] {
     if !cfg!(target_os = "linux") {
         &[("joining_needs_linux", joining_needs_linux)]
     } else if is_root() {
@@ -179,8 +215,61 @@ fn serve_if_asked(args: &[String]) -> Option<ExitCode> {
             };
             serve(Mode::Join(target), rest.get(1..).unwrap_or_default())
         }
+        #[cfg(target_os = "linux")]
+        "planned" => planned(rest),
         _ => return None,
     })
+}
+
+/// `planned STATE-ROOT ID ROOTFS [--user NAME] COMMAND…`: creates container
+/// ID from a plan (`create_planned`) and starts it, then leaves it to its
+/// monitor: for looking at a planned container by hand, with
+/// `shipyard-runtime --root STATE-ROOT` (`state`, `exec`, `kill`, `delete`).
+#[cfg(target_os = "linux")]
+fn planned(args: &[String]) -> ExitCode {
+    use shipyard_runtime::container;
+    let [state_root, id, rootfs, rest @ ..] = args else {
+        eprintln!("usage: planned STATE-ROOT ID ROOTFS [--user NAME] COMMAND…");
+        return ExitCode::from(2);
+    };
+    let (user, command) = match rest {
+        [flag, name, command @ ..] if flag == "--user" => (Some(name.clone()), command),
+        _ => (None, rest),
+    };
+    let mut isolation = standard_isolation();
+    isolation.root = Some(Root::new(rootfs));
+    if !is_root() {
+        isolation.namespaces.push(Namespace::User);
+        isolation.id_maps = Some(process::rootless_id_maps().maps);
+    }
+    let mut spec = ProcessSpec::new(command.iter().map(Into::into).collect());
+    spec.user.names.user = user;
+    let plan = container::Plan::new(spec, isolation);
+    let state_root = std::path::Path::new(state_root);
+    let created = match container::create_planned(
+        state_root,
+        id,
+        &plan,
+        &container::CreateOptions::default(),
+    ) {
+        Ok(created) => created,
+        Err(err) => {
+            eprintln!("planned: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for warning in &created.warnings {
+        eprintln!("planned: warning: {warning}");
+    }
+    if let Err(err) = container::start(state_root, id) {
+        eprintln!("planned: starting {id}: {err}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "{id}: created from a plan and started (monitor {})",
+        created.pid
+    );
+    ExitCode::SUCCESS
 }
 
 // --- The modes --------------------------------------------------------------
@@ -772,4 +861,421 @@ fn gone_soon(pid: u32) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+// --- Planned containers (`create_planned`) ---------------------------------
+
+/// A state root and a directory the container writes its results to, for
+/// one test; removed at the end.
+struct PlanTest {
+    dir: std::path::PathBuf,
+}
+
+impl PlanTest {
+    fn new(name: &str) -> Self {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("shipyard-planned-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("state"))
+            .unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        // Rootless, the container's root is one of the caller's subordinate
+        // IDs: it may write here only if anyone may.
+        open_to_all(&dir.join("out"));
+        Self { dir }
+    }
+
+    fn state_root(&self) -> std::path::PathBuf {
+        self.dir.join("state")
+    }
+
+    /// What the container wrote to `/out/NAME`.
+    fn out(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join("out").join(name)).unwrap_or_default()
+    }
+
+    /// `script` in `root`, with this test's `/out`, as a plan.
+    fn plan(&self, mut root: Root, script: &str) -> shipyard_runtime::container::Plan {
+        root.mounts.push(shipyard_runtime::isolation::Mount::bind(
+            self.dir.join("out"),
+            "/out",
+        ));
+        let mut isolation = standard_isolation();
+        isolation.root = Some(root);
+        // A plan says everything: rootless, its own user namespace too.
+        #[cfg(target_os = "linux")]
+        if !is_root() {
+            isolation
+                .namespaces
+                .push(shipyard_runtime::isolation::Namespace::User);
+            isolation.id_maps = Some(shipyard_runtime::process::rootless_id_maps().maps);
+        }
+        let spec = ProcessSpec::new(vec!["sh".into(), "-c".into(), script.into()]);
+        shipyard_runtime::container::Plan::new(spec, isolation)
+    }
+
+    /// Creates `id` from `plan`, starts it, and waits for its end.
+    fn run(&self, id: &str, plan: &shipyard_runtime::container::Plan) {
+        self.run_and(id, plan, None::<fn(&std::path::Path)>);
+    }
+
+    /// [`run`](Self::run), calling `running` once the command has written
+    /// `/out/started` (which it must), while it runs.
+    fn run_watching(
+        &self,
+        id: &str,
+        plan: &shipyard_runtime::container::Plan,
+        running: impl FnOnce(&std::path::Path),
+    ) {
+        self.run_and(id, plan, Some(running));
+    }
+
+    fn run_and(
+        &self,
+        id: &str,
+        plan: &shipyard_runtime::container::Plan,
+        running: Option<impl FnOnce(&std::path::Path)>,
+    ) {
+        use shipyard_runtime::container;
+        let root = self.state_root();
+        let options = container::CreateOptions::default();
+        container::create_planned(&root, id, plan, &options).unwrap();
+        let state = container::state(&root, id).unwrap();
+        assert_eq!(state.status, container::Status::Created);
+        assert_eq!(
+            state.bundle,
+            root.join(id).canonicalize().unwrap(),
+            "its own directory"
+        );
+        container::start(&root, id).unwrap();
+        let started = self.dir.join("out/started");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(running) = running {
+            assert!(started.exists(), "{id} never wrote /out/started");
+            running(&root);
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while container::exit_record(&root, id).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "{id} never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Makes `dir` writable by anyone (a rootless container's mapped IDs).
+fn open_to_all(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+}
+
+impl Drop for PlanTest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A container from a plan runs what the plan says, in its root, and ends
+/// with its code; its plan is beside its record. `exec` joins it, confined
+/// as the plan's process (the monitor's `exec.json` from the plan).
+fn a_planned_container_runs_its_plan() {
+    use shipyard_runtime::container::{self, ExecOptions, ExecOutcome};
+    let test = PlanTest::new("plain");
+    let rootfs = RootFs::minimal();
+    let plan = test.plan(
+        Root::new(rootfs.path()),
+        "cat /marker > /out/seen; touch /out/started; sleep 2; exit 3",
+    );
+    test.run_watching("plain", &plan, |root| {
+        let state = container::state(root, "plain").unwrap();
+        assert_eq!(state.status, container::Status::Running);
+        let options = ExecOptions::new(vec![
+            "sh".into(),
+            "-c".into(),
+            "cat /marker > /out/exec".into(),
+        ]);
+        let outcome = container::exec(root, "plain", &options, None).unwrap();
+        assert!(
+            matches!(outcome, ExecOutcome::Exited(process::ExitStatus::Exited(0))),
+            "{outcome:?}"
+        );
+    });
+    assert_eq!(test.out("seen"), MARKER);
+    assert_eq!(test.out("exec"), MARKER, "exec ran in the plan's root");
+    let root = test.state_root();
+    let ended = shipyard_runtime::container::exit_record(&root, "plain")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.code, Some(3), "{ended:?}");
+    assert!(root.join("plain/plan.json").is_file());
+    shipyard_runtime::container::delete(&root, "plain", false).unwrap();
+    assert!(!root.join("plain").exists());
+}
+
+/// This process's children (from `/proc`: any, living or a zombie).
+fn my_children() -> Vec<i32> {
+    let me = std::process::id().to_string();
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let ppid = stat.rsplit(')').next()?.split_whitespace().nth(1)?;
+            (ppid == me).then(|| entry.file_name().to_str()?.parse().ok())?
+        })
+        .collect()
+}
+
+/// A created container's init, for a caller to follow (pasta, detached):
+/// its PID and start time, and a pidfd that's readable once it has ended;
+/// refused once the container has started. `create` leaves no child of
+/// this process behind (the monitor's double fork).
+fn a_created_containers_init_can_be_followed() {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use shipyard_runtime::container;
+    let test = PlanTest::new("follow");
+    let rootfs = RootFs::minimal();
+    let plan = test.plan(Root::new(rootfs.path()), "sleep 30");
+    let root = test.state_root();
+    let options = container::CreateOptions::default();
+    // Not a subreaper meanwhile (the joining tests before made this one):
+    // a subreaper adopts the orphaned monitor, as init would.
+    #[cfg(target_os = "linux")]
+    let subreaper = nix::sys::prctl::get_child_subreaper().unwrap();
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_child_subreaper(false).unwrap();
+    let before = my_children();
+    container::create_planned(&root, "init-followed", &plan, &options).unwrap();
+    let after = my_children();
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_child_subreaper(subreaper).unwrap();
+    assert_eq!(after, before, "create left a child");
+    let init = container::init_process(&root, "init-followed").unwrap();
+    assert_eq!(
+        Some(init.pid),
+        container::state(&root, "init-followed").unwrap().pid
+    );
+    assert_ne!(init.start_time, 0);
+    let pidfd = init.pidfd.expect("a pidfd (Linux 5.3)");
+    let readable = |wait: u16| {
+        let mut fds = [PollFd::new(
+            std::os::fd::AsFd::as_fd(&pidfd),
+            PollFlags::POLLIN,
+        )];
+        poll(&mut fds, PollTimeout::from(wait)).unwrap() == 1
+    };
+    assert!(!readable(0), "readable while the init runs");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(init.pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    assert!(readable(5000), "not readable once the init has ended");
+    container::delete(&root, "init-followed", true).unwrap();
+
+    // Started: no longer the caller's to follow.
+    container::create_planned(&root, "init-started", &plan, &options).unwrap();
+    container::start(&root, "init-started").unwrap();
+    assert!(container::init_process(&root, "init-started").is_err());
+    container::delete(&root, "init-started", true).unwrap();
+}
+
+/// A plan's user by name (an image's `USER`): the container's process runs
+/// as it, from the container's own `/etc/passwd` and `/etc/group`, and so
+/// does `exec`'s command, with its groups and `HOME`.
+fn exec_runs_as_a_planned_user_by_name() {
+    use shipyard_runtime::container::{self, ExecOptions, ExecOutcome};
+    let test = PlanTest::new("named");
+    let rootfs = RootFs::minimal();
+    let etc = rootfs.path().join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::write(etc.join("passwd"), "app:x:4321:4322::/home/app:/bin/sh\n").unwrap();
+    std::fs::write(etc.join("group"), "app:x:4322:\nextra:x:4323:app\n").unwrap();
+    let mut plan = test.plan(
+        Root::new(rootfs.path()),
+        "cat /proc/self/status > /out/own; touch /out/started; sleep 2",
+    );
+    plan.spec.user.names.user = Some("app".to_owned());
+    plan.spec.user.names.memberships = true;
+    test.run_watching("named", &plan, |root| {
+        let options = ExecOptions::new(vec![
+            "sh".into(),
+            "-c".into(),
+            "cat /proc/self/status > /out/exec; echo \"$HOME\" > /out/home".into(),
+        ]);
+        let outcome = container::exec(root, "named", &options, None).unwrap();
+        assert!(
+            matches!(outcome, ExecOutcome::Exited(process::ExitStatus::Exited(0))),
+            "{outcome:?}"
+        );
+    });
+    let ids = |status: &str, key: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(|ids| ids.split_whitespace().next().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    };
+    for file in ["own", "exec"] {
+        let status = test.out(file);
+        assert_eq!(ids(&status, "Uid:"), "4321", "{file}: {status}");
+        assert_eq!(ids(&status, "Gid:"), "4322", "{file}: {status}");
+        let groups = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .unwrap_or_default();
+        assert!(
+            groups.split_whitespace().any(|gid| gid == "4323"),
+            "{file}: {status}"
+        );
+    }
+    assert_eq!(test.out("home").trim(), "/home/app");
+    container::delete(&test.state_root(), "named", false).unwrap();
+}
+
+/// An image's root as a plan has it: an overlay of a lower directory, with
+/// the container's writes in its upper one, the lower left as it was.
+fn a_planned_overlay_root_writes_to_its_upper() {
+    let test = PlanTest::new("overlay");
+    let lower = RootFs::minimal();
+    let area = test.dir.join("area");
+    for dir in ["upper", "work", "merged"] {
+        std::fs::create_dir_all(area.join(dir)).unwrap();
+        open_to_all(&area.join(dir));
+    }
+    let mut root = Root::new(area.join("merged"));
+    root.overlay = Some(shipyard_runtime::isolation::Overlay::new(
+        vec![lower.path().to_owned()],
+        area.join("upper"),
+        area.join("work"),
+    ));
+    let plan = test.plan(root, "cat /marker > /out/seen; echo new > /made");
+    test.run("overlay", &plan);
+    assert_eq!(test.out("seen"), MARKER, "the lower's files");
+    assert_eq!(
+        std::fs::read_to_string(area.join("upper/made")).unwrap(),
+        "new\n",
+        "the write is in the upper"
+    );
+    assert!(
+        !lower.path().join("made").exists(),
+        "the lower is untouched"
+    );
+    shipyard_runtime::container::delete(&test.state_root(), "overlay", false).unwrap();
+}
+
+/// A plan gets a bundle's checks before anything is made: a terminal with
+/// no console socket, or without a mount namespace; a hostname without a
+/// UTS namespace; a cgroup file a bundle couldn't name (`unified`); a cgroup
+/// mount without a cgroup namespace; a seccomp profile that can't be used;
+/// no root filesystem; and rootless, no user namespace of its own. The
+/// same plan with none of these mistakes is created (the control).
+fn a_plan_is_checked_as_a_bundle_is() {
+    use shipyard_runtime::container::{self, ContainerError, PlanError};
+    use shipyard_runtime::isolation::{IsolationError, Namespace};
+    let test = PlanTest::new("checked");
+    let rootfs = RootFs::minimal();
+    let create = |plan: &container::Plan| {
+        container::create_planned(
+            &test.state_root(),
+            "checked",
+            plan,
+            &container::CreateOptions::default(),
+        )
+    };
+    let refused = |plan: &container::Plan, kind: fn(&ContainerError) -> bool| {
+        let err = create(plan).unwrap_err();
+        assert!(!test.state_root().join("checked").exists(), "{err}");
+        assert!(kind(&err), "{err}");
+    };
+    let good = || test.plan(Root::new(rootfs.path()), "true");
+    let plan_without = |namespace: Namespace| {
+        let mut plan = good();
+        plan.isolation.namespaces.retain(|kept| *kept != namespace);
+        plan
+    };
+    // The control: created, then deleted unstarted.
+    create(&good()).unwrap();
+    container::delete(&test.state_root(), "checked", true).unwrap();
+    // Whether this host gives a container a cgroup (CI's and the test
+    // container's do; a user outside a delegated cgroup doesn't).
+    #[cfg(target_os = "linux")]
+    let gets_a_cgroup = shipyard_runtime::cgroup::Tree::find().is_ok();
+    #[cfg(not(target_os = "linux"))]
+    let gets_a_cgroup = false;
+    let mut plan = good();
+    plan.terminal = Some(shipyard_runtime::oci::BundleTerminal::default());
+    refused(&plan, |err| {
+        matches!(err, ContainerError::TerminalWithoutConsoleSocket)
+    });
+    let mut plan = plan_without(Namespace::Mount);
+    plan.isolation.root = good().isolation.root;
+    plan.terminal = Some(shipyard_runtime::oci::BundleTerminal::default());
+    refused(&plan, |err| {
+        matches!(
+            err,
+            ContainerError::InvalidPlan(PlanError::TerminalWithoutMount)
+        )
+    });
+    let mut plan = plan_without(Namespace::Uts);
+    plan.isolation.hostname = Some("box".to_owned());
+    refused(&plan, |err| {
+        matches!(
+            err,
+            ContainerError::InvalidPlan(PlanError::Isolation(IsolationError::HostnameNeedsUts))
+        )
+    });
+    let mut plan = good();
+    plan.isolation
+        .resources
+        .unified
+        .insert("../../../etc/x".to_owned(), "1".to_owned());
+    refused(&plan, |err| {
+        matches!(err, ContainerError::InvalidPlan(PlanError::Resources(_)))
+    });
+    // Where the container gets a cgroup, its mount is kept, and needs the
+    // namespace; where it can't, the mount is left out (as a bundle's), and
+    // the plan runs.
+    if gets_a_cgroup {
+        refused(&plan_without(Namespace::Cgroup), |err| {
+            matches!(
+                err,
+                ContainerError::InvalidPlan(PlanError::Isolation(
+                    IsolationError::CgroupMountNeedsCgroup
+                ))
+            )
+        });
+    } else {
+        create(&plan_without(Namespace::Cgroup)).unwrap();
+        container::delete(&test.state_root(), "checked", true).unwrap();
+    }
+    let mut plan = good();
+    plan.isolation.security.seccomp = shipyard_runtime::security::Seccomp::Profile(Box::new(
+        serde_json::from_str(r#"{"defaultAction":"SCMP_ACT_ALLOW","listenerPath":"/x"}"#).unwrap(),
+    ));
+    refused(&plan, |err| {
+        matches!(err, ContainerError::InvalidPlan(PlanError::Seccomp(_)))
+    });
+    let mut plan = good();
+    plan.isolation.root = None;
+    refused(&plan, |err| {
+        matches!(err, ContainerError::InvalidPlan(PlanError::NoRoot))
+    });
+    if !is_root() {
+        let mut plan = plan_without(Namespace::User);
+        plan.isolation.id_maps = None;
+        refused(&plan, |err| {
+            matches!(
+                err,
+                ContainerError::InvalidPlan(PlanError::NeedsUserNamespace)
+            )
+        });
+    }
 }

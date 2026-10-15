@@ -441,7 +441,11 @@ decoder, with a matcher oracle and a bound on held bytes), `process_json` (runc'
   `--since`.
 - **A rootless state root under `$XDG_RUNTIME_DIR`** goes when logind removes it at the
   last logout (no lingering): a container then runs on, but `state`, `attach` and
-  `delete` can't reach it. (From stage 4; stage 9's state model.)
+  `delete` can't reach it. (From stage 4; stage 9's state model.) *Settled in stage 9,
+  step 9.5c, on Ubuntu 24.04:* with logind's default (`KillUserProcesses=no`) the
+  directory isn't removed while a container runs: its monitor keeps the login session
+  "closing", and the user with it. With `KillUserProcesses=yes` the session's processes
+  end at logout, a monitor in the session's scope among them (linger or not).
 - **`poststart`** runs anyway after 5 seconds plus the `startContainer` hooks' timeouts;
   a hook without a timeout can make it run before the program starts.
 - **Refused by design** (the conformance gate's `fail` lines): `shared` (and for now

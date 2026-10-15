@@ -370,6 +370,96 @@ pub struct RuntimeConfig {
     /// The ports the image says it listens on (`ExposedPorts`' keys, like
     /// `80/tcp`), sorted: what `run -P` publishes.
     pub exposed_ports: Vec<String>,
+    /// Its health check (`Healthcheck`, a Dockerfile's `HEALTHCHECK`), if
+    /// it has one.
+    pub healthcheck: Option<ImageHealthcheck>,
+    /// The shell a shell-form health check runs with (`Shell`, a
+    /// Dockerfile's `SHELL`), if it sets one: `["/bin/bash", "-c"]`.
+    pub shell: Vec<String>,
+}
+
+/// An image's health check, as its config says it. A zero means Docker's
+/// default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageHealthcheck {
+    /// What to run: `["CMD-SHELL", script]`, `["CMD", program, …]`, or
+    /// `["NONE"]` (a base image's check turned off).
+    pub test: Vec<String>,
+    /// Between two checks.
+    pub interval: std::time::Duration,
+    /// The longest a check may take.
+    pub timeout: std::time::Duration,
+    /// After a start, how long failures don't count.
+    pub start_period: std::time::Duration,
+    /// Between two checks in the start period.
+    pub start_interval: std::time::Duration,
+    /// How many failures in a row make it unhealthy.
+    pub retries: u32,
+}
+
+impl ImageHealthcheck {
+    /// Whether it turns checks off (`["NONE"]`).
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        self.test.first().is_some_and(|form| form == "NONE")
+    }
+
+    /// Why it can't be used, if it can't: a duration under a millisecond
+    /// that isn't zero (Docker refuses one; zero is the default). Kept to
+    /// the nanosecond as read, so that it's said, not rounded up.
+    #[must_use]
+    pub fn unusable(&self) -> Option<String> {
+        [
+            ("Interval", self.interval),
+            ("Timeout", self.timeout),
+            ("StartPeriod", self.start_period),
+            ("StartInterval", self.start_interval),
+        ]
+        .into_iter()
+        .find(|(_, duration)| {
+            !duration.is_zero() && *duration < std::time::Duration::from_millis(1)
+        })
+        .map(|(name, duration)| format!("its {name} of {duration:?} is under 1 ms"))
+    }
+}
+
+/// A `Healthcheck` object as it appears in JSON: durations in
+/// nanoseconds (Go's), any field `null` or absent.
+#[derive(Debug, Deserialize, Default)]
+struct RawHealthcheck {
+    #[serde(rename = "Test", default, deserialize_with = "null_is_empty")]
+    test: Vec<String>,
+    #[serde(rename = "Interval", default)]
+    interval: Option<i64>,
+    #[serde(rename = "Timeout", default)]
+    timeout: Option<i64>,
+    #[serde(rename = "StartPeriod", default)]
+    start_period: Option<i64>,
+    #[serde(rename = "StartInterval", default)]
+    start_interval: Option<i64>,
+    #[serde(rename = "Retries", default)]
+    retries: Option<i64>,
+}
+
+impl RawHealthcheck {
+    /// The check it says, if any (no test: none). A negative or absent
+    /// value is zero (the default); retries past `u32` are `u32::MAX`.
+    fn read(self) -> Option<ImageHealthcheck> {
+        let nanos = |value: Option<i64>| {
+            std::time::Duration::from_nanos(value.and_then(|v| u64::try_from(v).ok()).unwrap_or(0))
+        };
+        (!self.test.is_empty()).then(|| ImageHealthcheck {
+            interval: nanos(self.interval),
+            timeout: nanos(self.timeout),
+            start_period: nanos(self.start_period),
+            start_interval: nanos(self.start_interval),
+            // Negative: zero (the default); past `u32`: as many as it can be.
+            retries: self.retries.map_or(0, |retries| {
+                u32::try_from(retries.max(0)).unwrap_or(u32::MAX)
+            }),
+            test: self.test,
+        })
+    }
 }
 
 /// An image config as it appears in JSON.
@@ -408,6 +498,10 @@ struct RawRuntimeConfig {
     /// objects), or `null`.
     #[serde(rename = "ExposedPorts", default)]
     exposed_ports: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(rename = "Healthcheck", default)]
+    healthcheck: Option<RawHealthcheck>,
+    #[serde(rename = "Shell", default, deserialize_with = "null_is_empty")]
+    shell: Vec<String>,
 }
 
 impl ImageConfig {
@@ -452,6 +546,8 @@ impl ImageConfig {
                     .exposed_ports
                     .map(|ports| ports.into_keys().collect())
                     .unwrap_or_default(),
+                healthcheck: runtime.healthcheck.and_then(RawHealthcheck::read),
+                shell: runtime.shell,
             },
         })
     }
@@ -655,6 +751,62 @@ mod tests {
         assert_eq!(config.config.working_dir.as_deref(), Some("/work"));
         assert_eq!(config.config.user.as_deref(), Some("1000:1000"));
         assert_eq!(config.config.exposed_ports, ["53/udp", "8080/tcp"]);
+    }
+
+    /// An image's health check, as Docker writes it (nanoseconds); `NONE`
+    /// kept as such; nulls, negatives and no test read as none or zero.
+    #[test]
+    fn an_image_config_has_its_health_check() {
+        use std::time::Duration;
+        let config = |healthcheck: &str| {
+            let json = format!(
+                r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[]}},
+                "config":{{"Healthcheck":{healthcheck}}}}}"#
+            );
+            ImageConfig::parse(json.as_bytes())
+                .unwrap()
+                .config
+                .healthcheck
+        };
+        let check = config(
+            r#"{"Test":["CMD-SHELL","curl -f localhost || exit 1"],"Interval":30000000000,
+            "Timeout":3000000000,"StartPeriod":5000000000,"StartInterval":1000000000,"Retries":5}"#,
+        )
+        .unwrap();
+        assert_eq!(check.test, ["CMD-SHELL", "curl -f localhost || exit 1"]);
+        assert_eq!(check.interval, Duration::from_secs(30));
+        assert_eq!(check.timeout, Duration::from_secs(3));
+        assert_eq!(check.start_period, Duration::from_secs(5));
+        assert_eq!(check.start_interval, Duration::from_secs(1));
+        assert_eq!(check.retries, 5);
+        assert!(!check.is_none());
+        let none = config(r#"{"Test":["NONE"]}"#).unwrap();
+        assert!(none.is_none());
+        let defaults =
+            config(r#"{"Test":["CMD","true"],"Interval":null,"Retries":-1,"Timeout":-5}"#).unwrap();
+        assert_eq!(
+            (defaults.interval, defaults.timeout, defaults.retries),
+            (Duration::ZERO, Duration::ZERO, 0)
+        );
+        assert_eq!(check.unusable(), None);
+        assert_eq!(defaults.unusable(), None, "zeros are defaults");
+        // Under a millisecond, not zero: kept as read, and said unusable.
+        let fast =
+            config(r#"{"Test":["CMD","true"],"Interval":1000000,"Timeout":999999}"#).unwrap();
+        assert_eq!(fast.timeout, Duration::from_nanos(999_999));
+        assert_eq!(
+            fast.unusable().as_deref(),
+            Some("its Timeout of 999.999µs is under 1 ms")
+        );
+        for field in ["Interval", "StartPeriod", "StartInterval"] {
+            let check = config(&format!(r#"{{"Test":["CMD","true"],"{field}":1}}"#)).unwrap();
+            assert!(check.unusable().unwrap().contains(field), "{field}");
+        }
+        let many = config(r#"{"Test":["CMD","true"],"Retries":99999999999}"#).unwrap();
+        assert_eq!(many.retries, u32::MAX);
+        assert_eq!(config(r#"{"Test":null}"#), None);
+        assert_eq!(config(r#"{"Test":[]}"#), None);
+        assert_eq!(config("null"), None);
     }
 
     #[test]

@@ -299,6 +299,72 @@ impl Drop for Signals {
     }
 }
 
+/// The signals this process receives, caught for its caller to pass on
+/// (stage 9, step 9.4c3a: `shipyard run`'s `--sig-proxy` forwards them to
+/// the container). What a supervisor catches: the forwardable ones (see
+/// `is_forwardable`; one ignored at startup stays ignored), SIGTERM always,
+/// and SIGCHLD and SIGCONT, which [`take`](Self::take) leaves out. The same
+/// handlers as a supervisor's, so one or the other at a time. Dropping it
+/// puts the previous handlers back, and the signal mask as it was when it
+/// was installed.
+pub struct SignalWatch {
+    signals: Signals,
+}
+
+impl SignalWatch {
+    /// Installs the handlers, and unblocks the signals they catch.
+    ///
+    /// # Errors
+    ///
+    /// Handlers installed already (a supervisor, another watch); a handler
+    /// the system refused.
+    pub fn install() -> Result<Self> {
+        Ok(Self {
+            signals: Signals::install()?,
+        })
+    }
+
+    /// The descriptor that becomes readable when a signal arrives: poll it.
+    #[must_use]
+    pub fn fd(&self) -> BorrowedFd<'static> {
+        self.signals.wake_fd()
+    }
+
+    /// What arrived since the last call: the forwardable signals, in
+    /// numeric order, each once however often it came (as the kernel keeps
+    /// pending standard signals), and whether this process was resumed
+    /// (SIGCONT: after a stop, or `bg`/`fg` of a running job).
+    #[must_use]
+    pub fn take(&self) -> Taken {
+        let arrivals = self.signals.drain();
+        Taken {
+            continued: arrivals
+                .iter()
+                .any(|arrival| arrival.signal == libc::SIGCONT),
+            signals: arrivals
+                .into_iter()
+                .filter(|arrival| is_forwardable(arrival.signal))
+                .filter_map(|arrival| super::Signal::from_raw(arrival.signal).ok())
+                .collect(),
+        }
+    }
+}
+
+/// What a [`SignalWatch`] caught ([`SignalWatch::take`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Taken {
+    /// The forwardable signals, in numeric order.
+    pub signals: Vec<super::Signal>,
+    /// Whether SIGCONT came: this process was resumed.
+    pub continued: bool,
+}
+
+impl std::fmt::Debug for SignalWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalWatch").finish_non_exhaustive()
+    }
+}
+
 /// Empties the wake pipe *first*, then collects the flags.
 ///
 /// The order matters: a signal arriving between the two steps has set its flag

@@ -9,6 +9,9 @@
 #   scripts/test-linux.sh --shell        # a shell in the same container, to debug
 #   scripts/test-linux.sh --root-shell   # the same, as root, with / made shared
 #   scripts/test-linux.sh --fuzz [SECONDS]  # each fuzz target (fuzz/) for SECONDS (300)
+#   scripts/test-linux.sh --mutants [BASE|FILE.diff]  # cargo-mutants on the changes
+#                                        # against BASE (main), committed or not,
+#                                        # or on FILE.diff's: a report, as tester
 #   scripts/test-linux.sh --conformance [NAME…]  # the OCI conformance suite, as
 #                                        # scripts/conformance/expected.txt expects
 #
@@ -48,6 +51,7 @@ fi
 mode="test"
 fuzz_seconds=300
 conformance_tests=""
+mutants_diff=""
 case "${1:-}" in
     "") ;;
     --shell) mode=shell ;;
@@ -55,6 +59,23 @@ case "${1:-}" in
     --fuzz)
         mode=fuzz
         fuzz_seconds=${2:-300}
+        ;;
+    --mutants)
+        mode=mutants
+        # The changes, from the host's git (the container's would see a
+        # repository owned by someone else): against where BASE and HEAD
+        # meet, the working tree's included, so uncommitted work counts.
+        if [ -f "${2:-}" ]; then
+            mutants_diff=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+        else
+            base=${2:-main}
+            mutants_diff=$(mktemp "${TMPDIR:-/tmp}/shipyard-mutants.XXXXXX")
+            git -C "$repo" diff "$(git -C "$repo" merge-base "$base" HEAD)" >"$mutants_diff"
+        fi
+        if [ ! -s "$mutants_diff" ]; then
+            echo "no changes to mutate" >&2
+            exit 0
+        fi
         ;;
     --conformance)
         mode=conformance
@@ -190,15 +211,56 @@ case "$MODE" in
             rm -rf /target/fuzz/crate
             cp -r fuzz /target/fuzz/crate
             sed -i "s|path = \"../crates/|path = \"/src/crates/|" /target/fuzz/crate/Cargo.toml
-            for target in manifest challenge reference tar unpack netlink ports dns proc_net cri_record logs_dir attach_frames process_json cp_unpack; do
+            # Every target, whichever crashes: the crashed ones named at the
+            # end (as the Quality workflow does).
+            crashed=()
+            for target in $(scripts/fuzz-targets.sh); do
                 echo "== fuzz $target, $FUZZ_SECONDS s"
                 mkdir -p "/target/fuzz/crashes/$target"
                 cargo +nightly fuzz run --fuzz-dir /target/fuzz/crate --target-dir /target/fuzz/build \
                     "$target" "/target/fuzz/corpus/$target" -- \
                     -max_total_time="$FUZZ_SECONDS" \
-                    -artifact_prefix="/target/fuzz/crashes/$target/"
+                    -artifact_prefix="/target/fuzz/crashes/$target/" || crashed+=("$target")
             done
+            if [ "${#crashed[@]}" -gt 0 ]; then
+                echo "== crashed: ${crashed[*]} (inputs in /target/fuzz/crashes)"
+                exit 1
+            fi
             echo "== no fuzz target crashed"
+        '
+        exit
+        ;;
+    mutants)
+        # As `tester`, unprivileged, with each crate's own tests
+        # (.cargo/mutants.toml): a report, not a gate. A mutant only a root
+        # test catches shows as missed: those are the step's own runner's.
+        # cargo-mutants is installed once into the toolchain volume (that
+        # needs network); its copies and builds go to the build volume.
+        as_tester bash -c '
+            set -euo pipefail
+            [ -x "$CARGO_HOME/bin/cargo-mutants" ] || cargo install --locked cargo-mutants --version 27.1.0
+            mkdir -p /target/mutants/tmp
+            # Never an earlier run'"'"'s results.
+            rm -rf /target/mutants/mutants.out
+            # Each mutant builds in its own copy, with its own target dir:
+            # never the shared one (a shared dir runs the wrong binary).
+            status=0
+            TMPDIR=/target/mutants/tmp env -u CARGO_TARGET_DIR cargo mutants --in-diff /changes.diff \
+                --output /target/mutants --no-shuffle -j 2 || status=$?
+            # 2 (missed) and 3 (timeouts) are the report; anything else
+            # (a stale diff, a baseline that fails) is a failure to run.
+            case $status in
+                0 | 2 | 3) ;;
+                *) echo "== cargo-mutants failed to run (exit $status)"; exit "$status" ;;
+            esac
+            for outcome in caught missed timeout unviable; do
+                file=/target/mutants/mutants.out/$outcome.txt
+                echo "$outcome: $( [ -f "$file" ] && wc -l <"$file" || echo 0 )"
+            done
+            if [ -s /target/mutants/mutants.out/missed.txt ]; then
+                echo "== missed"
+                cat /target/mutants/mutants.out/missed.txt
+            fi
         '
         exit
         ;;
@@ -221,12 +283,21 @@ as_tester cargo clippy --locked --workspace --all-targets -- -D warnings
 # crate was fetched by clippy: nothing below needs the network's DNS.)
 printf 'nameserver 127.0.0.53\noptions edns0 trust-ad\n' >/tmp/resolv.conf
 mount --bind /tmp/resolv.conf /etc/resolv.conf
+# Both passes run whole (`--no-fail-fast`: every test binary, not up to the
+# first that fails), and the root pass runs even if the first failed; then
+# any failure fails the run.
+failed=
 echo "== tests, as a normal user"
-as_tester cargo test --locked --workspace
+as_tester cargo test --locked --workspace --no-fail-fast || failed="$failed tester"
 as_root
 echo "== tests, including the root-only ones, run as root"
 # The image has ip, nft and dig: the differential tests (H5) must run.
-SHIPYARD_TEST_TOOLS=required cargo test --locked --workspace -- --include-ignored
+SHIPYARD_TEST_TOOLS=required cargo test --locked --workspace --no-fail-fast -- --include-ignored \
+  || failed="$failed root"
+if [ -n "$failed" ]; then
+  echo "== tests failed:$failed"
+  exit 1
+fi
 echo "== all Linux checks passed"
 EOF
 
@@ -234,10 +305,15 @@ tty_flags=()
 if [ "$mode" = shell ] || [ "$mode" = root-shell ]; then
     tty_flags=(--interactive --tty)
 fi
+diff_flags=()
+if [ "$mode" = mutants ]; then
+    diff_flags=(--volume "$mutants_diff:/changes.diff:ro")
+fi
 
 # (`${a[@]+"${a[@]}"}`: an empty array is "unbound" to `set -u` in bash before
 # 4.4, which is macOS's /bin/bash.)
 exec docker run --rm --privileged --init ${tty_flags[@]+"${tty_flags[@]}"} \
+    ${diff_flags[@]+"${diff_flags[@]}"} \
     --volume "$repo:/src:ro" \
     --volume shipyard-linux-target:/target \
     --volume shipyard-linux-cargo:/usr/local/cargo \

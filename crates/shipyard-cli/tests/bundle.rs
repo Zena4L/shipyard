@@ -470,6 +470,31 @@ fn a_destination_led_into_a_kernel_interface_is_refused_and_one_named_isnt() {
     assert_eq!(named.stdout, "ran\n");
 }
 
+/// A symlink leading into `/dev` (Shipyard's tmpfs, whose type says
+/// nothing): a mount it leads there is refused; one written there is the
+/// caller's, and works (F36, F31).
+#[test]
+#[ignore = "needs root"]
+fn a_mount_led_into_dev_is_refused_and_one_written_there_isnt() {
+    let bundle = Bundle::new();
+    std::os::unix::fs::symlink("/dev", bundle.root.host_path("/d")).unwrap();
+    let mut config = running(&bundle, "test -d /dev/x && echo ran");
+    config["mounts"] = json!([{"destination": "/d/x", "type": "tmpfs", "source": "tmpfs"}]);
+    let steered = run_bundle(&bundle, &config);
+    assert_eq!(steered.code, Some(125), "{}", steered.stderr);
+    assert!(
+        steered
+            .stderr
+            .contains("the mount point /d/x leads into a kernel interface"),
+        "{}",
+        steered.stderr
+    );
+    config["mounts"] = json!([{"destination": "/dev/x", "type": "tmpfs", "source": "tmpfs"}]);
+    let written = run_bundle(&bundle, &config);
+    assert_eq!(written.code, Some(0), "{}", written.stderr);
+    assert_eq!(written.stdout, "ran\n");
+}
+
 /// A destination through a symlink planted in the root filesystem, pointing
 /// at the host's `/etc`: it's followed inside the root, never out of it.
 #[test]

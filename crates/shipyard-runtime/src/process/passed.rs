@@ -65,14 +65,14 @@ pub struct Listen {
 /// descriptors: their numbers in it (in target order), and socket
 /// activation's part. Plain data: it crosses `exec` in a setup.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Passing {
+pub(crate) struct PassedPlan {
     /// The descriptors' numbers, in target order (3, 4, …).
     pub(crate) sources: Vec<RawFd>,
     /// How many of them are listening sockets, and their names.
     pub(crate) listen: Option<(usize, Option<Vec<u8>>)>,
 }
 
-impl Passing {
+impl PassedPlan {
     /// The first descriptor above the targets: where the command's sweep
     /// of what it mustn't keep starts.
     pub(crate) fn above(&self) -> RawFd {
@@ -143,9 +143,15 @@ impl PassedFds {
         self.fds.is_empty()
     }
 
+    /// How many there are: the descriptors 3 up to `3 + len` are theirs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.fds.len()
+    }
+
     /// What a process that starts the command needs to know of them.
-    pub(crate) fn passing(&self) -> Passing {
-        Passing {
+    pub(crate) fn plan(&self) -> PassedPlan {
+        PassedPlan {
             sources: self
                 .fds
                 .iter()
@@ -231,6 +237,59 @@ fn most_passable() -> usize {
     MAX_PASSED.min(soft.saturating_sub(SLACK.saturating_add(3)) / 2)
 }
 
+/// Descriptors passed across an exec for a command, this process's own
+/// now, with their targets (3 and up) held ([`reserve`]): what the process
+/// opens from then on can't take one of their numbers. The one way the
+/// monitor, the init and the joiner take them. Dropped once the command
+/// has its own: a socket the command closes is then closed.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the monitor, init and joiner are Linux's")
+)]
+pub(crate) struct Held {
+    _sources: Vec<OwnedFd>,
+    _reserved: Vec<OwnedFd>,
+}
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the monitor, init and joiner are Linux's")
+)]
+impl Held {
+    /// `sources`, held, and their targets reserved. The targets must be
+    /// free (see [`reserve`]).
+    ///
+    /// # Errors
+    ///
+    /// A target couldn't be held.
+    pub(crate) fn take(sources: Vec<OwnedFd>) -> Result<Self> {
+        let reserved = reserve(sources.len())?;
+        Ok(Self {
+            _sources: sources,
+            _reserved: reserved,
+        })
+    }
+}
+
+/// The descriptors `sources` names, as this process's own.
+///
+/// # Safety
+///
+/// Each is open, this process's, passed to it for this, and owned by
+/// nothing else in it (taken once).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the monitor, init and joiner are Linux's")
+)]
+pub(crate) unsafe fn adopt(sources: &[std::os::fd::RawFd]) -> Vec<OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    sources
+        .iter()
+        // SAFETY: the caller's promise.
+        .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .collect()
+}
+
 /// Holds descriptors 3 to 3+`count`-1 with `/dev/null`, close-on-exec, so
 /// that nothing this process opens takes their numbers before the command
 /// is placed there (see `child::place_passed`). They must be free: what's
@@ -303,14 +362,14 @@ mod tests {
             ..PassedFds::default()
         };
         assert_eq!(
-            passed.passing().listen_env(),
+            passed.plan().listen_env(),
             [
                 (b"LISTEN_FDS".to_vec(), b"2".to_vec()),
                 (b"LISTEN_FDNAMES".to_vec(), b"a:b".to_vec()),
             ]
         );
-        assert!(Passing::default().listen_env().is_empty());
-        assert_eq!(Passing::default().above(), 3);
+        assert!(PassedPlan::default().listen_env().is_empty());
+        assert_eq!(PassedPlan::default().above(), 3);
     }
 
     #[test]

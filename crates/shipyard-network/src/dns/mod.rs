@@ -4,7 +4,8 @@
 //! Each such network has one server, `shipyard __shipyard-dns`, on its
 //! gateway's port 53 (UDP and TCP), which the containers' `resolv.conf`
 //! names. It answers the names of the network's live containers (their
-//! `--name`, their `--network-alias`es and their run's ID) and the names for
+//! `--name`, their `--network-alias`es, their short ID and their run's ID)
+//! and the names for
 //! their addresses, from the network's leases, read for each query; anything
 //! else goes to the host's own resolvers. It's started by the first run that
 //! needs it, gives up root once its sockets are bound, and exits once the

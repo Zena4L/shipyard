@@ -57,10 +57,10 @@ what could go wrong), mutation-checked and run by hand on Linux, then reviewed a
 
 | Item | Now in | Why |
 |---|---|---|
-| `network connect` / `disconnect` | stage 9 | they act on a running container by name, which stage 9's state gives |
-| A command for a container's sockets (`port`, the UI's observed dependencies) | stage 9 | the reader is built (`observe.rs`); the command needs named containers |
-| The DNS servers' own cgroup, and a restart if one is killed | stage 9 | it belongs with the engine's state and restart policies |
-| A warning when a container's pasta dies | stage 9 | the supervisor reaps it quietly; events come with stage 9 |
+| `network connect` / `disconnect` | stage 9 (done: 9.7b2) | a running container's monitor holds a lease taken later (protocol v3, 9.7b1); disconnect unlinks the lease from under it; the record keeps the change |
+| A command for a container's sockets (`port`, the UI's observed dependencies) | stage 9 (done: 9.7a `port`, 9.7c1 `port --sockets`) | the sockets read through the container's init, each peer named from the networks' leases |
+| The DNS servers' own cgroup, and a restart if one is killed | stage 9 (done: 9.6c2) | each server is in `shipyard/dns/<network>-<random>` (its name kept in the network's `dns.cgroup`); a watchdog forks the worker and starts it again, with a backoff, said in `dns.log` |
+| A warning when a container's pasta dies | stage 9 (done: 9.6c1) | the launcher's hook writes `network-lost` in the start's logs and a `network_lost` event; `ps` and `inspect` show it |
 | `exec` joining a container's network namespace | stage 8 | `Join::standard` has no network yet; `exec` is stage 8's |
 | Rootless user-defined networks | later | they need a long-lived holder of a rootless network namespace (Podman's pause process) |
 | `slirp4netns` | not planned | pasta covers rootless networking with better performance |
@@ -101,7 +101,9 @@ shipyard run (CLI, single-threaded at every fork)            (shipyard-cli/run.r
 
 __shipyard-dns <network>  (one per network with names; outside any run's subreaper)
   started by the first run that needs it, holding dns.lock (an inherited flock)
+  in its own cgroup, shipyard/dns/<network>-<random> (stage 9: 64 MiB, 136 tasks)
   bound to gateway:53 UDP+TCP, SO_BINDTODEVICE the bridge; then nobody, no_new_privs
+  then a watchdog: it forks the worker that serves (and the next, if one is killed)
   answers the network's containers from live leases (and those of their other
   networks); forwards everything else to the host's resolvers
   exits when idle (no live lease for 30 s, re-checked under the network lock) or
@@ -242,6 +244,7 @@ maps, so rules are never edited:
 | N7 | ctnetlink dumps | ok |
 | N8 | How long until a veth's host end goes after its namespace's last process? | 1–43 ms, asynchronously: so it's deleted explicitly |
 | N9 | Extended ACK text | "Attribute failed policy validation" (an over-long name), "Unknown device type" |
+| N10 | (stage 9, step 9.7c2, Linux 7.2) A dynamic, bounded set; `dynset` with a nested `connlimit`, as one expression (`NFTA_DYNSET_EXPR`) and as a list (`NFTA_DYNSET_EXPRESSIONS`); `reject with icmpx admin-prohibited` | all load; Shipyard sends the single form, which kernels before 5.11 take too |
 
 `scripts/probes/pasta.sh`, as a normal user, attached by PID:
 

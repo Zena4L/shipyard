@@ -8,7 +8,7 @@ whatever it is (0–255). The codes below have a special meaning:
 
 | Code | Meaning |
 |---|---|
-| `125` | **Shipyard failed.** The command never ran. Causes include an unknown option, an invalid value (signal, limit, user, group, environment variable, hostname, sysctl), `-it` when your input isn't a terminal ("the input device is not a TTY"), a relative working directory, isolation refused by the system (user namespaces disabled, a container without privileges, or a security policy), a user namespace that can't be set up (`newuidmap` failing, a user or group the maps leave out), a seccomp profile that can't be read or installed (or that refuses what the container's init needs), supplementary groups asked for where the user namespace denies `setgroups`, a root filesystem that can't be used (`--rootfs`), a bundle that can't be run (a bad `config.json`, or fields that are refused), a user or group name the container's `/etc` doesn't have, a limit that can't be applied (no cgroup of the container's own, a controller not delegated, a value the kernel refuses), a device given with `--device` that isn't one, a kernel that refuses the device program as root, a bundle's hook that failed before the program (`prestart`, `createRuntime`, `createContainer`, `startContainer`), or a host problem. The message on stderr says which. |
+| `125` | **Shipyard failed.** The command never ran. Causes include an unknown option, a missing image or command (a run needs an image, or `--no-image`, `--rootfs`, `--bundle` or `--no-isolation`), an invalid value (signal, limit, user, group, environment variable, hostname, sysctl), `-it` when your input isn't a terminal ("the input device is not a TTY"), a relative working directory, isolation refused by the system (user namespaces disabled, a container without privileges, or a security policy), a user namespace that can't be set up (`newuidmap` failing, a user or group the maps leave out), a seccomp profile that can't be read or installed (or that refuses what the container's init needs), supplementary groups asked for where the user namespace denies `setgroups`, a root filesystem that can't be used (`--rootfs`), a bundle that can't be run (a bad `config.json`, or fields that are refused), a user or group name the container's `/etc` doesn't have, a limit that can't be applied (no cgroup of the container's own, a controller not delegated, a value the kernel refuses), a device given with `--device` that isn't one, a kernel that refuses the device program as root, a bundle's hook that failed before the program (`prestart`, `createRuntime`, `createContainer`, `startContainer`), or a host problem. The message on stderr says which. |
 | `126` | **The command could not be executed.** It isn't executable, is a directory, isn't a program this system can run (a binary built for another CPU, or a script with no `#!` line), or the user hit its process limit (`nproc`) as it started. If Shipyard itself can't create the process (the whole system is out of processes), that's `125`. |
 | `127` | **The command was not found.** Also when the file exists but its `#!` interpreter (or, for a binary, its loader) is missing; the message says so. |
 | `128 + N` | **The command was killed by signal N.** |
@@ -17,6 +17,9 @@ A command can also exit with 125–127, or above 128, by itself. If you need to
 tell the cases apart, check stderr: when the code comes from Shipyard, the
 message starts with `shipyard:` or `error:`. (One exception: `shipyard` with
 no command at all prints its help and exits with `125`.)
+
+When whatever reads Shipyard's output stops early (`shipyard ps | head -1`), the
+command ends quietly with `0`: nothing went wrong, the reader had what it wanted.
 
 ## Common signal codes
 
@@ -32,7 +35,7 @@ no command at all prints its help and exits with `125`.)
 ## In scripts
 
 ```sh
-shipyard run my-job
+shipyard run --no-image my-job
 case $? in
   0)   echo "succeeded" ;;
   125) echo "shipyard rejected the job; see the message above" ;;
@@ -44,6 +47,12 @@ esac
 ```
 
 `--help` and `--version` exit with `0`.
+
+**`shipyard exec`** exits with the command's own code (128 plus the signal's number
+for one a signal ended), `127` if the command isn't found, `126` if it can't be run,
+and `125` when Shipyard couldn't run it at all. **`shipyard attach`** and
+**`shipyard start -a`** exit with the container's code when it ends, `0` when you
+detach, `125` when they can't attach.
 
 ## `shipyard-runtime`
 

@@ -7,16 +7,20 @@
 //! and the OCI conformance suite drive a runtime this way. The work is in
 //! `shipyard_runtime::container`.
 
+#[path = "../cp_output.rs"]
+mod cp_output;
 #[path = "../limits.rs"]
 #[allow(
     dead_code,
     reason = "shared with `shipyard`, which uses what `update` doesn't"
 )]
 mod limits;
+#[path = "../logs_output.rs"]
+mod logs_output;
 #[path = "../runtime_commands.rs"]
 mod runtime_commands;
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream;
@@ -31,7 +35,7 @@ use shipyard_runtime::logs::time::Timestamp;
 use shipyard_runtime::process::{self, Signal};
 
 use crate::limits::LimitArgs;
-use crate::runtime_commands::{PsFormat, parse_interval};
+use crate::runtime_commands::PsFormat;
 
 /// Runs containers from OCI bundles, one lifecycle step per call.
 #[derive(Debug, Parser)]
@@ -127,7 +131,7 @@ enum Command {
         #[arg(long)]
         stats: bool,
         /// How often (such as 5s or 500ms).
-        #[arg(long, value_name = "DURATION", default_value = "5s", value_parser = parse_interval)]
+        #[arg(long, value_name = "DURATION", default_value = "5s", value_parser = logs_output::parse_duration)]
         interval: Duration,
         /// The container's ID.
         id: String,
@@ -197,6 +201,49 @@ struct CreateArgs {
     /// any), as runc does.
     #[arg(long, value_name = "N", default_value_t = 0)]
     preserve_fds: usize,
+    /// Have the container's monitor hold descriptor N (open in this
+    /// process, above 2 and above those --preserve-fds passes on) until the
+    /// container has ended, then give it to the exit command, or close it:
+    /// what keeps the caller's resources (a lock's, say) alive once the
+    /// caller has gone. The container never has it. LABEL (letters, digits,
+    /// : _ . and -; fd-N if not given) names it: the exit command is told
+    /// the labels in `SHIPYARD_HOLD_LABELS`. Repeatable.
+    #[arg(long = "hold-fd", value_name = "N[=LABEL]", value_parser = parse_hold)]
+    hold_fd: Vec<(i32, String)>,
+    /// Run PROGRAM (an absolute path) once the container has ended and its
+    /// end is recorded: in a session of its own, with this command's
+    /// environment, its output discarded, the held descriptors at 3 and up
+    /// (`SHIPYARD_HOLDS` says how many, `SHIPYARD_HOLD_LABELS` their labels,
+    /// comma-separated, in order), how the container ended in
+    /// `SHIPYARD_EXIT_RECORD` (JSON), and the monitor's PID in
+    /// `SHIPYARD_MONITOR_PID` (the monitor holds its copies of the
+    /// descriptors until it exits). Not waited for.
+    #[arg(long, value_name = "PROGRAM")]
+    exit_command: Option<PathBuf>,
+    /// An argument for the exit command (repeatable, in order).
+    #[arg(
+        long = "exit-command-arg",
+        value_name = "ARG",
+        requires = "exit_command",
+        allow_hyphen_values = true
+    )]
+    exit_command_arg: Vec<String>,
+    /// Run PROGRAM (an absolute path) beside the container: started once
+    /// it's created (the program waits for its start, if it needs to), in a
+    /// session of its own, with this command's environment, its output
+    /// discarded and none of the held descriptors; killed (SIGKILL), with
+    /// its whole process group, once the container has ended, before its end
+    /// is recorded (and if the monitor dies). For health checks.
+    #[arg(long, value_name = "PROGRAM")]
+    companion: Option<PathBuf>,
+    /// An argument for the companion (repeatable, in order).
+    #[arg(
+        long = "companion-arg",
+        value_name = "ARG",
+        requires = "companion",
+        allow_hyphen_values = true
+    )]
+    companion_arg: Vec<String>,
     /// The container's ID.
     id: String,
 }
@@ -317,7 +364,7 @@ struct LogsArgs {
     tail: Option<usize>,
     /// Only lines from TIME on: RFC 3339 (2026-10-10T06:16:19Z), or a
     /// duration ago (10m, 2h, 30s).
-    #[arg(long, value_name = "TIME", value_parser = runtime_commands::parse_since)]
+    #[arg(long, value_name = "TIME", value_parser = logs_output::parse_since)]
     since: Option<Timestamp>,
     /// Start each line with the time it was written (RFC 3339).
     #[arg(short, long)]
@@ -427,6 +474,49 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--hold-fd N[=LABEL]`: the number, and its label (`fd-N` if not given;
+/// `create` says whether it's one).
+fn parse_hold(text: &str) -> Result<(i32, String), String> {
+    let (number, label) = match text.split_once('=') {
+        Some((_, "")) => return Err(format!("{text:?}: a label after = (or none, and no =)")),
+        Some((number, label)) => (number, Some(label)),
+        None => (text, None),
+    };
+    let fd: i32 = number
+        .parse()
+        .map_err(|_| format!("{number:?} isn't a descriptor's number"))?;
+    let label = label.map_or_else(|| format!("fd-{fd}"), str::to_owned);
+    Ok((fd, label))
+}
+
+/// The descriptors `--hold-fd` names, borrowed for `create` (which says
+/// what can't be held), and made close-on-exec here: nothing this process
+/// starts but the monitor gets them. A number that isn't open is refused.
+fn take_holds(numbers: &[(i32, String)]) -> anyhow::Result<Vec<container::Hold<'_>>> {
+    numbers
+        .iter()
+        .map(|(fd, label)| {
+            let fd = *fd;
+            // SAFETY: `F_GETFD` on a number only asks whether it's open.
+            if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                return Err(container::ContainerError::BadHold(fd).into());
+            }
+            // SAFETY: open (checked), given to this process for this; it
+            // stays open as long as this process runs (nothing here closes
+            // it).
+            let hold = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let _ = nix::fcntl::fcntl(
+                hold,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            );
+            Ok(container::Hold {
+                fd: hold,
+                label: label.as_str(),
+            })
+        })
+        .collect()
+}
+
 /// `create`: the container, with its console socket or its logs if asked.
 fn create(cli: &Cli, root: &Path, args: &CreateArgs) -> anyhow::Result<()> {
     let CreateArgs {
@@ -439,11 +529,25 @@ fn create(cli: &Cli, root: &Path, args: &CreateArgs) -> anyhow::Result<()> {
         stdin,
         stdin_once,
         preserve_fds,
+        hold_fd,
+        exit_command,
+        exit_command_arg,
+        companion,
+        companion_arg,
         id,
     } = args;
     // First, before this process opens anything: what it was given to pass
-    // on is 3 and up.
+    // on is 3 and up, and what it was given to hold.
     let passed = shipyard_runtime::process::passed::PassedFds::from_caller(*preserve_fds)?;
+    let holds = take_holds(hold_fd)?;
+    let exit_command = exit_command
+        .as_ref()
+        .map(|program| container::ExitCommand::new(program, exit_command_arg.clone()))
+        .transpose()?;
+    let companion = companion
+        .as_ref()
+        .map(|program| container::ExitCommand::new(program, companion_arg.clone()))
+        .transpose()?;
     let console = console_socket.as_deref().map(connect_console).transpose()?;
     let defaults = LogSettings::default();
     let options = CreateOptions {
@@ -461,6 +565,9 @@ fn create(cli: &Cli, root: &Path, args: &CreateArgs) -> anyhow::Result<()> {
             },
         }),
         passed: Some(&passed),
+        holds: &holds,
+        exit_command,
+        companion,
     };
     let created = container::create(root, id, bundle, &options)?;
     // The init has already sent the master on its copy and closed it.
@@ -511,37 +618,12 @@ fn cp(cli: &Cli, root: &Path, args: &CpArgs) -> anyhow::Result<()> {
         Operand::parse(&args.destination),
     )?;
     // (Its own message only: cp's errors say their causes already.)
-    let copied = copy(root, transfer, options).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let copied =
+        cp_output::copy(root, transfer, options).map_err(|err| anyhow::anyhow!(err.to_string()))?;
     for warning in copied.warnings {
         report(cli, Level::Warning, &warning);
     }
     Ok(())
-}
-
-/// `cp`'s copy, once its operands are read.
-fn copy(
-    root: &Path,
-    transfer: shipyard_engine::cp::Transfer,
-    options: shipyard_engine::cp::CpOptions,
-) -> anyhow::Result<shipyard_engine::cp::CpReport> {
-    use shipyard_engine::cp::{Transfer, copy_in, copy_out};
-    Ok(match transfer {
-        Transfer::Out { id, path, to } => {
-            // As tar does: an archive on a terminal is noise (and escape
-            // sequences a container chose).
-            if to.is_none() && std::io::stdout().is_terminal() {
-                anyhow::bail!("refusing to write a tar archive to a terminal (redirect it)");
-            }
-            let mut stdout = std::io::stdout().lock();
-            let report = copy_out(root, &id, &path, to.as_deref(), &mut stdout, options)?;
-            stdout.flush()?;
-            report
-        }
-        Transfer::In { from, id, path } => {
-            let mut stdin = std::io::stdin().lock();
-            copy_in(root, &id, from.as_deref(), &mut stdin, &path, options)?
-        }
-    })
 }
 
 /// `text` with its control characters escaped (`\u{1b}`), so it can't move
@@ -566,46 +648,11 @@ fn attach(root: &Path, args: &AttachArgs) -> anyhow::Result<()> {
     let options = Options {
         detach_keys: shipyard_runtime::attach::DetachKeys::parse(&args.detach_keys)?,
         stdin: !args.no_stdin,
+        held: false,
     };
-    let attached = container::attach_stream(root, &args.id)
-        .map(|stream| shipyard_engine::attach::attach(stream, &options));
-    // The container ended as this attached: its recorded code.
-    let ended_code = || container::exit_code(root, &args.id).ok().flatten();
-    match attach_exit(attached, ended_code)? {
-        Some(code) => std::process::exit(code),
-        None => Ok(()),
-    }
-}
-
-/// What `attach` exits with, from how it went: `None` for 0 (detached, or
-/// its reader stopped reading), `Some` with the container's code once it
-/// ended. A container that ended just as this attached (its monitor gone,
-/// or refusing, before the container was seen as stopped) ends with the
-/// code `ended_code` finds recorded; without one, that's the failure.
-fn attach_exit(
-    attached: std::result::Result<
-        std::result::Result<shipyard_engine::attach::Ended, shipyard_engine::attach::AttachError>,
-        container::ContainerError,
-    >,
-    ended_code: impl FnOnce() -> Option<i32>,
-) -> anyhow::Result<Option<i32>> {
-    use shipyard_engine::attach::{AttachError, Ended};
-    match attached {
-        Err(err @ container::ContainerError::MonitorGone(_)) => {
-            ended_code().map(Some).ok_or_else(|| err.into())
-        }
-        Err(err) => Err(err.into()),
-        Ok(Ok(Ended::Detached)) => Ok(None),
-        Ok(Ok(Ended::Exited(code))) => Ok(Some(code)),
-        Ok(Ok(Ended::Dropped(reason))) => {
-            anyhow::bail!("the container's monitor let go of this attach: {reason}")
-        }
-        Ok(Err(
-            err @ (AttachError::Refused(_) | AttachError::MonitorGone | AttachError::NotLetIn),
-        )) => ended_code().map(Some).ok_or_else(|| err.into()),
-        // `attach ID | head`: the reader has seen what it wanted.
-        Ok(Err(AttachError::Io(err))) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(None),
-        Ok(Err(err)) => Err(err.into()),
+    match shipyard_engine::attach::to_runtime(root, &args.id, &options)? {
+        shipyard_engine::attach::Settled::Exited(code) => std::process::exit(code),
+        shipyard_engine::attach::Settled::Left => Ok(()),
     }
 }
 
@@ -682,8 +729,8 @@ fn logs(cli: &Cli, root: &Path, args: &LogsArgs) -> anyhow::Result<()> {
         id,
     } = args;
     let target = match (log_dir, id) {
-        (Some(dir), _) => runtime_commands::LogsSource::Dir(dir.clone()),
-        (None, Some(id)) => runtime_commands::LogsSource::Container(id.clone()),
+        (Some(dir), _) => shipyard_engine::logs::RuntimeLogs::Dir(dir),
+        (None, Some(id)) => shipyard_engine::logs::RuntimeLogs::Container(id),
         (None, None) => anyhow::bail!("give a container's ID, or --log-dir"),
     };
     let options = shipyard_engine::logs::Options {
@@ -692,14 +739,11 @@ fn logs(cli: &Cli, root: &Path, args: &LogsArgs) -> anyhow::Result<()> {
         follow: *follow,
         ..shipyard_engine::logs::Options::default()
     };
-    let skipped = runtime_commands::logs(root, &target, &options, *timestamps)?;
-    if skipped > 0 {
-        let lines = if skipped == 1 { "line" } else { "lines" };
-        report(
-            cli,
-            Level::Warning,
-            &format!("{skipped} {lines} in the logs weren't records (torn by a crash?): skipped"),
-        );
+    let skipped = logs_output::printed(*timestamps, |sink| {
+        shipyard_engine::logs::of_runtime(root, target, &options, sink)
+    })?;
+    if let Some(warning) = logs_output::skipped_warning(skipped) {
+        report(cli, Level::Warning, &warning);
     }
     Ok(())
 }
@@ -849,46 +893,6 @@ fn append_log(log: &Path, format: LogFormat, level: Level, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every way `attach` goes, and what it exits with: among them the race
-    /// where the container ends as attach connects (its monitor gone or
-    /// refusing before the container is seen as stopped), which ends with
-    /// the recorded code, and fails only where there's none.
-    #[test]
-    fn attach_exits_as_it_went() {
-        use container::ContainerError;
-        use shipyard_engine::attach::{AttachError, Ended};
-        let code = |code| move || code;
-        let gone = || Err(ContainerError::MonitorGone("c".into()));
-        assert_eq!(attach_exit(gone(), code(Some(3))).unwrap(), Some(3));
-        assert!(attach_exit(gone(), code(None)).is_err());
-        for late in [
-            AttachError::Refused("full".into()),
-            AttachError::MonitorGone,
-            AttachError::NotLetIn,
-        ] {
-            assert_eq!(attach_exit(Ok(Err(late)), code(Some(7))).unwrap(), Some(7));
-        }
-        assert!(attach_exit(Ok(Err(AttachError::NotLetIn)), code(None)).is_err());
-        assert_eq!(
-            attach_exit(Ok(Ok(Ended::Detached)), code(Some(1))).unwrap(),
-            None
-        );
-        assert_eq!(
-            attach_exit(Ok(Ok(Ended::Exited(4))), code(None)).unwrap(),
-            Some(4)
-        );
-        assert!(attach_exit(Ok(Ok(Ended::Dropped("slow".into()))), code(Some(0))).is_err());
-        let pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
-        assert_eq!(
-            attach_exit(Ok(Err(AttachError::Io(pipe))), code(None)).unwrap(),
-            None
-        );
-        // Not the end race: never the recorded code.
-        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert!(attach_exit(Ok(Err(AttachError::Io(other))), code(Some(0))).is_err());
-        assert!(attach_exit(Err(ContainerError::NotFound("c".into())), code(Some(0))).is_err());
-    }
 
     /// What a message quotes of a container's can't drive the terminal; a
     /// message's own lines stay lines.

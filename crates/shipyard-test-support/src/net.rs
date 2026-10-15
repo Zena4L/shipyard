@@ -443,6 +443,11 @@ impl Drop for FakeResolver {
 #[derive(Debug)]
 pub struct NetworkDir {
     path: std::path::PathBuf,
+    /// A container store of its own, beside it: a container's record names
+    /// its networks by name, and another test's network of the same name
+    /// mustn't count as this one's (`network rm` refuses a network a record
+    /// joins).
+    containers: std::path::PathBuf,
     shipyard: Shipyard,
 }
 
@@ -458,7 +463,12 @@ impl NetworkDir {
             COUNT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).expect("a scratch networks directory");
-        NetworkDir { path, shipyard }
+        let containers = path.with_extension("containers");
+        NetworkDir {
+            path,
+            containers,
+            shipyard,
+        }
     }
 
     /// `shipyard ARGS…` with these networks. A network's DNS server stops
@@ -468,6 +478,7 @@ impl NetworkDir {
     pub fn command(&self, args: &[&str]) -> std::process::Command {
         let mut command = self.shipyard.command(args);
         command.env("SHIPYARD_NETWORK_DIR", &self.path);
+        command.env("SHIPYARD_CONTAINER_DIR", &self.containers);
         command.env("SHIPYARD_DNS_IDLE", "1");
         command
     }
@@ -484,7 +495,8 @@ impl NetworkDir {
     /// [`sleeping`](Self::sleeping), with `env` set too.
     #[must_use]
     pub fn sleeping_with(&self, env: &[(&str, &str)], flags: &[&str]) -> (crate::Running, File) {
-        let mut command = self.command(&[&["run"], flags, &["sleep", "30"]].concat());
+        let mut command =
+            self.command(&[crate::run_words(flags), flags, &["sleep", "30"]].concat());
         command.env("SHIPYARD_DNS_UPSTREAM", Upstream::ADDRESS.to_string());
         command.envs(env.iter().copied());
         let running = crate::start_command(command);
@@ -546,9 +558,31 @@ impl NetworkDir {
         &self.path
     }
 
-    /// The process IDs of these networks' DNS servers running now.
+    /// The process IDs of these networks' DNS servers running now (their
+    /// watchdogs: see [`dns_workers`](Self::dns_workers)).
     #[must_use]
     pub fn dns_servers(&self) -> Vec<libc::pid_t> {
+        let ours = self.dns_processes();
+        ours.iter()
+            .filter(|(_, parent)| !ours.iter().any(|(pid, _)| pid == parent))
+            .map(|&(pid, _)| pid)
+            .collect()
+    }
+
+    /// The workers of these networks' DNS servers: each server's (its
+    /// watchdog's) child, which serves.
+    #[must_use]
+    pub fn dns_workers(&self) -> Vec<libc::pid_t> {
+        let ours = self.dns_processes();
+        ours.iter()
+            .filter(|(_, parent)| ours.iter().any(|(pid, _)| pid == parent))
+            .map(|&(pid, _)| pid)
+            .collect()
+    }
+
+    /// Every process of these networks' DNS servers (watchdogs and
+    /// workers), with its parent.
+    fn dns_processes(&self) -> Vec<(libc::pid_t, libc::pid_t)> {
         let mut servers = Vec::new();
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return servers;
@@ -567,8 +601,16 @@ impl NetworkDir {
                     .map(|dir| Path::new(std::ffi::OsStr::from_bytes(dir)))
                     == Some(self.path.as_path());
             // A zombie has no command line: it's gone already.
-            if ours {
-                servers.push(pid);
+            let parent = std::fs::read_to_string(entry.path().join("status"))
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("PPid:"))
+                        .and_then(|parent| parent.trim().parse().ok())
+                });
+            if let (true, Some(parent)) = (ours, parent) {
+                servers.push((pid, parent));
             }
         }
         servers
@@ -588,6 +630,20 @@ impl NetworkDir {
         }
     }
 
+    /// [`dns_workers`](Self::dns_workers) once there are `count` of them,
+    /// or as they are after `wait`.
+    #[must_use]
+    pub fn wait_for_dns_workers(&self, count: usize, wait: Duration) -> Vec<libc::pid_t> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let workers = self.dns_workers();
+            if workers.len() == count || Instant::now() >= deadline {
+                return workers;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// `shipyard ARGS…` with these networks, to its end.
     #[must_use]
     pub fn run(&self, args: &[&str]) -> Run {
@@ -598,6 +654,7 @@ impl NetworkDir {
 impl Drop for NetworkDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_dir_all(&self.containers);
     }
 }
 
@@ -662,7 +719,8 @@ impl TestUser {
     }
 
     /// `command` with this user's environment and `runtime` (made, theirs,
-    /// private) as its `XDG_RUNTIME_DIR`, but still run as the caller: for
+    /// private) as its `XDG_RUNTIME_DIR` (with a container store of theirs
+    /// in it), but still run as the caller: for
     /// a test that has root's work to do in the child first, then drops to
     /// the user itself.
     #[must_use]
@@ -677,9 +735,18 @@ impl TestUser {
             .expect("the runtime directory the user's");
         std::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o700))
             .expect("a private runtime directory");
+        // Its containers' records too (a foreground run is a container): the
+        // user's own store, private.
+        let containers = runtime.join("containers");
+        std::fs::create_dir_all(&containers).expect("a container store");
+        std::os::unix::fs::chown(&containers, Some(self.uid), Some(self.gid))
+            .expect("the container store the user's");
+        std::fs::set_permissions(&containers, std::fs::Permissions::from_mode(0o700))
+            .expect("a private container store");
         command
             .env("HOME", &self.home)
             .env("XDG_RUNTIME_DIR", runtime)
+            .env("SHIPYARD_CONTAINER_DIR", &containers)
             .env_remove("SUDO_UID")
             .env_remove("SUDO_GID")
             .env_remove("SUDO_USER");

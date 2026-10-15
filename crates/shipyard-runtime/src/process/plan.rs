@@ -17,7 +17,7 @@ use super::env::DEFAULT_PATH;
 use super::failure::FailureContext;
 #[cfg(target_os = "linux")]
 use super::failure::FilterStart;
-use super::passed::Passing;
+use super::passed::PassedPlan;
 use super::rlimit::{Rlimit, RlimitError, RlimitKind, RlimitValue};
 use super::spawn::SpawnOptions;
 use super::spec::{ProcessSpec, SpecError, User};
@@ -183,9 +183,9 @@ pub(crate) struct Reexec {
     /// those there are of the gate's FIFOs, the hooks pipe, an overlay to
     /// attach, the terminal's socket, and what's passed on):
     /// their close-on-exec flag is cleared just before the exec.
-    pub(crate) passed: Vec<RawFd>,
+    pub(crate) inherited: Vec<RawFd>,
     /// Every other descriptor from 3 up is closed before the exec: these
-    /// ranges (for `close_range`), everything but `passed`, `exe` and
+    /// ranges (for `close_range`), everything but `inherited`, `exe` and
     /// `host_exe`.
     pub(crate) close_ranges: Vec<(u32, u32)>,
     /// In a new user namespace: become its root (uid and gid 0 inside)
@@ -504,7 +504,7 @@ impl ChildPlan {
         parent: Option<libc::pid_t>,
         confinement: Confinement,
         setgroups_allowed: bool,
-        passing: Option<&Passing>,
+        passing: Option<&PassedPlan>,
     ) -> Result<(Self, FailureContext)> {
         let switch = UserSwitch::as_namespace_allows(setgroups_allowed);
         let (plan, context) = Self::for_command(spec, keep_ignored, false, None, switch, passing)?;
@@ -533,7 +533,7 @@ impl ChildPlan {
         confinement: Confinement,
         setgroups_allowed: bool,
         (join, exec): (JoinSetup, ExecChild),
-        passing: Option<&Passing>,
+        passing: Option<&PassedPlan>,
     ) -> Result<(Self, FailureContext)> {
         let switch = UserSwitch::Always {
             groups: setgroups_allowed,
@@ -564,7 +564,7 @@ impl ChildPlan {
         new_process_group: bool,
         handshake: Option<Handshake>,
         switch: UserSwitch,
-        passing: Option<&Passing>,
+        passing: Option<&PassedPlan>,
     ) -> Result<(Self, FailureContext)> {
         spec.validate()?;
         if let Some(passing) = passing {
@@ -601,7 +601,7 @@ impl ChildPlan {
                     || own_listen && key == b"LISTEN_PID")
             })
             .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
-            .chain(passing.map(Passing::listen_env).unwrap_or_default())
+            .chain(passing.map(PassedPlan::listen_env).unwrap_or_default())
             .map(|(key, value)| {
                 let entry = [key.as_slice(), b"=", value.as_slice()].concat();
                 c_string(&entry, "an environment variable")
@@ -615,7 +615,7 @@ impl ChildPlan {
             passed: passing
                 .map(|passing| passing.sources.clone())
                 .unwrap_or_default(),
-            sweep_from: passing.map_or(super::passed::FIRST_PASSED, Passing::above),
+            sweep_from: passing.map_or(super::passed::FIRST_PASSED, PassedPlan::above),
             listen_pid,
             candidates: candidates
                 .iter()
@@ -680,7 +680,7 @@ impl ChildPlan {
 /// passed descriptors: every `open` it made would fail (EMFILE). (`exec`'s
 /// joiner holds the targets and the copies under that limit too, and opens
 /// a terminal after them.)
-fn check_room(spec: &ProcessSpec, passing: &Passing) -> Result<()> {
+fn check_room(spec: &ProcessSpec, passing: &PassedPlan) -> Result<()> {
     let count = passing.sources.len();
     let needed = u64::try_from(
         usize::try_from(passing.above())
@@ -741,7 +741,7 @@ fn credentials_by(switch: UserSwitch, user: &User) -> Result<Option<Credentials>
 pub(crate) fn exec_failure_context(
     spec: &ProcessSpec,
     join: &crate::isolation::Join,
-    passing: Option<&Passing>,
+    passing: Option<&PassedPlan>,
 ) -> Result<FailureContext> {
     let switch = UserSwitch::Always { groups: true };
     let (_, context) = ChildPlan::for_command(spec, Vec::new(), false, None, switch, passing)?;
@@ -772,15 +772,17 @@ fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
         number(fds.status, "the status pipe")?,
         number(fds.report, "the report pipe")?,
     ];
-    let passed: Vec<RawFd> = [fds.setup, fds.status, fds.report]
+    let inherited: Vec<RawFd> = [fds.setup, fds.status, fds.report]
         .into_iter()
-        .chain(fds.gate.into_iter().flat_map(super::spawn::Gate::fds))
-        .chain(fds.hooks)
-        .chain(fds.overlay)
-        .chain(fds.terminal)
-        .chain(fds.passing.iter().copied())
+        .chain(super::setup::inherited_fds(
+            fds.gate,
+            fds.hooks,
+            fds.overlay,
+            fds.terminal,
+            &fds.passing,
+        ))
         .collect();
-    let kept: Vec<u32> = passed
+    let kept: Vec<u32> = inherited
         .iter()
         .chain([&fds.exe])
         .chain(fds.host_exe.as_ref())
@@ -801,7 +803,7 @@ fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
                 .collect(),
         ),
         env: CStringArray::new(Vec::new()),
-        passed,
+        inherited,
         close_ranges: ranges_excluding(&kept),
         namespace_root,
     })
@@ -1119,7 +1121,7 @@ mod tests {
         entries
     }
 
-    fn plan_for(spec: &ProcessSpec, passing: &Passing) -> Result<ChildPlan> {
+    fn plan_for(spec: &ProcessSpec, passing: &PassedPlan) -> Result<ChildPlan> {
         ChildPlan::for_command(
             spec,
             Vec::new(),
@@ -1142,7 +1144,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let activated = Passing {
+        let activated = PassedPlan {
             sources: vec![10, 11],
             listen: Some((1, Some(b"web".to_vec()))),
         };
@@ -1165,14 +1167,14 @@ mod tests {
         // Podman's way: the bundle says LISTEN_FDS (and LISTEN_PID=1), the
         // sockets come by --preserve-fds. The command isn't PID 1 here.
         let spec = spec_with(&["LISTEN_FDS=1", "LISTEN_PID=1"], Vec::new());
-        let preserved = Passing {
+        let preserved = PassedPlan {
             sources: vec![10],
             listen: None,
         };
         let plan = plan_for(&spec, &preserved).unwrap();
         assert_eq!(environment(&plan), ["LISTEN_FDS=1", "LISTEN_PID="]);
         // Without passed descriptors, a bundle's variables are its own.
-        let none = plan_for(&spec, &Passing::default()).unwrap();
+        let none = plan_for(&spec, &PassedPlan::default()).unwrap();
         assert_eq!(environment(&none), ["LISTEN_FDS=1", "LISTEN_PID=1"]);
         assert!(none.listen_pid.is_none());
     }
@@ -1189,7 +1191,7 @@ mod tests {
                 .unwrap(),
             ]
         };
-        let passing = Passing {
+        let passing = PassedPlan {
             sources: (100..120).collect(),
             listen: None,
         };

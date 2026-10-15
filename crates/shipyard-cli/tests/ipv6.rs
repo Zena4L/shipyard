@@ -232,7 +232,15 @@ fn ports_are_published_on_both_families() {
 
         // ::1 can't be published on; an IPv6 address needs a network with
         // IPv6.
-        let loopback = networks.run(&["run", "--network", "app", "-p", "[::1]:8082:80", "true"]);
+        let loopback = networks.run(&[
+            "run",
+            "--no-image",
+            "--network",
+            "app",
+            "-p",
+            "[::1]:8082:80",
+            "true",
+        ]);
         assert_eq!(loopback.code, Some(125));
         assert!(
             loopback.stderr.contains("can't reach a container"),
@@ -242,6 +250,7 @@ fn ports_are_published_on_both_families() {
         networks.create(&["plain"]);
         let plain = networks.run(&[
             "run",
+            "--no-image",
             "--network",
             "plain",
             "-p",

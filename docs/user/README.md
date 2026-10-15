@@ -10,15 +10,23 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > a minimal set of capabilities, `no_new_privs`, and a seccomp filter. It runs
 > **rootless** for anyone without root, in a user namespace whose root is that user
 > (root can ask for one with `--uidmap`). It can run a **pulled image**
-> (`--image`), stacking its layers into a root filesystem with overlayfs, and mount
+> (`shipyard run IMAGE`), stacking its layers into a root filesystem with overlayfs, and mount
 > **volumes** (`--volume`). Containers are on a **network** of their own with
 > a way out, and can **publish ports** (`-p`): a bridge network as root, pasta
 > without; on a network you make, they find each other **by name** (`--name`),
 > a container can be on **several networks** at once, and with `--ipv6` they have
 > IPv6 too. With `-t`, a container gets a **terminal of its own** (`-it` to type into
-> it: job control, full-screen programs, password prompts); it never gets yours. `shipyard-runtime`
-> keeps a container's **logs**, lets you **attach** to it, **exec** into it and **cp**
-> files in and out, by its runtime ID.
+> it: job control, full-screen programs, password prompts); it never gets yours.
+> **Containers** run in the background (`run -d`, `create` and `start`), outlive the
+> command that started them, and are found **by name**: listed (`ps`, `inspect`),
+> stopped and started again (`stop`, `kill`, `restart`, `wait`), renamed, and removed
+> (`rm`); what one writes is kept until it's removed. You can read a container's
+> **logs**, **attach** to it, **exec** into it and **cp** files in and out by its name, and
+> connect it to a network while it runs. **Restart policies** (`--restart`) bring a
+> container back when it ends, and after a reboot with the [systemd
+> units](https://github.com/Zena4L/shipyard/tree/main/contrib/systemd); **health
+> checks** (`--health-cmd`, or the image's own) show in `ps`; and `shipyard events`
+> tells what happened. 
 > It isn't a hardened boundary yet. It starts the command the way a container
 > runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
@@ -31,8 +39,10 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | Page | What it covers |
 |---|---|
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
-| [Images](images.md) | `shipyard pull`, `run --image`, `images`, `rmi`, `image prune`, `system df`: pulling, private registries and the local store |
+| [Containers](containers.md) | `run -d`, `create`, `start`, `ps`, `inspect`, `rm`: containers that outlive the command, by name, ID or serial; their kept files |
+| [Images](images.md) | `shipyard pull`, `run IMAGE`, `images`, `rmi`, `image prune`, `system df`: pulling, private registries and the local store |
 | [Networking](networking.md) | `--network`, `-p`, `--name`, `shipyard network …`: networks, addresses, names, published ports, other firewalls, the hostname and the `/etc` files |
+| [Events](events.md) | `shipyard events`: what happens to containers, images, volumes and networks, as it happens or since a time, filtered |
 | [Volumes](volumes.md) | `shipyard volume …` and `--volume`: named volumes and bind mounts |
 | [OCI bundles](bundles.md) | `shipyard run --bundle`: a container described by a `config.json`, what's supported, refused and ignored |
 | [The OCI runtime](runtime.md) | `shipyard-runtime`, as `runc`: a container's life one step at a time (`create`, `start`, `state`, `kill`, `delete`), its terminals, logs, `attach`, `exec`, `cp`, passing descriptors, and its cgroup (`pause`, `update`, `ps`, `events`) |
@@ -68,7 +78,7 @@ mounts, overlayfs where the image store goes, a cgroup), and says what to fix. I
 pasta, but doesn't start it.
 
 On macOS, Shipyard builds and runs, but doesn't isolate yet (see
-[Limitations](#limitations-in-v01)).
+[Limitations](#limitations-in-v02)).
 
 ## Install from source
 
@@ -133,12 +143,14 @@ ok    cgroups          v2, delegated at /sys/fs/cgroup/user.slice/user-1000.slic
 ok    images           overlayfs works where the store will be (/home/alice/.local/share/shipyard/images, not made yet: probed in /home/alice/.local/share)
 ok    network          pasta (/usr/bin/pasta)
 ok    runtime state    /run/user/1000/shipyard
+ok    linger           off (no container has a restart policy that would need it)
+ok    restart at boot  the boot unit isn't enabled (no container has a restart policy)
 
 containers run here
 ```
 
 Each line is `ok`, `warn` (something is limited, such as resource limits, but
-containers run) or `fail` (a plain `shipyard run`, or `run --image`, would fail),
+containers run) or `fail` (a plain `shipyard run --no-image`, or a run with an image, would fail),
 with what to do. The
 exit code is 1 if anything failed. `doctor` tries what a run needs: it makes a user
 namespace, a mount and an overlay next to the image store, and removes them again.
@@ -148,7 +160,7 @@ Docker's) would keep the containers from the outside, and how to let them throug
 Run a shell in Alpine Linux, pulled from Docker Hub:
 
 ```sh
-shipyard run -it --image alpine sh
+shipyard run -it alpine sh
 ```
 
 ```text
@@ -175,7 +187,7 @@ A container never gets your terminal itself.
 A command, and its exit code:
 
 ```sh
-shipyard run --image alpine sh -c 'echo "hello from PID $$"; exit 3'
+shipyard run alpine sh -c 'echo "hello from PID $$"; exit 3'
 echo $?
 ```
 
@@ -186,13 +198,15 @@ hello from PID 2
 
 PID 2: the command sees only its own processes, under Shipyard's small init (PID 1).
 
-## Limitations in v0.1
+## Limitations in v0.2
 
-- **No detached containers by name:** a `shipyard run` container lives as long as its
-  `shipyard run`, and `shipyard` has no `logs`, `attach`, `exec` or `cp` yet (v0.2).
-  `shipyard-runtime` has them all, by a container's runtime ID (see
-  [The OCI runtime](runtime.md)).
-- **macOS doesn't isolate yet:** commands run as ordinary processes until Shipyard runs
+- **No `stats`, `top`, `pause` or image commands by name yet:** `shipyard stats`,
+  `top`, `pause`/`unpause`, `update` of a running container's limits, `tag`, image
+  `inspect`/`history`/`save`/`load` and `--mount` come next. `shipyard-runtime` has
+  live stats (`events --stats`), `ps`, `pause`/`resume` and `update` by a container's
+  runtime ID.
+- **macOS doesn't isolate yet:** commands run as ordinary processes
+  (`shipyard run --no-image …`), and images don't run there, until Shipyard runs
   them in a Linux VM of its own (v0.4).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge
   networks, and names between containers, are root's
@@ -201,6 +215,19 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
   host can keep root's containers from the outside. Shipyard warns, with the exact
   fix, but never changes another program's firewall
   (see [Other firewalls](networking.md#other-firewalls)).
+- **No default limits on processes or memory:** as Docker, a container can use what
+  the host has unless it's given `--pids-limit` and `--memory`.
+- **The default network reaches the host and the cloud's metadata:** `bridge` can't
+  have `--isolate-host`; put containers that mustn't on a network of your own made
+  with it (see [Networking](networking.md#networks)).
+- **Restart policies have edges:** a full disk turns them off without a word; the
+  boot unit doesn't know stores you set with environment variables
+  (`SHIPYARD_IMAGE_STORE`, `XDG_DATA_HOME`); and a shutdown while the boot unit is
+  still starting containers ends them without their stop signal
+  (see [Containers](containers.md#after-a-reboot)).
+- **Not every Docker flag yet:** no `-v` (use `--volume`), `-h`, `--env-file`, `-l`,
+  `logs -n` (use `--tail`) or `inspect -f`; `inspect` and `images` print Shipyard's
+  own fields, not Docker's.
 - **Not a hardened security boundary yet:** containers are confined (namespaces,
   capabilities, seccomp, cgroups), but don't run code you wouldn't run as your own
   user. See [SECURITY.md](https://github.com/Zena4L/shipyard/blob/main/SECURITY.md).

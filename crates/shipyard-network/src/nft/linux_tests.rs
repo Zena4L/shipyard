@@ -21,6 +21,9 @@ fn bridge() -> NetworkRules {
         subnet: "10.88.0.0/16".parse().unwrap(),
         subnet6: Some("fd00:88::/64".parse().unwrap()),
         internal: false,
+        isolate_host: false,
+        conntrack_limit: false,
+        dns: None,
     }
 }
 
@@ -59,7 +62,7 @@ fn the_ruleset_installs_is_current_and_is_rebuilt() {
             .into_iter()
             .filter(|chain| chain.family == NFPROTO_INET && chain.table == TABLE)
             .collect();
-        assert_eq!(ours.len(), 5, "{ours:?}");
+        assert_eq!(ours.len(), 6, "{ours:?}");
         assert!(ours.iter().all(super::Chain::is_shipyards));
         let forward = ours.iter().find(|chain| chain.name == "forward").unwrap();
         assert_eq!(forward.hook, Some(NF_INET_FORWARD));
@@ -145,6 +148,9 @@ fn networks_and_ports_come_and_go() {
             subnet: "10.89.0.0/24".parse().unwrap(),
             subnet6: None,
             internal: true,
+            isolate_host: false,
+            conntrack_limit: false,
+            dns: None,
         };
         nft.add_network(&bridge()).unwrap();
         nft.add_network(&internal).unwrap();
@@ -238,6 +244,9 @@ fn adjacent_subnets_and_closed_routing() {
             subnet: "10.89.0.0/24".parse().unwrap(),
             subnet6: None,
             internal: false,
+            isolate_host: false,
+            conntrack_limit: false,
+            dns: None,
         })
         .unwrap();
         assert_eq!(nft.elements(set::MASQUERADE).unwrap().len(), 4);
@@ -306,6 +315,20 @@ fn install_everything(nft: &mut Nftables) -> Vec<PortRule> {
                 subnet: "10.90.0.0/24".parse().unwrap(),
                 subnet6: None,
                 internal: true,
+                isolate_host: false,
+                conntrack_limit: false,
+                dns: None,
+            },
+            // Kept from the host, but for its DNS server.
+            NetworkRules {
+                bridge: "shy-isolated".into(),
+                subnet: "10.91.0.0/24".parse().unwrap(),
+                subnet6: None,
+                internal: false,
+                isolate_host: true,
+                // And limited.
+                conntrack_limit: true,
+                dns: Some(Ipv4Addr::new(10, 91, 0, 1)),
             },
         ],
         &ports,
@@ -356,6 +379,24 @@ fn nft_reads_and_rebuilds_shipyards_table() {
             "meta nfproto @closed iifname @uplinks oifname @uplinks drop",
             "ip saddr @masquerade4 oifname != @bridges masquerade",
             "ip6 saddr @masquerade6 oifname != @bridges masquerade",
+            "iifname @isolated drop",
+            "iifname . ip daddr . meta l4proto . th dport @dns_allow accept",
+            "iifname @isolated ip daddr 169.254.0.0/16 drop",
+            "ip daddr 100.100.100.200 drop",
+            "ip6 daddr fd00:ec2::254 drop",
+            "ip6 daddr fd00:ec2::23 drop",
+            "ip6 daddr fd20:ce::254 drop",
+            // The isolated network's DNS server, as nft reads the element.
+            "\"shy-isolated\" . 10.91.0.1 . udp . 53",
+            "\"shy-isolated\" . 10.91.0.1 . tcp . 53",
+            // The limit, and its counting sets, as nft reads them.
+            "add @conns4 { ip saddr ct count over 8192 } reject with tcp reset",
+            "add @conns4 { ip saddr ct count over 8192 } reject with icmpx admin-prohibited",
+            "add @conns6 { ip6 saddr ct count over 8192 } reject with tcp reset",
+            "add @conns6 { ip6 saddr ct count over 8192 } reject with icmpx admin-prohibited",
+            "ip6 saddr fe80::/10 reject with icmpx admin-prohibited",
+            "size 65536",
+            "flags dynamic",
         ] {
             assert!(listed.contains(rule), "no `{rule}` in:\n{listed}");
         }
@@ -387,10 +428,18 @@ fn nft_reads_and_rebuilds_shipyards_table() {
             keys.sort();
             keys
         };
-        let elements: Vec<_> = [set::BRIDGES, set::MASQUERADE, set::MASQUERADE6, set::PORTS]
-            .into_iter()
-            .map(|name| (name, held(&mut ours, name)))
-            .collect();
+        let elements: Vec<_> = [
+            set::BRIDGES,
+            set::MASQUERADE,
+            set::MASQUERADE6,
+            set::PORTS,
+            set::ISOLATED,
+            set::DNS_ALLOW,
+            set::LIMITED,
+        ]
+        .into_iter()
+        .map(|name| (name, held(&mut ours, name)))
+        .collect();
 
         nft(&["delete", "table", "inet", "shipyard"], "");
         nft(&["-f", "-"], &listed);

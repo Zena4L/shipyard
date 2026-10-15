@@ -9,11 +9,12 @@
 //! goes on. The client ends with the container, with its exit code.
 //!
 //! One loop, `poll` over the user's input, the socket and a self-pipe for
-//! SIGWINCH. Writes to the socket are buffered, never waited for: the
-//! monitor drops a client that falls behind, and a client blocked on a
-//! write would stop reading.
+//! SIGWINCH (the session's own, or its caller's). Writes to the socket are buffered, never waited for: the
+//! monitor drops a client that falls behind (unless it's held, a
+//! foreground run's own: then the container waits for it), and a client
+//! blocked on a write would stop reading.
 
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -34,6 +35,11 @@ pub struct Options {
     pub detach_keys: DetachKeys,
     /// Pass the user's input on (`--no-stdin` turns it off).
     pub stdin: bool,
+    /// The container waits for this client rather than let it go when it
+    /// falls behind ([`Frame::HelloHeld`]): a foreground run's own (stage 9,
+    /// step 9.4c3a), so a slow reader loses no output and a fast writer no
+    /// input.
+    pub held: bool,
 }
 
 /// How an attachment ended.
@@ -46,6 +52,9 @@ pub enum Ended {
     /// The monitor let go of this client: it fell too far behind the
     /// container's output (the reason).
     Dropped(String),
+    /// The user's terminal hung up (closed): the container goes on, as
+    /// after a detach.
+    HungUp,
 }
 
 /// An attachment that couldn't go on.
@@ -102,11 +111,43 @@ impl From<Errno> for AttachError {
 /// # Errors
 ///
 /// [`AttachError`].
-pub fn attach(mut stream: UnixStream, options: &Options) -> Result<Ended, AttachError> {
+pub(crate) fn attach(stream: UnixStream, options: &Options) -> Result<Ended, AttachError> {
+    welcomed(stream, options)?.session()
+}
+
+/// A client the monitor has let in, its session not begun: what the
+/// container writes from now on comes to it (the monitor sends output to
+/// clients it has let in). `start -a` is let in before the container's
+/// start gate opens, so nothing its command writes is missed.
+#[derive(Debug)]
+pub(crate) struct Welcomed {
+    stream: UnixStream,
+    decoder: Decoder,
+    terminal: bool,
+    stdin: bool,
+    /// What its session goes on with.
+    options: Options,
+}
+
+/// Says hello through `stream` (connected to the container's
+/// `attach.sock`) as `options` say, and waits to be let in.
+///
+/// # Errors
+///
+/// [`AttachError`]: refused, another version, no answer.
+pub(crate) fn welcomed(mut stream: UnixStream, options: &Options) -> Result<Welcomed, AttachError> {
     let mut hello = Vec::new();
-    Frame::Hello {
-        version: VERSION,
-        detach_keys: options.detach_keys.bytes().to_vec(),
+    let (version, detach_keys) = (VERSION, options.detach_keys.bytes().to_vec());
+    if options.held {
+        Frame::HelloHeld {
+            version,
+            detach_keys,
+        }
+    } else {
+        Frame::Hello {
+            version,
+            detach_keys,
+        }
     }
     .encode(&mut hello);
     // Closed at once: someone else's container, or refused before the hello
@@ -114,33 +155,98 @@ pub fn attach(mut stream: UnixStream, options: &Options) -> Result<Ended, Attach
     let said = stream.write_all(&hello);
     let mut decoder = Decoder::new();
     let (terminal, stdin) = welcome(&mut stream, &mut decoder, said.is_ok())?;
-    let typing = options.stdin && stdin;
-    // Raw only for a terminal, typed into from one, in the foreground
-    // (`RawMode::set` says so): each key a byte, for the container's
-    // terminal to make sense of. Typing from a terminal into a container
-    // without one: lines, as the user edits them, but without flow control,
-    // which would take Ctrl-Q (the detach keys' second) for itself.
-    let _raw = if !typing {
-        None
-    } else if terminal {
-        RawMode::set(libc::STDIN_FILENO).ok().flatten()
-    } else {
-        RawMode::without_flow_control(libc::STDIN_FILENO)
-            .ok()
-            .flatten()
-    };
-    stream.set_nonblocking(true)?;
-    let winch = terminal.then(Winch::install).transpose()?;
-    let mut session = Session {
+    Ok(Welcomed {
         stream,
         decoder,
-        out: Vec::new(),
-        stdin_open: typing,
-    };
-    if terminal && let Some((rows, cols)) = terminal_size() {
-        Frame::Resize { rows, cols }.encode(&mut session.out);
+        terminal,
+        stdin,
+        options: options.clone(),
+    })
+}
+
+impl Welcomed {
+    /// The session, with the options it said hello with, until the
+    /// container ends, the detach keys are typed, or the monitor lets go.
+    ///
+    /// # Errors
+    ///
+    /// [`AttachError`].
+    pub(crate) fn session(self) -> Result<Ended, AttachError> {
+        self.session_with(None)
     }
-    session.run(winch.as_ref())
+
+    /// [`session`](Self::session), the window's resizes told by `resizes`
+    /// (readable once one or more came: drained, then the size sent) rather
+    /// than a SIGWINCH watch of the session's own: for a caller whose
+    /// signal watch has SIGWINCH already (a foreground run's, stage 9, step
+    /// 9.4c3b: one watch per process).
+    ///
+    /// # Errors
+    ///
+    /// [`AttachError`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "foreground runs are Linux's")
+    )]
+    pub(crate) fn session_resized(self, resizes: BorrowedFd<'_>) -> Result<Ended, AttachError> {
+        self.session_with(Some(resizes))
+    }
+
+    fn session_with(self, resizes: Option<BorrowedFd<'_>>) -> Result<Ended, AttachError> {
+        let Self {
+            stream,
+            decoder,
+            terminal,
+            stdin,
+            options,
+        } = self;
+        let typing = options.stdin && stdin;
+        // Raw only for a terminal, typed into from one, in the foreground
+        // (`RawMode::set_in_foreground` waits for it: stopped until `fg`):
+        // each key a byte, for the container's terminal to make sense of.
+        // Typing from a terminal into a container without one: lines, as
+        // the user edits them, but without flow control, which would take
+        // Ctrl-Q (the detach keys' second) for itself.
+        let (raw, wants_raw) = if !typing {
+            (None, false)
+        } else if terminal {
+            match RawMode::set_in_foreground(libc::STDIN_FILENO) {
+                Ok(Some(raw)) => (Some(raw), false),
+                // Still in the background (`bg`): raw once it's in the
+                // foreground.
+                Ok(None) => (None, true),
+                Err(_) => (None, false),
+            }
+        } else {
+            let raw = RawMode::without_flow_control(libc::STDIN_FILENO)
+                .ok()
+                .flatten();
+            (raw, false)
+        };
+        stream.set_nonblocking(true)?;
+        // The window's resizes: the caller's watch's, else one of the
+        // session's own.
+        let own = match resizes {
+            Some(_) => None,
+            None => terminal.then(Winch::install).transpose()?,
+        };
+        let resizes = resizes.or_else(|| own.as_ref().map(|winch| winch.read.as_fd()));
+        let mut session = Session {
+            stream,
+            decoder,
+            out: Vec::new(),
+            stdin_open: typing,
+            // A terminal's end (closed: a hang-up) ends the session; a
+            // file's or a pipe's ends only the input.
+            hangs_up: typing && terminal && std::io::stdin().is_terminal(),
+            raw,
+            wants_raw,
+        };
+        if terminal && let Some((rows, cols)) = terminal_size() {
+            Frame::Resize { rows, cols }.encode(&mut session.out);
+        }
+        session.run(terminal.then_some(resizes).flatten())
+    }
 }
 
 /// Waits for the monitor's answer to the hello (`said`: whether the hello
@@ -190,13 +296,26 @@ struct Session {
     out: Vec<u8>,
     /// Whether the user's input is still read.
     stdin_open: bool,
+    /// Whether the user's input is a terminal typed into a container's: its
+    /// hang-up ends the session.
+    hangs_up: bool,
+    /// The terminal in raw mode, while the session is.
+    raw: Option<RawMode>,
+    /// Raw mode wanted and not had yet (left in the background by `bg`).
+    wants_raw: bool,
 }
 
 impl Session {
-    fn run(&mut self, winch: Option<&Winch>) -> Result<Ended, AttachError> {
+    fn run(&mut self, resizes: Option<BorrowedFd<'_>>) -> Result<Ended, AttachError> {
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             self.flush()?;
+            // Raw mode due (left in the background by `bg`): looked for
+            // again each time round. A resume wakes the loop (SIGCONT, on the
+            // resize pipe: `fg` of a stopped job), and so does a quarter of
+            // a second (`fg` of a running one sends none).
+            self.go_raw_if_due();
+            let raw_due = self.raw_due();
             let socket_events = if self.out.is_empty() {
                 PollFlags::POLLIN
             } else {
@@ -210,14 +329,22 @@ impl Session {
             // arrive) and keeps 64 KiB of typing for a container slow to
             // read it: past that, typing is lost (`attach < big-file` into
             // a slow reader; runtime.md says so).
-            let reading_stdin = self.stdin_open && self.out.len() < 64 * 1024;
+            // Not while raw mode is due: from the background a read stops
+            // this process (SIGTTIN) inside it, and after `fg` the read,
+            // restarted, would wait for a whole line, cooked.
+            let reading_stdin = self.stdin_open && self.out.len() < 64 * 1024 && !raw_due;
             if reading_stdin {
                 fds.push(PollFd::new(stdin, PollFlags::POLLIN));
             }
-            if let Some(winch) = winch {
-                fds.push(PollFd::new(winch.read.as_fd(), PollFlags::POLLIN));
+            if let Some(resizes) = resizes {
+                fds.push(PollFd::new(resizes, PollFlags::POLLIN));
             }
-            match poll(&mut fds, PollTimeout::NONE) {
+            let timeout = if raw_due {
+                PollTimeout::from(250_u16)
+            } else {
+                PollTimeout::NONE
+            };
+            match poll(&mut fds, timeout) {
                 Ok(_) | Err(Errno::EINTR) => {}
                 Err(errno) => return Err(errno.into()),
             }
@@ -227,13 +354,21 @@ impl Session {
                     .is_some_and(|events| !events.is_empty())
             };
             let (socket_ready, stdin_ready) = (ready(0), reading_stdin && ready(1));
-            let winch_ready = winch.is_some() && ready(if reading_stdin { 2 } else { 1 });
+            let stdin_hung_up = reading_stdin
+                && fds
+                    .get(1)
+                    .and_then(PollFd::revents)
+                    .is_some_and(|events| events.contains(PollFlags::POLLHUP));
+            let resized = resizes.is_some() && ready(if reading_stdin { 2 } else { 1 });
             drop(fds);
-            if winch_ready && let Some(winch) = winch {
-                winch.clear();
+            if resized && let Some(resizes) = resizes {
+                drain(resizes);
                 if let Some((rows, cols)) = terminal_size() {
                     Frame::Resize { rows, cols }.encode(&mut self.out);
                 }
+            }
+            if stdin_ready && self.hangs_up && stdin_hung_up {
+                return Ok(Ended::HungUp);
             }
             if stdin_ready {
                 match nix::unistd::read(stdin, &mut buffer) {
@@ -242,6 +377,8 @@ impl Session {
                             .encode(&mut self.out);
                     }
                     Err(Errno::EAGAIN | Errno::EINTR) => {}
+                    // The user's terminal is gone.
+                    Err(Errno::EIO) if self.hangs_up => return Ok(Ended::HungUp),
                     // The user's input ended: the monitor is told (with
                     // `--stdin-once`, the container's stdin then ends too),
                     // and the output goes on.
@@ -254,6 +391,30 @@ impl Session {
             if socket_ready && let Some(ended) = self.receive(&mut buffer)? {
                 return Ok(ended);
             }
+        }
+    }
+
+    /// Whether raw mode is wanted and not on: left or resumed in the
+    /// background (`bg`).
+    fn raw_due(&self) -> bool {
+        self.wants_raw || self.raw.as_ref().is_some_and(|raw| !raw.is_applied())
+    }
+
+    /// Sets the terminal raw if that's due and it's in the foreground now.
+    fn go_raw_if_due(&mut self) {
+        if self.wants_raw {
+            match RawMode::set(libc::STDIN_FILENO) {
+                Ok(Some(raw)) => {
+                    self.raw = Some(raw);
+                    self.wants_raw = false;
+                }
+                Ok(None) => {}
+                Err(_) => self.wants_raw = false,
+            }
+        } else if let Some(raw) = &self.raw
+            && !raw.is_applied()
+        {
+            raw.reapply();
         }
     }
 
@@ -347,12 +508,14 @@ fn write_all(fd: i32, mut bytes: &[u8]) -> Result<(), AttachError> {
     Ok(())
 }
 
-/// SIGWINCH turned into a readable pipe (the self-pipe trick, TLPI
-/// §63.5.2), for the loop's `poll`; the previous handling put back on drop.
+/// SIGWINCH and SIGCONT turned into a readable pipe (the self-pipe trick,
+/// TLPI §63.5.2), for the loop's `poll`: a resize, or a resume (raw mode
+/// looked at again); the previous handling put back on drop.
 struct Winch {
     read: OwnedFd,
     _write: OwnedFd,
     previous: nix::sys::signal::SigAction,
+    previous_cont: nix::sys::signal::SigAction,
 }
 
 /// The pipe's write end, for the handler (-1: none).
@@ -387,17 +550,23 @@ impl Winch {
         );
         // SAFETY: the handler only writes to a pipe (async-signal-safe).
         let previous = unsafe { sigaction(Signal::SIGWINCH, &action) }?;
+        // SAFETY: as above. A resume, as a resize, wakes the session (to
+        // look at raw mode again); the kernel resumes a stopped process
+        // whatever SIGCONT's handler.
+        let previous_cont = match unsafe { sigaction(Signal::SIGCONT, &action) } {
+            Ok(previous) => previous,
+            Err(errno) => {
+                // SAFETY: putting back SIGWINCH's handling, found above.
+                let _ = unsafe { sigaction(Signal::SIGWINCH, &previous) };
+                return Err(errno.into());
+            }
+        };
         Ok(Self {
             read,
             _write: write,
             previous,
+            previous_cont,
         })
-    }
-
-    /// Empties the pipe: one resize for any number of signals.
-    fn clear(&self) {
-        let mut sink = [0_u8; 64];
-        while matches!(nix::unistd::read(&self.read, &mut sink), Ok(read) if read > 0) {}
     }
 }
 
@@ -407,6 +576,213 @@ impl Drop for Winch {
         let _ = unsafe {
             nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGWINCH, &self.previous)
         };
+        // SAFETY: as above.
+        let _ = unsafe {
+            nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGCONT, &self.previous_cont)
+        };
         WINCH_PIPE.store(-1, Ordering::Relaxed);
+    }
+}
+
+/// Empties the non-blocking pipe `read` (a resize watch's): one resize for
+/// any number of signals.
+fn drain(read: BorrowedFd<'_>) {
+    let mut sink = [0_u8; 64];
+    while matches!(nix::unistd::read(read, &mut sink), Ok(read) if read > 0) {}
+}
+
+/// What an attachment came to, for its caller's exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Detached (the keys typed), or its reader stopped reading (`attach
+    /// … | head`): the container goes on (0).
+    Left,
+    /// The container ended, with this exit code.
+    Exited(i32),
+}
+
+/// What an attachment comes to (F38: the CLI's, once). A container that ended just as this attached
+/// (its monitor gone, or refusing, before the container was seen as
+/// stopped) ends with the code `ended_code` finds recorded; without one,
+/// that's the failure.
+///
+/// # Errors
+///
+/// The attachment's failure, the end race aside; a client the monitor let
+/// go of (it fell behind).
+pub fn settle(
+    attached: std::result::Result<
+        std::result::Result<Ended, AttachError>,
+        shipyard_runtime::container::ContainerError,
+    >,
+    ended_code: impl FnOnce() -> Option<i32>,
+) -> crate::Result<Settled> {
+    use shipyard_runtime::container::ContainerError;
+    match attached {
+        Err(error @ ContainerError::MonitorGone(_)) => ended_code()
+            .map(Settled::Exited)
+            .ok_or_else(|| error.into()),
+        Err(error) => Err(error.into()),
+        Ok(Ok(Ended::Detached | Ended::HungUp)) => Ok(Settled::Left),
+        Ok(Ok(Ended::Exited(code))) => Ok(Settled::Exited(code)),
+        Ok(Ok(Ended::Dropped(reason))) => Err(crate::Error::new(
+            crate::ErrorKind::Runtime,
+            format!("the container's monitor let go of this attach: {reason}"),
+        )),
+        Ok(Err(
+            error @ (AttachError::Refused(_) | AttachError::MonitorGone | AttachError::NotLetIn),
+        )) => ended_code()
+            .map(Settled::Exited)
+            .ok_or_else(|| error.into()),
+        // `attach … | head`: the reader has seen what it wanted.
+        Ok(Err(AttachError::Io(error))) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            Ok(Settled::Left)
+        }
+        Ok(Err(error)) => Err(error.into()),
+    }
+}
+
+/// Attaches to runtime container `id` under `root` (`shipyard-runtime
+/// attach`): what [`settle`] says, the end race settled by the runtime's
+/// exit record.
+///
+/// # Errors
+///
+/// As [`settle`].
+pub fn to_runtime(root: &std::path::Path, id: &str, options: &Options) -> crate::Result<Settled> {
+    use shipyard_runtime::container;
+    let attached = container::attach_stream(root, id).map(|stream| attach(stream, options));
+    settle(attached, || container::exit_code(root, id).ok().flatten())
+}
+
+/// Attaches to the container `reference` names (stage 9, step 9.4c1):
+/// what [`settle`] says, the end race settled by its record once its end is
+/// (its `running` file free: its clean-up has recorded it).
+///
+/// # Errors
+///
+/// No such container, or one that ended as this connected and was removed
+/// at its end (`--rm`), its code with it
+/// ([`ErrorKind::NotFound`](crate::ErrorKind::NotFound)); one that isn't up
+/// ([`ErrorKind::NotRunning`](crate::ErrorKind::NotRunning)); as
+/// [`settle`].
+pub fn to_container(
+    engine: &crate::Engine,
+    reference: &str,
+    options: &Options,
+) -> crate::Result<Settled> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::containers::{self, Needs};
+        use shipyard_runtime::container::{self as runtime, ContainerError};
+        let record = containers::find(engine, reference)?;
+        containers::require(engine, &record, Needs::Up, "attach to it")?;
+        let root = engine.paths.runtime_root()?;
+        let attached = match runtime::attach_stream(root, record.id.as_str()) {
+            // Ended (and its state gone, or stopped) since it was seen up:
+            // the end race, as a monitor that has let go.
+            Err(ContainerError::NotFound(_) | ContainerError::WrongStatus { .. }) => {
+                Err(ContainerError::MonitorGone(record.id.as_str().to_owned()))
+            }
+            connected => connected.map(|stream| attach(stream, options)),
+        };
+        settle(attached, || recorded_end(engine, &record)).map_err(|error| {
+            if containers::find(engine, record.id.as_str()).is_err() {
+                crate::Error::new(
+                    crate::ErrorKind::NotFound,
+                    format!(
+                        "container {} ended as this attached, and was removed (--rm): its exit \
+                         code went with it",
+                        record.name
+                    ),
+                )
+            } else {
+                error
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, reference, options);
+        Err(crate::error::linux_only("containers"))
+    }
+}
+
+/// Container `record`'s exit code, once it has ended and its end is
+/// settled (waited for up to a minute): `None` if it's still up (what
+/// went wrong wasn't its end: a monitor refusing a client, say), if its
+/// end isn't settled by then, or if it's gone (`--rm`).
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded_end(
+    engine: &crate::Engine,
+    record: &crate::containers::Record,
+) -> Option<i32> {
+    use shipyard_runtime::container::{self as runtime, Status};
+    let root = engine.paths.runtime_root().ok()?;
+    // Stopping (its init gone, its monitor cleaning up) is the end coming.
+    if matches!(
+        runtime::peek_status(root, record.id.as_str()),
+        Ok(Some(
+            Status::Running | Status::Paused | Status::Created | Status::Creating
+        ))
+    ) {
+        return None;
+    }
+    crate::containers::running_lock(engine, &record.id, Duration::from_secs(60))
+        .ok()
+        .flatten()?;
+    let settled = crate::containers::find(engine, record.id.as_str()).ok()?;
+    Some(
+        settled
+            .exit?
+            .code
+            .unwrap_or(i32::from(shipyard_runtime::process::EXIT_ENGINE_ERROR)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every way an attachment goes, and what it comes to: among them the
+    /// race where the container ends as it connects (its monitor gone or
+    /// refusing before the container is seen as stopped), which ends with
+    /// the recorded code, and fails only where there's none.
+    #[test]
+    fn attachments_settle_as_they_went() {
+        use shipyard_runtime::container::ContainerError;
+        let code = |code| move || code;
+        let gone = || Err(ContainerError::MonitorGone("c".into()));
+        assert_eq!(settle(gone(), code(Some(3))).unwrap(), Settled::Exited(3));
+        assert!(settle(gone(), code(None)).is_err());
+        for late in [
+            AttachError::Refused("full".into()),
+            AttachError::MonitorGone,
+            AttachError::NotLetIn,
+        ] {
+            assert_eq!(
+                settle(Ok(Err(late)), code(Some(7))).unwrap(),
+                Settled::Exited(7)
+            );
+        }
+        assert!(settle(Ok(Err(AttachError::NotLetIn)), code(None)).is_err());
+        assert_eq!(
+            settle(Ok(Ok(Ended::Detached)), code(Some(1))).unwrap(),
+            Settled::Left
+        );
+        assert_eq!(
+            settle(Ok(Ok(Ended::Exited(4))), code(None)).unwrap(),
+            Settled::Exited(4)
+        );
+        assert!(settle(Ok(Ok(Ended::Dropped("slow".into()))), code(Some(0))).is_err());
+        let pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            settle(Ok(Err(AttachError::Io(pipe))), code(None)).unwrap(),
+            Settled::Left
+        );
+        // Not the end race: never the recorded code.
+        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(settle(Ok(Err(AttachError::Io(other))), code(Some(0))).is_err());
+        assert!(settle(Err(ContainerError::NotFound("c".into())), code(Some(0))).is_err());
     }
 }

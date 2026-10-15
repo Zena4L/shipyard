@@ -58,8 +58,16 @@ fn run_cgroup(pid: libc::pid_t) -> PathBuf {
 /// saw and what the host sees while it runs, then ends it and checks the
 /// cgroup is gone.
 fn a_run_has_its_own_cgroup(args: &[&str]) {
-    let shipyard =
-        start_command(SHIPYARD.command(&[&["run"], args, &["sh", "-c", LOOK_INSIDE]].concat()));
+    let shipyard = start_command(
+        SHIPYARD.command(
+            &[
+                shipyard_test_support::run_words(args),
+                args,
+                &["sh", "-c", LOOK_INSIDE],
+            ]
+            .concat(),
+        ),
+    );
     let inside: Vec<String> = (0..5).map(|_| shipyard.next_line()).collect();
     assert_eq!(
         inside[0], "0::/",
@@ -77,6 +85,13 @@ fn a_run_has_its_own_cgroup(args: &[&str]) {
         "{args:?}: the init's in it: {inside:?}"
     );
 
+    // A container (a root filesystem, since 9.4c3a) is its monitor's: its
+    // cgroup is the container's, looked at by the runtime's own tests.
+    if args.contains(&"--rootfs") {
+        shipyard.signal(libc::SIGTERM);
+        let _ = shipyard.finish();
+        return;
+    }
     let cgroup = run_cgroup(shipyard.pid());
     let init = child_of(shipyard.pid());
     assert_eq!(
@@ -126,7 +141,8 @@ fn a_run_in_a_user_namespace_has_its_own_cgroup() {
 #[ignore = "needs root"]
 fn a_finished_run_leaves_no_cgroup() {
     require_cgroup_v2();
-    let shipyard = start_command(SHIPYARD.command(&["run", "sh", "-c", "echo up; exit 3"]));
+    let shipyard =
+        start_command(SHIPYARD.command(&["run", "--no-image", "sh", "-c", "echo up; exit 3"]));
     assert_eq!(shipyard.next_line(), "up");
     let cgroup = run_cgroup(shipyard.pid());
     let (code, _) = shipyard.finish();
@@ -160,7 +176,7 @@ fn the_next_run_sweeps_cgroups_of_dead_runs() {
     let mut left = in_cgroup(&dead);
     let mut living = in_cgroup(&held);
 
-    let first = run(SHIPYARD.command(&["run", "true"]));
+    let first = run(SHIPYARD.command(&["run", "--no-image", "true"]));
     // Killed by the sweep; its cgroup goes with the next one, once empty.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let ended = loop {
@@ -172,7 +188,7 @@ fn the_next_run_sweeps_cgroups_of_dead_runs() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let second = run(SHIPYARD.command(&["run", "true"]));
+    let second = run(SHIPYARD.command(&["run", "--no-image", "true"]));
     let (held_left, dead_left) = (held.exists(), dead.exists());
     let still_living = living.try_wait().unwrap().is_none();
     let _ = left.kill();
@@ -230,7 +246,7 @@ fn gone_pid() -> libc::pid_t {
 
 /// `shipyard run ARGS…`, which must succeed: its output.
 fn ok(args: &[&str]) -> String {
-    let run = run(SHIPYARD.command(&[&["run"], args].concat()));
+    let run = run(SHIPYARD.command(&[shipyard_test_support::run_words(args), args].concat()));
     assert_eq!(run.code, Some(0), "{args:?}: {}", run.stderr);
     run.stdout
 }
@@ -276,7 +292,7 @@ fn swap_follows_dockers_rule() {
     let swap = |extra: &[&str]| {
         run(SHIPYARD.command(
             &[
-                &["run", "--memory", "64m"],
+                &["run", "--no-image", "--memory", "64m"],
                 extra,
                 &["cat", "/sys/fs/cgroup/memory.swap.max"],
             ]
@@ -310,6 +326,7 @@ fn the_oom_killer_is_reported() {
     let in_32m = |script: &str| {
         run(SHIPYARD.command(&[
             "run",
+            "--no-image",
             "--memory",
             "32m",
             "--memory-swap",
@@ -354,6 +371,7 @@ fn the_process_limit_holds() {
     // The shell gives up at the first fork refused ("Cannot fork").
     let capped = run(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--pids-limit",
         "10",
         "sh",
@@ -362,7 +380,7 @@ fn the_process_limit_holds() {
     ]));
     assert_ne!(capped.code, Some(0), "all 12 started");
     assert!(capped.stderr.contains("fork"), "{}", capped.stderr);
-    let refused = run(SHIPYARD.command(&["run", "--pids-limit", "1", "true"]));
+    let refused = run(SHIPYARD.command(&["run", "--no-image", "--pids-limit", "1", "true"]));
     assert_eq!(refused.code, Some(125), "{}", refused.stderr);
     assert!(
         refused.stderr.contains("process limit is 1"),
@@ -381,7 +399,7 @@ fn rootless_cgroups_follow_delegation() {
         return;
     }
     let Some(base) = delegated_cgroup() else {
-        let refused = run(SHIPYARD.command(&["run", "--memory", "64m", "true"]));
+        let refused = run(SHIPYARD.command(&["run", "--no-image", "--memory", "64m", "true"]));
         assert_eq!(refused.code, Some(125), "{}", refused.stderr);
         assert!(
             refused.stderr.contains("systemd-run --user --scope"),
@@ -392,6 +410,7 @@ fn rootless_cgroups_follow_delegation() {
     };
     let shipyard = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--memory",
         "64m",
         "--pids-limit",
@@ -437,7 +456,14 @@ fn an_undelegated_controller_is_named() {
         eprintln!("skipping: every controller is delegated here ({delegated})");
         return;
     };
-    let refused = run(SHIPYARD.command(&[&["run"], &flag[..], &["true"]].concat()));
+    let refused = run(SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(&flag[..]),
+            &flag[..],
+            &["true"],
+        ]
+        .concat(),
+    ));
     assert_eq!(refused.code, Some(125), "{}", refused.stderr);
     assert!(
         refused
@@ -469,7 +495,7 @@ fn without_delegation_a_limit_is_refused_with_the_fix() {
     command
         .args(["--reuid", "65534", "--regid", "65534", "--clear-groups"])
         .arg(SHIPYARD.path())
-        .args(["run", "--memory", "64m", "true"]);
+        .args(["run", "--no-image", "--memory", "64m", "true"]);
     // SAFETY: open, write and close are async-signal-safe; this moves the
     // child itself ("0") into the root-owned cgroup before it drops root.
     unsafe {
@@ -511,7 +537,8 @@ fn a_partition_is_not_a_disk() {
         return;
     };
     let limit = format!("{}:1mb", partition.display());
-    let refused = run(SHIPYARD.command(&["run", "--device-read-bps", &limit, "true"]));
+    let refused =
+        run(SHIPYARD.command(&["run", "--no-image", "--device-read-bps", &limit, "true"]));
     assert_eq!(refused.code, Some(125), "{}", refused.stderr);
     assert!(
         refused.stderr.contains("not a partition"),
@@ -529,6 +556,7 @@ fn shipyards_own_kill_is_not_an_oom_kill() {
     let mut shipyard = SHIPYARD
         .command(&[
             "run",
+            "--no-image",
             "--memory",
             "32m",
             "--memory-swap",

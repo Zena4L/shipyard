@@ -57,6 +57,22 @@ pub struct StopPolicy {
     pub timeout: Duration,
 }
 
+/// Whether signal `number` can stop a process: a real signal (1 to the
+/// last real-time one), not one that stops or continues it, and one the
+/// container's init passes on ([`StopPolicy::validate`]'s rule, by number:
+/// for a request from another process).
+#[must_use]
+pub fn is_stop_signal(number: libc::c_int) -> bool {
+    // The last signal: Linux's real-time ones, or (macOS) the 31 there are.
+    #[cfg(target_os = "linux")]
+    let last = libc::SIGRTMAX();
+    #[cfg(not(target_os = "linux"))]
+    let last = 31;
+    (1..=last).contains(&number)
+        && !NOT_STOP_SIGNALS.contains(&number)
+        && !NOT_FORWARDED_BY_THE_INIT.contains(&number)
+}
+
 impl StopPolicy {
     /// Rejects stop signals that can't end a process.
     pub fn validate(&self) -> Result<(), StopSignalError> {

@@ -196,15 +196,30 @@ impl Runtime {
     }
 
     /// How container `id` ended, as its monitor recorded it (waiting up to
-    /// 5 s for the record).
+    /// 5 s for the record): its words. The record is this Shipyard's
+    /// version, and its code is the one the words give.
     fn exit_record(&self, id: &str) -> String {
+        let record = self.exit_json(id);
+        assert_eq!(record["version"], 2, "{record}");
+        let description = record["description"].as_str().unwrap().to_owned();
+        if let Some(code) = record["code"].as_i64() {
+            assert!(
+                description.contains(&format!("(exit code {code})")),
+                "{record}"
+            );
+        }
+        description
+    }
+
+    /// Container `id`'s exit record, as written (waiting up to 5 s for it).
+    fn exit_json(&self, id: &str) -> Value {
         let exit = self.root.join(id).join("exit");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !exit.exists() {
             assert!(Instant::now() < deadline, "no exit recorded for {id}");
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::fs::read_to_string(exit).unwrap()
+        serde_json::from_slice(&std::fs::read(exit).unwrap()).unwrap()
     }
 
     /// Waits (up to 10 s) until container `id` is `status`.
@@ -714,6 +729,19 @@ fn a_container_that_exits_is_stopped() {
         "{recorded}; stderr: {:?}",
         std::fs::read_to_string(runtime.output_dir().join("exits.err"))
     );
+    let record = runtime.exit_json("exits");
+    assert_eq!(record["code"], 3, "{record}");
+    assert!(record.get("oom").is_none(), "{record}");
+    let finished = record["finished"]["secs_since_epoch"].as_u64().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(finished <= now && now - finished < 60, "{record}");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(runtime.root.join("exits/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["version"], 1, "{state}");
     // Started already: not again.
     let call = runtime.call(&["start", "exits"]);
     assert_eq!(call.code, Some(1));
@@ -1031,6 +1059,701 @@ fn a_kill_after_an_oom_kill_is_a_kill() {
     assert_eq!(runtime.call(&["kill", "survivor", "KILL"]).code, Some(0));
     let ended = runtime.exit_record("survivor");
     assert!(!ended.contains("out of memory"), "{ended}");
+    // The marker is the caller's alone.
+    let killed = std::fs::symlink_metadata(runtime.root.join("survivor/killed")).unwrap();
+    assert!(killed.is_file());
+    assert_eq!(killed.mode() & 0o777, 0o600);
+}
+
+/// Whether `path` is locked (`flock`) by someone: a fresh open of it can't
+/// take the lock.
+fn locked(path: &Path) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::File::open(path).unwrap();
+    // SAFETY: `flock` on a descriptor this function owns.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    !taken
+}
+
+/// A file locked here (`flock`, exclusive), and the command that passes it
+/// on as descriptor 9 (for `--hold-fd 9`).
+fn held_file(path: &Path) -> (std::fs::File, Command) {
+    held_file_at(path, 9)
+}
+
+/// [`held_file`], passed on as descriptor `at`.
+fn held_file_at(path: &Path, at: i32) -> (std::fs::File, Command) {
+    let (mut files, command) = held_files(&[(path, at)]);
+    (files.remove(0), command)
+}
+
+/// Files locked here (`flock`, exclusive), and the command that passes each
+/// on at its number.
+fn held_files(files: &[(&Path, i32)]) -> (Vec<std::fs::File>, Command) {
+    use std::os::fd::AsRawFd as _;
+    let opened: Vec<std::fs::File> = files.iter().map(|(path, _)| locked_file(path)).collect();
+    let moves: Vec<(i32, i32)> = opened
+        .iter()
+        .zip(files)
+        .map(|(file, (_, at))| (file.as_raw_fd(), *at))
+        .collect();
+    let mut command = Command::new(RUNTIME.path());
+    // SAFETY: `fcntl` and `dup2` are async-signal-safe, on a list made before
+    // the fork. Each is copied out of the way first (to 200 and up), then
+    // put at its number, which leaves it inheritable.
+    unsafe {
+        command.pre_exec(move || {
+            for (offset, &(raw, _)) in (200..).zip(&moves) {
+                if libc::fcntl(raw, libc::F_DUPFD, offset) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for (copy, &(_, at)) in (200..).zip(&moves) {
+                if libc::dup2(copy, at) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    (opened, command)
+}
+
+/// An exit command (a shell script) that records what it was given, a
+/// `key=value` line each: how many holds `SHIPYARD_HOLDS` says, its
+/// descriptors (a line of its own), their labels (`SHIPYARD_HOLD_LABELS`),
+/// whether `lock` is still held from outside, the inodes of its
+/// descriptors 3 and 4, and the exit record it was given; then lingers a
+/// second.
+fn recording_exit_command(dir: &Path, lock: &Path) -> (PathBuf, PathBuf) {
+    let record = dir.join("exit-command.txt");
+    let script = dir.join("exit-command.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "{{ echo holds=$SHIPYARD_HOLDS; ls /proc/self/fd | tr '\\n' ' '; echo; \
+             echo labels=$SHIPYARD_HOLD_LABELS; \
+             if flock -n {lock} true; then echo lock=free; else echo lock=held; fi; \
+             echo i3=$(stat -L -c %i /proc/self/fd/3 2>/dev/null); \
+             echo i4=$(stat -L -c %i /proc/self/fd/4 2>/dev/null); \
+             echo \"exit=$SHIPYARD_EXIT_RECORD\"; }} > {record}.tmp \
+             && mv {record}.tmp {record}\nsleep 1\n",
+            lock = lock.display(),
+            record = record.display(),
+        ),
+    )
+    .unwrap();
+    (script, record)
+}
+
+/// The value after `key=` on a line of the exit command's record.
+fn recorded<'a>(record: &'a str, key: &str) -> &'a str {
+    record
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap_or_default()
+}
+
+/// A lock handed to the monitor (`--hold-fd`) is held while the container
+/// runs, though `create`'s caller has let its copy go; the container never
+/// has it; once the container has ended, the exit command gets it at 3
+/// (still held), and once that's done it's free.
+#[test]
+#[ignore = "needs root"]
+fn a_hold_outlives_create_and_is_the_exit_commands() {
+    use std::os::unix::fs::MetadataExt as _;
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let lock = runtime.output_dir().join("held.lock");
+    let (script, record) = recording_exit_command(&runtime.output_dir(), &lock);
+    let (file, command) = held_file(&lock);
+    let bundle = bundle_running("exec sleep 300");
+    // A hook the monitor runs (createRuntime) lists the inodes of its
+    // descriptors: the hold mustn't be among them.
+    let hook_fds = runtime.output_dir().join("hook-fds.txt");
+    // A fresh config: its command set again (`bundle.config()` is the
+    // default one, not what `bundle_running` wrote).
+    let mut config = bundle.config();
+    config["process"]["args"] = json!(["sh", "-c", "exec sleep 300"]);
+    config["hooks"]["createRuntime"] = json!([{
+        "path": "/bin/sh",
+        "args": ["sh", "-c", format!(
+            "for fd in /proc/$$/fd/*; do stat -L -c '%d %i' $fd 2>/dev/null; done > {}; true",
+            hook_fds.display()
+        )],
+    }]);
+    bundle.write(&config);
+    let script = script.to_str().unwrap();
+    let extra = [
+        "--hold-fd",
+        "9",
+        "--exit-command",
+        "/bin/sh",
+        "--exit-command-arg",
+        script,
+    ];
+    let call = runtime.create_with("held", &bundle, &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    // Closed, not unlocked: the monitor's copy holds it now.
+    drop(file);
+    assert!(locked(&lock), "held by the monitor");
+    assert_eq!(runtime.call(&["start", "held"]).code, Some(0));
+    assert!(locked(&lock));
+    // None of the container's processes (its init, its program), nor its
+    // hook, has a descriptor of it.
+    let inode = std::fs::metadata(&lock).unwrap().ino();
+    let hooked = std::fs::read_to_string(&hook_fds).unwrap();
+    let lock_meta = std::fs::metadata(&lock).unwrap();
+    // A file is its device and inode: an inode number alone may be another
+    // file system's.
+    let lock_id = format!("{} {}", lock_meta.dev(), lock_meta.ino());
+    assert!(
+        !hooked.lines().any(|line| line == lock_id),
+        "the hook has the hold: {hooked}"
+    );
+    // Its init, and the command it forks once started (not at once).
+    let processes = eventually("the container's init and command", || {
+        Some(cgroup_procs(&cgroup_of("held"))).filter(|procs| procs.len() >= 2)
+    });
+    for pid in processes {
+        for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .flatten()
+        {
+            if let Ok(target) = std::fs::metadata(fd.path()) {
+                assert_ne!(
+                    (target.dev(), target.ino()),
+                    (lock_meta.dev(), lock_meta.ino()),
+                    "process {pid} has the hold"
+                );
+            }
+        }
+    }
+    assert!(!record.exists(), "no exit command while it runs");
+    assert_eq!(runtime.call(&["kill", "held", "KILL"]).code, Some(0));
+    let ran = eventually("the exit command", || std::fs::read_to_string(&record).ok());
+    let lines: Vec<&str> = ran.lines().collect();
+    assert_eq!(lines[0], "holds=1", "{ran}");
+    assert!(lines[1].split(' ').any(|fd| fd == "3"), "{ran}");
+    assert!(!lines[1].split(' ').any(|fd| fd == "9"), "only at 3: {ran}");
+    // Its label: `fd-9`, none given.
+    assert_eq!(recorded(&ran, "labels"), "fd-9", "{ran}");
+    assert_eq!(
+        recorded(&ran, "lock"),
+        "held",
+        "the exit command holds it: {ran}"
+    );
+    assert_eq!(
+        recorded(&ran, "i3"),
+        inode.to_string(),
+        "3 is the hold: {ran}"
+    );
+    assert!(recorded(&ran, "exit").contains("\"code\":137"), "{ran}");
+    eventually("the hold let go", || (!locked(&lock)).then_some(()));
+    assert_eq!(runtime.status("held"), "stopped");
+    // It started: nothing said.
+    assert!(
+        !runtime
+            .root
+            .join("held")
+            .join("exit-command-failed")
+            .exists()
+    );
+}
+
+/// Two holds, with the container's output in logs (more descriptors open
+/// in the monitor): the exit command gets each at its place, 3 and 4, in
+/// the order given; and an exit command that can't start leaves them to go
+/// with the monitor, and says so (`exit-command-failed`).
+#[test]
+#[ignore = "needs root"]
+fn holds_reach_the_exit_command_in_order() {
+    use std::os::unix::fs::MetadataExt as _;
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let first = runtime.output_dir().join("first.lock");
+    let second = runtime.output_dir().join("second.lock");
+    let (script, record) = recording_exit_command(&runtime.output_dir(), &first);
+    let (files, command) = held_files(&[(&second, 8), (&first, 9)]);
+    let bundle = bundle_running("echo out; exec sleep 300");
+    let logs = runtime.log_dir("ordered");
+    let extra = [
+        "--log-dir",
+        logs.to_str().unwrap(),
+        "--hold-fd",
+        "9=lease:first",
+        "--hold-fd",
+        "8",
+        "--exit-command",
+        "/bin/sh",
+        "--exit-command-arg",
+        script.to_str().unwrap(),
+    ];
+    let call = runtime.create_with("ordered", &bundle, &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    drop(files);
+    assert_eq!(runtime.call(&["start", "ordered"]).code, Some(0));
+    assert_eq!(runtime.call(&["kill", "ordered", "KILL"]).code, Some(0));
+    let ran = eventually("the exit command", || std::fs::read_to_string(&record).ok());
+    let inode = |path: &Path| std::fs::metadata(path).unwrap().ino().to_string();
+    assert_eq!(recorded(&ran, "holds"), "2", "{ran}");
+    assert_eq!(recorded(&ran, "labels"), "lease:first,fd-8", "{ran}");
+    assert_eq!(recorded(&ran, "i3"), inode(&first), "9 first, at 3: {ran}");
+    assert_eq!(recorded(&ran, "i4"), inode(&second), "8 next, at 4: {ran}");
+    eventually("the holds let go", || {
+        (!locked(&first) && !locked(&second)).then_some(())
+    });
+
+    let lock = runtime.output_dir().join("nowhere.lock");
+    let (file, command) = held_file(&lock);
+    let extra = ["--hold-fd", "9", "--exit-command", "/nonexistent/cleanup"];
+    let call = runtime.create_with("nowhere", &bundle_running("true"), &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    drop(file);
+    assert_eq!(runtime.call(&["start", "nowhere"]).code, Some(0));
+    runtime.wait_for("nowhere", "stopped");
+    eventually("the hold let go", || (!locked(&lock)).then_some(()));
+    // Said, for the caller's recovery: made before the monitor exits (and
+    // its hold with it), empty. Not tried again: it never would start.
+    let failed = runtime.root.join("nowhere").join("exit-command-failed");
+    let made = std::fs::symlink_metadata(&failed).unwrap();
+    assert!(made.is_file() && made.len() == 0, "{made:?}");
+    assert_eq!(made.mode() & 0o777, 0o600);
+}
+
+/// While the container runs (protocol version 3, stage 9, step 9.7b1): a
+/// lock given to its monitor (`hold`) outlives its giver's copy, and reaches
+/// the exit command after those from `create`, with its label; one from
+/// `create` let go of (`release`) is free at once, and the exit command
+/// doesn't get it. A label held already, a release of nothing, and a hold
+/// once the container has ended are refused.
+#[test]
+#[ignore = "needs root"]
+fn holds_are_added_and_let_go_of_while_it_runs() {
+    use shipyard_runtime::container::{self as runtime, ContainerError};
+    use std::os::fd::AsFd as _;
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let first = runtime.output_dir().join("first.lock");
+    let second = runtime.output_dir().join("second.lock");
+    let later = runtime.output_dir().join("later.lock");
+    let (script, record) = recording_exit_command(&runtime.output_dir(), &later);
+    let (files, command) = held_files(&[(&first, 8), (&second, 9)]);
+    let logs = runtime.log_dir("holder");
+    let extra = [
+        "--log-dir",
+        logs.to_str().unwrap(),
+        "--hold-fd",
+        "8=lease:first",
+        "--hold-fd",
+        "9=lease:second",
+        "--exit-command",
+        "/bin/sh",
+        "--exit-command-arg",
+        script.to_str().unwrap(),
+    ];
+    let call = runtime.create_with("holder", &bundle_running("exec sleep 300"), &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    drop(files);
+    assert_eq!(runtime.call(&["start", "holder"]).code, Some(0));
+    // Held since: the giver's copy closed, still locked.
+    let given = locked_file(&later);
+    runtime::hold(&runtime.root, "holder", "lease:later", given.as_fd()).unwrap();
+    let again = runtime::hold(&runtime.root, "holder", "lease:later", given.as_fd());
+    assert!(
+        matches!(again, Err(ContainerError::NotHeld { .. })),
+        "{again:?}"
+    );
+    drop(given);
+    assert!(locked(&later), "held by the monitor");
+    // One from `create`, let go of: free at once.
+    assert!(locked(&first));
+    runtime::release(&runtime.root, "holder", "lease:first").unwrap();
+    eventually("the released hold free", || (!locked(&first)).then_some(()));
+    let nothing = runtime::release(&runtime.root, "holder", "lease:first");
+    assert!(
+        matches!(nothing, Err(ContainerError::NotHeld { .. })),
+        "{nothing:?}"
+    );
+    assert!(locked(&second));
+    assert_eq!(runtime.call(&["kill", "holder", "KILL"]).code, Some(0));
+    let ran = eventually("the exit command", || std::fs::read_to_string(&record).ok());
+    assert_eq!(recorded(&ran, "holds"), "2", "{ran}");
+    assert_eq!(
+        recorded(&ran, "labels"),
+        "lease:second,lease:later",
+        "{ran}"
+    );
+    assert_eq!(
+        recorded(&ran, "lock"),
+        "held",
+        "the exit command holds the later one: {ran}"
+    );
+    eventually("the holds let go", || {
+        (!locked(&second) && !locked(&later)).then_some(())
+    });
+    // Ended: nothing more is held.
+    let late = locked_file(&runtime.output_dir().join("late.lock"));
+    let refused = runtime::hold(&runtime.root, "holder", "lease:late", late.as_fd());
+    assert!(
+        matches!(&refused, Err(ContainerError::NotHeld { why, .. }) if why.contains("ended")),
+        "{refused:?}"
+    );
+    // A label that isn't one; a container without logs (no attach
+    // socket: nothing can be handed to its monitor).
+    let bad = runtime::hold(&runtime.root, "holder", "a b", late.as_fd());
+    assert!(
+        matches!(bad, Err(ContainerError::BadHoldLabel(_))),
+        "{bad:?}"
+    );
+    let call = runtime.create("unlogged", &bundle_running("exec sleep 300"), &[]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    let unlogged = runtime::hold(&runtime.root, "unlogged", "lease:x", late.as_fd());
+    assert!(
+        matches!(unlogged, Err(ContainerError::NotAttachable(_))),
+        "{unlogged:?}"
+    );
+    assert_eq!(
+        runtime.call(&["delete", "--force", "unlogged"]).code,
+        Some(0)
+    );
+}
+
+/// A file, made and locked here (`flock`, exclusive).
+fn locked_file(path: &Path) -> std::fs::File {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::File::create(path).unwrap();
+    // SAFETY: `flock` on a descriptor this test owns.
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+    file
+}
+
+/// Without an exit command, a hold goes once the container has stopped;
+/// with its monitor killed, at once, and no exit command runs.
+#[test]
+#[ignore = "needs root"]
+fn holds_go_with_the_container_or_its_monitor() {
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let lock = runtime.output_dir().join("plain.lock");
+    let (file, command) = held_file(&lock);
+    let bundle = bundle_running("sleep 1");
+    let call = runtime.create_with("plain", &bundle, &["--hold-fd", "9"], command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    drop(file);
+    assert!(locked(&lock));
+    assert_eq!(runtime.call(&["start", "plain"]).code, Some(0));
+    runtime.wait_for("plain", "stopped");
+    eventually("the hold let go", || (!locked(&lock)).then_some(()));
+
+    let lock = runtime.output_dir().join("killed.lock");
+    let (script, record) = recording_exit_command(&runtime.output_dir(), &lock);
+    let (file, command) = held_file(&lock);
+    let bundle = bundle_running("exec sleep 300");
+    let extra = [
+        "--hold-fd",
+        "9",
+        "--exit-command",
+        "/bin/sh",
+        "--exit-command-arg",
+        script.to_str().unwrap(),
+    ];
+    let call = runtime.create_with("orphaned", &bundle, &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    drop(file);
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(runtime.root.join("orphaned/state.json")).unwrap())
+            .unwrap();
+    let monitor = state["monitor"][0].as_i64().unwrap();
+    // SAFETY: `kill` of the monitor this test's `create` started.
+    unsafe { libc::kill(i32::try_from(monitor).unwrap(), libc::SIGKILL) };
+    eventually("the hold let go", || (!locked(&lock)).then_some(()));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!record.exists(), "no exit command for a killed monitor");
+}
+
+/// `delete --force` of a running container ends it: its exit command runs.
+/// A `create` that fails after its monitor started runs none.
+#[test]
+#[ignore = "needs root"]
+fn the_exit_command_runs_after_delete_and_not_after_a_failed_create() {
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let lock = runtime.output_dir().join("deleted.lock");
+    let (script, record) = recording_exit_command(&runtime.output_dir(), &lock);
+    let script = script.to_str().unwrap().to_owned();
+    let exit = ["--exit-command", "/bin/sh", "--exit-command-arg", &script];
+    let bundle = bundle_running("exec sleep 300");
+    let call = runtime.create("deleted", &bundle, &exit);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.call(&["start", "deleted"]).code, Some(0));
+    assert_eq!(
+        runtime.call(&["delete", "--force", "deleted"]).code,
+        Some(0)
+    );
+    let ran = eventually("the exit command", || std::fs::read_to_string(&record).ok());
+    assert!(ran.starts_with("holds=0"), "{ran}");
+    std::fs::remove_file(&record).unwrap();
+
+    let failing = Bundle::new();
+    let (mut config, _log) = hooked(&runtime, &failing, "echo ran");
+    config["hooks"]["createRuntime"] = json!([{"path": "/bin/sh", "args": ["sh", "-c", "exit 3"]}]);
+    failing.write(&config);
+    let call = runtime.create("failing", &failing, &exit);
+    assert_eq!(call.code, Some(1), "{}", call.stderr);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!record.exists(), "no exit command after a failed create");
+}
+
+/// A companion (a shell script) that records its PID, its parent's and its
+/// session's, starts a child of its own and records its PID, then waits.
+fn recording_companion(dir: &Path) -> (PathBuf, PathBuf) {
+    let record = dir.join("companion.txt");
+    let script = dir.join("companion.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "sleep 300 & child=$!\n\
+             {{ echo pid=$$; echo child=$child; \
+             echo ppid=$(awk '{{print $4}}' /proc/$$/stat); \
+             echo sid=$(awk '{{print $6}}' /proc/$$/stat); }} > {record}.tmp \
+             && mv {record}.tmp {record}\nwait\n",
+            record = record.display(),
+        ),
+    )
+    .unwrap();
+    (script, record)
+}
+
+/// The value after `key=` on a line of a record.
+fn field(record: &str, key: &str) -> i64 {
+    record
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// A companion runs beside the container from `create` on: the monitor's
+/// child, in a session of its own, with only its standard streams. Once the
+/// container has ended, it's gone, with what it started, before the end is
+/// recorded (`state` says stopped): with its output in logs (the monitor
+/// watching the init) or not (the monitor only waiting for it).
+#[test]
+#[ignore = "needs root"]
+fn a_companion_runs_beside_the_container_and_ends_with_it() {
+    let runtime = Runtime::new();
+    companion_ends_with_its_container(&runtime, "beside", false);
+    companion_ends_with_its_container(&runtime, "beside-logged", true);
+}
+
+/// [`a_companion_runs_beside_the_container_and_ends_with_it`]'s for
+/// container `id`, `logged` or not.
+fn companion_ends_with_its_container(runtime: &Runtime, id: &str, logged: bool) {
+    let dir = runtime.output_dir().join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (script, record) = recording_companion(&dir);
+    let script = script.to_str().unwrap();
+    let extra = ["--companion", "/bin/sh", "--companion-arg", script];
+    let bundle = bundle_running("exec sleep 300");
+    let call = if logged {
+        runtime.create_logged(id, &bundle, &extra).0
+    } else {
+        runtime.create(id, &bundle, &extra)
+    };
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    // Before the start: it waits for it itself, if it needs to.
+    let ran = eventually("the companion", || std::fs::read_to_string(&record).ok());
+    let (pid, child) = (field(&ran, "pid"), field(&ran, "child"));
+    assert!(alive(pid) && alive(child), "{ran}");
+    assert_eq!(field(&ran, "sid"), pid, "a session of its own: {ran}");
+    // Its standard streams on /dev/null; nothing else but the script the
+    // shell reads.
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .flatten()
+    {
+        let target = std::fs::read_link(fd.path()).unwrap();
+        assert!(
+            target == Path::new("/dev/null") || target == Path::new(script),
+            "{}: {}",
+            fd.file_name().to_string_lossy(),
+            target.display()
+        );
+    }
+    let monitor = field(&ran, "ppid");
+    let cmdline = std::fs::read_to_string(format!("/proc/{monitor}/cmdline")).unwrap();
+    assert!(
+        cmdline.split('\0').any(|arg| arg == "__shipyard-monitor"),
+        "the monitor's child: {cmdline:?}"
+    );
+    assert_eq!(runtime.call(&["start", id]).code, Some(0));
+    assert!(alive(pid), "on while the container runs");
+    assert_eq!(runtime.call(&["kill", id, "KILL"]).code, Some(0));
+    runtime.wait_for(id, "stopped");
+    // Killed before the end was recorded (reaped: no zombie of the
+    // monitor's); its child with its process group.
+    assert!(!alive(pid), "the companion outlived the end");
+    assert!(!alive(child), "its child outlived the end");
+    assert_eq!(runtime.call(&["delete", id]).code, Some(0));
+}
+
+/// A monitor killed outright takes its companion (its parent-death
+/// signal), as it takes the container.
+#[test]
+#[ignore = "needs root"]
+fn a_monitor_killed_takes_its_companion() {
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let (script, record) = recording_companion(&runtime.output_dir());
+    let script = script.to_str().unwrap();
+    let extra = ["--companion", "/bin/sh", "--companion-arg", script];
+    let bundle = bundle_running("exec sleep 300");
+    assert_eq!(runtime.create("orphan", &bundle, &extra).code, Some(0));
+    assert_eq!(runtime.call(&["start", "orphan"]).code, Some(0));
+    let ran = eventually("the companion", || std::fs::read_to_string(&record).ok());
+    let (pid, monitor) = (field(&ran, "pid"), field(&ran, "ppid"));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(monitor).unwrap()),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    eventually("the companion gone", || (!alive(pid)).then_some(()));
+    runtime.wait_for("orphan", "stopped");
+    let _ = runtime.call(&["delete", "--force", "orphan"]);
+}
+
+/// What can't be held is refused: a standard stream, a number that isn't
+/// open, one given twice, one passed to the container; and an exit command
+/// that isn't an absolute path.
+#[test]
+fn bad_holds_and_exit_commands_are_refused() {
+    let runtime = Runtime::new();
+    std::fs::create_dir_all(runtime.output_dir()).unwrap();
+    let bundle = bundle_running("true");
+    for extra in [&["--hold-fd", "1"][..], &["--hold-fd", "77"]] {
+        let call = runtime.create("bad", &bundle, extra);
+        assert_eq!(call.code, Some(1), "{extra:?}: {}", call.stderr);
+        assert!(
+            call.stderr.contains("--hold-fd"),
+            "{extra:?}: {}",
+            call.stderr
+        );
+    }
+    // Descriptor 3, open, but passed to the container.
+    let (_file, command) = held_file_at(&runtime.output_dir().join("passed.lock"), 3);
+    let extra = ["--preserve-fds", "1", "--hold-fd", "3"];
+    let call = runtime.create_with("bad", &bundle, &extra, command);
+    assert_eq!(call.code, Some(1), "{}", call.stderr);
+    assert!(call.stderr.contains("--hold-fd 3"), "{}", call.stderr);
+    let (_file, command) = held_file(&runtime.output_dir().join("twice.lock"));
+    let call = runtime.create_with(
+        "bad",
+        &bundle,
+        &["--hold-fd", "9", "--hold-fd", "9"],
+        command,
+    );
+    assert_eq!(call.code, Some(1), "{}", call.stderr);
+    assert!(call.stderr.contains("--hold-fd 9"), "{}", call.stderr);
+    let call = runtime.create("bad", &bundle, &["--exit-command", "sh"]);
+    assert!(
+        call.stderr.contains("it must be an absolute path"),
+        "{}",
+        call.stderr
+    );
+    assert!(!runtime.root.join("bad").exists());
+}
+
+/// Between its init's end and its monitor's cleanup, a container is
+/// stopping: OCI's `state` says stopped (its process has exited), with no
+/// PID, and what needs it running refuses it as stopping. Made by
+/// hand (the window is short): a live process as its monitor, and as its
+/// init a PID whose start time isn't the recorded one (gone, its PID
+/// reused).
+#[test]
+#[ignore = "needs root"]
+fn a_stopping_container_is_said_to_be() {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let runtime = Runtime::new();
+    let mut monitor = Command::new("sleep").arg("300").spawn().unwrap();
+    let pid = i64::from(monitor.id());
+    let started = start_time_of(pid).unwrap();
+    let dir = runtime.root.join("ending");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .unwrap();
+    // As stage 8 wrote it, without a version: read as version 0.
+    let record = json!({
+        "bundle": "/nonexistent",
+        "monitor": [pid, started],
+        "init": [pid, started + 1],
+        "annotations": {},
+    });
+    std::fs::write(dir.join("state.json"), record.to_string()).unwrap();
+    let state = runtime.state("ending").unwrap();
+    assert_eq!(state["status"], "stopped", "{state}");
+    assert!(state.get("pid").is_none(), "{state}");
+    for call in [
+        &["kill", "ending", "TERM"][..],
+        &["kill", "--all", "ending", "KILL"],
+        &["pause", "ending"],
+        &["resume", "ending"],
+        &["exec", "ending", "true"],
+        &["cp", "ending:/etc/hostname", "-"],
+    ] {
+        let refused = runtime.call(call);
+        assert_ne!(refused.code, Some(0), "{call:?}");
+        assert!(
+            refused.stderr.contains("container ending is stopping"),
+            "{call:?}: {}",
+            refused.stderr
+        );
+    }
+    // The control: the same container once its end is recorded (as stage
+    // 8's monitor wrote it, a line of text) is stopped, and said to be.
+    std::fs::write(dir.join("exit"), "exited (exit code 0)").unwrap();
+    let refused = runtime.call(&["kill", "ending", "TERM"]);
+    assert!(
+        refused.stderr.contains("container ending is stopped"),
+        "{}",
+        refused.stderr
+    );
+    std::fs::remove_file(dir.join("exit")).unwrap();
+    // Stopped enough to delete: its monitor has nothing left to clean up
+    // that delete doesn't.
+    let deleted = runtime.call(&["delete", "ending"]);
+    assert_eq!(deleted.code, Some(0), "{}", deleted.stderr);
+    assert!(!dir.exists());
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+}
+
+/// A state record a newer Shipyard wrote is refused, never misread.
+#[test]
+#[ignore = "needs root"]
+fn a_newer_state_record_is_refused() {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let runtime = Runtime::new();
+    let dir = runtime.root.join("future");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .unwrap();
+    let record = json!({"version": 2, "bundle": "/b", "init": null, "annotations": {}});
+    std::fs::write(dir.join("state.json"), record.to_string()).unwrap();
+    let call = runtime.call(&["state", "future"]);
+    assert_ne!(call.code, Some(0));
+    assert!(
+        call.stderr
+            .contains("state.json has version 2, which this Shipyard doesn't know"),
+        "{}",
+        call.stderr
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `linux.cgroupsPath` places the cgroup: absolute below the root,
@@ -1081,8 +1804,37 @@ fn a_cgroups_path_is_honored() {
         bundle.write(&config);
         let call = runtime.create("taken", &bundle, &[]);
         assert_eq!(call.code, Some(1));
-        assert!(call.stderr.contains("exists already"), "{}", call.stderr);
+        // Refused as one that isn't a container's own (this process's cgroup
+        // is never one), before it's found to exist.
+        assert!(
+            call.stderr
+                .contains("isn't one of Shipyard's container cgroups"),
+            "{}",
+            call.stderr
+        );
         assert!(!runtime.root.join("taken").exists());
+    }
+    // Nor one below Shipyard's services' parents (another container's
+    // monitor's, a network's DNS server's), there or not: its `delete`
+    // would kill them. Refused before anything is made.
+    for service in [
+        format!("/shipyard/monitors/{parent}"),
+        format!("/shipyard/dns/{parent}-0a1b2c3d"),
+        format!("/shipyard/monitors/{parent}/below"),
+    ] {
+        config["linux"]["cgroupsPath"] = json!(service);
+        bundle.write(&config);
+        let call = runtime.create("service", &bundle, &[]);
+        assert_eq!(call.code, Some(1), "{service}");
+        assert!(
+            call.stderr
+                .contains("isn't one of Shipyard's container cgroups"),
+            "{service}: {}",
+            call.stderr
+        );
+        assert!(!runtime.root.join("service").exists(), "{service}");
+        let place = PathBuf::from("/sys/fs/cgroup").join(service.trim_start_matches('/'));
+        assert!(!place.exists(), "{service} was made");
     }
 }
 
@@ -1703,6 +2455,48 @@ fn mounts_are_made_in_the_order_listed() {
     assert!(options("/sys").starts_with("ro,"), "{out}");
     assert!(options("/proc").contains("nosuid,nodev,noexec"), "{out}");
     assert_eq!(runtime.call(&["delete", "ordered"]).code, Some(0));
+}
+
+/// A mount listed before `/sys` that a symlink in the root filesystem leads
+/// into `sys` (`/s -> /sys`, a mount at `/s/x`): refused by its place, not
+/// made there to be hidden by sysfs (F36). (Its mount point stays made, as
+/// a mount point is.)
+#[test]
+#[ignore = "needs root"]
+fn a_mount_a_symlink_leads_into_a_later_standard_mount_is_refused() {
+    steered_into_a_later_sys("steered");
+}
+
+/// The same rootless, where `/sys` is the host's, bound, with its mounts
+/// covered: the mount isn't made, so nothing is left to cover.
+#[test]
+fn a_rootless_mount_a_symlink_leads_into_sys_is_refused() {
+    if !rootless(Rootless::Single) {
+        return;
+    }
+    steered_into_a_later_sys("steered-rootless");
+}
+
+fn steered_into_a_later_sys(id: &str) {
+    let runtime = Runtime::new();
+    let bundle = Bundle::new();
+    std::os::unix::fs::symlink("/sys", bundle.root.path().join("s")).unwrap();
+    let mut config = bundle.config();
+    config["mounts"] = json!([
+        {"destination": "/s/x", "type": "tmpfs", "source": "tmpfs"},
+        {"destination": "/proc", "type": "proc", "source": "proc"},
+        {"destination": "/sys", "type": "sysfs", "source": "sysfs"},
+    ]);
+    bundle.write(&config);
+    let call = runtime.create(id, &bundle, &[]);
+    assert_eq!(call.code, Some(1), "{}", call.stderr);
+    assert!(
+        call.stderr
+            .contains("the mount point /s/x leads into a kernel interface"),
+        "{}",
+        call.stderr
+    );
+    assert!(runtime.state(id).is_none(), "nothing left");
 }
 
 /// An order that can't work is refused, saying what to move: a mount below
@@ -4093,14 +4887,16 @@ fn the_seventeenth_client_is_refused() {
         .collect();
     let mut one_more = std::os::unix::net::UnixStream::connect(&socket).unwrap();
     match frames_until(&mut one_more, |_| true).first() {
-        Some(Frame::Refused(reason)) => assert!(reason.contains("waiting to attach"), "{reason}"),
+        Some(Frame::Refused(reason)) => {
+            assert!(reason.contains("waiting to say hello"), "{reason}");
+        }
         other => panic!("{other:?}"),
     }
     // The CLI says it too.
     let refused = runtime.call(&["attach", "attach-crowded"]);
     assert_eq!(refused.code, Some(255));
     assert!(
-        refused.stderr.contains("waiting to attach"),
+        refused.stderr.contains("waiting to say hello"),
         "{}",
         refused.stderr
     );
@@ -4266,6 +5062,13 @@ fn a_dead_monitor_ends_attach() {
     let (code, stderr) = client.end();
     assert_ne!(code, Some(0));
     assert!(stderr.contains("monitor is gone"), "{stderr}");
+    // Its init follows the monitor (its parent-death signal), a moment
+    // later: until then, a new attach finds the monitor gone, not the
+    // container stopped.
+    assert!(
+        shipyard_test_support::gone(i32::try_from(init).unwrap()),
+        "the init outlived its monitor"
+    );
     let later = runtime.call(&["attach", "attach-abandoned"]);
     assert_eq!(later.code, Some(255));
     assert!(later.stderr.contains("is stopped"), "{}", later.stderr);
@@ -5004,10 +5807,15 @@ fn exec_refuses_a_cgroup_with_sub_cgroups() {
     });
     let cgroup = cgroup_of("exec-nested");
     std::fs::create_dir(cgroup.join("inner")).unwrap();
-    for pid in cgroup_procs(&cgroup) {
-        std::fs::write(cgroup.join("inner/cgroup.procs"), pid.to_string()).unwrap();
-    }
-    std::fs::write(cgroup.join("cgroup.subtree_control"), "+pids").unwrap();
+    // Moved until the cgroup holds none: a process forked meanwhile (the
+    // init starting its command) joins it after a first look, and the
+    // kernel refuses controllers below a cgroup with a process (EBUSY).
+    eventually("the container's processes moved below", || {
+        for pid in cgroup_procs(&cgroup) {
+            let _ = std::fs::write(cgroup.join("inner/cgroup.procs"), pid.to_string());
+        }
+        std::fs::write(cgroup.join("cgroup.subtree_control"), "+pids").ok()
+    });
     let call = exec(&runtime, &["exec-nested", "sh", "-c", ":"]);
     assert_eq!(call.code, Some(255), "{}", call.stderr);
     assert!(call.stderr.contains("sub-cgroups"), "{}", call.stderr);

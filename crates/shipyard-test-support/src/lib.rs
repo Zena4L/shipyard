@@ -16,6 +16,7 @@
 pub mod bundle;
 #[cfg(target_os = "linux")]
 pub mod console;
+pub mod harness;
 #[cfg(target_os = "linux")]
 pub mod net;
 pub mod pty;
@@ -157,6 +158,7 @@ impl Shipyard {
     pub fn command(self, args: &[&str]) -> Command {
         let mut command = Command::new(self.path());
         command.args(for_this_kernel(args));
+        with_container_places(&mut command);
         // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
         unsafe {
             command.pre_exec(|| {
@@ -189,6 +191,89 @@ impl Shipyard {
     #[must_use]
     pub fn run_unisolated_with(self, args: &[&str], setup: fn() -> std::io::Result<()>) -> Command {
         self.command_with(&[&["run", "--no-isolation"], args].concat(), setup)
+    }
+}
+
+/// Removes the places [`with_container_places`] made for test binaries
+/// that have ended (their process gone): what they left isn't kept.
+fn sweep_places() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("shipyard-tests-"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Gives `command` this test binary's own places for containers, where the
+/// test (or its environment) gave none: a container store
+/// (`SHIPYARD_CONTAINER_DIR`) and, for a caller other than root without
+/// one, a state directory (`XDG_RUNTIME_DIR`). A foreground image run is a
+/// container (stage 9, step 9.4c3a): its record doesn't go into the real
+/// stores, nor one test binary's into another's. Places the tests' own
+/// environment gives (`SHIPYARD_CONTAINER_DIR` exported) are used as they
+/// are, and the test's own `.env(…)` after this wins. Those of binaries
+/// that have ended are removed by the next.
+pub fn with_container_places(command: &mut Command) -> &mut Command {
+    use std::os::unix::fs::DirBuilderExt as _;
+    static PLACES: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let places = PLACES.get_or_init(|| {
+        sweep_places();
+        let dir = std::env::temp_dir().join(format!("shipyard-tests-{}", std::process::id()));
+        for sub in ["containers", "run"] {
+            let _ = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir.join(sub));
+        }
+        dir
+    });
+    if std::env::var_os("SHIPYARD_CONTAINER_DIR").is_none() {
+        command.env("SHIPYARD_CONTAINER_DIR", places.join("containers"));
+    }
+    if !is_root() && std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        command.env("XDG_RUNTIME_DIR", places.join("run"));
+    }
+    command
+}
+
+/// `shipyard`'s first words for a run with `flags` (options only, never
+/// the command): `run`, and `--no-image` unless the flags already say
+/// whether there's an image (`--image`, `--rootfs`, `--bundle`,
+/// `--no-isolation` or `--no-image`, spelled `--flag VALUE` or
+/// `--flag=VALUE`). Since 9.4a0 the first argument after the flags is
+/// otherwise the image.
+#[must_use]
+pub fn run_words(flags: &[&str]) -> &'static [&'static str] {
+    const SAY: [&str; 5] = [
+        "--image",
+        "--rootfs",
+        "--bundle",
+        "--no-isolation",
+        "--no-image",
+    ];
+    let says = |flag: &&str| {
+        SAY.iter().any(|say| {
+            *flag == *say
+                || flag
+                    .strip_prefix(say)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    };
+    if flags.iter().any(says) {
+        &["run"]
+    } else {
+        &["run", "--no-image"]
     }
 }
 

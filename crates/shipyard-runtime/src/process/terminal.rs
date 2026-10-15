@@ -38,8 +38,21 @@ use nix::errno::Errno;
 pub(crate) type Size = (u16, u16);
 
 /// The size a pseudo-terminal gets when there's no terminal to copy it
-/// from (`-t` with output to a pipe): a new one would be 0x0 (probe T7).
+/// from (`-t` with output to a pipe), or a console when the bundle gives
+/// none (`process.consoleSize`): a new one would be 0x0 (probe T7), which
+/// full-screen programs can't draw in (runc leaves it so; a shim resizes it
+/// anyway).
 pub(crate) const DEFAULT_SIZE: Size = (24, 80);
+
+/// `size` as the kernel's `winsize` (no pixel sizes).
+fn winsize((rows, cols): Size) -> libc::winsize {
+    libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
 
 /// The size of the terminal on `fd`, if it's one.
 #[must_use]
@@ -57,13 +70,8 @@ pub(crate) fn window_size(fd: RawFd) -> Option<Size> {
 
 /// Sets the size of the terminal on `fd` (a pseudo-terminal's master: the
 /// kernel then sends SIGWINCH to its foreground job, probe T7).
-pub(crate) fn set_window_size(fd: RawFd, (rows, cols): Size) -> Result<(), Errno> {
-    let size = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
+pub(crate) fn set_window_size(fd: RawFd, size: Size) -> Result<(), Errno> {
+    let size = winsize(size);
     // SAFETY: `TIOCSWINSZ` reads one `winsize`, which `size` is.
     Errno::result(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &raw const size) }).map(drop)
 }
@@ -227,13 +235,7 @@ fn cloexec(fd: &OwnedFd) -> Result<(), Errno> {
 /// A pseudo-terminal of Shipyard's own (no isolation: the command runs on
 /// the host), `size` big: (master, slave), both close-on-exec.
 pub(crate) fn host_pty(size: Size) -> Result<(OwnedFd, OwnedFd), Errno> {
-    let winsize = nix::pty::Winsize {
-        ws_row: size.0,
-        ws_col: size.1,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = nix::pty::openpty(Some(&winsize), None)?;
+    let pty = nix::pty::openpty(Some(&winsize(size)), None)?;
     for fd in [&pty.master, &pty.slave] {
         cloexec(fd)?;
     }
@@ -261,6 +263,9 @@ static RAW: AtomicBool = AtomicBool::new(false);
 /// Whether only flow control is turned off ([`RawMode::without_flow_control`]),
 /// not raw: what `save_and_go_raw` makes of the terminal.
 static FLOW_ONLY: AtomicBool = AtomicBool::new(false);
+/// Whether the terminal is raw now (set raw, not put back since): false
+/// while Shipyard is stopped, and after it's resumed in the background.
+static APPLIED: AtomicBool = AtomicBool::new(false);
 /// The signals that end Shipyard: the terminal is put back before they do
 /// (from a key, while only flow control is off; from outside, `kill` or a
 /// hang-up, in either mode). Only where they'd end it as they are, at their
@@ -291,6 +296,26 @@ impl RawMode {
     /// control, or goes without).
     pub fn set(fd: RawFd) -> Result<Option<Self>, Errno> {
         Self::enter(fd, false)
+    }
+
+    /// [`set`](Self::set), but from the background Shipyard first stops
+    /// itself (SIGTTOU, as a background job changing its terminal is) until
+    /// `fg`. `Ok(None)` if it's still in the background after (`bg`, or an
+    /// orphaned group's stop, which the kernel discards), or if SIGTTOU
+    /// wouldn't stop it (ignored or blocked).
+    ///
+    /// # Errors
+    ///
+    /// As [`set`](Self::set).
+    pub fn set_in_foreground(fd: RawFd) -> Result<Option<Self>, Errno> {
+        if let Some(raw) = Self::set(fd)? {
+            return Ok(Some(raw));
+        }
+        if !stops(libc::SIGTTOU) {
+            return Ok(None);
+        }
+        stop_self_with(libc::SIGTTOU);
+        Self::set(fd)
     }
 
     /// Turns off only the terminal's flow control on `fd` (`IXON`, `IXOFF`),
@@ -362,6 +387,35 @@ impl RawMode {
         }))
     }
 
+    /// Whether the terminal is raw now: not after Shipyard was resumed in
+    /// the background (`bg`), until [`reapply`](Self::reapply) finds it in
+    /// the foreground.
+    #[must_use]
+    // (`&self`: only while raw.)
+    #[allow(clippy::unused_self, reason = "callable only with raw mode on")]
+    pub fn is_applied(&self) -> bool {
+        APPLIED.load(Ordering::Acquire)
+    }
+
+    /// Sets the terminal raw again, read afresh, if it isn't now and
+    /// Shipyard is in its foreground: for a caller resumed in the background
+    /// (`bg`), then brought to the foreground (`fg`), which the SIGTSTP
+    /// handler doesn't see.
+    #[allow(clippy::unused_self, reason = "callable only with raw mode on")]
+    pub fn reapply(&self) {
+        // SIGTSTP held off: its handler, in between, would save raw
+        // settings.
+        let mut tstp = sigset(&[libc::SIGTSTP]);
+        let mut old = sigset(&[]);
+        // SAFETY: changing this thread's mask; both sets are valid.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw mut tstp, &raw mut old) };
+        if !APPLIED.load(Ordering::Acquire) {
+            go_raw_again();
+        }
+        // SAFETY: the mask as it was.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut()) };
+    }
+
     /// Stops Shipyard with `signal` (job control), the terminal put back
     /// meanwhile, and raw again once resumed.
     // (`&self`: only while raw.)
@@ -426,7 +480,9 @@ fn save_and_go_raw() -> Result<(), Errno> {
         make_raw(&mut raw);
     }
     // SAFETY: `raw` is a complete `termios`.
-    Errno::result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) }).map(drop)
+    Errno::result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) })?;
+    APPLIED.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// Resumed after a stop: the terminal raw again, read afresh (the user may
@@ -460,6 +516,7 @@ fn restore_saved() {
         libc::tcsetattr(fd, libc::TCSANOW, (*SAVED.0.get()).as_ptr());
         libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
     }
+    APPLIED.store(false, Ordering::Release);
 }
 
 /// `cfmakeraw`, spelled out: async-signal-safe, and the same on Linux and
@@ -501,6 +558,18 @@ pub(crate) fn stop_self_with(signal: libc::c_int) {
     // SAFETY: `kill` has no memory-safety conditions; this stops Shipyard
     // until its shell resumes it.
     unsafe { libc::kill(libc::getpid(), signal) };
+}
+
+/// Whether `signal` (SIGTTIN or SIGTTOU: Shipyard never catches those;
+/// only SIGTSTP, in raw mode) would stop this process now: its default
+/// action, and not blocked.
+pub(crate) fn stops(signal: libc::c_int) -> bool {
+    if current_action(signal).is_none_or(|action| action.sa_sigaction != libc::SIG_DFL) {
+        return false;
+    }
+    nix::sys::signal::SigSet::thread_get_mask().is_ok_and(|mask| {
+        nix::sys::signal::Signal::try_from(signal).is_ok_and(|signal| !mask.contains(signal))
+    })
 }
 
 /// `signal`'s current action.

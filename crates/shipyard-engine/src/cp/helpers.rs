@@ -14,10 +14,12 @@ use serde::{Deserialize, Serialize};
 use shipyard_image::{CopyOptions, IdRanges, LayerReport, Ownership, Top, UnpackError, unpack_tar};
 use shipyard_runtime::container::{
     ContainerError, Helper, HelperFailure, HelperIo, RunningHelper, start_helper,
+    start_helper_in_view,
 };
 
 use super::pack::{PackError, Packer};
 use super::{CpError, CpOptions, CpReport, Source, limits, names_directory, warnings};
+use crate::run::Files;
 
 /// The helpers `cp` registers.
 pub(super) const HELPERS: [Helper; 2] = [
@@ -83,8 +85,7 @@ const MAX_TRAILER: u64 = 1024 * 1024;
 
 /// See [`super::copy_out`].
 pub(super) fn copy_out(
-    root: &Path,
-    id: &str,
+    files: Files<'_>,
     path: &Path,
     to: Option<&Path>,
     stream: &mut dyn Write,
@@ -98,7 +99,7 @@ pub(super) fn copy_out(
     };
     // The container first: nothing is made on the host for a copy that
     // can't start.
-    let (read, helper) = start(root, id, "cp-out", &args, None)?;
+    let (read, helper) = start(files, "cp-out", &args, None)?;
     let Some(to) = to else {
         // A stream: the helper's, passed on as it is.
         let copied = std::io::copy(&mut std::fs::File::from(read), stream);
@@ -247,8 +248,7 @@ fn make_directory(parent: &OwnedFd, name: &std::ffi::OsStr) -> nix::Result<Owned
 
 /// See [`super::copy_in`].
 pub(super) fn copy_in(
-    root: &Path,
-    id: &str,
+    files: Files<'_>,
     from: Option<&Path>,
     stream: &mut dyn Read,
     path: &Path,
@@ -266,7 +266,7 @@ pub(super) fn copy_in(
         archive: options.archive,
     };
     let (input, output) = pipe()?;
-    let (report, helper) = start(root, id, "cp-in", &args, Some(input))?;
+    let (report, helper) = start(files, "cp-in", &args, Some(input))?;
     let mut writer = BufWriter::new(std::fs::File::from(output));
     let mut sockets = 0;
     let sent = match &source {
@@ -346,12 +346,11 @@ fn send_hit_closed_pipe(err: &CpError) -> bool {
     }
 }
 
-/// Starts helper `name` in container `id` with `args`, its standard input
+/// Starts helper `name` in the container's `files`, with `args`, its standard input
 /// `stdin` (`/dev/null` if `None`) and its output on a pipe: the pipe's
 /// read end, and the helper.
 fn start(
-    root: &Path,
-    id: &str,
+    files: Files<'_>,
     name: &str,
     args: &impl Serialize,
     stdin: Option<OwnedFd>,
@@ -373,7 +372,12 @@ fn start(
         })?,
     };
     let (read, write) = pipe()?;
-    let helper = start_helper(root, id, name, "copying files", &args, &stdin, &write)?;
+    let helper = match files {
+        Files::Live { root, id } => {
+            start_helper(root, id, name, "copying files", &args, &stdin, &write)?
+        }
+        Files::Stopped(view) => start_helper_in_view(view, name, &args, &stdin, &write)?,
+    };
     Ok((read, helper))
 }
 

@@ -1,0 +1,138 @@
+name: Quality
+
+# The slow quality tools (H5): every fuzz target for a while, and cargo-mutants
+# on what a branch changed. Manual only for now, as CI is: the repository's
+# Actions billing is off, so a schedule would start nothing. Run it by hand
+# (`gh workflow run Quality --ref BRANCH`, optionally `-f fuzz_seconds=600
+# -f base=main`); once billing is back, uncomment the schedule. Until then the
+# same tools run locally: `scripts/test-linux.sh --fuzz [SECONDS]` and
+# `scripts/test-linux.sh --mutants [BASE]`.
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target
+        default: "300"
+      base:
+        description: The branch mutants compare against (its changes are mutated)
+        default: main
+  # Nightly, once billing is back: the fuzz targets on main, and mutants of
+  # main's last commit (a scheduled run has no branch to compare).
+  # schedule:
+  #   - cron: "17 3 * * *"
+
+# Read-only token: these jobs never write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every action is pinned by commit (its version beside it), as in ci.yml.
+jobs:
+  # Each target from the one list (scripts/fuzz-targets.sh), started from
+  # scripts/fuzz-seeds.py's corpora. A crash fails the job; its input is
+  # uploaded.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # cargo-fuzz needs nightly (sanitizers); the workspace stays on
+      # rust-toolchain.toml's stable, so the fuzz crate is built with +nightly.
+      - name: Nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked --version 0.13.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - name: Fuzz every target
+        env:
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '300' }}
+        run: |
+          python3 scripts/fuzz-seeds.py fuzz/corpus
+          failed=()
+          for target in $(scripts/fuzz-targets.sh); do
+            echo "::group::$target"
+            mkdir -p "fuzz/crashes/$target"
+            if ! (cd fuzz && cargo +nightly fuzz run "$target" "corpus/$target" -- \
+                -max_total_time="$FUZZ_SECONDS" \
+                -artifact_prefix="crashes/$target/"); then
+              failed+=("$target")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "crashed: ${failed[*]}" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "every target ran ${FUZZ_SECONDS}s without a crash" >>"$GITHUB_STEP_SUMMARY"
+      - name: Keep crashes
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes
+          path: fuzz/crashes/
+
+  # cargo-mutants on the branch's changes against `base`, with each crate's
+  # own tests, unprivileged (.cargo/mutants.toml). A report, never a gate:
+  # a mutant that only a root test (or another platform) catches shows as
+  # missed. Both platforms, as `check` in ci.yml: each compiles code the
+  # other never sees.
+  mutants:
+    name: mutants (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo-mutants
+        run: cargo install cargo-mutants --locked --version 27.1.0
+      - name: Mutate the changes
+        env:
+          BASE: ${{ inputs.base || 'main' }}
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            git diff HEAD~1 >changes.diff
+          else
+            git diff "origin/$BASE...HEAD" >changes.diff
+          fi
+          if [ ! -s changes.diff ]; then
+            echo "no changes against $BASE: nothing to mutate" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # A missed mutant is reported, not failed on (see above).
+          cargo mutants --in-diff changes.diff --no-shuffle -j 2 || true
+          {
+            echo "### Mutants (${{ matrix.os }})"
+            for outcome in caught missed timeout unviable; do
+              file="mutants.out/$outcome.txt"
+              count=$( [ -f "$file" ] && wc -l <"$file" || echo 0 )
+              echo "- $outcome: $count"
+            done
+            if [ -s mutants.out/missed.txt ]; then
+              echo
+              echo "Missed:"
+              echo '```'
+              cat mutants.out/missed.txt
+              echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-${{ matrix.os }}
+          path: mutants.out/
+          if-no-files-found: ignore

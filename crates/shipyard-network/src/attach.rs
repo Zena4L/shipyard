@@ -305,6 +305,91 @@ fn in_netns<T: Send>(
     })
 }
 
+/// The interface a sysctl key is one interface's setting of
+/// (`net.ipv4.conf.IF.SETTING`, `net.ipv6.conf.IF.SETTING`, or `neigh`'s:
+/// `net.ipv4.neigh.IF.SETTING`), if it is,
+/// for an interface a container's network makes: not `all`, `default` or
+/// `lo` (those are there from the start, and its init sets them). Each part
+/// plain (letters, digits, `_` and `-`): never a path of another kind.
+#[must_use]
+pub fn interface_of_sysctl(key: &str) -> Option<&str> {
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    };
+    match key.split('.').collect::<Vec<_>>().as_slice() {
+        ["net", "ipv4" | "ipv6", "conf" | "neigh", interface, setting]
+            if plain(interface)
+                && plain(setting)
+                && !matches!(*interface, "all" | "default" | "lo") =>
+        {
+            Some(interface)
+        }
+        _ => None,
+    }
+}
+
+/// The interfaces the default routes of the network namespace `netns` go
+/// through, by name: IPv4's, then IPv6's (a container's way out, as its
+/// start set it, and whatever changed it since).
+///
+/// # Errors
+///
+/// Its links or routes can't be read.
+#[cfg(target_os = "linux")]
+pub fn default_route_interfaces(
+    netns: BorrowedFd<'_>,
+) -> Result<(Option<String>, Option<String>), AttachError> {
+    use crate::ipnet::Family;
+    let mut inside = Rtnetlink::in_namespace(netns)?;
+    let links = inside.links()?;
+    let mut through = |family: Family| -> Result<Option<String>, AttachError> {
+        Ok(inside
+            .routes(family)?
+            .into_iter()
+            .find(|route| route.destination.prefix() == 0)
+            .and_then(|route| route.index)
+            .and_then(|index| links.iter().find(|link| link.index == index))
+            .map(|link| link.name.clone()))
+    };
+    Ok((through(Family::V4)?, through(Family::V6)?))
+}
+
+/// Sets `settings` (sysctl keys, each an interface's: see
+/// [`interface_of_sysctl`], and their values) in the network namespace
+/// `netns`, once its interfaces are there (a container's own settings,
+/// which its init couldn't make before its networks were).
+///
+/// # Errors
+///
+/// A key that isn't an interface's, a setting the kernel doesn't have, or
+/// one it refuses.
+#[cfg(target_os = "linux")]
+pub fn set_interface_sysctls(
+    netns: BorrowedFd<'_>,
+    settings: &[(String, String)],
+) -> Result<(), AttachError> {
+    for (key, _) in settings {
+        if interface_of_sysctl(key).is_none() {
+            return Err(AttachError::Io {
+                context: format!("--sysctl {key}"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not an interface's setting",
+                ),
+            });
+        }
+    }
+    in_netns(netns, || {
+        for (key, value) in settings {
+            write_setting(&format!("/proc/sys/{}", key.replace('.', "/")), value)?;
+        }
+        Ok(())
+    })
+}
+
 /// Writes `value` to the kernel setting at `path`.
 fn write_setting(path: &str, value: &str) -> Result<(), AttachError> {
     std::fs::write(path, value).map_err(|source| AttachError::Io {
@@ -452,6 +537,7 @@ mod tests {
     use nix::sched::{CloneFlags, unshare};
 
     use super::*;
+
     use crate::linux_test::{in_new_netns, this_netns};
     use crate::store::{bridge_name, mac_for};
 
@@ -471,6 +557,8 @@ mod tests {
             created: 0,
             subnet6: None,
             gateway6: None,
+            isolate_host: false,
+            conntrack_limit: false,
         }
     }
 
@@ -487,6 +575,7 @@ mod tests {
             aliases: Vec::new(),
             interface: CONTAINER_INTERFACE.into(),
             ip6: None,
+            container: None,
         }
     }
 
@@ -606,5 +695,42 @@ mod tests {
             delete_bridge(&front).unwrap();
             delete_bridge(&back).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod sysctl_tests {
+    use super::*;
+
+    /// An interface's setting is `net.ipv4.conf.IF.X` or `net.ipv6.conf.IF.X`
+    /// for an interface a network makes; `all`, `default` and `lo` are the
+    /// init's, and anything else (another path) isn't one.
+    #[test]
+    fn interface_sysctls_are_one_interfaces() {
+        assert_eq!(
+            interface_of_sysctl("net.ipv4.conf.eth1.rp_filter"),
+            Some("eth1")
+        );
+        assert_eq!(
+            interface_of_sysctl("net.ipv6.conf.eth0.accept_ra"),
+            Some("eth0")
+        );
+        assert_eq!(
+            interface_of_sysctl("net.ipv4.neigh.eth1.gc_stale_time"),
+            Some("eth1")
+        );
+        for not in [
+            "net.ipv4.conf.all.rp_filter",
+            "net.ipv4.conf.default.rp_filter",
+            "net.ipv4.conf.lo.rp_filter",
+            "net.ipv4.ip_forward",
+            "net.ipv4.conf.eth0",
+            "net.ipv4.conf.eth0.a.b",
+            "net.ipv4.conf..rp_filter",
+            "net.ipv4.conf.eth0/../x.y",
+            "kernel.conf.eth0.x",
+        ] {
+            assert_eq!(interface_of_sysctl(not), None, "{not}");
+        }
     }
 }

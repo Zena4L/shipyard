@@ -18,7 +18,7 @@ carries real information:
 | Visual | What it encodes |
 |---|---|
 | Containers drawn as shipping containers | 20′ box = `memory.max` ≤ 512 MiB, 40′ box = > 512 MiB |
-| ISO 6346 container IDs (`SHPU 304812 5`) | Real freight-container format; the boxed digit is a real check digit |
+| ISO 6346 container IDs (`SHPU 304812 2`) | Real freight-container format; the boxed digit is a real check digit |
 | Yellow gantry crane over the yard | Follows the current selection |
 | Bays (rows) in the yard | Compose stacks |
 | Drums | Volumes; fill = size relative to the largest |

@@ -91,7 +91,7 @@ pub(crate) struct Setup {
     pub(crate) terminal: Option<TerminalSetup>,
     /// Descriptors passed on to the command (see `passed.rs`), inherited.
     #[serde(default)]
-    pub(crate) passing: Option<super::passed::Passing>,
+    pub(crate) passing: Option<super::passed::PassedPlan>,
 }
 
 /// The command's pseudo-terminal, made inside the container (see `init.rs`).
@@ -306,6 +306,14 @@ impl MountSetup {
 }
 
 impl RootSetup {
+    /// `root`, for a helper reaching a stopped container's files (stage 9,
+    /// step 9.4c2): what it mounts is the root, its overlay (`attach`: one
+    /// real root made) and its binds; the rest (`/dev`, `/sys`, devices) is
+    /// a running container's only, left empty.
+    pub(crate) fn for_view(root: &Root, id_maps: Option<&IdMaps>, attach: Option<RawFd>) -> Self {
+        Self::new(root, false, id_maps, SysSetup::Own, &[], attach)
+    }
+
     fn new(
         root: &Root,
         mqueue: bool,
@@ -489,7 +497,45 @@ impl SpecSetup {
     }
 }
 
+/// The descriptors the clean image inherits besides its own three (setup,
+/// status, report): the gate's FIFOs, the hooks pipe, an overlay to attach,
+/// the terminal's socket, and what's passed on to the command. The one
+/// list: the parent clears their close-on-exec flag for the re-exec
+/// (`plan.rs`), and the clean image sets it again (`init.rs`).
+pub(crate) fn inherited_fds(
+    gate: Option<super::spawn::Gate>,
+    hooks: Option<RawFd>,
+    overlay: Option<RawFd>,
+    terminal: Option<RawFd>,
+    passed: &[RawFd],
+) -> Vec<RawFd> {
+    gate.into_iter()
+        .flat_map(super::spawn::Gate::fds)
+        .chain(hooks)
+        .chain(overlay)
+        .chain(terminal)
+        .chain(passed.iter().copied())
+        .collect()
+}
+
 impl Setup {
+    /// What the clean image inherited besides its own three
+    /// ([`inherited_fds`]).
+    pub(crate) fn inherited(&self) -> Vec<RawFd> {
+        let passed: Vec<RawFd> = self
+            .passing
+            .iter()
+            .flat_map(|passing| passing.sources.iter().copied())
+            .collect();
+        inherited_fds(
+            self.gate,
+            self.hooks.as_ref().map(|hooks| hooks.pipe),
+            self.root.as_ref().and_then(RootSetup::attach),
+            self.terminal.as_ref().map(|terminal| terminal.socket),
+            &passed,
+        )
+    }
+
     /// The command's working directory (inside the container's root, if
     /// it has one).
     pub(crate) fn cwd(&self) -> &Path {
@@ -673,6 +719,34 @@ fn unlimited_if_none(value: Option<u64>) -> RlimitValue {
 mod tests {
     use super::*;
     use crate::process::RlimitKind;
+
+    /// A helper's view of a stopped container mounts its overlay with the
+    /// options its start uses: `userxattr` exactly when it has a user
+    /// namespace (overlay keeps its state in `user.overlay.*` then), so
+    /// the writable layer stays one its start can mount.
+    #[test]
+    fn a_views_overlay_is_mounted_as_its_starts() {
+        let mut root = Root::new("/c/merged");
+        root.overlay = Some(crate::isolation::Overlay::new(
+            vec!["/l".into()],
+            "/u".into(),
+            "/w".into(),
+        ));
+        let maps = IdMaps::single((1000, 1000));
+        let userxattr = |maps: Option<&IdMaps>| {
+            let view = RootSetup::for_view(&root, maps, None);
+            let start = RootSetup::new(&root, true, maps, SysSetup::Own, &[], None);
+            (view.overlay().map(|o| o.3), start.overlay().map(|o| o.3))
+        };
+        assert_eq!(userxattr(Some(&maps)), (Some(true), Some(true)));
+        assert_eq!(userxattr(None), (Some(false), Some(false)));
+        // Real root's prebuilt overlay is attached, not mounted again.
+        assert!(
+            RootSetup::for_view(&root, Some(&maps), Some(7))
+                .overlay()
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_setup_survives_the_memfd_byte_for_byte() {

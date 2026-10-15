@@ -27,7 +27,7 @@ const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
 /// `shipyard run ARGS…`, isolated (the default on Linux).
 fn isolated(args: &[&str]) -> Run {
-    run(SHIPYARD.command(&[&["run"], args].concat()))
+    run(SHIPYARD.command(&[shipyard_test_support::run_words(args), args].concat()))
 }
 
 /// Runs `shipyard run ARGS…` able to look into the container's init
@@ -177,6 +177,7 @@ fn results_come_back_through_the_namespaces() {
 fn a_stop_request_reaches_a_command_that_handles_it() {
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "sh",
         "-c",
         "trap 'exit 5' TERM; echo ready; sleep 100 & wait",
@@ -193,6 +194,7 @@ fn a_stop_request_reaches_a_command_that_handles_it() {
 fn sigterm_stops_a_command_without_a_handler() {
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--stop-timeout",
         "10",
         "sh",
@@ -214,8 +216,13 @@ fn sigterm_stops_a_command_without_a_handler() {
 #[test]
 #[ignore = "needs root"]
 fn sigint_ends_the_command_and_shipyard() {
-    let running =
-        start_command(SHIPYARD.command(&["run", "sh", "-c", "echo ready; exec sleep 100"]));
+    let running = start_command(SHIPYARD.command(&[
+        "run",
+        "--no-image",
+        "sh",
+        "-c",
+        "echo ready; exec sleep 100",
+    ]));
     assert_eq!(running.next_line(), "ready");
     running.signal(libc::SIGINT);
     let status = running.finish_status();
@@ -229,6 +236,7 @@ fn sigint_ends_the_command_and_shipyard() {
 fn a_command_ignoring_the_stop_signal_is_killed_after_the_timeout() {
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--stop-timeout",
         "1",
         "sh",
@@ -298,6 +306,7 @@ fn the_init_does_not_hold_leaked_descriptors() {
     let run = run(SHIPYARD.command_with(
         &[
             "run",
+            "--no-image",
             // To look into the init at all (see `inspecting_the_init`):
             // without it, every fd reads as "closed".
             "--cap-add",
@@ -335,6 +344,7 @@ fn an_isolated_run_passes_socket_activation_on() {
         .arg(SHIPYARD.path())
         .args([
             "run",
+            "--no-image",
             "--cap-add",
             "SYS_PTRACE",
             "sh",
@@ -356,7 +366,10 @@ fn the_init_survives_a_hostile_parent() {
     let hostile: [fn() -> std::io::Result<()>; 2] =
         [|| ignore(libc::SIGCHLD), || block(libc::SIGCHLD)];
     for setup in hostile {
-        let run = run(SHIPYARD.command_with(&["run", "sh", "-c", "sleep 0.2; exit 3"], setup));
+        let run = run(SHIPYARD.command_with(
+            &["run", "--no-image", "sh", "-c", "sleep 0.2; exit 3"],
+            setup,
+        ));
         assert_eq!(run.code, Some(3), "{}", run.stderr);
     }
 }
@@ -364,8 +377,13 @@ fn the_init_survives_a_hostile_parent() {
 #[test]
 #[ignore = "needs root"]
 fn the_container_dies_with_shipyard() {
-    let running =
-        start_command(SHIPYARD.command(&["run", "sh", "-c", "echo ready; exec sleep 100"]));
+    let running = start_command(SHIPYARD.command(&[
+        "run",
+        "--no-image",
+        "sh",
+        "-c",
+        "echo ready; exec sleep 100",
+    ]));
     assert_eq!(running.next_line(), "ready");
     let command = child_of(running.pid());
     // SAFETY: `kill` only sends a signal to the shipyard this test started.
@@ -382,6 +400,7 @@ fn the_container_dies_with_shipyard() {
 fn the_init_carries_none_of_shipyards_secrets() {
     let mut command = SHIPYARD.command(&[
         "run",
+        "--no-image",
         "-e",
         "TOKEN=hunter2-from-the-command-line",
         "-u",
@@ -403,6 +422,7 @@ fn the_init_carries_none_of_shipyards_secrets() {
     // The environment is root-only; read it as root.
     let mut command = SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--cap-add",
         "SYS_PTRACE",
         "sh",
@@ -503,8 +523,14 @@ fn a_full_status_pipe_does_not_freeze_the_init() {
 #[test]
 #[ignore = "needs root"]
 fn the_init_does_not_hold_shipyards_working_directory() {
-    let mut command =
-        SHIPYARD.command(&["run", "--cap-add", "SYS_PTRACE", "readlink", "/proc/1/cwd"]);
+    let mut command = SHIPYARD.command(&[
+        "run",
+        "--no-image",
+        "--cap-add",
+        "SYS_PTRACE",
+        "readlink",
+        "/proc/1/cwd",
+    ]);
     command.current_dir("/tmp");
     let run = run(command);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -547,6 +573,7 @@ fn a_host_unmount_reaches_the_container() {
     let unmounted = format!("{parent}.unmounted");
     let container = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "sh",
         "-c",
         &format!(
@@ -601,7 +628,7 @@ fn an_init_that_cannot_start_is_reported() {
         return;
     }
     let mut command = std::process::Command::new(loader);
-    command.args([SHIPYARD.path(), "run", "echo", "hi"]);
+    command.args([SHIPYARD.path(), "run", "--no-image", "echo", "hi"]);
     let run = run(command);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(
@@ -626,7 +653,13 @@ fn ignore_hup() -> std::io::Result<()> {
 #[ignore = "needs root"]
 fn signals_ignored_at_startup_stay_ignored_inside() {
     let run = run(SHIPYARD.command_with(
-        &["run", "sh", "-c", "grep SigIgn /proc/self/status"],
+        &[
+            "run",
+            "--no-image",
+            "sh",
+            "-c",
+            "grep SigIgn /proc/self/status",
+        ],
         ignore_hup,
     ));
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -644,6 +677,7 @@ fn signals_ignored_at_startup_stay_ignored_inside() {
 fn a_forged_record_cannot_hide_a_kill() {
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--cap-add",
         "SYS_PTRACE",
         "--stop-timeout",
@@ -701,7 +735,7 @@ fn a_large_environment_reaches_the_command() {
 #[ignore = "needs root"]
 fn non_utf8_arguments_and_environment_survive() {
     use std::os::unix::ffi::OsStrExt;
-    let mut command = SHIPYARD.command(&["run", "-e"]);
+    let mut command = SHIPYARD.command(&["run", "--no-image", "-e"]);
     command.arg(std::ffi::OsStr::from_bytes(b"BYTES=\xff\xfe"));
     command.args(["sh", "-c", "printf %s \"$1$BYTES\" | od -An -tx1", "sh"]);
     command.arg(std::ffi::OsStr::from_bytes(b"\xfd"));

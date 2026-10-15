@@ -24,6 +24,7 @@ fn a_containers_sockets_are_read_through_its_init() {
         let networks = NetworkDir::new(SHIPYARD);
         let running = start_command(networks.command(&[
             "run",
+            "--no-image",
             "--network",
             "bridge",
             "--name",

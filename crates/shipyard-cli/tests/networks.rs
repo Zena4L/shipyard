@@ -248,7 +248,7 @@ fn a_killed_runs_leases_are_swept_from_each_network() {
         let _ = killed.finish_status();
         // Each network's next run sweeps it from that network.
         for network in ["a", "b"] {
-            let next = networks.run(&["run", "--network", network, "true"]);
+            let next = networks.run(&["run", "--no-image", "--network", network, "true"]);
             assert_eq!(next.code, Some(0), "{}", next.stderr);
             assert_eq!(leases(network), 0, "{network}");
         }
@@ -269,6 +269,7 @@ fn runs_joining_networks_in_opposite_orders_both_start() {
         let start = |first: &str, second: &str| {
             start_command(networks.command(&[
                 "run",
+                "--no-image",
                 "--network",
                 first,
                 "--network",
@@ -292,6 +293,7 @@ fn host_none_and_pasta_join_nothing_else() {
     for mode in ["host", "none", "pasta"] {
         let refused = shipyard_test_support::run(SHIPYARD.command(&[
             "run",
+            "--no-image",
             "--network",
             mode,
             "--network",

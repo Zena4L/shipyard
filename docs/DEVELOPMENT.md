@@ -161,9 +161,13 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   sends over a netlink socket: messages, attributes, errors, links, addresses,
   routes, nf_tables objects and conntrack entries), `ports` (`-p` specs and an
   image's exposed ports), `dns` (DNS messages, as a network's DNS server reads
-  them, and its answers, which must read back) and `proc_net` (a container's
-  `/proc/<pid>/net` socket tables). It's its own workspace, built on
-  nightly, so it's not in CI. `scripts/test-linux.sh --fuzz` installs nightly and
+  them, and its answers, which must read back), `proc_net` (a container's
+  `/proc/<pid>/net` socket tables), `cri_record` and `logs_dir` (log records and
+  directories), `attach_frames` (the attach protocol's frames and detach keys),
+  `process_json` (`exec --process` documents) and `cp_unpack` (what `cp` copies into
+  a container). `scripts/fuzz-targets.sh` lists them, from `fuzz/Cargo.toml`: the one
+  list everything runs. It's its own workspace, built on nightly, so CI's `check`
+  doesn't build it; the `Quality` workflow runs it (below). `scripts/test-linux.sh --fuzz` installs nightly and
   cargo-fuzz into the toolchain volumes once (that needs network), writes starting
   corpora with `scripts/fuzz-seeds.py`, and runs each target as `tester` (an escape
   reaches only what a normal user can). Corpora and crashing inputs are kept in the
@@ -179,6 +183,15 @@ are fast. It's the quick way to run Linux-only code from a Mac; the Lima VM
   never the working tree. Build it in its **own** cargo target volume (for example
   `shipyard-mutation-target`). Cargo decides what to rebuild by timestamps, so a mutated
   build in the shared volume can be reused by the next normal run.
+  - **Each step's own runner** (the shipyard-dev skill's `mutation-runner.py`): chosen
+    mutants of the step's risky lines, run where their tests run (macOS, `tester` or
+    root in the container), controls first. The only check of root-only behaviour.
+  - **cargo-mutants on the changes** (H5): `scripts/test-linux.sh --mutants [BASE]`
+    mutates what changed against `BASE` (`main` by default; uncommitted work counts),
+    or a diff file's changes (`--mutants FILE.diff`), with each crate's own tests, as
+    `tester`, and prints caught, missed and timed out. `.cargo/mutants.toml` leaves out
+    the tests, the test helpers, the fuzz crate and the code between `fork` and `exec`.
+    It's a report, not a gate: a mutant only a root test catches shows as missed.
 
 ### Reclaiming Docker space
 
@@ -263,16 +276,29 @@ finds inside with the config.
 
 ### What CI runs
 
-`.github/workflows/ci.yml`, on every push and pull request:
+`.github/workflows/ci.yml`. **Manual only for now** (`gh workflow run CI --ref
+BRANCH`): the repository's Actions billing is off, so a push would start nothing. Its
+push and pull-request triggers are written, commented out. `check` and `root` run on
+macOS only for now (their Ubuntu runs took too long); the Linux tests run in the
+`apparmor` and `fedora` jobs, and locally in `scripts/test-linux.sh`.
 
 | Job | What it covers |
 |---|---|
 | `fmt`, `musl`, `docs`, `deny` | formatting; clippy for musl; rustdoc; dependencies |
-| `check` (Ubuntu, macOS) | clippy and every normal-user test. Rootless tests run the binaries cargo built, so the AppArmor restriction on user namespaces is turned off here |
-| `root` (Ubuntu, macOS) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
+| `check` (macOS; Ubuntu off) | clippy and every normal-user test. Rootless tests run the binaries cargo built, so the AppArmor restriction on user namespaces is turned off here |
+| `root` (macOS; Ubuntu off) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
 | `apparmor` | **A real Ubuntu host** (H4): the restriction left on, `shipyard` and `shipyard-runtime` installed in `/usr/local/bin` with the profile (`contrib/apparmor/shipyard`), as users install them. `scripts/ci/apparmor-control.sh` first proves the profile is what lets them make user namespaces (unloaded, `shipyard doctor` fails); then `shipyard-cli`'s tests run the installed binaries (the runtime's in-process tests make user namespaces from their own test binary, which no profile covers: they run in `check`) |
 | `conformance` | the OCI conformance suite, as `expected.txt` expects (amd64; recorded on arm64) |
 | `fedora` | **A real Fedora host** (H4): `scripts/ci/fedora-vm.sh` boots Fedora Cloud (pinned by SHA-256) in QEMU/KVM, SELinux enforcing, firewalld running, and runs the test executables built on the runner in both passes (`scripts/ci/run-test-binaries.sh`), plus the terminal probe |
+
+`.github/workflows/quality.yml` (`Quality`), the slow tools (H5), manual too (`gh
+workflow run Quality --ref BRANCH [-f fuzz_seconds=600] [-f base=main]`), its nightly
+schedule written, commented out, for when billing is back:
+
+| Job | What it covers |
+|---|---|
+| `fuzz` | every target in `scripts/fuzz-targets.sh` for `fuzz_seconds` (300), from `fuzz-seeds.py`'s corpora; a crash fails it, its input uploaded |
+| `mutants` (Ubuntu, macOS) | cargo-mutants on the branch's changes against `base` (`.cargo/mutants.toml`); caught, missed and timed out in the run's summary, `mutants.out` uploaded. A report, never a failure |
 
 **Required, not skipped.** CI and `test-linux.sh` set `SHIPYARD_TEST_ROOTLESS`,
 `SHIPYARD_TEST_DELEGATED` and `SHIPYARD_TEST_TOOLS` to `required`: a rootless test that
@@ -352,7 +378,7 @@ limactl shell shipyard-fedora -- sudo install -m 0755 /tmp/shipyard /usr/local/b
 limactl shell shipyard-fedora -- sudo dnf install -y firewalld passt
 limactl shell shipyard-fedora -- sudo systemctl enable --now firewalld
 limactl shell shipyard-fedora -- sudo shipyard doctor     # its firewall line warns
-limactl shell shipyard-fedora -- sudo shipyard run --image alpine wget -qO- example.com
+limactl shell shipyard-fedora -- sudo shipyard run alpine wget -qO- example.com
 limactl delete --force shipyard-fedora                  # when done
 ```
 

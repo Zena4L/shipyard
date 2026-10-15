@@ -360,7 +360,10 @@ reuse inode numbers (64-bit inode numbers, since about Linux 5.5); a user namesp
   devices are limited only by its capabilities (Docker's include `CAP_MKNOD`).
 - **Rootless needs delegation** (systemd's `user@UID.service`), and gets the controllers it
   delegates (`cpu memory pids` by default). A rootless container ends with the user
-  manager, at the last logout without lingering.
+  manager, at the last logout without lingering. *(Corrected in stage 9, step 9.5c, on
+  Ubuntu 24.04: a container made in a login session keeps that session "closing", and
+  the user manager with it, so it runs on with logind's `KillUserProcesses=no`; with
+  `yes` it ends at logout. See docs/user/containers.md, "Logging out".)*
 - **Rootless device control** depends on the kernel letting the user load the program;
   where it doesn't, the container can still use only what the user can.
 - **`io.weight`** comes from the iocost controller; refused where the file is missing.

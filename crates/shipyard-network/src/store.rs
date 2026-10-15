@@ -111,12 +111,13 @@ pub enum StoreError {
     #[error("a network named {0} exists already")]
     Exists(String),
     /// Containers are using it.
-    #[error("the network {name} is in use by {count} container(s)")]
+    #[error("the network {name} is in use by {}", users_text(users))]
     InUse {
         /// Its name.
         name: String,
-        /// How many.
-        count: usize,
+        /// The containers on it, as its DNS names their addresses: a
+        /// container's name, else its short ID, else its run's ID.
+        users: Vec<String>,
     },
     /// Another command has held it for longer than [`LOCK_WAIT`].
     #[error("the network {0} is busy: another shipyard command is changing it")]
@@ -178,6 +179,17 @@ pub struct NetworkConfig {
     /// The bridge's IPv6 address in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway6: Option<Ipv6Addr>,
+    /// Its containers kept from the host itself (its services, on any of
+    /// its addresses) and from the cloud's metadata addresses, but for the
+    /// network's DNS server (`--isolate-host`, stage 9, step 9.7c1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolate_host: bool,
+    /// Each of its containers may have at most
+    /// [`CONNTRACK_LIMIT`](crate::nft::CONNTRACK_LIMIT) connections open
+    /// that it opened; more are refused (`--conntrack-limit`, stage 9, step
+    /// 9.7c2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conntrack_limit: bool,
 }
 
 impl NetworkConfig {
@@ -212,6 +224,10 @@ impl NetworkConfig {
 
 /// What to create: a name, and the subnet and gateway if they're given.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each is one of `network create`'s flags, on or off independently"
+)]
 pub struct NetworkSpec {
     /// Its name.
     pub name: String,
@@ -227,6 +243,12 @@ pub struct NetworkSpec {
     pub subnet6: Option<IpNet>,
     /// Its IPv6 gateway; `None` is the prefix's first address.
     pub gateway6: Option<Ipv6Addr>,
+    /// Its containers kept from the host (see
+    /// [`NetworkConfig::isolate_host`]).
+    pub isolate_host: bool,
+    /// Its containers' connections limited (see
+    /// [`NetworkConfig::conntrack_limit`]).
+    pub conntrack_limit: bool,
 }
 
 /// One container's address on a network.
@@ -258,6 +280,10 @@ pub struct Lease {
     /// Its IPv6 address, on a network with IPv6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip6: Option<Ipv6Addr>,
+    /// The container's ID, for a container (stage 9; a foreground run
+    /// has none): how `rename` finds its leases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 /// A lease's interface when it doesn't say (one written before a container
@@ -268,16 +294,25 @@ fn first_interface() -> String {
 
 impl Lease {
     /// The names its container answers to on the network, in order: its
-    /// name, its aliases, its run's ID.
+    /// name, its aliases, its container's short ID (its hostname, as `ps`
+    /// shows it), its run's ID.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        names(self.name.as_ref(), &self.aliases, &self.run)
+        names(
+            self.name.as_ref(),
+            &self.aliases,
+            self.container.as_ref(),
+            &self.run,
+        )
     }
 
     /// The name its address has (a reverse lookup's answer): its
-    /// container's name, else its run's ID.
+    /// container's name, else its short ID, else its run's ID.
     #[must_use]
     pub fn address_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.run)
+        self.name
+            .as_deref()
+            .or_else(|| short_container_id(self.container.as_ref()))
+            .unwrap_or(&self.run)
     }
 
     /// Its addresses: its IPv4 one, and its IPv6 one if it has one.
@@ -353,26 +388,64 @@ pub struct LeaseRequest {
     /// An IPv6 address asked for (`--ip6`); `None` takes the one that goes
     /// with its IPv4 address.
     pub ip6: Option<Ipv6Addr>,
+    /// The container's ID, for a container (see [`Lease::container`]).
+    pub container: Option<String>,
 }
 
 impl LeaseRequest {
     /// The names its container would answer to (see [`Lease::names`]).
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        names(self.name.as_ref(), &self.aliases, &self.run)
+        names(
+            self.name.as_ref(),
+            &self.aliases,
+            self.container.as_ref(),
+            &self.run,
+        )
     }
 }
 
+/// The most containers an in-use message names (then "and N more").
+const MOST_USERS_SAID: usize = 5;
+
+/// `users` (containers' names), for a message: `web, db`, the first five
+/// and then `and 3 more`.
+#[must_use]
+pub fn users_text(users: &[String]) -> String {
+    let said = users
+        .iter()
+        .take(MOST_USERS_SAID)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match users.len().saturating_sub(MOST_USERS_SAID) {
+        0 => said,
+        more => format!("{said} and {more} more"),
+    }
+}
+
+/// How many characters of a container's ID are its short ID (`ps`'s, and
+/// its hostname).
+pub const SHORT_CONTAINER_ID: usize = 12;
+
+/// A container's short ID, from its whole ID (`container`), if it has one
+/// that long.
+fn short_container_id(container: Option<&String>) -> Option<&str> {
+    container.and_then(|id| id.get(..SHORT_CONTAINER_ID))
+}
+
 /// A container's names on a network, in order: its name, its aliases, its
-/// run's ID.
+/// short ID (a container's), its run's ID.
 fn names<'a>(
     name: Option<&'a String>,
     aliases: &'a [String],
-    run: &'a String,
+    container: Option<&'a String>,
+    run: &'a str,
 ) -> impl Iterator<Item = &'a str> {
     name.into_iter()
         .chain(aliases)
-        .chain(std::iter::once(run))
         .map(String::as_str)
+        .chain(short_container_id(container))
+        .chain(std::iter::once(run))
 }
 
 /// The networks, in a directory.
@@ -511,6 +584,8 @@ impl Networks {
                     .map_or(0, |since| since.as_secs()),
                 subnet6,
                 gateway6,
+                isolate_host: spec.isolate_host,
+                conntrack_limit: spec.conntrack_limit,
             };
             let json = serde_json::to_vec_pretty(&config).map_err(|error| {
                 StoreError::io("writing the network's config", io::Error::other(error))
@@ -733,14 +808,20 @@ impl LockedNetwork {
 
     /// [`StoreError::InUse`] if a live run holds a lease on it.
     pub fn ensure_unused(&self) -> Result<(), StoreError> {
-        let count = self.leases()?.iter().filter(|(_, live)| *live).count();
-        if count > 0 {
-            return Err(StoreError::InUse {
-                name: self.config.name.clone(),
-                count,
-            });
+        let mut users: Vec<String> = self
+            .leases()?
+            .iter()
+            .filter(|(_, live)| *live)
+            .map(|(lease, _)| lease.address_name().to_owned())
+            .collect();
+        if users.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        users.sort();
+        Err(StoreError::InUse {
+            name: self.config.name.clone(),
+            users,
+        })
     }
 
     /// Removes the leases of runs that are gone, and returns them: what
@@ -772,12 +853,204 @@ impl LockedNetwork {
         Ok(swept)
     }
 
+    /// `name` refused if a live container on the network (in `leases`) other
+    /// than the one at `except` answers to it: names are unique on a
+    /// network, ignoring case (as DNS does, RFC 4343).
+    fn refuse_taken_name(
+        &self,
+        leases: &[(Lease, bool)],
+        name: &str,
+        except: Option<IpAddr>,
+    ) -> Result<(), StoreError> {
+        let taken = leases.iter().any(|(lease, live)| {
+            *live
+                && Some(lease.ip) != except
+                && lease.names().any(|other| other.eq_ignore_ascii_case(name))
+        });
+        if taken {
+            return Err(StoreError::NameTaken {
+                name: name.to_owned(),
+                network: self.config.name.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether container `container` has a live lease on the network, and
+    /// its name there: `Ok(None)` if it has none. Found by its ID, or, if
+    /// `name` is given, by that name (a lease made before leases knew their
+    /// container).
+    ///
+    /// # Errors
+    ///
+    /// The leases couldn't be read.
+    pub fn name_of(
+        &self,
+        container: &str,
+        name: Option<&str>,
+    ) -> Result<Option<String>, StoreError> {
+        let leases = self.leases()?;
+        Ok(live_lease_of(&leases, container, name)
+            .map(|lease| lease.name.clone().unwrap_or_default()))
+    }
+
+    /// Container `container`'s live lease here, if it has one: by its ID,
+    /// or by `name` if it's given (as [`name_of`](Self::name_of)).
+    ///
+    /// # Errors
+    ///
+    /// The leases couldn't be read.
+    pub fn live_lease(
+        &self,
+        container: &str,
+        name: Option<&str>,
+    ) -> Result<Option<Lease>, StoreError> {
+        let leases = self.leases()?;
+        Ok(live_lease_of(&leases, container, name).cloned())
+    }
+
+    /// Removes container `container`'s live lease here (by its ID, or by
+    /// `name` if it's given, as [`name_of`](Self::name_of)), if it has one,
+    /// and returns it: what it made (its veth, its rules) is the caller's to
+    /// undo. Its holder (the container's monitor) keeps its
+    /// lock on the file, which no longer has a name: the lease is gone for
+    /// everyone else at once (its address, its names), and its holder's
+    /// copy goes when it lets go of it. A lock can't be taken from another
+    /// process (`flock` is its open file's, TLPI §55.2): unlinking the file
+    /// is what's left to do.
+    ///
+    /// # Errors
+    ///
+    /// The leases couldn't be read, or the file removed.
+    pub fn remove_live(
+        &self,
+        container: &str,
+        name: Option<&str>,
+    ) -> Result<Option<Lease>, StoreError> {
+        let leases = self.leases()?;
+        let Some(mine) = live_lease_of(&leases, container, name) else {
+            return Ok(None);
+        };
+        let path = self.dir.join("leases").join(mine.ip.to_string());
+        fs::remove_file(&path).map_err(|source| StoreError::Io {
+            context: format!("removing {}", path.display()),
+            source,
+        })?;
+        Ok(Some(mine.clone()))
+    }
+
+    /// Whether container `container` (found by its ID, or by `name` if it's
+    /// given, as [`name_of`](Self::name_of)) could be renamed `new` on the
+    /// network: `Ok(true)` if it has a live lease here and no other live
+    /// container answers to `new` (its own names may be taken again);
+    /// `Ok(false)` if it has no live lease here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NameTaken`]; the leases couldn't be read.
+    pub fn check_rename(
+        &self,
+        container: &str,
+        name: Option<&str>,
+        new: &str,
+    ) -> Result<bool, StoreError> {
+        let leases = self.leases()?;
+        let Some(mine) = live_lease_of(&leases, container, name) else {
+            return Ok(false);
+        };
+        self.refuse_taken_name(&leases, new, Some(mine.ip))?;
+        Ok(true)
+    }
+
+    /// Renames container `container` (found by its ID, or by `name` if it's
+    /// given, as [`name_of`](Self::name_of)) `new` on the network: its live
+    /// lease rewritten **in place**, the name checked as
+    /// [`check_rename`](Self::check_rename) does. `Ok(false)`: no live lease
+    /// of it here (or it went meanwhile, its container ending).
+    ///
+    /// In place, because its run holds the lease file's inode locked (its
+    /// liveness): a file renamed over it would be a new one, unlocked, that
+    /// the next sweep removes. Only the lease's `name` (and `container`,
+    /// for one made before leases knew their container) is changed, in its
+    /// JSON as written: fields a newer Shipyard added survive. The new text
+    /// is padded with spaces (JSON's whitespace) to at least the old length
+    /// and written from the start, under a write lock on the file's bytes
+    /// (an open file description lock, `F_OFD_SETLKW`: apart from the run's
+    /// `flock`, which says it's alive) that every reader of a lease takes
+    /// to read it (`read_lease`): no reader ever sees half of each.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NameTaken`]; the lease couldn't be read or written.
+    pub fn rename(
+        &self,
+        container: &str,
+        name: Option<&str>,
+        new: &str,
+    ) -> Result<bool, StoreError> {
+        let leases = self.leases()?;
+        let Some(mine) = live_lease_of(&leases, container, name) else {
+            return Ok(false);
+        };
+        self.refuse_taken_name(&leases, new, Some(mine.ip))?;
+        let path = self.dir.join("leases").join(mine.ip.to_string());
+        let opened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(LEASE_FLAGS)
+            .open(&path);
+        let file = match opened {
+            Ok(file) => file,
+            // Released meanwhile: its container has ended.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(StoreError::io(format!("opening {}", path.display()), error));
+            }
+        };
+        let failed = |what: &str, error: io::Error| {
+            StoreError::io(format!("{what} {}", path.display()), error)
+        };
+        if !file
+            .metadata()
+            .map_err(|error| failed("checking", error))?
+            .is_file()
+        {
+            return Ok(false);
+        }
+        bytes_lock(&file, BytesLock::Write).map_err(|error| failed("locking", error))?;
+        let mut text = Vec::new();
+        (&file)
+            .take(64 * 1024)
+            .read_to_end(&mut text)
+            .map_err(|error| failed("reading", error))?;
+        let mut json: serde_json::Value = serde_json::from_slice(&text).map_err(|error| {
+            StoreError::io(
+                format!("reading {}", path.display()),
+                io::Error::other(error),
+            )
+        })?;
+        json["name"] = serde_json::Value::from(new);
+        json["container"] = serde_json::Value::from(container);
+        let mut written = serde_json::to_vec(&json)
+            .map_err(|error| StoreError::io("writing the lease", io::Error::other(error)))?;
+        if (written.len() as u64) < (text.len() as u64) {
+            written.resize(text.len(), b' ');
+        }
+        {
+            use std::os::unix::fs::FileExt as _;
+            file.write_all_at(&written, 0)
+                .map_err(|error| failed("writing", error))?;
+        }
+        file.sync_all().map_err(|error| failed("syncing", error))?;
+        Ok(true)
+    }
+
     /// A lease for `request`: the address asked for, or the next free one
     /// after the last handed out (round robin, so a freed address isn't
     /// reused at once). Sweep first: a dead run's address is free.
     ///
-    /// The names the container would answer to (its name, aliases and run's
-    /// ID) must not be any live container's on the network.
+    /// The names the container would answer to (its name, aliases, short ID
+    /// and run's ID) must not be any live container's on the network.
     pub fn allocate(&self, request: &LeaseRequest) -> Result<HeldLease, StoreError> {
         let dir = self.dir.join("leases");
         fs::create_dir_all(&dir)
@@ -790,15 +1063,7 @@ impl LockedNetwork {
         let subnet = self.config.subnet;
         let leases = self.leases()?;
         for name in request.names() {
-            let taken = leases.iter().any(|(lease, live)| {
-                *live && lease.names().any(|other| other.eq_ignore_ascii_case(name))
-            });
-            if taken {
-                return Err(StoreError::NameTaken {
-                    name: name.to_owned(),
-                    network: self.config.name.clone(),
-                });
-            }
+            self.refuse_taken_name(&leases, name, None)?;
         }
         let taken6: Vec<Ipv6Addr> = leases.iter().filter_map(|(lease, _)| lease.ip6).collect();
         let taken: Vec<IpAddr> = leases.into_iter().map(|(lease, _)| lease.ip).collect();
@@ -828,6 +1093,7 @@ impl LockedNetwork {
             name: request.name.clone(),
             aliases: request.aliases.clone(),
             interface: request.interface.clone(),
+            container: request.container.clone(),
         };
         let path = dir.join(ip.to_string());
         let file = OpenOptions::new()
@@ -838,13 +1104,13 @@ impl LockedNetwork {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(|error| StoreError::io(format!("making {}", path.display()), error))?;
-        let mut lock =
-            Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| {
-                StoreError::io(
-                    format!("locking {}", path.display()),
-                    io::Error::from(errno),
-                )
-            })?;
+        let mut lock = file;
+        lock.try_lock().map_err(|error| {
+            StoreError::io(
+                format!("locking {}", path.display()),
+                io::Error::from(error),
+            )
+        })?;
         let json = serde_json::to_vec(&lease)
             .map_err(|error| StoreError::io("writing the lease", io::Error::other(error)))?;
         let written = {
@@ -865,7 +1131,8 @@ impl LockedNetwork {
         Ok(HeldLease {
             lease,
             path,
-            _lock: lock,
+            lock,
+            given_up: false,
         })
     }
 
@@ -917,12 +1184,25 @@ impl LockedNetwork {
 }
 
 /// A lease a run holds: its address is the run's until it's released, or the
-/// run ends.
+/// run ends (or, given up to a container's monitor, until every copy of its
+/// [`hold`](Self::hold) is closed).
 #[derive(Debug)]
 pub struct HeldLease {
     lease: Lease,
     path: PathBuf,
-    _lock: Flock<File>,
+    /// The lease file, locked (`flock`, exclusive): unlocked when this value
+    /// goes (another thread's child, forked meanwhile, may hold a copy until
+    /// it execs), unless it was given up: then this copy is only closed.
+    lock: File,
+    given_up: bool,
+}
+
+impl Drop for HeldLease {
+    fn drop(&mut self) {
+        if !self.given_up {
+            let _ = self.lock.unlock();
+        }
+    }
 }
 
 impl HeldLease {
@@ -930,6 +1210,21 @@ impl HeldLease {
     #[must_use]
     pub fn lease(&self) -> &Lease {
         &self.lease
+    }
+
+    /// The locked lease file, for a process that keeps the lease (a
+    /// container's monitor), once this value is [given up](Self::give_up).
+    #[must_use]
+    pub fn hold(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.lock)
+    }
+
+    /// Gives the lease up to whoever holds a copy of its
+    /// [`hold`](Self::hold): this value's copy is closed, never unlocked, so
+    /// the lease stays the run's while any copy is open, and the network's
+    /// sweep reclaims it once none is.
+    pub fn give_up(mut self) {
+        self.given_up = true;
     }
 
     /// Gives the address back: the file goes while it's still locked, so no
@@ -968,6 +1263,75 @@ fn read_leases(dir: &Path) -> Result<Vec<(Lease, bool)>, StoreError> {
     }
     leases.sort_by_key(|(lease, _)| ip_order(lease.ip));
     Ok(leases)
+}
+
+/// Container `container`'s live lease in `leases`: the one that says it's
+/// its; else, if a `name` is given (the caller's for a container whose
+/// leases were all made before leases knew their container), the one with
+/// that name that says no container (unique on a network among live
+/// leases). Without a name, never another's: a run with no record may have
+/// the container's name.
+fn live_lease_of<'a>(
+    leases: &'a [(Lease, bool)],
+    container: &str,
+    name: Option<&str>,
+) -> Option<&'a Lease> {
+    let live = || {
+        leases
+            .iter()
+            .filter(|(_, live)| *live)
+            .map(|(lease, _)| lease)
+    };
+    live()
+        .find(|lease| lease.container.as_deref() == Some(container))
+        .or_else(|| {
+            let name = name?;
+            live().find(|lease| lease.container.is_none() && lease.name.as_deref() == Some(name))
+        })
+}
+
+/// A lock on a lease file's bytes (see [`bytes_lock`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BytesLock {
+    /// To read them (shared).
+    Read,
+    /// To rewrite them.
+    Write,
+    /// Let go.
+    Off,
+}
+
+/// A lock on all of `file`'s bytes, `kind`, waited for, held until let go
+/// or `file` is closed: an open file description lock (Linux 3.15;
+/// `F_OFD_SETLKW`), apart from `flock`'s, which says a lease is alive.
+/// Elsewhere, nothing (no lease is rewritten there: renaming a running
+/// container is Linux's).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(clippy::unnecessary_wraps, reason = "Linux's can fail")
+)]
+fn bytes_lock(file: &File, kind: BytesLock) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: an all-zero `flock` is a valid one to fill.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        let kind = match kind {
+            BytesLock::Read => libc::F_RDLCK,
+            BytesLock::Write => libc::F_WRLCK,
+            BytesLock::Off => libc::F_UNLCK,
+        };
+        lock.l_type = libc::c_short::try_from(kind).map_err(io::Error::other)?;
+        lock.l_whence = libc::c_short::try_from(libc::SEEK_SET).map_err(io::Error::other)?;
+        // Start 0, length 0: the whole file, however long.
+        nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_OFD_SETLKW(&lock))
+            .map(drop)
+            .map_err(io::Error::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, kind);
+        Ok(())
+    }
 }
 
 /// Whether a run holds the lease open as `file`: its exclusive lock is the
@@ -1017,11 +1381,15 @@ fn read_lease(
     if !is_file {
         return Ok(None);
     }
+    // Never half of a rename's rewrite (`LockedNetwork::rename`); a lock
+    // that can't be had (an old kernel) reads as before.
+    let _ = bytes_lock(&file, BytesLock::Read);
     let mut text = String::new();
     let lease = match (&mut file).take(64 * 1024).read_to_string(&mut text) {
         Ok(_) => serde_json::from_str(&text).ok(),
         Err(_) => None,
     };
+    let _ = bytes_lock(&file, BytesLock::Off);
     Ok(Some((lease, file)))
 }
 
@@ -1758,7 +2126,165 @@ mod tests {
             aliases: Vec::new(),
             interface: "eth0".into(),
             ip6: None,
+            container: None,
         }
+    }
+
+    /// A container renamed on a network: its live lease rewritten in place
+    /// (the same file, still held by its run), with the new name and none
+    /// of the old; a name another live container answers to (its name, an
+    /// alias, its run's ID, in any case) refused, its own allowed; a
+    /// shorter name still reads as a lease (the padding); a container with
+    /// no lease there, nothing done.
+    #[test]
+    fn a_lease_is_renamed_in_place() {
+        use std::os::unix::fs::MetadataExt as _;
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let mine = network
+            .allocate(&LeaseRequest {
+                name: Some("a-rather-long-name".into()),
+                container: Some("c1".into()),
+                ..request("a1")
+            })
+            .unwrap();
+        let other = network
+            .allocate(&LeaseRequest {
+                name: Some("db".into()),
+                aliases: vec!["database".into()],
+                ..request("b1")
+            })
+            .unwrap();
+        let inode = fs::metadata(&mine.path).unwrap().ino();
+        for taken in ["db", "DATABASE", "b1"] {
+            assert!(
+                matches!(
+                    network.rename("c1", Some("a-rather-long-name"), taken),
+                    Err(StoreError::NameTaken { .. })
+                ),
+                "{taken}"
+            );
+        }
+        assert!(
+            network
+                .rename("c1", Some("a-rather-long-name"), "w")
+                .unwrap()
+        );
+        assert_eq!(fs::metadata(&mine.path).unwrap().ino(), inode, "in place");
+        let (lease, live) = network
+            .leases()
+            .unwrap()
+            .into_iter()
+            .find(|(lease, _)| lease.container.as_deref() == Some("c1"))
+            .unwrap();
+        assert!(live, "still held by its run");
+        assert_eq!(lease.name.as_deref(), Some("w"));
+        assert!(!lease.names().any(|name| name == "a-rather-long-name"));
+        // Its own names may be taken again: its run's ID, in another case.
+        assert!(network.rename("c1", Some("w"), "A1").unwrap());
+        assert!(!network.rename("nobody", Some("nobody"), "x").unwrap());
+        drop((mine, other));
+    }
+
+    /// A lease made before leases knew their container is found by its
+    /// container's name, and told its container as it's renamed; what the
+    /// lease has that this Shipyard doesn't know (a newer one's field)
+    /// survives the rewrite.
+    #[test]
+    fn a_lease_rename_keeps_what_it_doesnt_know() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let held = network
+            .allocate(&LeaseRequest {
+                name: Some("old".into()),
+                ..request("a1")
+            })
+            .unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&held.path).unwrap()).unwrap();
+        json["future"] = serde_json::Value::from(7);
+        // Rewritten where it is (the run's lock is on this file).
+        {
+            use std::os::unix::fs::FileExt as _;
+            let file = OpenOptions::new().write(true).open(&held.path).unwrap();
+            file.write_all_at(&serde_json::to_vec(&json).unwrap(), 0)
+                .unwrap();
+        }
+        assert!(network.rename("c9", Some("old"), "new-and-longer").unwrap());
+        let text = fs::read_to_string(&held.path).unwrap();
+        let renamed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(renamed["name"], "new-and-longer");
+        assert_eq!(renamed["container"], "c9");
+        assert_eq!(renamed["future"], 7, "{text}");
+        drop(held);
+    }
+
+    /// A container's live lease is the one that says its ID, before one of
+    /// its name that says no container (a run with no record named so);
+    /// that one is found by its name only when the caller gives it (all the
+    /// container's leases older than leases' containers), never by its ID.
+    #[test]
+    fn a_lease_by_id_comes_first_and_by_name_only_when_asked() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let recordless = network
+            .allocate(&LeaseRequest {
+                name: Some("web".into()),
+                ..request("a1")
+            })
+            .unwrap();
+        // The container has none here: by its ID alone, nothing.
+        assert_eq!(network.live_lease("c1", None).unwrap(), None);
+        assert_eq!(network.name_of("c1", None).unwrap(), None);
+        assert!(!network.check_rename("c1", None, "new").unwrap());
+        assert_eq!(network.remove_live("c1", None).unwrap(), None);
+        // Asked by its name too: the old kind of lease, found.
+        assert_eq!(
+            network
+                .live_lease("c1", Some("web"))
+                .unwrap()
+                .map(|lease| lease.ip),
+            Some(recordless.lease().ip)
+        );
+        drop(recordless);
+        // Its own, beside one of its name that says no container: its own.
+        let other = network
+            .allocate(&LeaseRequest {
+                name: Some("web".into()),
+                ..request("b1")
+            })
+            .unwrap();
+        let mine = network
+            .allocate(&LeaseRequest {
+                name: Some("web2".into()),
+                container: Some("c1".into()),
+                ..request("c1")
+            })
+            .unwrap();
+        assert_eq!(
+            network
+                .live_lease("c1", Some("web"))
+                .unwrap()
+                .map(|lease| lease.ip),
+            Some(mine.lease().ip)
+        );
+        drop((other, mine));
+    }
+
+    /// A lease written before leases knew their container still reads.
+    #[test]
+    fn a_lease_without_its_container_reads() {
+        let old: Lease = serde_json::from_str(
+            r#"{"ip":"10.89.0.9","mac":[2,66,0,0,0,9],"run":"r","hostname":"r","host_veth":"shyr"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.container, None);
     }
 
     #[test]
@@ -1911,6 +2437,42 @@ mod tests {
         assert!(matches!(networks.lock("app"), Err(StoreError::NotFound(_))));
     }
 
+    /// A lease handed over (a copy of its hold, as a container's monitor
+    /// keeps) stays the run's once its holder has gone, and goes to the
+    /// sweep once the copy is closed: dropping the holder only closes, never
+    /// unlocks.
+    #[test]
+    fn a_lease_handed_over_outlives_its_holder() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let lease = network.allocate(&request("a")).unwrap();
+        let copy = lease.hold().try_clone_to_owned().unwrap();
+        lease.give_up();
+        assert!(network.sweep().unwrap().is_empty(), "held by the copy");
+        drop(copy);
+        let swept = network.sweep().unwrap();
+        assert_eq!(swept.len(), 1, "free once the copy is closed");
+        assert_eq!(swept[0].run, "a");
+    }
+
+    /// A lease dropped (not given up) is free at once, even while a stray
+    /// copy of its lock's descriptor is open (another thread's child,
+    /// between its fork and its exec): it's unlocked, not only closed.
+    #[test]
+    fn a_dropped_lease_is_free_despite_a_stray_copy() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let lease = network.allocate(&request("a")).unwrap();
+        let stray = lease.hold().try_clone_to_owned().unwrap();
+        drop(lease);
+        assert_eq!(network.sweep().unwrap().len(), 1, "free despite the copy");
+        drop(stray);
+    }
+
     #[test]
     fn leases_are_held_released_and_swept() {
         let scratch = Scratch::new();
@@ -1946,10 +2508,29 @@ mod tests {
         drop(network);
         assert!(matches!(
             networks.remove(networks.lock("app").unwrap()),
-            Err(StoreError::InUse { count: 1, .. })
+            Err(StoreError::InUse { users, .. }) if users == ["c"]
         ));
         third.release();
         networks.remove(networks.lock("app").unwrap()).unwrap();
+    }
+
+    /// An in-use message names the containers, five at most.
+    #[test]
+    fn in_use_names_its_containers() {
+        let users = |count: usize| (1..=count).map(|n| format!("c{n}")).collect::<Vec<_>>();
+        let said = |count| {
+            StoreError::InUse {
+                name: "app".into(),
+                users: users(count),
+            }
+            .to_string()
+        };
+        assert_eq!(said(2), "the network app is in use by c1, c2");
+        assert_eq!(said(5), "the network app is in use by c1, c2, c3, c4, c5");
+        assert_eq!(
+            said(8),
+            "the network app is in use by c1, c2, c3, c4, c5 and 3 more"
+        );
     }
 
     #[test]
@@ -2213,6 +2794,7 @@ mod tests {
             aliases: Vec::new(),
             interface: "eth0".into(),
             ip6: Some("fd00:1::2".parse().unwrap()),
+            container: None,
         };
         let containers: Vec<IpAddr> = lease
             .port_rules()
@@ -2278,6 +2860,107 @@ mod tests {
         let again = network.allocate(&named("d1", Some("db"), &[])).unwrap();
         assert_eq!(again.lease().name.as_deref(), Some("db"));
         drop((elsewhere, again));
+    }
+
+    /// A container's live lease removed while its holder keeps the lock: the
+    /// address is free at once (a new lease may take it), the holder's
+    /// lock stays its own; none to remove is `None`.
+    #[test]
+    fn a_live_lease_is_removed_from_under_its_holder() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let held = network
+            .allocate(&LeaseRequest {
+                name: Some("web".to_owned()),
+                container: Some("c".repeat(64)),
+                ..request("a1")
+            })
+            .unwrap();
+        let ip = held.lease().ip;
+        let removed = network.remove_live(&"c".repeat(64), Some("web")).unwrap();
+        assert_eq!(removed.map(|lease| lease.ip), Some(ip));
+        assert!(network.leases().unwrap().is_empty(), "gone for everyone");
+        assert!(
+            network
+                .remove_live(&"c".repeat(64), Some("web"))
+                .unwrap()
+                .is_none()
+        );
+        // Its address and names are free, its holder still holding its
+        // (unnamed) file.
+        let again = network
+            .allocate(&LeaseRequest {
+                ip: Some(ip),
+                name: Some("web".to_owned()),
+                ..request("b1")
+            })
+            .unwrap();
+        assert_eq!(again.lease().ip, ip);
+        drop((held, again));
+    }
+
+    /// A container's lease answers to its short ID (its hostname) too,
+    /// after its name and aliases, and before its run's ID, and that name
+    /// is its own on the network; its address's name is its name, else its
+    /// short ID, else its run's ID.
+    #[test]
+    fn a_containers_short_id_is_one_of_its_names() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let id = "0123456789ab".to_owned() + &"c".repeat(52);
+        let of = |run: &str, name: Option<&str>, container: Option<&str>| LeaseRequest {
+            name: name.map(str::to_owned),
+            aliases: vec!["api".to_owned()],
+            container: container.map(str::to_owned),
+            ..request(run)
+        };
+        let web = network.allocate(&of("a1", Some("web"), Some(&id))).unwrap();
+        assert_eq!(
+            web.lease().names().collect::<Vec<_>>(),
+            ["web", "api", "0123456789ab", "a1"]
+        );
+        assert_eq!(web.lease().address_name(), "web");
+        // Its short ID is taken, as a name or an alias, in any case.
+        let taken = network.allocate(&LeaseRequest {
+            aliases: Vec::new(),
+            ..of("b1", Some("0123456789AB"), None)
+        });
+        assert!(
+            matches!(taken, Err(StoreError::NameTaken { .. })),
+            "{taken:?}"
+        );
+        drop(web);
+        // Unnamed: its short ID names its address; without a container,
+        // its run's ID does.
+        let unnamed = network.allocate(&of("c1", None, Some(&id))).unwrap();
+        assert_eq!(unnamed.lease().address_name(), "0123456789ab");
+        drop(unnamed);
+        let run = network.allocate(&of("d1", None, None)).unwrap();
+        assert_eq!(run.lease().address_name(), "d1");
+        assert_eq!(run.lease().names().collect::<Vec<_>>(), ["api", "d1"]);
+        drop(run);
+        // As an alias, it's taken too.
+        let first = network.allocate(&of("e1", None, Some(&id))).unwrap();
+        let alias = network.allocate(&LeaseRequest {
+            aliases: vec!["0123456789ab".to_owned()],
+            ..of("f1", None, None)
+        });
+        assert!(
+            matches!(alias, Err(StoreError::NameTaken { .. })),
+            "{alias:?}"
+        );
+        drop(first);
+        // A container field too short to have a short ID (not one this
+        // writes) gives none, and no panic.
+        for odd in ["abc", "", "é"] {
+            let lease = network.allocate(&of("g1", None, Some(odd))).unwrap();
+            assert_eq!(lease.lease().address_name(), "g1", "{odd:?}");
+            assert_eq!(lease.lease().names().collect::<Vec<_>>(), ["api", "g1"]);
+        }
     }
 
     /// A lease still being written (made and locked, not filled in yet)
@@ -2381,6 +3064,28 @@ mod tests {
         network.sweep().unwrap();
         assert!(leases.join("10.89.0.9").exists());
         drop(held);
+    }
+
+    /// The options of later steps are written only when on, and read as
+    /// off from a config written before them.
+    #[test]
+    fn options_are_kept_and_old_configs_read_them_off() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        let limited = NetworkSpec {
+            conntrack_limit: true,
+            ..spec("limited")
+        };
+        let config = networks.create(&limited, &[]).unwrap();
+        assert!(config.conntrack_limit);
+        assert!(networks.get("limited").unwrap().unwrap().conntrack_limit);
+        networks.create(&spec("plain"), &[]).unwrap();
+        let written = fs::read_to_string(scratch.0.join("plain/config.json")).unwrap();
+        assert!(!written.contains("conntrack_limit"), "{written}");
+        assert!(!written.contains("isolate_host"), "{written}");
+        // Read back from a config without them: off.
+        let plain = networks.get("plain").unwrap().unwrap();
+        assert!(!plain.conntrack_limit && !plain.isolate_host);
     }
 
     #[test]

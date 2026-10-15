@@ -2,7 +2,8 @@
 //! a peer that may be hostile, cut anywhere. Every frame is read or refused,
 //! never a panic; what's held is never more than one frame not yet whole;
 //! and the detach matcher detaches exactly when the keys are typed, passing
-//! on everything before them and nothing of them.
+//! on everything before them and nothing of them. Every other frame read
+//! is written back the same (stage 9's control frames too).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -44,7 +45,16 @@ fuzz_target!(|data: &[u8]| {
                         }
                     }
                 }
-                Ok(Some(_)) => {}
+                // Output with nothing in it: read, but never written (an
+                // empty write makes no frame), so nothing to write back.
+                Ok(Some(Frame::Stdout(bytes) | Frame::Stderr(bytes))) if bytes.is_empty() => {}
+                Ok(Some(frame)) => {
+                    let mut again = Vec::new();
+                    frame.encode(&mut again);
+                    let mut check = Decoder::new();
+                    check.push(&again);
+                    assert_eq!(check.next_frame(), Ok(Some(frame)));
+                }
                 Ok(None) => break,
                 Err(_) => return,
             }

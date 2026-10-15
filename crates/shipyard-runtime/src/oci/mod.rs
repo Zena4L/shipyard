@@ -70,11 +70,19 @@ pub struct Bundle {
 }
 
 /// What a bundle asks of its terminal (`process.terminal: true`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BundleTerminal {
     /// `process.consoleSize`, as rows and columns, if it gives both.
     pub size: Option<(u16, u16)>,
+}
+
+impl BundleTerminal {
+    /// A terminal of `size` (rows, columns), if known.
+    #[must_use]
+    pub fn sized(size: Option<(u16, u16)>) -> Self {
+        Self { size }
+    }
 }
 
 /// Why a bundle can't be run.
@@ -182,16 +190,23 @@ pub fn load_bundle_for_caller(dir: &Path) -> Result<Bundle, BundleError> {
     let mut bundle = load_bundle(dir)?;
     let added = crate::process::bundle_user_namespace(&mut bundle.isolation);
     bundle.warnings.extend(added);
-    if bundle.isolation.cgroup_mount.is_some()
-        && let Err(why) = crate::cgroup::Tree::find()
-    {
-        bundle.isolation.cgroup_mount = None;
-        bundle.warnings.push(format!(
-            "the cgroup mount at /sys/fs/cgroup is left out: the container can't have a cgroup \
-             of its own here: {why}"
-        ));
-    }
+    bundle
+        .warnings
+        .extend(without_unusable_cgroup_mount(&mut bundle.isolation));
     Ok(bundle)
+}
+
+/// Leaves out `isolation`'s cgroup mount if the container can't have a
+/// cgroup of its own here (nothing delegated, no cgroup v2), saying so.
+#[cfg(target_os = "linux")]
+pub(crate) fn without_unusable_cgroup_mount(isolation: &mut Isolation) -> Option<String> {
+    isolation.cgroup_mount?;
+    let why = crate::cgroup::Tree::find().err()?;
+    isolation.cgroup_mount = None;
+    Some(format!(
+        "the cgroup mount at /sys/fs/cgroup is left out: the container can't have a cgroup of \
+         its own here: {why}"
+    ))
 }
 
 /// Reads and parses `config.json`, refusing what isn't a small regular file

@@ -1,9 +1,10 @@
 //! End-to-end tests of networks' DNS servers (Linux, root): containers on a
 //! network made with `shipyard network create` find each other by name,
-//! alias and run ID; other names go to the upstream resolvers (but not from
+//! alias, short ID and run ID; other names go to the upstream resolvers (but not from
 //! an internal network); a name is one running container's; the server
-//! runs once per network, as nobody, and stops when its network is idle or
-//! removed; and only those networks' containers are told about it.
+//! runs once per network, as nobody, in a cgroup of its own, and stops when
+//! its network is idle or removed; its worker, killed, is started again;
+//! and only those networks' containers are told about it.
 //!
 //! Each test runs in a network namespace of its own (`in_new_netns`, "the
 //! host"), with networks in a scratch directory. Queries are sent from a
@@ -159,7 +160,8 @@ fn a_name_is_one_running_containers_at_a_time() {
             &["--name", "db"][..],
             &["--name", "web", "--network-alias", "DB"][..],
         ] {
-            let taken = networks.run(&[&["run", "--network", "app"], flags, &["true"]].concat());
+            let taken = networks
+                .run(&[&["run", "--no-image", "--network", "app"], flags, &["true"]].concat());
             assert_eq!(taken.code, Some(125), "{flags:?}");
             assert!(
                 taken
@@ -171,7 +173,15 @@ fn a_name_is_one_running_containers_at_a_time() {
             );
         }
         db.stop();
-        let again = networks.run(&["run", "--network", "app", "--name", "db", "true"]);
+        let again = networks.run(&[
+            "run",
+            "--no-image",
+            "--network",
+            "app",
+            "--name",
+            "db",
+            "true",
+        ]);
         assert_eq!(again.code, Some(0), "{}", again.stderr);
     });
 }
@@ -216,7 +226,8 @@ fn one_server_runs_as_nobody_until_its_network_is_idle() {
         networks.create(&["app"]);
         // Two runs at once: one server.
         let start = || {
-            let mut command = networks.command(&["run", "--network", "app", "sleep", "30"]);
+            let mut command =
+                networks.command(&["run", "--no-image", "--network", "app", "sleep", "30"]);
             command.env("SHIPYARD_DNS_UPSTREAM", Upstream::ADDRESS.to_string());
             start_command(command)
         };
@@ -225,12 +236,17 @@ fn one_server_runs_as_nobody_until_its_network_is_idle() {
         let servers = networks.dns_servers();
         assert_eq!(servers.len(), 1, "{servers:?}");
         let server = servers[0];
-        assert_eq!(status(server, "Uid:"), "65534\t65534\t65534\t65534");
-        assert_eq!(status(server, "Gid:"), "65534\t65534\t65534\t65534");
-        assert_eq!(status(server, "Groups:"), "");
-        assert_eq!(status(server, "CapPrm:"), "0000000000000000");
-        assert_eq!(status(server, "CapEff:"), "0000000000000000");
-        assert_eq!(status(server, "NoNewPrivs:"), "1");
+        // Its watchdog and its worker alike.
+        let workers = networks.wait_for_dns_workers(1, Duration::from_secs(5));
+        assert_eq!(workers.len(), 1, "{workers:?}");
+        for process in [server, workers[0]] {
+            assert_eq!(status(process, "Uid:"), "65534\t65534\t65534\t65534");
+            assert_eq!(status(process, "Gid:"), "65534\t65534\t65534\t65534");
+            assert_eq!(status(process, "Groups:"), "");
+            assert_eq!(status(process, "CapPrm:"), "0000000000000000");
+            assert_eq!(status(process, "CapEff:"), "0000000000000000");
+            assert_eq!(status(process, "NoNewPrivs:"), "1");
+        }
         assert_eq!(networks.inspect("app")["DNSRunning"], true);
 
         // With a container left, it stays (well past its idle time).
@@ -252,6 +268,117 @@ fn one_server_runs_as_nobody_until_its_network_is_idle() {
         let answer = resolve(&netns, networks.gateway("app"), "again", rtype::A).unwrap();
         assert_eq!(addresses(&answer), [ip]);
         again.stop();
+    });
+}
+
+/// The cgroup `pid` is in (`/proc/PID/cgroup`'s v2 line), as a directory.
+fn cgroup_of(pid: libc::pid_t) -> std::path::PathBuf {
+    let line = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let path = line
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or_else(|| panic!("no cgroup v2 line for {pid}: {line}"));
+    std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'))
+}
+
+/// A server is in a cgroup of its own (its watchdog and its worker), named
+/// in its network's directory, with its limits; it goes with its network.
+#[test]
+#[ignore = "needs root"]
+fn a_server_has_a_cgroup_of_its_own_till_its_network_goes() {
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        networks.create(&["app"]);
+        let (running, _) =
+            networks.sleeping_with(&[("SHIPYARD_DNS_IDLE", "3600")], &["--network", "app"]);
+        let servers = networks.dns_servers();
+        let workers = networks.wait_for_dns_workers(1, Duration::from_secs(5));
+        assert_eq!((servers.len(), workers.len()), (1, 1));
+        let name = std::fs::read_to_string(networks.path().join("app/dns.cgroup")).unwrap();
+        assert!(name.starts_with("app-"), "{name}");
+        let cgroup = cgroup_of(servers[0]);
+        assert!(
+            cgroup.ends_with(std::path::Path::new("shipyard/dns").join(&name)),
+            "{}",
+            cgroup.display()
+        );
+        assert_eq!(cgroup_of(workers[0]), cgroup);
+        let read = |file: &str| std::fs::read_to_string(cgroup.join(file)).unwrap();
+        assert_eq!(read("memory.max").trim(), (64u64 << 20).to_string());
+        // The server's most threads, its watchdog, and a few to spare.
+        let tasks = shipyard_network::dns::server::MOST_TASKS + 5;
+        assert_eq!(read("pids.max").trim(), tasks.to_string());
+
+        running.stop();
+        let removed = networks.run(&["network", "rm", "app"]);
+        assert_eq!(removed.code, Some(0), "{}", removed.stderr);
+        assert!(
+            networks
+                .wait_for_dns_servers(0, Duration::from_secs(10))
+                .is_empty()
+        );
+        assert!(!cgroup.exists(), "{} is left", cgroup.display());
+    });
+}
+
+/// A server's worker that's killed is started again by its watchdog (the
+/// server's lock held meanwhile: the same server), names resolve again, and
+/// the log says it; killed again at once, the next start waits twice as
+/// long. The watchdog stopped, its worker goes with it: no server is left
+/// unwatched.
+#[test]
+#[ignore = "needs root"]
+fn a_killed_servers_worker_is_started_again() {
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        networks.create(&["app"]);
+        let (db, netns) = networks.sleeping(&["--network", "app", "--name", "db"]);
+        let (db_ip, _) = container(&networks, "app", "db");
+        let gateway = networks.gateway("app");
+        let server = networks.dns_servers();
+        assert_eq!(server.len(), 1);
+        for (round, wait) in [(1, "100 ms"), (2, "200 ms")] {
+            let workers = networks.wait_for_dns_workers(1, Duration::from_secs(5));
+            assert_eq!(workers.len(), 1, "round {round}: {workers:?}");
+            // SAFETY: `kill` takes plain values.
+            assert_eq!(unsafe { libc::kill(workers[0], libc::SIGKILL) }, 0);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let again = loop {
+                let now = networks.dns_workers();
+                if now.len() == 1 && now[0] != workers[0] {
+                    break now[0];
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "round {round}: no new worker"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(networks.dns_servers(), server, "round {round}");
+            assert_eq!(status(again, "Uid:"), "65534\t65534\t65534\t65534");
+            let named = resolve(&netns, gateway, "db", rtype::A).unwrap();
+            assert_eq!(addresses(&named), [db_ip], "round {round}");
+            let log = std::fs::read_to_string(networks.path().join("app/dns.log")).unwrap();
+            assert!(
+                log.contains(&format!(
+                    "its worker was killed (SIGKILL): started again in {wait}"
+                )),
+                "round {round}: {log}"
+            );
+        }
+        assert_eq!(networks.inspect("app")["DNSRunning"], true);
+        // SAFETY: `kill` takes plain values.
+        assert_eq!(unsafe { libc::kill(server[0], libc::SIGTERM) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !networks.dns_workers().is_empty() || !networks.dns_servers().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "its worker outlived it"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(networks.inspect("app")["DNSRunning"], false);
+        db.stop();
     });
 }
 
@@ -345,6 +472,7 @@ fn only_a_created_networks_containers_are_told_about_its_server() {
         assert_eq!(networks.inspect("bridge")["DNSRunning"], false);
         let alias = networks.run(&[
             "run",
+            "--no-image",
             "--network",
             "bridge",
             "--network-alias",
@@ -472,5 +600,91 @@ fn dig_reads_the_servers_answers_as_meant() {
         db.stop();
         client.stop();
         lonely.stop();
+    });
+}
+
+/// A running container renamed (stage 9, step 9.4b2): it answers to its
+/// short ID too (9.7a); within a second or two its new name is its
+/// address's on the network, and its old one is
+/// nobody's (the world's to answer). A name another container on the
+/// network answers to (a foreground run's) is refused, and nothing changes.
+/// Started again, its lease has the new name from the start.
+#[test]
+#[ignore = "needs root"]
+fn a_renamed_container_answers_to_its_new_name() {
+    in_new_netns(|| {
+        use std::os::unix::fs::PermissionsExt as _;
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        let _world = FakeResolver::start(upstream.netns(), WORLD);
+        networks.create(&["app"]);
+        let (_registry, image) = shipyard_test_support::registry::fixture();
+        let scratch = shipyard_test_support::registry::Scratch::new();
+        let containers = scratch.0.join("containers");
+        std::fs::create_dir_all(&containers).unwrap();
+        std::fs::set_permissions(&containers, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shipyard = |args: &[&str]| {
+            let mut command = networks.command(args);
+            command
+                .env("SHIPYARD_IMAGE_STORE", scratch.store())
+                .env("SHIPYARD_CONTAINER_DIR", &containers)
+                .env("SHIPYARD_DNS_UPSTREAM", Upstream::ADDRESS.to_string());
+            shipyard_test_support::run(command)
+        };
+        let made = shipyard(&[
+            "run",
+            "-d",
+            "--name",
+            "web",
+            "--network",
+            "app",
+            &image,
+            "sleep",
+            "300",
+        ]);
+        assert_eq!(made.code, Some(0), "{}", made.stderr);
+        let (db, _) = networks.sleeping(&["--network", "app", "--name", "db"]);
+        let (client, netns) = networks.sleeping(&["--network", "app"]);
+        let server = networks.gateway("app");
+        let web = networks.address("app", "web");
+        let answer = |name: &str| resolve(&netns, server, name, rtype::A).unwrap();
+        assert_eq!(addresses(&answer("web")), [web]);
+        // Its short ID (its hostname, as `ps` shows it) is a name of its
+        // too (stage 9, step 9.7a), in any case.
+        let short = &made.stdout.trim()[..12];
+        assert_eq!(addresses(&answer(short)), [web]);
+        assert_eq!(addresses(&answer(&short.to_uppercase())), [web]);
+        let refused = shipyard(&["rename", "web", "DB"]);
+        assert_eq!(refused.code, Some(125), "{}", refused.stderr);
+        assert!(refused.stderr.contains("taken"), "{}", refused.stderr);
+        assert_eq!(addresses(&answer("web")), [web], "unchanged");
+        let named = |reference: &str| {
+            let shown = shipyard(&["inspect", reference]);
+            serde_json::from_str::<serde_json::Value>(&shown.stdout).unwrap()[0]["name"].clone()
+        };
+        assert_eq!(named("web"), "web", "its record unchanged");
+        let renamed = shipyard(&["rename", "web", "site"]);
+        assert_eq!(renamed.code, Some(0), "{}", renamed.stderr);
+        assert_eq!(renamed.stdout, "");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while addresses(&answer("site")) != [web] {
+            assert!(std::time::Instant::now() < deadline, "never site");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let old = answer("web");
+        assert_eq!(addresses(&old), [WORLD]);
+        assert!(!old.header.authoritative());
+        assert_eq!(named("site"), "site");
+        // Started again: its new lease has the new name.
+        for step in [&["stop", "-t", "1", "site"][..], &["start", "site"]] {
+            let done = shipyard(step);
+            assert_eq!(done.code, Some(0), "{step:?}: {}", done.stderr);
+        }
+        let again = networks.address("app", "site");
+        assert_eq!(addresses(&answer("site")), [again]);
+        let removed = shipyard(&["rm", "-f", "site"]);
+        assert_eq!(removed.code, Some(0), "{}", removed.stderr);
+        client.stop();
+        db.stop();
     });
 }

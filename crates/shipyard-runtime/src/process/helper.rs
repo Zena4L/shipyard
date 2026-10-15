@@ -32,6 +32,15 @@
 //! then root's, and ptrace refused to anyone without `CAP_SYS_PTRACE` over
 //! the host's user namespace.
 //!
+//! **A stopped container** (stage 9, step 9.4c2,
+//! [`launch_in_view`]) has no namespaces to join: the helper makes its own
+//! instead. With the container's ID maps, a user namespace (its starter
+//! writes the maps, told on a pipe, as for a container; then root in it);
+//! then a mount namespace, made private, where the container's root is
+//! mounted as a start mounts it (`rootfs::view`: the overlay, the volumes).
+//! Its mounts end with it. Then steps 3 to 5, as above (root in its user
+//! namespace already).
+//!
 //! **What can reach it.** Nothing in a container with a PID namespace of
 //! its own: the helper isn't in it. A container that shares the host's (or
 //! another) PID namespace sees it, and its processes running as the same
@@ -74,13 +83,8 @@ struct HelperSetup {
     name: String,
     /// What it's given.
     args: Vec<u8>,
-    /// Namespaces owned outside the container's user namespace, joined
-    /// first; the user namespace; then the rest, the mount one last:
-    /// `(index in Namespace::ALL, descriptor)`.
-    early: Vec<(u64, RawFd)>,
-    user: Option<RawFd>,
-    late: Vec<(u64, RawFd)>,
-    setgroups_allowed: bool,
+    /// How it reaches the container's files.
+    how: How,
     /// The report pipe's write end.
     report: RawFd,
     /// The PID of the process that started it, which it dies with.
@@ -88,16 +92,53 @@ struct HelperSetup {
     pause_ms: u32,
 }
 
+/// How a helper reaches a container's files.
+#[derive(Debug, Serialize, Deserialize)]
+enum How {
+    /// A container that's up: its namespaces, joined ([`launch`]).
+    Join {
+        /// Namespaces owned outside the container's user namespace, joined
+        /// first; the user namespace; then the rest, the mount one last:
+        /// `(index in Namespace::ALL, descriptor)`.
+        early: Vec<(u64, RawFd)>,
+        user: Option<RawFd>,
+        late: Vec<(u64, RawFd)>,
+        setgroups_allowed: bool,
+    },
+    /// One that isn't: namespaces of its own, its root mounted there
+    /// ([`launch_in_view`]).
+    Mount(Box<ViewSetup>),
+}
+
+/// A stopped container's root, for a helper to mount in namespaces of its
+/// own ([`launch_in_view`]).
+#[derive(Debug, Serialize, Deserialize)]
+struct ViewSetup {
+    /// The root, as a start mounts it.
+    root: super::setup::RootSetup,
+    /// With a user namespace of its own: the write end of the pipe it says
+    /// it's made on, and the read end of the one its starter answers on once
+    /// the maps are written (closed unanswered: they weren't).
+    user: Option<(RawFd, RawFd)>,
+}
+
 impl HelperSetup {
     /// Every descriptor it inherits by number.
-    fn passed(&self) -> Vec<RawFd> {
-        self.early
-            .iter()
-            .chain(&self.late)
-            .map(|&(_, fd)| fd)
-            .chain(self.user)
-            .chain([self.report])
-            .collect()
+    fn inherited(&self) -> Vec<RawFd> {
+        let mut inherited = vec![self.report];
+        match &self.how {
+            How::Join {
+                early, user, late, ..
+            } => {
+                inherited.extend(early.iter().chain(late).map(|&(_, fd)| fd));
+                inherited.extend(*user);
+            }
+            How::Mount(view) => {
+                inherited.extend(view.root.attach());
+                inherited.extend(view.user.into_iter().flat_map(|(ready, go)| [ready, go]));
+            }
+        }
+        inherited
     }
 }
 
@@ -113,30 +154,67 @@ pub(crate) fn launch(
 ) -> Result<RunningHelper> {
     super::internal::refuse_unsafe_dumpable("cp")?;
     let (early, late) = split_namespaces(joining)?;
+    let how = How::Join {
+        early,
+        user: joining.user.as_ref().map(AsRawFd::as_raw_fd),
+        late,
+        setgroups_allowed: setgroups_allowed(joining),
+    };
+    Ok(spawn(name, args, how, stdin, stdout)?.0)
+}
+
+/// Starts a helper running function `name` with `args`, reaching the
+/// container `how` says, its standard input and output `stdin` and
+/// `stdout`: the helper, and its PID.
+fn spawn(
+    name: &str,
+    args: &[u8],
+    how: How,
+    stdin: &OwnedFd,
+    stdout: &OwnedFd,
+) -> Result<(RunningHelper, u32)> {
     let (report_read, report_write) = nix::unistd::pipe2(OFlag::O_CLOEXEC)
         .map_err(|errno| Error::sys("making the helper's report pipe", errno))?;
-    let pause_ms = if cfg!(debug_assertions) {
+    let setup = HelperSetup {
+        name: name.to_owned(),
+        args: args.to_vec(),
+        how,
+        report: report_write.as_raw_fd(),
+        starter: nix::unistd::getpid().as_raw(),
+        pause_ms: pause_ms(),
+    };
+    let child = start(&setup, stdin, stdout)?;
+    let pid = child.id();
+    // Only the helper's copy of the write end left: its end of file is the
+    // helper's end.
+    drop(report_write);
+    Ok((
+        RunningHelper {
+            child: Some(child),
+            report: Some(report_read),
+        },
+        pid,
+    ))
+}
+
+/// How long a helper waits before its function (a test's hook).
+fn pause_ms() -> u32 {
+    if cfg!(debug_assertions) {
         std::env::var(PAUSE_VAR)
             .ok()
             .and_then(|ms| ms.parse().ok())
             .unwrap_or(0)
     } else {
         0
-    };
-    let setup = HelperSetup {
-        name: name.to_owned(),
-        args: args.to_vec(),
-        early,
-        user: joining.user.as_ref().map(AsRawFd::as_raw_fd),
-        late,
-        setgroups_allowed: setgroups_allowed(joining),
-        report: report_write.as_raw_fd(),
-        starter: nix::unistd::getpid().as_raw(),
-        pause_ms,
-    };
-    let mut passed = setup.passed();
-    let setup_fd = super::setup::sealed_json(&setup, c"shipyard-helper", "the helper's setup")?;
-    passed.push(setup_fd.as_raw_fd());
+    }
+}
+
+/// Starts the helper `setup` describes, its standard input and output
+/// `stdin` and `stdout`.
+fn start(setup: &HelperSetup, stdin: &OwnedFd, stdout: &OwnedFd) -> Result<std::process::Child> {
+    let mut inherited = setup.inherited();
+    let setup_fd = super::setup::sealed_json(setup, c"shipyard-helper", "the helper's setup")?;
+    inherited.push(setup_fd.as_raw_fd());
     // Its standard error: nowhere (a file it opens must never land on 2).
     let null = open("/dev/null", OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())
         .map_err(|errno| Error::sys("opening /dev/null for the helper", errno))?;
@@ -149,18 +227,106 @@ pub(crate) fn launch(
         arg0: "shipyard-helper",
         entry: HELPER_ENTRY_ARG,
         setup: setup_fd.as_raw_fd(),
-        passed: &passed,
+        inherited: &inherited,
         stdio: [
             Some(stdin.as_fd()),
             Some(stdout.as_fd()),
             Some(null.as_fd()),
         ],
     };
-    let child = start_sealed(&exe, host_exe.as_ref(), &how, "the helper", refused)?;
-    Ok(RunningHelper {
-        child: Some(child),
-        report: Some(report_read),
-    })
+    start_sealed(&exe, host_exe.as_ref(), &how, "the helper", refused)
+}
+
+/// What a helper with a user namespace of its own waits for: its maps
+/// written by its starter ([`launch_in_view`]).
+pub(crate) struct Handshake {
+    /// The helper's PID, whose maps are written.
+    pub(crate) pid: u32,
+    /// The maps.
+    pub(crate) maps: crate::isolation::IdMaps,
+    /// Where it says it has made its user namespace (a byte).
+    pub(crate) ready: OwnedFd,
+    /// Where it's told its maps are written (a byte; closed unanswered:
+    /// they weren't).
+    pub(crate) go: OwnedFd,
+}
+
+/// Starts helper function `name` with `args` (as [`launch`]) in container
+/// root `view`, mounted in namespaces of the helper's own (see the module
+/// docs), its standard input and output `stdin` and `stdout`. With ID maps,
+/// the helper then waits for them: the [`Handshake`] to complete.
+pub(crate) fn launch_in_view(
+    view: &crate::container::RootView,
+    name: &str,
+    args: &[u8],
+    stdin: &OwnedFd,
+    stdout: &OwnedFd,
+) -> Result<(RunningHelper, Option<Handshake>)> {
+    super::internal::refuse_unsafe_dumpable("cp")?;
+    // Real root mapping IDs: its overlay made here, as for an init.
+    let prebuilt = super::spawn::prebuilt_root_overlay(&view.root, view.id_maps.as_ref())?;
+    let root = super::setup::RootSetup::for_view(
+        &view.root,
+        view.id_maps.as_ref(),
+        prebuilt.as_ref().map(AsRawFd::as_raw_fd),
+    );
+    let pipe = || {
+        nix::unistd::pipe2(OFlag::O_CLOEXEC)
+            .map_err(|errno| Error::sys("making the helper's pipes", errno))
+    };
+    // (read, write) each: ready written there, read here; go the other way.
+    let sync = match &view.id_maps {
+        Some(maps) => Some((maps.clone(), pipe()?, pipe()?)),
+        None => None,
+    };
+    let how = How::Mount(Box::new(ViewSetup {
+        root,
+        user: sync
+            .as_ref()
+            .map(|(_, (_, ready), (go, _))| (ready.as_raw_fd(), go.as_raw_fd())),
+    }));
+    let (helper, pid) = spawn(name, args, how, stdin, stdout)?;
+    // The helper has its own copies now.
+    drop(prebuilt);
+    Ok((
+        helper,
+        sync.map(|(maps, (ready, _), (_, go))| Handshake {
+            pid,
+            maps,
+            ready,
+            go,
+        }),
+    ))
+}
+
+/// Waits up to `wait` for a byte on `pipe`: `EPIPE` at its end of file (its
+/// writer gone), `ETIMEDOUT` once the time is up.
+pub(crate) fn wait_for_byte(
+    pipe: &OwnedFd,
+    wait: std::time::Duration,
+) -> std::result::Result<(), Errno> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(Errno::ETIMEDOUT);
+        }
+        let timeout = PollTimeout::try_from(left).unwrap_or(PollTimeout::MAX);
+        let mut fds = [PollFd::new(pipe.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, timeout) {
+            Ok(0) | Err(Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(errno) => return Err(errno),
+        }
+        let mut byte = [0_u8];
+        return match nix::unistd::read(pipe, &mut byte) {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(Errno::EPIPE),
+            Err(Errno::EINTR) => continue,
+            Err(errno) => Err(errno),
+        };
+    }
 }
 
 /// Where the shipyard binary starts as a helper, running one of `helpers`.
@@ -178,7 +344,7 @@ fn run(setup_fd: RawFd, helpers: &[Helper]) -> ! {
     let Ok(setup) = read_sealed_json::<HelperSetup>(setup_fd) else {
         std::process::exit(SETUP_FAILED);
     };
-    close_on_exec(setup.passed().into_iter().chain([setup_fd]));
+    close_on_exec(setup.inherited().into_iter().chain([setup_fd]));
     // Its standard error goes nowhere: a panic is reported as a failure.
     let report = setup.report;
     std::panic::set_hook(Box::new(move |panic| {
@@ -245,30 +411,30 @@ fn enter<'h>(
     let bound = fd_bound();
 
     // 2. Hidden from here on; the container's namespaces, the mount one
-    //    last.
+    //    last; or, for a stopped container, its own, its root mounted there.
     hide()?;
-    for (kind, fd) in decode_namespaces(&setup.early) {
-        joined(kind, fd)?;
-    }
-    let maps = match setup.user {
-        Some(user) => {
-            joined(Namespace::User, user)?;
-            hide()?;
-            // Inside it now: the first column is the IDs as it sees them.
-            Some((id_map("uid_map")?, id_map("gid_map")?))
+    let (maps, mounted) = match &setup.how {
+        How::Mount(view) => {
+            let (maps, root) = made(view)?;
+            (maps, Some(root))
         }
-        None => None,
+        How::Join {
+            early,
+            user,
+            late,
+            setgroups_allowed,
+        } => {
+            let maps = joined_all(early, *user, late)?;
+            // 3. (begun) Root inside the user namespace it joined.
+            if user.is_some() {
+                become_root(*setgroups_allowed)?;
+                hide()?;
+            }
+            (maps, None)
+        }
     };
-    for (kind, fd) in decode_namespaces(&setup.late) {
-        joined(kind, fd)?;
-    }
-    nix::unistd::chdir("/").map_err(setting_up("going to its root"))?;
 
-    // 3. Root inside; dies with its starter; only its capabilities.
-    if setup.user.is_some() {
-        become_root(setup.setgroups_allowed)?;
-        hide()?;
-    }
+    // 3. Dies with its starter; only its capabilities.
     // (After the credential calls: a change of credentials clears it.)
     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
         .map_err(setting_up("tying itself to its starter"))?;
@@ -281,16 +447,21 @@ fn enter<'h>(
 
     // 4. Nothing of the host's but its standard streams, the report pipe
     //    and its own /proc/self/fd.
-    close_all_but([setup.report, own_fds.as_raw_fd()], bound)?;
+    let mut keep = vec![setup.report, own_fds.as_raw_fd()];
+    keep.extend(mounted.as_ref().map(AsRawFd::as_raw_fd));
+    close_all_but(keep, bound)?;
     if setup.pause_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(u64::from(setup.pause_ms)));
     }
-    let root = open(
-        "/",
-        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(setting_up("opening the container's root"))?;
+    let root = match mounted {
+        Some(root) => root,
+        None => open(
+            "/",
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(setting_up("opening the container's root"))?,
+    };
     let all = vec![(0, u32::MAX)];
     let (uids, gids) = maps.unwrap_or_else(|| (all.clone(), all));
     let io = HelperIo {
@@ -306,6 +477,90 @@ fn enter<'h>(
         own_fds,
     };
     Ok((helper, io))
+}
+
+/// Joins the container's namespaces (the mount one last) and goes to its
+/// root: the ID maps of its user namespace, as seen from inside, if it
+/// joined one.
+fn joined_all(
+    early: &[(u64, RawFd)],
+    user: Option<RawFd>,
+    late: &[(u64, RawFd)],
+) -> std::result::Result<Option<IdRanges>, HelperFailure> {
+    for (kind, fd) in decode_namespaces(early) {
+        joined(kind, fd)?;
+    }
+    let maps = match user {
+        Some(user) => {
+            joined(Namespace::User, user)?;
+            hide()?;
+            // Inside it now: the first column is the IDs as it sees them.
+            Some((id_map("uid_map")?, id_map("gid_map")?))
+        }
+        None => None,
+    };
+    for (kind, fd) in decode_namespaces(late) {
+        joined(kind, fd)?;
+    }
+    nix::unistd::chdir("/").map_err(setting_up("going to its root"))?;
+    Ok(maps)
+}
+
+/// A user's and a group's ID ranges, as `(first, count)` inside.
+type IdRanges = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
+/// A stopped container's namespaces, made: a user namespace with its maps
+/// (its starter writes them), root in it; a mount namespace, private; its
+/// root mounted there. The maps as seen inside, and the root's directory.
+fn made(view: &ViewSetup) -> std::result::Result<(Option<IdRanges>, OwnedFd), HelperFailure> {
+    use nix::sched::{CloneFlags, unshare};
+    let maps = match view.user {
+        Some((ready, go)) => {
+            unshare(CloneFlags::CLONE_NEWUSER)
+                .map_err(|errno| refused(errno, "making a user namespace"))?;
+            // (Making a user namespace leaves it as it was: hidden.)
+            // SAFETY: inherited for this; each used once, then the process
+            // ends with them.
+            let (ready, go) = unsafe { (OwnedFd::from_raw_fd(ready), OwnedFd::from_raw_fd(go)) };
+            nix::unistd::write(&ready, &[1]).map_err(setting_up("telling its starter"))?;
+            drop(ready);
+            let mut byte = [0_u8];
+            match nix::unistd::read(&go, &mut byte) {
+                Ok(1) => {}
+                Ok(_) => return Err(setup_failure(Errno::EPIPE, "waiting for its ID maps")),
+                Err(errno) => return Err(setup_failure(errno, "waiting for its ID maps")),
+            }
+            become_root(super::user_namespace::setgroups_allowed())?;
+            // Again: a credential change resets it.
+            hide()?;
+            Some((id_map("uid_map")?, id_map("gid_map")?))
+        }
+        None => None,
+    };
+    unshare(CloneFlags::CLONE_NEWNS).map_err(|errno| refused(errno, "making a mount namespace"))?;
+    // Private: nothing mounted here reaches the host, nor the other way.
+    nix::mount::mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .map_err(setting_up("making its mounts private"))?;
+    let root =
+        super::rootfs::view(&view.root).map_err(|(doing, errno)| setup_failure(errno, &doing))?;
+    Ok((maps, root))
+}
+
+/// A namespace not made, `doing`: why, where the host's policy says (a
+/// security module, `user.max_user_namespaces`).
+fn refused(errno: Errno, doing: &str) -> HelperFailure {
+    if matches!(errno, Errno::EPERM | Errno::EACCES | Errno::ENOSPC) {
+        let why = super::user_namespace::userns_refusal();
+        setup_failure(errno, &format!("{doing} ({why})"))
+    } else {
+        setup_failure(errno, doing)
+    }
 }
 
 /// Joins the namespace of `kind` open at `fd`.
@@ -345,7 +600,7 @@ fn become_root(setgroups_allowed: bool) -> std::result::Result<(), HelperFailure
 }
 
 /// Closes every descriptor from 3 up but `keep`.
-fn close_all_but(mut keep: [RawFd; 2], bound: RawFd) -> std::result::Result<(), HelperFailure> {
+fn close_all_but(mut keep: Vec<RawFd>, bound: RawFd) -> std::result::Result<(), HelperFailure> {
     let closing =
         |failure: super::child::Failure| setup_failure(failure.errno(), "closing the host's files");
     keep.sort_unstable();
@@ -378,6 +633,70 @@ fn id_ranges(map: &str) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The starter's wait for a byte: there, its writer gone, or nothing
+    /// before the time is up.
+    #[test]
+    fn a_byte_is_waited_for_and_never_forever() {
+        use std::time::Duration;
+        let pipe = || nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+        let (read, write) = pipe();
+        nix::unistd::write(&write, &[1]).unwrap();
+        assert_eq!(wait_for_byte(&read, Duration::from_secs(1)), Ok(()));
+        drop(write);
+        assert_eq!(
+            wait_for_byte(&read, Duration::from_secs(1)),
+            Err(Errno::EPIPE)
+        );
+        let (read, _write) = pipe();
+        let began = std::time::Instant::now();
+        assert_eq!(
+            wait_for_byte(&read, Duration::from_millis(20)),
+            Err(Errno::ETIMEDOUT)
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A helper that mounts a stopped container's root inherits its report
+    /// pipe, the overlay real root made (to attach) and its ready and go
+    /// pipes; one that joins, its namespaces.
+    #[test]
+    fn a_helper_inherits_what_it_reaches_with() {
+        let mut root = crate::isolation::Root::new("/var/lib/c/merged");
+        root.overlay = Some(crate::isolation::Overlay::new(
+            vec!["/l".into()],
+            "/u".into(),
+            "/w".into(),
+        ));
+        let maps = crate::isolation::IdMaps::single((1000, 1000));
+        let setup = |how| HelperSetup {
+            name: "cp-out".to_owned(),
+            args: Vec::new(),
+            how,
+            report: 3,
+            starter: 1,
+            pause_ms: 0,
+        };
+        let view = |attach, user| {
+            How::Mount(Box::new(ViewSetup {
+                root: super::super::setup::RootSetup::for_view(&root, Some(&maps), attach),
+                user,
+            }))
+        };
+        let mut inherited = setup(view(Some(7), Some((8, 9)))).inherited();
+        inherited.sort_unstable();
+        assert_eq!(inherited, [3, 7, 8, 9]);
+        assert_eq!(setup(view(None, None)).inherited(), [3]);
+        let joined = How::Join {
+            early: vec![(0, 4)],
+            user: Some(5),
+            late: vec![(1, 6)],
+            setgroups_allowed: true,
+        };
+        let mut inherited = setup(joined).inherited();
+        inherited.sort_unstable();
+        assert_eq!(inherited, [3, 4, 5, 6]);
+    }
 
     #[test]
     fn an_id_map_reads_as_its_inside_ranges() {

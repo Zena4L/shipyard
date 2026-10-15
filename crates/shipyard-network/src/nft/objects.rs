@@ -10,14 +10,14 @@
 
 use super::consts::{
     NFNL_SUBSYS_NFTABLES, NFT_MSG_DELSETELEM, NFT_MSG_DELTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWRULE,
-    NFT_MSG_NEWSET, NFT_MSG_NEWSETELEM, NFT_MSG_NEWTABLE, NFT_SET_ELEM_INTERVAL_END, NFT_SET_MAP,
-    NFTA_CHAIN_HOOK, NFTA_CHAIN_NAME, NFTA_CHAIN_POLICY, NFTA_CHAIN_TABLE, NFTA_CHAIN_TYPE,
-    NFTA_DATA_VALUE, NFTA_HOOK_HOOKNUM, NFTA_HOOK_PRIORITY, NFTA_LIST_ELEM, NFTA_RULE_CHAIN,
-    NFTA_RULE_EXPRESSIONS, NFTA_RULE_TABLE, NFTA_SET_DATA_LEN, NFTA_SET_DATA_TYPE,
-    NFTA_SET_ELEM_DATA, NFTA_SET_ELEM_FLAGS, NFTA_SET_ELEM_KEY, NFTA_SET_ELEM_LIST_ELEMENTS,
-    NFTA_SET_ELEM_LIST_SET, NFTA_SET_ELEM_LIST_TABLE, NFTA_SET_FLAGS, NFTA_SET_ID,
-    NFTA_SET_KEY_LEN, NFTA_SET_KEY_TYPE, NFTA_SET_NAME, NFTA_SET_TABLE, NFTA_SET_USERDATA,
-    NFTA_TABLE_NAME, NFTA_TABLE_USERDATA, TYPE_IFNAME,
+    NFT_MSG_NEWSET, NFT_MSG_NEWSETELEM, NFT_MSG_NEWTABLE, NFT_SET_ELEM_INTERVAL_END, NFT_SET_EVAL,
+    NFT_SET_MAP, NFTA_CHAIN_HOOK, NFTA_CHAIN_NAME, NFTA_CHAIN_POLICY, NFTA_CHAIN_TABLE,
+    NFTA_CHAIN_TYPE, NFTA_DATA_VALUE, NFTA_HOOK_HOOKNUM, NFTA_HOOK_PRIORITY, NFTA_LIST_ELEM,
+    NFTA_RULE_CHAIN, NFTA_RULE_EXPRESSIONS, NFTA_RULE_TABLE, NFTA_SET_DATA_LEN, NFTA_SET_DATA_TYPE,
+    NFTA_SET_DESC, NFTA_SET_DESC_SIZE, NFTA_SET_ELEM_DATA, NFTA_SET_ELEM_FLAGS, NFTA_SET_ELEM_KEY,
+    NFTA_SET_ELEM_LIST_ELEMENTS, NFTA_SET_ELEM_LIST_SET, NFTA_SET_ELEM_LIST_TABLE, NFTA_SET_FLAGS,
+    NFTA_SET_ID, NFTA_SET_KEY_LEN, NFTA_SET_KEY_TYPE, NFTA_SET_NAME, NFTA_SET_TABLE,
+    NFTA_SET_USERDATA, NFTA_TABLE_NAME, NFTA_TABLE_USERDATA, TYPE_IFNAME,
 };
 use super::expr::Expr;
 use crate::netlink::{BatchItem, MessageBuilder, flag, nfnl_message};
@@ -140,7 +140,12 @@ pub(crate) fn new_rule(
     }
 }
 
-/// Creates `set` in `table`; `id` is unique in the batch.
+/// The most elements a dynamic set (`NFT_SET_EVAL`) holds: its rules add
+/// one per source, and a full set adds no more (its rule then doesn't match).
+pub(crate) const DYNAMIC_SET_SIZE: u32 = 65_536;
+
+/// Creates `set` in `table`; `id` is unique in the batch. A dynamic one is
+/// bounded at [`DYNAMIC_SET_SIZE`].
 pub(crate) fn new_set(family: u8, table: &str, set: &SetSpec, id: u32) -> BatchItem {
     let mut message = message(NFT_MSG_NEWSET, flag::CREATE, family);
     let flags = set.flags | if set.data.is_some() { NFT_SET_MAP } else { 0 };
@@ -157,6 +162,11 @@ pub(crate) fn new_set(family: u8, table: &str, set: &SetSpec, id: u32) -> BatchI
         message
             .attr_be32(NFTA_SET_DATA_TYPE, kind)
             .attr_be32(NFTA_SET_DATA_LEN, len);
+    }
+    if set.flags & NFT_SET_EVAL != 0 {
+        message.nest(NFTA_SET_DESC, |desc| {
+            desc.attr_be32(NFTA_SET_DESC_SIZE, DYNAMIC_SET_SIZE);
+        });
     }
     message.attr_be32(NFTA_SET_ID, id);
     BatchItem {
@@ -280,5 +290,39 @@ mod tests {
         let carries = |bytes: &[u8]| bytes.windows(attribute.len()).any(|at| at == attribute);
         assert!(carries(&set(TYPE_IFNAME)));
         assert!(!carries(&set(TYPE_IPADDR)));
+    }
+
+    /// A dynamic set says its size (the kernel's default would be larger
+    /// than Shipyard wants: each element keeps a list of connections).
+    #[test]
+    fn a_dynamic_set_is_bounded() {
+        let set = |flags| {
+            new_set(
+                1,
+                "t",
+                &SetSpec {
+                    name: "s",
+                    flags,
+                    key: (TYPE_IPADDR, 4),
+                    data: None,
+                },
+                1,
+            )
+            .message
+            .finish(1, 1)
+            .unwrap()
+        };
+        // NFTA_SET_DESC (nested, 12 bytes) holding NFTA_SET_DESC_SIZE.
+        let desc = [
+            &12_u16.to_ne_bytes()[..],
+            &(NFTA_SET_DESC | crate::netlink::message::attr_flag::NESTED).to_ne_bytes(),
+            &8_u16.to_ne_bytes(),
+            &NFTA_SET_DESC_SIZE.to_ne_bytes(),
+            &DYNAMIC_SET_SIZE.to_be_bytes(),
+        ]
+        .concat();
+        let carries = |bytes: &[u8]| bytes.windows(desc.len()).any(|at| at == desc);
+        assert!(carries(&set(NFT_SET_EVAL)));
+        assert!(!carries(&set(0)));
     }
 }
