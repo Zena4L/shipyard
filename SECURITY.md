@@ -17,7 +17,7 @@ Shipyard is before 1.0: only the latest release gets fixes.
 
 ## What Shipyard defends, and what it doesn't yet
 
-Shipyard v0.1 confines containers, but **isn't a hardened security boundary yet**. Run
+Shipyard v0.2 confines containers, but **isn't a hardened security boundary yet**. Run
 only code you would run as your own user (rootless) or trust with root (as root).
 
 What a container is kept from, and tested for:
@@ -36,6 +36,16 @@ What a container is kept from, and tested for:
 - **Hostile input:** image layers are verified against their digests and unpacked so
   no entry escapes its layer; manifests, tar, netlink and DNS parsers are fuzzed;
   registry credentials go only to the registry and its token service.
+
+What a container isn't kept from by default (as with Docker):
+
+- **The host's processes and memory running out:** there's no default limit on a
+  container's processes or memory; give `--pids-limit` and `--memory` to one you
+  don't trust.
+- **The host's services and the cloud's metadata:** a container on the default
+  network, `bridge`, can reach the host's own addresses and `169.254.169.254`; on a
+  cloud VM that can be the instance's credentials. A network made with
+  `--isolate-host` keeps its containers from both.
 
 **The AppArmor profile** (`contrib/apparmor/shipyard`) lets anyone who can run
 Shipyard's binaries make user namespaces through them, where Ubuntu otherwise

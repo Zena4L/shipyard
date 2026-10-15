@@ -134,7 +134,7 @@ pub(crate) fn join_setup(namespaces: &[(Namespace, std::os::fd::RawFd)]) -> Join
 
 /// The start time of the process whose `/proc` directory is open at
 /// `directory` (none if it has exited).
-fn start_time_at(directory: &OwnedFd) -> Option<u64> {
+pub(crate) fn start_time_at(directory: &OwnedFd) -> Option<u64> {
     let fd = openat(
         directory,
         "stat",

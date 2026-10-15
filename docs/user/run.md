@@ -1,36 +1,129 @@
 # Running commands
 
 ```sh
-shipyard run [OPTIONS] COMMAND [ARGS...]
+shipyard run [OPTIONS] IMAGE [COMMAND [ARGS...]]
+shipyard run [OPTIONS] --no-image COMMAND [ARGS...]
 ```
 
 `shipyard run` starts a command the way a container runtime does: with a clean
 environment and exactly the user, working directory and limits you ask for.
 
 > **Status:** on Linux, `run` isolates the command in its own process IDs, mounts,
-> hostname and IPC (see [Isolation](#isolation)). With `--rootfs` it also gets a
-> root filesystem of its own (see [Root filesystem](#root-filesystem)); without it, it
-> sees the host's files. It has a network of its own with a way out and
-> published ports (`-p`): the default bridge network as root, pasta without (see
-> [Network](#network)). On macOS the command isn't isolated yet.
+> hostname and IPC (see [Isolation](#isolation)). With an image (see
+> [Image](#image)) or `--rootfs` (see [Root filesystem](#root-filesystem)) it gets
+> a root filesystem of its own; with `--no-image`, it sees the host's files. It
+> has a network of its own with a way out and published ports (`-p`): the default
+> bridge network as root, pasta without (see [Network](#network)). On macOS the
+> command isn't isolated yet, and running an image needs Linux.
+
+## A container, in the foreground
+
+On Linux, a run with an image or `--rootfs` is a **container**, as
+with Docker: it gets a record and a name (generated, `brave_tugboat`, unless
+`--name`), its own monitor, and its output goes to its logs as well as to you. You
+stay attached until it ends, and `run` exits with its exit code. Then it's kept:
+
+```sh
+shipyard run alpine echo hi        # hi
+shipyard ps -a                     # … Exited (0) …  brave_tugboat
+shipyard logs brave_tugboat        # hi
+shipyard start -a brave_tugboat    # again
+shipyard rm brave_tugboat
+shipyard run --rm alpine echo hi   # removed once it ends: run returns after that
+```
+
+- **Nothing it writes is missed:** you're attached before it starts. Its stdout
+  and stderr stay apart.
+- **Input:** with `-i`, what you give `run` is the container's input, and your
+  end of file ends its input (`printf 'a\nb\n' | shipyard run -i alpine cat`).
+  Without it, the container reads nothing (`/dev/null`). With `-it` your input is
+  a terminal: Ctrl-D is a key for the container's terminal, not the end of input.
+- **Detaching:** with `-it`, Ctrl-P Ctrl-Q detaches. `run` exits `0` and the
+  container runs on: `attach` reaches it again, and with `--rm` it's removed when it
+  ends. `--detach-keys` changes the keys (`--detach-keys ctrl-a,d`), or turns them
+  off (`--detach-keys=`). Without `-it` no keys detach: any bytes are input.
+- **Signals:** the signals `run` gets are passed on to the container
+  (`--sig-proxy`, on by default: Docker's). Ctrl-C and Ctrl-\\ go as they are: if
+  the container ends from one (`130` for Ctrl-C), `run` ends from it too, so a
+  shell loop around `run` stops. `SIGTERM` (a service manager's, `timeout`'s) is
+  the container's stop, as `shipyard stop` does it: its `--stop-signal`, then
+  `SIGKILL` once its `--stop-timeout` is up. A closed terminal's hang-up is passed
+  on too (the container usually ends, `129`). `--sig-proxy=false` passes none:
+  Ctrl-C then ends `run`, and the container runs on. With `-it` on a terminal,
+  Ctrl-C, Ctrl-Z and Ctrl-\\ are keys for the container's own terminal instead
+  (see [`-t`](#a-terminal-of-the-containers-own--t)).
+- **Restarting:** `--restart` gives it a restart policy (`on-failure`, `always`,
+  `unless-stopped`): `run` returns at its first end, with that code, and the
+  container is started again in the background (see
+  [Restart policies](containers.md#restart-policies)). Not with `--rm`.
+- **If `run` is killed** (`kill -9`), the container runs on, as one made with `-d`
+  does: it's in `ps`, and `attach`, `logs`, `stop` and `rm` reach it. With `--rm`,
+  it's removed when it ends.
+- **A slow reader loses nothing:** the container waits for `run` (stopped with
+  Ctrl-Z, or `run … | slow`), as a program waits on a full pipe, and all its output
+  comes once `run` reads again. So does a large input (`run -i … < big-file`).
+- **When `run`'s output closes** (`run … | head`), the container's writer gets
+  `SIGPIPE`, as in a pipeline (`141` if that ends it).
+- **A stopped container keeps its image** in the store: `rmi` refuses it until
+  the container is removed (see [Containers](containers.md)).
+
+Other runs are supervised by `run` itself, with no record, as before: `--no-image`,
+`--bundle`, `--no-isolation`, macOS, and in this version `--preserve-fds`.
+So is an image run of a user without a directory for containers' state
+(`XDG_RUNTIME_DIR` unset, outside a login session): it says so.
 
 ## Arguments
 
-Shipyard's options go **before** the command. Everything from the command onward
-belongs to the command:
+The first argument is the **image** to run, as with Docker. The rest is the
+command to run instead of the image's own, with its arguments:
 
 ```sh
-shipyard run -e A=1 ls -l --env X     # ls receives: -l --env X
+shipyard run alpine:3.20                        # the image's own command
+shipyard run alpine:3.20 cat /etc/os-release    # cat instead
 ```
 
-A mistyped option before the command is an error, so it is never mistaken for
-the command. Use `--` if the command itself starts with `-`:
+To run without an image, say so with a flag. The command then comes first:
+
+- **`--no-image`**: the host's files, isolated in namespaces of its own (on Linux).
+- **`--rootfs DIR`**: DIR as the container's root filesystem (see
+  [Root filesystem](#root-filesystem)).
+- **`--bundle DIR`**: an OCI bundle, whose `config.json` gives the command (see
+  [OCI bundles](bundles.md)).
+- **`--no-isolation`**: no container at all: the command runs on the host, as you.
 
 ```sh
-shipyard run -- --program-starting-with-dash
+shipyard run --no-image sh -c 'echo hi'
+shipyard run --rootfs ./rootfs sh
+shipyard run --no-isolation true
+```
+
+Without one of these flags, a run needs an image; with one, it needs a command
+(except `--bundle`, which takes none). `-P`, `--entrypoint` and `--pull` need an
+image, and `--read-only` an image or `--rootfs`. Each of these mistakes is an
+error before anything runs (exit code 125).
+
+Shipyard's options go **before** the image (or, without one, before the command).
+Everything after the image belongs to the command, options too, as with Docker:
+
+```sh
+shipyard run -e A=1 alpine ls -l --env X    # ls receives: -l --env X
+shipyard run alpine --rm                    # runs `--rm` in the container
+```
+
+A mistyped option before the image is an error, so it is never mistaken for the
+image. A command that starts with `-` goes after the image, or after `--`
+without one:
+
+```sh
+shipyard run --no-image -- --program-starting-with-dash
 ```
 
 Arguments are passed through byte for byte, including ones that aren't valid UTF-8.
+
+**Before this version,** the image was given as `--image REF`, and a bare
+`shipyard run COMMAND` ran COMMAND on the host's files. `--image` is still
+accepted for now (it's hidden, and will be removed); a bare command now needs
+`--no-image`.
 
 ## Isolation
 
@@ -41,13 +134,13 @@ its own view of:
 |---|---|
 | Process IDs | The command sees only its own processes (`ps`, `/proc`). It's PID 2: PID 1 is a small init (see below). |
 | Mounts | Mounts made inside stay inside; the host never sees them. Mounts the host makes or removes later do reach the container, so a disk unmounted on the host isn't kept busy by it. |
-| Hostname | Its own copy: `--hostname`, else the run's ID (12 hexadecimal digits) with a network of its own, or the host's name with the host's network. |
+| Hostname | Its own copy: `--hostname`, else the container's short ID (or, for a run that isn't a container, the run's ID: 12 hexadecimal digits either way) with a network of its own, or the host's name with the host's network. |
 | IPC | Its own System V IPC objects and POSIX message queues. |
 | Keyring | A new, empty session keyring (`man 7 keyrings`), as runc gives each container: the keys your login session holds stay out of its reach. |
 | Cgroup | Run as root, a **cgroup** of its own (see [Cgroup](#cgroup) below). |
 | Network | Its own: the default bridge network as root, pasta without; or what `--network` says (see [Network](#network)). |
 
-Without `--rootfs`, the command sees the host's files. With `--network host`, it
+With `--no-image`, the command sees the host's files. With `--network host`, it
 sees the host's network.
 
 - **Root or not.** Run as root, the container is rootful. Run as anyone else, it's
@@ -117,8 +210,8 @@ sees the host's network.
   and the system calls most programs need (see [System calls](#system-calls-seccomp)).
   In a rootful container it's still root on the host's files, unless `--uidmap`
   (see [User namespaces](#user-namespaces)) makes root inside an ordinary user
-  outside; in a rootless one it's you (see [Rootless](#rootless)). Without
-  `--image` or `--rootfs`, those files are the host's own, its whole `/`: a
+  outside; in a rootless one it's you (see [Rootless](#rootless)). With
+  `--no-image`, those files are the host's own, its whole `/`: a
   rootful run warns about it ("the container is root on the host's own files"). With
   `--network host`, the container shares the host's network; it uses as much
   memory and CPU as it likes unless you set limits (see
@@ -126,7 +219,8 @@ sees the host's network.
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
-- **macOS:** commands aren't isolated yet (as with `--no-isolation`);
+- **macOS:** commands aren't isolated yet (as with `--no-isolation`), and an
+  image needs Linux, so a run there needs `--no-image` or `--no-isolation`;
   `--hostname`, `--domainname`, `--sysctl`, `--rootfs`, the network flags
   (`--network`, `--name`, `--network-alias`, `--ip6`, `-p`, `--add-host`, the `--dns`
   flags) and the other isolation flags are errors there.
@@ -144,8 +238,8 @@ sees the host's network.
 | `none` | One of its own, with only a loopback interface (`lo`, up, `127.0.0.1`): no way in or out. |
 
 ```sh
-shipyard run --network none cat /proc/net/dev    # only lo
-sudo shipyard run --network bridge --image alpine:3.20 ip addr show eth0
+shipyard run --network none --no-image cat /proc/net/dev    # only lo
+sudo shipyard run --network bridge alpine:3.20 ip addr show eth0
 ```
 
 On a bridge network the container has `eth0` with an address of its own, and a
@@ -167,7 +261,7 @@ With a network of its own (any `--network` but `host`):
   privileges (`net.ipv4.ping_group_range`: every group the container has). It
   routes nothing (`net.ipv4.ip_forward=0` and `net.ipv6.conf.all.forwarding=0`,
   whatever the host's): a container on two networks never joins them. A `--sysctl` of yours for any of these wins.
-- **Its own `/sys`** (with `--rootfs` or `--image`): `/sys/class/net` lists only its
+- **Its own `/sys`** (with an image or `--rootfs`): `/sys/class/net` lists only its
   own interfaces, rootless too.
 - **Programs that talk to themselves over `127.0.0.1` work.** With `none`,
   nothing else can reach the container, or be reached from it.
@@ -209,7 +303,7 @@ own, named after the `shipyard` process's PID:
   rootless, where nothing is delegated to you. An SSH login, for one, puts your shell
   in a session scope that's root's. The run goes on without one (its cgroup
   namespace's root is then Shipyard's own cgroup; `/sys/fs/cgroup` is the host's tree
-  without `--rootfs`, and empty with one), unless it asks for limits: then it's refused
+  with `--no-image`, and empty with a root filesystem of its own), unless it asks for limits: then it's refused
   (exit 125), saying why, and for an SSH login how: run it under your user manager,
   `systemd-run --user --scope shipyard run …`.
 
@@ -340,7 +434,7 @@ privileges, so a command that breaks out of the container is nobody special.
 Capabilities inside apply only to what the container owns.
 
 ```sh
-sudo shipyard run --uidmap 0:100000:65536 sh -c 'id; cat /proc/self/uid_map'
+sudo shipyard run --uidmap 0:100000:65536 --no-image sh -c 'id; cat /proc/self/uid_map'
 # uid=0(root) gid=0(root) groups=0(root)
 #          0     100000      65536
 ```
@@ -371,7 +465,7 @@ sudo shipyard run --uidmap 0:100000:65536 sh -c 'id; cat /proc/self/uid_map'
   sudo shipyard run --uidmap 0:100000:65536 --rootfs rootfs sh
   ```
 
-  With `--image`, that's done for you: the image's layers are extracted again for
+  With an image, that's done for you: the image's layers are extracted again for
   that map, as a copy whose files belong to the mapped IDs (one copy per distinct
   map, removed with the image), and the container's writable layer belongs to the
   mapped root. Shipyard (as root) mounts the image itself, since the mapped root
@@ -417,7 +511,7 @@ command is root over the container: its processes, mounts, hostname and files yo
 own. On the host it's still you, with no more rights than you have.
 
 ```sh
-shipyard run sh -c 'id; cat /proc/self/uid_map'
+shipyard run --no-image sh -c 'id; cat /proc/self/uid_map'
 # uid=0(root) gid=0(root) groups=0(root)
 #          0       1000          1
 #          1     100000      65536
@@ -498,7 +592,7 @@ the bytes along:
 - **Files and pipes are passed on as they are:** `shipyard run -i … < file`,
   `… | shipyard run -i …` and `shipyard run … > log` give the command those
   directly.
-- **Not by name either:** without a root filesystem of its own (no `--image` or
+- **Not by name either:** without a root filesystem of its own (no image or
   `--rootfs`), the container's `/dev/pts` is its own, so your terminals aren't in
   it to be opened.
 - **`-t`** gives the command a terminal of the container's own (below). `-it`
@@ -508,13 +602,16 @@ the bytes along:
 ### A terminal of the container's own (`-t`)
 
 ```sh
-shipyard run -it --image alpine sh
+shipyard run -it alpine sh
 ```
 
 With **`-t`** (`--tty`), the command gets a *pseudo-terminal* made inside the
 container: the first of its own (`tty` prints `/dev/pts/0`), sized as your window,
 and its *controlling terminal*. Shipyard passes what it shows on to your terminal,
-and with **`-i`** what you type to it. So inside, everything a terminal gives works:
+and with **`-i`** what you type to it. In a container run (an image or `--rootfs`,
+above) the terminal is held by the container's monitor: what it shows is in
+`logs`, and after you detach `attach` gets it back. So inside, everything a
+terminal gives works:
 
 - **Full-screen programs** (`vi`, `top`, `less`) and **password prompts** (`su`,
   `sudo`, `ssh`, which ask on `/dev/tty`).
@@ -524,15 +621,19 @@ and with **`-i`** what you type to it. So inside, everything a terminal gives wo
   stops a job inside (`fg` there resumes it), not Shipyard. Ctrl-D ends the
   container shell's input.
 - **Resizing the window** resizes the container's terminal.
-- **Closing your terminal** hangs up the container's: its programs get SIGHUP,
-  and one that ignores it finds its input ended. A `kill -HUP` sent to Shipyard is
-  passed on as usual.
+- **Closing your terminal** ends the run (`129`). In a container run, SIGHUP is
+  passed on to the container (`--sig-proxy`), whose shell usually ends of it; one
+  that ignores it runs on, as after a detach, for `attach` to reach. Otherwise
+  the container's terminal hangs up: its programs get SIGHUP, and one that
+  ignores it finds its input ended. A `kill -HUP` sent to Shipyard is passed on as
+  usual.
 - **Your terminal is put back** when the run ends, however the command ends,
   and while Shipyard is stopped (`kill -TSTP`, or job control): `fg` makes it raw
   again (`bg` leaves it as your shell has it). Only `kill -9` of Shipyard itself,
   or SIGSTOP, leaves it raw; `reset` (or `stty sane`) fixes it.
 - **In the background**, `shipyard run -it … &` waits for `fg` before changing
-  your terminal, as any program that does would.
+  your terminal, as any program that does would. Under a parent without job
+  control (no `fg` to come), use `-i` without `-t`, or `-d`.
 - **`-t` alone** (no `-i`) gives a terminal without your input, also when the
   output goes to a pipe or a file: `shipyard run -t … | cat` works, and
   `>> file` appends (the terminal
@@ -541,7 +642,7 @@ and with **`-i`** what you type to it. So inside, everything a terminal gives wo
 - **The terminal belongs to the command's user** (`-u`), so programs that open it
   by name can.
 
-Without `--image` or `--rootfs`, the container's `/dev/pts` is its own too (above),
+Without an image or `--rootfs`, the container's `/dev/pts` is its own too (above),
 and programs that make terminals (`script`, `tmux`) make them there.
 
 With `--no-isolation` (and on macOS), `-t` makes the terminal on the host, and the
@@ -568,8 +669,8 @@ output aren't the terminal. So:
   programs that ask for a password on `/dev/tty` (`sudo`, `ssh`) can't prompt.
   Full-screen programs (`vim`, `top`) need a terminal: use `-it`.
 - **Ctrl-C and Ctrl-\\** reach it through Shipyard, exactly once. Ctrl-C stops
-  a `sleep` as usual, and Shipyard then ends as if interrupted, so a shell loop
-  around it stops too.
+  a `sleep` as usual. A container run then exits `130` (the container's code); a
+  run supervised here ends as if interrupted, so a shell loop around it stops too.
 - **Resizing the window** sends the command SIGWINCH, though it has no terminal
   to read the new size from.
 - **Ctrl-Z stops only Shipyard.** The command keeps running; its output waits
@@ -603,7 +704,7 @@ With `--rootfs DIR`, the directory DIR becomes the container's `/`. The command
 sees only what's in it: nothing of the host's files is reachable from inside. DIR
 must hold the programs you run and everything they need (their libraries, for
 example). Any directory works, such as an unpacked image or a `debootstrap`. To
-run a pulled image instead of a prepared directory, use `--image` (below).
+run a pulled image instead of a prepared directory, give the image (below).
 
 The program and the working directory (`-w`) are looked up inside DIR, with the
 container's `PATH`. A working directory DIR doesn't have is made there (root's,
@@ -651,7 +752,7 @@ they are. The mount's other options, such as `nosuid` or `noexec`, are kept.
 **Errors** (exit code 125, before the command starts):
 
 - DIR doesn't exist, or isn't a directory.
-- DIR is `/`, the host's own root. Leave out `--rootfs` to share the host's files.
+- DIR is `/`, the host's own root. Use `--no-image` to share the host's files.
 - DIR's `proc`, `sys` or `dev` is a symbolic link. Shipyard refuses to mount on
   it, because it could point out of DIR.
 - They're missing and DIR is on a read-only file system, so they can't be
@@ -667,12 +768,13 @@ they are. The mount's other options, such as `nosuid` or `noexec`, are kept.
 - **"mounted noexec"** (exit code 126): DIR is on a file system that forbids
   running programs (on some systems, `/tmp`). Put it somewhere else.
 
-## Image (`--image`)
+## Image
 
-Instead of preparing a root filesystem by hand, run a pulled image:
+Instead of preparing a root filesystem by hand, run a pulled image: it's the
+first argument (see [Arguments](#arguments)).
 
 ```sh
-shipyard run --image alpine:3.20 cat /etc/alpine-release
+shipyard run alpine:3.20 cat /etc/alpine-release
 ```
 
 Shipyard pulls the image (if the store doesn't have it), stacks its layers into a
@@ -692,9 +794,9 @@ user and command are the defaults; any flag you give wins over them:
 - **The user** is `--user`, else the image's, else root inside the container.
 
 ```sh
-shipyard run --image nginx:alpine nginx -v            # its entrypoint, your arguments
-shipyard run --image alpine:3.20 --entrypoint /bin/echo hi
-shipyard run --image node:20 -w / pwd                 # / (not the image's workdir)
+shipyard run nginx:alpine nginx -v                   # its entrypoint, your arguments
+shipyard run --entrypoint /bin/echo alpine:3.20 hi
+shipyard run -w / node:20 pwd                        # / (not the image's workdir)
 ```
 
 `--pull WHEN` says when to pull: `missing` (the default: only if the store
@@ -702,10 +804,11 @@ doesn't have the image), `always` (ask the registry each time, as a tag may have
 moved), or `never` (the store's copy, or an error). A stored image runs without a
 network.
 
-`--image` can't be combined with `--rootfs` (they're two ways to give the root).
-It works with the rest of `run` — `--read-only`, limits, `--volume`, capabilities.
-`--read-only` needs one of the two: without a root filesystem of the container's
-own, there's nothing of its own to make read-only.
+An image and `--rootfs` are two ways to give the root: with `--rootfs` there's no
+image, and the first argument is the command. An image works with the rest of
+`run` — `--read-only`, limits, `--volume`, capabilities. `--entrypoint`, `--pull`
+and `-P` need an image; `--read-only` needs an image or `--rootfs`: without a root
+filesystem of the container's own, there's nothing of its own to make read-only.
 Running an image needs Linux (overlayfs); see [Images](images.md) for references,
 the store, and the `images`/`rmi`/`prune` commands.
 
@@ -714,16 +817,18 @@ the store, and the `images`/`rmi`/`prune` commands.
 Mount persistent storage or a host path into the container:
 
 ```sh
-shipyard run --image alpine --volume data:/var/lib/data …     # a named volume
-shipyard run --image alpine --volume /host/dir:/mnt:ro …      # a host path, read-only
+shipyard run --volume data:/var/lib/data alpine …     # a named volume
+shipyard run --volume /host/dir:/mnt:ro alpine …      # a host path, read-only
 ```
 
 `--volume SOURCE:DEST[:ro]`: a bare `SOURCE` (no slash) is a **named volume**,
 created on first use and kept from removal while the container runs; an absolute
 host path (it must exist; symlinks are resolved) is **bind-mounted**. `DEST` is
-where it appears inside (absolute; not `/`, `/dev`, or in `/proc` or `/sys`).
-`:ro` mounts it read-only. Repeatable. A volume needs a root filesystem, so use
-`--volume` with `--image` or `--rootfs`. Every `--volume` is checked before an
+where it appears inside (absolute; not `/`, `/dev`, or in `/proc` or `/sys`). A
+`DEST` that a symbolic link in the image leads into `/proc`, `/sys` or `/dev`
+(`/data -> /proc/sys`) is refused too; one meant for `/dev` is written there
+(`/dev/x`). `:ro` mounts it read-only. Repeatable. A volume needs a root filesystem, so use
+`--volume` with an image or `--rootfs`. Every `--volume` is checked before an
 image is pulled. See [Volumes](volumes.md).
 
 ## Environment
@@ -815,7 +920,7 @@ own supplementary groups are always dropped.
 ## The OOM score (`--oom-score-adj`)
 
 ```sh
-shipyard run --oom-score-adj 500 my-batch-job
+shipyard run --oom-score-adj 500 --no-image my-batch-job
 ```
 
 `--oom-score-adj N` (-1000 to 1000) sets how willing the kernel's OOM killer is to
@@ -829,7 +934,7 @@ macOS it's an error.
 ## Process limits (`--ulimit`)
 
 ```sh
-shipyard run --ulimit nofile=1024:2048 --ulimit core=0 my-server
+shipyard run --ulimit nofile=1024:2048 --ulimit core=0 --no-image my-server
 ```
 
 `--ulimit NAME=SOFT[:HARD]` sets a limit:
@@ -875,7 +980,7 @@ use a number instead.
 ## Memory, CPU and I/O limits
 
 ```sh
-sudo shipyard run --memory 512m --cpus 1.5 --pids-limit 200 my-server
+sudo shipyard run --memory 512m --cpus 1.5 --pids-limit 200 --no-image my-server
 ```
 
 Docker's flags, with the same meaning. They're written into the container's own
@@ -959,14 +1064,14 @@ permitted".
 **By default** (Docker's list, which is runc's), the container may use `/dev/null`,
 `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, its own terminals (`/dev/pts/*`)
 and `/dev/net/tun`. It may make a node of any device with `mknod` (root has the
-capability by default), but can't open one it made. Without `--rootfs` the container sees the host's `/dev`, and
+capability by default), but can't open one it made. With `--no-image` the container sees the host's `/dev`, and
 the same rules apply: `/dev/sda` is there, but it can't be opened.
 
 Where Shipyard can't give the container a cgroup (cgroup v1, or a read-only
 `/sys/fs/cgroup`, as inside some containers), there's no program to ask. A rootful
 container then goes without `CAP_MKNOD`, even if `--cap-add` gave it, so it can't
 make device nodes; the ones Shipyard makes for it (the defaults and `--device`) still
-work. Shipyard warns when this happens. Without `--rootfs`, it still sees the host's
+work. Shipyard warns when this happens. With `--no-image`, it still sees the host's
 `/dev`, and every device there opens.
 
 - **`--device HOST[:CONTAINER][:PERMS]`** gives the container a device of the host's,
@@ -979,7 +1084,7 @@ work. Shipyard warns when this happens. Without `--rootfs`, it still sees the ho
   - A `CONTAINER` path outside `/dev` (a fresh, empty file system for each container)
     is made in the root filesystem's own directory, and stays there after the
     container, as a mount's missing destination does.
-  - Without `--rootfs`, the device is used where it is on the host: giving it another
+  - With `--no-image`, the device is used where it is on the host: giving it another
     path is an error (exit 125).
 - **`--device-cgroup-rule 'TYPE MAJOR:MINOR ACCESS'`** lets the container use a whole
   kind of device, without making a node: `TYPE` is `c` (character), `b` (block) or `a`
@@ -1030,7 +1135,7 @@ The command starts clean, whatever state Shipyard was started in:
   Shipyard's own PID, descriptors 3 to 3+n-1 go first, and the command gets
   `LISTEN_FDS`, `LISTEN_FDNAMES` and `LISTEN_PID` set to its own PID (as
   `sd_listen_fds` expects; with isolation, Shipyard's init is PID 1). So a systemd
-  socket unit can start `ExecStart=/usr/local/bin/shipyard run --image … app`
+  socket unit can start `ExecStart=/usr/local/bin/shipyard run IMAGE app`
   directly. Any other open descriptor is closed when the command starts, and Shipyard
   closes its own copies once the command has them.
 - **umask:** `022`.
@@ -1051,7 +1156,9 @@ Shipyard stays with the command until it has exited, and passes signals on.
 
 Isolated commands on a terminal behave differently: see
 [On a terminal, isolated](#on-a-terminal-isolated). This section describes
-`--no-isolation` (and macOS) on a terminal, and every run without one.
+`--no-isolation` (and macOS) on a terminal, and every run without one that `run`
+supervises itself. A container run passes its signals on as [A container, in the
+foreground](#a-container-in-the-foreground) says.
 
 **From the terminal.** Ctrl-C, Ctrl-\\ and Ctrl-Z reach the command directly,
 just as without Shipyard, and `fg`/`bg` work as usual. Shipyard doesn't pass
@@ -1119,6 +1226,9 @@ exits).
 | `--stop-signal SIGNAL` | `SIGTERM` | Signal sent to ask the command to exit |
 | `--stop-timeout SECONDS` | `10` | How long to wait before forcing it with `SIGKILL` |
 
+A container (`run -d`, `create`) keeps both: they're what `shipyard stop` and
+`restart` use unless told otherwise (`-s`, `-t`). See [Containers](containers.md).
+
 The stop signal can't be `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` or `SIGCONT`:
 those pause or resume the command instead of ending it. Nor can it be `SIGCHLD`
 or signals 32 and 33, which the container's init can't pass on.
@@ -1133,6 +1243,11 @@ Signals can be given as:
 
 ## Cleanup
 
+A container run (see [A container, in the foreground](#a-container-in-the-foreground))
+is cleaned up by its monitor when it ends, as a detached one is: its network,
+volumes and processes let go, its record and writable layer kept until `rm` (or
+removed at once with `--rm`). For a run supervised here:
+
 When the command exits, Shipyard cleans up what it left behind:
 
 - **Isolated** (Linux): when the command exits, the container's init exits and
@@ -1144,7 +1259,7 @@ When the command exits, Shipyard cleans up what it left behind:
 - **On Linux:** every leftover process is killed, even ones that left the
   command's group (for example with `setsid`). Shipyard registers as their parent
   (a "child subreaper") to find them. Processes that were already Shipyard's
-  children when it started (as in `helper & exec shipyard run app`) aren't the
+  children when it started (as in `helper & exec shipyard run --no-image app`) aren't the
   command's, and are left running.
 - **On macOS, from a terminal:** background processes the command started can be
   left running. Full isolation (a later version) removes this gap.

@@ -15,9 +15,22 @@ nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shipyard-image.workspace = true
+shipyard-network.workspace = true
 shipyard-runtime.workspace = true
+shipyard-storage.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+proptest.workspace = true
+shipyard-test-support.workspace = true
+
+[[test]]
+name = "detached"
+path = "tests/detached.rs"
+harness = false
 
 [lints]
 workspace = true

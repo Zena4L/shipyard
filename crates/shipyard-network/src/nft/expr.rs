@@ -10,6 +10,11 @@
 //! Each is sent as `NFTA_LIST_ELEM { NFTA_EXPR_NAME name, NFTA_EXPR_DATA {…} }`.
 
 use super::consts::{
+    NFT_CONNLIMIT_F_INV, NFTA_CONNLIMIT_COUNT, NFTA_CONNLIMIT_FLAGS, NFTA_DYNSET_EXPR,
+    NFTA_DYNSET_OP, NFTA_DYNSET_SET_NAME, NFTA_DYNSET_SREG_KEY, NFTA_REJECT_ICMP_CODE,
+    NFTA_REJECT_TYPE,
+};
+use super::consts::{
     NFT_LOOKUP_F_INV, NFT_REG_VERDICT, NFTA_BITWISE_DREG, NFTA_BITWISE_LEN, NFTA_BITWISE_MASK,
     NFTA_BITWISE_SREG, NFTA_BITWISE_XOR, NFTA_CMP_DATA, NFTA_CMP_OP, NFTA_CMP_SREG, NFTA_CT_DREG,
     NFTA_CT_KEY, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NFTA_EXPR_DATA, NFTA_EXPR_NAME, NFTA_FIB_DREG,
@@ -66,6 +71,23 @@ pub(crate) enum Expr {
     },
     /// Changes the source to the outgoing interface's address.
     Masquerade,
+    /// Finds `sreg`'s key in the dynamic `set`, adding it if it isn't
+    /// there (`op`: `NFT_DYNSET_OP_ADD`), and runs `expr` as that
+    /// element's own (each element keeps its own state: a count). Where
+    /// `expr` doesn't match, nor does the rule.
+    Dynset {
+        set: String,
+        op: u32,
+        sreg: u32,
+        expr: Box<Expr>,
+    },
+    /// The connections counted for an element (in a `dynset`): matches
+    /// while there are at most `count`; with `invert`, once there are more.
+    Connlimit { count: u32, invert: bool },
+    /// Answers the packet with an error (`kind`: `NFT_REJECT_*`; `code`: an
+    /// ICMP one's code, none for a TCP reset) and drops it: the sender
+    /// learns at once.
+    Reject { kind: u32, code: Option<u8> },
 }
 
 impl Expr {
@@ -82,15 +104,22 @@ impl Expr {
             Expr::Verdict(_) => "immediate",
             Expr::Nat { .. } => "nat",
             Expr::Masquerade => "masq",
+            Expr::Dynset { .. } => "dynset",
+            Expr::Connlimit { .. } => "connlimit",
+            Expr::Reject { .. } => "reject",
         }
     }
 
     /// Appends the expression to a rule's `NFTA_RULE_EXPRESSIONS`.
     pub(crate) fn encode(&self, message: &mut MessageBuilder) {
-        message.nest(NFTA_LIST_ELEM, |message| {
-            message.attr_str(NFTA_EXPR_NAME, self.name());
-            message.nest(NFTA_EXPR_DATA, |data| self.encode_data(data));
-        });
+        message.nest(NFTA_LIST_ELEM, |message| self.encode_named(message));
+    }
+
+    /// Its name and data, without the list's wrapper (as a `dynset`
+    /// nests its one expression).
+    fn encode_named(&self, message: &mut MessageBuilder) {
+        message.attr_str(NFTA_EXPR_NAME, self.name());
+        message.nest(NFTA_EXPR_DATA, |data| self.encode_data(data));
     }
 
     fn encode_data(&self, data: &mut MessageBuilder) {
@@ -126,18 +155,7 @@ impl Expr {
                 dreg,
                 mask,
                 xor,
-            } => {
-                let len = u32::try_from(mask.len()).unwrap_or(u32::MAX);
-                data.attr_be32(NFTA_BITWISE_SREG, *sreg)
-                    .attr_be32(NFTA_BITWISE_DREG, *dreg)
-                    .attr_be32(NFTA_BITWISE_LEN, len)
-                    .nest(NFTA_BITWISE_MASK, |nested| {
-                        nested.attr(NFTA_DATA_VALUE, mask);
-                    })
-                    .nest(NFTA_BITWISE_XOR, |nested| {
-                        nested.attr(NFTA_DATA_VALUE, xor);
-                    });
-            }
+            } => encode_bitwise(data, *sreg, *dreg, mask, xor),
             Expr::Lookup {
                 set,
                 sreg,
@@ -188,8 +206,56 @@ impl Expr {
                     .attr_be32(NFTA_NAT_REG_PROTO_MIN, *reg_proto);
             }
             Expr::Masquerade => {}
+            Expr::Dynset {
+                set,
+                op,
+                sreg,
+                expr,
+            } => encode_dynset(data, set, *op, *sreg, expr),
+            Expr::Connlimit { count, invert } => encode_connlimit(data, *count, *invert),
+            Expr::Reject { kind, code } => encode_reject(data, *kind, *code),
         }
     }
+}
+
+/// `bitwise`'s data: `(sreg & mask) ^ xor` into `dreg`, over the mask's
+/// length.
+fn encode_bitwise(data: &mut MessageBuilder, sreg: u32, dreg: u32, mask: &[u8], xor: &[u8]) {
+    let len = u32::try_from(mask.len()).unwrap_or(u32::MAX);
+    data.attr_be32(NFTA_BITWISE_SREG, sreg)
+        .attr_be32(NFTA_BITWISE_DREG, dreg)
+        .attr_be32(NFTA_BITWISE_LEN, len)
+        .nest(NFTA_BITWISE_MASK, |nested| {
+            nested.attr(NFTA_DATA_VALUE, mask);
+        })
+        .nest(NFTA_BITWISE_XOR, |nested| {
+            nested.attr(NFTA_DATA_VALUE, xor);
+        });
+}
+
+/// `dynset`'s data: its set, operation and key register, and its one
+/// expression nested whole (no list around it).
+fn encode_dynset(data: &mut MessageBuilder, set: &str, op: u32, sreg: u32, expr: &Expr) {
+    data.attr_str(NFTA_DYNSET_SET_NAME, set)
+        .attr_be32(NFTA_DYNSET_OP, op)
+        .attr_be32(NFTA_DYNSET_SREG_KEY, sreg)
+        .nest(NFTA_DYNSET_EXPR, |nested| expr.encode_named(nested));
+}
+
+/// `reject`'s data: its kind, and an ICMP one's code.
+fn encode_reject(data: &mut MessageBuilder, kind: u32, code: Option<u8>) {
+    data.attr_be32(NFTA_REJECT_TYPE, kind);
+    if let Some(code) = code {
+        data.attr(NFTA_REJECT_ICMP_CODE, &[code]);
+    }
+}
+
+/// `connlimit`'s data: the limit, and "over" as its flag.
+fn encode_connlimit(data: &mut MessageBuilder, count: u32, invert: bool) {
+    data.attr_be32(NFTA_CONNLIMIT_COUNT, count).attr_be32(
+        NFTA_CONNLIMIT_FLAGS,
+        if invert { NFT_CONNLIMIT_F_INV } else { 0 },
+    );
 }
 
 #[cfg(test)]
@@ -287,6 +353,75 @@ mod tests {
             [NFTA_LOOKUP_SET, NFTA_LOOKUP_SREG, NFTA_LOOKUP_FLAGS]
         );
         assert_eq!(data[0].1, b"bridges\0");
+    }
+
+    /// A `dynset` nests its expression's name and data directly (one
+    /// expression, no list around it); `connlimit`'s "over" is its flag.
+    #[test]
+    fn a_dynset_nests_its_count_whole() {
+        use crate::nft::consts::NFT_DYNSET_OP_ADD;
+        let (name, data) = encoded(&Expr::Dynset {
+            set: "conns4".into(),
+            op: NFT_DYNSET_OP_ADD,
+            sreg: NFT_REG32_00,
+            expr: Box::new(Expr::Connlimit {
+                count: 8192,
+                invert: true,
+            }),
+        });
+        assert_eq!(name, "dynset");
+        assert_eq!(
+            data[..3],
+            [
+                (NFTA_DYNSET_SET_NAME, b"conns4\0".to_vec()),
+                (NFTA_DYNSET_OP, vec![0, 0, 0, 0]),
+                (NFTA_DYNSET_SREG_KEY, vec![0, 0, 0, 8]),
+            ]
+        );
+        assert_eq!(data[3].0, NFTA_DYNSET_EXPR);
+        let nested: Vec<_> = Attrs::new(&data[3].1).flatten().collect();
+        assert_eq!(
+            (nested[0].kind, nested[0].value),
+            (NFTA_EXPR_NAME, &b"connlimit\0"[..])
+        );
+        assert_eq!(nested[1].kind, NFTA_EXPR_DATA);
+        let count: Vec<_> = nested[1]
+            .nested()
+            .flatten()
+            .map(|attr| (attr.kind, attr.value.to_vec()))
+            .collect();
+        assert_eq!(
+            count,
+            [
+                (NFTA_CONNLIMIT_COUNT, 8192_u32.to_be_bytes().to_vec()),
+                (NFTA_CONNLIMIT_FLAGS, vec![0, 0, 0, 1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reset_has_no_code() {
+        let (_, data) = encoded(&Expr::Reject {
+            kind: 1,
+            code: None,
+        });
+        assert_eq!(data, [(NFTA_REJECT_TYPE, vec![0, 0, 0, 1])]);
+    }
+
+    #[test]
+    fn a_reject_says_its_kind_and_one_byte_code() {
+        let (name, data) = encoded(&Expr::Reject {
+            kind: 2,
+            code: Some(3),
+        });
+        assert_eq!(name, "reject");
+        assert_eq!(
+            data,
+            [
+                (NFTA_REJECT_TYPE, vec![0, 0, 0, 2]),
+                (NFTA_REJECT_ICMP_CODE, vec![3])
+            ]
+        );
     }
 
     #[test]

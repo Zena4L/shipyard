@@ -23,12 +23,17 @@
 //! digest.
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::*;
+pub use linux::entry_point;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{Outcome, Request, ranges, run};
 
 /// Runs this process as the storage helper, if that's what it was started
-/// as; otherwise returns at once. Called first thing in `main`.
+/// as; otherwise returns at once. Called first thing in `main`, with what
+/// starts the binary's logging (the helper's warnings go to stderr).
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn entry_point() {}
+pub fn entry_point(init_logging: impl FnOnce()) {
+    let _ = init_logging;
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -39,7 +44,6 @@ mod linux {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use anyhow::{Context as _, Result, anyhow, bail};
     use nix::fcntl::OFlag;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use serde::{Deserialize, Serialize};
@@ -47,6 +51,8 @@ mod linux {
         IdRanges, LayerReport, LayerSpec, Limits, Ownership, Store, StoreLock, UnpackOptions,
     };
     use shipyard_runtime::isolation::{IdMap, IdMaps};
+
+    use crate::error::{Context as _, Error, ErrorKind, Result, bail};
 
     /// The hidden first argument the helper is started with.
     const HELPER_ARG: &str = "__shipyard-storage";
@@ -169,7 +175,7 @@ mod linux {
         let status = helper.wait().context("waiting for the storage helper")?;
         let outcome = result?;
         if matches!(outcome, Outcome::Done(_)) && !status.success() {
-            bail!("the storage helper failed ({status})");
+            bail!(Storage, "the storage helper failed ({status})");
         }
         Ok(outcome)
     }
@@ -183,8 +189,12 @@ mod linux {
         request: &Request,
     ) -> Result<Outcome> {
         let mut lines = Lines::default();
-        let ready: Ready =
-            lines.read(from_helper, helper, Some(Instant::now() + READY_DEADLINE))?;
+        let ready: Ready = lines.read(
+            from_helper,
+            helper,
+            Some(Instant::now() + READY_DEADLINE),
+            look,
+        )?;
         if let Ready::Refused(reason) = ready {
             return Ok(Outcome::Refused(reason));
         }
@@ -197,11 +207,17 @@ mod linux {
             .write_all(&line)
             .context("sending the storage helper its request")?;
         drop(to_helper);
-        match lines.read(from_helper, helper, None)? {
+        match lines.read(from_helper, helper, None, look)? {
             Answer::Done(report) => Ok(Outcome::Done(report)),
             Answer::Refused(reason) => Ok(Outcome::Refused(reason)),
-            Answer::Failed(message) => Err(anyhow!(message)),
+            Answer::Failed(message) => Err(Error::new(ErrorKind::Storage, message)),
         }
+    }
+
+    /// One look at the helper's pipe: up to 100 ms, then the helper is
+    /// checked on.
+    fn look(fds: &mut [PollFd<'_>]) -> nix::Result<libc::c_int> {
+        poll(fds, PollTimeout::from(100_u16))
     }
 
     /// JSON lines read from the helper, watching it doesn't die silently.
@@ -216,7 +232,12 @@ mod linux {
             from: &OwnedFd,
             helper: &mut Child,
             deadline: Option<Instant>,
+            mut look: impl FnMut(&mut [PollFd<'_>]) -> nix::Result<libc::c_int>,
         ) -> Result<T> {
+            // Once it's gone: what it wrote before it went is still in the
+            // pipe, so it's read to the end (its end of file, now nothing
+            // else holds the pipe) before it counts as not answering.
+            let mut gone = None;
             loop {
                 if let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = self.pending.drain(..=end).collect();
@@ -224,20 +245,24 @@ mod linux {
                         .context("the storage helper answered nonsense");
                 }
                 if deadline.is_some_and(|deadline| Instant::now() > deadline) {
-                    bail!("the storage helper didn't start in time");
+                    bail!(Storage, "the storage helper didn't start in time");
                 }
                 let mut fds = [PollFd::new(
                     std::os::fd::AsFd::as_fd(from),
                     PollFlags::POLLIN,
                 )];
-                match poll(&mut fds, PollTimeout::from(100_u16)) {
+                match look(&mut fds) {
                     Ok(0) | Err(nix::errno::Errno::EINTR) => {
-                        if let Some(status) = helper
-                            .try_wait()
-                            .context("waiting for the storage helper")?
-                        {
-                            bail!("the storage helper ended without answering ({status})");
+                        if let Some(status) = gone {
+                            // Gone, and its pipe still open elsewhere.
+                            bail!(
+                                Storage,
+                                "the storage helper ended without answering ({status})"
+                            );
                         }
+                        gone = helper
+                            .try_wait()
+                            .context("waiting for the storage helper")?;
                         continue;
                     }
                     Ok(_) => {}
@@ -247,7 +272,13 @@ mod linux {
                 let read =
                     nix::unistd::read(from, &mut buf).context("reading the storage helper")?;
                 if read == 0 {
-                    bail!("the storage helper ended without answering");
+                    if let Some(status) = gone {
+                        bail!(
+                            Storage,
+                            "the storage helper ended without answering ({status})"
+                        );
+                    }
+                    bail!(Storage, "the storage helper ended without answering");
                 }
                 self.pending.extend_from_slice(&buf[..read]);
             }
@@ -259,8 +290,10 @@ mod linux {
     /// Runs this process as the storage helper, if that's what it was
     /// started as; otherwise returns at once. **Call it first thing in
     /// `main`**, before anything starts a thread: making a user namespace
-    /// needs a single-threaded process.
-    pub(crate) fn entry_point() {
+    /// needs a single-threaded process. `init_logging` starts the binary's
+    /// logging, once it's known to be the helper (its warnings go to
+    /// stderr).
+    pub fn entry_point(init_logging: impl FnOnce()) {
         let args: Vec<OsString> = std::env::args_os().collect();
         if args.get(1).map(OsString::as_os_str) != Some(HELPER_ARG.as_ref()) {
             return;
@@ -299,7 +332,7 @@ mod linux {
             &held,
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         );
-        crate::init_tracing(None, false);
+        init_logging();
         // 0 on success, 1 otherwise (the caller reads the answer, not this).
         let succeeded = helper(&store, input, output);
         drop(held);
@@ -401,5 +434,57 @@ mod linux {
     /// The IDs a map lets this namespace give files.
     pub(crate) fn ranges(maps: &[IdMap]) -> IdRanges {
         IdRanges(maps.iter().map(|map| (map.container, map.size)).collect())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, reason = "tests")]
+    mod tests {
+        use super::*;
+
+        /// A helper that answers, then ends, between a look at its pipe that
+        /// saw nothing and the check that it's still there: its answer is
+        /// read all the same (it's in the pipe), not taken for none.
+        #[test]
+        fn an_answer_a_gone_helper_left_in_its_pipe_is_read() {
+            let (from, to) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            let mut helper = Command::new("sh")
+                .args(["-c", r#"printf '"Ready"\n'"#])
+                .stdout(Stdio::from(to))
+                .spawn()
+                .unwrap();
+            // Answered and gone before the first look.
+            helper.wait().unwrap();
+            let mut first = true;
+            let look = |fds: &mut [PollFd<'_>]| {
+                if std::mem::take(&mut first) {
+                    return Ok(0);
+                }
+                poll(fds, PollTimeout::ZERO)
+            };
+            let ready: Ready = Lines::default()
+                .read(&from, &mut helper, None, look)
+                .unwrap();
+            assert!(matches!(ready, Ready::Ready));
+        }
+
+        /// A helper that ends without a word is told as one, not waited for.
+        #[test]
+        fn a_helper_that_ends_without_answering_is_an_error() {
+            let (from, to) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            let mut helper = Command::new("true")
+                .stdout(Stdio::from(to))
+                .spawn()
+                .unwrap();
+            helper.wait().unwrap();
+            let error = Lines::default()
+                .read::<Ready>(&from, &mut helper, None, |fds: &mut [PollFd<'_>]| {
+                    poll(fds, PollTimeout::ZERO)
+                })
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("ended without answering"),
+                "{error}"
+            );
+        }
     }
 }

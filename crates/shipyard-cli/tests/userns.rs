@@ -26,7 +26,14 @@ const MAP: &str = "0:100000:65536";
 
 /// `shipyard run ARGS… sh -c SCRIPT`.
 fn shipyard_run(args: &[&str], script: &str) -> Run {
-    run(SHIPYARD.command(&[&["run"], args, &["sh", "-c", script]].concat()))
+    run(SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(args),
+            args,
+            &["sh", "-c", script],
+        ]
+        .concat(),
+    ))
 }
 
 /// The same, which must succeed: its output.
@@ -358,7 +365,16 @@ fn a_permission_error_names_the_mapped_user() {
 #[ignore = "needs root"]
 fn a_foreign_proc_is_refused() {
     let mut command = std::process::Command::new("unshare");
-    command.args(["-p", "-f", SHIPYARD.path(), "run", "--uidmap", MAP, "true"]);
+    command.args([
+        "-p",
+        "-f",
+        SHIPYARD.path(),
+        "run",
+        "--no-image",
+        "--uidmap",
+        MAP,
+        "true",
+    ]);
     let run = run(command);
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(

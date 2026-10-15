@@ -30,7 +30,10 @@ pub mod store;
 pub mod tar_reader;
 pub mod unpack;
 
-pub use containers::{Area, AreaError, ContainerArea, LiveArea, areas, remove_areas, trash_areas};
+pub use containers::{
+    Area, AreaError, ContainerArea, LiveArea, OwnedArea, areas, owned_area_name, remove_areas,
+    trash_areas,
+};
 pub use credentials::{Credential, CredentialError, Credentials, FoundCredential};
 pub use digest::{Digest, DigestError, Verifier, VerifyError};
 pub use images::{
@@ -42,7 +45,8 @@ pub use images::{
 // index); its other types are re-exported.
 pub use index::{DiskUsage, ImageRecord, IndexError, ListedImage};
 pub use manifest::{
-    Descriptor, ImageConfig, ImageManifest, Index, ManifestError, Platform, RuntimeConfig,
+    Descriptor, ImageConfig, ImageHealthcheck, ImageManifest, Index, ManifestError, Platform,
+    RuntimeConfig,
 };
 pub use pull::{PullError, PullOptions, Pulled, from_store, pull};
 pub use reference::{ImageReference, ReferenceError};

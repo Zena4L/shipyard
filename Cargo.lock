@@ -719,9 +719,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -771,7 +771,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -923,13 +923,11 @@ dependencies = [
  "libc",
  "nix",
  "proptest",
- "serde",
  "serde_json",
  "shipyard-engine",
  "shipyard-image",
  "shipyard-network",
  "shipyard-runtime",
- "shipyard-storage",
  "shipyard-test-support",
  "tar",
  "tracing",
@@ -938,21 +936,27 @@ dependencies = [
 
 [[package]]
 name = "shipyard-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "anyhow",
  "libc",
  "nix",
+ "proptest",
  "serde",
  "serde_json",
  "shipyard-image",
+ "shipyard-network",
  "shipyard-runtime",
+ "shipyard-storage",
+ "shipyard-test-support",
  "tar",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
 name = "shipyard-image"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "flate2",
@@ -970,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-network"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix",
@@ -982,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix",
@@ -997,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "thiserror",
@@ -1005,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-test-support"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -1327,7 +1331,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

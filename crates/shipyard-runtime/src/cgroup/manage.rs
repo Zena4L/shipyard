@@ -231,6 +231,35 @@ pub fn runtime_cgroup(id: &str) -> PathBuf {
     Path::new(RUNTIME_PARENT).join(id)
 }
 
+/// A container's monitor's cgroup, relative to the base
+/// ([`MONITOR_PARENT`](super::MONITOR_PARENT)`/<id>`). `id` is a valid
+/// container ID, so one path component.
+#[must_use]
+pub fn monitor_cgroup(id: &str) -> PathBuf {
+    Path::new(super::MONITOR_PARENT).join(id)
+}
+
+/// Removes the cgroups in `parent` other than `ours` that are empty and at
+/// least `age` old: those whose last process went without removing them (a
+/// DNS server's network removed by hand, a monitor's container removed from
+/// inside it). A cgroup with a process in it can't be removed (`rmdir`
+/// refuses), so a live one never is; the age spares one made a moment ago,
+/// its process not in it yet.
+pub fn remove_empty_left_over(parent: &Path, ours: &str, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|made| made.elapsed().is_ok_and(|elapsed| elapsed >= age));
+        if entry.file_name() != ours && old {
+            let _ = std::fs::remove_dir(entry.path());
+        }
+    }
+}
+
 /// Removes the run cgroup at `path` (below `base`) if no live run holds its
 /// lock. Whether it went, or was gone.
 ///
@@ -238,7 +267,7 @@ pub fn runtime_cgroup(id: &str) -> PathBuf {
 /// means that run is gone; what it left in its cgroup (processes that
 /// outlived it, with no PID namespace to end them, or cgroups made below)
 /// is killed, then the cgroup goes, deepest first. Only one of shipyard's
-/// run cgroups ([`Cgroup::recorded`]: never the root, a parent, or this
+/// run cgroups ([`Cgroup::container`]: never the root, a parent, or this
 /// process's own). What's still dying is left for the next sweep: a run's
 /// start never waits on it.
 pub(super) fn remove_if_stale(path: &Path, base: &Path) -> bool {
@@ -251,7 +280,7 @@ pub(super) fn remove_if_stale(path: &Path, base: &Path) -> bool {
     if std::fs::remove_dir(path).is_ok() {
         return true;
     }
-    Cgroup::recorded(path.to_owned(), base.to_owned())
+    Cgroup::container(path.to_owned(), base.to_owned())
         .is_ok_and(|cgroup| cgroup.remove(Duration::ZERO).is_ok())
 }
 
@@ -295,10 +324,12 @@ impl Cgroup {
     }
 
     /// The cgroup at `path`, made earlier below `base` (both absolute, as
-    /// recorded): only a container's own. Whatever else a record might say
-    /// (the root, `..`, shipyard's parents, the cgroup this process runs in
-    /// or one above it, a base this user doesn't own), killing all in it
-    /// could take the host, or this very process, along.
+    /// recorded): only one of Shipyard's own, a container's or one of its
+    /// services' (a DNS server's, a container's monitor's). Whatever else a
+    /// record might say (the root, `..`, shipyard's parents, the cgroup this
+    /// process runs in or one above it, a base this user doesn't own),
+    /// killing all in it could take the host, or this very process, along.
+    /// For what a container's record or bundle names, [`Cgroup::container`].
     ///
     /// The record's base, not this process's own [`Tree`](super::Tree): a
     /// rootless container made from a desktop terminal is deleted from an SSH
@@ -321,8 +352,27 @@ impl Cgroup {
         let users_base = euid.is_root()
             || std::fs::metadata(&base).is_ok_and(|meta| meta.uid() == euid.as_raw());
         let own = super::own_cgroup().map(|own| absolute(&own));
-        if plain_base && users_base && is_container_cgroup(&path, &base, own.as_deref()) {
+        if plain_base && users_base && is_shipyard_cgroup(&path, &base, own.as_deref()) {
             Ok(Self { path, base })
+        } else {
+            Err(CgroupError::NotShipyards(path))
+        }
+    }
+
+    /// The cgroup at `path`, below `base`, as a container's record (or its
+    /// bundle's `linux.cgroupsPath`) names it: as [`Cgroup::recorded`], and
+    /// never one below [`DNS_PARENT`](super::DNS_PARENT) or
+    /// [`MONITOR_PARENT`](super::MONITOR_PARENT). A bundle could name another
+    /// container's monitor's, or a network's DNS server's, and its `delete`
+    /// would kill them.
+    ///
+    /// # Errors
+    ///
+    /// `NotShipyards` for any other path or base.
+    pub fn container(path: PathBuf, base: PathBuf) -> Result<Self, CgroupError> {
+        let own = super::own_cgroup().map(|own| absolute(&own));
+        if is_container_cgroup(&path, &base, own.as_deref()) {
+            Self::recorded(path, base)
         } else {
             Err(CgroupError::NotShipyards(path))
         }
@@ -662,6 +712,20 @@ impl Cgroup {
             .is_ok_and(|text| parse_keyed(&text).get("frozen").copied() == Some(1))
     }
 
+    /// Its `cgroup.procs`, open for writing (close-on-exec): a child about
+    /// to `exec` writes `0` to it (one `write`, async-signal-safe) to move
+    /// itself in, before it runs anything.
+    ///
+    /// # Errors
+    ///
+    /// The file can't be opened.
+    pub fn procs_for_a_child(&self) -> Result<std::fs::File, CgroupError> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.path.join("cgroup.procs"))
+            .map_err(|err| self.error("opening cgroup.procs", io_errno(&err)))
+    }
+
     /// Moves process `pid` into it (its `cgroup.procs`).
     pub(crate) fn add(&self, pid: Pid) -> Result<(), CgroupError> {
         write_file(&self.path.join("cgroup.procs"), &pid.as_raw().to_string())
@@ -807,11 +871,22 @@ fn handing_down<'a>(path: &'a Path, base: &Path) -> Vec<&'a Path> {
     ancestors
 }
 
-/// Whether `path` can be a container's cgroup: strictly below `base` (a
+/// Whether `path` can be a container's cgroup: one of Shipyard's
+/// ([`is_shipyard_cgroup`]), and not below a parent of its services' (a
+/// container's monitor's, a DNS server's).
+pub(super) fn is_container_cgroup(path: &Path, base: &Path, own: Option<&Path>) -> bool {
+    let services = [super::DNS_PARENT, super::MONITOR_PARENT];
+    is_shipyard_cgroup(path, base, own)
+        && !path
+            .strip_prefix(base)
+            .is_ok_and(|below| services.iter().any(|parent| below.starts_with(parent)))
+}
+
+/// Whether `path` can be one of Shipyard's cgroups: strictly below `base` (a
 /// [`Tree`](super::Tree)'s, so itself below the root), by plain names (no
 /// `.`, `..`), not one of shipyard's parents, and not `own` (this process's
 /// cgroup, absolute) or above it.
-pub(super) fn is_container_cgroup(path: &Path, base: &Path, own: Option<&Path>) -> bool {
+pub(super) fn is_shipyard_cgroup(path: &Path, base: &Path, own: Option<&Path>) -> bool {
     let Ok(below) = path.strip_prefix(base) else {
         return false;
     };
@@ -822,6 +897,8 @@ pub(super) fn is_container_cgroup(path: &Path, base: &Path, own: Option<&Path>) 
         Path::new(SHIPYARD).to_path_buf(),
         Path::new(RUN_PARENT).to_path_buf(),
         Path::new(RUNTIME_PARENT).to_path_buf(),
+        Path::new(super::DNS_PARENT).to_path_buf(),
+        Path::new(super::MONITOR_PARENT).to_path_buf(),
     ];
     plain
         && !below.as_os_str().is_empty()
@@ -888,6 +965,48 @@ fn io_errno(err: &std::io::Error) -> Errno {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plain directories stand in for cgroups (`rmdir` refuses a non-empty
+    /// one, as it refuses a cgroup with processes): an old empty one goes;
+    /// one made a moment ago, an old one with something in it, and `ours`
+    /// (old and empty) stay.
+    #[test]
+    fn only_old_empty_left_overs_are_removed() {
+        let parent = std::env::temp_dir().join(format!(
+            "shipyard-left-over-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for name in ["old", "new", "full", "ours"] {
+            std::fs::create_dir_all(parent.join(name)).unwrap();
+        }
+        std::fs::write(parent.join("full/cgroup.procs"), b"1\n").unwrap();
+        // An hour ago (after what's made in them: that dates them now).
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for name in ["old", "full", "ours"] {
+            std::fs::File::open(parent.join(name))
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        }
+        remove_empty_left_over(&parent, "ours", Duration::from_secs(600));
+        let mut left: Vec<String> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["full", "new", "ours"]);
+        // The control: with no age to wait for, `new` goes too.
+        remove_empty_left_over(&parent, "ours", Duration::ZERO);
+        assert!(!parent.join("new").exists());
+        assert!(parent.join("ours").exists() && parent.join("full").exists());
+        // A parent that isn't there: nothing to do, no panic.
+        remove_empty_left_over(&parent.join("gone"), "ours", Duration::ZERO);
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
 
     /// Frozen, then killed one by one (before Linux 5.14, without
     /// `cgroup.kill`): a fork bomb goes, all of it, where passes PID by PID
@@ -1023,8 +1142,28 @@ mod tests {
             // A bundle's linux.cgroupsPath, absolute or relative.
             "/sys/fs/cgroup/default/web-1",
             "/sys/fs/cgroup/shipyard/runtime/pods/web-1",
+            // Beside the services' parents, not below them.
+            "/sys/fs/cgroup/shipyard/dnsmasq/web-1",
+            "/sys/fs/cgroup/shipyard/monitors-old/web-1",
         ] {
             assert!(is_container_cgroup(Path::new(ok), root, Some(own)), "{ok}");
+        }
+        // Shipyard's services' own: theirs, never a container's (a bundle's
+        // cgroupsPath naming one, whose delete would kill it).
+        for service in [
+            "/sys/fs/cgroup/shipyard/dns/app-0a1b2c3d",
+            "/sys/fs/cgroup/shipyard/monitors/web-1",
+            "/sys/fs/cgroup/shipyard/monitors/web-1/below",
+            "/sys/fs/cgroup/shipyard/dns/app-0a1b2c3d/below",
+        ] {
+            assert!(
+                is_shipyard_cgroup(Path::new(service), root, Some(own)),
+                "{service}"
+            );
+            assert!(
+                !is_container_cgroup(Path::new(service), root, Some(own)),
+                "{service}"
+            );
         }
         for bad in [
             "/sys/fs/cgroup",
@@ -1032,6 +1171,8 @@ mod tests {
             "/sys/fs/cgroup/shipyard",
             "/sys/fs/cgroup/shipyard/run",
             "/sys/fs/cgroup/shipyard/runtime",
+            "/sys/fs/cgroup/shipyard/dns",
+            "/sys/fs/cgroup/shipyard/monitors",
             "/sys/fs/cgroup/shipyard/runtime/..",
             "/sys/fs/cgroup/shipyard/runtime/../..",
             "/sys/fs/cgroup2/web",
@@ -1042,6 +1183,10 @@ mod tests {
         ] {
             assert!(
                 !is_container_cgroup(Path::new(bad), root, Some(own)),
+                "{bad}"
+            );
+            assert!(
+                !is_shipyard_cgroup(Path::new(bad), root, Some(own)),
                 "{bad}"
             );
         }
@@ -1063,6 +1208,9 @@ mod tests {
             format!("{USER}/shipyard"),
             format!("{USER}/shipyard/run"),
             format!("{USER}/shipyard/runtime"),
+            // Shipyard's services'.
+            format!("{USER}/shipyard/monitors/web-1"),
+            format!("{USER}/shipyard/dns/app-0a1b2c3d"),
             // Above or beside it: root's, or another user's.
             "/sys/fs/cgroup/user.slice/user-1000.slice".to_owned(),
             "/sys/fs/cgroup/shipyard/runtime/web-1".to_owned(),

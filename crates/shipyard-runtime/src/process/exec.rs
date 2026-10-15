@@ -101,13 +101,13 @@ pub(crate) struct JoinerSetup {
     detach: bool,
     pause_ms: u32,
     /// Descriptors passed on to the command (see `passed.rs`), inherited.
-    passing: Option<super::passed::Passing>,
+    passing: Option<super::passed::PassedPlan>,
 }
 
 impl JoinerSetup {
     /// Every descriptor the joiner inherits by number (they must survive
     /// its exec: their close-on-exec flag is cleared in the fork).
-    fn passed(&self) -> Vec<RawFd> {
+    fn inherited(&self) -> Vec<RawFd> {
         self.early
             .iter()
             .chain(&self.late)
@@ -133,8 +133,9 @@ impl JoinerSetup {
 /// What the parent opened for the joiner: kept open until it has started.
 pub(crate) struct JoinerFiles {
     pub(crate) setup: OwnedFd,
-    /// The descriptors the setup names, and the setup's.
-    passed: Vec<RawFd>,
+    /// The descriptors the setup names, and the setup's: what the joiner
+    /// inherits by number.
+    inherited: Vec<RawFd>,
 }
 
 /// The descriptors the joiner passes on, by number: the container's cgroup
@@ -168,7 +169,7 @@ pub(crate) fn joiner_files(
     joining: &super::join::Joining,
     pipes: JoinerPipes,
     detach: bool,
-    passing: Option<&super::passed::Passing>,
+    passing: Option<&super::passed::PassedPlan>,
 ) -> Result<JoinerFiles> {
     let (early, late) = split_namespaces(joining)?;
     let setgroups_allowed = setgroups_allowed(joining);
@@ -203,10 +204,13 @@ pub(crate) fn joiner_files(
         pause_ms,
         passing: passing.cloned(),
     };
-    let mut passed = setup.passed();
+    let mut inherited = setup.inherited();
     let fd = super::setup::sealed_json(&setup, c"shipyard-exec", "exec's setup")?;
-    passed.push(fd.as_raw_fd());
-    Ok(JoinerFiles { setup: fd, passed })
+    inherited.push(fd.as_raw_fd());
+    Ok(JoinerFiles {
+        setup: fd,
+        inherited,
+    })
 }
 
 /// Starts the joiner for the container `joining` names: a sealed copy of
@@ -236,7 +240,7 @@ pub(crate) fn start_joiner(
         arg0: "shipyard-exec",
         entry: EXEC_ENTRY_ARG,
         setup: files.setup.as_raw_fd(),
-        passed: &files.passed,
+        inherited: &files.inherited,
         // The command's, which it clones with them.
         stdio,
     };
@@ -250,20 +254,20 @@ pub(crate) fn start_joiner(
 
 /// What the joiner says once the command exists: its PID, and whether the
 /// clone placed it in the container's cgroup.
-const RECORD_LEN: usize = 8;
+const JOINER_RECORD_LEN: usize = 8;
 
 /// Reads the joiner's record, waiting up to `limit`: the command's PID and
 /// whether it's in its cgroup. `None` if the joiner ended (or was killed)
 /// without one.
-pub(crate) fn read_record(
+pub(crate) fn read_joiner_record(
     pipe: &OwnedFd,
     limit: std::time::Duration,
 ) -> Option<(nix::unistd::Pid, bool)> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     let deadline = std::time::Instant::now() + limit;
-    let mut record = [0_u8; RECORD_LEN];
+    let mut record = [0_u8; JOINER_RECORD_LEN];
     let mut filled = 0;
-    while filled < RECORD_LEN {
+    while filled < JOINER_RECORD_LEN {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return None;
@@ -314,7 +318,7 @@ fn run(setup_fd: RawFd) -> ! {
     };
     // Passed across the exec, so not close-on-exec: make them so again (the
     // command closes them for good anyway, `child.rs`).
-    close_on_exec(setup.passed());
+    close_on_exec(setup.inherited());
     // The passed descriptors' targets (3 and up), held before anything is
     // opened here (the terminal, say), and before the container's limits
     // apply (a low descriptor limit would refuse them). The command's
@@ -323,7 +327,10 @@ fn run(setup_fd: RawFd) -> ! {
     if !passing.sources.is_sorted() {
         fail(Failure::at(ChildStep::PassFds, Errno::EINVAL));
     }
-    let _reserved = super::passed::reserve(passing.sources.len()).unwrap_or_else(|err| {
+    // SAFETY: passed across the exec, this process's own (the setup names
+    // them), taken once, here.
+    let sources = unsafe { super::passed::adopt(&passing.sources) };
+    let _held = super::passed::Held::take(sources).unwrap_or_else(|err| {
         fail(Failure::at(
             ChildStep::PassFds,
             err.errno().unwrap_or(Errno::EBUSY),
@@ -394,7 +401,7 @@ fn run(setup_fd: RawFd) -> ! {
         Ok(Cloned::Parent { pid, in_cgroup }) => {
             // 5. Its PID, for shipyard (it can't see it otherwise: it's
             //    its child, but not one it started).
-            let mut record = [0_u8; RECORD_LEN];
+            let mut record = [0_u8; JOINER_RECORD_LEN];
             if let Some(head) = record.get_mut(..4) {
                 head.copy_from_slice(&pid.as_raw().to_ne_bytes());
             }

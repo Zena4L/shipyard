@@ -1,15 +1,22 @@
 //! `cp`: copying files into and out of a container (stage 8, step 8.5a),
-//! by runtime ID, with Docker's forms:
+//! with Docker's forms: by runtime ID ([`copy_out`], [`copy_in`]:
+//! `shipyard-runtime cp`), or by name, running or not ([`copy_by_name`]:
+//! `shipyard cp`, stage 9):
 //!
 //! ```text
 //! cp ID:SRC HOST_DEST     cp ID:SRC -         (a tar stream on stdout)
 //! cp HOST_SRC ID:DEST     cp - ID:DEST        (a tar stream on stdin)
 //! ```
 //!
-//! **Who touches what.** Inside the container, only a runtime helper
-//! (`shipyard_runtime::container::start_helper`): shipyard's own binary,
-//! joined to the container's user and mount namespaces, where `/` is the
-//! container's root and a planted symlink leads nowhere else. It writes the
+//! **Who touches what.** Inside the container, only a runtime helper:
+//! shipyard's own binary, where `/` is the container's root and a planted
+//! symlink leads nowhere else. For a container that's up, it joins the
+//! container's user and mount namespaces
+//! (`shipyard_runtime::container::start_helper`). For one that isn't
+//! (stopped, or never started: step 9.4c2), it makes its own and mounts the
+//! container's root there as a start would, its writable layer over its
+//! image and its volumes (`start_helper_in_view`); what only a running
+//! container has, its network's `/etc` files, isn't there. It writes the
 //! source as a tar stream (`pack.rs`), or extracts one
 //! (`shipyard_image::unpack_tar`). The host side only ever opens the user's
 //! own paths, and extracts a container's stream with the same safe
@@ -178,6 +185,16 @@ pub enum Transfer {
 }
 
 impl Transfer {
+    /// The container the copy is to or from, as its operand names it (a
+    /// name, ID, serial or ID prefix for `shipyard cp`; a runtime ID for
+    /// `shipyard-runtime cp`).
+    #[must_use]
+    pub fn container(&self) -> &str {
+        match self {
+            Self::Out { id, .. } | Self::In { id, .. } => id,
+        }
+    }
+
     /// The copy two operands ask for.
     ///
     /// # Errors
@@ -319,6 +336,71 @@ pub fn helper_entry_point() {
     shipyard_runtime::container::helper_entry_point(&helpers::HELPERS);
 }
 
+/// This side's streams for a copy: where a copy out writes its tar stream
+/// (when it goes to no host path), and where a copy in reads one (when it
+/// comes from none).
+pub struct Streams<'a> {
+    /// A copy in's stream.
+    pub input: &'a mut dyn Read,
+    /// A copy out's stream.
+    pub output: &'a mut dyn Write,
+}
+
+impl std::fmt::Debug for Streams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Streams").finish_non_exhaustive()
+    }
+}
+
+/// Does `transfer`, its container named by name, ID, serial or ID prefix
+/// (`shipyard cp`, stage 9), as `options` say, a stream in or out through
+/// `streams`:
+///
+/// - through the container if it's up (running or paused), its operation
+///   lock held for the copy (so a start waits until it's done, should the
+///   container end meanwhile);
+/// - otherwise (stopped, or created and never started: step 9.4c2) through
+///   its root as a start would mount it, its writable layer over its image
+///   and its volumes, with the container held meanwhile (a start, a stop or
+///   a removal waits for the copy). A read-only root (`--read-only`) and
+///   read-only volumes stay so: a copy into them fails as it would while
+///   the container runs (the kernel's `EROFS`).
+///
+/// # Errors
+///
+/// No such container; one being worked on (a start, another copy) past
+/// the operation lock's wait ([`ErrorKind::Busy`](crate::ErrorKind::Busy));
+/// what its root needs (its image gone from the store, a volume removed
+/// since); the copy's own failure: a [`CpError`] (found with
+/// [`Error::find`](crate::Error::find)), or the runtime's
+/// [`ContainerError`] for a helper the runtime refused.
+pub fn copy_by_name(
+    engine: &crate::Engine,
+    transfer: &Transfer,
+    streams: &mut Streams<'_>,
+    options: CpOptions,
+) -> crate::Result<CpReport> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::run::container_files(engine, transfer.container(), |files| {
+            let copied = match transfer {
+                Transfer::Out { path, to, .. } => {
+                    helpers::copy_out(files, path, to.as_deref(), &mut *streams.output, options)
+                }
+                Transfer::In { from, path, .. } => {
+                    helpers::copy_in(files, from.as_deref(), &mut *streams.input, path, options)
+                }
+            };
+            copied.map_err(crate::Error::from)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, transfer, streams, options);
+        Err(crate::error::linux_only("containers"))
+    }
+}
+
 /// Copies `path` out of container `id`, to the host path `to` or, if `None`,
 /// as a tar stream to `stream`.
 ///
@@ -335,7 +417,13 @@ pub fn copy_out(
 ) -> Result<CpReport, CpError> {
     #[cfg(target_os = "linux")]
     {
-        helpers::copy_out(root, id, path, to, stream, options)
+        helpers::copy_out(
+            crate::run::Files::Live { root, id },
+            path,
+            to,
+            stream,
+            options,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -360,7 +448,13 @@ pub fn copy_in(
 ) -> Result<CpReport, CpError> {
     #[cfg(target_os = "linux")]
     {
-        helpers::copy_in(root, id, from, stream, path, options)
+        helpers::copy_in(
+            crate::run::Files::Live { root, id },
+            from,
+            stream,
+            path,
+            options,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -1,0 +1,32 @@
+# Starts root's Shipyard containers whose restart policy says so when the
+# host starts (`always`; `unless-stopped` unless you stopped it; `on-failure`
+# after a failure), and settles what the last boot left. See README.md.
+[Unit]
+Description=Shipyard: start the containers whose restart policy brings them back
+Documentation=https://github.com/Zena4L/shipyard/tree/main/contrib/systemd
+Wants=network-online.target
+After=network-online.target remote-fs.target
+
+[Service]
+Type=oneshot
+# Active once started, so its stop (below) runs at the shutdown. (The
+# containers' monitors run in cgroups of Shipyard's own, `shipyard/monitors`,
+# where a cgroup tree is there: a shutdown ends them only after this stop.)
+RemainAfterExit=yes
+# Where `shipyard` is installed. A container that couldn't be started (125)
+# is said in the journal; the unit still counts as started, or systemd would
+# end every container it did start.
+ExecStart=/usr/local/bin/shipyard system recover
+SuccessExitStatus=125
+# At shutdown (or a stop of the unit): every container stopped with its own
+# stop signal and timeout, all at once; then whatever is left is killed.
+ExecStop=/usr/local/bin/shipyard system stop
+KillMode=mixed
+# No limit on the start: it starts each container in turn, and a unit whose
+# start times out is stopped (where there's no cgroup tree, the monitors are
+# in this unit's cgroup, and that would kill them).
+TimeoutStartSec=infinity
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target

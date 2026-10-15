@@ -328,14 +328,11 @@ impl Supervisor {
             placement,
             keep_ignored: self.keep_ignored(),
             #[cfg(target_os = "linux")]
-            exec: super::spawn::ExecSpawn {
-                detach: true,
-                console: console.is_some(),
-            },
+            exec: super::spawn::ExecSpawn { detach: true },
             // Its terminal, if it has one, goes to the console socket.
-            terminal: console.map(|(fd, size)| super::stdio::ChildTerminal::Socket { fd, size }),
+            terminal: console.map(|(fd, size)| super::stdio::ChildTerminal::Console { fd, size }),
             takes_terminal: console.is_some(),
-            passing: held.as_ref().map(super::passed::PassedFds::passing),
+            passing: held.as_ref().map(super::passed::PassedFds::plan),
             ..SpawnOptions::default()
         };
         let spawned = spawn(&spec, &options, None, |_| {});
@@ -419,7 +416,7 @@ impl Supervisor {
             stdio: child_ends.targets(),
             terminal: extras
                 .console
-                .map(|(fd, size)| super::stdio::ChildTerminal::Socket { fd, size })
+                .map(|(fd, size)| super::stdio::ChildTerminal::Console { fd, size })
                 .or(child_ends.terminal()),
             takes_terminal: pty || extras.console.is_some(),
             placement,
@@ -431,11 +428,8 @@ impl Supervisor {
             #[cfg(target_os = "linux")]
             cgroup: cgroup.as_ref().map(|run| run.cgroup().clone()),
             #[cfg(target_os = "linux")]
-            exec: super::spawn::ExecSpawn {
-                detach: false,
-                console: extras.console.is_some(),
-            },
-            passing: held.as_ref().map(super::passed::PassedFds::passing),
+            exec: super::spawn::ExecSpawn { detach: false },
+            passing: held.as_ref().map(super::passed::PassedFds::plan),
         };
         let started = |pid: Pid| self.signals.set_child(pid.as_raw());
         // Whether shipyard itself killed the command (its stop timeout): then

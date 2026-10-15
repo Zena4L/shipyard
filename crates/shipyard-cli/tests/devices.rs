@@ -33,7 +33,12 @@ const REFUSED: &str = "Operation not permitted";
 
 /// `shipyard run FLAGS… sh -c SCRIPT`.
 fn shipyard(flags: &[&str], script: &str) -> Run {
-    let args = [&["run"], flags, &["sh", "-c", script]].concat();
+    let args = [
+        shipyard_test_support::run_words(flags),
+        flags,
+        &["sh", "-c", script],
+    ]
+    .concat();
     run(SHIPYARD.command(&args))
 }
 
@@ -278,7 +283,10 @@ fn without_a_device_program_root_inside_cant_make_nodes() {
     );
     // Without a root filesystem, `/dev` is the host's: the warning says
     // what that leaves open.
-    let host_dev = run(without_cgroups(SHIPYARD.path(), &["run", "true"]));
+    let host_dev = run(without_cgroups(
+        SHIPYARD.path(),
+        &["run", "--no-image", "true"],
+    ));
     assert_eq!(host_dev.code, Some(0), "{}", host_dev.stderr);
     assert!(
         host_dev

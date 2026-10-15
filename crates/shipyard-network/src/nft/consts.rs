@@ -57,6 +57,34 @@ pub(crate) const NFTA_SET_ID: u16 = 10;
 pub(crate) const NFTA_SET_USERDATA: u16 = 13;
 pub(crate) const NFT_SET_INTERVAL: u32 = 0x4;
 pub(crate) const NFT_SET_MAP: u32 = 0x8;
+/// A dynamic set: rules add to it (`dynset`), as packets pass.
+pub(crate) const NFT_SET_EVAL: u32 = 0x20;
+/// A set's description (`NFTA_SET_DESC`), nesting its size: the most
+/// elements it holds.
+pub(crate) const NFTA_SET_DESC: u16 = 9;
+pub(crate) const NFTA_SET_DESC_SIZE: u16 = 1;
+
+/// `dynset`: adds the key in a register to a set, as a packet passes, and
+/// runs the element's own expression (one, nested) on the packet.
+pub(crate) const NFTA_DYNSET_SET_NAME: u16 = 1;
+pub(crate) const NFTA_DYNSET_OP: u16 = 3;
+pub(crate) const NFTA_DYNSET_SREG_KEY: u16 = 4;
+pub(crate) const NFTA_DYNSET_EXPR: u16 = 7;
+pub(crate) const NFT_DYNSET_OP_ADD: u32 = 0;
+
+/// `connlimit`: an element's count of connections (`nf_conncount`),
+/// compared with a limit; inverted, it matches when the count is over.
+pub(crate) const NFTA_CONNLIMIT_COUNT: u16 = 1;
+pub(crate) const NFTA_CONNLIMIT_FLAGS: u16 = 2;
+pub(crate) const NFT_CONNLIMIT_F_INV: u32 = 1;
+
+/// `reject`: answers the packet with an error and drops it. `icmpx` codes
+/// are the family-neutral ones (for IPv4 and IPv6 alike, in `inet`).
+pub(crate) const NFTA_REJECT_TYPE: u16 = 1;
+pub(crate) const NFTA_REJECT_ICMP_CODE: u16 = 2;
+pub(crate) const NFT_REJECT_TCP_RST: u32 = 1;
+pub(crate) const NFT_REJECT_ICMPX_UNREACH: u32 = 2;
+pub(crate) const NFT_REJECT_ICMPX_ADMIN_PROHIBITED: u8 = 3;
 
 /// Set elements.
 pub(crate) const NFTA_SET_ELEM_LIST_TABLE: u16 = 1;
@@ -130,6 +158,8 @@ pub(crate) const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
 pub(crate) const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = 2;
 pub(crate) const NFT_CMP_EQ: u32 = 0;
 pub(crate) const NFT_CMP_NEQ: u32 = 1;
+pub(crate) const NFT_CMP_LTE: u32 = 3;
+pub(crate) const NFT_CMP_GTE: u32 = 5;
 pub(crate) const NFT_NAT_DNAT: u32 = 1;
 pub(crate) const NFT_FIB_RESULT_ADDRTYPE: u32 = 3;
 pub(crate) const NFTA_FIB_F_DADDR: u32 = 2;
@@ -138,10 +168,17 @@ pub(crate) const NFT_CT_STATUS: u32 = 2;
 
 /// A route type: the address is one of this host's (`RTN_LOCAL`).
 pub(crate) const RTN_LOCAL: u32 = 2;
+
+/// `ICMPv6`'s protocol number (`IPPROTO_ICMPV6`).
+pub(crate) const IPPROTO_ICMPV6: u8 = 58;
 /// `ct state` bits: invalid, established and related.
 pub(crate) const CT_STATE_INVALID: u32 = 1;
 pub(crate) const CT_STATE_ESTABLISHED: u32 = 1 << 1;
 pub(crate) const CT_STATE_RELATED: u32 = 1 << 2;
+/// `ct status` bit: the connection is in the table (`IPS_CONFIRMED`): its
+/// first packet has been through, past `postrouting` or `input`. Not in
+/// libc.
+pub(crate) const IPS_CONFIRMED: u32 = 1 << 3;
 /// `ct status` bit: the connection's destination was NAT'd (`IPS_DST_NAT`).
 pub(crate) const IPS_DST_NAT: u32 = 1 << 5;
 
@@ -230,6 +267,17 @@ mod tests {
             (NFT_MSG_DELSETELEM.into(), libc::NFT_MSG_DELSETELEM.into()),
             (NFT_SET_INTERVAL.into(), libc::NFT_SET_INTERVAL.into()),
             (NFT_SET_MAP.into(), libc::NFT_SET_MAP.into()),
+            (NFT_SET_EVAL.into(), libc::NFT_SET_EVAL.into()),
+            (NFT_DYNSET_OP_ADD.into(), libc::NFT_DYNSET_OP_ADD.into()),
+            (NFT_REJECT_TCP_RST.into(), libc::NFT_REJECT_TCP_RST.into()),
+            (
+                NFT_REJECT_ICMPX_UNREACH.into(),
+                libc::NFT_REJECT_ICMPX_UNREACH.into(),
+            ),
+            (
+                NFT_REJECT_ICMPX_ADMIN_PROHIBITED.into(),
+                libc::NFT_REJECT_ICMPX_ADMIN_PROHIBITED.into(),
+            ),
             (
                 NFT_SET_ELEM_INTERVAL_END.into(),
                 libc::NFT_SET_ELEM_INTERVAL_END.into(),
@@ -262,10 +310,13 @@ mod tests {
             ),
             (NFT_CMP_EQ.into(), libc::NFT_CMP_EQ.into()),
             (NFT_CMP_NEQ.into(), libc::NFT_CMP_NEQ.into()),
+            (NFT_CMP_LTE.into(), libc::NFT_CMP_LTE.into()),
+            (NFT_CMP_GTE.into(), libc::NFT_CMP_GTE.into()),
             (NFT_NAT_DNAT.into(), libc::NFT_NAT_DNAT.into()),
             (NFT_CT_STATE.into(), libc::NFT_CT_STATE.into()),
             (NFT_CT_STATUS.into(), libc::NFT_CT_STATUS.into()),
             (RTN_LOCAL.into(), libc::RTN_LOCAL.into()),
+            (IPPROTO_ICMPV6.into(), libc::IPPROTO_ICMPV6.into()),
             (NFPROTO_UNSPEC.into(), libc::NFPROTO_UNSPEC.into()),
             (NFPROTO_INET.into(), libc::NFPROTO_INET.into()),
             (NFPROTO_IPV4.into(), libc::NFPROTO_IPV4.into()),

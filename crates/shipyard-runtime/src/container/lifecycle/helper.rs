@@ -53,7 +53,7 @@ pub fn start_helper(
     };
     let target = u32::try_from(pid).map_err(|_| ContainerError::NotFound(id.to_owned()))?;
     let stopped = |err| match status_of(&dir) {
-        Ok(Status::Stopped) => wrong(id, Status::Stopped, action, WANTED),
+        Ok(status @ (Status::Stopping | Status::Stopped)) => wrong(id, status, action, WANTED),
         _ => err,
     };
     let namespaces = super::unshared(target, &[Namespace::User, Namespace::Mount])
@@ -73,3 +73,75 @@ pub fn start_helper(
     drop(lock);
     Ok(helper)
 }
+
+/// Starts helper `name` (as [`start_helper`]) in container root `view`,
+/// mounted as a start mounts it, in a mount namespace of the helper's own
+/// (and, if `view` has ID maps, a user namespace of its own, mapped so):
+/// for a container that isn't running, whose files are its writable layer
+/// over its image and its volumes (stage 9, step 9.4c2). The caller holds
+/// the container so nothing else mounts that layer meanwhile. The mounts
+/// go with the helper.
+///
+/// Call it from the process's main thread: the helper dies with the thread
+/// that started it.
+///
+/// # Errors
+///
+/// A helper that couldn't start, or couldn't make its namespaces
+/// ([`ContainerError::Helper`]).
+pub fn start_helper_in_view(
+    view: &crate::container::RootView,
+    name: &str,
+    args: &[u8],
+    stdin: &OwnedFd,
+    stdout: &OwnedFd,
+) -> Result<RunningHelper> {
+    use crate::process::helper::{launch_in_view, wait_for_byte};
+    let helper_error = |err: crate::Error| ContainerError::Helper(Box::new(err));
+    let (helper, handshake) =
+        launch_in_view(view, name, args, stdin, stdout).map_err(helper_error)?;
+    let Some(handshake) = handshake else {
+        return Ok(helper);
+    };
+    // Its own report says why, if it ended (its end of file).
+    let ended = |helper: RunningHelper, doing: &str, errno| match helper.wait() {
+        Err(err) => err,
+        Ok(()) => helper_error(crate::Error::sys(doing.to_owned(), errno)),
+    };
+    match wait_for_byte(&handshake.ready, READY_WAIT) {
+        Ok(()) => {}
+        Err(errno @ nix::errno::Errno::EPIPE) => {
+            drop(handshake);
+            return Err(ended(
+                helper,
+                "waiting for the helper's user namespace",
+                errno,
+            ));
+        }
+        // Stuck: killed (dropped), never waited for.
+        Err(errno) => {
+            drop((handshake, helper));
+            return Err(helper_error(crate::Error::sys(
+                "waiting for the helper's user namespace",
+                errno,
+            )));
+        }
+    }
+    if let Err(err) = crate::process::map_user_namespace(handshake.pid, &handshake.maps) {
+        // Unanswered, it stops; dropped, it's killed.
+        drop((handshake, helper));
+        return Err(helper_error(err));
+    }
+    if let Err(errno) = nix::unistd::write(&handshake.go, &[1]) {
+        drop(handshake);
+        return Err(ended(
+            helper,
+            "telling the helper its maps are written",
+            errno,
+        ));
+    }
+    Ok(helper)
+}
+
+/// How long a helper's starter waits for it to make its user namespace.
+const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);

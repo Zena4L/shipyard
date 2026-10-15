@@ -2,7 +2,7 @@
 //! where it can't.
 //!
 //! Each check is a line: `ok`; `warn`, when something is limited but a plain
-//! `shipyard run` works; `fail`, when a plain `run`, or `run --image`,
+//! `shipyard run` works; `fail`, when a plain `run --no-image`, or `run IMAGE`,
 //! fails here. The exit code is 1 if a check failed, so a script can ask.
 //!
 //! Some answers only trying can give. A host's settings can allow a user
@@ -33,7 +33,7 @@ enum Level {
     Ok,
     /// Limited: a plain `run` works, something asked for may not.
     Warn,
-    /// A plain `run`, or `run --image`, fails here.
+    /// A plain `run --no-image`, or `run IMAGE`, fails here.
     Fail,
 }
 
@@ -220,9 +220,12 @@ mod linux {
             if rootless { "rootless" } else { "root" }
         )?;
         // As a run finds it (an absolute path: the probe looks above it).
-        let store = crate::image::store_dir().and_then(|store| {
-            std::path::absolute(&store).with_context(|| format!("finding {}", store.display()))
-        });
+        let store = shipyard_engine::Paths::from_env()
+            .image_store()
+            .map_err(anyhow::Error::from)
+            .and_then(|store| {
+                std::path::absolute(store).with_context(|| format!("finding {}", store.display()))
+            });
         // The overlay is probed only where a run's would go, and only where
         // nobody else could swap the scratch directory for a link.
         let place = store.as_ref().ok().map(|store| probe_place(store));
@@ -257,6 +260,28 @@ mod linux {
         checks.push(network(rootless));
         checks.extend(firewall(rootless));
         checks.push(state());
+        checks.extend(held_off_check(shipyard_engine::run::restarts_held_off(
+            &crate::engine(),
+        )));
+        // Containers after the last logout, and after a reboot (stage 9,
+        // step 9.5c): where systemd runs.
+        if Path::new("/run/systemd/system").is_dir() {
+            let with_policy = with_restart_policy();
+            let kill = kill_user_processes_live()
+                .or_else(|| kill_user_processes(&logind_configs()))
+                .unwrap_or(false);
+            if rootless {
+                let lingering = lingering(uid);
+                checks.push(linger_check(lingering, with_policy));
+                checks.extend(logout_check(kill, lingering));
+            } else {
+                checks.extend(sudo_logout_check(
+                    kill,
+                    std::env::var_os("SUDO_USER").is_some(),
+                ));
+            }
+            checks.push(boot_unit(rootless, with_policy));
+        }
         Ok(checks)
     }
 
@@ -497,10 +522,11 @@ mod linux {
         const NAME: &str = "network";
         if rootless {
             return pasta_check(
-                shipyard_network::pasta::find(std::env::var_os("PATH").as_deref()).as_deref(),
+                shipyard_network::pasta::find(shipyard_engine::Paths::from_env().program_path())
+                    .as_deref(),
             );
         }
-        if !crate::network::host_root() {
+        if !shipyard_engine::network::host_root() {
             return Check::new(
                 Level::Warn,
                 NAME,
@@ -508,7 +534,7 @@ mod linux {
                  namespace of its own)",
             );
         }
-        if let Some(why) = crate::network::why_no_network() {
+        if let Some(why) = shipyard_engine::network::why_no_network() {
             return Check::new(
                 Level::Warn,
                 NAME,
@@ -533,10 +559,14 @@ mod linux {
     /// traffic (root's bridge network: a rootless one's goes through pasta,
     /// the host's own sockets). Nothing where there's no bridge network.
     fn firewall(rootless: bool) -> Option<Check> {
-        if rootless || !crate::network::host_root() || crate::network::why_no_network().is_some() {
+        if rootless
+            || !shipyard_engine::network::host_root()
+            || shipyard_engine::network::why_no_network().is_some()
+        {
             return None;
         }
-        let uplink = crate::network::default_route_interface(shipyard_network::Family::V4);
+        let uplink =
+            shipyard_engine::network::default_route_interface(shipyard_network::Family::V4);
         // The default network as `shipyard network create` would make it:
         // IPv4 only, with no DNS server of its own.
         let view = shipyard_network::firewalls::NetworkView {
@@ -545,7 +575,7 @@ mod linux {
             uplink6: None,
             outward: true,
             ipv6: false,
-            bridged: crate::network::bridged_traffic_filtered(),
+            bridged: shipyard_engine::network::bridged_traffic_filtered(),
             dns: None,
         };
         let conflicts = shipyard_network::nft::Nftables::new()
@@ -567,7 +597,7 @@ mod linux {
         let open: Vec<String> = conflicts
             .iter()
             .filter(|conflict| !conflict.fixed)
-            .map(crate::network::describe_conflict)
+            .map(shipyard_engine::network::describe_conflict)
             .collect();
         if open.is_empty() {
             Check::new(
@@ -596,8 +626,9 @@ mod linux {
         }
     }
 
-    /// Where `shipyard-runtime` keeps its containers' state (`shipyard run`
-    /// does without).
+    /// Where containers' runtime state is kept: `run -d`, `create`, `start`
+    /// and foreground image runs as containers need it (without it, a run
+    /// is supervised by `run` itself, with no record).
     fn state() -> Check {
         const NAME: &str = "runtime state";
         match shipyard_runtime::container::default_root() {
@@ -605,7 +636,252 @@ mod linux {
             Err(err) => Check::new(
                 Level::Warn,
                 NAME,
-                format!("shipyard-runtime (the OCI runtime) can't keep containers here: {err}"),
+                format!(
+                    "containers can't be kept here (no `run -d`, `create` or `start`; a run is \
+                     supervised by `run` itself): {err}"
+                ),
+            ),
+        }
+    }
+
+    /// Whether `shipyard system stop` still holds restart policies off
+    /// (`held`): it ran, and `shipyard system recover` hasn't since. Only
+    /// the boot unit's stop should leave it so, until the boot; a stop run
+    /// by hand leaves containers that end unrestarted.
+    pub(super) fn held_off_check(held: bool) -> Option<Check> {
+        held.then(|| {
+            Check::new(
+                Level::Warn,
+                "restarts",
+                "held off: `shipyard system stop` ran and `shipyard system recover` hasn't \
+                 since, so a container that ends isn't restarted (the boot unit runs it at the \
+                 next boot; if the host isn't shutting down, run it yourself)",
+            )
+        })
+    }
+
+    /// Whether user `uid`'s systemd user manager lingers (runs without a
+    /// login session: `loginctl enable-linger`): logind's marker file.
+    fn lingering(uid: nix::unistd::Uid) -> bool {
+        nix::unistd::User::from_uid(uid)
+            .ok()
+            .flatten()
+            .is_some_and(|user| {
+                Path::new("/var/lib/systemd/linger")
+                    .join(user.name)
+                    .exists()
+            })
+    }
+
+    pub(super) fn linger_check(lingering: bool, with_policy: usize) -> Check {
+        const NAME: &str = "linger";
+        match (lingering, with_policy) {
+            (true, _) => Check::new(
+                Level::Ok,
+                NAME,
+                "on: your user manager runs from boot (the user unit starts your containers then)",
+            ),
+            (false, 0) => Check::new(
+                Level::Ok,
+                NAME,
+                "off (no container has a restart policy that would need it)",
+            ),
+            (false, _) => Check::new(
+                Level::Warn,
+                NAME,
+                "off: after a reboot your containers come back only once you log in, and those \
+                 the user unit starts end at your last logout (`sudo loginctl enable-linger $USER`)",
+            ),
+        }
+    }
+
+    /// logind's settings files, as it reads them: its main one, then its
+    /// drop-ins in name order (one in `/etc` hides one of the same name in
+    /// `/run` or `/usr/lib`).
+    fn logind_configs() -> Vec<String> {
+        let mut configs: Vec<String> = std::fs::read_to_string("/etc/systemd/logind.conf")
+            .into_iter()
+            .collect();
+        let mut drop_ins = std::collections::BTreeMap::new();
+        for dir in [
+            "/usr/lib/systemd/logind.conf.d",
+            "/run/systemd/logind.conf.d",
+            "/etc/systemd/logind.conf.d",
+        ] {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "conf") {
+                    // Later directories hide earlier ones' of the same name.
+                    drop_ins.insert(entry.file_name(), path);
+                }
+            }
+        }
+        configs.extend(
+            drop_ins
+                .values()
+                .filter_map(|path| std::fs::read_to_string(path).ok()),
+        );
+        configs
+    }
+
+    /// Whether logind ends a login session's processes at logout, as it
+    /// says itself (its `KillUserProcesses` property, over D-Bus): what's in
+    /// effect, whatever its build's default. `None` if it can't be asked.
+    fn kill_user_processes_live() -> Option<bool> {
+        let output = Command::new("busctl")
+            .args([
+                "get-property",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "KillUserProcesses",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "b true" => Some(true),
+            "b false" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether logind's settings files (`configs`, in the order it reads
+    /// them) set `KillUserProcesses` in its `[Login]` section, and to what:
+    /// the last setting wins; `None` if none does (then its build decides:
+    /// upstream's default is `yes`, most distributions' `no`).
+    pub(super) fn kill_user_processes(configs: &[String]) -> Option<bool> {
+        let mut kill = None;
+        for config in configs {
+            let mut login = false;
+            for line in config.lines().map(str::trim) {
+                if line.starts_with('[') {
+                    login = line == "[Login]";
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                if login && key.trim() == "KillUserProcesses" {
+                    kill = match value.trim().to_ascii_lowercase().as_str() {
+                        "yes" | "y" | "true" | "t" | "on" | "1" => Some(true),
+                        "no" | "n" | "false" | "f" | "off" | "0" => Some(false),
+                        _ => kill,
+                    };
+                }
+            }
+        }
+        kill
+    }
+
+    /// A container's monitor stays in the cgroup of the command that made
+    /// it: made in a login session, it's in the session's scope, which logind
+    /// ends at logout with `KillUserProcesses=yes` (linger or not; seen on
+    /// Ubuntu 24.04, stage 9, step 9.5c). Under the user manager it isn't.
+    pub(super) fn logout_check(kill_user_processes: bool, lingering: bool) -> Option<Check> {
+        let fix = if lingering {
+            "start them under your user manager: `systemd-run --user --scope shipyard run -d …`"
+        } else {
+            "`sudo loginctl enable-linger $USER`, then start them under your user manager: \
+             `systemd-run --user --scope shipyard run -d …`"
+        };
+        kill_user_processes.then(|| {
+            Check::new(
+                Level::Warn,
+                "logout",
+                format!(
+                    "logind ends a login session's processes at logout (KillUserProcesses=yes): \
+                     containers made in one end with it ({fix})"
+                ),
+            )
+        })
+    }
+
+    /// How many containers have a restart policy (one that isn't `no`).
+    fn with_restart_policy() -> usize {
+        shipyard_engine::containers::list(&crate::engine()).map_or(0, |records| {
+            records
+                .iter()
+                .filter(|record| {
+                    record.config.restart != shipyard_engine::containers::RestartPolicy::No
+                })
+                .count()
+        })
+    }
+
+    /// Root's side of [`logout_check`]: a container made with `sudo` from a
+    /// user's login session has its monitor in that session's scope, and
+    /// logind ends it at the user's logout with `KillUserProcesses=yes` (its
+    /// `KillExcludeUsers=root` spares root's own sessions only; seen on
+    /// Ubuntu 24.04, stage 9, step 9.5c).
+    pub(super) fn sudo_logout_check(kill_user_processes: bool, sudo: bool) -> Option<Check> {
+        (kill_user_processes && sudo).then(|| {
+            Check::new(
+                Level::Warn,
+                "logout",
+                "logind ends a login session's processes at logout (KillUserProcesses=yes): \
+                 containers made with sudo from your session end with it (start them outside \
+                 it: `sudo systemd-run --scope shipyard run -d …`; the boot unit's are)",
+            )
+        })
+    }
+
+    /// Whether the boot unit (contrib/systemd) is enabled, and whether it
+    /// failed: root's, or (rootless) the user's, as `systemctl` says (an
+    /// install with `--global` included).
+    fn boot_unit(rootless: bool, with_policy: usize) -> Check {
+        let ask = |what: &str| {
+            let mut command = Command::new("systemctl");
+            if rootless {
+                command.arg("--user");
+            }
+            command
+                .args([what, "shipyard-recover.service"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .unwrap_or_default()
+        };
+        let enabled = matches!(ask("is-enabled").as_str(), "enabled" | "enabled-runtime");
+        let failed = ask("is-active") == "failed";
+        boot_unit_check(enabled, failed, with_policy, rootless)
+    }
+
+    /// The boot unit's line: a failed one's journal is the user's for a
+    /// rootless user unit (`journalctl --user`).
+    pub(super) fn boot_unit_check(
+        enabled: bool,
+        failed: bool,
+        with_policy: usize,
+        rootless: bool,
+    ) -> Check {
+        const NAME: &str = "restart at boot";
+        match (enabled, failed, with_policy) {
+            (true, true, _) => Check::new(
+                Level::Warn,
+                NAME,
+                format!(
+                    "the boot unit failed: see `journalctl {}-u shipyard-recover`",
+                    if rootless { "--user " } else { "" }
+                ),
+            ),
+            (true, false, _) => Check::new(Level::Ok, NAME, "the boot unit is enabled"),
+            (false, _, 0) => Check::new(
+                Level::Ok,
+                NAME,
+                "the boot unit isn't enabled (no container has a restart policy)",
+            ),
+            (false, _, count) => Check::new(
+                Level::Warn,
+                NAME,
+                format!(
+                    "{count} {} a restart policy, and none comes back after a reboot: the boot \
+                     unit isn't enabled (see contrib/systemd)",
+                    super::plural(count, "container has", "containers have")
+                ),
             ),
         }
     }
@@ -861,8 +1137,9 @@ mod tests {
         use shipyard_runtime::process::probe::Probe;
 
         use super::super::linux::{
-            ProbedAt, controllers_check, decode, encode, firewall_check, left_by_gone, mounts,
-            overlay_check, pasta_check, user_namespaces,
+            ProbedAt, boot_unit_check, controllers_check, decode, encode, firewall_check,
+            held_off_check, kill_user_processes, left_by_gone, linger_check, logout_check, mounts,
+            overlay_check, pasta_check, sudo_logout_check, user_namespaces,
         };
         use super::super::{INDENT, Level};
 
@@ -1057,6 +1334,119 @@ mod tests {
             let check = pasta_check(None);
             assert_eq!(check.level, Level::Fail);
             assert!(check.text.contains("passt"), "{}", check.text);
+        }
+
+        #[test]
+        fn restarts_held_off_is_a_warning() {
+            assert!(held_off_check(false).is_none());
+            let held = held_off_check(true).unwrap();
+            assert_eq!(held.level, Level::Warn);
+            assert!(
+                held.text.contains("shipyard system recover"),
+                "{}",
+                held.text
+            );
+        }
+
+        #[test]
+        fn linger_off_is_a_warning() {
+            assert_eq!(linger_check(true, 2).level, Level::Ok);
+            // Nothing that needs it: not a warning.
+            assert_eq!(linger_check(false, 0).level, Level::Ok);
+            let off = linger_check(false, 1);
+            assert_eq!(off.level, Level::Warn);
+            assert!(off.text.contains("loginctl enable-linger"), "{}", off.text);
+            assert!(off.text.contains("reboot"), "{}", off.text);
+        }
+
+        #[test]
+        fn kill_user_processes_is_read_as_logind_reads_it() {
+            let configs = |texts: &[&str]| {
+                texts
+                    .iter()
+                    .map(|&text| text.to_owned())
+                    .collect::<Vec<_>>()
+            };
+            // Unset, commented out, or another section's: not said.
+            assert_eq!(kill_user_processes(&[]), None);
+            assert_eq!(
+                kill_user_processes(&configs(&["[Login]\n#KillUserProcesses=yes\n"])),
+                None
+            );
+            assert_eq!(
+                kill_user_processes(&configs(&["[Other]\nKillUserProcesses=yes\n"])),
+                None
+            );
+            assert_eq!(
+                kill_user_processes(&configs(&["[Login]\nKillUserProcesses=yes\n"])),
+                Some(true)
+            );
+            // Spaces around `=`, any case.
+            assert_eq!(
+                kill_user_processes(&configs(&["[Login]\nKillUserProcesses = No\n"])),
+                Some(false)
+            );
+            // The last setting wins: a drop-in after the main file.
+            assert_eq!(
+                kill_user_processes(&configs(&[
+                    "[Login]\nKillUserProcesses=yes\n",
+                    "[Login]\nKillUserProcesses=no\n",
+                ])),
+                Some(false)
+            );
+            assert_eq!(
+                kill_user_processes(&configs(&[
+                    "[Login]\nKillUserProcesses=no\n",
+                    "[Login]\n KillUserProcesses=yes \n",
+                ])),
+                Some(true)
+            );
+            // Said whenever logind ends a session's processes: linger
+            // doesn't keep a monitor that's in a session's scope.
+            assert!(logout_check(true, false).is_some());
+            let lingering = logout_check(true, true).unwrap();
+            assert!(
+                lingering.text.contains("systemd-run --user"),
+                "{}",
+                lingering.text
+            );
+            assert!(logout_check(false, false).is_none());
+            assert!(logout_check(false, true).is_none());
+            // Root: only through sudo, from a user's session.
+            let sudo = sudo_logout_check(true, true).unwrap();
+            assert!(sudo.text.contains("systemd-run --scope"), "{}", sudo.text);
+            assert!(sudo_logout_check(true, false).is_none());
+            assert!(sudo_logout_check(false, true).is_none());
+        }
+
+        #[test]
+        fn a_restart_policy_without_the_boot_unit_is_a_warning() {
+            assert_eq!(boot_unit_check(true, false, 3, false).level, Level::Ok);
+            assert_eq!(boot_unit_check(false, false, 0, true).level, Level::Ok);
+            let missing = boot_unit_check(false, false, 2, false);
+            assert_eq!(missing.level, Level::Warn);
+            assert!(missing.text.contains("contrib/systemd"), "{}", missing.text);
+            assert!(
+                missing.text.contains("2 containers have"),
+                "{}",
+                missing.text
+            );
+            let failed = boot_unit_check(true, true, 1, false);
+            assert_eq!(failed.level, Level::Warn);
+            assert!(
+                failed.text.contains("`journalctl -u shipyard-recover`"),
+                "{}",
+                failed.text
+            );
+            // A rootless user unit's journal is the user's.
+            let user = boot_unit_check(true, true, 1, true);
+            assert_eq!(user.level, Level::Warn);
+            assert!(
+                user.text
+                    .contains("`journalctl --user -u shipyard-recover`"),
+                "{}",
+                user.text
+            );
         }
 
         #[test]

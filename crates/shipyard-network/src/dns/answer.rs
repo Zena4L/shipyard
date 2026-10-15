@@ -25,8 +25,9 @@ pub struct Names {
 
 impl Names {
     /// The names `leases` (the live ones) answer to: each container's
-    /// `--name`, its aliases and its run's ID. An address's name is its
-    /// container's `--name`, or its run's ID ([`Lease::address_name`]).
+    /// `--name`, its aliases, its short ID and its run's ID
+    /// ([`Lease::names`]). An address's name is its container's `--name`,
+    /// else its short ID, else its run's ID ([`Lease::address_name`]).
     #[must_use]
     pub fn of(leases: &[Lease]) -> Names {
         let mut names = Names::default();
@@ -418,6 +419,7 @@ mod tests {
             aliases: aliases.iter().map(|&alias| alias.to_owned()).collect(),
             interface: "eth0".into(),
             ip6: None,
+            container: None,
         };
         let names = Names::of(&[
             lease("10.89.0.2", "a1b2c3d4e5f6", Some("db"), &["database"]),

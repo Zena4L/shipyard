@@ -231,9 +231,22 @@ pub fn implying_layer(path: &str, content: &[u8]) -> (Vec<u8>, String) {
 /// A fixture registry serving an image of `layers` (base first).
 #[must_use]
 pub fn fixture_layers(layers: Vec<(Vec<u8>, String)>) -> (Serving, String) {
+    fixture_configured(layers, r#"{"Cmd":["/bin/cat","/marker"]}"#)
+}
+
+/// The fixture image (one layer, the host's programs) with `runtime` as
+/// its config's `config` object (JSON: `{"Cmd": […], "Healthcheck": {…}}`).
+#[must_use]
+pub fn fixture_with_config(runtime: &str) -> (Serving, String) {
+    fixture_configured(vec![layer_tar(RootFs::minimal().path())], runtime)
+}
+
+/// A fixture registry serving an image of `layers` (base first), its
+/// config's `config` object `runtime` (JSON).
+fn fixture_configured(layers: Vec<(Vec<u8>, String)>, runtime: &str) -> (Serving, String) {
     let diff_ids: Vec<String> = layers.iter().map(|(_, id)| format!("\"{id}\"")).collect();
     let config = format!(
-        r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}},"config":{{"Cmd":["/bin/cat","/marker"]}}}}"#,
+        r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}},"config":{runtime}}}"#,
         diff_ids.join(","),
         arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" },
     )

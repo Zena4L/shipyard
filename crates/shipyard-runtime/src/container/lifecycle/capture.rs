@@ -146,9 +146,12 @@ impl Capture {
     /// What to wait on: the outputs still open, the terminal's socket, and
     /// the attach socket and its clients.
     pub(super) fn poll_fds(&self) -> Vec<PollFd<'_>> {
+        // A held client behind: the outputs wait (the container with them).
+        let reading = !self.attach.behind();
         let mut fds: Vec<PollFd<'_>> = self
             .sources
             .iter()
+            .filter(|_| reading)
             .map(|source| source.fd.as_fd())
             .chain(self.socket.as_ref().map(AsFd::as_fd))
             .map(|fd| PollFd::new(fd, PollFlags::POLLIN))
@@ -188,6 +191,18 @@ impl Capture {
                 Err(_) => self.socket = None,
             }
         }
+        self.read_sources(false);
+        self.track_pending();
+        self.attach.service();
+    }
+
+    /// Reads what's there from each output, unless a held client is behind
+    /// (the container waits for it: its pipe fills) and `all` isn't asked
+    /// for (the drain at its end: what's left goes on regardless).
+    fn read_sources(&mut self, all: bool) {
+        if !all && self.attach.behind() {
+            return;
+        }
         let mut ended = Vec::new();
         for (at, source) in self.sources.iter().enumerate() {
             // A few reads each, so that one busy output can't keep the
@@ -222,8 +237,6 @@ impl Capture {
                 self.writer.finish(source.stream);
             }
         }
-        self.track_pending();
-        self.attach.service();
     }
 
     /// Writes the partial lines that have waited [`IDLE`].
@@ -250,7 +263,9 @@ impl Capture {
         // The master can't come any more.
         self.socket = None;
         while !self.sources.is_empty() {
-            self.service();
+            self.read_sources(true);
+            self.track_pending();
+            self.attach.service();
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || self.sources.is_empty() {
                 break;
@@ -275,6 +290,38 @@ impl Capture {
 }
 
 impl Capture {
+    /// Serves the attach socket's clients only (not the outputs): after the
+    /// drain, the logs complete.
+    pub(super) fn service_clients(&mut self) {
+        self.attach.service();
+    }
+
+    /// What [`service_clients`](Self::service_clients) waits on.
+    pub(super) fn client_poll_fds(&self) -> Vec<PollFd<'_>> {
+        self.attach.poll_fds()
+    }
+
+    /// The stops control clients have asked for since the last call.
+    pub(super) fn take_stops(&mut self) -> Vec<super::attach::StopRequest> {
+        self.attach.take_stops()
+    }
+
+    /// The monitor's holds, for its holders to add to and let go of while
+    /// the container runs.
+    pub(super) fn serve_holds(&mut self, holds: super::holds::Holds) {
+        self.attach.serve_holds(holds);
+    }
+
+    /// The container is ending: nothing more is held.
+    pub(super) fn stop_taking_holds(&mut self) {
+        self.attach.stop_taking_holds();
+    }
+
+    /// The holds, back, for the exit command.
+    pub(super) fn take_holds(&mut self) -> super::holds::Holds {
+        self.attach.take_holds()
+    }
+
     /// The container has ended with `code`, its exit recorded: the clients
     /// are told, and let go.
     pub(super) fn end(&mut self, code: i32) {

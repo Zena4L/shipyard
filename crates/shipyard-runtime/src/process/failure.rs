@@ -1068,8 +1068,9 @@ fn describe_mount(step: ChildStep, errno: Errno, detail: u64, ctx: &FailureConte
                 SpawnErrorKind::Setup,
                 format!(
                     "the mount point {destination} leads into a kernel interface \
-                     ({KERNEL_INTERFACES}) through a symbolic link in the root filesystem, where \
-                     mounts aren't allowed"
+                     ({KERNEL_INTERFACES}) or /dev through a symbolic link in the root \
+                     filesystem, where mounts aren't allowed (one meant for /dev is written \
+                     there: /dev/x)"
                 ),
                 errno,
             );

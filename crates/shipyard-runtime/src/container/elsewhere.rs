@@ -51,6 +51,47 @@ pub fn kill(_root: &Path, _id: &str, _signal: Signal) -> Result<()> {
 /// # Errors
 ///
 /// Always [`ContainerError::LinuxOnly`].
+pub fn stop(
+    _root: &Path,
+    _id: &str,
+    _signal: Signal,
+    _timeout: std::time::Duration,
+) -> Result<bool> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn wait(_root: &Path, _id: &str) -> Result<Option<i32>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn hold(_root: &Path, _id: &str, _label: &str, _fd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn release(_root: &Path, _id: &str, _label: &str) -> Result<()> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
 pub fn kill_all(_root: &Path, _id: &str, _signal: Signal) -> Result<()> {
     Err(ContainerError::LinuxOnly)
 }
@@ -172,6 +213,89 @@ pub fn exit_code(_root: &Path, _id: &str) -> Result<Option<i32>> {
     Err(ContainerError::LinuxOnly)
 }
 
+/// A created container's init, for a caller that follows it: Linux only.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn init_process(_root: &Path, _id: &str) -> Result<super::InitProcess> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// The network namespace of a created container's init: Linux only.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn network_namespace(_root: &Path, _id: &str) -> Result<std::os::fd::OwnedFd> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// The network namespace of a running container's init: Linux only.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn network_namespace_live(_root: &Path, _id: &str) -> Result<std::os::fd::OwnedFd> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn exit_record(_root: &Path, _id: &str) -> Result<Option<super::ExitRecord>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn status(_root: &Path, _id: &str) -> Result<Option<super::Status>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn peek_status(_root: &Path, _id: &str) -> Result<Option<super::Status>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn peek_init(_root: &Path, _id: &str) -> Result<Option<(i32, u64)>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// No containers, so no process is a container's: false.
+#[must_use]
+pub fn is_process(_pid: i32, _started: u64) -> bool {
+    false
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn create_planned(
+    _root: &Path,
+    _id: &str,
+    _plan: &super::Plan,
+    _options: &super::CreateOptions<'_>,
+) -> Result<super::Created> {
+    Err(ContainerError::LinuxOnly)
+}
+
 /// Helpers need Linux: nothing to run.
 pub fn helper_entry_point(_helpers: &[super::Helper]) {}
 
@@ -185,6 +309,21 @@ pub fn start_helper(
     _id: &str,
     _name: &str,
     _action: &'static str,
+    _args: &[u8],
+    _stdin: &std::os::fd::OwnedFd,
+    _stdout: &std::os::fd::OwnedFd,
+) -> Result<super::RunningHelper> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn start_helper_in_view(
+    _view: &super::RootView,
+    _name: &str,
     _args: &[u8],
     _stdin: &std::os::fd::OwnedFd,
     _stdout: &std::os::fd::OwnedFd,

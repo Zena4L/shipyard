@@ -20,7 +20,7 @@ use super::{
 };
 use crate::container::{ExecOptions, ExecOutcome};
 use crate::isolation::{Join, Namespace};
-use crate::process::{ProcessSpec, RlimitValue, SpecSetup, StopPolicy, Supervisor};
+use crate::process::{ProcessSpec, RlimitValue, SpecSetup, Supervisor};
 use crate::security::{Capabilities, Security};
 
 /// The snapshot's name in the state directory.
@@ -160,8 +160,30 @@ pub fn exec(
     let Some((pid, started)) = record.init else {
         return Err(wrong(id, Status::Creating, "exec", "created or running"));
     };
-    let (base, base_security) = read_snapshot(&dir, id)?;
-    let (spec, security, process_terminal) = narrowed(&base, &base_security, options)?;
+    let target = u32::try_from(pid).map_err(|_| ContainerError::NotFound(id.to_owned()))?;
+    let (mut base, base_security) = read_snapshot(&dir, id)?;
+    // What the container was given, not found for its user: its own `HOME`
+    // (`-e`, an image's `Env`) and the groups added to its user's
+    // (`--group-add`), which an exec as another user keeps (Docker's).
+    let given = Given {
+        home: base.env.get(std::ffi::OsStr::new("HOME")).is_some(),
+        gids: base.user.additional_gids.clone(),
+        groups: base.user.names.additional_groups.clone(),
+    };
+    // Its user and groups by name (a plan's, an image's `USER`): as its
+    // init resolved them, in its own files, before anything is narrowed
+    // from them (its capabilities are by uid).
+    if !base.user.names.is_empty() {
+        resolve_names_in(&mut base, target, started)?;
+    }
+    // Its user by name: made numbers first, as `--user` gives them, so its
+    // capabilities (by uid) are the right user's.
+    let (options, groups) = with_user_resolved(options, &given, target, started)?;
+    let options = &options;
+    let (mut spec, security, process_terminal) = narrowed(&base, &base_security, options)?;
+    if let Some(groups) = groups {
+        spec.user.additional_gids = groups;
+    }
     // Its terminal: `-t`, or the `process.json`'s, to a relay or a console
     // socket (runc's rules).
     let terminal = options.terminal || process_terminal.is_some();
@@ -174,11 +196,12 @@ pub fn exec(
     }
     let console = options
         .console
-        .map(|fd| (fd, size.unwrap_or(super::DEFAULT_CONSOLE_SIZE)));
-    let target = u32::try_from(pid).map_err(|_| ContainerError::NotFound(id.to_owned()))?;
+        .map(|fd| (fd, size.unwrap_or(crate::process::terminal::DEFAULT_SIZE)));
     // Gone meanwhile, its namespaces read as none: it's stopped.
     let namespaces = namespaces_of(target, id).map_err(|err| match status_of(&dir) {
-        Ok(Status::Stopped) => wrong(id, Status::Stopped, "exec", "created or running"),
+        Ok(status @ (Status::Stopping | Status::Stopped)) => {
+            wrong(id, status, "exec", "created or running")
+        }
         _ => err,
     })?;
     // Recorded but not the one made (replaced, or not set up yet): refused,
@@ -210,15 +233,20 @@ pub fn exec(
         let raw = nix::unistd::isatty(std::io::stdin()).unwrap_or(false);
         supervisor.set_stdio(crate::process::Stdio {
             terminal: Some(crate::process::Pty {
-                input: true,
-                raw,
+                input: !options.no_input,
+                raw: raw && !options.no_input,
                 size,
             }),
             ..crate::process::Stdio::default()
         });
     } else if !terminal {
-        // Never the user's terminal: relayed, or `/dev/null` once detached.
-        supervisor.set_stdio(crate::process::Stdio::sparing_terminals(options.detach));
+        // Never the user's terminal: relayed, or `/dev/null` once detached
+        // (or without input).
+        let mut stdio = crate::process::Stdio::sparing_terminals(options.detach);
+        if options.no_input {
+            stdio.stdin = crate::process::Stream::Null;
+        }
+        supervisor.set_stdio(stdio);
     }
     let outcome = if options.detach {
         let started = supervisor.start_detached(&spec, &join, console);
@@ -228,7 +256,7 @@ pub fn exec(
         // Let go of once the command runs (or never, if it doesn't: then
         // when the run's over).
         supervisor
-            .supervise_exec(&spec, StopPolicy::default(), &join, console, move || {
+            .supervise_exec(&spec, options.stop, &join, console, move || {
                 drop(lock);
             })
             .map(ExecOutcome::Exited)
@@ -378,6 +406,94 @@ fn above(ours: RlimitValue, theirs: RlimitValue) -> bool {
     }
 }
 
+/// What a container's process was given rather than found for its user.
+struct Given {
+    /// A `HOME` of its own.
+    home: bool,
+    /// Groups added to its user's own, by number.
+    gids: Vec<u32>,
+    /// And by name (or number), looked up in its `/etc/group`.
+    groups: Vec<String>,
+}
+
+/// `options`, its user given by name or number (`user_spec`) made numbers:
+/// looked up in the container's own `/etc` (through its init's root, `pid`
+/// started at `started`), its groups (those that list it, as Docker's, and
+/// those the container was `given`), and its home as `HOME` unless
+/// `options` or the container (`given`) sets one. With the groups, which
+/// replace the container's process's.
+fn with_user_resolved(
+    options: &ExecOptions,
+    given: &Given,
+    pid: u32,
+    started: u64,
+) -> Result<(ExecOptions, Option<Vec<u32>>)> {
+    let Some(user) = &options.user_spec else {
+        return Ok((options.clone(), None));
+    };
+    let (name, group) = match user.split_once(':') {
+        Some((name, group)) => (name, Some(group)),
+        None => (user.as_str(), None),
+    };
+    let mut scratch = ProcessSpec::new(Vec::new());
+    scratch.user.names.user = Some(name.to_owned());
+    scratch.user.names.group = group.map(str::to_owned);
+    scratch.user.names.memberships = true;
+    scratch.user.additional_gids.clone_from(&given.gids);
+    scratch
+        .user
+        .names
+        .additional_groups
+        .clone_from(&given.groups);
+    resolve_names_in(&mut scratch, pid, started)?;
+    let mut resolved = options.clone();
+    resolved.user = Some((scratch.user.uid, Some(scratch.user.gid)));
+    resolved.user_spec = None;
+    let has_home = given.home
+        || options
+            .env
+            .iter()
+            .any(|entry| entry.as_encoded_bytes().starts_with(b"HOME="));
+    if !has_home && let Some(home) = scratch.env.get(std::ffi::OsStr::new("HOME")) {
+        let mut entry = std::ffi::OsString::from("HOME=");
+        entry.push(home);
+        resolved.env.push(entry);
+    }
+    // Groups given (`-g`) win; else the container's added ones and the
+    // user's own.
+    let groups = options
+        .additional_gids
+        .is_empty()
+        .then(|| scratch.user.additional_gids.clone());
+    Ok((resolved, groups))
+}
+
+/// Resolves `spec`'s user and group names in the `/etc` of the container
+/// whose init is `pid` (started at `started`, so a PID reused since is
+/// refused), through its root as it sees it.
+fn resolve_names_in(spec: &mut ProcessSpec, pid: u32, started: u64) -> Result<()> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    let dir = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let gone = || ContainerError::Exec(Box::new(crate::Error::NoSuchProcess { pid }));
+    let proc_dir = open(
+        format!("/proc/{pid}").as_str(),
+        OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| gone())?;
+    if crate::process::join::start_time_at(&proc_dir) != Some(started) {
+        return Err(gone());
+    }
+    let root =
+        openat(&proc_dir, "root", dir, Mode::empty()).map_err(|errno| ContainerError::Io {
+            doing: format!("opening /proc/{pid}/root"),
+            error: errno.into(),
+        })?;
+    crate::process::resolve_names_in_root(spec, &root)
+        .map_err(|err| ContainerError::Exec(Box::new(err.into())))
+}
+
 /// The namespaces of process `target` that aren't this process's own (one
 /// it shares with the host is joined already). The PID and mount ones must
 /// be among them: a container always has them.
@@ -415,8 +531,8 @@ fn exec_failed(dir: &Path, id: &str, err: crate::Error) -> ContainerError {
             _ => {}
         }
     }
-    if matches!(status_of(dir), Ok(Status::Stopped)) {
-        return wrong(id, Status::Stopped, "exec", "created or running");
+    if let Ok(status @ (Status::Stopping | Status::Stopped)) = status_of(dir) {
+        return wrong(id, status, "exec", "created or running");
     }
     ContainerError::Exec(Box::new(err))
 }

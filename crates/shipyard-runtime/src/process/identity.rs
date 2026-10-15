@@ -163,6 +163,26 @@ struct GroupEntry {
 ///
 /// A name that isn't there, or a file that can't be read.
 pub(crate) fn resolve(spec: &mut ProcessSpec, etc: Option<&Path>) -> Result<(), LookupError> {
+    resolve_from(spec, etc.map_or(Etc::None, Etc::Path))
+}
+
+/// [`resolve`] in the `etc` of a root filesystem open at `root`: another
+/// process's (a container's, through `/proc/<pid>/root`). Its files are
+/// found as that process sees them (symlinks followed inside the root,
+/// never out of it), and must be regular files before they're opened.
+///
+/// # Errors
+///
+/// As [`resolve`].
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_in_root(
+    spec: &mut ProcessSpec,
+    root: &std::os::fd::OwnedFd,
+) -> Result<(), LookupError> {
+    resolve_from(spec, Etc::InRoot(root))
+}
+
+fn resolve_from(spec: &mut ProcessSpec, etc: Etc<'_>) -> Result<(), LookupError> {
     let names = std::mem::take(&mut spec.user.names);
     let wants_home = spec.env.get(OsStr::new("HOME")).is_none();
     let mut tables = Tables::new(etc);
@@ -299,15 +319,27 @@ fn parse_table_id(field: &str) -> Option<u32> {
         .or_else(|| field.parse::<i32>().ok().map(i32::cast_unsigned))
 }
 
+/// Where the `passwd` and `group` files are.
+#[derive(Clone, Copy)]
+enum Etc<'a> {
+    /// Nowhere: there are none.
+    None,
+    /// In this directory, by path.
+    Path(&'a Path),
+    /// In `etc` of the root filesystem open here.
+    #[cfg(target_os = "linux")]
+    InRoot(&'a std::os::fd::OwnedFd),
+}
+
 /// The two files, each read the first time it's needed.
 struct Tables<'a> {
-    etc: Option<&'a Path>,
+    etc: Etc<'a>,
     passwd: Option<Vec<PasswdEntry>>,
     group: Option<Vec<GroupEntry>>,
 }
 
 impl<'a> Tables<'a> {
-    fn new(etc: Option<&'a Path>) -> Self {
+    fn new(etc: Etc<'a>) -> Self {
         Self {
             etc,
             passwd: None,
@@ -330,8 +362,12 @@ impl<'a> Tables<'a> {
     }
 
     fn read(&self, file: &str) -> Result<String, Errno> {
-        self.etc
-            .map_or(Ok(String::new()), |etc| read_table(&etc.join(file)))
+        match self.etc {
+            Etc::None => Ok(String::new()),
+            Etc::Path(etc) => read_table(&etc.join(file)),
+            #[cfg(target_os = "linux")]
+            Etc::InRoot(root) => read_table_in_root(root, file),
+        }
     }
 }
 
@@ -362,6 +398,24 @@ fn read_table(path: &Path) -> Result<String, Errno> {
     }
     // Entries that aren't UTF-8 can't match a name given as a string.
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Reads `etc/FILE` of the root open at `root`, as [`read_table`] does. It's
+/// looked at before it's opened (through its `O_PATH` descriptor): opening
+/// a device runs its driver, and the root is another's to fill.
+#[cfg(target_os = "linux")]
+fn read_table_in_root(root: &std::os::fd::OwnedFd, file: &str) -> Result<String, Errno> {
+    use std::os::fd::AsRawFd as _;
+    let found = match super::resolve::open_in_root(root, &Path::new("etc").join(file), true) {
+        Ok(found) => found,
+        Err(Errno::ENOENT) => return Ok(String::new()),
+        Err(errno) => return Err(errno),
+    };
+    let stat = nix::sys::stat::fstat(&found)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(Errno::EINVAL);
+    }
+    read_table(Path::new(&format!("/proc/self/fd/{}", found.as_raw_fd())))
 }
 
 /// The lines of a `passwd` or `group` file that are entries, split at `:`.

@@ -44,7 +44,14 @@ fn with_users() -> RootFs {
 
 /// `shipyard run FLAGS… sh -c SCRIPT`.
 fn shipyard(flags: &[&str], script: &str) -> Run {
-    run(SHIPYARD.command(&[&["run"], flags, &["sh", "-c", script]].concat()))
+    run(SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(flags),
+            flags,
+            &["sh", "-c", script],
+        ]
+        .concat(),
+    ))
 }
 
 /// Prints `HOME`, then `/proc/self/status`.

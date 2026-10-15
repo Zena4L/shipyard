@@ -408,7 +408,7 @@ fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Fa
     if !closed {
         // No `close_range` (before Linux 5.9, or seccomp): the plan's list.
         let keep = |fd: RawFd| {
-            reexec.passed.contains(&fd)
+            reexec.inherited.contains(&fd)
                 || fd == reexec.exe
                 || reexec
                     .host_exe
@@ -427,7 +427,7 @@ fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Fa
             FdSweep::Below(bound) => (3..*bound).for_each(close),
         }
     }
-    for &fd in &reexec.passed {
+    for &fd in &reexec.inherited {
         // SAFETY: `fcntl` is async-signal-safe; clearing close-on-exec only
         // lets the descriptor survive the exec.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {

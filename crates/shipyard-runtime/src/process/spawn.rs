@@ -94,7 +94,7 @@ pub(crate) struct SpawnOptions {
     /// Descriptors passed on to the command (see `passed.rs`): their
     /// numbers here (held open by the caller until `spawn` returns), and
     /// socket activation's part.
-    pub(crate) passing: Option<super::passed::Passing>,
+    pub(crate) passing: Option<super::passed::PassedPlan>,
 }
 
 impl SpawnOptions {
@@ -113,9 +113,6 @@ impl SpawnOptions {
 pub(crate) struct ExecSpawn {
     /// Detached (`exec -d`): it outlives shipyard (no parent-death signal).
     pub(crate) detach: bool,
-    /// `terminal`'s socket is an OCI console socket (`--console-socket`):
-    /// nothing answers on it (runc's protocol), unlike shipyard's relay.
-    pub(crate) console: bool,
 }
 
 /// Which namespaces the command starts in.
@@ -137,7 +134,11 @@ impl SpawnOptions {
     fn slave(&self) -> Option<RawFd> {
         match self.terminal {
             Some(super::stdio::ChildTerminal::Slave(slave)) => Some(slave),
-            Some(super::stdio::ChildTerminal::Socket { .. }) | None => None,
+            Some(
+                super::stdio::ChildTerminal::Socket { .. }
+                | super::stdio::ChildTerminal::Console { .. },
+            )
+            | None => None,
         }
     }
 }
@@ -444,7 +445,7 @@ fn spawn_joined(
     join: &Join,
     started: impl FnOnce(Pid),
 ) -> Result<Child> {
-    use super::exec::{joiner_files, read_record, start_joiner};
+    use super::exec::{joiner_files, read_joiner_record, start_joiner};
     super::internal::refuse_unsafe_dumpable("exec")?;
     // A joined command's terminal is made in the container, never on the
     // host: never run it without the one it asked for.
@@ -495,7 +496,7 @@ fn spawn_joined(
     let mut joiner = start_joiner(&joining, &files, options.stdio)?;
     // The joiner and its clone have their copies.
     drop((report_write, go_read, record_write, files, joining, cgroup));
-    let record = read_record(&record_read, JOINER_WAIT);
+    let record = read_joiner_record(&record_read, JOINER_WAIT);
     if record.is_none() {
         let _ = joiner.kill();
     }
@@ -590,19 +591,17 @@ fn exec_terminal(
     options: &SpawnOptions,
     joining: &super::join::Joining,
 ) -> Option<(super::setup::TerminalSetup, RawFd)> {
-    match options.terminal {
-        Some(super::stdio::ChildTerminal::Socket { fd, size }) => Some((
-            super::setup::TerminalSetup {
-                socket: fd,
-                rows: size.0,
-                cols: size.1,
-                acknowledged: !options.exec.console,
-            },
-            joining.directory.as_raw_fd(),
-        )),
-        // (A slave made on the host: refused by `spawn_joined` already.)
-        Some(super::stdio::ChildTerminal::Slave(_)) | None => None,
-    }
+    // (A slave made on the host: refused by `spawn_joined` already.)
+    let (fd, size, acknowledged) = options.terminal?.socket()?;
+    Some((
+        super::setup::TerminalSetup {
+            socket: fd,
+            rows: size.0,
+            cols: size.1,
+            acknowledged,
+        },
+        joining.directory.as_raw_fd(),
+    ))
 }
 
 /// Why the joiner gave up: the failure it (or the command) reported, once
@@ -786,10 +785,9 @@ impl CleanImageFiles {
                 why,
             },
         )?;
-        let terminal = match options.terminal {
-            Some(super::stdio::ChildTerminal::Socket { fd, size }) => Some((fd, size)),
-            Some(super::stdio::ChildTerminal::Slave(_)) | None => None,
-        };
+        let terminal = options
+            .terminal
+            .and_then(super::stdio::ChildTerminal::socket);
         Ok(Self {
             status_read,
             status_write,
@@ -805,22 +803,20 @@ impl CleanImageFiles {
                     hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
                     overlay.as_ref().map(AsRawFd::as_raw_fd),
                 );
-                setup.terminal = terminal.map(|(fd, size)| super::setup::TerminalSetup {
-                    socket: fd,
-                    rows: size.0,
-                    cols: size.1,
-                    // A container waiting at its gate sends the master to an
-                    // OCI console socket, which never answers (runc's
-                    // protocol); Shipyard's relay does.
-                    acknowledged: options.gate.is_none(),
-                });
+                setup.terminal =
+                    terminal.map(|(fd, size, acknowledged)| super::setup::TerminalSetup {
+                        socket: fd,
+                        rows: size.0,
+                        cols: size.1,
+                        acknowledged,
+                    });
                 setup.passing.clone_from(&options.passing);
                 setup.to_memfd()?
             },
             gate: options.gate,
             hooks,
             overlay,
-            terminal: terminal.map(|(fd, _)| fd),
+            terminal: terminal.map(|(fd, ..)| fd),
             passing: options
                 .passing
                 .as_ref()
@@ -877,13 +873,23 @@ impl CleanImageFiles {
 /// it (no user namespace, or rootless: the store is the caller's).
 #[cfg(target_os = "linux")]
 fn prebuilt_overlay(isolation: &Isolation) -> Result<Option<OwnedFd>> {
-    let Some(root) = &isolation.root else {
-        return Ok(None);
-    };
+    match &isolation.root {
+        Some(root) => prebuilt_root_overlay(root, isolation.id_maps.as_ref()),
+        None => Ok(None),
+    }
+}
+
+/// [`prebuilt_overlay`] for `root`, with `id_maps` (a helper's too: real
+/// root's mount, which the helper's user namespace couldn't make).
+#[cfg(target_os = "linux")]
+pub(super) fn prebuilt_root_overlay(
+    root: &crate::isolation::Root,
+    id_maps: Option<&crate::isolation::IdMaps>,
+) -> Result<Option<OwnedFd>> {
     let Some(overlay) = &root.overlay else {
         return Ok(None);
     };
-    if isolation.id_maps.is_none() || !nix::unistd::geteuid().is_root() {
+    if id_maps.is_none() || !nix::unistd::geteuid().is_root() {
         return Ok(None);
     }
     let lower: Vec<&std::path::Path> = overlay

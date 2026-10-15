@@ -66,6 +66,11 @@ const MAX_FORWARDS: Places = Places::new(64, 16);
 /// that is closed.
 const MAX_CONNECTIONS: Places = Places::new(64, 8);
 
+/// The most tasks (threads) a server has at once: its main thread, the UDP
+/// and TCP threads, and one per forwarded query and TCP connection. Its
+/// cgroup's `pids.max` must allow at least this, or queries fail.
+pub const MOST_TASKS: usize = 3 + MAX_FORWARDS.total + MAX_CONNECTIONS.total;
+
 /// How long an upstream resolver has to answer.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -109,9 +114,6 @@ pub enum ServerError {
     /// Root couldn't be given up.
     #[error("giving up root: {0}")]
     Privileges(String),
-    /// Its own lock couldn't be held.
-    #[error("holding its lock: {0}")]
-    Lock(String),
     /// The server's threads couldn't be started.
     #[error("starting the server's threads: {0}")]
     Threads(io::Error),
@@ -505,10 +507,10 @@ pub fn serve(setup: Setup, sockets: Sockets) -> Result<Ending, ServerError> {
         idle,
         upstreams,
     } = setup;
-    // Its own lock, as a lock it can let go of (it holds it already: taking
-    // it again on the same open file only confirms it).
-    let dns_lock = Flock::lock(dns_lock, FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, errno)| ServerError::Lock(errno.to_string()))?;
+    // Its own lock is held already, on an open file it may share (a
+    // watchdog's): kept as a plain file, never a `Flock`, whose drop (on a
+    // failure, say) would let go of it for every holder. Only an idle end
+    // lets go of it, on purpose.
     let mut resolv = ResolvConf::default();
     let initial = match &upstreams {
         Upstreams::Fixed(fixed) => fixed.clone(),
@@ -569,9 +571,11 @@ pub fn serve(setup: Setup, sockets: Sockets) -> Result<Ending, ServerError> {
         // container, there won't be one before this server is gone.
         match Flock::lock(network_lock, FlockArg::LockExclusiveNonblock) {
             Ok(held) if shared.leases.live().is_ok_and(|leases| leases.is_empty()) => {
-                // Its own lock first: a run waiting for the network's finds
-                // no server, and starts one.
-                drop(dns_lock.unlock());
+                // Its own lock first (for every holder of its open file): a
+                // run waiting for the network's finds no server, and
+                // starts one.
+                // SAFETY: `flock` on a descriptor this owns, open.
+                unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&dns_lock), libc::LOCK_UN) };
                 return Ok(Ending::Idle(held));
             }
             Ok(held) => match held.unlock() {
@@ -747,6 +751,9 @@ fn serve_udp(socket: &Arc<UdpSocket>, shared: &Arc<Shared>) {
             continue;
         }
         let forwarded = message.to_vec();
+        // Said at once if no thread can forward it (the cgroup's tasks all
+        // taken, say), rather than left to time out.
+        let unforwarded = servfail(&query);
         let (to_client, state) = (Arc::clone(socket), Arc::clone(shared));
         let spawned = std::thread::Builder::new().spawn(move || {
             let reply =
@@ -756,12 +763,15 @@ fn serve_udp(socket: &Arc<UdpSocket>, shared: &Arc<Shared>) {
         });
         if spawned.is_err() {
             shared.forwards.give_back(forwarder);
+            let _ = socket.send_to(&unforwarded, client);
         }
     }
 }
 
 /// The TCP thread: each connection from the network on a thread of its own
-/// (up to [`MAX_CONNECTIONS`] at once).
+/// (up to [`MAX_CONNECTIONS`] at once), its places counted against its
+/// client as forwarding places are ([`forwarder`]: a live lease's address,
+/// else the network's, all made-up sources together).
 fn serve_tcp(listener: &TcpListener, shared: &Arc<Shared>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
@@ -771,16 +781,20 @@ fn serve_tcp(listener: &TcpListener, shared: &Arc<Shared>) {
         let Ok(client) = stream.peer_addr().map(|peer| peer.ip()) else {
             continue;
         };
-        if !shared.answers_to(client) || !shared.connections.take(MAX_CONNECTIONS, client) {
+        if !shared.answers_to(client) {
+            continue;
+        }
+        let key = shared.forwarder(client);
+        if !shared.connections.take(MAX_CONNECTIONS, key) {
             continue;
         }
         let state = Arc::clone(shared);
         let spawned = std::thread::Builder::new().spawn(move || {
             serve_connection(stream, &state, client);
-            state.connections.give_back(client);
+            state.connections.give_back(key);
         });
         if spawned.is_err() {
-            shared.connections.give_back(client);
+            shared.connections.give_back(key);
         }
     }
 }
@@ -987,6 +1001,16 @@ mod tests {
         assert_eq!(granted, MAX_FORWARDS.per_client);
         // The leased client still has its own.
         assert!(taken.take(MAX_FORWARDS, leased));
+        // TCP connections' places too (`serve_tcp` keys them alike).
+        let connections = Taken::default();
+        let mut granted = 0;
+        for last in 3..=200_u8 {
+            let made_up = IpAddr::from([10, 89, 0, last]);
+            let key = forwarder(zone, std::slice::from_ref(&lease), made_up);
+            granted += usize::from(connections.take(MAX_CONNECTIONS, key));
+        }
+        assert_eq!(granted, MAX_CONNECTIONS.per_client);
+        assert!(connections.take(MAX_CONNECTIONS, leased));
     }
 
     /// A query for example.com, with the ID 7.

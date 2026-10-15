@@ -1,10 +1,10 @@
-//! End-to-end `shipyard run --image` (stage 6, phase 6.6): a pulled image
+//! End-to-end `shipyard run IMAGE` (stage 6, phase 6.6): a pulled image
 //! becomes the container's root filesystem.
 //!
 //! A fixture registry (in-process, std-only HTTP) serves a one-layer image
 //! built from the host's own programs (via `shipyard-test-support`'s
 //! `RootFs`), so there's no network and no real registry. The test runs the
-//! real `shipyard` binary with `--image localhost:PORT/...` and checks the
+//! real `shipyard` binary with `run localhost:PORT/...` and checks the
 //! command ran inside the image's root (it can read the image's `/marker`).
 //!
 //! Linux only. The runs need root, or rootless containers and a kernel that
@@ -33,13 +33,27 @@ use shipyard_test_support::rootfs::RootFs;
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
-/// `shipyard ARGS`, with its image store in `store`.
+/// `shipyard ARGS`, with its image store in `store`. A foreground `run` is
+/// a container (stage 9, step 9.4c3a), which would keep its image pinned:
+/// these tests are the images', so it's removed at its end (`--rm`).
 fn shipyard(store: &Scratch, args: &[&str]) -> std::process::Output {
-    Command::new(SHIPYARD.path())
-        .args(args)
-        .env("SHIPYARD_IMAGE_STORE", store.store())
+    on(store, &mut Command::new(SHIPYARD.path()))
+        .args(removed_at_its_end(args))
         .output()
         .expect("running shipyard")
+}
+
+/// An error that repeats what it was given (or what a registry or a layer
+/// said) never sends what a terminal acts on: here an OSC sequence that
+/// would set the terminal's title, escaped (the v0.2 review).
+#[test]
+fn an_error_never_sends_a_terminal_escape() {
+    let store = Scratch::new();
+    let output = shipyard(&store, &["rmi", "a\x1b]0;owned\x07b"]);
+    assert_eq!(output.status.code(), Some(125), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.stderr.contains(&0x1b), "{stderr:?}");
+    assert!(stderr.contains("a\\u{1b}]0;owned\\u{7}b"), "{stderr}");
 }
 
 #[test]
@@ -47,7 +61,7 @@ fn run_from_an_image_sees_its_root_filesystem() {
     let (_serving, image) = fixture();
     // No command: the image's Cmd.
     let store = Scratch::new();
-    let output = shipyard(&store, &["run", "--image", &image]);
+    let output = shipyard(&store, &["run", &image]);
 
     if !image_runs_here(&output) {
         return;
@@ -56,7 +70,7 @@ fn run_from_an_image_sees_its_root_filesystem() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "shipyard run --image failed:\nstdout: {stdout}\nstderr: {stderr}"
+        "shipyard run IMAGE failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stdout.contains("shipyard test root filesystem"),
@@ -79,7 +93,7 @@ fn rootless_layers_belong_to_subordinate_ids_and_are_removed() {
     let store = Scratch::new();
     // Whether the run itself works here (overlay) doesn't matter: the layers
     // are extracted before it.
-    let _ = shipyard(&store, &["run", "--image", &image, "sh", "-c", "exit 0"]);
+    let _ = shipyard(&store, &["run", &image, "sh", "-c", "exit 0"]);
 
     let layers = store.store().join("layers");
     let layer = std::fs::read_dir(&layers)
@@ -148,37 +162,47 @@ fn layers(store: &Scratch) -> Vec<String> {
         .collect()
 }
 
-/// Waits (up to 10 s) until no run's area in the store is locked: every
-/// process that held one is gone.
-fn wait_until_unlocked(store: &Scratch) {
-    use nix::fcntl::{Flock, FlockArg};
-    let containers = store.store().join("containers");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    for name in areas(store) {
-        loop {
-            let dir = std::fs::File::open(containers.join(&name)).unwrap();
-            // Taken and let go at once: only whether it can be.
-            if Flock::lock(dir, FlockArg::LockExclusiveNonblock).is_ok() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{name} is still locked: a process of the killed run is left"
-            );
-            thread::sleep(std::time::Duration::from_millis(20));
+/// `command` on `store`: its image store, and a container store of its own
+/// beside it (a container's writable layer is in the image store its record
+/// goes with: one image store per container store, as the engine has it).
+fn on<'c>(store: &Scratch, command: &'c mut Command) -> &'c mut Command {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let containers = store.0.join("container-records");
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&containers);
+    shipyard_test_support::with_container_places(command)
+        .env("SHIPYARD_IMAGE_STORE", store.store())
+        .env("SHIPYARD_CONTAINER_DIR", containers)
+}
+
+/// `args`, with `--rm` after a foreground `run`.
+fn removed_at_its_end<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    match args {
+        // `-d` among run's own flags (before its image), not its command's.
+        ["run", rest @ ..]
+            if !rest
+                .iter()
+                .take_while(|arg| arg.starts_with('-'))
+                .any(|arg| *arg == "-d") =>
+        {
+            [&["run", "--rm"], rest].concat()
         }
+        _ => args.to_vec(),
     }
 }
 
-/// The runs' areas in the store (not leftovers).
+/// The runs' areas in the store (not leftovers): a container's (`ctr-`),
+/// or a run's supervised here (`run-`).
 fn runs(store: &Scratch) -> usize {
     areas(store)
         .iter()
-        .filter(|name| name.starts_with("run-"))
+        .filter(|name| name.starts_with("run-") || name.starts_with("ctr-"))
         .count()
 }
 
-/// Starts `shipyard run --image IMAGE sleep SECONDS`, and waits until there
+/// Starts `shipyard run IMAGE sleep SECONDS`, and waits until there
 /// are `areas` runs' areas in the store (its own among them).
 fn start_sleeping(
     store: &Scratch,
@@ -186,21 +210,21 @@ fn start_sleeping(
     seconds: &str,
     areas: usize,
 ) -> std::process::Child {
-    start_sleeping_with(store, &["--image", image], seconds, areas)
+    start_sleeping_with(store, image, &[], seconds, areas)
 }
 
 /// As [`start_sleeping`], with these run flags.
 fn start_sleeping_with(
     store: &Scratch,
+    image: &str,
     flags: &[&str],
     seconds: &str,
     areas: usize,
 ) -> std::process::Child {
-    let child = Command::new(SHIPYARD.path())
-        .arg("run")
+    let child = on(store, &mut Command::new(SHIPYARD.path()))
+        .args(["run", "--rm"])
         .args(flags)
-        .args(["sleep", seconds])
-        .env("SHIPYARD_IMAGE_STORE", store.store())
+        .args([image, "sleep", seconds])
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -219,7 +243,7 @@ fn start_sleeping_with(
 fn ready() -> Option<(Serving, String, Scratch)> {
     let (serving, image) = fixture();
     let store = Scratch::new();
-    let first = shipyard(&store, &["run", "--image", &image, "sh", "-c", "exit 0"]);
+    let first = shipyard(&store, &["run", &image, "sh", "-c", "exit 0"]);
     if !image_runs_here(&first) {
         return None;
     }
@@ -256,9 +280,8 @@ fn two_first_runs_of_an_image_at_once_share_its_layer() {
     let (_serving, image) = fixture();
     let store = Scratch::new();
     let start = || {
-        Command::new(SHIPYARD.path())
-            .args(["run", "--image", &image, "cat", "/marker"])
-            .env("SHIPYARD_IMAGE_STORE", store.store())
+        on(&store, &mut Command::new(SHIPYARD.path()))
+            .args(["run", "--rm", &image, "cat", "/marker"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -325,7 +348,7 @@ fn a_prune_during_a_pull_waits_for_it() {
     let pruned = prune.wait_with_output().unwrap();
     assert!(pruned.status.success(), "{}", text(&pruned).1);
     drop(serving);
-    let run = shipyard(&store, &["run", "--image", &image]);
+    let run = shipyard(&store, &["run", &image]);
     if !image_runs_here(&run) {
         return;
     }
@@ -352,7 +375,7 @@ fn an_image_in_use_is_kept_until_its_container_ends() {
     let mut running = start_sleeping(&store, &image, "3", 1);
     let refused = shipyard(&store, &["rmi", &reference]);
     assert!(!refused.status.success(), "removed while in use");
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("in use"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("used by container"));
     let forced = shipyard(&store, &["rmi", "--force", &reference]);
     assert!(
         forced.status.success(),
@@ -365,29 +388,50 @@ fn an_image_in_use_is_kept_until_its_container_ends() {
     assert!(layers(&store).is_empty(), "collected once it ended");
 }
 
-/// A run killed outright leaves its area unlocked: the next run sweeps it.
-///
-/// Unlocked once all its processes are gone, which is a moment after
-/// `shipyard` itself: its children (the container's, not yet re-executed)
-/// hold the lock's descriptor until their parent-death signal ends them. A
-/// sweep in that moment rightly leaves the area alone, so the next run
-/// starts once it's free.
+/// A run killed outright (`kill -9`) leaves its container running, as a
+/// detached one (its monitor's, not the run's): its writable layer stays
+/// until the container goes, here by `rm -f`.
 #[test]
-fn a_killed_runs_writable_layer_is_swept_by_the_next() {
+fn a_killed_runs_container_runs_on_until_removed() {
     let Some((_serving, image, store)) = ready() else {
         return;
     };
-    let mut killed = start_sleeping(&store, &image, "30", 1);
+    // Its own name: the tests of this binary share a container store.
+    let name = format!("killed-{}", std::process::id());
+    let mut killed = start_sleeping_with(&store, &image, &["--name", &name], "30", 1);
+    // Killed once it runs (killed while it's made, its start is undone).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !text(&shipyard(&store, &["ps", "--format", "json"]))
+        .0
+        .contains(&name)
+    {
+        assert!(std::time::Instant::now() < deadline, "it never ran");
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let init = |store: &Scratch| {
+        let shown: serde_json::Value =
+            serde_json::from_slice(&shipyard(store, &["inspect", &name]).stdout).unwrap();
+        shown[0]["state"]["pid"].as_i64()
+    };
+    let before = init(&store).expect("its init's PID");
     killed.kill().unwrap();
     killed.wait().unwrap();
-    assert_eq!(runs(&store), 1, "the killed run's area stays");
-    wait_until_unlocked(&store);
-    let next = shipyard(&store, &["run", "--image", &image, "sh", "-c", "exit 0"]);
+    // Not only listed just after: the same init, alive a while later (an
+    // end following the run's would have come by then).
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert_eq!(runs(&store), 1, "the container's layer stays");
+    let listed = shipyard(&store, &["ps", "--format", "json"]);
     assert!(
-        next.status.success(),
-        "{}",
-        String::from_utf8_lossy(&next.stderr)
+        String::from_utf8_lossy(&listed.stdout).contains(&name),
+        "it runs on: {listed:?}"
     );
+    assert_eq!(init(&store), Some(before), "the same init");
+    assert!(
+        std::path::Path::new(&format!("/proc/{before}")).exists(),
+        "its init is gone"
+    );
+    let removed = shipyard(&store, &["rm", "-f", &name]);
+    assert!(removed.status.success(), "{}", text(&removed).1);
     assert!(areas(&store).is_empty(), "left behind: {:?}", areas(&store));
 }
 
@@ -415,9 +459,7 @@ fn a_pulled_image_runs_without_its_registry() {
     drop(serving);
     let offline = shipyard(
         &store,
-        &[
-            "run", "--image", &image, "--pull", "never", "cat", "/marker",
-        ],
+        &["run", "--pull", "never", &image, "cat", "/marker"],
     );
     if !image_runs_here(&offline) {
         return;
@@ -428,16 +470,14 @@ fn a_pulled_image_runs_without_its_registry() {
         String::from_utf8_lossy(&offline.stderr)
     );
     assert!(String::from_utf8_lossy(&offline.stdout).contains("shipyard test root filesystem"));
-    let missing = shipyard(&store, &["run", "--image", &image, "cat", "/marker"]);
+    let missing = shipyard(&store, &["run", &image, "cat", "/marker"]);
     assert!(
         missing.status.success(),
         "the default (missing) needs no registry either"
     );
     let always = shipyard(
         &store,
-        &[
-            "run", "--image", &image, "--pull", "always", "sh", "-c", "exit 0",
-        ],
+        &["run", "--pull", "always", &image, "sh", "-c", "exit 0"],
     );
     assert!(
         !always.status.success(),
@@ -449,6 +489,51 @@ fn a_pulled_image_runs_without_its_registry() {
         removed.status.success(),
         "{}",
         String::from_utf8_lossy(&removed.stderr)
+    );
+}
+
+/// `pull` tells stderr of each layer as it arrives (downloaded, or already
+/// in the store); `pull -q` prints nothing but the digest.
+#[test]
+fn pull_reports_its_layers_unless_quiet() {
+    let (_serving, image) = fixture();
+    let store = Scratch::new();
+    let first = shipyard(&store, &["pull", &image]);
+    let (stdout, stderr) = text(&first);
+    assert!(first.status.success(), "{stderr}");
+    assert!(stdout.starts_with("Digest: sha256:"), "{stdout}");
+    let mut lines = stderr.lines();
+    assert_eq!(
+        lines.next(),
+        Some(format!("Pulling {image}:latest").as_str()),
+        "{stderr}"
+    );
+    let layer = lines.next().unwrap_or_default();
+    let (digest, what) = layer.split_once(": ").unwrap_or_default();
+    assert!(
+        digest.len() == 12 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{stderr}"
+    );
+    assert!(
+        what.starts_with("downloaded (") && what.ends_with("B)"),
+        "{stderr}"
+    );
+
+    let again = shipyard(&store, &["pull", &image]);
+    let (_, stderr) = text(&again);
+    assert!(again.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{digest}: already here")),
+        "{stderr}"
+    );
+
+    let quiet = shipyard(&store, &["pull", "-q", &image]);
+    let (stdout, stderr) = text(&quiet);
+    assert!(quiet.status.success(), "{stderr}");
+    assert!(stderr.is_empty(), "-q: {stderr}");
+    assert!(
+        stdout.starts_with("sha256:") && stdout.lines().count() == 1,
+        "{stdout}"
     );
 }
 
@@ -467,10 +552,13 @@ fn a_volume_in_use_is_never_removed() {
     let Some((_serving, image, store)) = ready() else {
         return;
     };
+    // Named, and asleep for longer than the test: it's up for every check
+    // (`stop`ped at the end).
     let mut running = start_sleeping_with(
         &store,
-        &["--image", &image, "--volume", "keep:/data"],
-        "3",
+        &image,
+        &["--name", "keeper", "--volume", "keep:/data"],
+        "120",
         1,
     );
     // The run's area comes before its volumes are held (as root, its
@@ -489,8 +577,18 @@ fn a_volume_in_use_is_never_removed() {
     }
     let refused = shipyard(&store, &["volume", "rm", "keep"]);
     assert_eq!(refused.status.code(), Some(125));
-    assert!(text(&refused).1.contains("in use"), "{}", text(&refused).1);
-    assert!(running.wait().unwrap().success(), "the container ran on");
+    // By the container's name (a foreground run with an image has a
+    // record).
+    assert!(
+        text(&refused)
+            .1
+            .contains("the volume keep is in use by keeper"),
+        "{}",
+        text(&refused).1
+    );
+    let stopped = shipyard(&store, &["stop", "-t", "1", "keeper"]);
+    assert!(stopped.status.success(), "{}", text(&stopped).1);
+    let _ = running.wait().unwrap();
     let removed = shipyard(&store, &["volume", "rm", "keep"]);
     assert!(removed.status.success(), "{}", text(&removed).1);
     assert_eq!(
@@ -515,10 +613,9 @@ fn a_volume_a_rootless_container_wrote_as_another_user_is_removed() {
         &store,
         &[
             "run",
-            "--image",
-            &image,
             "--volume",
             "theirs:/data",
+            &image,
             "sh",
             "-c",
             "mkdir /data/d && touch /data/d/f && chown -R 1000:1000 /data/d && chmod 700 /data/d",
@@ -588,10 +685,9 @@ fn a_bad_flag_costs_no_pull() {
         &store,
         &[
             "run",
-            "--image",
-            "localhost:1/nothing",
             "--hostname",
             "bad_name",
+            "localhost:1/nothing",
             "true",
         ],
     );
@@ -601,7 +697,7 @@ fn a_bad_flag_costs_no_pull() {
     let expected = if cfg!(target_os = "linux") {
         "hostname"
     } else {
-        "--image needs Linux"
+        "an image needs Linux"
     };
     assert!(stderr.contains(expected), "{stderr}");
 }
@@ -638,23 +734,14 @@ fn volumes_and_entrypoints_as_docker_has_them() {
     let mount = format!("{}:/host:ro", host.0.display());
     let wrote = shipyard(
         &store,
-        &[
-            "run", "--image", &image, "--volume", &mount, "touch", "/host/f",
-        ],
+        &["run", "--volume", &mount, &image, "touch", "/host/f"],
     );
     assert!(!wrote.status.success(), "a read-only bind took a write");
     assert!(!host.0.join("f").exists());
 
     let entry = shipyard(
         &store,
-        &[
-            "run",
-            "--image",
-            &image,
-            "--entrypoint",
-            "/bin/cat",
-            "/marker",
-        ],
+        &["run", "--entrypoint", "/bin/cat", &image, "/marker"],
     );
     assert!(entry.status.success(), "{}", text(&entry).1);
     assert!(text(&entry).0.contains("shipyard test root filesystem"));
@@ -673,7 +760,7 @@ fn a_layer_implying_directories_is_placed_on_its_base() {
         implying_layer("work/sub/file", b"implied"),
     ]);
     for _ in 0..2 {
-        let output = shipyard(&store, &["run", "--image", &image, "cat", "/work/sub/file"]);
+        let output = shipyard(&store, &["run", &image, "cat", "/work/sub/file"]);
         if !image_runs_here(&output) {
             return;
         }
@@ -697,15 +784,7 @@ fn an_image_of_sixty_layers_runs() {
     let store = Scratch::new();
     let run = shipyard(
         &store,
-        &[
-            "run",
-            "--image",
-            &image,
-            "cat",
-            "/layer-0",
-            "/layer-58",
-            "/top",
-        ],
+        &["run", &image, "cat", "/layer-0", "/layer-58", "/top"],
     );
     let (stdout, stderr) = text(&run);
     // Before Linux 6.8, one mount stacks about 50 such layers: refused,
@@ -735,10 +814,9 @@ fn a_missing_working_directory_is_made() {
         &store,
         &[
             "run",
-            "--image",
-            &image,
             "-w",
             "/new/dir",
+            &image,
             "sh",
             "-c",
             "pwd && stat -c %a .",
@@ -765,10 +843,9 @@ fn an_image_with_uidmap_belongs_to_the_containers_root() {
         &store,
         &[
             "run",
-            "--image",
-            &image,
             "--uidmap",
             "0:100000:65536",
+            &image,
             "sh",
             "-c",
             "stat -c %u /marker && touch /marker && echo changed",
@@ -787,12 +864,11 @@ fn an_image_with_uidmap_belongs_to_the_containers_root() {
         &store,
         &[
             "run",
-            "--image",
-            &image,
             "--uidmap",
             "0:100000:65536",
             "--volume",
             &volume,
+            &image,
             "cat",
             "/data/from-host",
         ],
@@ -812,14 +888,7 @@ fn an_image_with_uidmap_belongs_to_the_containers_root() {
     let (_serving, image) = fixture();
     let refused = shipyard(
         &store,
-        &[
-            "run",
-            "--image",
-            &image,
-            "--uidmap",
-            "1:100000:65536",
-            "true",
-        ],
+        &["run", "--uidmap", "1:100000:65536", &image, "true"],
     );
     assert_eq!(refused.status.code(), Some(125), "{}", text(&refused).1);
     assert!(
@@ -848,7 +917,7 @@ fn a_store_on_overlayfs_is_explained() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let run = Command::new(SHIPYARD.path())
-        .args(["run", "--image", &image, "true"])
+        .args(["run", &image, "true"])
         .env("SHIPYARD_IMAGE_STORE", dir.join("store"))
         .output()
         .unwrap();
@@ -860,7 +929,7 @@ fn a_store_on_overlayfs_is_explained() {
 
 /// Milestone v0.1, end to end: a normal user's interactive shell in an
 /// image pulled from a registry, isolated, resource-limited and networked
-/// (`shipyard run --image IMAGE --memory 64m sh`), on the user's terminal (a
+/// (`shipyard run --memory 64m IMAGE sh`), on the user's terminal (a
 /// pseudo-terminal the test types into, as a person would). Root sets the world up, each test in
 /// a network namespace of its own: an [`Upstream`] that's the way out,
 /// with a web server and a DNS server on it, and the host's resolver
@@ -897,11 +966,12 @@ fn the_v0_1_milestone_a_rootless_interactive_shell_in_a_pulled_image_is_networke
         };
         let mut command =
             user.environment(Command::new(SHIPYARD.path()), &scratch.0.join("runtime"));
-        // `-it`: a terminal of the container's own, as Docker's.
+        // `-it`: a terminal of the container's own, as Docker's; a container
+        // (stage 9, step 9.4c3b), its terminal its monitor's, removed after.
         command
-            .args(["run", "-it", "--image", &image])
+            .args(["run", "-it", "--rm"])
             .args(memory)
-            .arg("sh")
+            .args([image.as_str(), "sh"])
             .env("SHIPYARD_IMAGE_STORE", scratch.store());
         let mut console = Console::start(command, &user, &resolv, cgroup.as_deref());
 

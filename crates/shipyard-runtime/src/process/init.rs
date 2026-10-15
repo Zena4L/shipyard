@@ -99,60 +99,24 @@ pub(crate) fn entry_point() {
 /// passed across the exec (the gate, the hooks pipe, an overlay to
 /// attach): the command must not inherit them.
 fn close_on_exec_again(setup: &super::setup::Setup) {
-    let hooks_pipe = setup.hooks.as_ref().map(|hooks| hooks.pipe);
-    let attach = setup
-        .root
-        .as_ref()
-        .and_then(super::setup::RootSetup::attach);
-    let terminal = setup.terminal.as_ref().map(|terminal| terminal.socket);
-    let passed = setup
+    super::internal::close_on_exec(setup.inherited());
+}
+
+/// The descriptors passed on to the command (see `passed.rs`), and their
+/// targets held, from the start: what this process opens from then on (the
+/// report pipe made again after the gate, say) can't take one of their
+/// numbers.
+fn held(setup: &super::setup::Setup) -> Result<super::passed::Held, Failure> {
+    let sources: Vec<RawFd> = setup
         .passing
         .iter()
-        .flat_map(|passing| passing.sources.iter().copied());
-    for fd in setup
-        .gate
-        .into_iter()
-        .flat_map(super::spawn::Gate::fds)
-        .chain(hooks_pipe)
-        .chain(attach)
-        .chain(terminal)
-        .chain(passed)
-    {
-        let _ = nix::fcntl::fcntl(
-            // SAFETY: inherited across the exec; borrowed only for this call.
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        );
-    }
-}
-
-/// The descriptors passed on to the command (see `passed.rs`) and their
-/// targets (3 and up), held from the start: what this process opens from
-/// then on (the report pipe made again after the gate, say) can't take one
-/// of their numbers. Dropped once the command has them: a socket it closes
-/// is then closed.
-struct Held {
-    _sources: Vec<OwnedFd>,
-    _reserved: Vec<OwnedFd>,
-}
-
-impl Held {
-    fn new(setup: &super::setup::Setup) -> Result<Self, Failure> {
-        // SAFETY: passed across the exec, this process's own (the setup
-        // names them).
-        let sources: Vec<OwnedFd> = setup
-            .passing
-            .iter()
-            .flat_map(|passing| passing.sources.iter())
-            .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
-            .collect();
-        let reserved = super::passed::reserve(sources.len())
-            .map_err(|err| Failure::at(ChildStep::PassFds, err.errno().unwrap_or(Errno::EBUSY)))?;
-        Ok(Self {
-            _sources: sources,
-            _reserved: reserved,
-        })
-    }
+        .flat_map(|passing| passing.sources.iter().copied())
+        .collect();
+    // SAFETY: passed across the exec, this process's own (the setup names
+    // them), taken once, here.
+    let sources = unsafe { super::passed::adopt(&sources) };
+    super::passed::Held::take(sources)
+        .map_err(|err| Failure::at(ChildStep::PassFds, err.errno().unwrap_or(Errno::EBUSY)))
 }
 
 /// Sets the container up, then runs the command: as the init's child (PID
@@ -178,13 +142,7 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     }
     // Passed across the exec, so not close-on-exec: make them so again,
     // or the command would inherit them.
-    for fd in [status, report] {
-        let _ = nix::fcntl::fcntl(
-            // SAFETY: inherited across the exec; borrowed only for this call.
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        );
-    }
+    super::internal::close_on_exec([status, report]);
     report_panics_to(report);
     let fail = |failure: Failure| -> ! {
         report_failure(report, &failure);
@@ -193,8 +151,8 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     let setup =
         read_setup(setup_fd).unwrap_or_else(|errno| fail(Failure::at(ChildStep::ReadSetup, errno)));
     close_on_exec_again(&setup);
-    // Before anything is opened here (see `Held`).
-    let held = Held::new(&setup).unwrap_or_else(|failure| fail(failure));
+    // Before anything is opened here (see `held`).
+    let held = held(&setup).unwrap_or_else(|failure| fail(failure));
     // The proof that this image started: without it, shipyard reports an
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);

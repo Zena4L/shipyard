@@ -127,7 +127,8 @@ glibc hides: libc types differ (`time_t` is deprecated there; `statfs`'s filesys
 `CC_aarch64_unknown_linux_musl=musl-gcc cargo clippy --locked --workspace --all-targets
 --target aarch64-unknown-linux-musl -- -D warnings`. Prefer nix's typed constants
 (`nix::sys::statfs::NSFS_MAGIC`) and `TimeValLike::seconds` to raw libc types.
-`scripts/test-linux.sh --fuzz 120` runs every fuzz target (do it at least at a stage's end).
+`scripts/test-linux.sh --fuzz 120` runs every fuzz target (do it at least at a stage's end);
+`scripts/fuzz-targets.sh` is their one list, so a new target goes in `fuzz/Cargo.toml` only.
 
 ## Running Linux code from macOS
 
@@ -189,6 +190,10 @@ glibc hides: libc types differ (`time_t` is deprecated there; `statfs`'s filesys
 ## Mutation checks
 
 Use `references/mutation-runner.py` (copy it to the scratchpad and fill in `MUTANTS`).
+It's the check of record: chosen mutants, root ones included, controls first.
+`scripts/test-linux.sh --mutants [BASE|FILE.diff]` (cargo-mutants on the changes,
+unprivileged, a report) is a sweep beside it: read its missed list for gaps the hand
+runner didn't think of, but a mutant only root tests catch shows there as missed.
 The rules, each learned the hard way:
 
 - One scratch copy of the repo **and one cargo target dir per mutant**: a shared target

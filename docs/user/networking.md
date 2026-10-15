@@ -11,12 +11,12 @@ A container's network is chosen with `shipyard run --network MODE`. On Linux:
 | `none` | One of its own, with only a loopback interface (`lo`): nothing in or out. |
 
 ```sh
-sudo shipyard run --image alpine:3.20 wget -qO- example.com      # the default network
-sudo shipyard run -p 8080:80 --image nginx:alpine                # http://localhost:8080
+sudo shipyard run alpine:3.20 wget -qO- example.com      # the default network
+sudo shipyard run -p 8080:80 nginx:alpine                # http://localhost:8080
 sudo shipyard network create app
-sudo shipyard run --network app --image alpine:3.20 ip addr show eth0
-shipyard run -p 8080:80 --image nginx:alpine                     # rootless, through pasta
-sudo shipyard run --network front --network back --image alpine:3.20 ip addr   # two networks
+sudo shipyard run --network app alpine:3.20 ip addr show eth0
+shipyard run -p 8080:80 nginx:alpine                     # rootless, through pasta
+sudo shipyard run --network front --network back alpine:3.20 ip addr   # two networks
 ```
 
 > **Status:** as root, containers on a network reach each other, the host and
@@ -51,10 +51,15 @@ your distribution's `passt` package.
   even one only the host can reach, like systemd's `127.0.0.53`. Without a root of
   its own, the container sees the host's `/etc/resolv.conf`; if that names only
   the host's own resolver (`127.0.0.53`), lookups can't work, and `shipyard` warns:
-  give it `--image` or `--rootfs`, or `--network host`.
+  give it an image or `--rootfs`, or `--network host`.
 - **Signals:** pasta is out of the terminal's reach (Ctrl-C is the container's),
-  and goes after the container. If pasta itself fails while the container runs,
-  the container loses its network without a word (for now).
+  and goes after the container. If pasta itself fails while a container runs
+  (killed, or it crashes), the container runs on with only its loopback, as with
+  Podman: that's said. `ps` shows `Up 3 minutes (no network)`, `inspect` gives
+  `state.network_lost` (when, and how pasta ended), the events journal has a
+  `network_lost` event, and a foreground run warns when it ends. Starting the
+  container again gives it a new pasta. A run that isn't a container (`--no-image`,
+  say) isn't watched so.
 - **Published ports** (`-p`, `-P`): pasta listens on the host's ports and carries
   connections in, on IPv4 and IPv6. As for any program of yours, ports below 1024
   need the host's
@@ -109,6 +114,8 @@ Makes the network and its bridge, and prints its name.
 | `--ipv6` | IPv6 too (see [IPv6](#ipv6)). |
 | `--subnet PREFIX`, `--gateway IP6` | Given a second time with IPv6, the network's IPv6 prefix (`fd00:1::/64`) and gateway; either implies `--ipv6`. The prefix needs at least as many addresses as the IPv4 subnet (a `/112` or larger). |
 | `--internal` | No way in or out of the network: its containers reach each other and the host only, and publish no ports. |
+| `--isolate-host` | Its containers can't reach the host itself (its services, on any of its addresses) nor the cloud's metadata addresses, but for the network's DNS server (see [What gets in](#the-way-out-and-what-gets-in)). Not for the default network, `bridge`, which has no DNS server. |
+| `--conntrack-limit` | Each container address on it may have at most 8,192 connections open of those it opened; the next is refused (see [What gets in](#the-way-out-and-what-gets-in)). |
 
 A name is letters, digits, `_`, `.` and `-`, starting with a letter or digit, at
 most 64 characters. `bridge` is the default network's.
@@ -128,23 +135,25 @@ bridge   10.88.0.0/16  -                         10.88.0.1  shipyard0       0
 The networks as JSON: the name, subnet, gateway, IPv6 prefix and gateway
 (`Subnet6`, `Gateway6`), bridge, whether it's internal,
 when it was made, whether its DNS server is running (`DNSRunning`, see
-[Names](#names)), and each running container on it (its run ID, `--name` and
-aliases, hostname, interface (`eth0`, …), address and IPv6 address, MAC address,
-host-side veth
-and published ports,
-each with its `host_ip` if it has one, `host_port`, `container_port` and
-`protocol`).
+[Names](#names)), and each running container on it: its full ID (`Container`,
+what every other command takes; a run with no record, such as `--no-image`, has
+none), its run ID, `--name` and aliases, hostname, interface (`eth0`, …), address
+and IPv6 address, MAC address, host-side veth and published ports, each with its
+`host_ip` if it has one, `host_port`, `container_port` and `protocol`.
 
 ### `shipyard network rm NETWORK...`
 
-Removes networks and their bridges. A network a running container uses is
-refused ("in use by 2 container(s)"), and so is `bridge`. It carries on past a
-network it can't remove, and exits with 125 if any failed.
+Removes networks and their bridges. A network a container is on is refused,
+whether it's running or stopped: a stopped one would join it again when it
+starts ("the network app is in use by web, db": up to five, by name; a run with
+no record, such as `--no-image`, by its run ID). Disconnect it first
+(`shipyard network disconnect`), or remove it. `bridge` is refused too. It
+carries on past a network it can't remove, and exits with 125 if any failed.
 
 ### `shipyard network prune [-f]`
 
-Removes every network no running container uses, except `bridge`. It asks first
-on a terminal; elsewhere it needs `-f`.
+Removes every network no container is on, running or stopped, except `bridge`.
+It asks first on a terminal; elsewhere it needs `-f`.
 
 ## Addresses
 
@@ -178,8 +187,15 @@ On a network you make (`shipyard network create`), containers find each other
 `/etc/resolv.conf` names. It answers:
 
 - **A container's names**, with its address: its `--name`, each
-  `--network-alias`, and its run ID. Any case works (`DB` is `db`).
-- **Its address's name** (a reverse lookup, `PTR`): its `--name`, or its run ID.
+  `--network-alias`, its short ID (the 12 characters `ps` shows, which is also its
+  hostname unless you give it `--hostname`, so `ping $(hostname)` from another
+  container works) and its run ID
+  (each start's own, as `network inspect` shows it). Any case works (`DB` is
+  `db`). A container's
+  name can change while it runs (`shipyard rename`, see
+  [Containers](containers.md)): it answers to the new one within a second.
+- **Its address's name** (a reverse lookup, `PTR`): its `--name`, else its short
+  ID, else (a run with no record, such as `--no-image`) its run ID.
 - **Everything else** goes to the host's own resolvers (those in the host's
   `/etc/resolv.conf`, even a local one such as systemd-resolved's `127.0.0.53`),
   and their answer comes back as it is. **On an internal network**, nothing goes
@@ -187,8 +203,8 @@ On a network you make (`shipyard network create`), containers find each other
 
 ```sh
 sudo shipyard network create app
-sudo shipyard run --network app --name db --image postgres:16 &
-sudo shipyard run --network app --image alpine:3.20 nslookup db
+sudo shipyard run -d --network app --name db postgres:16
+sudo shipyard run --network app alpine:3.20 nslookup db
 ```
 
 | Option | Effect |
@@ -222,10 +238,19 @@ log, next to the network's other files
 (`/var/lib/shipyard/networks/NAME/dns.log`). The networks' files there are
 readable by root and the servers' group (`nogroup`, 65534) only.
 
-The server isn't a daemon anyone looks after: if it's killed (or the service
-manager stops the session of the command that started it), the network's
-running containers have no DNS until the next `shipyard run` on that network
-starts another.
+The server runs in a cgroup of its own, `shipyard/dns/NAME-…` (at most 64 MiB of
+memory and 136 tasks), not in the session of the command that started it: a logout,
+or the service manager stopping that command's unit, leaves it running. It's two
+processes. One serves, and the other, its watchdog, starts it again if it's killed
+or fails: after 100 ms, then waiting twice as long each time it ends again (up to 30
+seconds; afresh once it has served for a minute). Each restart is in its log ("its
+worker was killed (SIGKILL): started again in 100 ms"). After 20 ends in a row that
+quick, the watchdog gives up, and the next `shipyard run` on the network starts a
+server afresh (saying why, if it can't). If the watchdog itself is killed, its worker
+ends with it, and the network's running containers have no DNS until the next
+`shipyard run` on that network starts another server. `network rm` removes the
+server's cgroup with the network. If the cgroup can't be had (no cgroup v2), the
+server runs where it was started, as its log says.
 
 ## Several networks
 
@@ -234,9 +259,9 @@ A container joins several bridge networks with `--network` once for each:
 ```sh
 sudo shipyard network create front
 sudo shipyard network create back
-sudo shipyard run --network front --name web --image nginx:alpine &
-sudo shipyard run --network back --name db --image postgres:16 &
-sudo shipyard run --network front --network back --name app --image alpine:3.20 \
+sudo shipyard run -d --network front --name web nginx:alpine
+sudo shipyard run -d --network back --name db postgres:16
+sudo shipyard run --network front --network back --name app alpine:3.20 \
     sh -c 'wget -qO- web; nc -z db 5432'
 ```
 
@@ -282,6 +307,51 @@ sudo shipyard run --network name=front,ip=10.89.0.50,alias=www \
 give each its own"). `--network-alias` goes to every network you made that the container
 joins, with each long form's own `alias=` added there.
 
+
+## Connecting a running container: `network connect`, `disconnect`
+
+A container joins a network, or leaves one, while it runs, as with Docker:
+
+```sh
+sudo shipyard network connect back web            # web joins back, at once
+sudo shipyard network connect --ip 10.89.1.20 --alias api back web
+sudo shipyard network disconnect back web         # and leaves it
+```
+
+- **At once, if it's running** (or paused): it gets an interface on the network
+  (`eth1`, the first number free), an address, and its names there (its name, its
+  short ID, its `--network-alias`es, and any `--alias` given). Its peers there find it
+  by name straight away. The address is its own until it leaves the network or ends,
+  though the command has gone (its monitor holds it, as for a network it started on).
+- **At its next start, if it isn't:** a created or stopped container's record changes,
+  and its next start joins (or doesn't join) the network.
+- **Its record keeps it**, either way: a restart (by `restart`, or its restart policy)
+  joins what it's on now.
+- **What its start set stays:** its default route and published ports stay on the
+  network that has them, and its `/etc/hosts` and `/etc/resolv.conf` are left as they
+  are. So a network connected later is reached by names through the DNS server the
+  container has already: each network's server answers its containers' names on their
+  other networks too. A container that started only on the default network `bridge`
+  (which has no names) finds the new network's names after a restart.
+- **The network that carries its way out** (its IPv4 or IPv6 default route, as it is
+  in the container now, and the ports its start published) is refused without
+  `--force`; with it, the container is left with no default route of that family.
+  (Docker moves the default route to another network instead.)
+- **`--ip` and `--ip6`** must be the network's (its subnet; IPv6 only on a network
+  with IPv6), checked when you connect, a stopped container too.
+- **A container's monitor holds at most 2100 things** (its networks' addresses, its
+  published ports, its volumes): a running container with that many may have to be
+  restarted to join one more. A run that would need more is refused before anything is
+  made: its published ports (two sockets per port published on every address, `-P`'s
+  too) and its other holds (one per network, one per volume, a few of its own) must fit
+  within 2100 and within the descriptor limit (`ulimit -n`).
+- **Its only network** can't be left (with none, it would join the default network at
+  its next start).
+- **Root only** (bridge networks are root's): a rootless container's network is
+  pasta's, and `--network host` or `none` has no bridges to join either.
+- Events: `network connect` and `network disconnect`, with the container's ID (see
+  [Events](events.md)).
+
 ## IPv6
 
 A network made with `--ipv6` is dual-stack: each container on it has an IPv6
@@ -289,7 +359,7 @@ address beside its IPv4 one.
 
 ```sh
 sudo shipyard network create --ipv6 app
-sudo shipyard run --network app --image alpine:3.20 ip -6 addr show eth0
+sudo shipyard run --network app alpine:3.20 ip -6 addr show eth0
 ```
 
 - **Its prefix** is a random unique local one (a ULA `/64`, `fd…`, as RFC 4193
@@ -357,6 +427,66 @@ What gets in:
   link-local IPv6 address isn't checked yet.
 - **Packets the kernel's connection tracking finds invalid** (outside any
   connection's window, say) are dropped on their way into or out of a network.
+- **A container reaches the host itself** (a service on any of the host's addresses,
+  even one listening only on the network's gateway), and the cloud's metadata
+  service where the host is a cloud machine, unless its network was made with
+  **`--isolate-host`**. Then it reaches only the network's DNS server on the host
+  (its gateway's port 53), and IPv6's neighbour discovery (solicitations and
+  advertisements); the host's replies, and what the host publishes, still reach it.
+  Nor does it reach the metadata addresses: all of 169.254.0.0/16 (the
+  link-local block: most clouds' 169.254.169.254, AWS's DNS and time servers),
+  Alibaba's 100.100.100.200, and `fd00:ec2::254`, `fd00:ec2::23` and
+  `fd20:ce::254`. (Docker has no such option; Podman's is a firewall rule of your
+  own.)
+  - **Per network:** a container that's on an isolated network and on a plain one
+    reaches the host through the plain one.
+  - **Kept by the firewall table:** if something flushes Shipyard's `nft` table
+    (`nft flush ruleset`, a firewall service's restart), isolation is off until a
+    Shipyard command that touches networks runs again and puts it back.
+  - **A downgrade** to a Shipyard without `--isolate-host` rebuilds the table
+    without it: an isolated network's containers then reach the host. A newer
+    Shipyard's table is left as it is by an older one.
+- **A container can open as many connections as the host's connection table
+  holds** (`net.netfilter.nf_conntrack_max`, often 65,536 to 262,144), and one that
+  fills it stops every new connection on the host, the host's own included, unless
+  its network was made with **`--conntrack-limit`**. Then each container address
+  on it may have at most **8,192** connections open of those it opened: to the
+  world, to the host, and to containers on other networks (UDP "connections" count
+  too, until they time out: about 30 seconds unanswered, 2 minutes answered). A
+  connection counts once, on its first packet. The next new one is refused:
+  - **TCP** with a reset, so `connect` fails at once with `Connection refused`;
+  - **anything else** with an ICMP "administratively prohibited", which a program
+    sees as `No route to host` (`EHOSTUNREACH`) over IPv4 and `Permission denied`
+    (`EACCES`) over IPv6. The kernel rate-limits ICMP errors
+    (`net.ipv4.icmp_ratelimit`), so past a few refusals a second some are just
+    dropped, and the program waits for its own timeout.
+
+  What it doesn't count, and its limits:
+  - **Per address, per network:** an address on each of two limited networks has
+    8,192 each, and a container's IPv6 address counts apart from its IPv4 one.
+  - **Within one network:** connections between containers on the same network
+    are switched by its bridge, not routed, so they count only where the host
+    loads `br_netfilter` (which hands bridged traffic to the firewall).
+  - **Connections to it** (its published ports) count against whoever opened them.
+  - **Its DNS lookups count:** each query to the network's DNS server is a UDP
+    connection for about 30 seconds, so a container at its limit can't resolve
+    names either.
+  - **Attempts Shipyard's own rules then refuse** (an isolated network's to the
+    host, say) count for about a second.
+  - **An IPv6 link-local source** (`fe80::/10`) can't open connections to the host
+    from a limited network: the network's bridge can't tell one container's
+    made-up link-local addresses from another's, and each would have a count of its
+    own. Neighbour discovery isn't affected.
+  - **At most 65,536 addresses are counted at once** across the host's limited
+    networks. A new address beyond that isn't limited.
+  - **A small host** (about 1 GiB of memory or less) may have a table no larger
+    than 8,192 to begin with: there, one container can still fill it.
+  - **Kept by the firewall table:** after something flushes Shipyard's table there
+    is no limit until a Shipyard command that touches networks puts it back, and a
+    rebuild (a Shipyard update that changes the table) forgets the connections
+    already open: they aren't counted until they end. A downgrade to a Shipyard
+    without `--conntrack-limit` rebuilds the table without the limit.
+  - (Docker has no such option; Podman's is a firewall rule of your own.)
 
 ### Published ports (`-p`, `-P`)
 
@@ -366,7 +496,7 @@ What gets in:
 |---|---|
 | `8080:80` | the host's port 8080, on every IPv4 address (and every IPv6 one, on a network with IPv6), to the container's 80 |
 | `127.0.0.1:8080:80` | the same on that address only (here: from this machine only) |
-| `80` | a free host port to the container's 80 (`network inspect` shows which) |
+| `80` | a free host port to the container's 80 (`shipyard port` shows which) |
 | `127.0.0.1::80` | a free port on that address |
 | `[2001:db8::1]:8080:80` | on that IPv6 address only (in brackets; a network with IPv6) |
 | `0.0.0.0:8080:80`, `[::]:8080:80` | every address, as `8080:80` |
@@ -384,8 +514,9 @@ shipyard: published 0.0.0.0:41665 -> 80/tcp
 - **The host's port is held** while the container runs (on IPv6 too, for a port
   published on every address, whether the network has IPv6 or not): no other program (or container) can take it, and a
   second `-p 8080:80` is refused with "port 8080/tcp on 0.0.0.0 is already in use".
-  So is a port a program has just stopped using, for a minute (while the kernel
-  closes its connections, `TIME_WAIT`).
+  A TCP port that only closed connections still wait on (the minute or so after a
+  program or container stopped serving it, `TIME_WAIT`) is free to publish: a
+  container started again at once gets its port back.
 - **Published on `127.0.0.1`, it's this machine's only:** nothing that comes in on
   another interface reaches it, nor anything else on 127.0.0.0/8.
 - **It works from everywhere:** other machines, the host itself (its own
@@ -398,6 +529,10 @@ shipyard: published 0.0.0.0:41665 -> 80/tcp
   the host's already) or `none`. Not on `[::1]`: the kernel never routes the IPv6
   loopback address off the host, so a port there can't reach a container
   (`127.0.0.1` can be published on).
+- **As many as its monitor can hold:** a port published on every address takes two
+  of the container monitor's 2100 holds (one on a single address), `-P`'s too, beside
+  one per network, one per volume and a few of its own; within the descriptor limit
+  (`ulimit -n`) too. A run that would need more is refused before anything is made.
 
 ### Other firewalls
 
@@ -418,7 +553,7 @@ next `shipyard run` rebuilds the table whole:
 - what keeps each from sending as another.
 
 So after a flush, run any container on a network at once: `sudo shipyard run
-true` (on the default network) puts the table back.
+--no-image true` (on the default network) puts the table back.
 
 Another firewall can still drop what Shipyard lets through. A rule of
 Shipyard's that accepts a packet ends only Shipyard's own chain, while a drop in
@@ -508,7 +643,7 @@ is named by its **run ID**, 12 hexadecimal digits new for each run, as Docker
 names a container. With the host's network it keeps the host's name, the one the
 host's `/etc/hosts` and DNS know. `--hostname` sets another either way.
 
-A container with a root filesystem of its own (`--image` or `--rootfs`) gets
+A container with a root filesystem of its own (an image or `--rootfs`) gets
 three files Shipyard writes for that run, as Docker's do:
 
 | File | What it says |
@@ -520,7 +655,7 @@ three files Shipyard writes for that run, as Docker's do:
 - **With `--rootfs`**, only the files DIR already has, as regular files, are
   replaced: Shipyard never writes into your directory. A symbolic link (such as
   Debian's `/etc/resolv.conf`, which points into `/run`) is left as it is. With
-  `--image`, all three always (the image's own are hidden for the run; the image
+  an image, all three always (the image's own are hidden for the run; the image
   is unchanged).
 - **A volume on one of them wins** (`--volume ./hosts:/etc/hosts`).
 - **Without a root of its own**, the container sees the host's files.
@@ -548,10 +683,10 @@ These change the files:
 | `--dns-option OPTION` | A resolver option, such as `ndots:2`, instead of the host's (repeatable). |
 | `--add-host NAME:IP` | An extra line in `/etc/hosts` (repeatable). IPv6 works: `db:fd00::5`. |
 
-They need `--image` or `--rootfs`.
+They need an image or `--rootfs`.
 
 ```sh
-shipyard run --image alpine:3.20 --dns 1.1.1.1 --add-host db:10.0.0.5 \
+shipyard run --dns 1.1.1.1 --add-host db:10.0.0.5 alpine:3.20 \
     cat /etc/resolv.conf /etc/hosts
 ```
 
@@ -586,7 +721,7 @@ These exit with 125, before the command starts:
   on the network answers to already; `--network-alias` without a network you
   made.
 - A network's DNS server that can't start (port 53 taken, say).
-- `--add-host` or a `--dns` flag without `--image` or `--rootfs`.
+- `--add-host` or a `--dns` flag without an image or `--rootfs`.
 - Any of these with `--no-isolation` or `--bundle`.
 - A device already called `shipyard0` (or a network's bridge name) that isn't a
   bridge.

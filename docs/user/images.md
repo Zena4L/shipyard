@@ -3,7 +3,7 @@
 Shipyard pulls container images from a registry, keeps them in a local store,
 and runs them. An image's layers become a container's root filesystem.
 
-> **Status:** on Linux, `shipyard pull` and `shipyard run --image` pull, store and
+> **Status:** on Linux, `shipyard pull` and `shipyard run IMAGE` pull, store and
 > run images, rootless or as root. Running an image needs Linux (it uses
 > overlayfs); on macOS it will run in the VM a later version manages. Building,
 > pushing and signature verification aren't here yet.
@@ -11,7 +11,7 @@ and runs them. An image's layers become a container's root filesystem.
 ## Running an image
 
 ```sh
-shipyard run --image alpine:3.20 cat /etc/alpine-release
+shipyard run alpine:3.20 cat /etc/alpine-release
 ```
 
 The first time, Shipyard pulls `alpine:3.20` from Docker Hub, verifies and stores
@@ -21,7 +21,7 @@ store already has it, so it starts immediately.
 With no command, the image's own default runs:
 
 ```sh
-shipyard run --image alpine:3.20          # runs the image's CMD (here, /bin/sh)
+shipyard run alpine:3.20          # runs the image's CMD (here, /bin/sh)
 ```
 
 The image's baked-in **environment**, **working directory**, **user**, and
@@ -30,15 +30,27 @@ flag you give wins: `-e KEY=VALUE` adds to (or overrides) the image's
 environment, a `COMMAND` replaces its default command (and follows its
 entrypoint), `--entrypoint` replaces the entrypoint, `-w` sets the working
 directory, `-u` the user. The rules are in
-[Running commands](run.md#image---image).
+[Running commands](run.md#image).
 
-`--image` works with the rest of `run`: `--read-only`, limits (`--memory`,
-`--cpus`, …), `--volume`, `--cap-add`/`--cap-drop`, and so on. See
-[Running commands](run.md).
+Its **exposed ports** are what `-P` publishes, and its **health check** (a
+Dockerfile's `HEALTHCHECK`) is every container's of it, unless `--health-cmd`
+replaces it or `--no-healthcheck` turns it off (see
+[Health checks](containers.md#health-checks)).
+
+The image is `run`'s first argument; Shipyard's options go before it, and
+everything after it is the command's (see [Arguments](run.md#arguments)). An image
+works with the rest of `run`: `--read-only`, limits (`--memory`, `--cpus`, …),
+`--volume`, `--cap-add`/`--cap-drop`, and so on:
+
+```sh
+shipyard run --memory 512m -e A=1 alpine:3.20 env
+```
+
+See [Running commands](run.md).
 
 ## Pulling
 
-`run --image` pulls an image only if the store doesn't have it; after that, runs
+`run` pulls an image only if the store doesn't have it; after that, runs
 need no registry and no network. `shipyard pull` fetches one ahead of time, and
 always asks the registry, so a tag that moved is brought up to date:
 
@@ -141,13 +153,20 @@ directories no *other* image still needs — a shared base layer survives removi
 one of the images that use it. `image prune` reclaims everything unreferenced,
 and what interrupted work left behind.
 
-An image a running container uses isn't removed (`rmi --force` removes its name;
-its layers stay until the container ends and a prune collects them). A prune or
+An image a [container](containers.md) was made from isn't removed while the
+container exists, running or not (`rmi --force` removes its name; the container
+keeps what it needs to start again, until it's removed): a foreground image run
+is a container too, so its image stays until the container is removed (`run --rm`
+removes it as it ends). Nor is one a run without a record is using (`rmi --force`
+removes its name; its layers stay until the run ends and a prune collects them). A container's own writable layer is never pruned. A
+prune or
 `rmi` never takes what a pull or a starting run is using: it waits for them, up
 to 15 seconds, then says the store is busy.
 
-`system df` shows what images, running containers' writable layers and volumes
-take, and how much of each nothing uses now (reclaimable):
+`system df` shows what images, containers' writable layers and volumes take, and
+how much of each nothing uses now (reclaimable). `COUNT` for containers is the
+running ones; a stopped container's layer counts in `SIZE`, not as reclaimable
+(`rm` reclaims it, not a prune):
 
 ```text
 TYPE         COUNT   SIZE       RECLAIMABLE

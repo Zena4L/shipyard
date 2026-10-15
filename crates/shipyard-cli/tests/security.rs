@@ -31,12 +31,19 @@ const SHOW_STATUS: &str = "cat /proc/self/status";
 
 /// `shipyard run ARGS… sh -c SCRIPT`.
 fn shipyard_run(args: &[&str], script: &str) -> Run {
-    run(SHIPYARD.command(&[&["run"], args, &["sh", "-c", script]].concat()))
+    run(SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(args),
+            args,
+            &["sh", "-c", script],
+        ]
+        .concat(),
+    ))
 }
 
 /// `shipyard run ARGS…`.
 fn run_args(args: &[&str]) -> Run {
-    run(SHIPYARD.command(&[&["run"], args].concat()))
+    run(SHIPYARD.command(&[shipyard_test_support::run_words(args), args].concat()))
 }
 
 /// The value of `field` in `/proc/…/status` output.
@@ -250,6 +257,7 @@ fn root_inside_cant_reach_the_inits_descriptors() {
 fn the_init_still_forwards_signals_to_a_non_root_command() {
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--user",
         "1000",
         "sh",
@@ -820,6 +828,7 @@ fn a_profile_refusing_the_inits_kill_ends_the_container() {
     }));
     let running = start_command(SHIPYARD.command(&[
         "run",
+        "--no-image",
         "--security-opt",
         &profile.option(),
         "sh",

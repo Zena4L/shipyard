@@ -8,6 +8,11 @@
 //! any program's port), and two runs can't publish the same one. The socket
 //! never sees a packet: the DNAT happens before the kernel looks for one.
 //!
+//! A TCP port only closed connections still wait on (`TIME_WAIT`, the
+//! minute or so after the side that closed first, here pasta for a
+//! rootless container, let go) is held all the same, with `SO_REUSEADDR`
+//! for one call, under a lock (`after_time_wait`, Linux).
+//!
 //! A port on every address is published (and held) on IPv4 and IPv6; one
 //! on an address, on that address's family. An IPv6 address is written in
 //! brackets, as in a URL: `[2001:db8::1]:8080:80`.
@@ -256,12 +261,28 @@ pub fn parse_exposed(key: &str) -> Option<PortRequest> {
 
 /// A host port held for a run: the sockets bound to it (IPv4, and for one
 /// published on every address, IPv6 too: a program listening on `[::]:PORT`
-/// would otherwise get the IPv6 clients). Dropping it frees the port.
+/// would otherwise get the IPv6 clients). Dropping it frees the port, unless
+/// a copy of its [`sockets`](Self::sockets) is still open.
 #[derive(Debug)]
 pub struct HeldPort {
     /// What's published.
     pub published: Published,
-    _sockets: Vec<OwnedFd>,
+    sockets: Vec<OwnedFd>,
+}
+
+impl HeldPort {
+    /// The bound sockets (one or two), for a process that keeps the port
+    /// held (a container's monitor).
+    pub fn sockets(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.sockets.iter().map(std::os::fd::AsFd::as_fd)
+    }
+
+    /// Whether it's held on IPv6's every address (`[::]`) too: published on
+    /// every address, on a host with IPv6.
+    #[must_use]
+    pub fn also_ipv6(&self) -> bool {
+        self.published.host_ip.is_none() && self.sockets.len() > 1
+    }
 }
 
 /// Holds the host's port for each of `requests`, in order: the ports asked
@@ -291,19 +312,21 @@ fn hold_one(request: &PortRequest) -> Result<HeldPort, PortError> {
         },
     };
     let ipv6 = |ip: Ipv6Addr, port| {
-        bind_socket(
+        bind_port(
             request.protocol,
             AddressFamily::Inet6,
             &SockaddrIn6::from(std::net::SocketAddrV6::new(ip, port, 0, 0)),
+            port,
         )
     };
     let (first, host_port) = match address {
         IpAddr::V4(ip) => {
             let [a, b, c, d] = ip.octets();
-            let socket = bind_socket(
+            let socket = bind_port(
                 request.protocol,
                 AddressFamily::Inet,
                 &SockaddrIn::new(a, b, c, d, asked),
+                asked,
             )
             .map_err(|errno| fail(asked, errno))?;
             let port = getsockname::<SockaddrIn>(socket.as_raw_fd())
@@ -335,21 +358,54 @@ fn hold_one(request: &PortRequest) -> Result<HeldPort, PortError> {
             container_port: request.container_port,
             protocol: request.protocol,
         },
-        _sockets: sockets,
+        sockets,
     })
+}
+
+/// [`bind_socket`], to `address` with its `port`; a TCP port that only
+/// closed connections still wait on is held all the same (Linux:
+/// [`after_time_wait`]).
+fn bind_port(
+    protocol: Protocol,
+    family: nix::sys::socket::AddressFamily,
+    address: &dyn nix::sys::socket::SockaddrLike,
+    port: u16,
+) -> Result<OwnedFd, nix::errno::Errno> {
+    match bind_socket(protocol, family, address) {
+        #[cfg(target_os = "linux")]
+        Err(nix::errno::Errno::EADDRINUSE) if protocol == Protocol::Tcp && port != 0 => {
+            after_time_wait::bind(family, address, port)
+        }
+        bound => {
+            let _ = port;
+            bound
+        }
+    }
 }
 
 /// A socket of `protocol` in `family`, bound to `address`, never listening.
 /// Close-on-exec: never a container's. No `SO_REUSEADDR`: a port another
 /// socket has (or a closed connection still waits on, `TIME_WAIT`) is
-/// refused, as for any program. An IPv6 one is IPv6 only.
+/// refused, as for any program (but see [`bind_port`]). An IPv6 one is IPv6
+/// only.
 fn bind_socket(
     protocol: Protocol,
     family: nix::sys::socket::AddressFamily,
     address: &dyn nix::sys::socket::SockaddrLike,
 ) -> Result<OwnedFd, nix::errno::Errno> {
-    use nix::sys::socket::{SockFlag, SockProtocol, SockType, bind, setsockopt, socket, sockopt};
     use std::os::fd::AsRawFd as _;
+    let socket = unbound_socket(protocol, family)?;
+    nix::sys::socket::bind(socket.as_raw_fd(), address)?;
+    Ok(socket)
+}
+
+/// A socket of `protocol` in `family`, not bound yet: close-on-exec, and
+/// an IPv6 one IPv6 only.
+fn unbound_socket(
+    protocol: Protocol,
+    family: nix::sys::socket::AddressFamily,
+) -> Result<OwnedFd, nix::errno::Errno> {
+    use nix::sys::socket::{SockFlag, SockProtocol, SockType, setsockopt, socket, sockopt};
     let (kind, protocol) = match protocol {
         Protocol::Tcp => (SockType::Stream, SockProtocol::Tcp),
         Protocol::Udp => (SockType::Datagram, SockProtocol::Udp),
@@ -368,8 +424,133 @@ fn bind_socket(
     if family == nix::sys::socket::AddressFamily::Inet6 {
         setsockopt(&socket, sockopt::Ipv6V6Only, &true)?;
     }
-    bind(socket.as_raw_fd(), address)?;
     Ok(socket)
+}
+
+/// Holding a TCP port that only closed connections still wait on.
+///
+/// The side of a TCP connection that closes first keeps its address and
+/// port in `TIME_WAIT` for a minute or so (twice the longest a segment can
+/// live: TLPI §61.6.6), so that a stray segment of the old connection
+/// can't be taken for a new one's. A rootless container's pasta is that
+/// side for its published ports: once it served a client, a start again
+/// would find its port "in use" for that minute. A plain `bind` refuses a
+/// port in `TIME_WAIT`; one with `SO_REUSEADDR` is let through.
+///
+/// But `SO_REUSEADDR` also lets two sockets that both have it, neither
+/// listening, bind one port: two runs could both hold it. So, Linux's rules
+/// (checked by a probe, as root and not): a socket bound with it, and at
+/// once without it again, holds the port as a plain one does (every later
+/// `bind` is refused, with `SO_REUSEADDR` or not, listening or not). That
+/// leaves the moment between the two calls, and what else is on the port:
+///
+/// 1. Under a lock every Shipyard holding a port this way takes: an
+///    abstract Unix socket's name (`@shipyard/port-reservations`). Its
+///    scope is the network namespace, as the ports'; any user can take it;
+///    and the kernel frees it when its holder ends, even killed.
+/// 2. Bound with `SO_REUSEADDR`, which is cleared at once.
+/// 3. Kept only if every socket the kernel's tables list on the port
+///    (`/proc/net/tcp` and `tcp6`) is in `TIME_WAIT`: a listener, a
+///    connection still open, or another program's listener from that
+///    moment (outside the lock) means the port is let go, and in use. (The
+///    tables don't list a socket only bound, never listening. One bound
+///    with `SO_REUSEADDR` can be beside the port held, but once it's held
+///    it can't `listen`, nor can any other: probed. The port is this run's
+///    to serve on.)
+///
+/// The lock not had within `LOCK_WAIT` (a stuck holder, or another
+/// process holding the name) is a port in use, as before.
+#[cfg(target_os = "linux")]
+mod after_time_wait {
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+    use std::time::{Duration, Instant};
+
+    use nix::errno::Errno;
+    use nix::sys::socket::{AddressFamily, SockaddrLike, setsockopt, sockopt};
+
+    use crate::observe::{self, State, Table};
+
+    /// The lock's name, in the abstract namespace (no file).
+    const LOCK_NAME: &[u8] = b"shipyard/port-reservations";
+
+    /// How long the lock is waited for.
+    pub(super) const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+    /// `address` (with its `port`) held, if only closed connections wait
+    /// on it; else `EADDRINUSE`.
+    pub(super) fn bind(
+        family: AddressFamily,
+        address: &dyn SockaddrLike,
+        port: u16,
+    ) -> Result<OwnedFd, Errno> {
+        let Some(_lock) = Lock::take(LOCK_WAIT) else {
+            return Err(Errno::EADDRINUSE);
+        };
+        let socket = super::unbound_socket(super::Protocol::Tcp, family)?;
+        setsockopt(&socket, sockopt::ReuseAddr, &true)?;
+        nix::sys::socket::bind(socket.as_raw_fd(), address)?;
+        // Held as a plain socket holds it, from here on.
+        setsockopt(&socket, sockopt::ReuseAddr, &false)?;
+        // Anything else on the port (a listener, a connection still open,
+        // one that came meanwhile from outside the lock): let go.
+        if !only_time_wait(port) {
+            return Err(Errno::EADDRINUSE);
+        }
+        Ok(socket)
+    }
+
+    /// Whether every TCP socket the tables list on `port` (any address,
+    /// either family) is in `TIME_WAIT` (this process's held ones, only
+    /// bound, aren't listed). A table that can't be read says no.
+    fn only_time_wait(port: u16) -> bool {
+        [
+            ("/proc/net/tcp", Table::Tcp),
+            ("/proc/net/tcp6", Table::Tcp6),
+        ]
+        .into_iter()
+        .all(|(path, table)| {
+            let Ok(file) = std::fs::File::open(path) else {
+                // No IPv6 here: no table, no sockets.
+                return table == Table::Tcp6 && !std::path::Path::new(path).exists();
+            };
+            observe::read(std::io::BufReader::new(file), table, |socket| {
+                socket.local.port() == port && socket.state != State::TimeWait
+            })
+            .is_ok_and(|others| others.is_empty())
+        })
+    }
+
+    /// The lock: an abstract Unix socket bound to [`LOCK_NAME`], held while
+    /// this lives.
+    pub(super) struct Lock {
+        _held: OwnedFd,
+    }
+
+    impl Lock {
+        /// The lock, waited for up to `wait`: `None` if it isn't had by
+        /// then (or can't be).
+        pub(super) fn take(wait: Duration) -> Option<Lock> {
+            use nix::sys::socket::{SockFlag, SockType, UnixAddr, socket};
+            let name = UnixAddr::new_abstract(LOCK_NAME).ok()?;
+            let deadline = Instant::now() + wait;
+            loop {
+                let socket = socket(
+                    AddressFamily::Unix,
+                    SockType::Stream,
+                    SockFlag::SOCK_CLOEXEC,
+                    None,
+                )
+                .ok()?;
+                match nix::sys::socket::bind(socket.as_raw_fd(), &name) {
+                    Ok(()) => return Some(Lock { _held: socket }),
+                    Err(Errno::EADDRINUSE) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +709,92 @@ mod tests {
             .unwrap_err();
             assert_eq!(error, nix::errno::Errno::EADDRINUSE);
         }
+    }
+
+    /// A TCP port only a closed connection waits on (`TIME_WAIT`) is held
+    /// (F42), then as any held port: refused to a second hold, and to a
+    /// program binding with `SO_REUSEADDR` (std's listeners do). One that
+    /// another socket is on too, or whose lock another process holds, is
+    /// still in use. (One test: the lock is held in its last part.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_port_closed_connections_wait_on_is_held() {
+        use nix::sys::socket::{AddressFamily, SockaddrIn, setsockopt, sockopt};
+        use std::os::fd::AsRawFd as _;
+        use std::time::Duration;
+        // A port whose server side closed first: that side waits on it.
+        let time_wait = || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let (served, _) = listener.accept().unwrap();
+            drop(served);
+            std::thread::sleep(Duration::from_millis(50));
+            drop(client);
+            drop(listener);
+            std::thread::sleep(Duration::from_millis(50));
+            port
+        };
+        let on_every_address = |port| {
+            hold(&[PortRequest {
+                host_ip: None,
+                host_port: Some(port),
+                container_port: 80,
+                protocol: Protocol::Tcp,
+            }])
+        };
+        let in_use = |held: &Result<Vec<HeldPort>, PortError>, port| matches!(held, Err(PortError::InUse { port: p, .. }) if *p == port);
+        let port = time_wait();
+        assert_eq!(
+            bind_socket(
+                Protocol::Tcp,
+                AddressFamily::Inet,
+                &SockaddrIn::new(0, 0, 0, 0, port)
+            )
+            .unwrap_err(),
+            nix::errno::Errno::EADDRINUSE,
+            "a plain bind isn't refused: the test shows nothing"
+        );
+        let held = on_every_address(port).unwrap();
+        let again = on_every_address(port);
+        assert!(in_use(&again, port), "{again:?}");
+        assert!(
+            std::net::TcpListener::bind(("0.0.0.0", port)).is_err(),
+            "held, but not from SO_REUSEADDR"
+        );
+        drop(held);
+
+        // Another program's socket on it, bound with SO_REUSEADDR, never
+        // listening (the kernel's tables don't list one): held beside it,
+        // which then can't listen, nor can any other.
+        let port = time_wait();
+        let other = unbound_socket(Protocol::Tcp, AddressFamily::Inet).unwrap();
+        setsockopt(&other, sockopt::ReuseAddr, &true).unwrap();
+        nix::sys::socket::bind(other.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, port)).unwrap();
+        let held = on_every_address(port).unwrap();
+        let backlog = nix::sys::socket::Backlog::new(1).unwrap();
+        assert_eq!(
+            nix::sys::socket::listen(&other, backlog).unwrap_err(),
+            nix::errno::Errno::EADDRINUSE
+        );
+        drop((held, other));
+
+        // A connection still open on it (its listener gone): in use.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _served = listener.accept().unwrap();
+        drop(listener);
+        let open = on_every_address(port);
+        assert!(in_use(&open, port), "{open:?}");
+
+        // The lock held by another: in use, as before.
+        let port = time_wait();
+        let lock = after_time_wait::Lock::take(Duration::ZERO).unwrap();
+        let locked = on_every_address(port);
+        assert!(in_use(&locked, port), "{locked:?}");
+        drop(lock);
+        on_every_address(port).unwrap();
     }
 
     #[test]

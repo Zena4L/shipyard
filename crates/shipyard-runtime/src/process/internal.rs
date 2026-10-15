@@ -120,7 +120,7 @@ pub(super) struct Internal<'a> {
     pub(super) setup: RawFd,
     /// The descriptors it inherits by number (their close-on-exec flag is
     /// cleared in the fork).
-    pub(super) passed: &'a [RawFd],
+    pub(super) inherited: &'a [RawFd],
     /// Its standard input, output and error, each inherited if `None`.
     pub(super) stdio: [Option<std::os::fd::BorrowedFd<'a>>; 3],
 }
@@ -148,12 +148,12 @@ pub(super) fn start_internal(
     if let Some(fd) = stderr {
         command.stderr(fd.try_clone_to_owned()?);
     }
-    let passed = how.passed.to_vec();
+    let inherited = how.inherited.to_vec();
     // SAFETY: the closure only calls `fcntl` (async-signal-safe) on
     // descriptor numbers, from a vector made before the fork.
     unsafe {
         command.pre_exec(move || {
-            for &fd in &passed {
+            for &fd in &inherited {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
                     return Err(std::io::Error::last_os_error());
@@ -341,9 +341,10 @@ pub(super) fn internal_entry(entry: &std::ffi::CStr, label: &str) -> Option<RawF
     std::process::exit(SETUP_FAILED);
 }
 
-/// Makes the descriptors an internal process inherited by number
-/// close-on-exec again (they were passed across its own exec).
-pub(super) fn close_on_exec(fds: impl IntoIterator<Item = RawFd>) {
+/// Makes descriptors this process holds close-on-exec (again: an internal
+/// process's, inherited by number across its own exec; or what a monitor
+/// keeps from its children). A failure (one already closed) is ignored.
+pub(crate) fn close_on_exec(fds: impl IntoIterator<Item = RawFd>) {
     for fd in fds {
         let _ = nix::fcntl::fcntl(
             // SAFETY: inherited across the exec; borrowed only for this call.

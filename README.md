@@ -3,17 +3,21 @@
 A lightweight, daemonless container engine written in Rust: a minimal-overhead
 alternative to Docker / Podman / OrbStack with a small, clean interface.
 
-> **Status: v0.1.** On Linux, `shipyard run --image alpine sh` pulls an image from
-> Docker Hub and runs it **rootless**, isolated in its own namespaces, confined
-> (capabilities, `no_new_privs`, seccomp), resource-limited (cgroup v2), and
+> **Status: v0.2** (0.2.0). On Linux, `shipyard run alpine sh` pulls an
+> image from Docker Hub and runs it **rootless**, isolated in its own namespaces,
+> confined (capabilities, `no_new_privs`, seccomp), resource-limited (cgroup v2), and
 > **networked** (pasta without root, bridge networks as root, published ports,
 > container names on your own networks, IPv6). Volumes, private registries, OCI
 > bundles and an OCI runtime (`shipyard-runtime`, as runc) work too.
 >
-> **Not yet:** detached containers, `exec` and logs (v0.2); isolation on macOS
-> (v0.4). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
+> New in v0.2: containers that run in the background by name (`run -d`, `create`,
+> `start`, `stop`, `ps`, `inspect`, `logs`, `attach`, `exec`, `cp`, `port`, `rm`),
+> restart policies (and containers back after a reboot, with the
+> [systemd units](contrib/systemd/README.md)), health checks, `network connect` and
+> `disconnect` on a running container, and `shipyard events`.
+> **Not yet:** isolation on macOS (v0.4). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
 > works is in the [user docs](docs/user/README.md), and the
-> [limitations](docs/user/README.md#limitations-in-v01) are listed there.
+> [limitations](docs/user/README.md#limitations-in-v02) are listed there.
 
 The project is built step by step, from first principles, with
 [*The Linux Programming Interface*](https://man7.org/tlpi/) as the primary reference.
@@ -31,7 +35,7 @@ cargo build --release
 sudo install -m 0755 target/release/shipyard target/release/shipyard-runtime /usr/local/bin/
 
 shipyard doctor                          # can this host run containers? what to fix
-shipyard run --image alpine sh -c 'cat /etc/alpine-release; id; wget -qO- example.com | head -c 60'
+shipyard run alpine sh -c 'cat /etc/alpine-release; id; wget -qO- example.com | head -c 60'
 ```
 
 On Ubuntu 23.10 and later, install Shipyard's AppArmor profile first
@@ -61,6 +65,7 @@ crates/
   shipyard-engine/         # the engine: orchestration above the runtime, behind typed APIs
   shipyard-test-support/   # helpers for the end-to-end tests (dev only)
 contrib/apparmor/          # the AppArmor profile for hosts that restrict user namespaces
+contrib/systemd/           # units that bring containers back after a reboot
 docs/
   user/                    # user-facing docs, published to the website
   ROADMAP.md               # staged build plan mapped to TLPI chapters

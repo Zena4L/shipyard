@@ -26,6 +26,15 @@ pub const RUN_PARENT: &str = "shipyard/run";
 /// bundle's relative `linux.cgroupsPath`).
 pub const RUNTIME_PARENT: &str = "shipyard/runtime";
 
+/// Below the base, where a network's DNS server goes (`<network>-<random>`): out of
+/// whichever login session started it.
+pub const DNS_PARENT: &str = "shipyard/dns";
+
+/// Below the base, where a container's monitor goes (`<id>`): out of the
+/// login session or unit that made it, so that a shutdown ending those
+/// doesn't end the monitor before `shipyard system stop` reaches it.
+pub const MONITOR_PARENT: &str = "shipyard/monitors";
+
 /// The controllers Shipyard uses: each limits one kind of resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
@@ -158,7 +167,10 @@ mod tree;
 #[cfg(target_os = "linux")]
 pub use live::{available_controllers, is_cgroup2, own_cgroup};
 #[cfg(target_os = "linux")]
-pub use manage::{Cgroup, CgroupError, OomEvents, RunCgroup, run_cgroup, runtime_cgroup};
+pub use manage::{
+    Cgroup, CgroupError, OomEvents, RunCgroup, monitor_cgroup, remove_empty_left_over, run_cgroup,
+    runtime_cgroup,
+};
 #[cfg(target_os = "linux")]
 pub use tree::{NoTree, Tree};
 

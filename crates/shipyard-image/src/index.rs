@@ -45,6 +45,13 @@ const INDEX_LOCK: &str = "index.lock";
 const INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The prefix a corrupt index is moved aside to.
 const CORRUPT_PREFIX: &str = "index.json.corrupt-";
+/// A container's pin: an index entry under this prefix, its container
+/// store's identity and the container's ID (`container:<store>:<id>`) keeps
+/// the image it was made from (its manifest, config and layers),
+/// whatever happens to its tag (since 9.4a). Garbage collection keeps what
+/// any entry names; listings, lookups and removals by reference leave pins
+/// out: only [`Index::pin`] and [`Index::unpin`] touch them.
+const PIN_PREFIX: &str = "container:";
 
 /// What one image reference depends on in the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,22 +226,100 @@ impl Index {
         Ok(moved)
     }
 
-    /// The record of `reference`, if the index has one.
+    /// The record of `reference`, if the index has one (a container's pin
+    /// is never one: it isn't a reference).
     #[must_use]
     pub fn get(&self, reference: &str) -> Option<&ImageRecord> {
+        if reference.starts_with(PIN_PREFIX) {
+            return None;
+        }
         self.images.get(reference)
     }
 
-    /// The images present, by reference.
+    /// Pins the image `record` for container `id` of container store
+    /// `owner` (in the index under `root`): kept while the container
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// As [`record`](Self::record).
+    pub fn pin(
+        root: &Path,
+        owner: &str,
+        id: &str,
+        record: ImageRecord,
+    ) -> Result<Option<PathBuf>, IndexError> {
+        Self::record(root, &format!("{PIN_PREFIX}{owner}:{id}"), record)
+    }
+
+    /// Lets go of container `id`'s pin (of container store `owner`),
+    /// collecting nothing (the next collection takes what only it kept).
+    /// Whether it had one.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Busy`] if the lock is held too long;
+    /// [`IndexError::Io`] or [`IndexError::Corrupt`] if the index can't be
+    /// read or written.
+    pub fn unpin(root: &Path, owner: &str, id: &str) -> Result<bool, IndexError> {
+        Self::forget(root, &format!("{PIN_PREFIX}{owner}:{id}"))
+    }
+
+    /// The containers that pin images: each one's store and ID.
+    #[must_use]
+    pub fn pins(&self) -> Vec<(String, String)> {
+        self.images
+            .keys()
+            .filter_map(|reference| {
+                let (owner, id) = reference.strip_prefix(PIN_PREFIX)?.split_once(':')?;
+                Some((owner.to_owned(), id.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The images present, by reference (containers' pins left out).
     #[must_use]
     pub fn images(&self) -> Vec<ListedImage> {
         self.images
             .iter()
+            .filter(|(reference, _)| !reference.starts_with(PIN_PREFIX))
             .map(|(reference, record)| ListedImage {
                 reference: reference.clone(),
                 record: record.clone(),
             })
             .collect()
+    }
+
+    /// The containers (their IDs) whose pins name the image whose manifest
+    /// digest is `manifest`.
+    #[must_use]
+    pub fn pinned_by(&self, manifest: &str) -> Vec<String> {
+        self.images
+            .iter()
+            .filter(|(_, record)| record.manifest == manifest)
+            .filter_map(|(reference, _)| {
+                let (_, id) = reference.strip_prefix(PIN_PREFIX)?.split_once(':')?;
+                Some(id.to_owned())
+            })
+            .collect()
+    }
+
+    /// Removes the entry `reference` from the index under `root`, under its
+    /// lock, collecting nothing. Whether it was there.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Busy`] if the lock is held too long;
+    /// [`IndexError::Io`] or [`IndexError::Corrupt`] if the index can't be
+    /// read or written.
+    fn forget(root: &Path, reference: &str) -> Result<bool, IndexError> {
+        let _lock = lock(root)?;
+        let mut index = Self::open(root)?;
+        if index.images.remove(reference).is_none() {
+            return Ok(false);
+        }
+        index.save()?;
+        Ok(true)
     }
 
     /// Removes `reference` and garbage-collects the blobs and layer
@@ -264,7 +349,9 @@ impl Index {
             "collection needs the lock alone"
         );
         self.refuse_after_corruption()?;
-        if self.images.remove(reference).is_none() {
+        // A container's pin is never removed by reference (`rmi`): only by
+        // its container's removal.
+        if reference.starts_with(PIN_PREFIX) || self.images.remove(reference).is_none() {
             return Err(IndexError::NoSuchImage(reference.to_owned()));
         }
         self.save()?;
@@ -628,6 +715,64 @@ mod tests {
             let in_use: BTreeSet<String> = [name.clone()].into();
             assert!(!layer_unneeded(&name, &in_use, &none), "{name}");
         }
+    }
+
+    /// A container's pin keeps its image's blobs and layers through a
+    /// collection, but isn't listed; who pins an image is found; once
+    /// forgotten, the next collection takes what only it kept.
+    #[test]
+    fn a_pin_keeps_an_image_unlisted_until_forgotten() {
+        let scratch = Scratch::new();
+        scratch.blob(&hex("a"), 10);
+        scratch.blob(&hex("b"), 10);
+        scratch.blob(&hex("c"), 10);
+        scratch.layer_dir(&hex("c"));
+        let id = "1".repeat(64);
+        Index::pin(&scratch.0, "store", &id, record("a", "b", &["c"])).unwrap();
+        let pin = format!("{PIN_PREFIX}store:{id}");
+        let mut index = Index::open(&scratch.0).unwrap();
+        assert!(index.images().is_empty(), "pins aren't listed");
+        assert_eq!(
+            index.pinned_by(&format!("sha256:{}", hex("a"))),
+            ["1".repeat(64)]
+        );
+        assert_eq!(index.pins(), [("store".to_owned(), "1".repeat(64))]);
+        let removed = index
+            .prune(
+                &scratch.exclusive(),
+                &BTreeSet::new(),
+                &mut scratch.remover(),
+            )
+            .unwrap();
+        assert!(removed.is_empty(), "kept: {removed:?}");
+        assert!(scratch.0.join("layers").join(hex("c")).is_dir());
+        // Not a reference: never found, nor removed, by one (`rmi`).
+        assert!(index.get(&pin).is_none());
+        assert!(matches!(
+            index.remove(
+                &pin,
+                &scratch.exclusive(),
+                &BTreeSet::new(),
+                &mut scratch.remover()
+            ),
+            Err(IndexError::NoSuchImage(_))
+        ));
+        assert!(!Index::unpin(&scratch.0, "another store", &id).unwrap());
+        assert!(Index::unpin(&scratch.0, "store", &id).unwrap());
+        assert!(
+            !Index::unpin(&scratch.0, "store", &id).unwrap(),
+            "already gone"
+        );
+        let mut index = Index::open(&scratch.0).unwrap();
+        let removed = index
+            .prune(
+                &scratch.exclusive(),
+                &BTreeSet::new(),
+                &mut scratch.remover(),
+            )
+            .unwrap();
+        assert_eq!(removed.len(), 3, "{removed:?}");
+        assert!(!scratch.0.join("layers").join(hex("c")).exists());
     }
 
     #[test]

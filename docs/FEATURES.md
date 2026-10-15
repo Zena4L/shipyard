@@ -85,7 +85,7 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Moved to the stages that give them meaning:**
   - a terminal inside (`process.terminal`, `--console-socket`): stage 8;
   - names for commands run in an existing container (`exec`): numeric in 8.4a (runc's),
-    names with stage 9;
+    names with stage 9 (from the container's `/etc/passwd`);
   - hooks, `oomScoreAdj`, cgroup mounts and `linux.resources`: stage 5 (cgroups);
   - bundles without a `pid` namespace in `shipyard-runtime`, `kill STOP`, `pause` and
     `resume`: stage 5 (cgroups find and freeze every process);
@@ -133,11 +133,11 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **OOM detection:** via `memory.events`, reported clearly ("the command was killed: out of
   memory", exit 137; "(out of memory)" in the runtime's exit record).
 - **Live stats:** CPU, memory, I/O and process count: `shipyard-runtime events --stats`
-  now; `shipyard stats`, `top` and the UI with stage 9's named containers.
+  now; `shipyard stats`, `top` (stage 10's first steps) and the UI by name.
 - **Change limits on a running container:** `shipyard-runtime update` now; `shipyard
-  update` with stage 9.
+  update` by name: `--restart` in stage 9 (9.5b), the limits with stage 10's first steps.
 - **Pause and resume:** via `cgroup.freeze`: `shipyard-runtime pause`/`resume` now;
-  `shipyard pause` with stage 9.
+  `shipyard pause` with stage 10's first steps.
 - **Docker's limit flags on `shipyard run`** (`--memory`, `--cpus`, `--pids-limit`, …) and
   OCI's `linux.resources`, `unified` and `cgroupsPath`.
 - **The runtime's other cgroup commands:** `ps`, `kill --all`; and OCI hooks (all six
@@ -183,7 +183,7 @@ Shipyard has three layers, mirroring how the established tools split up:
   concurrent pulls, runs and collections.
 - **Commands:** `pull`, `images`, `rmi`, `image prune`, `run --image` (with `--pull`
   and `--entrypoint`). `tag`, `inspect`, `history`, `save`/`load`, `import`/`export`
-  move to stage 9.
+  move to stage 10's first steps.
 - **Garbage collection:** reference-counted, plus `prune`; never what a running
   container or a pull in progress uses.
 - *Later:* `push`, signature verification (cosign / sigstore).
@@ -197,7 +197,7 @@ Shipyard has three layers, mirroring how the established tools split up:
   to later: it needs a helper outside the container's PID namespace to be safe.
 - **`--uidmap` with images** (as root): layers extracted again for the map.
 - **Mount types:** named volumes and bind mounts (`--volume`), kept from removal while
-  in use. tmpfs mounts and propagation options come with `--mount` (stage 9).
+  in use. tmpfs mounts and propagation options come with `--mount` (stage 10's first steps).
 - **Mount options:** read-only/read-write.
 - **Commands:** `volume create / ls / inspect / rm / prune`.
 - **Disk accounting:** `system df` (images, containers' writable layers, volumes).
@@ -238,10 +238,10 @@ Shipyard has three layers, mirroring how the established tools split up:
   long form), internal networks, IPv6 (a ULA `/64` with NAT66, `--ip6`, `-p` on IPv6).
 - **Connection observation:** a library reading `/proc/<pid>/net/{tcp,tcp6,udp,udp6}`
   through a container's init (pinned by a pidfd), listening and established sockets,
-  fuzzed. Its command (and the UI's "observed but undeclared" dependencies) come with
-  stage 9.
+  fuzzed. Its command came with stage 9 (`port --sockets`, 9.7c1); the UI's "observed but
+  undeclared" dependencies come with the UI (stage 13).
 - *Moved:* `network connect`/`disconnect`, the sockets command and the DNS servers' own
-  cgroup and restart to stage 9; `exec` joining the network namespace to stage 8.
+  cgroup and restart to stage 9 (built: 9.7, 9.6c2); `exec` joining the network namespace to stage 8.
 
 ## 8. Terminals, I/O and logs — stage 8
 
@@ -258,11 +258,11 @@ Shipyard has three layers, mirroring how the established tools split up:
   sent with `SCM_RIGHTS` and a name, no answer awaited).
 - **`attach` / detach:** with detach keys (built in step 8.3c, by runtime ID:
   `shipyard-runtime attach`, `create --stdin [--stdin-once]`; the monitor serves
-  `attach.sock`, `SO_PEERCRED`, 16 clients × 256 KiB, a versioned protocol; by name with
-  stage 9). The monitor's own memory stays under 1 MiB idle; up to 4 MiB more with 16
+  `attach.sock`, `SO_PEERCRED`, 16 clients × 256 KiB, a versioned protocol; by name in
+  stage 9, 9.4c1). The monitor's own memory stays under 1 MiB idle; up to 4 MiB more with 16
   clients behind.
 - **`exec`, confined** (built in step 8.4a, by runtime ID: `shipyard-runtime exec`, root
-  and rootless; a terminal for it in 8.4b; by name with stage 9): it joins every
+  and rootless; a terminal for it in 8.4b; by name in stage 9, 9.4c1): it joins every
   namespace the container has (the user one first) and starts in its cgroup
   (`clone3(CLONE_INTO_CGROUP)`, moved from stage 5: its limits, device rules and freezing
   cover it, a cgroup kill catches it; its network namespace, moved from stage 7,
@@ -277,30 +277,41 @@ Shipyard has three layers, mirroring how the established tools split up:
   run`; `LISTEN_PID` is the process's own PID, Shipyard's init being PID 1).
 - **Logs:** log files with rotation; `logs --follow --tail --since --timestamps` (built
   in step 8.3b, by runtime ID: `shipyard-runtime create --log-dir`, CRI files with a
-  versioned `log.json`, the monitor's poll loop; `logs` by name comes with stage 9).
+  versioned `log.json`, the monitor's poll loop; `logs` by name in stage 9, 9.4c1).
 - **`cp`:** copy files into and out of a container (built in step 8.5a, by runtime ID:
   `shipyard-runtime cp`, Docker's forms and path rules, `-` for tar streams; done inside
-  the container by a helper of Shipyard's own; `cp` by name comes with stage 9).
+  the container by a helper of Shipyard's own; `cp` by name in stage 9, 9.4c1; from a stopped container, 9.4c2).
 
 ## 9. Engine state (daemonless) — stage 9
 
-- **On-disk state:**
+- **On-disk state** (built in steps 9.2a–9.4a: records versioned from their first write,
+  stage 8's still read):
   - persistent data in `/var/lib/shipyard` (rootless: `~/.local/share/shipyard`)
   - runtime data under `/run`
-- **Locking:** `flock`, so concurrent `shipyard` commands never corrupt state.
-- **Crash recovery:** on startup, compare recorded state with what's actually running.
-- **IDs:** full hex IDs, ISO 6346 display IDs, names and labels.
+- **Locking:** `flock`, so concurrent `shipyard` commands never corrupt state (built in
+  9.4a: the store's lock, each container's operation lock and its `running` lock).
+- **Crash recovery:** on startup, compare recorded state with what's actually running
+  (built in 9.5a: every command's recovery pass; `shipyard system recover`, 9.5c).
+- **IDs:** full hex IDs, ISO 6346 display IDs, names and labels (built in 9.2b and 9.4a:
+  a container is found by its ID, a prefix, its name or its serial; `rename`, 9.4b2).
 - **Restart policies:** `no` / `on-failure` / `always` / `unless-stopped`, enforced by the
-  monitor rather than a daemon.
-- **Health checks:** with health state exposed to the CLI and UI.
-- **`events` stream:** start, stop, die, OOM, pull, …
+  monitor rather than a daemon (built in 9.5b: its exit command restarts it, with backoff;
+  `update --restart`).
+- **Health checks:** with health state exposed to the CLI and UI (built in 9.6b: a
+  companion of the monitor's runs them; the image's `HEALTHCHECK` too; `ps`, `inspect`).
+- **`events` stream:** start, stop, die, OOM, pull, … (built in 9.6a: a journal the
+  commands write; `--since`, `--until`, `--filter`, JSON lines).
 - **Commands across processes:** `kill`, `wait`, `stop` and `ps` work on containers started
-  by other shipyard invocations, using the on-disk state.
+  by other shipyard invocations, using the on-disk state (built in 9.4b1; `logs`, `attach`,
+  `exec` and `cp` by name in 9.4c).
 - **Networks of named containers** (moved from stage 7): `network connect` /
   `disconnect` on a running container; `port` and a view of its sockets (stage 7's
   reader); `--name` for everything, not only DNS; the DNS servers in a cgroup of their
-  own, restarted if killed; a warning when a container's pasta dies.
-- *Optional:* generated systemd units so containers start at boot.
+  own, restarted if killed; a warning when a container's pasta dies (built in 9.6c and
+  9.7).
+- *Optional:* systemd units so containers start at boot (built in 9.5c, as shipped units in
+  `contrib/systemd` rather than generated ones; each container's monitor in a cgroup of
+  its own since 9.9b, so a shutdown stops every container gracefully).
 
 ## 10. Compose and stacks — stage 10
 

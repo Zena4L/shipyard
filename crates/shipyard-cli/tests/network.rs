@@ -40,7 +40,14 @@ fn run_cli(args: &[&str]) -> Run {
 
 /// `shipyard run FLAGS… sh -c SCRIPT`.
 fn shipyard(flags: &[&str], script: &str) -> Run {
-    run(SHIPYARD.command(&[&["run"], flags, &["sh", "-c", script]].concat()))
+    run(SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(flags),
+            flags,
+            &["sh", "-c", script],
+        ]
+        .concat(),
+    ))
 }
 
 /// Whether this user can run isolated commands here (root, or rootless
@@ -298,6 +305,7 @@ fn the_host_reaches_containers_on_a_network() {
         assert_eq!(created.code, Some(0), "{}", created.stderr);
         let first = start_command(networks.command(&[
             "run",
+            "--no-image",
             "--network",
             "app",
             "--ip",
@@ -305,7 +313,16 @@ fn the_host_reaches_containers_on_a_network() {
             "sleep",
             "30",
         ]));
-        let second = start_command(networks.command(&["run", "--network", "app", "sleep", "30"]));
+        let second = start_command(networks.command(&[
+            "run",
+            "--no-image",
+            "--network",
+            "app",
+            "--name",
+            "api",
+            "sleep",
+            "30",
+        ]));
         // Each container's kernel answers: nothing listens, so it refuses.
         assert!(
             refused_at("10.90.0.50:9"),
@@ -322,13 +339,35 @@ fn the_host_reaches_containers_on_a_network() {
             inspect.stdout
         );
         // Taken: refused.
-        let taken = networks.run(&["run", "--network", "app", "--ip", "10.90.0.50", "true"]);
+        let taken = networks.run(&[
+            "run",
+            "--no-image",
+            "--network",
+            "app",
+            "--ip",
+            "10.90.0.50",
+            "true",
+        ]);
         assert_eq!(taken.code, Some(125), "{}", taken.stderr);
         assert!(taken.stderr.contains("taken"), "{}", taken.stderr);
         // In use: can't be removed.
         let busy = networks.run(&["network", "rm", "app"]);
         assert_eq!(busy.code, Some(125), "{}", busy.stderr);
-        assert!(busy.stderr.contains("in use by 2"), "{}", busy.stderr);
+        // Named: by name; the other (a run with no record, unnamed) by its
+        // run's ID.
+        assert!(busy.stderr.contains("in use by "), "{}", busy.stderr);
+        assert!(busy.stderr.contains("api"), "{}", busy.stderr);
+        // A prune keeps it (in use isn't a failure), and removes the one no
+        // container is on.
+        let spare = networks.run(&["network", "create", "--subnet", "10.95.0.0/24", "spare"]);
+        assert_eq!(spare.code, Some(0), "{}", spare.stderr);
+        let pruned = networks.run(&["network", "prune", "-f"]);
+        assert_eq!(pruned.code, Some(0), "{}", pruned.stderr);
+        assert_eq!(
+            pruned.stdout, "spare\nRemoved 1 network(s)\nKept 1 in use: app\n",
+            "{}",
+            pruned.stderr
+        );
         first.signal(libc::SIGTERM);
         second.signal(libc::SIGTERM);
         let _ = (first.finish(), second.finish());
@@ -351,6 +390,7 @@ fn a_killed_runs_address_is_swept_by_the_next() {
         assert_eq!(created.code, Some(0), "{}", created.stderr);
         let killed = start_command(networks.command(&[
             "run",
+            "--no-image",
             "--network",
             "app",
             "--ip",
@@ -363,7 +403,15 @@ fn a_killed_runs_address_is_swept_by_the_next() {
         let _ = killed.finish_status();
         // The lease is still on disk, but its lock is gone: the next run
         // sweeps it, and may take the address.
-        let next = networks.run(&["run", "--network", "app", "--ip", "10.91.0.9", "true"]);
+        let next = networks.run(&[
+            "run",
+            "--no-image",
+            "--network",
+            "app",
+            "--ip",
+            "10.91.0.9",
+            "true",
+        ]);
         assert_eq!(next.code, Some(0), "{}", next.stderr);
         let inspect = networks.run(&["network", "inspect", "app"]);
         assert!(
@@ -697,7 +745,7 @@ fn root_without_net_admin_is_told_it_gets_the_hosts_network() {
         let warned = "the container gets the host's network: the bridge network needs \
                       CAP_NET_ADMIN";
         // The same command, under `setpriv`, without the capability.
-        let shipyard = networks.command(&["run", "true"]);
+        let shipyard = networks.command(&["run", "--no-image", "true"]);
         let mut without = std::process::Command::new("setpriv");
         without
             .args([
@@ -721,7 +769,7 @@ fn root_without_net_admin_is_told_it_gets_the_hosts_network() {
             "{}",
             run.stderr
         );
-        let with = networks.run(&["run", "true"]);
+        let with = networks.run(&["run", "--no-image", "true"]);
         assert_eq!(with.code, Some(0), "{}", with.stderr);
         assert!(!with.stderr.contains(warned), "{}", with.stderr);
     });

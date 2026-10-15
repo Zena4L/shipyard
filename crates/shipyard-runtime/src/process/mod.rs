@@ -35,7 +35,7 @@ mod rlimit;
 mod rootfs;
 
 #[cfg(target_os = "linux")]
-mod setup;
+pub(crate) mod setup;
 mod signal;
 mod signals;
 pub(crate) mod spawn;
@@ -53,7 +53,11 @@ mod user_namespace;
 
 pub use env::{DEFAULT_PATH, Env, EnvError};
 pub use failure::{SpawnError, SpawnErrorKind, overlay_refusal};
+#[cfg(target_os = "linux")]
+pub(crate) use identity::resolve_in_root as resolve_names_in_root;
 pub use identity::{LookupError, Which};
+#[cfg(target_os = "linux")]
+pub(crate) use internal::close_on_exec;
 #[cfg(target_os = "linux")]
 pub(crate) use plan::current_rlimits;
 #[cfg(target_os = "linux")]
@@ -65,6 +69,7 @@ pub(crate) use setup::{SpecSetup, container_security};
 pub(crate) use signal::discard_pending;
 pub(crate) use signal::is_pending;
 pub use signal::{Signal, SignalError};
+pub use signals::{SignalWatch, Taken};
 #[cfg(target_os = "linux")]
 pub(crate) use spawn::ExecSpawn;
 pub use spawn::die_from;
@@ -72,7 +77,7 @@ pub use spec::{MAX_GROUPS, Names, ProcessSpec, SpecError, User};
 pub use startup::refuse_privileged_start;
 pub use status::{EXIT_CANNOT_EXECUTE, EXIT_ENGINE_ERROR, EXIT_NOT_FOUND, ExitStatus};
 pub use stdio::{Pty, Stdio, Stream};
-pub use stop::{DEFAULT_STOP_TIMEOUT_SECS, StopPolicy, StopSignalError};
+pub use stop::{DEFAULT_STOP_TIMEOUT_SECS, StopPolicy, StopSignalError, is_stop_signal};
 pub use supervisor::{NetworkHook, NetworkTarget, Supervisor};
 #[cfg(target_os = "linux")]
 pub(crate) use user_namespace::bundle_user_namespace;

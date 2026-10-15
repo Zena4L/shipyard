@@ -173,6 +173,23 @@ impl HelperFailure {
     }
 }
 
+/// A container's root filesystem as its start mounts it, for a helper that
+/// reaches a stopped container's files
+/// ([`start_helper_in_view`](super::start_helper_in_view); stage 9, step
+/// 9.4c2).
+#[derive(Debug, Clone)]
+pub struct RootView {
+    /// Its root: the directory, the image's overlay, and its mounts
+    /// ([`Root::mounts`](crate::isolation::Root::mounts)): binds (volumes,
+    /// host directories) are mounted; a tmpfs, a running container's only,
+    /// is skipped.
+    pub root: crate::isolation::Root,
+    /// Its user namespace's maps, if it has one: the helper makes a user
+    /// namespace with them, so files have the owners they have in the
+    /// container.
+    pub id_maps: Option<crate::isolation::IdMaps>,
+}
+
 /// A helper, running (see [`start_helper`](super::start_helper)). Dropped
 /// before [`wait`](Self::wait), it's killed and reaped.
 #[derive(Debug)]

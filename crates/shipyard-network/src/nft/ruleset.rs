@@ -1,7 +1,8 @@
 //! Shipyard's firewall: the table `inet shipyard`, ours alone.
 //!
 //! Its rules never change. What changes, as networks and containers come and
-//! go, is the contents of its sets and maps:
+//! go, is the contents of its sets and maps (and, as packets pass, of the
+//! dynamic sets `conns4` and `conns6`, which the kernel fills):
 //!
 //! | set           | holds                                                        |
 //! |---------------|--------------------------------------------------------------|
@@ -15,6 +16,10 @@
 //! | `ports6`, `ports6_addr` | the same for IPv6                                  |
 //! | `closed`      | `ipv4`, `ipv6`: those Shipyard turned forwarding on for      |
 //! | `uplinks`     | the host's own interfaces when it did                        |
+//! | `isolated`    | the bridges of networks kept from the host (`--isolate-host`) |
+//! | `dns_allow`   | `bridge . gateway . protocol . 53`: what those may still reach |
+//! | `limited`     | the bridges of networks with a connection limit              |
+//! | `conns4`, `conns6` | a container address each, counting its connections (dynamic) |
 //!
 //! The chains:
 //!
@@ -39,7 +44,14 @@
 //!   routing for others: what goes from one of the interfaces it had then
 //!   (`uplinks`) to another is dropped. Interfaces that came later (another
 //!   program's bridges, a VPN) are left to their programs, which turned
-//!   forwarding on for themselves.
+//!   forwarding on for themselves. Before anything is accepted: an isolated
+//!   network's connections to the cloud's metadata addresses are dropped,
+//!   and a limited network's new ones counted (see `input`).
+//! - `input` (what's for the host itself): from a limited network, a new
+//!   connection is counted per source address, and refused over
+//!   [`CONNTRACK_LIMIT`] (one from an IPv6 link-local source refused
+//!   outright); from an isolated network, only replies, its DNS server and
+//!   IPv6's neighbour discovery pass.
 //! - `srcnat` (postrouting): a container's packet leaving by another
 //!   interface takes the host's address (masquerade): its way out. One
 //!   DNAT'd back onto a bridge (a container reaching a published port, maybe
@@ -58,13 +70,16 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::consts::{
-    CT_STATE_ESTABLISHED, CT_STATE_INVALID, CT_STATE_RELATED, IFNAMSIZ, IPS_DST_NAT, NF_ACCEPT,
-    NF_DROP, NF_INET_FORWARD, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING,
-    NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NFT_CMP_EQ, NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS,
-    NFT_FIB_RESULT_ADDRTYPE, NFT_META_IIFNAME, NFT_META_L4PROTO, NFT_META_NFPROTO,
-    NFT_META_OIFNAME, NFT_NAT_DNAT, NFT_PAYLOAD_NETWORK_HEADER, NFT_PAYLOAD_TRANSPORT_HEADER,
-    NFT_REG32_00, NFT_SET_INTERVAL, NFTA_FIB_F_DADDR, RTN_LOCAL, TYPE_IFNAME, TYPE_INET_PROTOCOL,
-    TYPE_INET_SERVICE, TYPE_IP6ADDR, TYPE_IPADDR, TYPE_NFPROTO, concat_type,
+    CT_STATE_ESTABLISHED, CT_STATE_INVALID, CT_STATE_RELATED, IFNAMSIZ, IPPROTO_ICMPV6,
+    IPS_CONFIRMED, IPS_DST_NAT, NF_ACCEPT, NF_DROP, NF_INET_FORWARD, NF_INET_LOCAL_IN,
+    NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_INET, NFPROTO_IPV4,
+    NFPROTO_IPV6, NFT_CMP_EQ, NFT_CMP_GTE, NFT_CMP_LTE, NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS,
+    NFT_DYNSET_OP_ADD, NFT_FIB_RESULT_ADDRTYPE, NFT_META_IIFNAME, NFT_META_L4PROTO,
+    NFT_META_NFPROTO, NFT_META_OIFNAME, NFT_NAT_DNAT, NFT_PAYLOAD_NETWORK_HEADER,
+    NFT_PAYLOAD_TRANSPORT_HEADER, NFT_REG32_00, NFT_REJECT_ICMPX_ADMIN_PROHIBITED,
+    NFT_REJECT_ICMPX_UNREACH, NFT_REJECT_TCP_RST, NFT_SET_EVAL, NFT_SET_INTERVAL, NFTA_FIB_F_DADDR,
+    RTN_LOCAL, TYPE_IFNAME, TYPE_INET_PROTOCOL, TYPE_INET_SERVICE, TYPE_IP6ADDR, TYPE_IPADDR,
+    TYPE_NFPROTO, concat_type,
 };
 use super::expr::Expr;
 use super::objects::{
@@ -81,8 +96,19 @@ pub(crate) const FAMILY: u8 = NFPROTO_INET;
 /// Its user data: what version of these rules it holds.
 // (6: `masquerade` became `masquerade4`: `masquerade` is a keyword of
 // nft's language, so `nft -f` couldn't read back a listing of the table,
-// and a host saving and restoring its firewall with nft would fail on it.)
-pub(crate) const VERSION: &[u8] = b"shipyard ruleset 6";
+// and a host saving and restoring its firewall with nft would fail on it.
+// 7: the `input` chain and the metadata drops, for networks made with
+// `--isolate-host`, stage 9, step 9.7c1. 8: the connection limit, for
+// networks made with `--conntrack-limit`, step 9.7c2.)
+pub(crate) const VERSION: &[u8] = b"shipyard ruleset 8";
+
+/// The most connections a container on a network made with
+/// `--conntrack-limit` may have open, of those it opened (counted per
+/// source address: an IPv6 one apart from the IPv4 one). The next new one
+/// is refused. A busy server opens few (its clients open theirs); a
+/// container opening thousands is a crawler, or a runaway: the host's
+/// whole table is often 65,536 to 262,144.
+pub const CONNTRACK_LIMIT: u32 = 8192;
 /// The most elements one request adds or removes: each is answered alone,
 /// and a batch must fit the socket's buffers.
 const ELEMENTS_PER_REQUEST: usize = 256;
@@ -98,6 +124,7 @@ pub(crate) mod chain {
     pub(crate) const OUTPUT: &str = "output";
     pub(crate) const FORWARD: &str = "forward";
     pub(crate) const SRCNAT: &str = "srcnat";
+    pub(crate) const INPUT: &str = "input";
 }
 
 /// The sets' names.
@@ -113,6 +140,11 @@ pub(crate) mod set {
     pub(crate) const PORTS_ADDR: &str = "ports_addr";
     pub(crate) const PORTS6: &str = "ports6";
     pub(crate) const PORTS6_ADDR: &str = "ports6_addr";
+    pub(crate) const ISOLATED: &str = "isolated";
+    pub(crate) const DNS_ALLOW: &str = "dns_allow";
+    pub(crate) const LIMITED: &str = "limited";
+    pub(crate) const CONNS4: &str = "conns4";
+    pub(crate) const CONNS6: &str = "conns6";
 }
 
 /// A network, as the firewall sees it.
@@ -126,6 +158,15 @@ pub struct NetworkRules {
     pub subnet6: Option<IpNet>,
     /// No way out.
     pub internal: bool,
+    /// Its containers kept from the host itself, and from the cloud's
+    /// metadata addresses (`network create --isolate-host`).
+    pub isolate_host: bool,
+    /// Its DNS server's address (its gateway), if it has one: what an
+    /// isolated network's containers may still reach on the host.
+    pub dns: Option<Ipv4Addr>,
+    /// Its containers' connections limited (`network create
+    /// --conntrack-limit`, [`CONNTRACK_LIMIT`]).
+    pub conntrack_limit: bool,
 }
 
 impl From<&crate::store::NetworkConfig> for NetworkRules {
@@ -135,9 +176,39 @@ impl From<&crate::store::NetworkConfig> for NetworkRules {
             subnet: config.subnet,
             subnet6: config.subnet6,
             internal: config.internal,
+            isolate_host: config.isolate_host,
+            conntrack_limit: config.conntrack_limit,
+            dns: match config.gateway {
+                IpAddr::V4(gateway) if config.has_dns() => Some(gateway),
+                _ => None,
+            },
         }
     }
 }
+
+/// IPv4's link-local block (169.254.0.0/16), kept from an isolated
+/// network's containers: it holds most clouds' metadata address
+/// (169.254.169.254: AWS's, Azure's, Google's, …) and AWS's DNS and time
+/// servers (169.254.169.253, 169.254.169.123).
+const LINK_LOCAL4: [u8; 2] = [169, 254];
+/// IPv6's link-local prefix (`fe80::/10`).
+const LINK_LOCAL6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
+/// Alibaba Cloud's metadata address, outside the link-local block.
+const METADATA4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+/// The IPv6 metadata addresses: AWS's (`fd00:ec2::254`), AWS's DNS
+/// (`fd00:ec2::23`) and Google's (`fd20:ce::254`).
+const METADATA6: [Ipv6Addr; 3] = [
+    Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+    Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x23),
+    Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254),
+];
+/// `ICMPv6`'s neighbour solicitation and advertisement (RFC 4861: 135 and
+/// 136): what an isolated network's IPv6 still needs of the host, to find
+/// its gateway's hardware address and be found. (Router solicitations, 133,
+/// aren't: a container's IPv6 is set, not learnt from the host.)
+const ND_FIRST: u8 = 135;
+/// See [`ND_FIRST`].
+const ND_LAST: u8 = 136;
 
 /// A published port, and the container address it goes to (of the host
 /// address's family, for a port on one).
@@ -154,9 +225,10 @@ const fn reg(n: u32) -> u32 {
     NFT_REG32_00 + n
 }
 
-pub(super) fn sets() -> [SetSpec; 11] {
+pub(super) fn sets() -> [SetSpec; 16] {
     let ifname_len = u32::try_from(IFNAMSIZ).unwrap_or(16);
     let ifname = (TYPE_IFNAME, ifname_len);
+    let [isolated, dns_allow, limited, conns4, conns6] = option_sets();
     let target = Some((concat_type(&[TYPE_IPADDR, TYPE_INET_SERVICE]), 8));
     // An IPv6 address takes four registers: 16 bytes, then the port's 4.
     let target6 = Some((concat_type(&[TYPE_IP6ADDR, TYPE_INET_SERVICE]), 20));
@@ -233,10 +305,66 @@ pub(super) fn sets() -> [SetSpec; 11] {
             ),
             data: target6,
         },
+        isolated,
+        dns_allow,
+        limited,
+        conns4,
+        conns6,
     ]
 }
 
-pub(super) fn chains() -> [BaseChain; 5] {
+/// The sets of a network's options: `--isolate-host`'s and
+/// `--conntrack-limit`'s.
+fn option_sets() -> [SetSpec; 5] {
+    let ifname_len = u32::try_from(IFNAMSIZ).unwrap_or(16);
+    let ifname = (TYPE_IFNAME, ifname_len);
+    [
+        SetSpec {
+            name: set::ISOLATED,
+            flags: 0,
+            key: ifname,
+            data: None,
+        },
+        // The bridge (16 bytes), the gateway, the protocol, the port: each
+        // in whole registers.
+        SetSpec {
+            name: set::DNS_ALLOW,
+            flags: 0,
+            key: (
+                concat_type(&[
+                    TYPE_IFNAME,
+                    TYPE_IPADDR,
+                    TYPE_INET_PROTOCOL,
+                    TYPE_INET_SERVICE,
+                ]),
+                ifname_len + 12,
+            ),
+            data: None,
+        },
+        SetSpec {
+            name: set::LIMITED,
+            flags: 0,
+            key: ifname,
+            data: None,
+        },
+        // Filled by the limit's rules, one element per source, each with its
+        // count.
+        SetSpec {
+            name: set::CONNS4,
+            flags: NFT_SET_EVAL,
+            key: (TYPE_IPADDR, 4),
+            data: None,
+        },
+        SetSpec {
+            name: set::CONNS6,
+            flags: NFT_SET_EVAL,
+            key: (TYPE_IP6ADDR, 16),
+            data: None,
+        },
+    ]
+}
+
+pub(super) fn chains() -> [BaseChain; 6] {
     [
         BaseChain {
             name: chain::GUARD,
@@ -271,6 +399,14 @@ pub(super) fn chains() -> [BaseChain; 5] {
             kind: "nat",
             hook: NF_INET_POST_ROUTING,
             priority: 100,
+            policy: NF_ACCEPT,
+        },
+        // What's for the host itself, from an isolated network.
+        BaseChain {
+            name: chain::INPUT,
+            kind: "filter",
+            hook: NF_INET_LOCAL_IN,
+            priority: 0,
             policy: NF_ACCEPT,
         },
     ]
@@ -533,7 +669,237 @@ pub(crate) fn rules() -> Vec<(&'static str, Vec<Expr>)> {
             .map(|rule| (chain::FORWARD, rule)),
     );
     rules.extend(srcnat_rules().into_iter().map(|rule| (chain::SRCNAT, rule)));
+    rules.extend(input_rules().into_iter().map(|rule| (chain::INPUT, rule)));
     rules
+}
+
+/// `input`'s: from an isolated network's bridge, to the host itself, only
+/// replies (what the host opened), its DNS server on the gateway, and IPv6's
+/// neighbour discovery; nothing else.
+fn input_rules() -> [Vec<Expr>; 9] {
+    let [tcp4, other4, tcp6, other6] = limit_rules();
+    let [protocol, port] = protocol_and_port(5);
+    let dns = vec![
+        Expr::Meta {
+            key: NFT_META_IIFNAME,
+            dreg: reg(0),
+        },
+        // The bridge's name takes four registers.
+        address(16, reg(4)),
+        protocol,
+        port,
+        Expr::Lookup {
+            set: set::DNS_ALLOW.to_owned(),
+            sreg: reg(0),
+            dreg: None,
+            invert: false,
+        },
+    ];
+    let neighbours = vec![
+        Expr::Meta {
+            key: NFT_META_L4PROTO,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: vec![IPPROTO_ICMPV6],
+        },
+        Expr::Payload {
+            base: NFT_PAYLOAD_TRANSPORT_HEADER,
+            offset: 0,
+            len: 1,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_GTE,
+            data: vec![ND_FIRST],
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_LTE,
+            data: vec![ND_LAST],
+        },
+    ];
+    [
+        // Counted first: what a container opens to the host counts too.
+        link_local_refused(),
+        tcp4,
+        other4,
+        tcp6,
+        other6,
+        [
+            from_isolated(),
+            ct_bits(NFT_CT_STATE, CT_STATE_ESTABLISHED | CT_STATE_RELATED, true),
+            vec![Expr::Verdict(NF_ACCEPT)],
+        ]
+        .concat(),
+        [ipv4(), dns, vec![Expr::Verdict(NF_ACCEPT)]].concat(),
+        [
+            ipv6(),
+            from_isolated(),
+            neighbours,
+            vec![Expr::Verdict(NF_ACCEPT)],
+        ]
+        .concat(),
+        [from_isolated(), vec![Expr::Verdict(NF_DROP)]].concat(),
+    ]
+}
+
+/// The connection limit (in `forward` and `input`): a connection from a
+/// limited network, on its first packet (not yet confirmed: a later packet
+/// of one unanswered still has `ct state new`, and isn't counted again),
+/// adds its source to `conns4` (or `conns6`), whose element counts its
+/// connections (`nf_conncount`). Over [`CONNTRACK_LIMIT`], it's refused: a
+/// TCP one with a reset (`connect` fails, `ECONNREFUSED`, every time), any
+/// other with an ICMP "administratively prohibited" (which the kernel
+/// rate-limits). Refused, it's never confirmed: the table keeps the limit.
+/// IPv4's TCP and others, then IPv6's.
+fn limit_rules() -> [Vec<Expr>; 4] {
+    let limit = |family: Vec<Expr>, source: Expr, set: &str, tcp: bool| {
+        let refuse = if tcp {
+            Expr::Reject {
+                kind: NFT_REJECT_TCP_RST,
+                code: None,
+            }
+        } else {
+            Expr::Reject {
+                kind: NFT_REJECT_ICMPX_UNREACH,
+                code: Some(NFT_REJECT_ICMPX_ADMIN_PROHIBITED),
+            }
+        };
+        [
+            family,
+            interface_in(NFT_META_IIFNAME, set::LIMITED, false),
+            unconfirmed(),
+            vec![
+                Expr::Meta {
+                    key: NFT_META_L4PROTO,
+                    dreg: reg(0),
+                },
+                Expr::Cmp {
+                    sreg: reg(0),
+                    op: if tcp { NFT_CMP_EQ } else { NFT_CMP_NEQ },
+                    data: vec![crate::ports::Protocol::Tcp.number()],
+                },
+                source,
+                Expr::Dynset {
+                    set: set.to_owned(),
+                    op: NFT_DYNSET_OP_ADD,
+                    sreg: reg(0),
+                    expr: Box::new(Expr::Connlimit {
+                        count: CONNTRACK_LIMIT,
+                        invert: true,
+                    }),
+                },
+                refuse,
+            ],
+        ]
+        .concat()
+    };
+    [
+        limit(ipv4(), address(12, reg(0)), set::CONNS4, true),
+        limit(ipv4(), address(12, reg(0)), set::CONNS4, false),
+        limit(ipv6(), address6(8, reg(0)), set::CONNS6, true),
+        limit(ipv6(), address6(8, reg(0)), set::CONNS6, false),
+    ]
+}
+
+/// `ct status & confirmed == 0`: a connection's first packet. (A packet
+/// with no connection, `untracked` like neighbour discovery, has no status:
+/// the rule doesn't match.)
+fn unconfirmed() -> Vec<Expr> {
+    ct_bits(NFT_CT_STATUS, IPS_CONFIRMED, false)
+}
+
+/// `input`'s first: a new connection to the host from a limited network,
+/// from an IPv6 link-local source, is refused. The bridge table lets any
+/// link-local source through (with the container's hardware address), so
+/// counted, each made-up one would be a budget of its own, and enough of
+/// them would fill `conns6`. Neighbour discovery is untracked, and passes.
+fn link_local_refused() -> Vec<Expr> {
+    [
+        ipv6(),
+        interface_in(NFT_META_IIFNAME, set::LIMITED, false),
+        unconfirmed(),
+        // `ip6 saddr fe80::/10`, the whole address loaded (as nft reads it).
+        vec![
+            address6(8, reg(0)),
+            Expr::Bitwise {
+                sreg: reg(0),
+                dreg: reg(0),
+                mask: [[0xff, 0xc0].as_slice(), &[0; 14]].concat(),
+                xor: vec![0; 16],
+            },
+            Expr::Cmp {
+                sreg: reg(0),
+                op: NFT_CMP_EQ,
+                data: LINK_LOCAL6.octets().to_vec(),
+            },
+        ],
+        vec![Expr::Reject {
+            kind: NFT_REJECT_ICMPX_UNREACH,
+            code: Some(NFT_REJECT_ICMPX_ADMIN_PROHIBITED),
+        }],
+    ]
+    .concat()
+}
+
+/// `iifname @isolated`: from an isolated network's bridge.
+fn from_isolated() -> Vec<Expr> {
+    interface_in(NFT_META_IIFNAME, set::ISOLATED, false)
+}
+
+/// `forward`'s metadata drops: from an isolated network, nothing to the
+/// cloud's metadata addresses (IPv4's link-local block and Alibaba's, then
+/// IPv6's).
+fn metadata_rules() -> [Vec<Expr>; 5] {
+    let to = |family: Vec<Expr>, daddr: Expr, data: Vec<u8>| {
+        [
+            family,
+            from_isolated(),
+            vec![
+                daddr,
+                Expr::Cmp {
+                    sreg: reg(0),
+                    op: NFT_CMP_EQ,
+                    data,
+                },
+                Expr::Verdict(NF_DROP),
+            ],
+        ]
+        .concat()
+    };
+    let link_local = [
+        ipv4(),
+        from_isolated(),
+        vec![
+            address(16, reg(0)),
+            Expr::Bitwise {
+                sreg: reg(0),
+                dreg: reg(0),
+                mask: vec![0xff, 0xff, 0, 0],
+                xor: vec![0; 4],
+            },
+            Expr::Cmp {
+                sreg: reg(0),
+                op: NFT_CMP_EQ,
+                data: [LINK_LOCAL4, [0, 0]].concat(),
+            },
+            Expr::Verdict(NF_DROP),
+        ],
+    ]
+    .concat();
+    let [aws, aws_dns, google] =
+        METADATA6.map(|metadata| to(ipv6(), address6(24, reg(0)), metadata.octets().to_vec()));
+    [
+        link_local,
+        to(ipv4(), address(16, reg(0)), METADATA4.octets().to_vec()),
+        aws,
+        aws_dns,
+        google,
+    ]
 }
 
 /// `guard`'s: nothing for or from 127.0.0.0/8 but on `lo`.
@@ -546,7 +912,9 @@ fn guard_rules() -> [Vec<Expr>; 2] {
 }
 
 /// `forward`'s (see the module).
-fn forward_rules() -> [Vec<Expr>; 9] {
+fn forward_rules() -> [Vec<Expr>; 18] {
+    let [link_local, alibaba, aws, aws_dns, google] = metadata_rules();
+    let [tcp4, other4, tcp6, other6] = limit_rules();
     let drop = || Expr::Verdict(NF_DROP);
     let accept = || Expr::Verdict(NF_ACCEPT);
     let invalid = || ct_bits(NFT_CT_STATE, CT_STATE_INVALID, true);
@@ -571,6 +939,20 @@ fn forward_rules() -> [Vec<Expr>; 9] {
             vec![accept()],
         ]
         .concat(),
+        // New connections from an isolated network to the metadata
+        // addresses: before anything accepts them.
+        link_local,
+        alibaba,
+        aws,
+        aws_dns,
+        google,
+        // New connections from a limited network, counted: before anything
+        // accepts them (after the metadata drops: one dropped anyway isn't
+        // counted).
+        tcp4,
+        other4,
+        tcp6,
+        other6,
         [on_one_bridge(), vec![accept()]].concat(),
         [
             interface_in(NFT_META_IIFNAME, set::INTERNAL, false),
@@ -743,6 +1125,15 @@ pub(crate) fn network_elements(network: &NetworkRules) -> Vec<(&'static str, Vec
         (set::BRIDGES, vec![bridge.clone()]),
         (set::SAME_BRIDGE, vec![same]),
     ];
+    if network.isolate_host {
+        elements.push((set::ISOLATED, vec![bridge.clone()]));
+        if let Some(dns) = network.dns {
+            elements.push((set::DNS_ALLOW, dns_allow(&network.bridge, dns)));
+        }
+    }
+    if network.conntrack_limit {
+        elements.push((set::LIMITED, vec![bridge.clone()]));
+    }
     if network.internal {
         elements.push((set::INTERNAL, vec![bridge]));
     } else {
@@ -752,6 +1143,26 @@ pub(crate) fn network_elements(network: &NetworkRules) -> Vec<(&'static str, Vec
         }
     }
     elements
+}
+
+/// `dns_allow`'s elements for a network's bridge `bridge` and DNS server
+/// `dns`: port 53, over UDP and TCP (each field in whole registers, as
+/// the kernel loads them).
+fn dns_allow(bridge: &str, dns: Ipv4Addr) -> Vec<Element> {
+    [crate::ports::Protocol::Udp, crate::ports::Protocol::Tcp]
+        .into_iter()
+        .map(|protocol| {
+            Element::key(
+                [
+                    ifname_key(bridge),
+                    dns.octets().to_vec(),
+                    vec![protocol.number(), 0, 0, 0],
+                    vec![0, 53, 0, 0],
+                ]
+                .concat(),
+            )
+        })
+        .collect()
 }
 
 /// Adds `network`'s elements (those there already are left).
@@ -1146,6 +1557,9 @@ mod tests {
             subnet: "10.89.0.0/24".parse().unwrap(),
             subnet6: Some("fd00:1::/64".parse().unwrap()),
             internal: true,
+            isolate_host: false,
+            conntrack_limit: false,
+            dns: None,
         };
         let sets: Vec<&str> = network_elements(&internal)
             .iter()
@@ -1154,6 +1568,9 @@ mod tests {
         assert_eq!(sets, [set::BRIDGES, set::SAME_BRIDGE, set::INTERNAL]);
         let open = NetworkRules {
             internal: false,
+            isolate_host: false,
+            conntrack_limit: false,
+            dns: None,
             ..internal
         };
         let sets: Vec<&str> = network_elements(&open).iter().map(|(s, _)| *s).collect();
@@ -1240,6 +1657,189 @@ mod tests {
         assert_eq!(chains()[0].priority, -300);
     }
 
+    /// A connection from a limited network's bridge, on its first packet,
+    /// adds its source to the dynamic set, whose element counts it; over the
+    /// limit, a TCP one is reset and any other refused with an ICMP. Only
+    /// limited networks' bridges are in `limited`.
+    #[test]
+    fn a_limited_network_counts_each_containers_new_connections() {
+        let rules = limit_rules();
+        let cases = [
+            (NFPROTO_IPV4, address(12, reg(0)), set::CONNS4, true),
+            (NFPROTO_IPV4, address(12, reg(0)), set::CONNS4, false),
+            (NFPROTO_IPV6, address6(8, reg(0)), set::CONNS6, true),
+            (NFPROTO_IPV6, address6(8, reg(0)), set::CONNS6, false),
+        ];
+        for (rule, (family, source, conns, tcp)) in rules.iter().zip(cases) {
+            assert_eq!(rule[..2], nfproto(family)[..]);
+            assert!(rule.contains(&Expr::Lookup {
+                set: set::LIMITED.into(),
+                sreg: reg(0),
+                dreg: None,
+                invert: false,
+            }));
+            // Its first packet only: `ct status & confirmed == 0`.
+            let first = ct_bits(NFT_CT_STATUS, IPS_CONFIRMED, false);
+            assert!(rule.windows(first.len()).any(|at| at == first));
+            assert!(rule.contains(&Expr::Cmp {
+                sreg: reg(0),
+                op: if tcp { NFT_CMP_EQ } else { NFT_CMP_NEQ },
+                data: vec![6],
+            }));
+            let refuse = if tcp {
+                Expr::Reject {
+                    kind: NFT_REJECT_TCP_RST,
+                    code: None,
+                }
+            } else {
+                Expr::Reject {
+                    kind: NFT_REJECT_ICMPX_UNREACH,
+                    code: Some(NFT_REJECT_ICMPX_ADMIN_PROHIBITED),
+                }
+            };
+            assert_eq!(
+                rule[rule.len() - 3..],
+                [
+                    source,
+                    Expr::Dynset {
+                        set: conns.into(),
+                        op: NFT_DYNSET_OP_ADD,
+                        sreg: reg(0),
+                        expr: Box::new(Expr::Connlimit {
+                            count: 8192,
+                            invert: true,
+                        }),
+                    },
+                    refuse,
+                ]
+            );
+        }
+        // A link-local source's new connection to the host is refused,
+        // uncounted.
+        let refused = link_local_refused();
+        assert_eq!(refused[..2], nfproto(NFPROTO_IPV6)[..]);
+        let first = ct_bits(NFT_CT_STATUS, IPS_CONFIRMED, false);
+        assert!(refused.windows(first.len()).any(|at| at == first));
+        assert!(refused.contains(&Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: LINK_LOCAL6.octets().to_vec(),
+        }));
+        assert!(
+            !refused
+                .iter()
+                .any(|expr| matches!(expr, Expr::Dynset { .. }))
+        );
+        // The counting sets are dynamic: the kernel fills them.
+        let dynamic: Vec<&str> = sets()
+            .iter()
+            .filter(|spec| spec.flags & NFT_SET_EVAL != 0)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(dynamic, [set::CONNS4, set::CONNS6]);
+        let network = |conntrack_limit| NetworkRules {
+            bridge: "shy-app".into(),
+            subnet: "10.89.0.0/24".parse().unwrap(),
+            subnet6: None,
+            internal: false,
+            isolate_host: false,
+            dns: None,
+            conntrack_limit,
+        };
+        let limited: Vec<_> = network_elements(&network(true))
+            .into_iter()
+            .filter(|(set, _)| *set == set::LIMITED)
+            .collect();
+        assert_eq!(
+            limited,
+            [(set::LIMITED, vec![Element::key(ifname_key("shy-app"))])]
+        );
+        assert!(
+            network_elements(&network(false))
+                .iter()
+                .all(|(set, _)| *set != set::LIMITED)
+        );
+    }
+
+    /// `input`: from an isolated network, replies, its DNS server (IPv4),
+    /// IPv6's neighbour discovery, then nothing; its elements: its bridge,
+    /// and its gateway's port 53 over UDP and TCP if it has names.
+    #[test]
+    fn an_isolated_network_reaches_the_host_only_for_its_dns() {
+        let input: Vec<Vec<Expr>> = rules()
+            .into_iter()
+            .filter(|(chain, _)| *chain == chain::INPUT)
+            .map(|(_, exprs)| exprs)
+            .collect();
+        assert_eq!(input.len(), 9);
+        // The limit first (see the test before).
+        assert_eq!(input[0], link_local_refused());
+        assert_eq!(input[1..5], limit_rules());
+        let input = &input[5..];
+        assert_eq!(input[0].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+        assert!(input[1].contains(&Expr::Lookup {
+            set: set::DNS_ALLOW.into(),
+            sreg: reg(0),
+            dreg: None,
+            invert: false,
+        }));
+        assert_eq!(input[1].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+        assert_eq!(input[2].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+        // Neighbour solicitations and advertisements only (135 and 136).
+        for (op, kind) in [(NFT_CMP_GTE, 135), (NFT_CMP_LTE, 136)] {
+            assert!(input[2].contains(&Expr::Cmp {
+                sreg: reg(0),
+                op,
+                data: vec![kind],
+            }));
+        }
+        assert_eq!(
+            input[3],
+            [
+                interface_in(NFT_META_IIFNAME, set::ISOLATED, false),
+                vec![Expr::Verdict(NF_DROP)]
+            ]
+            .concat()
+        );
+        let isolated = |dns| NetworkRules {
+            bridge: "shy-app".into(),
+            subnet: "10.89.0.0/24".parse().unwrap(),
+            subnet6: None,
+            internal: false,
+            isolate_host: true,
+            conntrack_limit: false,
+            dns,
+        };
+        let with_dns = network_elements(&isolated(Some(Ipv4Addr::new(10, 89, 0, 1))));
+        let allowed: Vec<&Element> = with_dns
+            .iter()
+            .filter(|(set, _)| *set == set::DNS_ALLOW)
+            .flat_map(|(_, elements)| elements)
+            .collect();
+        // The bridge, the gateway, then UDP's and TCP's port 53, each field
+        // in whole registers.
+        let key = |protocol: u8| {
+            let mut key = ifname_key("shy-app");
+            key.extend([10, 89, 0, 1, protocol, 0, 0, 0, 0, 53, 0, 0]);
+            key
+        };
+        let keys: Vec<&Vec<u8>> = allowed.iter().map(|element| &element.key).collect();
+        assert_eq!(keys, [&key(17), &key(6)]);
+        assert!(allowed.iter().all(|element| element.data.is_none()));
+        assert!(with_dns.iter().any(|(set, _)| *set == set::ISOLATED));
+        // No names: kept from the host whole.
+        let without = network_elements(&isolated(None));
+        assert!(without.iter().all(|(set, _)| *set != set::DNS_ALLOW));
+        // Not isolated: none of it.
+        let mut open = isolated(Some(Ipv4Addr::new(10, 89, 0, 1)));
+        open.isolate_host = false;
+        assert!(
+            network_elements(&open)
+                .iter()
+                .all(|(set, _)| *set != set::ISOLATED && *set != set::DNS_ALLOW)
+        );
+    }
+
     #[test]
     fn only_dnated_traffic_reaches_a_bridge_and_internal_networks_are_closed() {
         let forward: Vec<Vec<Expr>> = rules()
@@ -1247,10 +1847,11 @@ mod tests {
             .filter(|(chain, _)| *chain == "forward")
             .map(|(_, exprs)| exprs)
             .collect();
-        assert_eq!(forward.len(), 9);
-        // What conntrack finds invalid on a bridge first, then replies, what
-        // stays on a bridge, the internal networks, DNAT, the rest, then
-        // routing for others if closed.
+        assert_eq!(forward.len(), 18);
+        // What conntrack finds invalid on a bridge first, then replies, an
+        // isolated network's to the metadata addresses, the limit, what stays on a
+        // bridge, the internal networks, DNAT, the rest, then routing for
+        // others if closed.
         let invalid = ct_bits(NFT_CT_STATE, CT_STATE_INVALID, true);
         for (rule, key) in forward[..2]
             .iter()
@@ -1266,8 +1867,10 @@ mod tests {
                 .concat()
             );
         }
-        let forward = &forward[2..];
-        assert_eq!(forward[0].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+        assert_eq!(forward[2].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+        assert_eq!(forward[3..8], metadata_rules());
+        assert_eq!(forward[8..12], limit_rules());
+        let forward = &forward[11..];
         assert_eq!(
             forward[1],
             [on_one_bridge(), vec![Expr::Verdict(NF_ACCEPT)]].concat()
@@ -1304,6 +1907,9 @@ mod tests {
                 subnet: "10.88.0.0/16".parse().unwrap(),
                 subnet6: None,
                 internal: false,
+                isolate_host: false,
+                conntrack_limit: false,
+                dns: None,
             }],
             &[rule(Published {
                 host_ip: None,
@@ -1319,8 +1925,9 @@ mod tests {
         let what: Vec<&str> = items.iter().map(|item| item.what.as_str()).collect();
         assert_eq!(what[0], "adding the table shipyard");
         assert_eq!(what[1], "adding the set bridges");
-        assert_eq!(what[12], "adding the chain guard");
-        assert!(what.contains(&"adding rule 9 of the chain forward"));
+        assert_eq!(what[17], "adding the chain guard");
+        assert!(what.contains(&"adding rule 18 of the chain forward"));
+        assert!(what.contains(&"adding rule 9 of the chain input"));
         assert_eq!(
             what[what.len() - 5..],
             [

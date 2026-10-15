@@ -137,7 +137,7 @@ fn the_hosts_own_root_is_refused() {
 #[test]
 fn contradicting_flags_are_usage_errors() {
     for args in [
-        &["run", "--read-only", "true"][..],
+        &["run", "--no-image", "--read-only", "true"][..],
         &["run", "--no-isolation", "--rootfs", "/", "true"],
     ] {
         let run = run(SHIPYARD.command(args));

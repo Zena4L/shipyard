@@ -38,21 +38,31 @@ mod elsewhere;
 mod helper;
 #[cfg(target_os = "linux")]
 mod lifecycle;
+mod plan;
+mod versions;
 
 #[cfg(not(target_os = "linux"))]
 pub use elsewhere::{
-    attach_stream, create, delete, exec, exit_code, helper_entry_point, kill, kill_all, logs_of,
-    memory_limit, monitor_entry_point, pause, ps, remove_failed_logs, resume, start, start_helper,
-    state, stats, update,
+    attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
+    helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
+    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_status,
+    ps, release, remove_failed_logs, resume, start, start_helper, start_helper_in_view, state,
+    stats, status, stop, update, wait,
 };
 #[cfg(target_os = "linux")]
+pub use lifecycle::{Waiter, waiter};
+#[cfg(target_os = "linux")]
 pub use lifecycle::{
-    attach_stream, create, delete, exec, exit_code, helper_entry_point, kill, kill_all, logs_of,
-    memory_limit, monitor_entry_point, pause, ps, remove_failed_logs, resume, start, start_helper,
-    state, stats, update,
+    attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
+    helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
+    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_status,
+    ps, release, remove_failed_logs, remove_monitor_cgroup, resume, start, start_helper,
+    start_helper_in_view, state, stats, status, stop, update, wait,
 };
 
-pub use helper::{Helper, HelperFailure, HelperIo, RunningHelper};
+pub use helper::{Helper, HelperFailure, HelperIo, RootView, RunningHelper};
+pub use plan::{Plan, PlanError};
+pub use versions::ExitRecord;
 
 /// Where root's state directories go unless told otherwise (runc's is
 /// `/run/runc`).
@@ -85,9 +95,16 @@ pub fn default_root() -> Result<PathBuf> {
     choose_root(me.is_root(), runtime_dir.as_deref(), owner, me.as_raw())
 }
 
-/// [`default_root`]'s decision: `owner` is the uid owning `runtime_dir`,
-/// if it's a directory.
-fn choose_root(
+/// [`default_root`]'s decision, for a caller that read the environment
+/// itself (the engine's `Paths`): root's (`root`) is [`DEFAULT_ROOT`];
+/// anyone else's is `shipyard` in their `runtime_dir` (`XDG_RUNTIME_DIR`),
+/// which must be absolute, a directory, and theirs: `owner` is the uid
+/// owning it, if it's a directory, and `me` the caller's.
+///
+/// # Errors
+///
+/// [`ContainerError::NoStateRoot`], saying why.
+pub fn choose_root(
     root: bool,
     runtime_dir: Option<&Path>,
     owner: Option<u32>,
@@ -128,7 +145,152 @@ pub struct CreateOptions<'a> {
     /// [`PassedFds`](crate::process::passed::PassedFds). The container's
     /// init holds them from `create` until its program starts.
     pub passed: Option<&'a crate::process::passed::PassedFds>,
+    /// Descriptors the container's monitor holds from `create` until the
+    /// container has ended (`--hold-fd`): what keeps the caller's
+    /// resources alive (a `flock`'s, say) once the caller has gone. Then
+    /// they're the exit command's, or closed. The container never has them.
+    /// Each must be above 2, given once, and above the descriptors
+    /// [`passed`](Self::passed) puts at 3 and up; each has a label
+    /// ([`Hold`]), which the exit command is told, and by which it can be
+    /// let go of while the container runs ([`release`]).
+    pub holds: &'a [Hold<'a>],
+    /// What the monitor runs once the container has ended
+    /// (`--exit-command`): given the holds, to clean up after it.
+    pub exit_command: Option<ExitCommand>,
+    /// What the monitor runs beside the container (`--companion`): started
+    /// once the container is created (held at its gate: the companion waits
+    /// for the start itself), in a session of its own, with the monitor's
+    /// environment, `/dev/null` for its standard streams and none of the
+    /// holds, killed by the monitor's death (its parent-death signal); its
+    /// process group is killed, and it's reaped, once the container has
+    /// ended, before that's recorded. For an engine's health checks.
+    pub companion: Option<ExitCommand>,
 }
+
+/// A program the monitor runs: its exit command, or its companion
+/// ([`CreateOptions::companion`]). An exit command runs once its container
+/// has ended (conmon's `--exit-command`): after its end is recorded, in a
+/// session of its own, with the monitor's environment (the creator's),
+/// `/dev/null` for its standard streams, the holds at 3 and up
+/// ([`HOLDS_ENV`] says how many, [`HOLD_LABELS_ENV`] their labels), how the
+/// container ended ([`EXIT_RECORD_ENV`]), and the monitor's PID
+/// ([`MONITOR_PID_ENV`]: its copies of the holds go when it exits). The
+/// monitor doesn't wait for it, and a failure to start it is silent: what
+/// it would have cleaned up is left to the sweeps of whatever held it.
+///
+/// It may find the container's state gone (`delete --force` doesn't wait
+/// for it), and an OCI caller may reuse the ID meanwhile: it mustn't act on
+/// the container by ID alone. Its arguments are UTF-8, as the record that
+/// keeps them is JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedExitCommand")]
+#[non_exhaustive]
+pub struct ExitCommand {
+    /// The program (an absolute path).
+    pub program: PathBuf,
+    /// Its arguments, after its name.
+    pub args: Vec<String>,
+}
+
+impl ExitCommand {
+    /// `program`, with `args`.
+    ///
+    /// # Errors
+    ///
+    /// [`ContainerError::BadExitCommand`]: the program isn't an absolute
+    /// path (the monitor runs in `/`, with the creator's `PATH` no help).
+    pub fn new(program: impl Into<PathBuf>, args: Vec<String>) -> Result<Self> {
+        let program = program.into();
+        // Absolute, UTF-8 (JSON keeps it), and no NUL anywhere: an `execve`
+        // would refuse that at the container's end, too late to say.
+        let valid = program.is_absolute()
+            && program.to_str().is_some_and(|text| !text.contains('\0'))
+            && !args.iter().any(|arg| arg.contains('\0'));
+        if !valid {
+            return Err(ContainerError::BadExitCommand(program));
+        }
+        Ok(Self { program, args })
+    }
+}
+
+/// An [`ExitCommand`] as JSON gives it: checked by [`ExitCommand::new`].
+#[derive(Deserialize)]
+struct UncheckedExitCommand {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+impl TryFrom<UncheckedExitCommand> for ExitCommand {
+    type Error = ContainerError;
+
+    fn try_from(unchecked: UncheckedExitCommand) -> Result<Self> {
+        Self::new(unchecked.program, unchecked.args)
+    }
+}
+
+/// A created container's init, for a caller that follows it
+/// ([`init_process`]).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct InitProcess {
+    /// Its PID, as the host sees it.
+    pub pid: i32,
+    /// Its start time (clock ticks since boot, `/proc/PID/stat`'s 22nd
+    /// field): with the PID, it names this process alone.
+    pub start_time: u64,
+    /// A pidfd for it (readable once it has exited), where the kernel has
+    /// them (Linux 5.3).
+    pub pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+/// A descriptor the container's monitor holds (`--hold-fd N=LABEL`), and
+/// what it's called.
+#[derive(Debug, Clone, Copy)]
+pub struct Hold<'a> {
+    /// The descriptor.
+    pub fd: std::os::fd::BorrowedFd<'a>,
+    /// Its label ([`crate::attach::is_label`]): told to the exit command
+    /// ([`HOLD_LABELS_ENV`]), and what [`release`] names.
+    pub label: &'a str,
+}
+
+/// The variable that tells an exit command how many holds it has, at 3 and
+/// up.
+pub const HOLDS_ENV: &str = "SHIPYARD_HOLDS";
+
+/// The variable that tells an exit command its holds' labels, in their
+/// order (3 and up), comma-separated: those given at `create` that weren't
+/// let go of, then those held since ([`hold`]).
+pub const HOLD_LABELS_ENV: &str = "SHIPYARD_HOLD_LABELS";
+
+/// The most descriptors a container's monitor holds for its caller (see
+/// [`CreateOptions::holds`]): room for a container publishing a whole `-p`
+/// range (1024 ports, on IPv4 and IPv6: two sockets each), beside its
+/// networks and volumes. The caller's descriptor limit (which the monitor
+/// inherits, and which a run publishing that many has met already) is the
+/// other bound.
+pub const MOST_HOLDS: usize = 2_100;
+
+/// What a monitor says, after the number, when it holds all it can (in a
+/// refused hold's [`ContainerError::NotHeld`]): its caller tells this
+/// refusal from the others by it, as the protocol has no code for it. A
+/// monitor since 9.7b1 says it so; keep it so.
+pub const HOLDS_FULL: &str = "descriptors are held already";
+
+/// The most bytes of hold labels a monitor keeps, all told: they reach the
+/// exit command in one environment variable ([`HOLD_LABELS_ENV`]), and one
+/// string of an exec's is at most 128 KiB (`MAX_ARG_STRLEN`).
+pub const MOST_HOLD_LABEL_BYTES: usize = 96 * 1024;
+
+/// The variable that gives an exit command how the container ended: its
+/// [`ExitRecord`], as JSON (the state directory may be gone by then).
+pub const EXIT_RECORD_ENV: &str = "SHIPYARD_EXIT_RECORD";
+
+/// The variable that gives an exit command its monitor's PID: the monitor
+/// keeps its own copies of the holds until it has exited (it doesn't wait
+/// for the exit command), so what they keep alive isn't free before then.
+/// While the exit command's parent is this PID, the monitor is there.
+pub const MONITOR_PID_ENV: &str = "SHIPYARD_MONITOR_PID";
 
 /// What [`exec`] runs in a container, and how (runc's `exec` flags). What
 /// isn't given is the container's own process's: its environment, working
@@ -136,6 +298,10 @@ pub struct CreateOptions<'a> {
 /// filter always. None of it may widen what the container has.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "exec's flags (--no-new-privs, -d, -t, no -i), each its own"
+)]
 pub struct ExecOptions {
     /// The command and its arguments (`exec ID CMD…`); empty with
     /// [`process`](Self::process).
@@ -149,6 +315,16 @@ pub struct ExecOptions {
     pub env: Vec<std::ffi::OsString>,
     /// The user (`--user UID[:GID]`): numeric, as the container sees them.
     pub user: Option<(u32, Option<u32>)>,
+    /// The user by name or number, `USER[:GROUP]` (`shipyard exec -u`),
+    /// taking the place of [`user`](Self::user) (ignored when this is
+    /// given): looked up in the container's own `/etc/passwd` and
+    /// `/etc/group`, with the groups that list it and those the container
+    /// was given (as Docker's), and its home as `HOME` unless
+    /// [`env`](Self::env) or the container's own environment sets one.
+    pub user_spec: Option<String>,
+    /// No input (`shipyard exec` without `-i`): its stdin is `/dev/null`,
+    /// and a terminal (`-t`) takes no typing.
+    pub no_input: bool,
     /// Supplementary groups (`--additional-gids`), instead of the
     /// container's process's.
     pub additional_gids: Vec<u32>,
@@ -165,6 +341,10 @@ pub struct ExecOptions {
     /// An OCI console socket (`--console-socket`), connected, open for the
     /// whole call: the terminal's master goes there (runc's protocol).
     pub console: Option<std::os::fd::RawFd>,
+    /// How a stop request (SIGTERM or SIGINT to this process) ends the
+    /// command: its signal, then SIGKILL to all it started after its
+    /// timeout (by default SIGTERM, then 10 s).
+    pub stop: crate::process::StopPolicy,
 }
 
 impl ExecOptions {
@@ -292,6 +472,12 @@ pub enum Status {
     Created,
     /// Its program runs.
     Running,
+    /// Its init has ended and its monitor is cleaning up (its cgroup
+    /// removed, its output drained into the logs): stopped once that's
+    /// done. Derived from what's alive, never stored. OCI's `state` says
+    /// `stopped` (its process has exited); what needs it running says it's
+    /// stopping.
+    Stopping,
     /// Its processes are frozen (`pause`), until `resume`.
     Paused,
     /// It has ended.
@@ -304,6 +490,7 @@ impl std::fmt::Display for Status {
             Self::Creating => "creating",
             Self::Created => "created",
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Paused => "paused",
             Self::Stopped => "stopped",
         })
@@ -395,6 +582,19 @@ pub enum ContainerError {
          program, or pause the whole container"
     )]
     StopSignal(String),
+    /// A signal that can't stop container `id`: one that would stop or
+    /// continue its init rather than end it (SIGSTOP, SIGTSTP, SIGTTIN,
+    /// SIGTTOU, SIGCONT), or that the init can't pass on (SIGCHLD, 32, 33).
+    #[error(
+        "signal {signal} can't stop container {id}: it would pause or continue it, or never \
+         reach its command"
+    )]
+    CantStop {
+        /// Its ID.
+        id: String,
+        /// The signal's number.
+        signal: i32,
+    },
     /// The bundle asks for a terminal (`process.terminal`), and no console
     /// socket was given to send it to.
     #[error(
@@ -431,6 +631,48 @@ pub enum ContainerError {
     /// by a Shipyard before attach.
     #[error("container {0} can't be attached to: create it with --log-dir")]
     NotAttachable(String),
+    /// The container's monitor has no control channel (`stop`, `wait`):
+    /// one of a Shipyard before them.
+    #[error(
+        "container {0}'s monitor can't be asked to stop it (an older Shipyard's): end it with \
+         kill, or rm -f"
+    )]
+    NoControl(String),
+    /// The container's monitor can't hold descriptors for it (an older
+    /// Shipyard's, before protocol version 3).
+    #[error(
+        "container {0}'s monitor can't hold or let go of descriptors (an older Shipyard's): \
+         restart the container"
+    )]
+    MonitorTooOld(String),
+    /// The container's monitor didn't answer a hold or release (no answer
+    /// in time, or the connection lost while the container's up): it may or
+    /// may not have done it.
+    #[error("container {id}'s monitor: {why} (it may or may not have done it)")]
+    HoldUnanswered {
+        /// Its ID.
+        id: String,
+        /// What happened.
+        why: String,
+    },
+    /// The container's monitor didn't hold (or let go of) a descriptor:
+    /// why, as it says (or the container has ended).
+    #[error("container {id}'s monitor: {why}")]
+    NotHeld {
+        /// Its ID.
+        id: String,
+        /// Why.
+        why: String,
+    },
+    /// The container's monitor turned a control client away (too many of
+    /// its kind), or didn't answer.
+    #[error("container {id}'s monitor: {reason}")]
+    MonitorRefused {
+        /// Its ID.
+        id: String,
+        /// Why.
+        reason: String,
+    },
     /// Nothing answers on the container's attach socket: its monitor was
     /// killed, or let go as the container ended.
     #[error("container {0}'s monitor is gone: nothing can be attached to")]
@@ -494,6 +736,65 @@ pub enum ContainerError {
     /// `--log-dir`): there are no logs to read.
     #[error("container {0} has no logs: it was created without --log-dir")]
     NotCaptured(String),
+    /// A plan ([`create_planned`]) that can't be run: what's wrong with it.
+    /// Found before anything is made, as a bundle's mistakes are.
+    #[error("the container's plan can't be run: {0}")]
+    InvalidPlan(#[from] PlanError),
+    /// A `plan.json` of another version than this binary's (one binary
+    /// writes and reads it, so another can only be a mistake).
+    #[error(
+        "{} has version {found}, and this Shipyard writes and reads version {}",
+        plan::PLAN_FILE,
+        plan::PLAN_VERSION
+    )]
+    UnknownPlanVersion {
+        /// Its version.
+        found: u32,
+    },
+    /// A hold (`--hold-fd`) that isn't one: not open, a standard stream
+    /// (0 to 2), given twice, or one of the descriptors passed to the
+    /// container's process.
+    #[error(
+        "--hold-fd {0}: not a descriptor the monitor can hold (it must be open, above 2, given \
+         once, and not passed to the container)"
+    )]
+    BadHold(i32),
+    /// A hold whose label isn't one ([`crate::attach::is_label`]).
+    #[error(
+        "{0:?} isn't a hold's label (letters, digits, : _ . and -, at most {max})",
+        max = crate::attach::MAX_LABEL
+    )]
+    BadHoldLabel(String),
+    /// More holds than a monitor keeps ([`MOST_HOLDS`]), or labels longer
+    /// than it passes on, all told.
+    #[error(
+        "--hold-fd: {0} descriptors, and a monitor holds at most {most} (with labels of at most \
+         {bytes} bytes, all told)",
+        most = MOST_HOLDS,
+        bytes = MOST_HOLD_LABEL_BYTES
+    )]
+    TooManyHolds(usize),
+    /// An exit command that isn't an absolute UTF-8 path, or has a NUL in
+    /// it or its arguments.
+    #[error(
+        "the exit command {} isn't one: it must be an absolute path, in UTF-8, with no NUL in \
+         it or its arguments",
+        .0.display()
+    )]
+    BadExitCommand(PathBuf),
+    /// A file in the state directory was written by a newer Shipyard, in a
+    /// version this one can't read.
+    #[error(
+        "{file} has version {found}, which this Shipyard doesn't know (it reads version {} and \
+         older): a newer Shipyard wrote it",
+        versions::STATE_VERSION
+    )]
+    UnknownVersion {
+        /// The file.
+        file: &'static str,
+        /// Its version.
+        found: u32,
+    },
     /// Another call has held the container's lock too long (stopped, or
     /// stuck on a hung file system).
     #[error("container {0} is busy: another call has held its lock for over 15 seconds")]
@@ -591,6 +892,30 @@ mod root_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exit command is an absolute UTF-8 path with no NUL, its
+    /// arguments without one; read from JSON, it's checked the same.
+    #[test]
+    fn exit_commands_are_checked_however_made() {
+        assert!(ExitCommand::new("/bin/cleanup", vec!["web".to_owned()]).is_ok());
+        for (program, args) in [
+            ("cleanup", vec![]),
+            ("/bin/clean\0up", vec![]),
+            ("/bin/cleanup", vec!["w\0eb".to_owned()]),
+        ] {
+            assert!(
+                matches!(
+                    ExitCommand::new(program, args),
+                    Err(ContainerError::BadExitCommand(_))
+                ),
+                "{program:?}"
+            );
+        }
+        let read: ExitCommand =
+            serde_json::from_str(r#"{"program":"/bin/cleanup","args":["a"]}"#).unwrap();
+        assert_eq!(read.args, ["a"]);
+        assert!(serde_json::from_str::<ExitCommand>(r#"{"program":"cleanup","args":[]}"#).is_err());
+    }
 
     /// The reason is in the message, not also its cause: printed as a chain
     /// (the CLI does), it would appear twice.

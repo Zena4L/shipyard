@@ -38,7 +38,14 @@ fn at(ip: Ipv4Addr, port: u16) -> SocketAddr {
 /// namespace once it's connected.
 fn sleeping(user: &TestUser, runtime: &Path, flags: &[&str]) -> (Running, File) {
     let mut command = user.command(
-        SHIPYARD.command(&[&["run"], flags, &["sleep", "30"]].concat()),
+        SHIPYARD.command(
+            &[
+                shipyard_test_support::run_words(flags),
+                flags,
+                &["sleep", "30"],
+            ]
+            .concat(),
+        ),
         runtime,
     );
     command.stderr(File::create(runtime.join("stderr")).unwrap());
@@ -208,7 +215,7 @@ fn a_rootless_container_never_reaches_the_hosts_loopback() {
 /// `runtime` (its `pasta.pid`, in the run's directory), once pasta has
 /// written it (the file is made a moment before).
 fn pasta_of(runtime: &Path) -> i32 {
-    let runs = runtime.join("shipyard/runs");
+    let runs = runtime.join("shipyard/.runs");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let written = std::fs::read_dir(&runs)
@@ -255,8 +262,12 @@ fn pasta_gets_the_namespace_as_a_file_the_host_never_sees_mounted() {
             .expect("--netns");
         let file = &args[at + 1];
         assert!(
-            file.starts_with(&runtime.join("shipyard/runs").to_string_lossy().into_owned())
-                && file.ends_with("/netns"),
+            file.starts_with(
+                &runtime
+                    .join("shipyard/.runs")
+                    .to_string_lossy()
+                    .into_owned()
+            ) && file.ends_with("/netns"),
             "{args:?}"
         );
         assert!(!args.iter().any(|arg| arg == &init.to_string()), "{args:?}");
@@ -301,8 +312,14 @@ fn roots_pasta_run_leaves_no_mount_on_the_host() {
         let upstream = Upstream::new();
         upstream.route_default();
         let server = Server::start(upstream.netns(), 7001, "root-out");
-        let running =
-            start_command(SHIPYARD.command(&["run", "--network", "pasta", "sleep", "30"]));
+        let running = start_command(SHIPYARD.command(&[
+            "run",
+            "--no-image",
+            "--network",
+            "pasta",
+            "sleep",
+            "30",
+        ]));
         let netns = container_netns(running.pid());
         assert_eq!(
             fetch_from(&netns, at(Upstream::ADDRESS, 7001)).as_deref(),
@@ -392,7 +409,8 @@ fn without_pasta_a_rootless_run_says_how_to_do_without() {
         return;
     }
     let without = |flags: &[&str]| {
-        let mut command = SHIPYARD.command(&[&["run"], flags, &["true"]].concat());
+        let mut command =
+            SHIPYARD.command(&[shipyard_test_support::run_words(flags), flags, &["true"]].concat());
         command.env("PATH", "/nonexistent");
         run(command)
     };
@@ -418,7 +436,7 @@ fn a_rootless_containers_network_is_its_own_through_pasta() {
     if is_root() || !rootless(Rootless::Single) {
         return;
     }
-    let listed = run(SHIPYARD.command(&["run", "cat", "/proc/net/dev"]));
+    let listed = run(SHIPYARD.command(&["run", "--no-image", "cat", "/proc/net/dev"]));
     assert_eq!(listed.code, Some(0), "{}", listed.stderr);
     let interfaces: Vec<&str> = listed
         .stdout
@@ -443,7 +461,7 @@ fn a_rootless_run_ends_as_soon_as_its_command_does() {
         let took = |network: &str| {
             let started = std::time::Instant::now();
             let ran = run(user.command(
-                SHIPYARD.command(&["run", "--network", network, "true"]),
+                SHIPYARD.command(&["run", "--no-image", "--network", network, "true"]),
                 &runtime,
             ));
             assert_eq!(ran.code, Some(0), "{}", ran.stderr);

@@ -114,19 +114,32 @@ impl Volumes {
     /// Returns a volume, creating it if it doesn't exist (the behaviour `run
     /// --volume NAME:...` wants: a named volume is made on first use). Only
     /// under its lock: see [`hold`](Self::hold).
-    fn get_or_create(&self, name: &str) -> Result<Volume, VolumeError> {
+    /// Whether this call made it is the second value: of two runs making
+    /// the same volume at once, one did (its data directory's `mkdir`
+    /// succeeded).
+    fn get_or_create(&self, name: &str) -> Result<(Volume, bool), VolumeError> {
         validate_name(name)?;
-        let data = self.root.join(name).join(DATA_DIR);
-        if !data.is_dir() {
-            std::fs::create_dir_all(&data).map_err(|source| VolumeError::Io {
-                context: format!("creating the volume {name}"),
-                source,
-            })?;
-        }
-        Ok(Volume {
+        let dir = self.root.join(name);
+        let data = dir.join(DATA_DIR);
+        let creating = |source| VolumeError::Io {
+            context: format!("creating the volume {name}"),
+            source,
+        };
+        let made = if data.is_dir() {
+            false
+        } else {
+            std::fs::create_dir_all(&dir).map_err(creating)?;
+            match std::fs::create_dir(&data) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(creating(error)),
+            }
+        };
+        let volume = Volume {
             name: name.to_owned(),
             data,
-        })
+        };
+        Ok((volume, made))
     }
 
     /// Looks up a volume by name.
@@ -209,12 +222,43 @@ impl Volumes {
     /// [`VolumeError::InvalidName`] or [`VolumeError::Io`].
     pub fn hold(&self, name: &str) -> Result<VolumeHold, VolumeError> {
         validate_name(name)?;
-        let lock = Flock::lock(self.lock_file(name)?, FlockArg::LockShared)
-            .map_err(|(_, errno)| Self::locking(name, errno))?;
-        let volume = self.get_or_create(name)?;
+        let lock = self.lock_file(name)?;
+        lock.lock_shared()
+            .map_err(|source| Self::locking(name, source))?;
+        let (volume, created) = self.get_or_create(name)?;
         Ok(VolumeHold {
             volume,
-            _lock: lock,
+            lock,
+            created,
+            given_up: false,
+        })
+    }
+
+    /// The volume `name`, held as [`hold`](Self::hold) holds it, only if
+    /// it exists: never made (a copy from a stopped container's volume that
+    /// was removed since finds none, rather than a new empty one).
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::NotFound`] if it doesn't exist (or is being removed);
+    /// [`VolumeError::InvalidName`] or [`VolumeError::Io`].
+    pub fn hold_existing(&self, name: &str) -> Result<VolumeHold, VolumeError> {
+        validate_name(name)?;
+        let lock = self.lock_file(name)?;
+        lock.lock_shared()
+            .map_err(|source| Self::locking(name, source))?;
+        let data = self.root.join(name).join(DATA_DIR);
+        if !data.is_dir() {
+            return Err(VolumeError::NotFound(name.to_owned()));
+        }
+        Ok(VolumeHold {
+            volume: Volume {
+                name: name.to_owned(),
+                data,
+            },
+            lock,
+            created: false,
+            given_up: false,
         })
     }
 
@@ -347,10 +391,10 @@ impl Volumes {
             })
     }
 
-    fn locking(name: &str, errno: nix::errno::Errno) -> VolumeError {
+    fn locking(name: &str, source: impl Into<std::io::Error>) -> VolumeError {
         VolumeError::Io {
             context: format!("locking the volume {name}"),
-            source: errno.into(),
+            source: source.into(),
         }
     }
 }
@@ -394,11 +438,27 @@ pub fn is_trash(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
-/// A volume a run holds (see [`Volumes::hold`]): released when dropped.
+/// A volume a run holds (see [`Volumes::hold`]): released when dropped
+/// (or, once [given up](Self::give_up), when every copy of its
+/// [`hold`](Self::hold) is closed).
 #[derive(Debug)]
 pub struct VolumeHold {
     volume: Volume,
-    _lock: Flock<File>,
+    /// Its lock file, locked (`flock`, shared): unlocked when this value goes
+    /// (another thread's child, forked meanwhile, may hold a copy until it
+    /// execs), unless it was given up: then this copy is only closed.
+    lock: File,
+    /// Whether holding it made it.
+    created: bool,
+    given_up: bool,
+}
+
+impl Drop for VolumeHold {
+    fn drop(&mut self) {
+        if !self.given_up {
+            let _ = self.lock.unlock();
+        }
+    }
 }
 
 impl VolumeHold {
@@ -406,6 +466,26 @@ impl VolumeHold {
     #[must_use]
     pub fn volume(&self) -> &Volume {
         &self.volume
+    }
+
+    /// Whether holding it made it: a run's first use of a name.
+    #[must_use]
+    pub fn created(&self) -> bool {
+        self.created
+    }
+
+    /// The locked descriptor, for a process that keeps the volume held (a
+    /// container's monitor), once this value is [given up](Self::give_up).
+    #[must_use]
+    pub fn hold(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.lock)
+    }
+
+    /// Gives the volume up to whoever holds a copy of its
+    /// [`hold`](Self::hold): this value's copy is closed, never unlocked, so
+    /// the volume stays held while any copy is open.
+    pub fn give_up(mut self) {
+        self.given_up = true;
     }
 }
 
@@ -526,6 +606,49 @@ mod tests {
         }
     }
 
+    /// A hold dropped (not given up) frees the volume at once, even while a
+    /// stray copy of its lock's descriptor is open (another thread's child,
+    /// between its fork and its exec): it's unlocked, not only closed.
+    #[test]
+    fn a_dropped_hold_frees_the_volume_despite_a_stray_copy() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let hold = volumes.hold("data").unwrap();
+        let stray = hold.hold().try_clone_to_owned().unwrap();
+        drop(hold);
+        assert!(volumes.trash("data").is_ok(), "free despite the copy");
+        drop(stray);
+    }
+
+    /// A volume handed over (a copy of its hold, as a container's monitor
+    /// keeps) stays held once its holder has gone: it can't be removed until
+    /// the copy is closed. Dropping the holder only closes, never unlocks.
+    #[test]
+    fn a_volume_handed_over_stays_held() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let hold = volumes.hold("data").unwrap();
+        let copy = hold.hold().try_clone_to_owned().unwrap();
+        hold.give_up();
+        assert!(
+            matches!(volumes.trash("data"), Err(VolumeError::InUse(_))),
+            "held by the copy"
+        );
+        drop(copy);
+        assert!(
+            volumes.trash("data").is_ok(),
+            "free once the copy is closed"
+        );
+    }
+
+    #[test]
+    fn a_hold_says_whether_it_made_the_volume() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        assert!(volumes.hold("new").unwrap().created());
+        assert!(!volumes.hold("new").unwrap().created());
+    }
+
     #[test]
     fn a_created_volume_can_be_inspected_and_listed() {
         let scratch = Scratch::new();
@@ -543,8 +666,10 @@ mod tests {
         volumes.create("v").unwrap();
         assert!(matches!(volumes.create("v"), Err(VolumeError::Exists(_))));
         // get_or_create returns the same one twice.
-        let a = volumes.get_or_create("v").unwrap();
-        let b = volumes.get_or_create("v").unwrap();
+        let (a, made) = volumes.get_or_create("v").unwrap();
+        assert!(!made, "it existed");
+        let (b, made) = volumes.get_or_create("v").unwrap();
+        assert!(!made);
         assert_eq!(a, b);
     }
 

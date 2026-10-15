@@ -25,12 +25,19 @@ const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
 /// `shipyard run ARGS… sh -c SCRIPT`.
 fn shipyard_run(args: &[&str], script: &str) -> Run {
-    run(SHIPYARD.command(&[&["run"], args, &["sh", "-c", script]].concat()))
+    run(SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(args),
+            args,
+            &["sh", "-c", script],
+        ]
+        .concat(),
+    ))
 }
 
 /// `shipyard run ARGS…`, as given.
 fn run_plain(args: &[&str]) -> Run {
-    run(SHIPYARD.command(&[&["run"], args].concat()))
+    run(SHIPYARD.command(&[shipyard_test_support::run_words(args), args].concat()))
 }
 
 /// The same, which must succeed: its output.
@@ -43,8 +50,15 @@ fn ok(args: &[&str], script: &str) -> String {
 /// The same, with a `PATH` that has no `newuidmap`: the single-ID map.
 fn without_helpers(args: &[&str], script: &str) -> Run {
     // The host's network: pasta is on the PATH taken away.
-    let mut command =
-        SHIPYARD.command(&[&["run", "--network", "host"], args, &["sh", "-c", script]].concat());
+    let mut command = SHIPYARD.command(
+        &[
+            shipyard_test_support::run_words(args),
+            &["--network", "host"],
+            args,
+            &["sh", "-c", script],
+        ]
+        .concat(),
+    );
     command.env("PATH", "/nonexistent");
     run(command)
 }
@@ -187,7 +201,9 @@ fn in_a_namespace_denying_setgroups(map: &str, args: &[&str]) -> Run {
     let mut command = Command::new("unshare");
     command
         .args(["--user", map, SHIPYARD.path()])
-        .args(for_this_kernel(&[&["run"], args].concat()));
+        .args(for_this_kernel(
+            &[shipyard_test_support::run_words(args), args].concat(),
+        ));
     run(command)
 }
 
@@ -342,7 +358,7 @@ impl FakeHelpers {
     }
 
     fn run(&self, script: &str) -> Run {
-        let mut command = SHIPYARD.command(&["run", "sh", "-c", script]);
+        let mut command = SHIPYARD.command(&["run", "--no-image", "sh", "-c", script]);
         let path = std::env::var("PATH").unwrap_or_default();
         command.env("PATH", format!("{}:{path}", self.0.0.display()));
         run(command)
@@ -544,7 +560,14 @@ fn a_rootless_command_can_only_raise_its_oom_score() {
 /// `shipyard run ARGS… sh -c SCRIPT`, with `input` on its stdin.
 fn run_fed(args: &[&str], script: &str, input: &[u8]) -> Run {
     shipyard_test_support::run_with_input(
-        SHIPYARD.command(&[&["run"], args, &["sh", "-c", script]].concat()),
+        SHIPYARD.command(
+            &[
+                shipyard_test_support::run_words(args),
+                args,
+                &["sh", "-c", script],
+            ]
+            .concat(),
+        ),
         Some(input),
     )
 }
@@ -582,7 +605,8 @@ fn relaying_adds_little_to_a_run() {
     if !rootless(Rootless::Single) {
         return;
     }
-    let args = shipyard_test_support::for_this_kernel(&["run", "--network", "none", "true"]);
+    let args =
+        shipyard_test_support::for_this_kernel(&["run", "--no-image", "--network", "none", "true"]);
     let shipyard = format!("{} {}", SHIPYARD.path(), args.join(" "));
     let best = |command: &str| {
         (0..5)
@@ -633,7 +657,15 @@ fn t_appends_to_its_output_file() {
         .open(&path)
         .expect("opening the file");
     let output = SHIPYARD
-        .command(&["run", "-t", "--network", "none", "echo", "body"])
+        .command(&[
+            "run",
+            "--no-image",
+            "-t",
+            "--network",
+            "none",
+            "echo",
+            "body",
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(file)
         .output()

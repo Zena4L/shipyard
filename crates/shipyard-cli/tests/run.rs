@@ -139,6 +139,36 @@ fn expected_home() -> String {
         .unwrap_or_else(|| if is_root() { "/root" } else { "/" }.to_owned())
 }
 
+/// A bare `-e NAME` copies the caller's value; one the caller hasn't set
+/// is left out (Docker's behaviour).
+#[test]
+fn a_bare_env_name_copies_the_callers_value() {
+    let mut command = SHIPYARD.command(&[
+        "run",
+        "--no-isolation",
+        "-e",
+        "SHIPYARD_TEST_BARE",
+        "-e",
+        "SHIPYARD_TEST_UNSET",
+        "env",
+    ]);
+    command
+        .env("SHIPYARD_TEST_BARE", "from-the-caller")
+        .env_remove("SHIPYARD_TEST_UNSET");
+    let run = run(command);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.contains("SHIPYARD_TEST_BARE=from-the-caller"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("SHIPYARD_TEST_UNSET"),
+        "{}",
+        run.stdout
+    );
+}
+
 #[test]
 fn the_working_directory_is_applied() {
     let run = shipyard_run(&["-w", "/tmp", "pwd", "-P"]);
@@ -440,7 +470,7 @@ fn hostname_mistakes_are_usage_errors() {
     let both = run(SHIPYARD.command(&["run", "--no-isolation", "--hostname", "box", "true"]));
     assert_eq!(both.code, Some(125), "{}", both.stderr);
     // An invalid name; on macOS, no namespaces to give one to.
-    let bad = run(SHIPYARD.command(&["run", "--hostname", "bad_name", "true"]));
+    let bad = run(SHIPYARD.command(&["run", "--no-image", "--hostname", "bad_name", "true"]));
     assert_eq!(bad.code, Some(125), "{}", bad.stderr);
     assert!(bad.stderr.contains("hostname"), "{}", bad.stderr);
 }
@@ -458,7 +488,10 @@ fn the_oom_score_adjustment_reaches_the_command() {
 
 /// `shipyard run ARGS…` with `input` piped to its stdin.
 fn run_fed(args: &[&str], input: &[u8]) -> Run {
-    shipyard_test_support::run_with_input(SHIPYARD.command(&[&["run"], args].concat()), Some(input))
+    shipyard_test_support::run_with_input(
+        SHIPYARD.command(&[shipyard_test_support::run_words(args), args].concat()),
+        Some(input),
+    )
 }
 
 /// `-it` needs a terminal to type on: Docker's rule, and its words, which

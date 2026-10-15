@@ -1,0 +1,20 @@
+# cargo-mutants' settings (H5): `scripts/test-linux.sh --mutants`, and CI's
+# `quality` workflow, run it on the changes against a base branch
+# (`--in-diff`), with each crate's own tests, unprivileged. Root-only and
+# Linux-only behaviour stays with each step's own mutation runner (see
+# docs/DEVELOPMENT.md): here, a mutant only a root test catches is reported
+# missed, so the result is a report, not a gate.
+
+# Not code under test: the tests, the test helpers, and the fuzz crate. And
+# what runs between `fork` and `exec` (CLAUDE.md: "Code that runs after
+# fork"), where a mutant hangs or kills the test binary rather than failing
+# a test: the hand-written runner covers it, in the Linux container.
+exclude_globs = [
+    "crates/*/tests/**",
+    "crates/shipyard-test-support/**",
+    "fuzz/**",
+    "crates/shipyard-runtime/src/process/child.rs",
+]
+
+# Builds are slow and tests spawn processes: give each mutant room.
+timeout_multiplier = 3.0

@@ -33,7 +33,7 @@ use std::process::ExitCode;
 
 use shipyard_test_support::bundle::Bundle;
 use shipyard_test_support::pty::{
-    Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped,
+    Job, Mode, Session, Shell, Status, TERM, process_state, wait_until_stopped,
 };
 use shipyard_test_support::rootfs::RootFs;
 use shipyard_test_support::{Shipyard, child_of, is_root, killed_by};
@@ -88,6 +88,8 @@ const TESTS: &[(&str, fn())] = tests![
 /// `--include-ignored`, as the root passes do. As a normal user, they run
 /// whenever rootless containers work here (see [`select`]).
 const ISOLATED_TESTS: &[(&str, fn())] = tests![
+    attach_by_name_to_a_terminal_container,
+    exec_it_by_name,
     isolated_ctrl_c_is_forwarded_exactly_once,
     isolated_ctrl_c_ends_shipyard_by_sigint,
     isolated_ctrl_backslash_quits_the_command,
@@ -143,59 +145,27 @@ const ISOLATED_TESTS: &[(&str, fn())] = tests![
     ctrl_z_and_fg_with_limits,
     an_oom_kill_on_a_terminal,
     pause_on_a_terminal,
+    a_terminal_container_run_is_raw_and_detaches,
+    a_terminal_container_run_started_in_the_background_waits_for_fg,
+    a_stopped_terminal_container_run_puts_the_terminal_back,
+    a_hangup_ends_a_terminal_container_run,
+    a_terminal_container_run_without_input_is_output_only,
+    a_terminal_container_run_brought_back_after_bg_goes_raw,
+    a_hangup_leaves_a_container_ignoring_it_running,
 ];
 
-/// libtest options that take a value; their value is skipped so it isn't
-/// taken for a name filter.
-const OPTIONS_WITH_VALUES: &[&str] = &[
-    "--test-threads",
-    "--color",
-    "--format",
-    "--logfile",
-    "--shuffle-seed",
-    "-Z",
-];
-
-/// The tests to run, as libtest would pick them from `args`: names
-/// containing any filter (or equal to one, with `--exact`), minus `--skip`
-/// matches. [`ISOLATED_TESTS`] count as ignored: `--ignored` picks only
-/// them, `--include-ignored` adds them (on Linux; there's no isolation
-/// elsewhere), and so does `rootless` (a normal user who can run rootless
-/// containers here). Other libtest options are accepted and ignored.
+/// The tests to run, as libtest would pick them from `args`
+/// ([`shipyard_test_support::harness::select`]). [`ISOLATED_TESTS`] count as
+/// ignored: `--ignored` picks only them, `--include-ignored` adds them (on
+/// Linux; there's no isolation elsewhere), and so does `rootless` (a normal
+/// user who can run rootless containers here).
 fn select(args: &[String], rootless: bool) -> Vec<&'static (&'static str, fn())> {
-    let mut filters = Vec::new();
-    let mut skips = Vec::new();
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            "--skip" => skips.extend(rest.next()),
-            option if OPTIONS_WITH_VALUES.contains(&option) => {
-                rest.next();
-            }
-            option if option.starts_with('-') => {}
-            filter => filters.push(filter),
-        }
-    }
-    let exact = args.iter().any(|arg| arg == "--exact");
-    let only_ignored = args.iter().any(|arg| arg == "--ignored");
-    let with_ignored = cfg!(target_os = "linux")
-        && (only_ignored || rootless || args.iter().any(|arg| arg == "--include-ignored"));
-    let matches = |name: &str, pattern: &str| {
-        if exact {
-            name == pattern
-        } else {
-            name.contains(pattern)
-        }
+    let isolated: &'static [(&'static str, fn())] = if cfg!(target_os = "linux") {
+        ISOLATED_TESTS
+    } else {
+        &[]
     };
-    let ordinary = TESTS.iter().filter(|_| !only_ignored);
-    let isolated = ISOLATED_TESTS.iter().filter(|_| with_ignored);
-    ordinary
-        .chain(isolated)
-        .filter(|(name, _)| {
-            (filters.is_empty() || filters.iter().any(|f| matches(name, f)))
-                && !skips.iter().any(|skip| matches(name, skip))
-        })
-        .collect()
+    shipyard_test_support::harness::select(args, TESTS, isolated, rootless)
 }
 
 /// Runs the selected tests in order, printing results the way libtest does.
@@ -271,7 +241,10 @@ macro_rules! foreground_sh {
 macro_rules! foreground_isolated {
     ($script:expr) => {
         |shell: &mut Shell| {
-            let job = shell.spawn(Mode::Foreground, &["run", "sh", "-c", $script]);
+            let job = shell.spawn(
+                Mode::Foreground,
+                &["run", "--no-image", "sh", "-c", $script],
+            );
             shell.wait(job);
         }
     };
@@ -711,7 +684,7 @@ fn isolated_ctrl_c_is_forwarded_exactly_once() {
             Mode::Foreground,
             &[
                 "--debug",
-                "run",
+                "run", "--no-image",
                 "sh",
                 "-c",
                 "trap 'echo got-\"\"int; kill $!' INT; echo re\"\"ady; sleep 5 & wait; echo e\"\"nd",
@@ -756,6 +729,7 @@ fn isolated_ctrl_backslash_quits_the_command() {
             &[
                 "--debug",
                 "run",
+                "--no-image",
                 "--ulimit",
                 "core=0",
                 "sh",
@@ -789,7 +763,7 @@ fn isolated_ctrl_z_stops_only_shipyard() {
         let job = shell.spawn(
             Mode::Foreground,
             &[
-                "run",
+                "run", "--no-image",
                 "sh",
                 "-c",
                 // About 3 s of ticks: time enough for Ctrl-Z to land first.
@@ -834,6 +808,7 @@ fn with_i_the_command_reads_what_is_typed() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-image",
                 "-i",
                 "sh",
                 "-c",
@@ -859,7 +834,14 @@ fn a_background_isolated_reader_waits_for_fg() {
     let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Background,
-            &["run", "-i", "sh", "-c", "read x; echo \"got $x\""],
+            &[
+                "run",
+                "--no-image",
+                "-i",
+                "sh",
+                "-c",
+                "read x; echo \"got $x\"",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -884,6 +866,7 @@ fn kill_of_a_run_stopped_for_input_ends_it() {
             Mode::Background,
             &[
                 "run",
+                "--no-image",
                 "-i",
                 "--stop-timeout",
                 "1",
@@ -930,6 +913,7 @@ fn an_isolated_command_never_holds_the_host_terminal() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-image",
                 "sh",
                 "-c",
                 "for fd in 0 1 2; do [ -t $fd ] && echo \"fd $fd: a t\"\"ty\"; done; \
@@ -1065,6 +1049,183 @@ fn attach_to_a_terminal_container() {
     session.expect("settings unchanged");
     session.finish();
     let _ = std::fs::remove_dir_all(&logs);
+}
+
+/// The environment variables that point `shipyard` at a test's container
+/// stores (and, rootless, its runtime directory).
+const STORE_VARS: [&str; 4] = [
+    "SHIPYARD_IMAGE_STORE",
+    "SHIPYARD_CONTAINER_DIR",
+    "SHIPYARD_NETWORK_DIR",
+    "XDG_RUNTIME_DIR",
+];
+
+/// A test's own container stores (stage 9), set in this process's
+/// environment so a session's shell inherits them (the harness clears a
+/// program's own: [`through_env`] passes them on). Removed when dropped.
+struct ContainerStores(std::path::PathBuf);
+
+impl ContainerStores {
+    fn new(name: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("shipyard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (var, sub) in STORE_VARS
+            .iter()
+            .zip(["images", "containers", "networks", "xdg"])
+        {
+            let path = dir.join(sub);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if *var != "XDG_RUNTIME_DIR" || !is_root() {
+                // SAFETY: this test binary is single-threaded (see the module docs).
+                unsafe { std::env::set_var(var, &path) };
+            }
+        }
+        Self(dir)
+    }
+
+    /// `shipyard ARGS…` on these stores, which must succeed: its output.
+    fn ok(&self, args: &[&str]) -> String {
+        let mut command = std::process::Command::new(SHIPYARD.path());
+        command.args(args).stdin(std::process::Stdio::null());
+        for (var, sub) in STORE_VARS
+            .iter()
+            .zip(["images", "containers", "networks", "xdg"])
+        {
+            if *var != "XDG_RUNTIME_DIR" || !is_root() {
+                command.env(var, self.0.join(sub));
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+}
+
+impl Drop for ContainerStores {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `/usr/bin/env`'s arguments to run `shipyard ARGS…` with this process's
+/// store variables (in a session's shell: inherited from the test).
+fn through_env(args: &[&str]) -> Vec<String> {
+    STORE_VARS
+        .iter()
+        .filter_map(|var| Some(format!("{var}={}", std::env::var(var).ok()?)))
+        .chain(std::iter::once(SHIPYARD.path().to_owned()))
+        .chain(args.iter().map(|&arg| arg.to_owned()))
+        .collect()
+}
+
+/// `shipyard attach NAME` from a terminal to a container with one (stage
+/// 9): what's typed reaches it in raw mode, its size follows the window,
+/// Ctrl-C is a byte for its shell, and Ctrl-P Ctrl-Q detaches (exit 0),
+/// the terminal as it was.
+fn attach_by_name_to_a_terminal_container() {
+    let stores = ContainerStores::new("attach-name");
+    let root = RootFs::minimal();
+    stores.ok(&[
+        "create",
+        "-it",
+        "--name",
+        "tty-attach",
+        "--network",
+        "none",
+        "--rootfs",
+        root.arg(),
+        "sh",
+        "-c",
+        "trap 'echo caught-int' INT; while :; do read line && echo got-$line && stty size; done",
+    ]);
+    stores.ok(&["start", "tty-attach"]);
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let args = through_env(&["attach", "tty-attach"]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let job = shell.spawn_program(Mode::Foreground, "/usr/bin/env", &args);
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.type_keys(b"one\r");
+    session.expect("got-one");
+    session.resize(33, 99);
+    session.type_keys(b"two\r");
+    session.expect("got-two");
+    session.expect("33 99");
+    session.type_keys(b"\x03");
+    session.expect("caught-int");
+    session.type_keys(b"\x10\x11");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+    stores.ok(&["rm", "-f", "tty-attach"]);
+}
+
+/// `shipyard exec -it NAME …` from a terminal (stage 9): a terminal of its
+/// own in the container, raw, sized as the window, Ctrl-C a byte for it;
+/// its exit code is exec's; the terminal as it was.
+fn exec_it_by_name() {
+    let stores = ContainerStores::new("exec-name");
+    let root = RootFs::minimal();
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "tty-exec",
+        "--network",
+        "none",
+        "--rootfs",
+        root.arg(),
+        "sleep",
+        "120",
+    ]);
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let args = through_env(&[
+            "exec",
+            "-it",
+            "tty-exec",
+            "sh",
+            "-c",
+            "tty; trap 'echo caught-int' INT; while :; do read line && echo got-$line && stty \
+             size; [ \"$line\" = bye ] && exit 3; done",
+        ]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let job = shell.spawn_program(Mode::Foreground, "/usr/bin/env", &args);
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("/dev/pts/");
+    session.type_keys(b"one\r");
+    session.expect("got-one");
+    session.resize(33, 99);
+    session.type_keys(b"two\r");
+    session.expect("33 99");
+    // Back in its `read` (not still between `stty` and the loop's test),
+    // where the trap is sure to say so.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    session.type_keys(b"\x03");
+    session.expect("caught-int");
+    session.type_keys(b"bye\r");
+    assert_eq!(
+        session.status(),
+        Status::Exited(3),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+    stores.ok(&["rm", "-f", "tty-exec"]);
 }
 
 /// `shipyard-runtime attach` from a terminal to a container without one: the
@@ -1535,7 +1696,10 @@ fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
         let mut session = session(|shell| {
             let bytes = std::env::var(STALL_BYTES_VAR).expect("the test sets the size");
             let script = format!("echo re\"\"ady; sleep 1; head -c {bytes} /dev/zero | tr '\\0' x");
-            let job = shell.spawn(Mode::Foreground, &["run", "sh", "-c", &script]);
+            let job = shell.spawn(
+                Mode::Foreground,
+                &["run", "--no-image", "sh", "-c", &script],
+            );
             shell.wait(job);
         });
         let shipyard = session.job();
@@ -1596,7 +1760,14 @@ fn the_shells_terminal_stays_blocking_after_kill_9_of_shipyard() {
     let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "-i", "sh", "-c", "echo re\"\"ady; read x"],
+            &[
+                "run",
+                "--no-image",
+                "-i",
+                "sh",
+                "-c",
+                "echo re\"\"ady; read x",
+            ],
         );
         shell.wait(job);
         shell.report_blocking();
@@ -1618,7 +1789,7 @@ fn isolated_window_size_changes_are_forwarded() {
             Mode::Foreground,
             &[
                 "--debug",
-                "run",
+                "run", "--no-image",
                 "sh",
                 "-c",
                 "trap 'echo got-w\"\"inch; exit 0' WINCH; echo re\"\"ady; while :; do sleep 0.1; done",
@@ -1689,7 +1860,13 @@ fn an_isolated_command_that_stops_itself_resumes_with_ctrl_z_and_fg() {
     let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "sh", "-c", "echo ready; kill -STOP $$; echo resumed"],
+            &[
+                "run",
+                "--no-image",
+                "sh",
+                "-c",
+                "echo ready; kill -STOP $$; echo resumed",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -2014,6 +2191,7 @@ fn ctrl_z_and_fg_with_limits() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-image",
                 "--memory",
                 "64m",
                 "--pids-limit",
@@ -2068,6 +2246,7 @@ fn an_oom_kill_on_a_terminal() {
             Mode::Foreground,
             &[
                 "run",
+                "--no-image",
                 "--memory",
                 "32m",
                 "--memory-swap",
@@ -2080,7 +2259,14 @@ fn an_oom_kill_on_a_terminal() {
         shell.await_go();
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "-i", "sh", "-c", "read x; echo \"got $x\""],
+            &[
+                "run",
+                "--no-image",
+                "-i",
+                "sh",
+                "-c",
+                "read x; echo \"got $x\"",
+            ],
         );
         shell.wait(job);
     });
@@ -2181,11 +2367,33 @@ fn pause_on_a_terminal() {
 
 // --- `-t`: a terminal of the container's own (stage 8, step 8.2b) ---
 
+/// `/usr/bin/env`'s arguments for `shipyard run FLAGS… --network none
+/// --rootfs ROOT sh -c SCRIPT` (the root from [`ROOTFS_VAR`]) on the test's
+/// container stores: a container (stage 9, step 9.4c3b), its terminal its
+/// monitor's.
+fn container_run_args(flags: &[&str], script: &str) -> Vec<String> {
+    let root = std::env::var(ROOTFS_VAR).expect("the test sets the root filesystem");
+    let args = [
+        &["run"][..],
+        flags,
+        &["--network", "none", "--rootfs", &root, "sh", "-c", script],
+    ]
+    .concat();
+    through_env(&args)
+}
+
+/// Spawns [`container_run_args`]' run.
+fn spawn_container_run(shell: &mut Shell, mode: Mode, flags: &[&str], script: &str) -> Job {
+    let args = container_run_args(flags, script);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    shell.spawn_program(mode, "/usr/bin/env", &args)
+}
+
 /// Starts `shipyard run ARGS… sh -c SCRIPT` in the foreground and waits.
 macro_rules! foreground_t {
     ([$($arg:expr),*], $script:expr) => {
         |shell: &mut Shell| {
-            let job = shell.spawn(Mode::Foreground, &["run", $($arg,)* "sh", "-c", $script]);
+            let job = shell.spawn(Mode::Foreground, &["run", "--no-image", $($arg,)* "sh", "-c", $script]);
             shell.wait(job);
         }
     };
@@ -2199,13 +2407,11 @@ fn with_t_tty_names_the_containers_own_terminal() {
     without.expect("/dev/pts/0");
     assert_eq!(without.status(), Status::Exited(0));
     without.finish();
+    // With one: a container (stage 9, step 9.4c3b), on the test's stores.
+    let _stores = ContainerStores::new("tty-names");
     let _root = rootfs();
     let mut session = session(|shell| {
-        let path = std::env::var(ROOTFS_VAR).expect("the test sets the root filesystem");
-        let job = shell.spawn(
-            Mode::Foreground,
-            &["run", "-it", "--rootfs", &path, "sh", "-c", "tty"],
-        );
+        let job = spawn_container_run(shell, Mode::Foreground, &["-it", "--rm"], "tty");
         shell.wait(job);
     });
     session.job();
@@ -2222,7 +2428,7 @@ fn with_t_stty_size_follows_the_window() {
         let job = shell.spawn(
             Mode::Foreground,
             &[
-                "run",
+                "run", "--no-image",
                 "-it",
                 "sh",
                 "-c",
@@ -2262,6 +2468,7 @@ fn with_it_ctrl_c_reaches_the_inner_job_only() {
             &[
                 "--debug",
                 "run",
+                "--no-image",
                 "-it",
                 "sh",
                 "-c",
@@ -2322,7 +2529,14 @@ fn the_terminal_is_restored_after_kill_9_of_the_command() {
         let before = shell.terminal_settings();
         let job = shell.spawn(
             Mode::Foreground,
-            &["run", "-it", "sh", "-c", "echo re\"\"ady; kill -9 $$"],
+            &[
+                "run",
+                "--no-image",
+                "-it",
+                "sh",
+                "-c",
+                "echo re\"\"ady; kill -9 $$",
+            ],
         );
         shell.wait(job);
         shell.report_settings(&before);
@@ -2340,7 +2554,7 @@ fn the_terminal_is_restored_after_kill_9_of_the_command() {
 fn the_terminal_is_restored_while_shipyard_is_stopped() {
     let mut session = session(|shell| {
         let before = shell.terminal_settings();
-        let job = shell.spawn(Mode::Foreground, &["run", "-it", "sh"]);
+        let job = shell.spawn(Mode::Foreground, &["run", "--no-image", "-it", "sh"]);
         shell.wait(job);
         shell.report_settings(&before);
         shell.await_go();
@@ -2385,7 +2599,14 @@ fn with_it_in_the_background_waits_for_fg() {
     let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Background,
-            &["run", "-it", "sh", "-c", "echo started-\"\"ok"],
+            &[
+                "run",
+                "--no-image",
+                "-it",
+                "sh",
+                "-c",
+                "echo started-\"\"ok",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -2407,7 +2628,7 @@ fn with_it_in_the_background_ignoring_sigttou_leaves_the_terminal_alone() {
     let mut session = session(|shell| {
         let before = shell.terminal_settings();
         let script = format!(
-            "trap '' TTOU; exec {} run -it sh -c 'echo ran-an\"\"yway'",
+            "trap '' TTOU; exec {} run --no-image -it sh -c 'echo ran-an\"\"yway'",
             SHIPYARD.path()
         );
         let job = shell.spawn_program(Mode::Background, "/bin/sh", &["-c", &script]);
@@ -2427,7 +2648,16 @@ fn kill_of_a_run_waiting_for_the_terminal_ends_it() {
     let mut session = session(|shell| {
         let job = shell.spawn(
             Mode::Background,
-            &["run", "-it", "--stop-timeout", "1", "sh", "-c", "sleep 100"],
+            &[
+                "run",
+                "--no-image",
+                "-it",
+                "--stop-timeout",
+                "1",
+                "sh",
+                "-c",
+                "sleep 100",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -2458,7 +2688,16 @@ fn a_background_run_whose_container_dies_doesnt_wait_for_fg() {
         // No network: no pasta, so the init is Shipyard's only child.
         let job = shell.spawn(
             Mode::Background,
-            &["run", "-it", "--network", "none", "sh", "-c", "sleep 100"],
+            &[
+                "run",
+                "--no-image",
+                "-it",
+                "--network",
+                "none",
+                "sh",
+                "-c",
+                "sleep 100",
+            ],
         );
         shell.wait(job);
         shell.await_go();
@@ -2492,7 +2731,7 @@ fn a_raw_run_continued_in_the_background_leaves_the_terminal_alone() {
     let mut session = session(|shell| {
         let before = shell.terminal_settings();
         let script = format!(
-            "trap '' TTOU TTIN; exec {} run -it sh -c 'echo re\"\"ady; sleep 3'",
+            "trap '' TTOU TTIN; exec {} run --no-image -it sh -c 'echo re\"\"ady; sleep 3'",
             SHIPYARD.path()
         );
         let job = shell.spawn_program(Mode::Foreground, "/bin/sh", &["-c", &script]);
@@ -2567,7 +2806,10 @@ const HUP_DEAF: &str = "trap '' HUP; echo re\"\"ady; while read x; do :; done; e
 /// terminal, rather than waiting on one nobody can type on.
 fn with_t_hangup_ends_the_input_of_a_command_ignoring_it() {
     let mut session = session(|shell| {
-        let job = shell.spawn(Mode::Foreground, &["run", "-it", "sh", "-c", HUP_DEAF]);
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["run", "--no-image", "-it", "sh", "-c", HUP_DEAF],
+        );
         shell.wait(job);
     });
     session.job();
@@ -2708,7 +2950,10 @@ fn the_terminal_survives_stops_around_the_end_of_runs() {
     let mut session = session(|shell| {
         let before = shell.terminal_settings();
         for _ in 0..RUNS {
-            let job = shell.spawn(Mode::Foreground, &["run", "-it", "sh", "-c", "sleep 0.05"]);
+            let job = shell.spawn(
+                Mode::Foreground,
+                &["run", "--no-image", "-it", "sh", "-c", "sleep 0.05"],
+            );
             while let Status::Stopped(_) = shell.wait(job) {
                 shell.await_go();
                 shell.fg(job);
@@ -2737,4 +2982,265 @@ fn the_terminal_survives_stops_around_the_end_of_runs() {
     }
     session.expect("settings unchanged");
     session.finish();
+}
+
+// --- `-t` runs as containers (stage 9, step 9.4c3b) ---
+
+/// `run -it` of a container: what's typed reaches it in raw mode (Ctrl-C a
+/// byte its shell's terminal makes SIGINT of), its terminal follows the
+/// window, and Ctrl-P Ctrl-Q detaches (exit 0, the terminal as it was):
+/// it runs on, `attach` gets it back, and its exit code is attach's.
+fn a_terminal_container_run_is_raw_and_detaches() {
+    let stores = ContainerStores::new("tty-run");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let job = spawn_container_run(
+            shell,
+            Mode::Foreground,
+            &["-it", "--name", "tty-run"],
+            "trap 'echo caught-int' INT; echo re\"\"ady; \
+             while :; do read line; case $line in exit*) exit 3;; esac; \
+             echo got-$line; stty size; done",
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+        shell.await_go();
+        let args = through_env(&["attach", "tty-run"]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let job = shell.spawn_program(Mode::Foreground, "/usr/bin/env", &args);
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("ready");
+    session.type_keys(b"one\r");
+    session.expect("got-one");
+    session.resize(33, 99);
+    session.type_keys(b"two\r");
+    session.expect("got-two");
+    session.expect("33 99");
+    session.type_keys(CTRL_C);
+    session.expect("caught-int");
+    session.type_keys(b"\x10\x11");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.go();
+    session.job();
+    session.type_keys(b"three\r");
+    session.expect("got-three");
+    session.type_keys(b"exit\r");
+    assert_eq!(
+        session.status(),
+        Status::Exited(3),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+    stores.ok(&["rm", "-f", "tty-run"]);
+}
+
+/// `run -it … &`: stopped (SIGTTOU) before it sets the terminal raw from
+/// the background, as the in-process run is; raw once `fg` resumes it (its
+/// detach keys work: the line discipline would keep Ctrl-Q otherwise).
+fn a_terminal_container_run_started_in_the_background_waits_for_fg() {
+    let stores = ContainerStores::new("tty-bg");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let job = spawn_container_run(
+            shell,
+            Mode::Background,
+            &["-it", "--name", "tty-bg"],
+            "echo started-\"\"ok; exec sleep 30",
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    session.job();
+    assert_eq!(
+        session.status(),
+        Status::Stopped(libc::SIGTTOU),
+        "{}",
+        session.transcript()
+    );
+    session.go();
+    session.expect("started-ok");
+    session.type_keys(b"\x10\x11");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+    stores.ok(&["rm", "-f", "tty-bg"]);
+}
+
+/// Stopped from outside (`kill -TSTP`: Ctrl-Z is the container's in raw
+/// mode), the run puts the terminal back for the shell; `fg` sets it raw
+/// again, and the container's shell is still there (it waited).
+fn a_stopped_terminal_container_run_puts_the_terminal_back() {
+    let _stores = ContainerStores::new("tty-tstp");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let job = spawn_container_run(
+            shell,
+            Mode::Foreground,
+            &["-it", "--rm"],
+            "echo re\"\"ady; read x; echo got-$x; exit 4",
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    let shipyard = session.job();
+    session.expect("ready");
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    unsafe { libc::kill(shipyard, libc::SIGTSTP) };
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTSTP));
+    session.expect("settings unchanged");
+    session.go();
+    session.type_keys(b"x\r");
+    session.expect("got-x");
+    assert_eq!(
+        session.status(),
+        Status::Exited(4),
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+}
+
+/// The user's terminal hangs up: the run passes SIGHUP on (`--sig-proxy`),
+/// the container's shell ends of it, and the run ends 129.
+fn a_hangup_ends_a_terminal_container_run() {
+    let _stores = ContainerStores::new("tty-hup");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let job = spawn_container_run(
+            shell,
+            Mode::Foreground,
+            &["-it", "--rm"],
+            "echo re\"\"ady; exec sleep 100",
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("ready");
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(killed_by(libc::SIGHUP)));
+    session.finish();
+}
+
+/// `-t` without `-i`, its output piped: the container has a terminal of its
+/// own, nothing is read from the user's (which stays as it was), and its
+/// exit code is the run's.
+fn a_terminal_container_run_without_input_is_output_only() {
+    let _stores = ContainerStores::new("tty-out");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let run = container_run_args(&["-t", "--rm"], "tty; echo out-\"\"put; exit 7");
+        // Its exit code through the pipe (`pipefail`: cat's is 0).
+        let piped = [
+            "-c",
+            "set -o pipefail; \"$@\" | cat",
+            "bash",
+            "/usr/bin/env",
+        ];
+        let args: Vec<&str> = piped
+            .into_iter()
+            .chain(run.iter().map(String::as_str))
+            .collect();
+        let job = shell.spawn_program(Mode::Foreground, "/bin/bash", &args);
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    session.job();
+    session.expect("/dev/pts/0");
+    session.expect("out-put");
+    assert_eq!(
+        session.status(),
+        Status::Exited(7),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    session.finish();
+}
+
+/// `run -it … &`, then `bg` (it goes on in the background, cooked), then
+/// `fg`: raw again without a line typed first (its detach keys work: the
+/// line discipline would keep Ctrl-Q otherwise).
+fn a_terminal_container_run_brought_back_after_bg_goes_raw() {
+    let stores = ContainerStores::new("tty-bg-fg");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let job = spawn_container_run(
+            shell,
+            Mode::Background,
+            &["-it", "--name", "tty-bg-fg"],
+            "echo started-\"\"ok; exec sleep 30",
+        );
+        shell.wait(job);
+        shell.await_go();
+        shell.bg(job);
+        shell.await_go();
+        shell.fg(job);
+        shell.wait(job);
+    });
+    session.job();
+    assert_eq!(session.status(), Status::Stopped(libc::SIGTTOU));
+    session.go();
+    session.expect("started-ok");
+    session.go();
+    // Raw within a quarter of a second of `fg`.
+    session.settle(std::time::Duration::from_millis(600));
+    session.type_keys(b"\x10\x11");
+    assert_eq!(
+        session.status(),
+        Status::Exited(0),
+        "{}",
+        session.transcript()
+    );
+    session.finish();
+    stores.ok(&["rm", "-f", "tty-bg-fg"]);
+}
+
+/// A container that ignores SIGHUP: when the user's terminal hangs up, the
+/// run ends at once (129, as from the hang-up), and the container runs on,
+/// as after a detach (Docker's), for `attach` to reach.
+fn a_hangup_leaves_a_container_ignoring_it_running() {
+    let stores = ContainerStores::new("tty-hup-deaf");
+    let _root = rootfs();
+    let mut session = session(|shell| {
+        let job = spawn_container_run(
+            shell,
+            Mode::Foreground,
+            &["-it", "--name", "tty-hup-deaf"],
+            HUP_DEAF,
+        );
+        shell.wait(job);
+    });
+    session.job();
+    session.expect("ready");
+    let hung_up = std::time::Instant::now();
+    session.hang_up();
+    assert_eq!(session.status(), Status::Exited(killed_by(libc::SIGHUP)));
+    assert!(hung_up.elapsed() < std::time::Duration::from_secs(3));
+    session.finish();
+    let running = stores.ok(&["ps"]);
+    assert!(running.contains("tty-hup-deaf"), "{running}");
+    stores.ok(&["rm", "-f", "tty-hup-deaf"]);
 }

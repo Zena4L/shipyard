@@ -102,6 +102,17 @@ pub enum Protocol {
     Udp,
 }
 
+impl Protocol {
+    /// Its name: `tcp`, `udp`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
 /// A socket's state: the kernel's TCP states (UDP uses `Established` for a
 /// connected socket, and `Close` for one that isn't).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -177,6 +188,28 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Its state as `ss` says it: `LISTEN`, `ESTAB`, `TIME-WAIT`, …; a UDP
+    /// socket's `UNCONN` or `ESTAB`.
+    #[must_use]
+    pub fn state_word(&self) -> &'static str {
+        match self.state {
+            State::Established => "ESTAB",
+            State::SynSent => "SYN-SENT",
+            State::SynRecv | State::NewSynRecv => "SYN-RECV",
+            State::FinWait1 => "FIN-WAIT-1",
+            State::FinWait2 => "FIN-WAIT-2",
+            State::TimeWait => "TIME-WAIT",
+            // As `ss` says it, for TCP too: a socket made, not yet
+            // listening or connected (or past its end).
+            State::Close => "UNCONN",
+            State::CloseWait => "CLOSE-WAIT",
+            State::LastAck => "LAST-ACK",
+            State::Listen => "LISTEN",
+            State::Closing => "CLOSING",
+            State::Other(_) => "UNKNOWN",
+        }
+    }
+
     /// Whether it waits for others: a TCP socket listening, or a UDP one
     /// bound and not connected. (A UDP client that only sends, unconnected,
     /// has a port of its own too, and looks the same: the tables can't
@@ -610,6 +643,32 @@ mod tests {
         );
         let listening: Vec<bool> = sockets.iter().map(Socket::is_listening).collect();
         assert_eq!(listening, [true, false]);
+        let words: Vec<&str> = sockets.iter().map(Socket::state_word).collect();
+        assert_eq!(words, ["UNCONN", "ESTAB"]);
+    }
+
+    #[test]
+    fn states_are_said_as_ss_says_them() {
+        let socket = |protocol, state| Socket {
+            protocol,
+            local: "10.0.0.2:80".parse().unwrap(),
+            remote: "0.0.0.0:0".parse().unwrap(),
+            state,
+            uid: 0,
+            inode: 1,
+        };
+        for (protocol, state, word) in [
+            (Protocol::Tcp, State::Listen, "LISTEN"),
+            (Protocol::Tcp, State::Established, "ESTAB"),
+            (Protocol::Tcp, State::TimeWait, "TIME-WAIT"),
+            (Protocol::Tcp, State::NewSynRecv, "SYN-RECV"),
+            // Made, neither listening nor connected: as UDP's.
+            (Protocol::Tcp, State::Close, "UNCONN"),
+            (Protocol::Udp, State::Close, "UNCONN"),
+            (Protocol::Tcp, State::Other(99), "UNKNOWN"),
+        ] {
+            assert_eq!(socket(protocol, state).state_word(), word, "{state:?}");
+        }
     }
 
     #[test]

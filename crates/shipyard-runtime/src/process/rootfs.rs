@@ -85,8 +85,40 @@ pub(crate) const DEV_ENTRIES: [&str; 15] = [
     "/dev/mqueue",
 ];
 
+/// Whether a mount at `destination` (as written) that resolved to
+/// `target_place` was steered by a symlink into one of the standard mounts'
+/// places in the root (at `root_place`): `/proc`, `/sys`, `/dev`, or one
+/// nested in them (`/dev/pts`, `/sys/fs/cgroup`, …). Its place is in one
+/// (or is one) and its destination, as written, isn't. Those are the
+/// kernel's interfaces, or the standard mounts', made before or after: one
+/// led there would land on them, or be hidden by them (F36). So
+/// `/dev/ptmx`, which Shipyard links into `pts`, is refused as a mount's
+/// destination, but `/dev/pts/x`, written there, isn't.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "mounts are made on Linux")
+)]
+pub(crate) fn steered(
+    root_place: &std::path::Path,
+    target_place: &std::path::Path,
+    destination: &std::path::Path,
+) -> bool {
+    let Ok(inside) = target_place.strip_prefix(root_place) else {
+        // Not under the root at all: it can't be told where it is.
+        return true;
+    };
+    let written = destination.strip_prefix("/").unwrap_or(destination);
+    crate::isolation::StandardMount::ORDER
+        .into_iter()
+        .map(|standard| {
+            let place = standard.destination();
+            place.strip_prefix('/').unwrap_or(place)
+        })
+        .any(|standard| inside.starts_with(standard) && !written.starts_with(standard))
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) use linux::enter;
+pub(crate) use linux::{enter, view};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -155,31 +187,10 @@ mod linux {
         // Device nodes and directories get exactly the modes given here.
         // Whatever runs in between (hooks), and after, gets the umask back.
         let umask_before = umask(Mode::empty());
-        // The bind sources, cloned before anything is mounted over the host's
-        // paths (see `staging`), where the root needs it.
-        let mut cloned: Vec<Option<ClonedSource>> = Vec::new();
-        let root_fd = if let Some(mounted) = root.attach() {
-            // Made by real root (`--uidmap`: the container's own root can't
-            // reach the image store, nor the directory it's for): attached in
-            // this mount namespace where the container's root can reach, a
-            // private staging tmpfs; the mount's descriptor is the root's.
-            // SAFETY: inherited across the exec for this; owned by nothing
-            // else here.
-            let mounted = unsafe { OwnedFd::from_raw_fd(mounted) };
-            cloned = clone_sources(root)?;
-            let fail = |errno| Failure::at(ChildStep::AttachOverlay, errno);
-            let on = staging().map_err(fail)?;
-            overlay::attach(&mounted, on.as_fd()).map_err(fail)?;
-            mounted
-        } else {
-            // An image root: mounted here, inside the container's namespaces,
-            // so a rootless overlay mount lands in the user namespace where
-            // the kernel allows it.
-            if let Some((lower, upper, work, userxattr)) = root.overlay() {
-                mount_overlay(root.path(), &lower, upper, work, userxattr)?;
-            }
-            bind_root(root.path())?
-        };
+        let (root_fd, cloned) = mount_root(root)?;
+        // Where the root is, for where each mount lands (read once, when a
+        // mount needs it).
+        let mut root_place = None;
         // In the order given: a config's listed order (the spec's "MUST"),
         // the standard ones it doesn't list first (`Root::mount_order`).
         for step in &root.order {
@@ -194,7 +205,14 @@ mod linux {
                     ) else {
                         continue;
                     };
-                    add_mount(&root_fd, mount, source)
+                    let root_place = match &root_place {
+                        Some(place) => place,
+                        None => root_place.insert(
+                            place(&root_fd)
+                                .map_err(|errno| Failure::at(ChildStep::MountTarget, errno))?,
+                        ),
+                    };
+                    add_mount(&root_fd, root_place, mount, source)
                         .map_err(|(step, errno)| Failure::at(step, errno).detail(index))?;
                 }
             }
@@ -267,6 +285,89 @@ mod linux {
             OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
+    }
+
+    /// The root filesystem `root` describes, mounted: its overlay (or the
+    /// one real root made, attached) bound onto itself. Its directory, and
+    /// its bind sources cloned where that's needed (an attached overlay's:
+    /// its staging hides the host's `/tmp`), for [`add_mount`].
+    fn mount_root(root: &RootSetup) -> Step<(OwnedFd, Vec<Option<ClonedSource>>)> {
+        // The bind sources, cloned before anything is mounted over the host's
+        // paths (see `staging`), where the root needs it.
+        let mut cloned: Vec<Option<ClonedSource>> = Vec::new();
+        let root_fd = if let Some(mounted) = root.attach() {
+            // Made by real root (`--uidmap`: the container's own root can't
+            // reach the image store, nor the directory it's for): attached in
+            // this mount namespace where the container's root can reach, a
+            // private staging tmpfs; the mount's descriptor is the root's.
+            // SAFETY: inherited across the exec for this; owned by nothing
+            // else here.
+            let mounted = unsafe { OwnedFd::from_raw_fd(mounted) };
+            cloned = clone_sources(root)?;
+            let fail = |errno| Failure::at(ChildStep::AttachOverlay, errno);
+            let on = staging().map_err(fail)?;
+            overlay::attach(&mounted, on.as_fd()).map_err(fail)?;
+            mounted
+        } else {
+            // An image root: mounted here, inside the container's namespaces,
+            // so a rootless overlay mount lands in the user namespace where
+            // the kernel allows it.
+            if let Some((lower, upper, work, userxattr)) = root.overlay() {
+                mount_overlay(root.path(), &lower, upper, work, userxattr)?;
+            }
+            bind_root(root.path())?
+        };
+        Ok((root_fd, cloned))
+    }
+
+    /// The root filesystem `root` describes, as a start mounts it, for a
+    /// helper reaching a stopped container's files (stage 9, step 9.4c2):
+    /// its overlay (or the one real root made, attached), bound onto itself,
+    /// and its binds (volumes) at their destinations, in their order. Not
+    /// what only a running container has: no `/proc`, `/dev`, `/sys`, tmpfs
+    /// mounts, devices or masks, and no pivot. Read-only if the container's
+    /// root is (`--read-only`). Returns the root's directory.
+    ///
+    /// Runs in a mount namespace of the caller's own, made private: every
+    /// mount goes with it.
+    ///
+    /// # Errors
+    ///
+    /// What it was doing, and why it failed.
+    pub(crate) fn view(root: &RootSetup) -> Result<OwnedFd, (String, Errno)> {
+        let (root_fd, cloned) = mount_root(root)
+            .map_err(|failure| ("mounting the container's root".to_owned(), failure.errno()))?;
+        let root_place =
+            place(&root_fd).map_err(|errno| ("finding the container's root".to_owned(), errno))?;
+        for step in &root.order {
+            let MountStep::Mount(index) = *step else {
+                continue;
+            };
+            // A bind (a volume, a host directory); a tmpfs is a running
+            // container's only (Docker's `cp` leaves them out too).
+            let Some(mount) = root
+                .mounts
+                .get(index)
+                .filter(|mount| mount.source().is_some())
+            else {
+                continue;
+            };
+            add_mount(
+                &root_fd,
+                &root_place,
+                mount,
+                cloned.get(index).and_then(Option::as_ref),
+            )
+            .map_err(|(_, errno)| (format!("mounting {}", mount.destination().display()), errno))?;
+        }
+        if root.read_only {
+            // As its start leaves it: the root read-only, its volumes as
+            // they are (mounts of their own).
+            let path = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
+            remount(&path, MsFlags::MS_RDONLY)
+                .map_err(|errno| ("making the container's root read-only".to_owned(), errno))?;
+        }
+        Ok(root_fd)
     }
 
     /// A bind mount's source, cloned as a detached mount tree
@@ -355,6 +456,13 @@ mod linux {
     /// whose options are at most a page: the paths are made relative to
     /// the directory they share to fit more, and an image with more layers
     /// than fit is refused (`E2BIG`, the detail its layer count).
+    ///
+    /// Always `index=off` (a container's own upper layer is mounted again
+    /// at each start, over layers that may have been extracted again since:
+    /// with overlay's index on, a kernel's default on some, that mount would
+    /// fail). And a root overlay mounted read-only (its kernel's quiet
+    /// fallback when the work directory can't be used) is refused (`EROFS`):
+    /// what the container writes would be lost.
     fn mount_overlay(
         merged: &Path,
         lower: &[&Path],
@@ -369,7 +477,16 @@ mod linux {
                 0
             };
             Failure::at(ChildStep::MountOverlay, errno).detail(detail)
-        })
+        })?;
+        let read_only = nix::sys::statvfs::statvfs(merged).is_ok_and(|stats| {
+            stats
+                .flags()
+                .contains(nix::sys::statvfs::FsFlags::ST_RDONLY)
+        });
+        if read_only {
+            return Err(Failure::at(ChildStep::MountOverlay, Errno::EROFS));
+        }
+        Ok(())
     }
 
     /// One of the mounts Shipyard makes in every container, with its own
@@ -679,6 +796,7 @@ mod linux {
     /// at its destination resolved inside the root (made if missing).
     fn add_mount(
         root: &OwnedFd,
+        root_place: &Path,
         entry: &MountSetup,
         cloned: Option<&ClonedSource>,
     ) -> Result<(), (ChildStep, Errno)> {
@@ -694,6 +812,14 @@ mod linux {
         // symlink in the root filesystem can still lead there: what counts
         // is where the target is (runc's CVE-2019-19921).
         if on_kernel_interface(&target, entry.destination()) {
+            return Err((ChildStep::MountTarget, Errno::EXDEV));
+        }
+        // Nor, by its place, into the root's `/proc`, `/sys` or `/dev` when
+        // it isn't written there: one of those may not be mounted yet (a
+        // config can list them after), or be a tmpfs, which the type
+        // doesn't tell (F36).
+        let target_place = place(&target).map_err(|errno| (ChildStep::MountTarget, errno))?;
+        if super::steered(root_place, &target_place, entry.destination()) {
             return Err((ChildStep::MountTarget, Errno::EXDEV));
         }
         let restrictions = entry.restrictions()
@@ -957,6 +1083,12 @@ mod linux {
         }
     }
 
+    /// Where what's open at `fd` is: the kernel's own path to it, read from
+    /// its `/proc/self/fd` link (the host's `/proc`, before the pivot).
+    fn place(fd: &OwnedFd) -> nix::Result<PathBuf> {
+        nix::fcntl::readlink(&fd_path(fd)).map(PathBuf::from)
+    }
+
     /// `/proc/self/fd/N`: what's open at `fd`, as a path.
     fn fd_path(fd: &OwnedFd) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
@@ -1128,6 +1260,49 @@ mod linux {
     }
 }
 
+#[cfg(test)]
+mod place_tests {
+    use std::path::Path;
+
+    use super::steered;
+
+    /// Refused where a symlink led a mount into `/proc`, `/sys` or `/dev`;
+    /// fine where it's written there, or elsewhere.
+    #[test]
+    fn a_mount_steered_into_a_standard_directory_is_told() {
+        let root = Path::new("/run/shipyard/x/root");
+        let at = |inside: &str| root.join(inside);
+        for (place, destination, refused) in [
+            ("sys/x", "/s/x", true),
+            ("sys", "/s", true),
+            ("proc/sys", "/data", true),
+            ("dev/x", "/d/x", true),
+            ("dev/shm", "/dev/shm", false),
+            ("dev/x", "/dev/x", false),
+            ("data", "/data", false),
+            ("etc", "/evil", false),
+            // A component, not a prefix of the name.
+            ("sysx", "/s", false),
+            ("devices", "/d", false),
+            ("", "/", false),
+            // Nested standard mounts: Shipyard's `/dev/ptmx` leads into
+            // `pts`; written there, a mount is the caller's.
+            ("dev/pts/ptmx", "/dev/ptmx", true),
+            ("dev/shm/x", "/dev/foo", true),
+            ("dev/pts/x", "/dev/pts/x", false),
+            ("sys/fs/cgroup/x", "/c/x", true),
+        ] {
+            assert_eq!(
+                steered(root, &at(place), Path::new(destination)),
+                refused,
+                "{destination} at {place}"
+            );
+        }
+        // Outside the root: it can't be told, so it's refused.
+        assert!(steered(root, Path::new("/etc"), Path::new("/etc")));
+    }
+}
+
 /// Mounting an image's overlay, by the new mount API or the old one.
 #[cfg(target_os = "linux")]
 pub(crate) mod overlay {
@@ -1259,6 +1434,7 @@ pub(crate) mod overlay {
         }
         set_dir(c"upperdir", upper)?;
         set_dir(c"workdir", work)?;
+        set_string(&fs, c"index", b"off").map_err(unsupported)?;
         if userxattr {
             fsconfig(&fs, FSCONFIG_SET_FLAG, Some(c"userxattr"), None).map_err(unsupported)?;
         }
@@ -1385,6 +1561,7 @@ pub(crate) mod overlay {
         options.push(relative(upper));
         options.push(",workdir=");
         options.push(relative(work));
+        options.push(",index=off");
         if userxattr {
             options.push(",userxattr");
         }
@@ -1482,7 +1659,7 @@ pub(crate) mod overlay {
                 "top first: {text}"
             );
             assert!(text.ends_with(
-                ",upperdir=containers/run-1/upper,workdir=containers/run-1/work,userxattr"
+                ",upperdir=containers/run-1/upper,workdir=containers/run-1/work,index=off,userxattr"
             ));
             // About 55 such layers fit in a page; 100 don't.
             let many: Vec<PathBuf> = (0..100)

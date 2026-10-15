@@ -40,7 +40,7 @@ mod spoofing;
 
 pub use decode::{Chain, FIREWALLD, Rule, Verdict};
 pub use objects::Element;
-pub use ruleset::{ClosedRouting, NetworkRules, PortRule, TABLE};
+pub use ruleset::{CONNTRACK_LIMIT, ClosedRouting, NetworkRules, PortRule, TABLE};
 pub use spoofing::PortGuard;
 
 #[cfg(target_os = "linux")]
@@ -55,6 +55,10 @@ pub enum Ruleset {
     Outdated,
     /// It's this version's.
     Current,
+    /// It's a newer Shipyard's (a higher version: another install of it, on
+    /// this host): never rebuilt by this one, which would take away what
+    /// that one added (an isolated network's rules, say).
+    Newer,
 }
 
 impl Ruleset {
@@ -79,14 +83,25 @@ impl Ruleset {
     }
 
     /// Current only with `version` as its user data and all `expected`
-    /// rules.
+    /// rules; newer with a higher number after the same words.
     fn of_table(userdata: &[u8], rules: usize, version: &[u8], expected: usize) -> Ruleset {
         if userdata == version && rules == expected {
-            Ruleset::Current
-        } else {
-            Ruleset::Outdated
+            return Ruleset::Current;
+        }
+        match (numbered(userdata), numbered(version)) {
+            (Some((words, number)), Some((ours, mine))) if words == ours && number > mine => {
+                Ruleset::Newer
+            }
+            _ => Ruleset::Outdated,
         }
     }
+}
+
+/// A version's words, and the number they end with (`shipyard ruleset 8`).
+fn numbered(version: &[u8]) -> Option<(&[u8], u32)> {
+    let text = std::str::from_utf8(version).ok()?;
+    let (words, number) = text.rsplit_once(' ')?;
+    Some((words.as_bytes(), number.parse().ok()?))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -107,6 +122,9 @@ mod tests {
         assert_eq!(Ruleset::of(ruleset::VERSION, 0), Ruleset::Outdated);
         assert_eq!(Ruleset::of(ruleset::VERSION, all - 1), Ruleset::Outdated);
         assert_eq!(Ruleset::of(b"", all), Ruleset::Outdated);
+        // A newer Shipyard's: left alone, whatever its rules.
+        assert_eq!(Ruleset::of(b"shipyard ruleset 99", 3), Ruleset::Newer);
+        assert_eq!(Ruleset::of(b"shipyard rules 99", all), Ruleset::Outdated);
         // The bridge table's version is its own.
         let bridge = super::spoofing::rules().len();
         assert_eq!(

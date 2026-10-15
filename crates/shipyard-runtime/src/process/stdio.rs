@@ -151,12 +151,34 @@ pub(crate) enum ChildTerminal {
     Slave(RawFd),
     /// A socket for the process that makes the pseudo-terminal inside the
     /// container (the init, or `exec`'s joiner) to send the master back on,
-    /// `size` big: to shipyard's relay, or to an OCI console socket's
-    /// caller.
+    /// `size` big, to shipyard's relay: which answers once it has it.
     Socket {
         fd: RawFd,
         size: super::terminal::Size,
     },
+    /// The same, to a socket nothing answers on (runc's protocol): an OCI
+    /// console socket's caller (`--console-socket`), or the monitor's own
+    /// capture of a container's terminal.
+    Console {
+        fd: RawFd,
+        size: super::terminal::Size,
+    },
+}
+
+impl ChildTerminal {
+    /// Where the master is sent, how big, and whether an answer comes:
+    /// `None` for a slave made here.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "the init and the joiner are Linux's")
+    )]
+    pub(crate) fn socket(self) -> Option<(RawFd, super::terminal::Size, bool)> {
+        match self {
+            Self::Socket { fd, size } => Some((fd, size, true)),
+            Self::Console { fd, size } => Some((fd, size, false)),
+            Self::Slave(_) => None,
+        }
+    }
 }
 
 impl ChildEnds {
@@ -465,7 +487,7 @@ impl Direction {
             Host::To if tostop(fd) => libc::SIGTTOU,
             Host::To => return None,
         };
-        stops(signal).then_some(signal)
+        super::terminal::stops(signal).then_some(signal)
     }
 
     /// Whether this direction has something it would do with the host's
@@ -650,7 +672,7 @@ impl PtyRelay {
             && self.raw.is_none()
             && matches!(self.state, PtyState::Arrived { .. })
             && !super::terminal::in_foreground(libc::STDIN_FILENO)
-            && stops(libc::SIGTTOU)
+            && super::terminal::stops(libc::SIGTTOU)
     }
 }
 
@@ -743,7 +765,7 @@ impl Relay {
                 // `fg` (see `stop_needed`), and this is tried again then;
                 // unless SIGTTOU wouldn't stop it (ignored or blocked): then
                 // without raw mode or input.
-                Ok(None) if !stops(libc::SIGTTOU) => pty.request = Pty::default(),
+                Ok(None) if !super::terminal::stops(libc::SIGTTOU) => pty.request = Pty::default(),
                 Ok(None) => return,
                 Err(errno) => {
                     tracing::debug!(%errno, "the terminal can't go raw; relaying it as it is");
@@ -973,18 +995,4 @@ fn tostop(fd: BorrowedFd<'_>) -> bool {
     // SAFETY: `tcgetattr` succeeded, so it filled the structure in.
     let termios = unsafe { termios.assume_init() };
     termios.c_lflag & libc::TOSTOP != 0
-}
-
-/// Whether `signal` (SIGTTIN or SIGTTOU: Shipyard never catches those;
-/// only SIGTSTP, in raw mode) would stop this process now: its default
-/// action, and not blocked.
-fn stops(signal: libc::c_int) -> bool {
-    if super::terminal::current_action(signal)
-        .is_none_or(|action| action.sa_sigaction != libc::SIG_DFL)
-    {
-        return false;
-    }
-    nix::sys::signal::SigSet::thread_get_mask().is_ok_and(|mask| {
-        nix::sys::signal::Signal::try_from(signal).is_ok_and(|signal| !mask.contains(signal))
-    })
 }

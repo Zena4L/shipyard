@@ -51,9 +51,14 @@ parent cgroup ran out of memory)" if it never reached its own limit); one ended 
 `kill … KILL` or `delete` doesn't, though the OOM killer struck one of its processes
 before.
 
-**A rootless container lives below your systemd user manager** (`user@UID.service`), so
-it ends when that does: at your last logout, unless lingering keeps it running
-(`loginctl enable-linger`). `delete` still works afterwards, and from any of your
+**A rootless container's monitor stays where its maker ran**: in your login session's
+scope (an SSH login), or below your systemd user manager (`user@UID.service`, under
+`systemd-run --user --scope`). Made in a login session, at logout it runs on with
+logind's `KillUserProcesses=no` (as on Ubuntu 24.04): its monitor keeps your session
+from closing, and with it your user manager and `$XDG_RUNTIME_DIR`. With
+`KillUserProcesses=yes`, logind ends the session's processes at logout, the monitor
+among them (and its container with it). Made under your user manager, it lasts as
+long as that does: past your last logout only with linger (`loginctl enable-linger`). `delete` still works afterwards, and from any of your
 sessions, an SSH login included: the state records where its cgroup was.
 
 **A bundle without a `pid` namespace** needs that cgroup: without either, the runtime
@@ -67,7 +72,7 @@ in the container.
 
 | Command | What it does |
 |---|---|
-| `create [--bundle DIR] [--pid-file FILE] [--console-socket SOCKET] [--log-dir DIR [--log-max-size SIZE] [--log-max-files N] [--stdin [--stdin-once]]] [--preserve-fds N] ID` | Sets the container up from the bundle in DIR (default: the current directory) and stops just before its program runs. Returns once it's *created*. `--pid-file` writes the PID of its init (its PID 1, as seen from the host); if it can't be written, `create` fails and the container is removed. `--console-socket`: see [Terminals](#terminals); `--log-dir`: see [Logs](#logs). |
+| `create [--bundle DIR] [--pid-file FILE] [--console-socket SOCKET] [--log-dir DIR [--log-max-size SIZE] [--log-max-files N] [--stdin [--stdin-once]]] [--preserve-fds N] [--hold-fd N[=LABEL]]… [--exit-command PROGRAM [--exit-command-arg ARG]…] [--companion PROGRAM [--companion-arg ARG]…] ID` | Sets the container up from the bundle in DIR (default: the current directory) and stops just before its program runs. Returns once it's *created*. `--pid-file` writes the PID of its init (its PID 1, as seen from the host); if it can't be written, `create` fails and the container is removed. `--console-socket`: see [Terminals](#terminals); `--log-dir`: see [Logs](#logs); `--hold-fd`, `--exit-command` and `--companion`: see [Holds and an exit command](#holds-and-an-exit-command). |
 | `logs [--follow] [--tail N] [--since TIME] [--timestamps] ID` | Prints a container's logs (one created with `--log-dir`; see [Logs](#logs)). |
 | `attach [--detach-keys KEYS] [--no-stdin] ID` | Attaches to a container created with `--log-dir`: its output from now on, and your typing (see [Attach](#attach)). |
 | `exec [-d] [-t] [--console-socket SOCK] [-p FILE] [--cwd DIR] [-e K=V]… [-u UID[:GID]] [-g GID]… [-c CAP]… [--no-new-privs] [--pid-file FILE] ID [COMMAND…]` | Runs a command inside a *created* or *running* container, confined as its own process is (see [Exec](#exec)). |
@@ -118,6 +123,12 @@ create ──► created ──start──► running ──(it exits, or kill)�
 ```
 
 - **`status`** is one of `creating`, `created`, `running`, `paused` and `stopped`.
+  Between the container's program ending and its monitor having cleaned up (its cgroup
+  removed, its output written to the logs), usually a fraction of a second and a few
+  seconds at most, it's *stopping*: `state` says `stopped` (OCI's word for a container
+  whose process has exited), and the commands that need it running (`exec`, `cp`, `kill`,
+  `pause`, `resume`, `update`, `ps`, `events`) refuse it as stopping (`container ID is
+  stopping`). `delete` removes it at once, finishing the cleanup itself.
 - **`pid`** is the container's init, while it's created, running or paused. A PID the system
   has since given to another process is never reported as the container's: Shipyard
   checks that it's still the same process.
@@ -128,6 +139,10 @@ Shipyard has no daemon. `create` starts a small **monitor** process for the cont
 (`shipyard-monitor` in `ps -f`):
 
 - **It stays the container's parent** after `create` returns.
+- **It's nobody's child:** it's forked once more as it starts, so `create` leaves no
+  child behind (a program that creates containers and lives on, say an API server,
+  collects no zombie when a monitor ends). It's adopted by init, or by the nearest
+  subreaper (`systemd --user`, say).
 - **It records how the container ended,** for `state`.
 - **It takes the container down with it if it's killed.** So don't kill a monitor
   unless you mean to stop its container. (A process that escaped the container's
@@ -500,6 +515,80 @@ shipyard-runtime exec --preserve-fds 1 web ./reload 3<new.conf
 
   (`shipyard run` can be `ExecStart` itself: see [run](run.md).)
 
+## Holds and an exit command
+
+A caller that keeps resources for a container (a lock that says an address is taken,
+say) and goes away before the container does can hand them to the container's
+monitor, which holds them while the container lives, and then to a command of the
+caller's that cleans up after it, as Podman's conmon does:
+
+```sh
+shipyard-runtime create --hold-fd 9=lock:web --exit-command /usr/local/bin/cleanup \
+    --exit-command-arg web web 9<>/run/my/web.lock
+```
+
+- **`--hold-fd N[=LABEL]`** (repeatable): the monitor keeps descriptor N open from
+  `create` until the container has ended. LABEL names it (letters, digits, `:`, `_`,
+  `.` and `-`, at most 128; `fd-N` if not given): the exit command is told the labels,
+  and a hold can be let go of by its label while the container runs (below). Two
+  holds may share a label (two ports, say), but then neither can be let go of by it.
+  At most 2100, with labels of at most 96 KiB all told. The container never has it
+  (nor do its hooks). N
+  must be open, above 2, given once, and not one of those passed to the container
+  (`--preserve-fds`): "--hold-fd N: not a descriptor the monitor can hold". A lock
+  taken with `flock` stays held as long as the monitor has its copy, whatever the
+  caller does with its own, short of unlocking it: an unlock through any copy
+  releases it for all.
+- **`--exit-command PROGRAM`** (an absolute path), with `--exit-command-arg ARG` for
+  each argument: run once the container has ended and its end is recorded (`state`
+  says stopped), however it ended (`delete --force` too). It runs in a session of its
+  own, in `/`, with the caller's environment, its output discarded, the held
+  descriptors at 3, 4, … in the order given (`SHIPYARD_HOLDS` says how many,
+  `SHIPYARD_HOLD_LABELS` their labels, comma-separated, in the same order), and how
+  the container ended in `SHIPYARD_EXIT_RECORD` (the `exit` record's JSON); nothing
+  else is open. The monitor doesn't wait for it, and keeps its own copies of the held
+  descriptors until it has exited: what they keep alive (a `flock`'s lock) is free only
+  once both have closed them. `SHIPYARD_MONITOR_PID` gives the monitor's PID: while the
+  command's parent is that PID, the monitor is still there. It's kept in `state.json`
+  (`exit_command`), never taken from the bundle. It may find the container's state
+  gone (`delete --force` doesn't wait for it), and an ID may be reused meanwhile: it
+  shouldn't act on the container by its ID alone.
+- **An exit command that can't be started** (a missing program, say) fails silently:
+  the holds then close with the monitor.
+- **Without an exit command,** the holds are closed once the container has ended.
+- **A monitor that's killed** (SIGKILL) closes them at once, and no exit command
+  runs: a caller's own sweep must find what was left (a lock nobody holds).
+- **A `create` that fails** runs no exit command: the caller still has its own
+  copies.
+- **While the container runs** (with `--log-dir`: through its attach socket), a
+  program of the same user (or root) can give the monitor another descriptor to hold
+  (a file, a directory or a socket), or have it let go of one, by its label. It's
+  Shipyard's own extension of the attach protocol (version 3: a *holder*, which
+  passes the descriptor with `SCM_RIGHTS`), for Shipyard's engine, with no command of
+  its own here. One held since `create` reaches the exit command after those given at
+  `create`, with its label; one let go of doesn't. A label held already, more than 64
+  held, a descriptor of another kind (a pipe, a device), or a hold while the container
+  is starting or once it has begun to end, is refused.
+
+A caller can also give the monitor a **companion**: a program that runs beside the
+container for its whole life (Shipyard's engine runs a container's health checks so):
+
+```sh
+shipyard-runtime create --companion /usr/local/bin/checker --companion-arg web web
+```
+
+- **`--companion PROGRAM`** (an absolute path), with `--companion-arg ARG` for each
+  argument: started once the container is created (held at its gate: the program
+  waits for the start itself, if it must), in a session of its own, in `/`, with the
+  caller's environment, its output discarded, and none of the held descriptors.
+- Once the container's init has ended, **before its end is recorded**, the monitor
+  kills the companion's process group (SIGKILL: what it started in that group goes
+  with it) and reaps it. A monitor that's killed takes it too (its parent-death
+  signal is SIGKILL). What it started in a group of its own is its own to end: give
+  it a parent-death signal.
+- One that ends early, or can't be started, is left so: the container runs on.
+- It's kept in `state.json` (`companion`), never taken from the bundle.
+
 ## Copying files
 
 `cp` copies files into and out of a container that's *created*, *running* or *paused*,
@@ -568,14 +657,13 @@ tar -c data | shipyard-runtime cp - web:/srv         # in, from a tar stream on 
   the same safe extraction as an image's layers.
 - **Rootless:** the helper is root in your container's user namespace, so files owned
   by your subordinate IDs, which you can't read from the host, are copied too.
-- **Refused:** a *stopped* container (its files go with it until stage 9's state
-  keeps them), one with no mount namespace of its own (its files are the host's), and
-  copying between two containers.
+- **Refused:** a *stopped* container (`shipyard cp` copies from one, by its record:
+  see [Containers](containers.md#copying-files-cp)), one with no mount namespace of its
+  own (its files are the host's), and copying between two containers.
 - **Limits:** a directory of more than a million names, or a tree more than 256
   directories deep, is refused; files that are mostly holes (sparse) are copied whole;
   memory for what a copy keeps track of is capped at 1 GiB (some ten million entries).
-- **Not yet:** user names in `--archive` (owners are numbers), and copying from a
-  stopped container.
+- **Not yet:** user names in `--archive` (owners are numbers).
 
 ## The state directory
 
@@ -583,13 +671,22 @@ Each container has a directory `ROOT/ID` (only its owner can read it):
 
 | File | What it is |
 |---|---|
-| `state.json` | The bundle, the init's PID, the annotations, the cgroup, the hooks, and where the logs are (`--log-dir`). |
+| `state.json` | The bundle, the init's PID, the annotations, the cgroup, the hooks, where the logs are (`--log-dir`), the exit command (`--exit-command`) and the companion (`--companion`). It has a `version`. |
 | `exec.fifo` | Where `start` signals the waiting container; removed once started. |
 | `exec.started` | Made only for a bundle with `poststart` hooks: held open by the container until its command has started, so `start` runs them after that. |
-| `exit` | How the container ended, once it has. |
-| `killed` | Left by `kill` with SIGKILL, `kill --all` or `delete`: the container's end was theirs, not the out-of-memory killer's. |
+| `exit` | How the container ended, once it has: JSON with a `version`, a `description` (`exited (exit code 3)`), the `code`, what the out-of-memory killer did (`oom`) and when it ended (`finished`). |
+| `killed` | Left by `kill` with SIGKILL, `kill --all` or `delete`: the container's end was theirs, not the out-of-memory killer's. An empty marker: that it's there is all it says. |
 | `attach.sock` | Where `attach` connects (a container created with `--log-dir`). |
 | `exec.json` | The container's process as it was started: what `exec` starts from. |
+| `plan.json` | Only for a container created from a plan rather than a bundle (`create_planned`, as Shipyard's engine does: an image's overlay as its root, users by name): what it runs, checked as a bundle is. `state` then gives this directory as the bundle, and `exec` runs as the plan's user, its names looked up in the container's own `/etc/passwd` and `/etc/group`. Read only by the container's own monitor, so its version is never read across upgrades. |
+
+**Upgrading.** Every file here that holds data has a version (markers and sockets need
+none), and Shipyard reads the previous one:
+containers made by the previous version keep working after an upgrade, even while they
+run (their monitor is the previous version's, and writes what it always wrote). A file
+written by a newer Shipyard is refused (`state.json has version 2, which this Shipyard
+doesn't know`) rather than misread: an older Shipyard can't show or delete a container a newer one made
+(delete it with the newer one). It still finds the exit codes in the newer exit records.
 
 Commands on the same container take turns: each locks the directory while it reads
 and changes it. `create` holds the lock only while it fills the directory in, not while

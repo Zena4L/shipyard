@@ -4,9 +4,10 @@
  * even from a user namespace), how a veth pair reaches into a namespace, why
  * a netlink socket belongs to the namespace it was made in, which nf_tables
  * pieces the NAT and port rules use, conntrack's netlink interface, how long
- * a namespace lingers after its last process, and what the kernel's
- * extended ACK says. Each line of output answers one question;
- * docs/stages/07-networking.md records the results.
+ * a namespace lingers after its last process, what the kernel's
+ * extended ACK says, and (stage 9) the connection limit's pieces. Each line
+ * of output answers one question; docs/stages/07-networking.md records the
+ * results.
  *
  * Everything that changes networking happens in network namespaces the probe
  * makes and throws away: the host's (or the container's) interfaces, routes
@@ -351,6 +352,88 @@ static void rule_ct_status(struct msg *m) {
     expr_end(m);
 }
 
+/* N10: the connection limit (stage 9, step 9.7c2). A dynamic set (NFT_SET_EVAL,
+ * bounded) and a filter rule:
+ *   ip saddr → reg 1; dynset add @conns { reg 1 } with connlimit over 1; reject
+ * The connlimit is nested either as one expression (NFTA_DYNSET_EXPR) or as a
+ * list (NFTA_DYNSET_EXPRESSIONS, with NFT_DYNSET_F_EXPR, Linux 5.11): which
+ * forms does the kernel take? */
+static int nft_dynset_try(int fd, int list_form, int with_reject) {
+    struct batch b = {0};
+    struct msg body;
+    memset(&body, 0, sizeof body);
+    attr_str(&body, NFTA_TABLE_NAME, "probe");
+    batch_add(&b, NFT(NFT_MSG_NEWTABLE), NLM_F_CREATE, NFPROTO_INET, &body);
+
+    memset(&body, 0, sizeof body);
+    attr_str(&body, NFTA_SET_TABLE, "probe");
+    attr_str(&body, NFTA_SET_NAME, "conns");
+    attr_be32(&body, NFTA_SET_FLAGS, NFT_SET_EVAL);
+    attr_be32(&body, NFTA_SET_KEY_TYPE, 7 /* ipv4_addr */);
+    attr_be32(&body, NFTA_SET_KEY_LEN, 4);
+    nest(&body, NFTA_SET_DESC);
+    attr_be32(&body, NFTA_SET_DESC_SIZE, 65536);
+    end(&body);
+    attr_be32(&body, NFTA_SET_ID, 1);
+    batch_add(&b, NFT(NFT_MSG_NEWSET), NLM_F_CREATE, NFPROTO_INET, &body);
+
+    memset(&body, 0, sizeof body);
+    attr_str(&body, NFTA_CHAIN_TABLE, "probe");
+    attr_str(&body, NFTA_CHAIN_NAME, "c");
+    nest(&body, NFTA_CHAIN_HOOK);
+    attr_be32(&body, NFTA_HOOK_HOOKNUM, NF_INET_FORWARD);
+    attr_be32(&body, NFTA_HOOK_PRIORITY, 0);
+    end(&body);
+    attr_str(&body, NFTA_CHAIN_TYPE, "filter");
+    batch_add(&b, NFT(NFT_MSG_NEWCHAIN), NLM_F_CREATE, NFPROTO_INET, &body);
+
+    memset(&body, 0, sizeof body);
+    attr_str(&body, NFTA_RULE_TABLE, "probe");
+    attr_str(&body, NFTA_RULE_CHAIN, "c");
+    nest(&body, NFTA_RULE_EXPRESSIONS);
+    expr_begin(&body, "payload");
+    attr_be32(&body, NFTA_PAYLOAD_DREG, NFT_REG_1);
+    attr_be32(&body, NFTA_PAYLOAD_BASE, NFT_PAYLOAD_NETWORK_HEADER);
+    attr_be32(&body, NFTA_PAYLOAD_OFFSET, 12);
+    attr_be32(&body, NFTA_PAYLOAD_LEN, 4);
+    expr_end(&body);
+    expr_begin(&body, "dynset");
+    attr_str(&body, NFTA_DYNSET_SET_NAME, "conns");
+    attr_be32(&body, NFTA_DYNSET_SET_ID, 1);
+    attr_be32(&body, NFTA_DYNSET_OP, NFT_DYNSET_OP_ADD);
+    attr_be32(&body, NFTA_DYNSET_SREG_KEY, NFT_REG_1);
+    if (list_form) {
+        attr_be32(&body, NFTA_DYNSET_FLAGS, NFT_DYNSET_F_EXPR);
+        nest(&body, NFTA_DYNSET_EXPRESSIONS);
+        nest(&body, NFTA_LIST_ELEM);
+    } else {
+        nest(&body, NFTA_DYNSET_EXPR);
+    }
+    attr_str(&body, NFTA_EXPR_NAME, "connlimit");
+    nest(&body, NFTA_EXPR_DATA);
+    attr_be32(&body, NFTA_CONNLIMIT_COUNT, 1);
+    attr_be32(&body, NFTA_CONNLIMIT_FLAGS, NFT_CONNLIMIT_F_INV);
+    end(&body);
+    end(&body);
+    if (list_form)
+        end(&body);
+    expr_end(&body);
+    if (with_reject) {
+        expr_begin(&body, "reject");
+        attr_be32(&body, NFTA_REJECT_TYPE, NFT_REJECT_ICMPX_UNREACH);
+        uint8_t code = NFT_REJECT_ICMPX_ADMIN_PROHIBITED;
+        attr(&body, NFTA_REJECT_ICMP_CODE, &code, 1);
+        expr_end(&body);
+    }
+    end(&body);
+    batch_add(&b, NFT(NFT_MSG_NEWRULE), NLM_F_CREATE | NLM_F_APPEND, NFPROTO_INET, &body);
+
+    memset(&body, 0, sizeof body);
+    attr_str(&body, NFTA_TABLE_NAME, "probe");
+    batch_add(&b, NFT(NFT_MSG_DELTABLE), NLM_F_ACK, NFPROTO_INET, &body);
+    return batch_send(fd, &b);
+}
+
 static double ms_since(struct timespec *t0) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -504,6 +587,12 @@ static void netfilter_checks(void) {
            say(nft_try(fd, NFPROTO_INET, NF_INET_PRE_ROUTING, 0, "filter", rule_ct_status)));
     printf("N5 ip nat chain (for comparison): %s\n",
            say(nft_try(fd, NFPROTO_IPV4, NF_INET_POST_ROUTING, 100, "nat", rule_masq)));
+    printf("N10 dynamic set + dynset with one connlimit (NFTA_DYNSET_EXPR): %s\n",
+           say(nft_dynset_try(fd, 0, 0)));
+    printf("N10 the same as a list (NFTA_DYNSET_EXPRESSIONS, F_EXPR): %s\n",
+           say(nft_dynset_try(fd, 1, 0)));
+    printf("N10 dynset + connlimit, then reject with icmpx admin-prohibited: %s\n",
+           say(nft_dynset_try(fd, 0, 1)));
 
     struct stat st;
     printf("N6 route_localnet per interface (conf/lo): %s\n",

@@ -84,6 +84,11 @@ Create a container from a bundle, set up and waiting for `start`
 * `--preserve-fds <N>` — Pass N more descriptors on to the container's process, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as runc does
 
   Default value: `0`
+* `--hold-fd <N[=LABEL]>` — Have the container's monitor hold descriptor N (open in this process, above 2 and above those --preserve-fds passes on) until the container has ended, then give it to the exit command, or close it: what keeps the caller's resources (a lock's, say) alive once the caller has gone. The container never has it. LABEL (letters, digits, : _ . and -; fd-N if not given) names it: the exit command is told the labels in `SHIPYARD_HOLD_LABELS`. Repeatable
+* `--exit-command <PROGRAM>` — Run PROGRAM (an absolute path) once the container has ended and its end is recorded: in a session of its own, with this command's environment, its output discarded, the held descriptors at 3 and up (`SHIPYARD_HOLDS` says how many, `SHIPYARD_HOLD_LABELS` their labels, comma-separated, in order), how the container ended in `SHIPYARD_EXIT_RECORD` (JSON), and the monitor's PID in `SHIPYARD_MONITOR_PID` (the monitor holds its copies of the descriptors until it exits). Not waited for
+* `--exit-command-arg <ARG>` — An argument for the exit command (repeatable, in order)
+* `--companion <PROGRAM>` — Run PROGRAM (an absolute path) beside the container: started once it's created (the program waits for its start, if it needs to), in a session of its own, with this command's environment, its output discarded and none of the held descriptors; killed (SIGKILL), with its whole process group, once the container has ended, before its end is recorded (and if the monitor dies). For health checks
+* `--companion-arg <ARG>` — An argument for the companion (repeatable, in order)
 
 
 

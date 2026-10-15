@@ -21,7 +21,7 @@ use shipyard_network::dns::message::rtype;
 use shipyard_network::nft::Nftables;
 use shipyard_network::route::{Route, Rtnetlink};
 use shipyard_test_support::net::{
-    NetworkDir, Server, Upstream, fetch, fetch_from, in_netns, resolve,
+    NetworkDir, Server, Upstream, fetch, fetch_from, in_netns, resolve, resolve_tcp,
 };
 use shipyard_test_support::{Rootless, Shipyard, in_new_netns, is_root, rootless};
 
@@ -129,7 +129,7 @@ fn published_ports_reach_the_container_from_everywhere() {
         other.stop();
         running.stop();
         // A port the kernel chose is printed.
-        let chosen = networks.run(&["run", "-p", "83", "true"]);
+        let chosen = networks.run(&["run", "--no-image", "-p", "83", "true"]);
         assert_eq!(chosen.code, Some(0), "{}", chosen.stderr);
         assert!(
             chosen.stderr.lines().any(|line| {
@@ -149,7 +149,7 @@ fn a_published_port_is_held_while_its_run_lives() {
     in_new_netns(|| {
         let networks = NetworkDir::new(SHIPYARD);
         let (running, _netns) = networks.sleeping(&["-p", "8090:80"]);
-        let again = networks.run(&["run", "-p", "8090:80", "true"]);
+        let again = networks.run(&["run", "--no-image", "-p", "8090:80", "true"]);
         assert_eq!(again.code, Some(125), "{}", again.stderr);
         assert!(
             again
@@ -181,7 +181,7 @@ fn an_internal_network_has_no_way_out_and_publishes_nothing() {
             .as_str()
             .unwrap()
             .to_owned();
-        let first = networks.run(&["run", "--network", "secret", "true"]);
+        let first = networks.run(&["run", "--no-image", "--network", "secret", "true"]);
         assert_eq!(first.code, Some(0), "{}", first.stderr);
         // A container with a way out gets out (so the world is there)...
         let (open, open_netns) = networks.sleeping(&[]);
@@ -211,14 +211,22 @@ fn an_internal_network_has_no_way_out_and_publishes_nothing() {
             .as_str()
             .unwrap()
             .to_owned();
-        let on_later = networks.run(&["run", "--network", "later", "true"]);
+        let on_later = networks.run(&["run", "--no-image", "--network", "later", "true"]);
         assert_eq!(on_later.code, Some(0), "{}", on_later.stderr);
         assert_eq!(setting(&format!("ipv4/conf/{later}/forwarding")), "0");
         // The host still reaches it.
         let _inside = Server::start(&netns, 80, "inside");
         let ip = container_ip(&networks, "secret", 0);
         assert_eq!(fetch(SocketAddr::from((ip, 80))).as_deref(), Some("inside"));
-        let published = networks.run(&["run", "--network", "secret", "-p", "80", "true"]);
+        let published = networks.run(&[
+            "run",
+            "--no-image",
+            "--network",
+            "secret",
+            "-p",
+            "80",
+            "true",
+        ]);
         assert_eq!(published.code, Some(125), "{}", published.stderr);
         assert!(
             published
@@ -292,12 +300,12 @@ fn a_killed_runs_ports_and_connections_are_swept_by_the_next() {
         let _ = killed.finish_status();
         // Left as they were, until the next run on the network sweeps them.
         assert_eq!(nft.elements("ports").unwrap().len(), 2);
-        let next = networks.run(&["run", "true"]);
+        let next = networks.run(&["run", "--no-image", "true"]);
         assert_eq!(next.code, Some(0), "{}", next.stderr);
         assert!(nft.elements("ports").unwrap().is_empty());
         assert_eq!(involving(), 0);
         // And the ports are free again.
-        let again = networks.run(&["run", "-p", "8095:80", "true"]);
+        let again = networks.run(&["run", "--no-image", "-p", "8095:80", "true"]);
         assert_eq!(again.code, Some(0), "{}", again.stderr);
     });
 }
@@ -399,7 +407,9 @@ fn publishing_needs_a_network_of_the_containers_own() {
         return;
     }
     let run = |flags: &[&str]| {
-        shipyard_test_support::run(SHIPYARD.command(&[&["run"], flags, &["true"]].concat()))
+        shipyard_test_support::run(
+            SHIPYARD.command(&[shipyard_test_support::run_words(flags), flags, &["true"]].concat()),
+        )
     };
     let none = run(&["--network", "none", "-p", "80"]);
     assert_eq!(none.code, Some(125), "{}", none.stderr);
@@ -422,6 +432,242 @@ fn publishing_needs_a_network_of_the_containers_own() {
         "{}",
         v6.stderr
     );
+}
+
+/// A network made with `--isolate-host` (stage 9, step 9.7c1): its
+/// containers reach neither the host's services (on the gateway, or another
+/// of the host's addresses) nor the cloud's metadata address, but their DNS
+/// server answers, and a port the host publishes reaches them; a plain
+/// network's containers reach all of it.
+#[test]
+#[ignore = "needs root"]
+fn an_isolated_network_reaches_the_host_only_for_its_dns() {
+    in_new_netns(|| {
+        use std::os::fd::AsFd as _;
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        upstream.route_default();
+        // The metadata address, out in the world.
+        let mut world = Rtnetlink::in_namespace(upstream.netns().as_fd()).unwrap();
+        let lo = world.link("lo").unwrap().unwrap().index;
+        world
+            .change(lo, shipyard_network::route::LinkChange::Up(true))
+            .unwrap();
+        for metadata in ["169.254.169.254/32", "100.100.100.200/32"] {
+            world.add_address(lo, metadata.parse().unwrap()).unwrap();
+        }
+        // On every address of the world's: the metadata ones, and its own.
+        let _metadata = Server::start(upstream.netns(), 80, "metadata");
+        // A service of the host's own, on every address.
+        let host = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
+        let _service = Server::start(&host, 7070, "host");
+        // The default network has no DNS server to leave open.
+        let default = networks.run(&["network", "create", "--isolate-host", "bridge"]);
+        assert_eq!(default.code, Some(125), "{}", default.stderr);
+        assert!(
+            default.stderr.contains("default network"),
+            "{}",
+            default.stderr
+        );
+        let created = networks.run(&["network", "create", "--isolate-host", "kept"]);
+        assert_eq!(created.code, Some(0), "{}", created.stderr);
+        assert_eq!(networks.inspect("kept")["IsolateHost"], true);
+        networks.create(&["open"]);
+        let (kept, kept_netns) =
+            networks.sleeping(&["--network", "kept", "--name", "inside", "-p", "8090:80"]);
+        let (open, open_netns) = networks.sleeping(&["--network", "open"]);
+        let kept_gateway = networks.gateway("kept");
+        let open_gateway = networks.gateway("open");
+        let metadata = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 80));
+        let alibaba = SocketAddr::from((Ipv4Addr::new(100, 100, 100, 200), 80));
+        let world = SocketAddr::from((Upstream::ADDRESS, 80));
+        // Kept: not the host, nor the metadata; its DNS server answers,
+        // over UDP and TCP; the world beyond the host is still its way out.
+        assert_eq!(
+            fetch_from(&kept_netns, SocketAddr::from((kept_gateway, 7070))),
+            None
+        );
+        assert_eq!(
+            fetch_from(&kept_netns, SocketAddr::from((Upstream::HOST, 7070))),
+            None
+        );
+        assert_eq!(fetch_from(&kept_netns, metadata), None);
+        assert_eq!(fetch_from(&kept_netns, alibaba), None);
+        assert!(answered(&kept_netns, kept_gateway, "inside"));
+        assert!(
+            resolve_tcp(&kept_netns, kept_gateway, "inside", rtype::A)
+                .is_some_and(|answer| !answer.answers.is_empty())
+        );
+        assert_eq!(fetch_from(&kept_netns, world).as_deref(), Some("metadata"));
+        // Plain: all of it.
+        assert_eq!(
+            fetch_from(&open_netns, SocketAddr::from((open_gateway, 7070))).as_deref(),
+            Some("host")
+        );
+        assert_eq!(
+            fetch_from(&open_netns, SocketAddr::from((Upstream::HOST, 7070))).as_deref(),
+            Some("host")
+        );
+        for address in [metadata, alibaba] {
+            assert_eq!(
+                fetch_from(&open_netns, address).as_deref(),
+                Some("metadata")
+            );
+        }
+        // What the host publishes still reaches the kept one.
+        let _inside = Server::start(&kept_netns, 80, "inside");
+        assert_eq!(
+            fetch(SocketAddr::from((Upstream::HOST, 8090))).as_deref(),
+            Some("inside")
+        );
+        kept.stop();
+        open.stop();
+    });
+}
+
+/// A network made with `--conntrack-limit` lets each container have at
+/// most `CONNTRACK_LIMIT` connections it opened: the next new one is
+/// refused at once (TCP with a reset, others with an ICMP), to the world and
+/// to the host alike, and never enters the table. A connection is counted on
+/// its first packet only. A plain network's container isn't limited. The
+/// flows are UDP, one socket sending to many ports: a connection each,
+/// without a descriptor each.
+#[test]
+#[ignore = "needs root"]
+fn a_limited_network_caps_each_containers_connections() {
+    use shipyard_network::nft::CONNTRACK_LIMIT;
+    const FLOWS: u16 = 8300;
+    // Both containers' flows at once, and room to spare.
+    let needed = CONNTRACK_LIMIT as usize + usize::from(FLOWS) + 1000;
+    in_new_netns(move || {
+        // The ICMP the limit answers with is rate-limited (per destination):
+        // not here, where many are refused at once.
+        std::fs::write("/proc/sys/net/ipv4/icmp_ratelimit", "0").unwrap();
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        upstream.route_default();
+        // Listeners: a reset from either is the limit, not a closed port.
+        let _world = Server::start(upstream.netns(), 80, "world");
+        let host = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
+        let _service = Server::start(&host, 7070, "host");
+        let created = networks.run(&["network", "create", "--conntrack-limit", "capped"]);
+        assert_eq!(created.code, Some(0), "{}", created.stderr);
+        assert_eq!(
+            networks.inspect("capped")["ConntrackLimit"],
+            CONNTRACK_LIMIT
+        );
+        // The host's table size, read once conntrack is surely loaded (the
+        // network's rules use it): before, the file may not be there yet.
+        let max: usize = std::fs::read_to_string("/proc/sys/net/netfilter/nf_conntrack_max")
+            .ok()
+            .and_then(|max| max.trim().parse().ok())
+            .unwrap_or(0);
+        if max < needed {
+            assert!(
+                std::env::var("SHIPYARD_TEST_TOOLS").as_deref() != Ok("required"),
+                "nf_conntrack_max is {max}, under the {needed} this needs \
+                 (SHIPYARD_TEST_TOOLS=required: raise it on the host)"
+            );
+            eprintln!("nf_conntrack_max is {max}, under the {needed} this needs; skipping");
+            return;
+        }
+        networks.create(&["free"]);
+        assert!(networks.inspect("free")["ConntrackLimit"].is_null());
+        let (capped, capped_netns) = networks.sleeping(&["--network", "capped"]);
+        let (free, free_netns) = networks.sleeping(&["--network", "free"]);
+        let capped_ip = IpAddr::V4(container_ip(&networks, "capped", 0));
+        let free_ip = IpAddr::V4(container_ip(&networks, "free", 0));
+        // One socket each, kept: a second pass resends the same flows.
+        let socket = |netns| in_netns(netns, || std::net::UdpSocket::bind("0.0.0.0:0").unwrap());
+        let (capped_socket, free_socket) = (socket(&capped_netns), socket(&free_netns));
+        // Twice: a flow's second packet (unanswered, still `ct state new`)
+        // isn't counted again, so the first 8192 still pass.
+        for _ in 0..2 {
+            flood(&capped_socket, FLOWS);
+            flood(&free_socket, FLOWS);
+            assert_eq!(tracked(capped_ip), CONNTRACK_LIMIT as usize);
+            assert_eq!(tracked(free_ip), usize::from(FLOWS));
+        }
+        // Over the limit: TCP is reset at once, out to the world and to the
+        // host; UDP is answered with an ICMP.
+        let gateway = networks.gateway("capped");
+        for to in [
+            SocketAddr::from((Upstream::ADDRESS, 80)),
+            SocketAddr::from((gateway, 7070)),
+        ] {
+            let refused = in_netns(&capped_netns, || {
+                std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_secs(5))
+            });
+            assert_eq!(
+                refused.map(|_| ()).unwrap_err().kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "to {to}"
+            );
+        }
+        let answered = in_netns(&capped_netns, || {
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            socket.connect((Upstream::ADDRESS, 9)).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket.send(b"x").unwrap();
+            socket.recv(&mut [0; 1])
+        });
+        assert_eq!(
+            answered.unwrap_err().kind(),
+            std::io::ErrorKind::HostUnreachable
+        );
+        // Not limited: the free one reaches the world and the host.
+        assert_eq!(
+            fetch_from(&free_netns, SocketAddr::from((Upstream::ADDRESS, 80))).as_deref(),
+            Some("world")
+        );
+        assert_eq!(
+            fetch_from(
+                &free_netns,
+                SocketAddr::from((networks.gateway("free"), 7070))
+            )
+            .as_deref(),
+            Some("host")
+        );
+        capped.stop();
+        free.stop();
+    });
+}
+
+/// A byte from `socket` to each of `flows` ports of the upstream: a flow
+/// each (a connection, to conntrack).
+fn flood(socket: &std::net::UdpSocket, flows: u16) {
+    for port in 10_000..10_000 + flows {
+        // A refused one is an error on a later send, at most.
+        let _ = socket.send_to(b"x", (Upstream::ADDRESS, port));
+    }
+}
+
+/// How many flows the host tracks from `ip` to the upstream, once they've
+/// all been through (the count stops changing).
+fn tracked(ip: IpAddr) -> usize {
+    use shipyard_network::{Family, conntrack};
+    let count = || {
+        conntrack::connections(Family::V4)
+            .unwrap()
+            .iter()
+            .filter(|connection| {
+                connection.orig_source == Some(ip)
+                    && connection.reply_source == Some(IpAddr::V4(Upstream::ADDRESS))
+            })
+            .count()
+    };
+    let mut last = count();
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = count();
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    last
 }
 
 /// The kernel setting at `path` (under `/proc/sys`), as this thread's
@@ -516,7 +762,7 @@ fn another_firewalls_drop_policies_are_warned_about_with_their_fixes() {
             .to_owned();
         let gateway = networks.gateway("app");
         let theirs = nft(&["list", "table", "ip", "filter"]).unwrap();
-        let warned = networks.run(&["run", "--network", "app", "true"]);
+        let warned = networks.run(&["run", "--no-image", "--network", "app", "true"]);
         assert_eq!(warned.code, Some(0), "{}", warned.stderr);
         let forward = "the firewall's chain ip filter FORWARD drops forwarded traffic by default";
         let input =
@@ -554,7 +800,7 @@ fn another_firewalls_drop_policies_are_warned_about_with_their_fixes() {
         assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
         assert!(answered(&netns, gateway, "web"));
         running.stop();
-        let again = networks.run(&["run", "--network", "app", "true"]);
+        let again = networks.run(&["run", "--no-image", "--network", "app", "true"]);
         assert_eq!(again.code, Some(0), "{}", again.stderr);
         assert!(
             !again.stderr.contains("the firewall's chain"),
@@ -584,7 +830,15 @@ fn an_nftables_chains_printed_fix_works() {
         let networks = NetworkDir::new(SHIPYARD);
         networks.create(&["app"]);
         let gateway = networks.gateway("app");
-        let warned = networks.run(&["run", "--network", "app", "-p", "8080:80", "true"]);
+        let warned = networks.run(&[
+            "run",
+            "--no-image",
+            "--network",
+            "app",
+            "-p",
+            "8080:80",
+            "true",
+        ]);
         assert_eq!(warned.code, Some(0), "{}", warned.stderr);
         let forward = "the firewall's chain inet custom forward drops";
         let input = "the firewall's chain inet custom input drops";
@@ -613,7 +867,7 @@ fn an_nftables_chains_printed_fix_works() {
         );
         assert!(answered(&netns, gateway, "web"));
         running.stop();
-        let again = networks.run(&["run", "--network", "app", "true"]);
+        let again = networks.run(&["run", "--no-image", "--network", "app", "true"]);
         assert!(
             !again.stderr.contains("the firewall's chain"),
             "{}",
@@ -670,7 +924,7 @@ fn dockers_firewall_is_warned_about_and_its_printed_fix_works() {
         upstream.route_back();
         let networks = NetworkDir::new(SHIPYARD);
         let docker = nft(&["list", "table", "ip", "filter"]).unwrap();
-        let warned = networks.run(&["run", "true"]);
+        let warned = networks.run(&["run", "--no-image", "true"]);
         assert_eq!(warned.code, Some(0), "{}", warned.stderr);
         let opening = "Docker's firewall drops forwarded traffic by default";
         assert!(
@@ -736,7 +990,7 @@ fn dockers_firewall_is_warned_about_and_its_printed_fix_works() {
         first.stop();
         second.stop();
         // Fixed: no warning again.
-        let again = networks.run(&["run", "true"]);
+        let again = networks.run(&["run", "--no-image", "true"]);
         assert_eq!(again.code, Some(0), "{}", again.stderr);
         assert!(!again.stderr.contains(opening), "{}", again.stderr);
     });
@@ -827,7 +1081,7 @@ fn firewalld_is_warned_about_until_the_bridge_is_trusted() {
         let _out = Server::start(upstream.netns(), 7000, "out");
         let world = SocketAddr::from((Upstream::ADDRESS, 7000));
         // The default network: no DNS server, and the zone forwards.
-        let quiet = networks.run(&["run", "true"]);
+        let quiet = networks.run(&["run", "--no-image", "true"]);
         assert!(!quiet.stderr.contains("firewalld"), "{}", quiet.stderr);
         let (running, netns) = networks.sleeping(&[]);
         assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
@@ -839,7 +1093,7 @@ fn firewalld_is_warned_about_until_the_bridge_is_trusted() {
             .unwrap()
             .to_owned();
         let gateway = networks.gateway("app");
-        let warned = networks.run(&["run", "--network", "app", "true"]);
+        let warned = networks.run(&["run", "--no-image", "--network", "app", "true"]);
         assert!(
             warned.stderr.contains(&format!(
                 "firewalld rejects what comes from an interface it doesn't trust: containers on \
@@ -863,7 +1117,7 @@ fn firewalld_is_warned_about_until_the_bridge_is_trusted() {
         firewalld_trusts(&bridge);
         assert!(answered(&netns, gateway, "web"));
         running.stop();
-        let again = networks.run(&["run", "--network", "app", "true"]);
+        let again = networks.run(&["run", "--no-image", "--network", "app", "true"]);
         assert!(!again.stderr.contains("firewalld"), "{}", again.stderr);
     });
 }
@@ -882,7 +1136,7 @@ fn firewalld_that_doesnt_forward_keeps_the_way_out_until_trusted() {
         upstream.route_default();
         let networks = NetworkDir::new(SHIPYARD);
         let opening = "firewalld rejects what comes from an interface it doesn't trust";
-        let warned = networks.run(&["run", "true"]);
+        let warned = networks.run(&["run", "--no-image", "true"]);
         assert!(
             warned.stderr.contains(&format!(
                 "{opening}: containers on shipyard0 would have no way out; to put the bridge"
@@ -897,7 +1151,7 @@ fn firewalld_that_doesnt_forward_keeps_the_way_out_until_trusted() {
         firewalld_trusts("shipyard0");
         assert_eq!(fetch_from(&netns, world).as_deref(), Some("out"));
         running.stop();
-        let again = networks.run(&["run", "true"]);
+        let again = networks.run(&["run", "--no-image", "true"]);
         assert!(!again.stderr.contains(opening), "{}", again.stderr);
     });
 }
@@ -1105,7 +1359,7 @@ fn a_container_sends_only_as_itself() {
             .args(["delete", "table", "bridge", "shipyard"])
             .status();
         if flushed.is_ok_and(|status| status.success()) {
-            let run = networks.run(&["run", "--network", "app", "true"]);
+            let run = networks.run(&["run", "--no-image", "--network", "app", "true"]);
             assert_eq!(run.code, Some(0), "{}", run.stderr);
             check();
         }

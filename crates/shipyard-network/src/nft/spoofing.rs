@@ -42,10 +42,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::consts::{
-    ETH_P_ARP, ETH_P_IP, ETH_P_IPV6, IFNAMSIZ, NF_ACCEPT, NF_BR_PRE_ROUTING, NF_DROP,
-    NFPROTO_BRIDGE, NFT_CMP_EQ, NFT_CMP_NEQ, NFT_META_IIFNAME, NFT_META_L4PROTO, NFT_META_PROTOCOL,
-    NFT_PAYLOAD_LL_HEADER, NFT_PAYLOAD_NETWORK_HEADER, NFT_PAYLOAD_TRANSPORT_HEADER, NFT_REG32_00,
-    TYPE_ETHERADDR, TYPE_IFNAME, TYPE_IP6ADDR, TYPE_IPADDR, concat_type,
+    ETH_P_ARP, ETH_P_IP, ETH_P_IPV6, IFNAMSIZ, IPPROTO_ICMPV6, NF_ACCEPT, NF_BR_PRE_ROUTING,
+    NF_DROP, NFPROTO_BRIDGE, NFT_CMP_EQ, NFT_CMP_NEQ, NFT_META_IIFNAME, NFT_META_L4PROTO,
+    NFT_META_PROTOCOL, NFT_PAYLOAD_LL_HEADER, NFT_PAYLOAD_NETWORK_HEADER,
+    NFT_PAYLOAD_TRANSPORT_HEADER, NFT_REG32_00, TYPE_ETHERADDR, TYPE_IFNAME, TYPE_IP6ADDR,
+    TYPE_IPADDR, concat_type,
 };
 use super::expr::Expr;
 use super::objects::{
@@ -71,8 +72,7 @@ mod set {
     pub(super) const ADDRESSES6: &str = "addresses6";
 }
 
-/// `ICMPv6`'s protocol number, and a neighbour advertisement's type.
-const IPPROTO_ICMPV6: u8 = 58;
+/// A neighbour advertisement's `ICMPv6` type.
 const ND_NEIGHBOR_ADVERT: u8 = 136;
 
 /// A container's port on a bridge, and who it may send as.

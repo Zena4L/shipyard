@@ -238,9 +238,9 @@ fn someone_elses_directory_isnt_probed_in() {
     assert!(text.contains("not to you"), "{text}");
 }
 
-/// Without `XDG_RUNTIME_DIR`, only `shipyard-runtime` loses its state
-/// directory (`shipyard run` keeps its files elsewhere): a warning, not a
-/// failure.
+/// Without `XDG_RUNTIME_DIR`, containers can't be kept (no `run -d`,
+/// `create` or `start`), but a run still works, supervised by `run` itself:
+/// a warning, not a failure.
 #[test]
 fn no_runtime_dir_only_limits() {
     if !rootless(Rootless::Full) {
@@ -256,6 +256,58 @@ fn no_runtime_dir_only_limits() {
     assert_eq!(level, "warn");
     assert!(text.contains("XDG_RUNTIME_DIR"), "{text}");
     assert!(report.fails().is_empty(), "{}", report.stdout);
+}
+
+/// `shipyard system stop` holds restart policies off until `shipyard system
+/// recover`: doctor says so meanwhile, and not before or after (stage 9,
+/// step 9.9a, L4). With no state root yet, a stop has nothing to do, and
+/// succeeds. Rootless, on a runtime directory of its own (root's
+/// state root is shared with other tests, whose restarts a stop would hold
+/// off).
+#[test]
+fn a_stop_that_holds_restarts_off_is_said() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !rootless(Rootless::Full) {
+        return;
+    }
+    let scratch = Scratch::new(&std::env::temp_dir(), "held");
+    let xdg = scratch.0.join("xdg");
+    for dir in [&xdg, &scratch.0.join("containers")] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let set_up = |command: &mut Command| {
+        command
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env("SHIPYARD_CONTAINER_DIR", scratch.0.join("containers"))
+            .env("SHIPYARD_IMAGE_STORE", scratch.0.join("store"));
+    };
+    let system = |verb: &str| {
+        let mut command = SHIPYARD.command(&["system", verb]);
+        set_up(&mut command);
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "system {verb}: {out:?}");
+    };
+    let said = || {
+        let report = doctor(set_up);
+        report
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("warn ") && line.contains("restarts"))
+    };
+    // Before any container: no state root, nothing to stop or hold off
+    // (the user unit's stop at a shutdown).
+    system("stop");
+    assert!(!said(), "a stop with no state root");
+    // As a first container leaves it.
+    let root = xdg.join("shipyard");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!said(), "before a stop");
+    system("stop");
+    assert!(said(), "after a stop");
+    system("recover");
+    assert!(!said(), "after the recovery");
 }
 
 /// Root: no user namespace to probe, a bridge network with `nf_tables`, and
