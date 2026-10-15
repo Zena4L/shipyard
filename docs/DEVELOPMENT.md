@@ -316,9 +316,30 @@ whether user namespaces work, instead of `unshare` (which no profile covers).
 VM, runs both passes there, and removes the VM; the image stays cached in
 `~/.cache/shipyard-vm`.
 
+### Unattended checks while CI is off
+
+`scripts/watch.sh` does at night what CI would (ROADMAP D31): it checks `origin/main` in a
+clone of its own (`~/Library/Caches/shipyard-watch`), with its own cargo target dir and
+Docker volume (`shipyard-watch-target`), so it never touches your working tree or your
+build volume. Each night it verifies the whole workspace when `main` moved (`verify.sh`:
+macOS, both Linux passes, rustdoc, musl), fuzzes every target for 10 minutes (the corpora
+grow night after night), and runs cargo-mutants on what changed since its last sweep.
+
+```sh
+scripts/watch.sh --install    # a launchd agent: every night at 02:00 (a missed night runs on wake)
+scripts/watch.sh --quick      # the plumbing only, now: the macOS checks and 20 s of fuzzing
+scripts/watch.sh              # a full run, now
+scripts/watch.sh --uninstall
+```
+
+The report is `~/Library/Caches/shipyard-watch/runs/latest/report.md`. It notifies you
+only when something got worse (a check that passed now fails, a fuzz crash, missed
+mutants) or when it couldn't run at all (Docker down, no network): silence means it ran
+and nothing regressed. Docker must be running at night; the Mac is kept awake for the run.
+
 ## Running Linux-only stages on macOS: Lima VM
 
-Eventually Shipyard manages its own VM (roadmap stage 12). Until then,
+Eventually Shipyard manages its own VM (a minimal path in roadmap stage 10, production-grade in stage 13). Until then,
 [Lima](https://lima-vm.io) gives you a lightweight Linux VM with your home directory
 mounted.
 

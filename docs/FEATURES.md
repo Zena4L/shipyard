@@ -11,7 +11,7 @@ Shipyard has three layers, mirroring how the established tools split up:
 | Layer | Equivalent | Responsibility |
 |---|---|---|
 | **Runtime** (`shipyard-runtime`) | runc / crun | Turns a root filesystem plus an OCI `config.json` into an isolated process. Implements the [OCI runtime spec](https://github.com/opencontainers/runtime-spec). |
-| **Engine** (daemonless; `shipyard-engine`, `shipyard-image`, `shipyard-storage`; `shipyard-network` serves the runtime too) | Podman | Images, storage, networks, volumes, state, compose, API. Calls the runtime. |
+| **Engine** (daemonless; `shipyard-engine`, `shipyard-image`, `shipyard-storage`; `shipyard-network` serves the runtime too) | Podman | Images, storage, networks, volumes, state, and the Docker-compatible API (`docker compose` runs through it; builds through BuildKit). Calls the runtime. |
 | **Product** | OrbStack | CLI, macOS VM backend, desktop UI, packaging. |
 
 ## 1. Process lifecycle — stage 1 *(POSIX, runs natively on macOS)*
@@ -133,11 +133,11 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **OOM detection:** via `memory.events`, reported clearly ("the command was killed: out of
   memory", exit 137; "(out of memory)" in the runtime's exit record).
 - **Live stats:** CPU, memory, I/O and process count: `shipyard-runtime events --stats`
-  now; `shipyard stats`, `top` (stage 10's first steps) and the UI by name.
+  now; `shipyard stats`, `top` (stage 11) and the UI by name.
 - **Change limits on a running container:** `shipyard-runtime update` now; `shipyard
-  update` by name: `--restart` in stage 9 (9.5b), the limits with stage 10's first steps.
+  update` by name: `--restart` in stage 9 (9.5b), the limits in stage 11.
 - **Pause and resume:** via `cgroup.freeze`: `shipyard-runtime pause`/`resume` now;
-  `shipyard pause` with stage 10's first steps.
+  `shipyard pause` in stage 11.
 - **Docker's limit flags on `shipyard run`** (`--memory`, `--cpus`, `--pids-limit`, …) and
   OCI's `linux.resources`, `unified` and `cgroupsPath`.
 - **The runtime's other cgroup commands:** `ps`, `kill --all`; and OCI hooks (all six
@@ -183,7 +183,7 @@ Shipyard has three layers, mirroring how the established tools split up:
   concurrent pulls, runs and collections.
 - **Commands:** `pull`, `images`, `rmi`, `image prune`, `run --image` (with `--pull`
   and `--entrypoint`). `tag`, `inspect`, `history`, `save`/`load`, `import`/`export`
-  move to stage 10's first steps.
+  move to stage 12 (build and images).
 - **Garbage collection:** reference-counted, plus `prune`; never what a running
   container or a pull in progress uses.
 - *Later:* `push`, signature verification (cosign / sigstore).
@@ -197,7 +197,7 @@ Shipyard has three layers, mirroring how the established tools split up:
   to later: it needs a helper outside the container's PID namespace to be safe.
 - **`--uidmap` with images** (as root): layers extracted again for the map.
 - **Mount types:** named volumes and bind mounts (`--volume`), kept from removal while
-  in use. tmpfs mounts and propagation options come with `--mount` (stage 10's first steps).
+  in use. tmpfs mounts and propagation options come with `--mount` (stage 11).
 - **Mount options:** read-only/read-write.
 - **Commands:** `volume create / ls / inspect / rm / prune`.
 - **Disk accounting:** `system df` (images, containers' writable layers, volumes).
@@ -239,7 +239,7 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Connection observation:** a library reading `/proc/<pid>/net/{tcp,tcp6,udp,udp6}`
   through a container's init (pinned by a pidfd), listening and established sockets,
   fuzzed. Its command came with stage 9 (`port --sockets`, 9.7c1); the UI's "observed but
-  undeclared" dependencies come with the UI (stage 13).
+  undeclared" dependencies come with the UI (stage 14).
 - *Moved:* `network connect`/`disconnect`, the sockets command and the DNS servers' own
   cgroup and restart to stage 9 (built: 9.7, 9.6c2); `exec` joining the network namespace to stage 8.
 
@@ -313,61 +313,121 @@ Shipyard has three layers, mirroring how the established tools split up:
   `contrib/systemd` rather than generated ones; each container's monitor in a cgroup of
   its own since 9.9b, so a shutdown stops every container gracefully).
 
-## 10. Compose and stacks — stage 10
+## 10. Foundations and the Mac path — stage 10
 
-- **A `compose.yaml` subset:** services, `depends_on` (with conditions), networks, volumes,
-  ports, environment, healthcheck, restart.
-- **Commands:** `compose up / down / ps / logs / restart`.
-- **Start order:** derived from the dependency graph.
+Decided 2026-10-15 (ROADMAP D23, D24).
 
-## 11. API — stage 11
+- **The refactor, with no behaviour change** (checked against the v0.2 binary):
+  - the persisted container record split from `Config` and from the API's types, so a
+    record version is a frozen type of its own (before any v4);
+  - one `take` ("find, lock, read again") for every command that works on a container;
+  - one safe-file module: atomic writes, capped no-follow reads, lock files, one `pidfd`
+    helper, using `rustix` beside `nix` (closes F61);
+  - `doctor`'s checks into the engine (`system::diagnose`, for the UI's backend panel),
+    `cp`'s helper into the runtime, `run/detached.rs` split by job;
+  - F48's list.
+- **Stage 9's book chapter.**
+- **A minimal macOS path, used daily:**
+  - Virtualization.framework driven from Rust (`objc2-virtualization`), in a VM-host
+    process that starts on first use and exits when idle;
+  - one shared VM: a minimal Alpine root filesystem with Alpine's `linux-virt` kernel,
+    built reproducibly by a script, running the static `shipyard` as its agent;
+  - the Mac CLI forwards commands to the guest's `shipyard` over vsock (stdio and the
+    terminal);
+  - the project directory shared (virtiofs), published ports on `localhost`;
+  - every kernel feature the engine needs checked in the guest by the probes (cgroup
+    v2, overlayfs, nftables, user namespaces, virtiofs, vsock).
 
-- **A versioned REST API plus an event stream,** over a UNIX socket.
-- **Still daemonless:** the API server is socket-activated on demand and exits when idle.
-- *Optional:* a Docker-compatible API subset, so existing tools work against Shipyard (the
-  docker CLI, IDE integrations, Testcontainers).
+## 11. Docker compatibility — stage 11
 
-## 12. macOS VM backend — stage 12
+Decided 2026-10-15 (ROADMAP D25–D27).
 
-- **Virtualization.framework,** driven from Rust via `objc2`.
-- **Guest system:** a minimal Linux kernel and root filesystem, tuned for fast boot.
-- **Guest agent:** a small agent inside the VM, spoken to over vsock.
-- **File sharing:** virtiofs, so bind mounts of macOS paths just work.
-- **Ports and DNS:** port forwarding from macOS into the VM, plus DNS.
-- **Rosetta:** for running amd64 images on Apple Silicon.
-- **VM lifecycle:**
-  - start on first use, stop when idle
-  - memory ballooning to return unused memory to macOS
-  - clock sync after sleep
+- **The Docker Engine API, as a subset,** over a UNIX socket that starts on first use and
+  exits when idle (systemd socket activation on Linux; forwarded from the VM over vsock
+  on macOS), plus an event stream. Shipyard's own data (serials, health history, observed
+  sockets) under `/shipyard/…`. The subset is what `docker compose` and Testcontainers
+  use, listed in the stage's plan.
+- **The Mac CLI talks this API** to the guest, replacing stage 10's forwarding.
+- **The CLI, a drop-in for `docker`** on the everyday commands (`run`, `create`, `start`,
+  `stop`, `rm`, `ps`, `logs`, `exec`, `inspect`, `images`, `pull`, `compose`…): Docker's
+  flags and short forms (`-v`, `-h`, `--env-file`, `-l`, `logs -n`, `inspect -f`,
+  `--mount`) and output formats; Shipyard-only fields only in its own formats or behind
+  flags.
+- **`stats`, `top`, `pause`/`unpause` and live `update`** by name.
+- **Compose is Docker's `docker compose`** run against Shipyard's API; `shipyard compose`
+  finds and runs it.
+- **Acceptance tests:** `docker compose` and Testcontainers suites against Shipyard.
 
-## 13. Desktop UI — stage 13
+## 12. Build and images — stage 12
+
+Decided 2026-10-15 (ROADMAP D28).
+
+- **`shipyard build`:** BuildKit, started on demand in a container and stopped after the
+  build, its cache in a volume; Dockerfiles in full (multi-stage, cache mounts) as
+  BuildKit reads them.
+- **Images:** `push`, `tag`, `login`/`logout`, `image inspect` / `history` / `save` /
+  `load`, `import`/`export`.
+
+## 13. macOS production — stage 13
+
+Decided 2026-10-15 (ROADMAP D29). Apple Silicon only.
+
+- **Rosetta:** amd64 images on Apple Silicon.
+- **Memory:** ballooning returns unused memory to macOS.
+- **Clock sync after sleep:** a small agent in the guest, over vsock.
+- **File sharing fast enough for real projects** (virtiofs, its caching tuned), and bind
+  mounts of macOS paths that just work.
+- **Ports and DNS** from macOS into the VM.
+- **Lifecycle:** the VM starts on first use and stops when idle.
+- **Entitlements and notarization** (`com.apple.security.virtualization`).
+- **The macOS version floor:** 13 (Rosetta in Virtualization.framework) or 14, decided in
+  stage 10.
+
+## 14. Desktop UI — stage 14
 
 - **Built on the stage 11 API.** The spec is [`design/README.md`](design/README.md), with
   an interactive mock in [`design/shipyard-ui.html`](design/shipyard-ui.html).
+- **The observed-traffic map first:** dependencies seen in containers' sockets, declared
+  or not, the feature no other engine has.
 - **Likely built with Tauri:** Rust core, small binaries.
 
-## 14. CLI — grows with every stage
+## 15. CLI — grows with every stage
 
 - **Containers:** `run, create, start, stop, restart, kill, rm, ps, logs, exec, attach,
   pause, unpause, inspect, stats, top, cp, port, wait, rename, update`.
 - **Other resources:** `image …`, `volume …`, `network …`, `compose …`.
 - **System:** `system info / df / prune / events`, and `doctor`.
 - **Output:** `--format json|table`, quiet modes, consistent exit codes.
-- **Docker-compatible flags** wherever sensible.
+- **A drop-in for `docker`** on the everyday commands (stage 11, D26).
 - **Shell completions** (bash / zsh / fish) and man pages.
 
-## 15. Production quality — ongoing from stage 1, finalized in stage 14
+## 16. Production quality — ongoing from stage 1, finalized in stage 15
+
+**v1.0** (ROADMAP D30), the first public release:
+
+- **Platforms:** Linux (x86-64 and arm64, cgroup v2, kernel ≥ 5.11) and macOS on Apple
+  Silicon.
+- **The developer loop:** `alias docker=shipyard` works for `build`, `run`, `ps`, `logs`,
+  `exec`, `push`, `pull` and `compose`; Testcontainers and devcontainers work against the
+  API; x86 images run through Rosetta.
+- **The Linux host:** rootless by default, restart policies, boot units, packages.
+- **The desktop UI,** with its observed-traffic map.
+- **Quality:** green CI, OCI conformance as expected, fuzzing and mutation checks on
+  every parser and state machine, signed reproducible releases, every open finding fixed
+  or explicitly accepted.
+- **Performance targets** (below) measured and reported; they don't block v1.0.
 
 **Correctness**
 
-- Unit tests per stage, and integration tests run in a Linux VM in CI.
+- Unit tests per stage, and integration tests run in a Linux VM in CI (CI is off until
+  before v1.0, ROADMAP D31: local verification is the check of record until then).
 - Pass the OCI runtime-spec conformance suite
   ([`runtime-tools`](https://github.com/opencontainers/runtime-tools)): it runs since
   stage 8 (H5), gated by `scripts/conformance/expected.txt`. By v1.0, every test is
   `pass`, or a refusal by design.
 - Fuzzing of every parser: manifests, tar, compose, config.
 
-**Performance targets** (benchmarked in CI)
+**Performance targets** (benchmarked; reported, not blocking v1.0)
 
 - Container start in under 100 ms, excluding image pull.
 - Idle cost of zero processes besides the per-container monitors.
@@ -395,6 +455,7 @@ Shipyard has three layers, mirroring how the established tools split up:
 - **Multi-host orchestration** (Swarm / Kubernetes-style scheduling). Shipyard is a
   single-host engine.
 - **Windows containers.** Shipyard is UNIX-only.
-- **Building images.** Deferred until after stage 11; then a Dockerfile subset, built
-  in-house.
+- **A builder or a compose engine of Shipyard's own.** Images are built by BuildKit
+  (stage 12) and stacks run by `docker compose` against Shipyard's API (stage 11).
+- **Intel Macs.** macOS support is Apple Silicon only (Rosetta exists only there).
 - **Checkpoint/restore (CRIU)** and a **Kubernetes CRI** implementation. Possibly much later.

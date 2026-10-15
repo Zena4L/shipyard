@@ -1,3 +1,8 @@
+---
+name: guideline
+description: General coding discipline for any change, in any repository — think before coding (state assumptions, surface trade-offs, ask when unclear), simplicity first (the minimum that solves it, nothing speculative), surgical changes (touch only what the request needs, match the existing style), and goal-driven execution (turn a task into verifiable success criteria, loop until verified). Use when starting a non-trivial change, when tempted to refactor or generalize beyond the request, or when a task's success criteria are vague.
+---
+
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
 ## 1. Think Before Coding

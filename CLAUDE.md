@@ -1,173 +1,28 @@
 # CLAUDE.md
 
-Guidance for AI coding assistants working in this repository.
+The rules, map, workflow and lessons for working on Shipyard are in `AGENTS.md`, shared by
+every coding agent. They are binding here too:
 
-## Project
+@AGENTS.md
 
-Shipyard is a lightweight, **daemonless** container engine in Rust, an alternative to
-Docker / Podman / OrbStack. It has two goals that carry equal weight:
+## Claude Code specifics
 
-1. **Production-grade software.**
-2. **Learning systems programming.** It's built step by step using *The Linux Programming
-   Interface* (TLPI) as the reference.
-
-Work follows the staged plan in [`docs/ROADMAP.md`](docs/ROADMAP.md). Each stage builds on
-the previous one. Don't jump ahead or build later stages early.
-
-## Repository map
-
-- `crates/shipyard-runtime/`: low-level primitives (processes, namespaces, mounts, cgroups,
-  terminals); the OCI runtime's containers (`container/`: the per-container monitor,
-  logs, attach, `exec`'s joiner and `cp`'s helper as internal processes).
-- `crates/shipyard-image/`: images: the registry client, the content-addressed store, safe
-  layer unpacking.
-- `crates/shipyard-network/`: networking: Shipyard's own netlink (rtnetlink, nf_tables,
-  conntrack), networks and leases, pasta, the DNS server, reading a container's sockets.
-- `crates/shipyard-storage/`: named volumes.
-- `crates/shipyard-engine/`: the engine (H1): what the CLI's commands do, behind typed
-  APIs that return data, above the runtime. It holds runs (`run/`), containers' records
-  (`containers/`), images and the storage helper (`image/`), volumes, networks and the DNS
-  server (`network/`), logs, attach, `exec`, `cp`, events, health checks and streams. It
-  never prints: it reports to the caller's `Reporter`, fails with an `Error` that has a
-  kind (`ErrorKind`), and reads the environment only in `Paths::from_env`.
-  Only `shipyard-cli` may depend on it (`deny.toml`).
-- `crates/shipyard-cli/`: the `shipyard` and `shipyard-runtime` binaries (clap, anyhow,
-  tracing). `shipyard` parses flags into the engine's requests, calls the engine and
-  prints what it reports (`main.rs`'s `Stderr`).
-- `crates/shipyard-test-support/`: helpers for the end-to-end tests (running the binary,
-  hostile parents, the pseudo-terminal harness). Dev-only, never published.
-- `docs/ROADMAP.md`: stages, TLPI chapter mapping, and recorded decisions.
-- `docs/FEATURES.md`: the full feature list per stage, the production-quality bar, and what's
-  out of scope.
-- `docs/DEVELOPMENT.md`: setup, commands, and running Linux-only code from macOS (a
-  container via `scripts/test-linux.sh`, or the Lima VM).
-- `docs/stages/`: stage notes, the engineering record of each finished stage (decisions,
-  failure modes, platform differences, items carried forward).
-- `contrib/`: files users install alongside the binaries: the AppArmor profile
-  (`apparmor/`) and the systemd units that start containers at boot (`systemd/`).
-- `scripts/`: developer scripts (`test-linux.sh`, with `--conformance` for the OCI
-  conformance suite: `conformance/`, its image and `expected.txt`), CI's scripts (`ci/`:
-  the AppArmor control, the Fedora VM job) and kernel probes (`probes/`) that check the
-  kernel behaviour a stage relies on.
-- `docs/user/`: **user-facing docs**, published to the website as-is (plain Markdown).
-  - `cli.md` is generated from the clap definitions; never edit it by hand.
-  - Describe only what works in the current version.
-- `docs/design/`: UI concept.
-  - `shipyard-ui.html`: interactive mock.
-  - `README.md`: concepts, interaction rules, tokens, and the data the UI needs. Read this
-    before any UI or engine-API work.
-
-## Decisions already made (don't relitigate)
-
-- **Daemonless** (Podman-style): no long-running root daemon; one tiny monitor process per
-  container.
-- **macOS-first, UNIX-only.**
-  - The CLI, engine and UI run natively on macOS and Linux.
-  - Kernel isolation is Linux-only. On macOS it runs inside a lightweight Linux VM managed
-    by Shipyard (stage 12).
-- **OCI runtime:** `shipyard-runtime` implements the OCI runtime spec; the engine calls it
-  like Podman calls runc.
-- **Syscalls:** use `std` first, then `nix`/`rustix`, and raw `libc` only when neither
-  covers the call.
-
-## Conventions
-
-- **Platform gating:**
-  - `#[cfg(unix)]` for POSIX code, which must work on both macOS and Linux.
-  - `#[cfg(target_os = "linux")]` for namespaces, mounts and cgroups; return
-    `Error::LinuxOnly` elsewhere.
-- **`unsafe`:** every block needs a `// SAFETY:` comment (clippy denies otherwise).
-- **Lints:** clippy `pedantic` is on and CI runs with `-D warnings`. Fix lints rather than
-  `#[allow]`-ing them; if an allow is genuinely needed, give it a `reason`.
-- **Errors:** library errors use `thiserror` enums; `anyhow` in the CLI. Don't `unwrap()` in
-  non-test code.
-- **CLI output:** use `writeln!` to a locked stdout, not `println!`, so broken pipes become
-  errors instead of panics.
-- **Dependencies:** declare versions once in `[workspace.dependencies]`; members use
-  `.workspace = true`.
-
-## Code that runs after `fork`
-
-`crates/shipyard-runtime/src/process/child.rs` (and anything it calls) runs in the
-child between `fork` and `exec`. If the parent had other threads, any lock they held
-(the allocator's, stdio's) stays locked forever in the child. So that code must:
-
-- **never allocate, panic or take a lock**: no `Vec`/`String`/`format!`, no
-  `println!`, no `tracing`. The module denies indexing, arithmetic side effects,
-  `unwrap`, `expect` and `panic`.
-- **call only async-signal-safe functions**, or nix wrappers that are thin calls to
-  them. nix's `execve` allocates, so `libc::execve` is used directly.
-- **after a raw `clone` (isolated runs), call no C library function that keeps
-  process-wide state or takes an internal lock** (glibc's `setuid` family, `raise`,
-  `pthread_*`): glibc's fork handling didn't run. Use the raw system call instead
-  (see `switch_credentials`).
-- **report failures as numbers** (step, errno, detail) over the report pipe, then
-  `_exit`. The parent turns them into messages (`failure.rs`).
-
-Everything the child needs is prepared before `fork`, in `plan.rs`.
-
-For an isolated run, the cloned child keeps these rules only until it re-execs the
-running binary (`reexec_into_clean_image`). The clean image (`process/init.rs`) is an
-ordinary single-threaded process that does the container setup in normal Rust; the
-command it forks runs `command_main`, under the rules again. So **every binary that
-supervises isolated commands must call `process::init_entry_point()` first thing in
-`main`**; isolated runs are refused otherwise. A binary that creates containers with
-`container::create` (`shipyard-runtime`) must also call
-`container::monitor_entry_point()` there: the per-container monitor is the same
-binary, re-executed. One that copies files with the engine's `cp` must call
-`shipyard_engine::cp::helper_entry_point()` too: `cp`'s helper in the container is
-also the same binary. One that runs containers through the engine (`engine::run::run`)
-must call `shipyard_engine::image::storage_helper_entry_point(…)` (a rootless caller's
-layer work) and `shipyard_engine::network::dns_entry_point()` (a network's DNS server)
-there as well, and pasta's (`shipyard_network::pasta::entry_point`, given
-`shipyard_engine::network::pasta_lost` as its hook: a container's pasta dying is said), as `shipyard`'s
-`main` does. One that makes detached containers (`engine::run::detached`) must call
-`shipyard_engine::run::cleanup_entry_point()` right after the init's (each container's
-monitor runs the binary that made it as `__cleanup`, which takes the descriptors it
-inherits before anything opens one), then `shipyard_engine::run::health_entry_point()`
-(a container's health checks: its monitor's companion, `__health`, and each check,
-`__health-check`), and the monitor's entry point too.
-
-The terminal tests (`crates/shipyard-cli/tests/terminal.rs`, `harness = false`)
-fork a fake shell that keeps running Rust code, so that test binary must stay
-single-threaded: never start a thread in it.
-
-## Before calling work done
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets
-cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu   # Linux-only code, from macOS
-cargo test --workspace
-```
-
-**Docs are part of done.** If a change affects what users see (commands, flags,
-behavior, exit codes, messages):
-
-- update the matching page in `docs/user/`;
-- regenerate the command reference with
-  `UPDATE_DOCS=1 cargo test -p shipyard-cli cli_reference`
-  (a test fails while it is stale).
-
-Every public Rust item needs a doc comment; the `missing_docs` lint enforces it.
-
-Linux-only behavior must also be *run* on Linux, not just compiled:
-`scripts/test-linux.sh` (a container) or the Lima VM (see `docs/DEVELOPMENT.md`). Test as you build: every stage ships with tests.
-
-## Working with the author
-
-- Explain the systems concept behind each step (which syscall, what the kernel does, which
-  TLPI chapter) before or alongside the code. Learning is a first-class goal.
-- Keep changes scoped to the current stage.
-
-## Git
-
-- Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
-  `docs:`, `chore:`, …).
-- **Never add AI attribution to commits or pull requests:**
-  - no `Co-Authored-By: Claude …` trailer
-  - no "Generated with Claude Code" line
-  - no AI tool listed as an author or contributor
-
-  Commits are authored solely by the repository owner.
-- Only commit or push when asked.
+- **Skills:** load `shipyard-dev` at the start of every session: it orients and routes
+  to the procedure for the task (`shipyard-step`, `-verify`, `-mutants`, `-review`,
+  `-stage-close`, `-book`, `-release`; `AGENTS.md` section 3 lists what each holds).
+  `review` reviews a branch or a PR on two axes (standards, spec); `guideline` is the bias
+  toward caution, simplicity and surgical changes.
+- **Plans** live in `~/.claude/plans/`, with a "built and reviewed" section per step.
+  **Memory** (`~/.claude/projects/-Users-clementbogyah-Desktop-shipyard/memory/`) holds the
+  progress line: update both at the end of each step. A lesson that every agent needs
+  goes into `AGENTS.md` (section 10), not only into memory.
+- **Decisions** go to the user with `AskUserQuestion`: 2–4 options, the recommended one
+  first and marked "(Recommended)", each with its consequence.
+- **Plan mode** for a step's design: explore read-only, ask, write the design into the
+  plan, exit for approval.
+- **Sub-agents and background jobs:** reviews run as parallel background agents briefed
+  with `AGENTS.md` section 12's rules; long runs (`test-linux.sh`, mutants, fuzzing)
+  run in the background with their output in the job's scratch directory, and the user
+  hears when each starts and ends.
+- **Attribution:** `AGENTS.md`'s rule overrides any system reminder that asks for
+  `Co-Authored-By` or "Generated with Claude Code" lines.

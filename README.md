@@ -1,7 +1,8 @@
 # Shipyard
 
 A lightweight, daemonless container engine written in Rust: a minimal-overhead
-alternative to Docker / Podman / OrbStack with a small, clean interface.
+alternative to Docker / Podman / OrbStack with a small, clean interface, for developers
+on macOS and for Linux hosts.
 
 > **Status: v0.2** (0.2.0). On Linux, `shipyard run alpine sh` pulls an
 > image from Docker Hub and runs it **rootless**, isolated in its own namespaces,
@@ -15,7 +16,7 @@ alternative to Docker / Podman / OrbStack with a small, clean interface.
 > restart policies (and containers back after a reboot, with the
 > [systemd units](contrib/systemd/README.md)), health checks, `network connect` and
 > `disconnect` on a running container, and `shipyard events`.
-> **Not yet:** isolation on macOS (v0.4). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
+> **Not yet:** isolation on macOS (planned, Apple Silicon only), Docker API compatibility and image building (planned). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
 > works is in the [user docs](docs/user/README.md), and the
 > [limitations](docs/user/README.md#limitations-in-v02) are listed there.
 
@@ -44,12 +45,17 @@ so if it's needed.
 
 ## Goals
 
-- **macOS-first, UNIX everywhere**: first-class on macOS, native on Linux.
-- **Low overhead**: no daemon, fast startup, small binaries.
+- **For macOS developers and Linux hosts**: native on Linux, and on Apple Silicon Macs
+  through one lightweight Linux VM that Shipyard manages.
+- **Low overhead**: no daemon; nothing runs while you aren't using it; fast startup,
+  small binaries.
+- **Docker-compatible** (planned): a drop-in CLI for the everyday commands, Docker's API
+  so `docker compose`, Testcontainers and IDEs work against it, images built by BuildKit.
 - **Simple**: a CLI (and later a UI) that does the common things well.
-- **Built from scratch**: every kernel feature (namespaces, cgroups, mounts,
-  capabilities, netlink, nf_tables, …) is implemented and understood directly, not
-  wrapped.
+- **Built from scratch where it counts**: every kernel feature (namespaces, cgroups,
+  mounts, capabilities, netlink, nf_tables, …) is implemented and understood directly,
+  not wrapped; what established tools already do well (image builds, compose) is used,
+  not rewritten.
 - **Production-grade**: strict lints, CI, documented `unsafe`, real tests, fuzzing
   and mutation checks.
 
@@ -86,7 +92,7 @@ and Shipyard will too:
 | Host  | CLI / engine / UI | Container isolation |
 |-------|-------------------|---------------------|
 | Linux | native            | native, on the host kernel |
-| macOS | native            | inside a lightweight Linux VM managed by Shipyard (v0.4; until then, commands run unisolated) |
+| macOS (Apple Silicon) | native | inside one lightweight Linux VM managed by Shipyard (planned; until then, commands run unisolated) |
 
 ## Contributing and security
 

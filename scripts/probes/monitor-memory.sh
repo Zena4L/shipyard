@@ -15,8 +15,8 @@
 #
 # Run it in the test container, as root and as tester (rootless):
 #
-#   timeout 1800 .claude/skills/shipyard-dev/references/run-in-linux.sh root scripts/probes/monitor-memory.sh
-#   timeout 1800 .claude/skills/shipyard-dev/references/run-in-linux.sh tester scripts/probes/monitor-memory.sh
+#   timeout 1800 .claude/skills/shipyard-verify/scripts/run-in-linux.sh root scripts/probes/monitor-memory.sh
+#   timeout 1800 .claude/skills/shipyard-verify/scripts/run-in-linux.sh tester scripts/probes/monitor-memory.sh
 #
 # Everything it makes is under one mktemp directory, removed at the end.
 set -euo pipefail
