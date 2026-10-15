@@ -13,7 +13,7 @@ appears.
 
 ## Read first
 
-1. `CLAUDE.md`, and `docs/book/README.md`: the book's rules (the five parts of every
+1. `AGENTS.md`, and `docs/book/README.md`: the book's rules (the five parts of every
    chapter, the third part split by the plan's steps, "Try it" conventions, the safe place
    to run examples).
 2. The last chapter of the previous stage, in full: the style model (sentence length,
@@ -38,7 +38,7 @@ appears.
 - The five parts, the third split by steps ("## Step 3: …"), and "What you learned".
 - **"Try it" commands must work.** Verify every one in the test container and show the real
   output (shortened with `…`). Write a script into the scratchpad and run it with the
-  skill's `references/run-in-linux.sh` (`tester` or `root`), starting with
+  `.claude/skills/shipyard-verify/scripts/run-in-linux.sh` (`tester` or `root`), starting with
   `cd /src && cargo build -q -p shipyard-cli` and using `/target/debug/shipyard`. Readers
   use `scripts/test-linux.sh --root-shell` / `--shell`: phrase the commands for that.
 - Never write to a real block device in the container (loop 7:0 is the VM's disk). Wrap

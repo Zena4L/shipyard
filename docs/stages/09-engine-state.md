@@ -181,7 +181,7 @@ contrib/systemd: shipyard-recover.service   ExecStart: system recover   ExecStop
 **The processes.** Every one is Shipyard's own binary started again with a hidden first
 argument (`__shipyard-monitor`, `__cleanup`, `__health`, `__health-check`,
 `__shipyard-pasta`, `__shipyard-dns`, `__shipyard-storage`), so `shipyard`'s `main` calls
-each entry point first, in CLAUDE.md's order. The monitor and pasta's launcher double-fork:
+each entry point first, in AGENTS.md's order. The monitor and pasta's launcher double-fork:
 no caller keeps a child (or a zombie) of theirs, and a caller that is a subreaper is warned
 about. The exit command is `/proc/self/exe __cleanup …` in the monitor: the binary that made
 the container, even after an upgrade or a delete on disk, so `__cleanup`'s arguments never

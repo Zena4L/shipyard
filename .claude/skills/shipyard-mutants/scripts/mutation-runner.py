@@ -27,6 +27,15 @@ TARGETS = f"{HERE}/mutant-targets"
 
 N = "crates/shipyard-network/src/"
 C = "crates/shipyard-cli/src/"
+E = "crates/shipyard-engine/src/"
+R = "crates/shipyard-runtime/src/"
+I = "crates/shipyard-image/src/"
+
+# Test commands most mutants use (append the test's name).
+MAIN_UNIT = "cargo test -p shipyard-cli --bin shipyard -- --exact tests::"
+ENGINE_UNIT = "cargo test -p shipyard-engine --lib -- --exact "
+# The engine's end-to-end tests (`harness = false`: its own `--exact`).
+DETACHED = "cargo test -p shipyard-engine --test detached -- --exact "
 
 # name: (where, file, the exact text (must occur once), its replacement, test command)
 # where: "mac" (cargo here), "tester" or "root" (the Linux container).

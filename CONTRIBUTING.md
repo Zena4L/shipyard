@@ -33,7 +33,7 @@ running the Linux-only code from macOS (`scripts/test-linux.sh`, or a Lima VM).
   (`feat:`, `fix:`, `docs:`, `chore:`, …).
 
 The conventions (platform gating, errors, the rules for code that runs after `fork`)
-are in [CLAUDE.md](CLAUDE.md), which guides human and AI contributors alike.
+are in [AGENTS.md](AGENTS.md), which guides human and AI contributors alike.
 
 ## Security issues
 

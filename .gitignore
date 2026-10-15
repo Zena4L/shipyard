@@ -18,3 +18,11 @@
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+
+# Default outputs of vendored skills (their notes send them to scratch instead)
+/.rust-review-results/
+/variant-analysis-report.md
+/.claude/skills/*-workspace/
+
+# Python bytecode (skills' scripts)
+__pycache__/

@@ -1,7 +1,7 @@
 # UI design
 
 [`shipyard-ui.html`](shipyard-ui.html) is the interactive concept for Shipyard's desktop UI
-(roadmap stage 13). It's a single self-contained file with all state mocked in-page. Open it
+(roadmap stage 14). It's a single self-contained file with all state mocked in-page. Open it
 in any browser; no build step needed.
 
 - **Live version:** https://claude.ai/artifact/HzWgUs7ewr5ANtKKC3p7QP (private to the owner)

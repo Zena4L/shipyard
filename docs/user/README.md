@@ -207,7 +207,7 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
   runtime ID.
 - **macOS doesn't isolate yet:** commands run as ordinary processes
   (`shipyard run --no-image …`), and images don't run there, until Shipyard runs
-  them in a Linux VM of its own (v0.4).
+  them in a Linux VM of its own (planned, for Apple Silicon Macs).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge
   networks, and names between containers, are root's
   (see [Networking](networking.md#rootless-containers-pasta)).

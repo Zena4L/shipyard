@@ -33,6 +33,8 @@
 # the cargo registry and the pinned toolchain live in named Docker volumes
 # (shipyard-linux-*), so later runs are fast. Remove them with
 #   docker volume rm shipyard-linux-target shipyard-linux-cargo shipyard-linux-rustup
+# TARGET_VOLUME names another build volume (default shipyard-linux-target), for a
+# second checkout's runs beside this one's (scripts/watch.sh uses its own).
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -315,7 +317,7 @@ fi
 exec docker run --rm --privileged --init ${tty_flags[@]+"${tty_flags[@]}"} \
     ${diff_flags[@]+"${diff_flags[@]}"} \
     --volume "$repo:/src:ro" \
-    --volume shipyard-linux-target:/target \
+    --volume "${TARGET_VOLUME:-shipyard-linux-target}:/target" \
     --volume shipyard-linux-cargo:/usr/local/cargo \
     --volume shipyard-linux-rustup:/usr/local/rustup \
     --env CARGO_TARGET_DIR=/target \

@@ -17,16 +17,17 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 | 2 | **Namespaces** | PID, mount, UTS and IPC namespaces (`clone3`); own session; a minimal PID-1 init; `setns` to join a running container. The other namespaces moved to stages 4, 5 and 7 | TLPI 26, 28, 34; `namespaces(7)`, `pid_namespaces(7)`, `setns(2)` | [done](stages/02-namespaces.md) |
 | 3 | **Filesystem isolation & OCI bundles** | `pivot_root`, mount propagation, `/proc` `/sys` `/dev`, masked and read-only paths; OCI `config.json` and `create / start / kill / delete / state`; user/group names; domain name and namespaced sysctls | TLPI 8, 14, 18, 44, 55; `mount_namespaces(7)`, `pivot_root(2)`, `mount_setattr(2)`; OCI runtime spec | [done](stages/03-filesystem.md) |
 | 4 | **Users & security** | Rootless (user namespaces, UID/GID maps), capabilities, `no_new_privs`, seccomp. Device access control moved to stage 5, with cgroups | TLPI 8, 9, 39; `user_namespaces(7)`, `capabilities(7)`, `seccomp(2)` | [done](stages/04-security.md) |
-| 5 | **Resource control** | cgroups v2 limits and cgroup namespaces, OOM detection, live stats, pause/resume, device access control (eBPF), OCI hooks; `shipyard`'s own `stats`/`top`/`pause`/`update` by name come with stage 10's first steps | TLPI 36; `cgroups(7)`; OCI runtime spec (hooks) | [done](stages/05-resources.md) |
-| 6 | **Images & storage** | Registry pulls (private registries, resumable), OCI/Docker manifests, safe layer unpacking (fuzzed), content-addressed store shared by concurrent runs, overlayfs (rootless too), volumes. `tag`/`inspect`/`save`… and `--mount` come with stage 10's first steps; the `fuse-overlayfs` fallback later | OCI image & distribution specs; `overlayfs` docs; TLPI 14, 18, 55 | [done](stages/06-images.md) |
+| 5 | **Resource control** | cgroups v2 limits and cgroup namespaces, OOM detection, live stats, pause/resume, device access control (eBPF), OCI hooks; `shipyard`'s own `stats`/`top`/`pause`/`update` by name come with stage 11 (Docker compatibility) | TLPI 36; `cgroups(7)`; OCI runtime spec (hooks) | [done](stages/05-resources.md) |
+| 6 | **Images & storage** | Registry pulls (private registries, resumable), OCI/Docker manifests, safe layer unpacking (fuzzed), content-addressed store shared by concurrent runs, overlayfs (rootless too), volumes. `tag`/`inspect`/`save`… come with stage 12 (build and images), `--mount` with stage 11; the `fuse-overlayfs` fallback later | OCI image & distribution specs; `overlayfs` docs; TLPI 14, 18, 55 | [done](stages/06-images.md) |
 | 7 | **Networking** | Network namespaces, bridge + veth over Shipyard's own netlink, IPAM, NAT and published ports with its own nf_tables client, rootless networking with pasta, a DNS server per network, several networks per container, IPv6, reading a container's sockets. `network connect`/`disconnect` and the sockets command came with stage 9 (9.7b2, 9.7c1) | TLPI 56–61; `netlink(7)`, `rtnetlink(7)`, `network_namespaces(7)` | [done](stages/07-networking.md) |
 | 8 | **Terminals, I/O & logs** | Per-container monitor, PTYs, attach/detach, `exec`, log files with rotation, `cp`; also `--preserve-fds` and socket activation, other firewalls (F14), and the OCI conformance suite (H5) | TLPI 44, 62–64 | done ([notes](stages/08-terminals.md)) |
 | 9 | **Engine state** | On-disk state, locking, crash recovery, restart policies, health checks, events | TLPI 37, 55 | done ([notes](stages/09-engine-state.md)) |
-| 10 | **Compose** | `compose.yaml` subset; `up / down / ps / logs`; dependency-ordered start | Compose spec | |
-| 11 | **API** | Versioned REST + event stream over a UNIX socket, socket-activated (still daemonless) | TLPI 57 | |
-| 12 | **macOS VM backend** | Shipyard boots and manages its own minimal Linux VM; the Mac CLI drives the runtime inside it | Virtualization.framework, vsock, virtiofs | |
-| 13 | **Desktop UI** | The [design](design/README.md), built on the stage 11 API | Tauri (likely) | |
-| 14 | **Hardening & release** | OCI conformance suite passing (it runs since stage 8), fuzzing, benchmarks, threat model, signed reproducible releases, packaging | [FEATURES.md §15](FEATURES.md#15-production-quality--ongoing-from-stage-1-finalized-in-stage-14) | |
+| 10 | **Foundations & the Mac path** | The refactor with no behaviour change (D23: the record split from `Config`, one `take`, one safe-file module with rustix, `doctor` into the engine, `cp`'s helper into the runtime, `run/detached.rs` split; F48); stage 9's book chapter; **a minimal macOS path used daily** (D24): Virtualization.framework from Rust, an Alpine guest running `shipyard`, commands forwarded over vsock, the project directory shared, ports on `localhost` | Virtualization.framework, vsock, virtiofs; the kernel probes in the guest | |
+| 11 | **Docker compatibility** | The Docker Engine API subset, socket-activated (over vsock on macOS), with `/shipyard/…` extensions; the CLI a drop-in for everyday `docker` commands; `stats`, `top`, `pause`, live `update`; compose is `docker compose` against the API (`shipyard compose` passes through); `docker compose` and Testcontainers as acceptance tests (D25–D27) | Docker Engine API; TLPI 57 | |
+| 12 | **Build & images** | `shipyard build` driving BuildKit started on demand (D28); `push`, `tag`, `login`, image `inspect` / `history` / `save` / `load` | BuildKit, OCI image & distribution specs | |
+| 13 | **macOS production** | The Mac path made production-grade: Rosetta, memory ballooning, clock sync after sleep, fast file sharing, DNS and ports, exit when idle, entitlements and notarization; Apple Silicon only (D29) | Virtualization.framework, vsock, virtiofs | |
+| 14 | **Desktop UI** | The [design](design/README.md), built on the stage 11 API; the observed-traffic map first | Tauri (likely) | |
+| 15 | **Hardening & v1.0** | OCI conformance as expected (it runs since stage 8), fuzzing and mutation checks on every parser and state machine, benchmarks, signed reproducible releases, packages (Homebrew, `.deb`, `.rpm`), a docs site; green CI; **the first public release** (D21, D30) | [FEATURES.md §16](FEATURES.md#16-production-quality--ongoing-from-stage-1-finalized-in-stage-15) | |
 
 Each finished stage gets **stage notes** in [`stages/`](stages/): what was built and why,
 macOS and Linux differences, the failure modes and how they're handled, known limitations,
@@ -36,25 +37,25 @@ and what was carried forward to later stages.
 
 - tests for every stage
 - the CLI growing with each stage
-- the production-quality items in FEATURES.md §15, adopted as soon as they apply
+- the production-quality items in FEATURES.md §16, adopted as soon as they apply
 - the [hardening track](#hardening-track), each item from its home stage
 
-Stages 2–9 are Linux-only. Until stage 12 lands, develop them on macOS inside a Lima VM,
+Stages 2–9 are Linux-only. Until stage 10's macOS path lands, develop them on macOS inside a Lima VM,
 and run their tests in a Linux container with `scripts/test-linux.sh` (see
 [DEVELOPMENT.md](DEVELOPMENT.md)).
 
 ## Hardening track
 
 What looking back at stages 0–7 says to do differently (decided 2026-10-09). Each item
-has a home stage; none waits for stage 14. The first two get more expensive with every
+has a home stage; none waits for stage 15. The first two get more expensive with every
 stage, so they come first.
 
 | # | Item | Why | Home |
 |---|---|---|---|
-| H1 | **An engine crate** (`shipyard-engine`): the logic now in the CLI (`run.rs`, `network.rs`, …) behind a typed API; the CLI a thin client of it, with `--json` output | stage 11's API and stage 13's UI need it as a library; the move grows with every stage | stage 9 (start in stage 8 for what it adds). **Done in 9.1** (no behaviour change, checked against the previous binary): runs, images, volumes, networks and the DNS server are the engine's; the CLI parses, calls and prints. `--json` comes with the container record (9.2/9.4). **9.4a:** `ps --format json` and `inspect` (a JSON array) print the engine's container views (`containers::summaries`, `inspect`). **Done in stage 9.** A container's published ports are bounded by its caller's descriptor limit (the caller binds them; 9.9a refuses early, with a `ulimit -n` hint); the monitor's own limit for holds `network connect` adds later is F49 |
+| H1 | **An engine crate** (`shipyard-engine`): the logic now in the CLI (`run.rs`, `network.rs`, …) behind a typed API; the CLI a thin client of it, with `--json` output | stage 11's API and stage 14's UI need it as a library; the move grows with every stage | stage 9 (start in stage 8 for what it adds). **Done in 9.1** (no behaviour change, checked against the previous binary): runs, images, volumes, networks and the DNS server are the engine's; the CLI parses, calls and prints. `--json` comes with the container record (9.2/9.4). **9.4a:** `ps --format json` and `inspect` (a JSON array) print the engine's container views (`containers::summaries`, `inspect`). **Done in stage 9.** A container's published ports are bounded by its caller's descriptor limit (the caller binds them; 9.9a refuses early, with a `ulimit -n` hint); the monitor's own limit for holds `network connect` adds later is F49 |
 | H2 | **One state model, versioned:** one container record and state machine, one liveness rule and one recovery path in place of each stage's own lock-and-sweep; a schema version on every on-disk format from its first write, and a test reading the previous version (the first: stage 8's `log.json`, its version refused when unknown) | today's records (run areas, leases, run directories, volume holds, `dns.lock`, cgroup records) each work alone; upgrades rest on `serde` defaults. **Started in 9.2a:** the runtime's `state.json` and `exit` versioned, stage 8's read as v0. **9.2b:** the engine's container record (v1 from its first write, its format in types of its own, pinned by a literal record), its derived state. **9.3b1:** a planned container's `plan.json` (v1; read only by the monitor its own `create` starts, so another version is refused rather than read). **9.3b2a:** a detached container's resources held by its monitor (the run's `flock`s handed over, not re-made) and let go by its `__cleanup`, which records its end in the engine's record; liveness stays one rule, a held lock. **9.3b2b:** a detached container's pasta follows its init (the init's pidfd, its start time checked), never its caller: the launcher and the monitor double-forked, so no caller keeps a child of theirs. **9.4a:** containers by name (`create`, `start`, `run -d`, `ps`, `inspect`, `rm`): the record v2 (the image's digest, `--rm`, the ports bound; v1 read), the exit record v2 (whether the command started); a per-container operation lock (`op.lock`) and a `running` lock its `__cleanup` frees last, so a start or a removal sees one rule; the leftovers of a killed start reconciled by the next start or `rm`; a container's own writable layer, kept until `rm`, and its image pinned. **9.4b1:** `stop`, `kill`, `restart`, `wait` across processes: the attach protocol v2 has control clients (waiters and stoppers, capped apart), and the monitor owns a stop (its signal, the earliest SIGKILL), so a stop outlives its caller. **9.4b2:** `rename`, a running container's DNS name too: leases record their container, and are rewritten in place under an OFD byte-range lock every lease reader takes (the run's `flock` on the inode stays its liveness). **9.9a:** a container stage 8's runtime made, still running, is driven by stage 9's binaries (checked against stage 8's real ones, 21/21; `a_container_stage_8s_runtime_made_is_left_to_it`). **Done in stage 9**; the rule for the next record version is F43 | stage 9 |
 | H3 | **A threat model in every plan:** who is hostile (the container, a local user, the network, a registry, the image) and what each may never do, written as invariants with a test each; the Murphy review run against the plan too | stage 6's tar escapes and stage 7's router advertisements, open router and lockable leases were all found after building | from stage 8 |
-| H4 | **Real hosts in CI:** VM jobs on the distributions users run (Ubuntu with AppArmor, Fedora with SELinux, an older LTS kernel), the probes on each | the test container is one privileged Debian on one kernel; stage 7's last failures appeared only on Ubuntu | stage 8 (one VM job), widened by stage 12; Ubuntu 24.04 checked by hand for v0.1 (rootless with the AppArmor restriction on, root bridge networks). **Built in 8.1b:** CI's `apparmor` job (Ubuntu, the restriction on, the installed binaries and profile, a control without it) and `fedora` job (a QEMU/KVM VM, SELinux enforcing, both passes, the terminal probe). *Not yet run on stage 8's code:* CI is manual-only (billing off) and its Ubuntu `check`/`root` jobs are off; stage 8 was checked by `test-linux.sh` and by hand on Ubuntu and Fedora VMs, arm64 only |
+| H4 | **Real hosts in CI:** VM jobs on the distributions users run (Ubuntu with AppArmor, Fedora with SELinux, an older LTS kernel), the probes on each | the test container is one privileged Debian on one kernel; stage 7's last failures appeared only on Ubuntu | stage 8 (one VM job), widened by stage 13 (macOS); Ubuntu 24.04 checked by hand for v0.1 (rootless with the AppArmor restriction on, root bridge networks). **Built in 8.1b:** CI's `apparmor` job (Ubuntu, the restriction on, the installed binaries and profile, a control without it) and `fedora` job (a QEMU/KVM VM, SELinux enforcing, both passes, the terminal probe). *Not yet run on stage 8's code:* CI is manual-only (billing off) and its Ubuntu `check`/`root` jobs are off; stage 8 was checked by `test-linux.sh` and by hand on Ubuntu and Fedora VMs, arm64 only |
 | H5 | **Quality tools in CI:** `cargo-mutants` on changed files, the fuzz targets on a schedule, the OCI runtime conformance suite, differential tests of Shipyard's own netlink and nf_tables against `ip` and `nft` | the method works but runs by hand; conformance was planned for stage 14 though the runtime exists since stage 3 | conformance and differential tests in stage 8 (differential tests built in 8.1b: see [Owned components](#owned-components); the conformance suite in 8.7a: `scripts/test-linux.sh --conformance`, gated by `scripts/conformance/expected.txt`, and a CI job, not yet run: amd64 unchecked); mutants and fuzzing **in 9.8b**: the `Quality` workflow (`fuzz`, every target from `scripts/fuzz-targets.sh`; `mutants`, cargo-mutants on a branch's changes, a report), manual until billing is back, its schedule written; locally `scripts/test-linux.sh --fuzz` and `--mutants` |
 | H6 | **Errors as a designed surface:** stable error kinds (and codes) in one module per crate; tests assert the kind, not the wording; messages stay free to improve | wording drifted across steps, and tests matching on wording broke CI twice | with H1 (stage 9), and each new error from stage 8. **Started in 9.1:** the engine's `Error` has an `ErrorKind` (`InvalidRequest`, `NotFound`, `InUse`, `NeedsRoot`, `Unsupported`…), other crates' errors are mapped to kinds, warnings have a `WarningKind`, and engine tests assert kinds; the CLI's own tests still match some wording. **9.9a:** one kind per situation (`WrongStatus` of an ended container is `NotRunning`, `MonitorTooOld` `Unsupported`, `BadHoldLabel` `InvalidRequest`, attach's refusal `Busy`). **Done for the engine in stage 9**; the CLI tests' wording matches go as they're next touched |
 | H7 | **Performance budgets as tests:** run start, run exit, a cached pull, a network attach; a regression fails | pasta's one-second exit delay was found by accident | stage 8 (built in 8.1b: `tests/budgets.rs`, whose documentation lists every budget). **9.4a:** `ps -a` over 100 containers under 200 ms. **9.4b1:** `stop` of a container that ends on its signal under 1 s, of one that ignores it its timeout and under 2 s more. **9.9a:** `run -d` back at the prompt (`run_d_returns_quickly`) |
@@ -71,13 +72,15 @@ implementation on the same input; where they differ, one of them is wrong.
 |---|---|---|---|
 | **netlink** (rtnetlink: links, addresses, routes) | No `ip` binary run as root, no C library, and no netlink crate whose dumps and errors would be another surface to audit; it's small and its parser is bounded and fuzzed | `ip -j`: what Shipyard makes, `ip` reads the same, and the reverse (links, addresses, routes and their types; a route's scope is checked by a unit test of what Shipyard sends) | `route/linux_tests.rs`: `ip_reads_what_shipyard_makes`, `shipyard_reads_what_ip_makes` (root) |
 | **nf_tables** (`inet shipyard`) | The same: no `nft` run as root; one batch, atomic, from Rust | `nft`: Shipyard's table lists with nothing unknown, its key rules read as meant, nft rebuilds it from its own listing to the same (a fixed point, the same rules per chain and the same elements), and `nft -j` gives each chain the type, hook, priority and policy, and each set the types and flags, Shipyard made them with. Not byte for byte: nft encodes some rules differently but equivalently | `nft/linux_tests.rs`: `nft_reads_and_rebuilds_shipyards_table`, `nft_json_describes_shipyards_chains_and_sets` (root) |
-| **seccomp** (a BPF compiler for Docker's profile) | No libseccomp (a C library): the binary stays static, and the filter's every instruction is Shipyard's | The kernel: the filter loads, and the e2e tests see what it allows and refuses; an interpreter runs it as the kernel would | `security/seccomp/`, `tests/security.rs`. A libseccomp differential: stage 14 (moved from 9, D9.9-5: it belongs with the seccomp tooling's release checks) |
-| **eBPF** (device programs) | No libbpf or clang: a small assembler for one kind of program | The kernel's verifier (it loads them), the e2e device tests, and an interpreter as strict as the verifier | `devices/ebpf.rs`, `tests/devices.rs`. A bpftool differential: stage 14 (moved from 9, D9.9-5) |
+| **seccomp** (a BPF compiler for Docker's profile) | No libseccomp (a C library): the binary stays static, and the filter's every instruction is Shipyard's | The kernel: the filter loads, and the e2e tests see what it allows and refuses; an interpreter runs it as the kernel would | `security/seccomp/`, `tests/security.rs`. A libseccomp differential: stage 15 (moved from 9, D9.9-5: it belongs with the seccomp tooling's release checks) |
+| **eBPF** (device programs) | No libbpf or clang: a small assembler for one kind of program | The kernel's verifier (it loads them), the e2e device tests, and an interpreter as strict as the verifier | `devices/ebpf.rs`, `tests/devices.rs`. A bpftool differential: stage 15 (moved from 9, D9.9-5) |
 | **tar** (reading layers) | A layer is untrusted: the reader bounds what an archive can make it hold, and nothing is unpacked by path (the `tar` crate's `unpack` isn't used) | The `tar` crate: generated GNU and ustar archives, and PAX ones, read the same (for a PAX `mtime`, owner or extended attribute, which the crate hands over without applying, the reference is the test's own reading). Shipyard reads an empty number field as 0, as GNU tar does; the crate refuses it | `tar_reader/differential.rs` (proptest); the `tar` fuzz target fuzzes Shipyard's reader alone |
 | **tar** (`cp`'s: walking a tree, and extracting a copy) | The tree may be a hostile container's: walked by descriptor (`O_PATH`, never followed; only files and directories opened, by reopening what was checked), each file written at its header's size; the `tar` crate only writes the headers (no `append_path`, which follows paths). Extraction is the layer unpacker's, with a copy's rules (no whiteouts, nothing implied, one top-level name) | GNU `tar`: it extracts `cp`'s stream to the same tree `cp` makes (contents, modes, links, hard links), and `cp` extracts GNU tar's to the same | `tests/runtime.rs`: `cp_streams_agree_with_gnu_tar` (root); `cp/pack.rs`; fuzzed (`cp_unpack`) |
 | **Timestamps** (RFC 3339, for CRI logs and `--since`) | A few dozen lines of calendar arithmetic (Howard Hinnant's days-to-date) instead of a time crate: UTC only, no time zones to get wrong | GNU `date`: 200 instants from year 0000 to 9999, the same text | `logs/time.rs`: `the_same_as_date_says` (Linux), plus round trips and known instants |
 | **CRI logs** (the writer and reader) | The format is a line per record; writing it is the monitor's job (conmon's), and reading it the engine's: no Go tools, no daemon | kubelet's own test lines (read the same), and the round trip of any text; `crictl` or fluent-bit by hand | `logs/cri.rs`, `logs/writer.rs`, the engine's `logs.rs`; fuzzed (`cri_record`, `logs_dir`) |
 | **DNS** (a server per network) | No daemon beside the container (as Podman's aardvark-dns or dnsmasq): one small server, started per network, as nobody | `dig` (BIND's library): names, aliases, case, other types, reverse, TCP, upstream, refusal | `tests/dns.rs`: `dig_reads_the_servers_answers_as_meant` (root) |
+
+**The owned surface is frozen** (D19, 2026-10-15): nothing is added to this table unless the static binary depends on it; a maintained crate or tool is used instead.
 
 What the tests found when first run (8.1b): the set `masquerade` was a keyword of nft's
 language, so `nft -f` couldn't read back a listing of Shipyard's table (renamed
@@ -134,6 +137,66 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
 | F61 | low | The v0.2 review, small items: `NetworkLost::read`, `previous_start` and `store_id` read without `O_NOFOLLOW`, `O_NONBLOCK` or a size cap; a relative `SHIPYARD_EVENTS_DIR` is taken; a health check's drain polls with no timeout for up to 100 ms; the DNS server's test variables (`SHIPYARD_DNS_UPSTREAM`, `_IDLE`) are honoured as root; `LockedNetwork::rename` can panic on a lease that's a JSON array; a monitor's failed join of its cgroup (the `pre_exec` write) is said only on stderr, not in `create`'s warnings | each with F48's refactor | 10 |
 | F62 | low | The v0.2 review (security): no default limit on a container's processes or memory (Docker has none; Podman's is 2,048 processes), and the default network can't have `--isolate-host`, so its containers reach the host's services and the cloud's metadata (documented in `SECURITY.md`) | a default `pids` limit; `--isolate-host` for `bridge` (it needs its own DNS-less exception) | 10 |
 
+**Direction decisions (2026-10-15):** after the v0.2 reviews (code, security, strategy,
+architecture, tests, Rust craft), decided in a grilling session, round by round.
+
+- **D18 — Two users:** macOS developers and Linux hosts. The Linux host's needs are
+  served first (stages 10–11), but development and testing happen on macOS, so a
+  minimal macOS path comes early (D24).
+- **D19 — The product decides what is built; learning decides how.** Every concept is still
+  explained (the book, the stage notes), but the next stage is chosen by the users' needs,
+  not by TLPI's chapter order. The owned surface is frozen: no new hand-written protocol
+  or format unless the static binary depends on it.
+- **D20 — "Daemonless" means nothing runs while Shipyard isn't being used.** Never a root
+  daemon; one monitor per container; anything else (the API socket, the macOS VM) starts
+  on first use and stops when idle. This replaces the stricter "no long-running process"
+  reading, which would rule out the Docker API and macOS.
+- **D21 — No release and no outside users until v1.0** (no testers either). v0.3–v0.5 are
+  internal milestones; the first public release is v1.0.
+- **D22 — The learning book stays part of each stage's "done";** stage 9's chapter is
+  written in stage 10.
+- **D23 — Stage 10 starts with a refactor that changes no behaviour,** checked against the
+  v0.2 binary as 9.1 was: the persisted record split from `Config` and the API's types
+  (before any record v4), one `take` ("find, lock, read again"), one safe-file module
+  (atomic writes, capped no-follow reads, locks, one `pidfd` helper) using `rustix`
+  beside `nix` for what nix lacks, `doctor`'s checks into the engine, `cp`'s helper into
+  the runtime (so `shipyard-runtime` no longer links the engine), and `run/detached.rs`
+  split. Includes F48 and the v0.2 architecture review's findings.
+- **D24 — A minimal macOS path, used daily, right after the refactor:** not a throwaway
+  spike. The Mac CLI runs the guest's `shipyard` over vsock (stdio and the terminal
+  forwarded), the project directory shared, published ports on `localhost`; the stage 11
+  API replaces the forwarding.
+- **D25 — Stage 11's API is a subset of Docker's Engine API,** socket-activated (systemd on
+  Linux; forwarded from the VM on macOS), with Shipyard's own data under `/shipyard/…`.
+  The subset is defined and tested by what `docker compose` and Testcontainers use.
+- **D26 — The CLI is a drop-in for `docker` on the everyday commands** (`run`, `ps`, `logs`,
+  `exec`, `build`, `compose`, `images`, `pull`, `push`, `rm`, `stop`…), with Docker's flags,
+  short forms and output formats; Shipyard-only fields only in its own formats or behind
+  flags.
+- **D27 — Compose is `docker compose` against Shipyard's API;** `shipyard compose` passes
+  through to it. No compose engine of Shipyard's own.
+- **D28 — Images are built by BuildKit, started on demand in a container,** driven by
+  `shipyard build`, its cache in a volume. No Dockerfile builder of Shipyard's own.
+- **D29 — macOS:** Apple's Virtualization.framework driven in-process from Rust through
+  `objc2-virtualization`, in a VM-host process that starts on first use and exits when
+  idle (the VM lives as long as that process); one shared VM running the real Linux
+  engine (as OrbStack, Docker Desktop and Podman machine do), not a VM per container; a
+  minimal Alpine root filesystem with Alpine's `linux-virt` kernel, built reproducibly,
+  `shipyard` as the guest agent; Apple Silicon only (Rosetta exists only there). Chosen
+  over libkrun (no Rosetta), Apple's Containerization (macOS 26, Swift-only, a VM per
+  container), and vfkit or Lima (a Go binary run as a subprocess).
+- **D30 — v1.0 is:** Linux (x86-64 and arm64, cgroup v2, kernel ≥ 5.11) and macOS on Apple
+  Silicon; the developer loop through `alias docker=shipyard` (`build`, `run`, `ps`,
+  `logs`, `exec`, `push`, `pull`, `compose`), Testcontainers and devcontainers against
+  the API, x86 images through Rosetta; the Linux host rootless by default with restart
+  policies, boot units and packages; the desktop UI with its observed-traffic map; green
+  CI, OCI conformance as expected, fuzzing and mutation checks on every parser and state
+  machine, signed reproducible releases, every F-row fixed or explicitly accepted. The
+  performance targets (FEATURES §16) are measured and reported, not blocking.
+- **D31 — CI stays off for now** (GitHub billing). It must run again before v1.0 (D30);
+  until then local verification is the check of record. Accepted trade-off: with no
+  outside users either (D21), every check before v1.0 runs on the author's machines.
+
 **Stage 8 decisions (2026-10-09):**
 - **D13:** stage 8 builds the pieces (terminals, a confined `exec`, a monitor that
   captures output and serves attach, `logs`/`attach`/`cp` by runtime ID); the
@@ -170,19 +233,21 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
 |---|---|---|---|
 | **v0.1** | 7 | `shipyard run --image alpine sh` rootless on Linux, on the caller's own terminal: pulled from Docker Hub, isolated, resource-limited, networked. Docker's spelling, `run -it alpine sh`, comes with a pseudo-terminal of the container's own (stage 8: `run -it --image alpine sh` works since step 8.2) and the image as the first argument (stage 9) | reached; release-ready after the readiness pass (doctor, the AppArmor profile, release files; checked by hand on Ubuntu 24.04) |
 | **v0.2** | 9 | Containers run detached and survive the CLI exiting; logs, `exec`, restart policies | **reached (0.2.0)**: containers by name, detached, with `logs`, `attach`, `exec`, `cp`, restart policies (and after a reboot, with `contrib/systemd`), health checks and `events`. The milestone test (`the_v0_2_milestone_a_named_container_end_to_end`), and by hand (step 9.9b), rootless and root, on Ubuntu 24.04 arm64 (AppArmor's restriction on), Fedora 44 arm64 (SELinux enforcing, firewalld) and Ubuntu 24.04 x86-64 (under QEMU), each through a reboot |
-| **v0.3** | 11 | Compose stacks and the API | |
-| **v0.4** | 12 | Works on macOS | |
-| **v1.0** | 14 | Desktop UI, conformance-tested, hardened, packaged | |
+| **v0.3** | 11 | Docker compatibility: the Engine API subset, the drop-in CLI, `docker compose` and Testcontainers against Shipyard; a minimal Mac path since stage 10 (internal, D21) | |
+| **v0.4** | 12 | Images built with `shipyard build` (BuildKit), pushed, tagged (internal) | |
+| **v0.5** | 13 | Works on macOS, production-grade: Rosetta, ballooning, clock sync, fast file sharing (internal) | |
+| **v1.0** | 15 | As D30: both platforms, the developer loop through `alias docker=shipyard`, the Linux host complete, the desktop UI, green CI, conformance, signed releases. **The first public release** | |
 
 ## Decisions
 
-- **Daemonless** (Podman-style). There's no long-running daemon. Each container gets a
-  tiny monitor process instead (built in stage 3 for `shipyard-runtime`), so an idle
-  Shipyard costs nothing.
-- **macOS-first, UNIX-only.**
+- **Daemonless** (Podman-style). There's no root daemon. Each container gets a tiny
+  monitor process instead (built in stage 3 for `shipyard-runtime`), and anything else
+  (the API socket, the macOS VM) starts on first use and stops when idle, so an idle
+  Shipyard costs nothing (D20).
+- **For macOS developers and Linux hosts, UNIX-only** (D18).
   - The CLI, engine and UI are native on macOS and Linux.
-  - Kernel isolation runs on Linux: natively there, and inside a Shipyard-managed VM on
-    macOS.
+  - Kernel isolation runs on Linux: natively there, and inside one Shipyard-managed VM on
+    Apple Silicon Macs (D29).
 - **The runtime is an OCI runtime.**
   - `shipyard-runtime` implements the OCI runtime spec (`config.json`;
     `create / start / kill / delete / state`).
@@ -192,6 +257,9 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
   `nix`, and raw `libc` only where neither does (stage 1, step 1).
   - `nix` over `rustix`: rustix offers no safe `fork`, `execve` or credential-changing
     API for this use, and nix covers the later stages' `clone`, `mount` and `setns`.
+  - `rustix` beside it for what nix lacks (pidfds, some ioctls, `*at` calls), so those
+    stop being raw `libc` (D23, from the v0.2 Rust review: `pidfd_open` was written
+    out four times).
 - **The container's PID 1 is Shipyard's own init** (stage 2). It re-execs the running
   binary to start clean, so every binary that runs containers calls
   `process::init_entry_point()` first in `main`. Its status pipe is never trusted beyond
@@ -263,12 +331,16 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
   binary, non-dumpable before they join, holding nothing of the host's.
 - **The OCI conformance suite gates the runtime** (stage 8, H5): every test passes, or
   fails for a stated reason matched in its output (`scripts/conformance/expected.txt`).
-- **No image building before stage 11.** It's out of scope until then; see
-  [FEATURES.md](FEATURES.md#out-of-scope-on-purpose).
+- **Images are built by BuildKit, in stage 12** (D28), not by a builder of Shipyard's own.
 
 ## Open questions
 
 Decide these when we reach them:
 
-- Whether to ship a Docker-compatible API subset (stage 11).
-- UI framework: Tauri or alternatives (stage 13).
+- UI framework: Tauri or alternatives (stage 14).
+- The macOS version floor: 13 (Rosetta) or 14, decided in stage 10's Mac path (D29).
+- How CI runs again before v1.0: restored GitHub billing or a self-hosted runner (D31).
+- Which of the Docker Engine API's endpoints and versions the subset covers: set by what
+  `docker compose` and Testcontainers use (D25), listed in stage 11's plan.
+
+Decided: the Docker-compatible API (D25, 2026-10-15).
