@@ -3,7 +3,7 @@
 A lightweight, daemonless container engine written in Rust: a minimal-overhead
 alternative to Docker / Podman / OrbStack with a small, clean interface.
 
-> **Status: v0.2** (0.2.0, unreleased). On Linux, `shipyard run alpine sh` pulls an
+> **Status: v0.2** (0.2.0). On Linux, `shipyard run alpine sh` pulls an
 > image from Docker Hub and runs it **rootless**, isolated in its own namespaces,
 > confined (capabilities, `no_new_privs`, seccomp), resource-limited (cgroup v2), and
 > **networked** (pasta without root, bridge networks as root, published ports,

@@ -5,7 +5,7 @@ All notable changes to Shipyard. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change
 behaviour; each change is listed here).
 
-## 0.2.0 - unreleased
+## 0.2.0 - 2026-10-15
 
 ### Added
 
