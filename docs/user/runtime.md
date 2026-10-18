@@ -534,8 +534,10 @@ shipyard-runtime create --hold-fd 9=lock:web --exit-command /usr/local/bin/clean
   holds may share a label (two ports, say), but then neither can be let go of by it.
   At most 2100, with labels of at most 96 KiB all told. The container never has it
   (nor do its hooks). N
-  must be open, above 2, given once, and not one of those passed to the container
-  (`--preserve-fds`): "--hold-fd N: not a descriptor the monitor can hold". A lock
+  must be open, above 2, given once, not one of those passed to the container
+  (`--preserve-fds`), and a file, a directory or a socket (not a pipe or a device):
+  "--hold-fd N: not a descriptor the monitor can hold (it must be open, above 2, given
+  once, not passed to the container, and a file, a directory or a socket)". A lock
   taken with `flock` stays held as long as the monitor has its copy, whatever the
   caller does with its own, short of unlocking it: an unlock through any copy
   releases it for all.

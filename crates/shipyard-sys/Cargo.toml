@@ -1,0 +1,24 @@
+[package]
+name = "shipyard-sys"
+description = "Shipyard's shared plumbing: atomic writes, bounded reads, locks, pidfds, descriptor passing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `openat`, `renameat`, `fstat`, `fsync` relative to a directory descriptor.
+nix.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `pidfd_open` (nix has none). Its `pidfd_send_signal` can't send signal 0 or
+# a real-time one: that call stays raw (`pidfd::send_signal`). Its `recvmsg`,
+# which yields a truncated message's descriptors (nix's gives none: F54).
+rustix.workspace = true
+
+[lints]
+workspace = true

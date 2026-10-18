@@ -20,6 +20,9 @@ no command at all prints its help and exits with `125`.)
 
 When whatever reads Shipyard's output stops early (`shipyard ps | head -1`), the
 command ends quietly with `0`: nothing went wrong, the reader had what it wanted.
+That's its standard output's reader: `logs` whose standard error is closed while its
+standard output is still read fails (`125`, or `1` from `shipyard-runtime logs`), as
+that output is lost.
 
 ## Common signal codes
 

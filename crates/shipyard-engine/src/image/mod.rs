@@ -61,7 +61,7 @@ use crate::error::ErrorKind;
 use crate::error::{Context as _, Error, Result, bail};
 #[cfg(target_os = "linux")]
 use crate::report::Reporter;
-use crate::report::{Event, Progress, WarningKind};
+use crate::report::{Message, Progress, WarningKind};
 
 /// When a run pulls its image (`--pull`), as Docker's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +78,7 @@ pub enum PullPolicy {
 /// runtime defaults, and the run's writable area.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-pub struct Prepared {
+pub(crate) struct Prepared {
     /// The merged mount point — the container's root filesystem path. The
     /// runtime mounts the overlay here, then binds and pivots into it.
     pub root: PathBuf,
@@ -102,7 +102,7 @@ pub struct Prepared {
 /// dropped or ended, it's only unlocked (its files are the container's,
 /// kept until `rm`); only `remove_owned_area` removes it.
 #[cfg(target_os = "linux")]
-pub struct RunArea {
+pub(crate) struct RunArea {
     store: Store,
     area: Option<shipyard_image::ContainerArea>,
     /// A container's own: unlocked, never removed, as it goes.
@@ -113,7 +113,7 @@ pub struct RunArea {
 #[cfg(target_os = "linux")]
 impl RunArea {
     /// Removes the area, now the container has ended.
-    pub fn remove(mut self) {
+    pub(crate) fn remove(mut self) {
         self.clean_up();
     }
 
@@ -206,7 +206,7 @@ impl Drop for RunArea {
 /// # Errors
 ///
 /// If the store can't be made, or it's reachable by other users.
-pub fn open_store(engine: &Engine) -> Result<Store> {
+pub(crate) fn open_store(engine: &Engine) -> Result<Store> {
     Store::open(engine.paths().image_store()?).context("opening the image store")
 }
 
@@ -219,7 +219,7 @@ pub fn open_store(engine: &Engine) -> Result<Store> {
 /// Returns an error if the image can't be found or pulled, or a layer can't
 /// be extracted.
 #[cfg(target_os = "linux")]
-pub fn prepare(
+pub(crate) fn prepare(
     engine: &Engine,
     reference: &str,
     policy: PullPolicy,
@@ -576,11 +576,11 @@ fn download(
     platform: &Platform,
     options: shipyard_image::PullOptions,
 ) -> Result<Pulled> {
-    engine.report(Event::Progress(Progress::Pulling {
+    engine.report(Message::Progress(Progress::Pulling {
         image: image.to_string(),
     }));
     let progress = |layer: &Descriptor, fetched: bool| {
-        engine.report(Event::Progress(Progress::Layer {
+        engine.report(Message::Progress(Progress::Layer {
             short_digest: layer.digest.hex().chars().take(12).collect(),
             downloaded: fetched.then_some(layer.size),
         }));

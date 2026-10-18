@@ -40,7 +40,9 @@ pub mod security;
 /// guard, stage 8).
 #[cfg(unix)]
 pub mod terminal {
-    pub use crate::process::terminal::{RawMode, terminal_size};
+    pub use crate::process::terminal::{
+        DEFAULT_SIZE, RawMode, Size, host_pty, set_window_size, terminal_size,
+    };
 }
 mod small_file;
 

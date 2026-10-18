@@ -16,7 +16,9 @@ on macOS and for Linux hosts.
 > restart policies (and containers back after a reboot, with the
 > [systemd units](contrib/systemd/README.md)), health checks, `network connect` and
 > `disconnect` on a running container, and `shipyard events`.
-> **Not yet:** isolation on macOS (planned, Apple Silicon only), Docker API compatibility and image building (planned). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
+> On an Apple Silicon Mac (built from source since stage 10, not yet released), every
+> command runs in a small Linux VM of Shipyard's own: [macOS](docs/user/macos.md).
+> **Not yet:** Docker API compatibility and image building (planned). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
 > works is in the [user docs](docs/user/README.md), and the
 > [limitations](docs/user/README.md#limitations-in-v02) are listed there.
 
@@ -69,6 +71,7 @@ crates/
   shipyard-network/        # its own netlink (rtnetlink, nf_tables), networks and leases, pasta, DNS
   shipyard-storage/        # named volumes
   shipyard-engine/         # the engine: orchestration above the runtime, behind typed APIs
+  shipyard-sys/            # the shared plumbing: atomic writes, bounded reads, locks, pidfds, fd passing
   shipyard-test-support/   # helpers for the end-to-end tests (dev only)
 contrib/apparmor/          # the AppArmor profile for hosts that restrict user namespaces
 contrib/systemd/           # units that bring containers back after a reboot
@@ -92,7 +95,7 @@ and Shipyard will too:
 | Host  | CLI / engine / UI | Container isolation |
 |-------|-------------------|---------------------|
 | Linux | native            | native, on the host kernel |
-| macOS (Apple Silicon) | native | inside one lightweight Linux VM managed by Shipyard (planned; until then, commands run unisolated) |
+| macOS (Apple Silicon) | native | inside one lightweight Linux VM managed by Shipyard (stage 10: built from source, its guest by `scripts/guest/build.sh`; [macOS](docs/user/macos.md)) |
 
 ## Contributing and security
 

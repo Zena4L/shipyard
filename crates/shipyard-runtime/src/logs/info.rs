@@ -19,6 +19,9 @@ pub const FORMAT: &str = "cri";
 /// The layout this code writes and reads.
 pub const VERSION: u32 = 1;
 
+/// The most of `log.json` read: a few dozen bytes; more is not `log.json`.
+const INFO_MAX: u64 = 64 * 1024;
+
 /// How the logs are kept: rotated by size and count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,21 +137,7 @@ impl LogInfo {
     ///
     /// [`InfoError`]: unreadable, malformed, or another format or version.
     pub fn read_at(dir: impl AsFd) -> Result<Self, InfoError> {
-        use std::io::Read as _;
-        let fd = nix::fcntl::openat(
-            dir,
-            INFO_FILE,
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_NOFOLLOW
-                | nix::fcntl::OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        )
-        .map_err(|errno| InfoError::Read(errno.into()))?;
-        let mut text = Vec::new();
-        // A few dozen bytes; more is not `log.json`.
-        std::fs::File::from(fd)
-            .take(64 * 1024)
-            .read_to_end(&mut text)
+        let text = shipyard_sys::fs::read_bounded_at(dir.as_fd(), INFO_FILE, INFO_MAX)
             .map_err(InfoError::Read)?;
         Self::from_json(&text)
     }
@@ -182,6 +171,32 @@ impl LogInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One larger than any written isn't read: refused as such.
+    #[test]
+    fn a_log_json_over_its_bound_is_refused() {
+        let dir = std::env::temp_dir().join(format!("shipyard-log-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = br#"{"format": "cri", "version": 1, "maxSize": 4096, "maxFiles": 2}"#;
+        std::fs::write(dir.join(INFO_FILE), written).unwrap();
+        let opened = std::fs::File::open(&dir).unwrap();
+        assert!(LogInfo::read_at(&opened).is_ok(), "the control");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(INFO_FILE))
+            .unwrap();
+        file.set_len(INFO_MAX + 1).unwrap();
+        let err = LogInfo::read_at(&opened).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let InfoError::Read(source) = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(
+            shipyard_sys::fs::refusal(source),
+            Some(shipyard_sys::fs::Refusal::TooLarge { cap: INFO_MAX })
+        );
+    }
 
     #[test]
     fn version_1_is_read() {

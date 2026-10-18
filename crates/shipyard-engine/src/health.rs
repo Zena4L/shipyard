@@ -399,22 +399,7 @@ impl Health {
     /// waiting on a FIFO) of at most 1 MiB.
     #[must_use]
     pub fn read(dir: &Path) -> Option<Self> {
-        use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(dir.join(FILE))
-            .ok()?;
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_FILE + 1).read_to_end(&mut bytes).ok()?;
-        if bytes.len() as u64 > MAX_FILE {
-            return None;
-        }
-        Self::from_json(&bytes)
+        Self::from_json(&shipyard_sys::fs::read_bounded(&dir.join(FILE), MAX_FILE).ok()?)
     }
 }
 

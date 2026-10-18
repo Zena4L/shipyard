@@ -69,7 +69,8 @@ pub(crate) use setup::{SpecSetup, container_security};
 pub(crate) use signal::discard_pending;
 pub(crate) use signal::is_pending;
 pub use signal::{Signal, SignalError};
-pub use signals::{SignalWatch, Taken};
+pub(crate) use signals::ResizeWatch;
+pub use signals::{SignalWatch, Taken, is_forwardable};
 #[cfg(target_os = "linux")]
 pub(crate) use spawn::ExecSpawn;
 pub use spawn::die_from;

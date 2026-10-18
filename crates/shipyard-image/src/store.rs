@@ -124,6 +124,13 @@ impl StoreLock {
     /// child ends too. Given to the storage helper, so work it does for
     /// this process stays covered if this process dies first.
     ///
+    /// The one scoped lock (`shipyard_sys::lock`) handed to another process:
+    /// this value's drop lets it go for the copy too (`LOCK_UN` on the one
+    /// description), so it must outlive the child. The engine waits for the
+    /// helper before letting this go; only a failed `wait` (which leaves it
+    /// unknown whether the helper still runs) would let a helper still at
+    /// work lose it.
+    ///
     /// # Errors
     ///
     /// The `dup(2)` errno.

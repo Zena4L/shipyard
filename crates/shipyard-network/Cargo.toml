@@ -18,6 +18,9 @@ nix.workspace = true
 # Networks' configs and leases on disk.
 serde.workspace = true
 serde_json.workspace = true
+# Configs written whole and read with a bound, locks, pidfds, inherited
+# descriptors (stage 10).
+shipyard-sys.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

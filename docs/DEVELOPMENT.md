@@ -337,6 +337,63 @@ only when something got worse (a check that passed now fails, a fuzz crash, miss
 mutants) or when it couldn't run at all (Docker down, no network): silence means it ran
 and nothing regressed. Docker must be running at night; the Mac is kept awake for the run.
 
+## Shipyard's own VM on a Mac (step 10.3)
+
+On an Apple Silicon Mac, Shipyard runs containers in one Linux VM of its own,
+booted with Virtualization.framework. Two things make it work from a checkout:
+
+**The guest**, built once (and again after a change to the engine's code: the
+guest runs a static `shipyard` of this tree's):
+
+```sh
+scripts/guest/build.sh            # in the test container; writes target/guest/
+```
+
+It's Alpine's `linux-virt` kernel (unpacked: the framework boots a raw arm64
+`Image`) and an initramfs holding the whole guest: Alpine's minirootfs, the
+kernel's modules, `e2fsprogs` and the static `shipyard` as `/init`. What it's
+built from is pinned in `scripts/guest/alpine.lock`; `manifest.json` beside it says
+what it was made of, and the VM checks the files against it before it boots.
+
+**The entitlement.** macOS gives a VM only to a binary signed with
+`com.apple.security.virtualization` (`contrib/macos/shipyard.entitlements`). The
+linker's own signature has none, so every build is signed again:
+
+```sh
+scripts/macos/sign.sh             # every shipyard binary under target/
+```
+
+`cargo run` and `cargo test` do it themselves: `.cargo/config.toml` makes
+`scripts/macos/sign-and-run.sh` cargo's runner on a Mac. A binary the tests start
+(`CARGO_BIN_EXE_shipyard`) isn't run by cargo: the VM tests sign it first.
+
+Then:
+
+```sh
+export SHIPYARD_GUEST_DIR=$PWD/target/guest
+target/debug/shipyard vm start    # boots the guest (about a second)
+target/debug/shipyard vm status
+target/debug/shipyard vm run run --rm alpine echo hi   # hidden, until 10.3b
+target/debug/shipyard vm stop     # its containers stopped, the guest powered off
+```
+
+The VM keeps its files in `~/Library/Application Support/Shipyard/vm`
+(`SHIPYARD_VM_DIR`): its data disk (a sparse 64 GiB file), `console.log` (the
+guest's console: why a boot failed), `host.log`, its lock and its socket.
+
+`cargo run` and `cargo test` run commands on the Mac itself, not in the VM:
+`.cargo/config.toml` sets `SHIPYARD_VM=off` for them (a value in your shell wins), so
+the macOS tests keep checking the native path. Run the built binary
+(`target/debug/shipyard`) to use the VM.
+
+The VM's end-to-end tests run only where asked, with a guest built (each boots a VM;
+four run at once):
+
+```sh
+SHIPYARD_TEST_VM=required cargo test -p shipyard-cli --test vm --test vm_terminal
+.claude/skills/shipyard-verify/scripts/verify.sh --vm   # the guest built first, then both
+```
+
 ## Running Linux-only stages on macOS: Lima VM
 
 Eventually Shipyard manages its own VM (a minimal path in roadmap stage 10, production-grade in stage 13). Until then,

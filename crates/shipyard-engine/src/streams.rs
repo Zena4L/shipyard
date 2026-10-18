@@ -14,6 +14,10 @@
 //!
 //! **Without isolation** the command is the user's own process, not a
 //! container: it keeps Shipyard's descriptors, terminal and all.
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "a run's streams are set up on Linux")
+)]
 
 use std::io::IsTerminal;
 
@@ -23,7 +27,7 @@ use crate::StreamsError;
 
 /// How the run's command runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Runs {
+pub(crate) enum Runs {
     /// On the host, as the user's own process (`--no-isolation`; macOS).
     #[default]
     Unisolated,
@@ -34,15 +38,15 @@ pub enum Runs {
     Bundle {
         /// It does (`process.terminal`): as if `-t` were given.
         terminal: bool,
-        /// The terminal's size (rows, columns) when there's none to copy it
-        /// from (`process.consoleSize`).
-        size: Option<(u16, u16)>,
+        /// The terminal's size when there's none to copy it from
+        /// (`process.consoleSize`).
+        size: Option<shipyard_runtime::terminal::Size>,
     },
 }
 
 /// What the run asked for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Request {
+pub(crate) struct Request {
     /// `-t`: a pseudo-terminal of the container's own.
     pub tty: bool,
     /// `-i`: keep stdin open, and pass it on.
@@ -53,7 +57,7 @@ pub struct Request {
 
 /// Which of Shipyard's own standard descriptors are terminals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Terminals {
+pub(crate) struct Terminals {
     /// Descriptor 0.
     pub stdin: bool,
     /// Descriptor 1.
@@ -65,7 +69,7 @@ pub struct Terminals {
 impl Terminals {
     /// This process's own.
     #[must_use]
-    pub fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         Self {
             stdin: std::io::stdin().is_terminal(),
             stdout: std::io::stdout().is_terminal(),
@@ -83,7 +87,7 @@ impl Terminals {
 /// terminal (Docker's rule: there'd be nothing to type with), and
 /// [`StreamsError::TerminalFromBundle`] for `-t` with a bundle (whose
 /// `process.terminal` says, and is then taken as `-t`).
-pub fn plan(request: Request, host: Terminals) -> Result<Stdio, StreamsError> {
+pub(crate) fn plan(request: Request, host: Terminals) -> Result<Stdio, StreamsError> {
     let passed_on = |terminal: bool| {
         if terminal {
             Stream::Relay
@@ -273,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_bundles_terminal_is_taken_as_t() {
-        let size = Some((30, 100));
+        let size = Some(shipyard_runtime::terminal::Size::new(30, 100));
         let bundle = |interactive| Request {
             interactive,
             runs: Runs::Bundle {

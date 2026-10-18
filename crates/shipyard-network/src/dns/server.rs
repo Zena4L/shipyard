@@ -63,7 +63,8 @@ const TICK: Duration = Duration::from_secs(1);
 const MAX_FORWARDS: Places = Places::new(64, 16);
 
 /// The most TCP connections at once, and from one container; one past
-/// that is closed.
+/// that is closed. Each lives [`CONNECTION_LIFETIME`] at most, so its
+/// place always comes back (F58).
 const MAX_CONNECTIONS: Places = Places::new(64, 8);
 
 /// The most tasks (threads) a server has at once: its main thread, the UDP
@@ -80,6 +81,14 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long a TCP client may take to send a query, whole: from its first
 /// byte (or the last answer) to its last.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a TCP connection is read from, from when it's served, whatever
+/// it sends (F58): a query read by then is still answered (forwarded within
+/// [`FORWARD_TIMEOUT`], written within [`CLIENT_TIMEOUT`]), then it's
+/// closed, and a resolver opens another (RFC 7766 lets a server close an
+/// idle or busy connection). Without it, a client sending a query every few
+/// seconds kept its place for good.
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(30);
 
 /// The most upstream resolvers asked (as resolv.conf's `MAXNS`).
 const MAX_UPSTREAMS: usize = 3;
@@ -799,19 +808,37 @@ fn serve_tcp(listener: &TcpListener, shared: &Arc<Shared>) {
     }
 }
 
-/// Answers the queries on a TCP connection, one after the other, until the
-/// client closes it, or takes longer than [`CLIENT_TIMEOUT`] to send one.
-fn serve_connection(mut stream: TcpStream, shared: &Shared, client: IpAddr) {
+/// Answers the queries on a TCP connection from `client`, for
+/// [`CONNECTION_LIFETIME`] at most ([`serve_frames`]).
+fn serve_connection(stream: TcpStream, shared: &Shared, client: IpAddr) {
+    serve_frames(stream, CONNECTION_LIFETIME, |message| {
+        match respond(message, shared, client) {
+            Response::Now(bytes) => Some(bytes),
+            Response::Forward(query) => {
+                Some(forward_tcp(message, &shared.upstreams()).unwrap_or_else(|| servfail(&query)))
+            }
+            Response::Nothing => None,
+        }
+    });
+}
+
+/// Answers the queries on a TCP connection, one after the other, each with
+/// what `answer` says (`None`: the connection closed), until the client
+/// closes it, takes longer than [`CLIENT_TIMEOUT`] to send one, or the
+/// connection has lived `lifetime` (a query being read then isn't waited
+/// for; one read before is answered).
+fn serve_frames(
+    mut stream: TcpStream,
+    lifetime: Duration,
+    mut answer: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+) {
+    let end = Instant::now() + lifetime;
     if stream.set_write_timeout(Some(CLIENT_TIMEOUT)).is_err() {
         return;
     }
-    while let Some(message) = read_frame(&mut stream, CLIENT_TIMEOUT) {
-        let reply = match respond(&message, shared, client) {
-            Response::Now(bytes) => bytes,
-            Response::Forward(query) => {
-                forward_tcp(&message, &shared.upstreams()).unwrap_or_else(|| servfail(&query))
-            }
-            Response::Nothing => return,
+    while let Some(message) = read_frame(&mut stream, end.min(Instant::now() + CLIENT_TIMEOUT)) {
+        let Some(reply) = answer(&message) else {
+            return;
         };
         let Ok(framed) = message::frame(&reply) else {
             return;
@@ -822,11 +849,10 @@ fn serve_connection(mut stream: TcpStream, shared: &Shared, client: IpAddr) {
     }
 }
 
-/// A message framed for TCP, read whole from `stream` within `within`
+/// A message framed for TCP, read whole from `stream` by `deadline`
 /// (`None` at its end, on an error, or if it takes longer: a byte at a time
 /// doesn't keep a connection forever).
-fn read_frame(stream: &mut TcpStream, within: Duration) -> Option<Vec<u8>> {
-    let deadline = Instant::now() + within;
+fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8>> {
     let mut length = [0u8; 2];
     read_by(stream, &mut length, deadline)?;
     let mut message = vec![0u8; usize::from(u16::from_be_bytes(length))];
@@ -904,7 +930,7 @@ fn forward_tcp(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
         if stream.set_write_timeout(Some(wait)).is_err() || stream.write_all(&framed).is_err() {
             continue;
         }
-        if let Some(reply) = read_frame(&mut stream, wait)
+        if let Some(reply) = read_frame(&mut stream, Instant::now() + wait)
             && message::answers(&reply, query)
         {
             return Some(reply);
@@ -1063,7 +1089,7 @@ mod tests {
         let answering = std::thread::spawn(move || {
             let (mut stream, _) = upstream.accept().unwrap();
             assert_eq!(
-                read_frame(&mut stream, Duration::from_secs(5)).unwrap(),
+                read_frame(&mut stream, Instant::now() + Duration::from_secs(5)).unwrap(),
                 example().0
             );
             let right = message::response(&query, rcode::NOERROR, false, &[RData::A(WORLD)]);
@@ -1087,20 +1113,74 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
+        let within = |time: Duration| Instant::now() + time;
         client.write_all(b"\x00\x03abc\x00\x05ab").unwrap();
         assert_eq!(
-            read_frame(&mut server, Duration::from_secs(5)).unwrap(),
+            read_frame(&mut server, within(Duration::from_secs(5))).unwrap(),
             b"abc"
         );
         // Two bytes of five, then nothing: given up on at the deadline,
         // however long the connection stays open.
         let started = Instant::now();
-        assert_eq!(read_frame(&mut server, Duration::from_millis(300)), None);
+        assert_eq!(
+            read_frame(&mut server, within(Duration::from_millis(300))),
+            None
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         // Closed early.
         client.write_all(b"\x00\x09ab").unwrap();
         drop(client);
-        assert_eq!(read_frame(&mut server, Duration::from_secs(5)), None);
+        assert_eq!(
+            read_frame(&mut server, within(Duration::from_secs(5))),
+            None
+        );
+    }
+
+    /// A connection is closed once it has lived its lifetime, however
+    /// often its client asks (F58): queries every 100 ms, each answered
+    /// while it lives (the control), then the end, within the lifetime and
+    /// one query's read of it.
+    #[test]
+    fn a_connection_is_closed_at_its_lifetime() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let lifetime = Duration::from_millis(500);
+        // Before the server's own clock starts: never after its end.
+        let started = Instant::now();
+        let serving = std::thread::spawn(move || {
+            serve_frames(server, lifetime, |message| Some(message.to_vec()));
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut answered = 0;
+        loop {
+            assert!(
+                started.elapsed() < lifetime + Duration::from_secs(2),
+                "still open after {:?}",
+                started.elapsed()
+            );
+            if client.write_all(b"\x00\x02hi").is_err() {
+                break;
+            }
+            let mut reply = [0u8; 4];
+            match client.read_exact(&mut reply) {
+                Ok(()) => {
+                    assert_eq!(&reply, b"\x00\x02hi");
+                    answered += 1;
+                }
+                Err(_) => break,
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        serving.join().unwrap();
+        assert!(answered >= 2, "answered while it lived: {answered}");
+        assert!(
+            started.elapsed() >= lifetime,
+            "closed before its lifetime: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

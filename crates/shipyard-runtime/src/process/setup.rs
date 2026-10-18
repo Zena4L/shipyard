@@ -101,8 +101,7 @@ pub(crate) struct TerminalSetup {
     /// or an OCI console socket.
     pub(crate) socket: RawFd,
     /// Its size, the user's terminal's (or the bundle's `consoleSize`).
-    pub(crate) rows: u16,
-    pub(crate) cols: u16,
+    pub(crate) size: super::terminal::Size,
     /// Whether the receiver answers once it relays the master (Shipyard's
     /// own relay, which the command waits for), or not (an OCI console
     /// socket, at a start gate or for `exec`: runc's protocol has no answer).

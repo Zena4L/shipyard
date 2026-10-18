@@ -143,6 +143,8 @@ pub struct Shell {
     control: File,
     /// The shipyard binary that [`Shell::spawn`] starts.
     shipyard: &'static str,
+    /// Variables a job gets beyond `TERM` (set, or with `None` removed).
+    env: Vec<(String, Option<std::ffi::OsString>)>,
 }
 
 // The job-control methods take `&mut self` on purpose: they're the shell's
@@ -161,6 +163,17 @@ impl Shell {
         let foreground = mode == Mode::Foreground;
         let mut command = Command::new(program);
         command.args(args).env_clear().env("TERM", TERM);
+        // On a Mac, whether commands run there or in Shipyard's VM is the
+        // test's to say (`.cargo/config.toml` turns the VM off for cargo).
+        if let Some(vm) = std::env::var_os("SHIPYARD_VM") {
+            command.env("SHIPYARD_VM", vm);
+        }
+        for (name, value) in &self.env {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
         // SAFETY: only async-signal-safe calls, as `pre_exec` requires.
         unsafe {
             command.pre_exec(move || {
@@ -379,6 +392,21 @@ impl Session {
     /// keeps running ordinary Rust code (it allocates, uses `Command`), which
     /// is only sound when no other thread could hold a lock at the fork.
     pub unsafe fn start(shipyard: &'static str, script: fn(&mut Shell)) -> Self {
+        // SAFETY: the caller's promise, passed on.
+        unsafe { Self::start_with_env(shipyard, Vec::new(), script) }
+    }
+
+    /// [`start`](Self::start), the jobs given `env` too: each variable set,
+    /// or with `None` removed (a Mac's `SHIPYARD_VM`, for the VM's tests).
+    ///
+    /// # Safety
+    ///
+    /// As [`start`](Self::start)'s: the calling process is single-threaded.
+    pub unsafe fn start_with_env(
+        shipyard: &'static str,
+        env: Vec<(String, Option<std::ffi::OsString>)>,
+        script: fn(&mut Shell),
+    ) -> Self {
         let size = Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -403,7 +431,13 @@ impl Session {
                 // Nothing may unwind out of here: it would land in the test
                 // runner's code, and this copy would run the other tests.
                 let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    run_shell(pty.slave, events_write, control_read, shipyard, script)
+                    run_shell(
+                        pty.slave,
+                        events_write,
+                        control_read,
+                        (shipyard, env),
+                        script,
+                    )
                 }))
                 .unwrap_or(1);
                 // SAFETY: `_exit` ends the forked shell without running the
@@ -705,13 +739,14 @@ fn run_shell(
     slave: OwnedFd,
     events: OwnedFd,
     control: OwnedFd,
-    shipyard: &'static str,
+    (shipyard, env): (&'static str, Vec<(String, Option<std::ffi::OsString>)>),
     script: fn(&mut Shell),
 ) -> i32 {
     let mut shell = Shell {
         events: File::from(events),
         control: File::from(control),
         shipyard,
+        env,
     };
     let became = become_interactive_shell(&slave);
     // Now stdin, stdout and stderr; the original isn't needed.

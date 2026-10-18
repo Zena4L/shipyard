@@ -50,6 +50,10 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard system df`↴](#shipyard-system-df)
 * [`shipyard system recover`↴](#shipyard-system-recover)
 * [`shipyard system stop`↴](#shipyard-system-stop)
+* [`shipyard vm`↴](#shipyard-vm)
+* [`shipyard vm start`↴](#shipyard-vm-start)
+* [`shipyard vm status`↴](#shipyard-vm-status)
+* [`shipyard vm stop`↴](#shipyard-vm-stop)
 * [`shipyard doctor`↴](#shipyard-doctor)
 
 ## `shipyard`
@@ -85,6 +89,7 @@ A lightweight container engine
 * `volume` — Manage named volumes
 * `network` — Manage networks (bridges containers share; Linux, root)
 * `system` — System-wide information and maintenance
+* `vm` — The Linux VM containers run in on a Mac: its status, start and stop
 * `doctor` — Check whether this host can run containers, and what to fix
 
 ###### **Options:**
@@ -869,7 +874,7 @@ System-wide information and maintenance
 
 * `df` — Show the store's disk usage
 * `recover` — Settle containers that ended unwatched, then start those whose restart policy brings them back when the host starts (what the boot unit runs: see contrib/systemd)
-* `stop` — Stop every container that's up, for the host's shutdown, each with its own stop signal and timeout: not as your stop (their restart policy brings them back at boot), and none restarted until `system recover` (what the boot unit runs as it stops)
+* `stop` — Stop every container that's up, for the host's shutdown, each with its own stop signal and timeout: not as your stop (their restart policy brings them back at boot), and none restarted until `system recover` (what shipyard-stop.service runs at a shutdown)
 
 
 
@@ -891,9 +896,47 @@ Settle containers that ended unwatched, then start those whose restart policy br
 
 ## `shipyard system stop`
 
-Stop every container that's up, for the host's shutdown, each with its own stop signal and timeout: not as your stop (their restart policy brings them back at boot), and none restarted until `system recover` (what the boot unit runs as it stops)
+Stop every container that's up, for the host's shutdown, each with its own stop signal and timeout: not as your stop (their restart policy brings them back at boot), and none restarted until `system recover` (what shipyard-stop.service runs at a shutdown)
 
 **Usage:** `shipyard system stop`
+
+
+
+## `shipyard vm`
+
+The Linux VM containers run in on a Mac: its status, start and stop
+
+**Usage:** `shipyard vm <COMMAND>`
+
+###### **Subcommands:**
+
+* `start` — Start the VM, if it isn't running, and wait for its guest to boot
+* `status` — Say whether the VM runs, which guest it boots, and the ports it forwards to this Mac
+* `stop` — Stop the VM: its containers stopped in order, then the guest powered off
+
+
+
+## `shipyard vm start`
+
+Start the VM, if it isn't running, and wait for its guest to boot
+
+**Usage:** `shipyard vm start`
+
+
+
+## `shipyard vm status`
+
+Say whether the VM runs, which guest it boots, and the ports it forwards to this Mac
+
+**Usage:** `shipyard vm status`
+
+
+
+## `shipyard vm stop`
+
+Stop the VM: its containers stopped in order, then the guest powered off
+
+**Usage:** `shipyard vm stop`
 
 
 

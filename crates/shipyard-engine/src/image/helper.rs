@@ -39,7 +39,7 @@ pub fn entry_point(init_logging: impl FnOnce()) {
 mod linux {
     use std::ffi::OsString;
     use std::io::{BufRead as _, BufReader, Write as _};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
     use std::os::unix::process::CommandExt as _;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -51,6 +51,7 @@ mod linux {
         IdRanges, LayerReport, LayerSpec, Limits, Ownership, Store, StoreLock, UnpackOptions,
     };
     use shipyard_runtime::isolation::{IdMap, IdMaps};
+    use shipyard_sys::fd::{OnExec, take_inherited};
 
     use crate::error::{Context as _, Error, ErrorKind, Result, bail};
 
@@ -316,22 +317,31 @@ mod linux {
             let _ = writeln!(std::io::stderr(), "shipyard-storage: bad arguments");
             std::process::exit(125);
         };
-        // SAFETY: the caller passed these four descriptors, open and ours
-        // alone (dups made for this process, closed on its side).
-        let (store, input, output, held) = unsafe {
+        // Four different descriptors: one number twice would be owned, and
+        // closed, twice.
+        let mut numbers = [store, input, output, lock];
+        numbers.sort_unstable();
+        if numbers.windows(2).any(|pair| pair[0] == pair[1]) {
+            let _ = writeln!(std::io::stderr(), "shipyard-storage: bad arguments");
+            std::process::exit(125);
+        }
+        // SAFETY: the caller passed these four descriptors for this process
+        // to own (dups made for it, closed on its side), distinct (checked),
+        // and nothing here has opened anything yet that could be one. The caller's store
+        // lock: held (open) until this process ends, with nothing more to
+        // do with it; close-on-exec, now it's here.
+        let taken = unsafe {
             (
-                OwnedFd::from_raw_fd(store),
-                OwnedFd::from_raw_fd(input),
-                OwnedFd::from_raw_fd(output),
-                OwnedFd::from_raw_fd(lock),
+                take_inherited(store, OnExec::Keep),
+                take_inherited(input, OnExec::Keep),
+                take_inherited(output, OnExec::Keep),
+                take_inherited(lock, OnExec::Close),
             )
         };
-        // The caller's store lock: held (open) until this process ends, with
-        // nothing more to do with it; close-on-exec, now it's here.
-        let _ = nix::fcntl::fcntl(
-            &held,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        );
+        let (Ok(store), Ok(input), Ok(output), Ok(held)) = taken else {
+            let _ = writeln!(std::io::stderr(), "shipyard-storage: bad arguments");
+            std::process::exit(125);
+        };
         init_logging();
         // 0 on success, 1 otherwise (the caller reads the answer, not this).
         let succeeded = helper(&store, input, output);

@@ -579,6 +579,32 @@ fn rename_gives_a_container_a_new_name() {
     stores.ok(&["rm", "site", "db"]);
 }
 
+/// `shipyard logs` ends as its readers do (F70): 125 when stderr's reader
+/// goes while stdout's is read.
+#[test]
+fn logs_end_as_their_readers_do_by_name() {
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "both",
+        "--network",
+        "none",
+        &stores.image,
+        "sh",
+        "-c",
+        "n=0; while [ $n -lt 20000 ]; do echo out $n; echo err $n >&2; n=$((n+1)); done",
+    ]);
+    assert_eq!(stores.ok(&["wait", "both"]).trim(), "0");
+    shipyard_test_support::pipes::logs_end_as_their_readers_do(
+        || stores.command(&["logs", "both"]),
+        125,
+    );
+}
+
 /// `logs`, `exec`, `cp` and `attach` by name: a stopped container's logs,
 /// and its files copied out and in; exec's exit codes (the command's, 127
 /// for one that isn't there); a running container's file copied out;
@@ -642,6 +668,59 @@ fn logs_exec_cp_and_attach_by_name() {
         "shipyard test root filesystem\n"
     );
     stores.ok(&["rm", "-f", "web", "once"]);
+}
+
+/// `logs -f` ends, quietly, once its reader has gone (`logs -f web | head
+/// -n1`), though the container runs on and writes nothing more: between
+/// its looks it asks whether stdout's reader is there (F78).
+#[test]
+fn logs_follow_ends_when_its_reader_goes() {
+    use std::io::BufRead as _;
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "quiet",
+        "--network",
+        "none",
+        &stores.image,
+        "sh",
+        "-c",
+        "echo first; exec sleep 300",
+    ]);
+    let mut follow = stores
+        .command(&["logs", "-f", "quiet"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Its first line read (the control: it follows), then its reader gone.
+    let mut stdout = std::io::BufReader::new(follow.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "first\n");
+    drop(stdout);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = follow.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = follow.kill();
+            panic!("it followed with no reader");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(follow.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert_eq!(stderr, "");
+    // It ended for its reader, not its container's end.
+    assert!(stores.ok(&["ps"]).contains("Up"));
+    stores.ok(&["rm", "-f", "quiet"]);
 }
 
 /// Stage 9's milestone (v0.2), through the `shipyard` binary, on one

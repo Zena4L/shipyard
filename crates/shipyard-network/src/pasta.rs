@@ -133,6 +133,14 @@ impl Features {
     /// depending on the version): asked once, when a run is checked, never
     /// while a container waits for its network.
     pub fn of(pasta: &Path) -> Result<Features, PastaError> {
+        Self::asked(pasta).map(|(features, _)| features)
+    }
+
+    /// [`of`](Self::of), and whether the answer can be kept: pasta's
+    /// `--help` ended well (exit 0) and said something. One killed, or cut
+    /// short, says no features, true for this run at worst, and never kept
+    /// for the next (F50).
+    fn asked(pasta: &Path) -> Result<(Features, bool), PastaError> {
         let help = std::process::Command::new(pasta)
             .arg("--help")
             .stdin(std::process::Stdio::null())
@@ -143,8 +151,104 @@ impl Features {
             })?;
         let mut text = String::from_utf8_lossy(&help.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&help.stderr));
-        Ok(Features::from_help(&text))
+        let keepable = help.status.success() && !text.trim().is_empty();
+        Ok((Features::from_help(&text), keepable))
     }
+
+    /// [`of`](Self::of), kept in the file `at` (the caller's runtime
+    /// directory: gone at logout or a reboot) for as long as `pasta` is the
+    /// same binary (its path, device, inode, size, and modification and
+    /// change times: the change time no one can set, and any write moves):
+    /// asking runs it, and pasta writes its help to the system log too,
+    /// about 60 lines a run (F50). With no `at`, or `pasta` that can't be
+    /// looked at, it's asked. A record that doesn't match, or can't be
+    /// read, is asked again and written anew; a newer Shipyard's (a later
+    /// version) is asked again and left as it is. A record that can't be
+    /// written (the directory not made yet: a first run) costs only the
+    /// log lines next time; an answer from a `--help` that failed is never
+    /// kept. Two callers finding pasta at two paths (two `PATH`s) keep
+    /// replacing each other's record, and ask as before F50.
+    ///
+    /// # Errors
+    ///
+    /// `pasta` can't be run ([`of`](Self::of)).
+    pub fn cached(pasta: &Path, at: Option<&Path>) -> Result<Features, PastaError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let (Some(at), Ok(metadata)) = (at, std::fs::metadata(pasta)) else {
+            return Self::of(pasta);
+        };
+        let record = |features: Features| KeptFeatures {
+            v: KEPT_VERSION,
+            path: pasta.to_owned(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+            ns_ifname: features.ns_ifname,
+            no_netns_quit: features.no_netns_quit,
+        };
+        let text = shipyard_sys::fs::read_bounded(at, KEPT_MAX).ok();
+        let version = text
+            .as_deref()
+            .and_then(|text| serde_json::from_slice::<KeptVersion>(text).ok())
+            .map(|kept| kept.v);
+        if version == Some(KEPT_VERSION)
+            && let Some(kept) = text
+                .as_deref()
+                .and_then(|text| serde_json::from_slice::<KeptFeatures>(text).ok())
+        {
+            let features = Features {
+                ns_ifname: kept.ns_ifname,
+                no_netns_quit: kept.no_netns_quit,
+            };
+            if kept == record(features) {
+                return Ok(features);
+            }
+        }
+        let (features, keepable) = Self::asked(pasta)?;
+        if keepable
+            && version.is_none_or(|version| version <= KEPT_VERSION)
+            && let Ok(json) = serde_json::to_vec(&record(features))
+        {
+            let _ =
+                shipyard_sys::fs::write_atomically(at, &json, &shipyard_sys::fs::Write::new(0o600));
+        }
+        Ok(features)
+    }
+}
+
+/// The version of [`KeptFeatures`] this Shipyard writes (H2).
+const KEPT_VERSION: u32 = 1;
+
+/// The most a kept record is read of.
+const KEPT_MAX: u64 = 4096;
+
+/// What a pasta binary can do, as [`Features::cached`] keeps it: the
+/// binary (by path, and by what `stat` says of it), and its features.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeptFeatures {
+    v: u32,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+    ns_ifname: bool,
+    no_netns_quit: bool,
+}
+
+/// A kept record's version, read before the rest (a newer one's fields
+/// aren't known here).
+#[derive(serde::Deserialize)]
+struct KeptVersion {
+    v: u32,
 }
 
 /// Where programs are looked for without a `PATH` (as `execvp` does).
@@ -504,7 +608,7 @@ fn start_time(pid: i32) -> Option<u64> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs::File;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::fd::{AsRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -628,7 +732,7 @@ mod linux {
                 .map_err(|_| PastaError::Failed("an impossible process ID".to_owned()))?;
             let pasta = Pasta {
                 pid,
-                pidfd: crate::pidfd::open(pid).ok(),
+                pidfd: shipyard_sys::pidfd::open(pid).ok(),
             };
             pasta.wait_ready(&pid_file, &log_path)?;
             Ok(pasta)
@@ -696,7 +800,7 @@ mod linux {
             // Opened by PID: still the init followed? (One reused in
             // between would be another process's namespaces.)
             let alive = match init.pidfd {
-                Some(pidfd) => crate::pidfd::send_signal(pidfd, 0).is_ok(),
+                Some(pidfd) => shipyard_sys::pidfd::send_signal(pidfd, 0).is_ok(),
                 None => super::start_time(init.pid) == Some(init.start_time),
             };
             if !alive {
@@ -1008,22 +1112,16 @@ mod linux {
             }
         }
         let parent = nix::unistd::getppid();
-        for (fd, what) in [(launch.userns, "user"), (launch.netns, "network")] {
-            // SAFETY: `F_GETFD` only reads the descriptor's flags; one that
-            // isn't open is EBADF.
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-                return Err(format!("no {what} namespace descriptor {fd} open"));
-            }
-        }
-        // SAFETY: both are open (just checked) and distinct (`from_args`),
-        // left for this process by Shipyard (`Pasta::start`, `start_detached`); nothing
-        // else here owns them.
-        let (userns, netns) = unsafe {
-            (
-                OwnedFd::from_raw_fd(launch.userns),
-                OwnedFd::from_raw_fd(launch.netns),
-            )
+        let own = |fd: i32, what: &str| -> Result<OwnedFd, String> {
+            use shipyard_sys::fd::{OnExec, take_inherited};
+            // SAFETY: distinct (`from_args`), left for this process by
+            // Shipyard (`Pasta::start`, `start_detached`); nothing else here
+            // owns them.
+            unsafe { take_inherited(fd, OnExec::Keep) }
+                .map_err(|_| format!("no {what} namespace descriptor {fd} open"))
         };
+        let userns = own(launch.userns, "user")?;
+        let netns = own(launch.netns, "network")?;
         let same = |fd: &OwnedFd| -> Result<bool, String> {
             let id = |path: String| {
                 std::fs::metadata(&path)
@@ -1114,13 +1212,11 @@ mod linux {
             hold: Option<i32>,
         ) -> Result<Following, String> {
             let own = |fd: i32, what: &str| -> Result<OwnedFd, String> {
-                // SAFETY: `F_SETFD` on a number: EBADF if it isn't open.
-                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                    return Err(format!("no {what} descriptor {fd} open"));
-                }
-                // SAFETY: open (just checked), distinct (`from_args`), left
-                // for this process by Shipyard (`start_detached`).
-                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                use shipyard_sys::fd::{OnExec, take_inherited};
+                // SAFETY: distinct (`from_args`), left for this process by
+                // Shipyard (`start_detached`).
+                unsafe { take_inherited(fd, OnExec::Close) }
+                    .map_err(|_| format!("no {what} descriptor {fd} open"))
             };
             Ok(Following {
                 pid,
@@ -1424,7 +1520,7 @@ mod linux {
             match &self.pidfd {
                 // ESRCH (gone already) is fine.
                 Some(pidfd) => {
-                    let _ = crate::pidfd::send_signal(pidfd, signal);
+                    let _ = shipyard_sys::pidfd::send_signal(pidfd, signal);
                 }
                 // SAFETY: no memory involved. Before Linux 5.3 only: an
                 // unreaped child's PID isn't reused, and the supervisor
@@ -1492,6 +1588,82 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// What pasta can do is asked once per binary (F50): a fake pasta that
+    /// counts its runs is run once for two asks, again once it's another
+    /// binary (its size changed), again when the record is torn (and the
+    /// record is written anew), again when the record is a newer
+    /// Shipyard's (left as it is), every time without a record, and every
+    /// time its `--help` fails (never kept).
+    #[test]
+    fn what_pasta_can_do_is_asked_once_per_binary() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "shipyard-pasta-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pasta = dir.join("pasta");
+        let runs = dir.join("runs");
+        // Written under another name, then renamed into place: never run
+        // while a descriptor of it is open for writing in a process a
+        // test beside this one forks (`ETXTBSY`).
+        let write_pasta = |extra: &str| {
+            let writing = dir.join("pasta.new");
+            std::fs::write(
+                &writing,
+                format!(
+                    "#!/bin/sh\necho run >> '{}'\necho '--ns-ifname --no-netns-quit'{extra}\n",
+                    runs.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&writing, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&writing, &pasta).unwrap();
+        };
+        let ran = || std::fs::read_to_string(&runs).map_or(0, |text| text.lines().count());
+        let kept = dir.join("pasta-features.json");
+        let all = Features {
+            ns_ifname: true,
+            no_netns_quit: true,
+        };
+        write_pasta("");
+        assert_eq!(Features::cached(&pasta, Some(&kept)).unwrap(), all);
+        assert_eq!(Features::cached(&pasta, Some(&kept)).unwrap(), all);
+        assert_eq!(ran(), 1, "asked once for two");
+        // Another binary (an upgrade): asked again.
+        write_pasta("\n# another build");
+        assert_eq!(Features::cached(&pasta, Some(&kept)).unwrap(), all);
+        assert_eq!(ran(), 2, "asked again of another binary");
+        // A torn record: asked again, and written anew.
+        std::fs::write(&kept, b"{\"v\": 1, \"pa").unwrap();
+        Features::cached(&pasta, Some(&kept)).unwrap();
+        assert_eq!(ran(), 3);
+        Features::cached(&pasta, Some(&kept)).unwrap();
+        assert_eq!(ran(), 3, "the record written anew");
+        // A newer Shipyard's record: asked, and left as it is.
+        let newer = br#"{"v": 2, "what": "a later version's"}"#;
+        std::fs::write(&kept, newer).unwrap();
+        Features::cached(&pasta, Some(&kept)).unwrap();
+        assert_eq!(ran(), 4);
+        assert_eq!(std::fs::read(&kept).unwrap(), newer);
+        // No record: asked every time.
+        Features::cached(&pasta, None).unwrap();
+        Features::cached(&pasta, None).unwrap();
+        assert_eq!(ran(), 6);
+        // A `--help` that fails: its answer (no features) never kept.
+        std::fs::remove_file(&kept).unwrap();
+        write_pasta("\nexit 1");
+        Features::cached(&pasta, Some(&kept)).unwrap();
+        Features::cached(&pasta, Some(&kept)).unwrap();
+        assert_eq!(ran(), 8, "a failed --help is asked again");
+        assert!(!kept.exists(), "and never kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A detached container's pasta never gets `--no-netns-quit`, even
     /// from a pasta that has it (a foreground run's does).
     #[test]
@@ -1520,7 +1692,7 @@ mod tests {
     #[test]
     fn a_detached_pasta_for_an_ended_init_is_refused() {
         let mut ended = std::process::Command::new("true").spawn().unwrap();
-        let pidfd = crate::pidfd::open(libc::pid_t::try_from(ended.id()).unwrap()).unwrap();
+        let pidfd = shipyard_sys::pidfd::open(libc::pid_t::try_from(ended.id()).unwrap()).unwrap();
         ended.wait().unwrap();
         let dir = std::env::temp_dir().join(format!("shipyard-pasta-ended-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

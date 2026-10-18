@@ -1098,17 +1098,22 @@ fn held_files(files: &[(&Path, i32)]) -> (Vec<std::fs::File>, Command) {
         .map(|(file, (_, at))| (file.as_raw_fd(), *at))
         .collect();
     let mut command = Command::new(RUNTIME.path());
-    // SAFETY: `fcntl` and `dup2` are async-signal-safe, on a list made before
-    // the fork. Each is copied out of the way first (to 200 and up), then
-    // put at its number, which leaves it inheritable.
+    // Where each copy landed: made before the fork, written after it.
+    let mut copies = vec![0; moves.len()];
+    // SAFETY: `fcntl` and `dup2` are async-signal-safe, on lists made before
+    // the fork. Each is copied out of the way first (200 and up: the lowest
+    // free there, which needn't be 200 itself, with the test process's
+    // other descriptors inherited), then put at its number, which leaves it
+    // inheritable.
     unsafe {
         command.pre_exec(move || {
-            for (offset, &(raw, _)) in (200..).zip(&moves) {
-                if libc::fcntl(raw, libc::F_DUPFD, offset) == -1 {
+            for (copy, &(raw, _)) in copies.iter_mut().zip(&moves) {
+                *copy = libc::fcntl(raw, libc::F_DUPFD, 200);
+                if *copy == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            for (copy, &(_, at)) in (200..).zip(&moves) {
+            for (&copy, &(_, at)) in copies.iter().zip(&moves) {
                 if libc::dup2(copy, at) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1396,7 +1401,13 @@ fn holds_are_added_and_let_go_of_while_it_runs() {
     let late = locked_file(&runtime.output_dir().join("late.lock"));
     let refused = runtime::hold(&runtime.root, "holder", "lease:late", late.as_fd());
     assert!(
-        matches!(&refused, Err(ContainerError::NotHeld { why, .. }) if why.contains("ended")),
+        matches!(
+            &refused,
+            Err(ContainerError::NotHeld {
+                reason: shipyard_runtime::attach::HoldRefusal::Ending,
+                ..
+            })
+        ),
         "{refused:?}"
     );
     // A label that isn't one; a container without logs (no attach
@@ -1416,6 +1427,120 @@ fn holds_are_added_and_let_go_of_while_it_runs() {
     assert_eq!(
         runtime.call(&["delete", "--force", "unlogged"]).code,
         Some(0)
+    );
+}
+
+/// A monitor raises its own descriptor limit once its container is
+/// spawned (F49): holds added since go past the soft limit its caller had
+/// (128 here, the hard limit left alone), where its caller's limit refused
+/// them. The container's init and the companion keep the caller's 128;
+/// the exit command, given 300 holds at 3 and up, gets room for them and
+/// 64 more (and can write its record).
+#[test]
+#[ignore = "needs root"]
+fn holds_go_past_the_callers_limit_and_its_helpers_keep_it() {
+    use nix::sys::resource::{Resource, getrlimit};
+    use shipyard_runtime::container as runtime;
+    use std::os::fd::AsFd as _;
+    const CALLERS: u64 = 128;
+    const HELD: usize = 300;
+    let runtime = Runtime::new();
+    let dir = runtime.output_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    // Each helper writes its soft limit down, then the companion waits.
+    let limit_of = |name: &str, then: &str| {
+        let script = dir.join(format!("{name}.sh"));
+        let record = dir.join(format!("{name}.txt"));
+        std::fs::write(
+            &script,
+            format!(
+                "ulimit -Sn > {record}.tmp && mv {record}.tmp {record}\n{then}\n",
+                record = record.display()
+            ),
+        )
+        .unwrap();
+        (script, record)
+    };
+    let (exit_script, exit_record) = limit_of("exit-command", "");
+    let (companion_script, companion_record) = limit_of("companion", "exec sleep 300");
+    let logs = runtime.log_dir("limited");
+    let extra = [
+        "--log-dir",
+        logs.to_str().unwrap(),
+        "--exit-command",
+        "/bin/sh",
+        "--exit-command-arg",
+        exit_script.to_str().unwrap(),
+        "--companion",
+        "/bin/sh",
+        "--companion-arg",
+        companion_script.to_str().unwrap(),
+    ];
+    let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    // A precondition, said loudly: the test container's and a root
+    // session's hard limit are far above it.
+    assert!(hard > 3_000, "a hard limit with room to raise to: {hard}");
+    let mut command = Command::new(RUNTIME.path());
+    // SAFETY: `setrlimit` is async-signal-safe, on values known before the
+    // fork.
+    unsafe {
+        command.pre_exec(move || {
+            nix::sys::resource::setrlimit(Resource::RLIMIT_NOFILE, CALLERS, hard)
+                .map_err(std::io::Error::from)
+        });
+    }
+    let bundle = bundle_running("exec sleep 300");
+    let call = runtime.create_with("limited", &bundle, &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.call(&["start", "limited"]).code, Some(0));
+    let files: Vec<std::fs::File> = (0..HELD)
+        .map(|n| std::fs::File::create(dir.join(format!("held-{n}"))).unwrap())
+        .collect();
+    for (n, file) in files.iter().enumerate() {
+        runtime::hold(
+            &runtime.root,
+            "limited",
+            &format!("lease:h{n}"),
+            file.as_fd(),
+        )
+        .unwrap_or_else(|error| panic!("hold {n}: {error}"));
+    }
+    let init = runtime.state("limited").unwrap()["pid"].as_i64().unwrap();
+    // The monitor, as the runtime's own state file records it.
+    let recorded: Value =
+        serde_json::from_slice(&std::fs::read(runtime.root.join("limited/state.json")).unwrap())
+            .unwrap();
+    let monitor = recorded["monitor"][0].as_i64().unwrap();
+    let open = std::fs::read_dir(format!("/proc/{monitor}/fd"))
+        .unwrap()
+        .count();
+    assert!(open > HELD, "past the caller's {CALLERS}: {open} open");
+    let soft_of = |pid: &str| {
+        std::fs::read_to_string(format!("/proc/{pid}/limits"))
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("Max open files"))
+            .and_then(|line| line.split_whitespace().nth(3).map(str::to_owned))
+            .unwrap()
+    };
+    assert_eq!(
+        soft_of(&init.to_string()),
+        CALLERS.to_string(),
+        "the init's"
+    );
+    let companion = eventually("the companion's limit", || {
+        std::fs::read_to_string(&companion_record).ok()
+    });
+    assert_eq!(companion.trim(), CALLERS.to_string(), "the companion's");
+    assert_eq!(runtime.call(&["kill", "limited", "KILL"]).code, Some(0));
+    let exit = eventually("the exit command's limit", || {
+        std::fs::read_to_string(&exit_record).ok()
+    });
+    // Its holds at 3 and up, and the monitor's `OWN_DESCRIPTORS` (64) more.
+    assert_eq!(
+        exit.trim(),
+        (3 + HELD + 64).to_string(),
+        "the exit command's"
     );
 }
 
@@ -3635,6 +3760,58 @@ fn following_ends_when_the_id_is_another_containers() {
     assert_eq!(runtime.call(&["delete", "--force", id]).code, Some(0));
 }
 
+/// `logs --follow` ends, quietly, once its reader has gone (`… | head -n1`),
+/// while the container still runs and writes nothing more: between its
+/// looks it asks whether stdout's reader is there (F78). By ID, and by
+/// `--log-dir`, which had no end of its own.
+#[test]
+#[ignore = "needs root"]
+fn following_ends_when_its_reader_goes() {
+    use std::io::BufRead as _;
+    let runtime = Runtime::new();
+    let id = "followed-unread";
+    let bundle = bundle_running("echo first; exec sleep 60");
+    let (created, dir) = runtime.create_logged(id, &bundle, &[]);
+    assert_eq!(created.code, Some(0), "{}", created.stderr);
+    assert_eq!(runtime.call(&["start", id]).code, Some(0));
+    for target in [vec![id], vec!["--log-dir", dir.to_str().unwrap()]] {
+        let mut follow = Command::new(RUNTIME.path())
+            .arg("--root")
+            .arg(&runtime.root)
+            .args(["logs", "--follow"])
+            .args(&target)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Its first line read (the control: it follows), then its reader
+        // gone, the pipe's read end closed.
+        let mut stdout = std::io::BufReader::new(follow.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "first\n", "{target:?}");
+        drop(stdout);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = follow.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = follow.kill();
+                panic!("{target:?}: it followed with no reader");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(follow.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        assert!(status.success(), "{target:?}: {status:?}: {stderr}");
+        assert_eq!(stderr, "", "{target:?}");
+    }
+    // Still running: the follow ended for its reader, not its container.
+    assert_eq!(runtime.status(id), "running");
+    assert_eq!(runtime.call(&["delete", "--force", id]).code, Some(0));
+}
+
 /// `logs --follow ID` ends when that container is deleted, even if a new
 /// one takes its ID and its log directory's path at once (the old directory
 /// removed, a new one made there): what's at the path is another directory.
@@ -4365,6 +4542,32 @@ fn logs_into_a_closed_pipe_end_quietly() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }
 
+/// `shipyard-runtime logs` ends as its readers do (F70): 1 when stderr's
+/// reader goes while stdout's is read.
+#[test]
+#[ignore = "needs root"]
+fn runtime_logs_end_as_their_readers_do() {
+    let runtime = Runtime::new();
+    let bundle = bundle_running(
+        "n=0; while [ $n -lt 20000 ]; do echo out $n; echo err $n >&2; n=$((n+1)); done",
+    );
+    let (created, _) = runtime.create_logged("both", &bundle, &[]);
+    assert_eq!(created.code, Some(0), "{}", created.stderr);
+    assert_eq!(runtime.call(&["start", "both"]).code, Some(0));
+    runtime.wait_for("both", "stopped");
+    shipyard_test_support::pipes::logs_end_as_their_readers_do(
+        || {
+            let mut command = Command::new(RUNTIME.path());
+            command
+                .arg("--root")
+                .arg(&runtime.root)
+                .args(["logs", "both"]);
+            command
+        },
+        1,
+    );
+}
+
 /// `logs --log-dir` reads a directory: no state root is needed (none
 /// without `XDG_RUNTIME_DIR`, for anyone but root).
 #[test]
@@ -4762,7 +4965,11 @@ fn a_stalled_client_doesnt_slow_the_container() {
         started.elapsed()
     );
     // Let go: what it was sent ends (no more than a socket's buffer and a
-    // client's allowance) with `Dropped`, then end-of-file.
+    // client's allowance), then end-of-file. With `Dropped`, or (under
+    // load, its socket full by then) without it, as
+    // `a_dropped_client_doesnt_keep_the_monitor_busy` expects; that it's
+    // sent at all is the attach unit
+    // `a_client_too_far_behind_is_dropped_with_a_frame`'s.
     let frames = frames_until(&mut stalled, |_| false);
     let output: usize = frames
         .iter()
@@ -4774,6 +4981,7 @@ fn a_stalled_client_doesnt_slow_the_container() {
     assert!(output < 4 * 1024 * 1024, "{output}");
     match frames.last() {
         Some(Frame::Dropped(reason)) => assert!(reason.contains("256 KiB"), "{reason}"),
+        Some(Frame::Stdout(_)) => {}
         other => panic!("{other:?}"),
     }
 }

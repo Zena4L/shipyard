@@ -165,7 +165,7 @@ pub fn create(
 
 /// A network, and its live leases: the containers on it now.
 #[derive(Debug)]
-pub struct Listed {
+pub struct NetworkListed {
     /// The network.
     pub config: shipyard_network::store::NetworkConfig,
     /// Its live leases.
@@ -180,7 +180,7 @@ pub struct Listed {
 /// # Errors
 ///
 /// If one named doesn't exist, or the store can't be read.
-pub fn list(engine: &Engine, names: &[String]) -> Result<Vec<Listed>> {
+pub fn list(engine: &Engine, names: &[String]) -> Result<Vec<NetworkListed>> {
     use shipyard_network::store::StoreError;
     let networks = networks(engine)?;
     let configs = if names.is_empty() {
@@ -200,7 +200,7 @@ pub fn list(engine: &Engine, names: &[String]) -> Result<Vec<Listed>> {
         .map(|config| {
             let leases = networks.live_leases(&config.name)?;
             let dns_running = networks.dns_running(&config.name);
-            Ok(Listed {
+            Ok(NetworkListed {
                 config,
                 leases,
                 dns_running,
@@ -213,7 +213,7 @@ pub fn list(engine: &Engine, names: &[String]) -> Result<Vec<Listed>> {
 /// Docker-like, and kept: scripts read them).
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct Inspected {
+pub struct NetworkInspected {
     /// Its name.
     pub name: String,
     /// Its IPv4 subnet.
@@ -275,9 +275,9 @@ pub struct Attached {
     pub ports: Vec<shipyard_network::ports::Published>,
 }
 
-impl From<Listed> for Inspected {
-    fn from(listed: Listed) -> Self {
-        let Listed {
+impl From<NetworkListed> for NetworkInspected {
+    fn from(listed: NetworkListed) -> Self {
+        let NetworkListed {
             config,
             leases,
             dns_running,
@@ -322,10 +322,10 @@ impl From<Listed> for Inspected {
 /// # Errors
 ///
 /// As [`list`].
-pub fn inspect(engine: &Engine, names: &[String]) -> Result<Vec<Inspected>> {
+pub fn inspect(engine: &Engine, names: &[String]) -> Result<Vec<NetworkInspected>> {
     Ok(list(engine, names)?
         .into_iter()
-        .map(Inspected::from)
+        .map(NetworkInspected::from)
         .collect())
 }
 

@@ -443,11 +443,12 @@ mod linux {
     /// Waits for `child` until it exits or `deadline`, reading its output
     /// from `reader` meanwhile: the first [`health::MAX_OUTPUT`] bytes (the
     /// rest read and dropped, so it never blocks on a full pipe). Once it
-    /// has exited, what's left to read is read for at most [`DRAIN`], and
-    /// no more: something it left in the container (out of its process
+    /// has exited, what's left to read is read for at most [`DRAIN`] (what
+    /// comes within it kept, waited for until the pipe ends or it's over),
+    /// and no more: something it left in the container (out of its process
     /// group, which `exec` ends) may keep the pipe open, or keep writing.
     /// Its output, and how it exited (none: out of time).
-    fn wait(
+    pub(super) fn wait(
         child: &mut std::process::Child,
         reader: OwnedFd,
         deadline: Instant,
@@ -458,14 +459,16 @@ mod linux {
         let mut drained_by = None;
         loop {
             let exited = child.try_wait().ok().flatten();
-            if let Some(status) = exited {
-                let by = *drained_by.get_or_insert_with(|| Instant::now() + DRAIN);
-                if Instant::now() >= by {
-                    return (text(&kept), Some(status));
-                }
-            }
             let wait = if exited.is_some() {
-                PollTimeout::ZERO
+                // Drained: the pipe's end, or the drain's (F61: polled
+                // for what's left of it, so a line written just after the
+                // exit is kept).
+                let by = *drained_by.get_or_insert_with(|| Instant::now() + DRAIN);
+                let left = by.saturating_duration_since(Instant::now());
+                if left.is_zero() || !open {
+                    return (text(&kept), exited);
+                }
+                PollTimeout::try_from(left.as_millis()).unwrap_or(PollTimeout::ZERO)
             } else {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -488,10 +491,8 @@ mod linux {
                     }
                 }
             }
-            match exited {
-                Some(status) => return (text(&kept), Some(status)),
-                None if !open => std::thread::sleep(CHECK_POLL),
-                None => {}
+            if exited.is_none() && !open {
+                std::thread::sleep(CHECK_POLL);
             }
         }
     }
@@ -571,6 +572,35 @@ mod linux {
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
     use super::*;
+
+    /// A check's output written just after it exits, by something it left
+    /// running, is kept (F61: the drain waits up to its 100 ms for it); the
+    /// control, its output before, read by the drain too: the check has
+    /// ended before it's waited for. (20 ms against the drain's 100: a host
+    /// slower than that loses the line, and fails this test.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_checks_late_output_is_kept() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "echo early; (sleep 0.02; echo late) & exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer)
+            .spawn()
+            .unwrap();
+        // Ended before it's waited for: what's read from here is the
+        // drain's (the late line comes 20 ms after the start).
+        child.wait().unwrap();
+        let (text, status) = super::linux::wait(
+            &mut child,
+            std::os::fd::OwnedFd::from(reader),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(status.is_some_and(|status| status.success()), "{status:?}");
+        assert!(text.contains("early"), "{text:?}");
+        assert!(text.contains("late"), "{text:?}");
+    }
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()

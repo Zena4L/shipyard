@@ -16,7 +16,7 @@ mod dns;
 mod dns_server;
 mod firewall;
 mod live;
-pub mod lost;
+pub(crate) mod lost;
 #[cfg(target_os = "linux")]
 mod pasta;
 mod run;
@@ -29,21 +29,24 @@ use shipyard_network::files::{DnsSettings, HostEntry};
 #[cfg(target_os = "linux")]
 pub(crate) use attach::release_lease_hold;
 pub use commands::{
-    Attached, Inspected, Listed, Pruned, SpecOptions, create, inspect, list, prune, remove, spec,
+    Attached, NetworkInspected, NetworkListed, Pruned, SpecOptions, create, inspect, list, prune,
+    remove, spec,
 };
 pub use dns_server::entry_point as dns_entry_point;
 pub(crate) use dns_server::{IDLE_ENV as DNS_IDLE_ENV, UPSTREAM_ENV as DNS_UPSTREAM_ENV};
-pub use firewall::describe_conflict;
+#[cfg(target_os = "linux")]
+pub(crate) use firewall::describe_conflict;
 #[cfg(target_os = "linux")]
 pub(crate) use live::{
     Joining, check_bridge, connect_live, container_addresses, container_leases, disconnect_live,
     next_interface, way_out,
 };
-pub use lost::pasta_lost;
+pub use lost::{NetworkLost, pasta_lost};
 #[cfg(target_os = "linux")]
 pub(crate) use run::DetachedNetwork;
-pub use run::RunNetwork;
-pub use rundir::{ETC_FILES, RunDir};
+pub(crate) use run::RunNetwork;
+pub(crate) use rundir::ETC_FILES;
+pub use rundir::RunDir;
 
 use crate::Engine;
 use crate::error::{Context as _, Result, bail};
@@ -52,18 +55,18 @@ use crate::error::{Context as _, Result, bail};
 /// unless `--hostname` says otherwise (as Docker names them), and the name
 /// of what the run makes (its lease, its veth pair, its directory).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunId(String);
+pub(crate) struct RunId(String);
 
 impl RunId {
     /// A new one, from the kernel's random numbers.
-    pub fn new() -> Result<RunId> {
+    pub(crate) fn new() -> Result<RunId> {
         let bytes = crate::random::bytes::<6>().context("the run's ID")?;
         Ok(RunId(crate::random::hex(&bytes)))
     }
 
     /// The ID.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -72,7 +75,11 @@ impl RunId {
     /// joins another network later takes it from its leases: its veths'
     /// names come from it).
     #[must_use]
-    pub fn from_lease(text: &str) -> Option<RunId> {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "joining a network later is Linux's")
+    )]
+    pub(crate) fn from_lease(text: &str) -> Option<RunId> {
         (text.len() == 12 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
             .then(|| RunId(text.to_owned()))
     }
@@ -82,7 +89,11 @@ impl RunId {
     /// (an interface name is at most 15 bytes: up to `n` = 99; the lengths
     /// differ, so the first network's names are never the others').
     #[must_use]
-    pub fn host_veth(&self, n: usize) -> String {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "veths are Linux's")
+    )]
+    pub(crate) fn host_veth(&self, n: usize) -> String {
         if n == 0 {
             format!(
                 "{}{}",
@@ -147,33 +158,37 @@ impl NetworkMode {
 
 /// A run's network, as the flags ask for it: checked, but nothing made yet.
 #[derive(Debug, Clone)]
-pub struct NetworkPlan {
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "networks are set up on Linux")
+)]
+pub(crate) struct NetworkPlan {
     /// The network it gets.
-    pub mode: NetworkMode,
+    pub(crate) mode: NetworkMode,
     /// The run it's for.
-    pub run: RunId,
+    pub(crate) run: RunId,
     /// The container's hostname (`--hostname`, else the run's ID).
-    pub hostname: String,
+    pub(crate) hostname: String,
     /// Whether it gets the `/etc` files (it has a root filesystem of its
     /// own to bind them into).
-    pub etc_files: bool,
+    pub(crate) etc_files: bool,
     /// `--add-host`.
-    pub hosts: Vec<HostEntry>,
+    pub(crate) hosts: Vec<HostEntry>,
     /// `--dns`, `--dns-search`, `--dns-option`.
-    pub dns: DnsSettings,
+    pub(crate) dns: DnsSettings,
     /// `-p`.
-    pub ports: Vec<shipyard_network::ports::PortRequest>,
+    pub(crate) ports: Vec<shipyard_network::ports::PortRequest>,
     /// `-P`: the image's `ExposedPorts` too, on free host ports.
-    pub publish_all: bool,
+    pub(crate) publish_all: bool,
     /// pasta and what it can do, for the `Pasta` mode (found on `PATH`, and
     /// asked, when the run was checked).
-    pub pasta: Option<(PathBuf, shipyard_network::pasta::Features)>,
+    pub(crate) pasta: Option<(PathBuf, shipyard_network::pasta::Features)>,
     /// The mode is the default, not one asked for.
-    pub defaulted: bool,
+    pub(crate) defaulted: bool,
     /// `--name`: the container's name on its networks.
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// A detached container's ID, written into its leases.
-    pub container: Option<crate::containers::ContainerId>,
+    pub(crate) container: Option<crate::containers::ContainerId>,
 }
 
 /// Whether this process is the host's root: user 0 in the initial user
@@ -216,7 +231,7 @@ pub fn can_network() -> bool {
 /// anything: no `CAP_NET_ADMIN`, or a read-only `/proc/sys`.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn why_no_network() -> Option<&'static str> {
+pub(crate) fn why_no_network() -> Option<&'static str> {
     /// `CAP_NET_ADMIN`'s bit.
     const CAP_NET_ADMIN: u32 = 12;
     let net_admin = std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
@@ -249,7 +264,7 @@ pub fn can_network() -> bool {
 /// unseen).
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn default_route_interface(family: shipyard_network::Family) -> Option<String> {
+pub(crate) fn default_route_interface(family: shipyard_network::Family) -> Option<String> {
     let mut rtnetlink = shipyard_network::route::Rtnetlink::new().ok()?;
     let index = rtnetlink
         .routes(family)
@@ -270,7 +285,7 @@ pub fn default_route_interface(family: shipyard_network::Family) -> Option<Strin
 /// one bridge from each other too.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn bridged_traffic_filtered() -> bool {
+pub(crate) fn bridged_traffic_filtered() -> bool {
     std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
         .is_ok_and(|value| value.trim() == "1")
 }
@@ -295,7 +310,7 @@ pub(crate) fn networks(engine: &Engine) -> Result<shipyard_network::store::Netwo
         bail!(NeedsRoot, "{NETWORKS_NEED_ROOT}");
     }
     Ok(shipyard_network::store::Networks::open(
-        engine.paths().networks(),
+        engine.paths().networks()?,
     )?)
 }
 

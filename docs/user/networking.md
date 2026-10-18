@@ -228,7 +228,9 @@ sudo shipyard run --network app alpine:3.20 nslookup db
 the network has had no container for 30 seconds, or is removed. It binds the
 gateway's port 53 (UDP and TCP) on the network's bridge only, then runs as
 `nobody`, with no privileges at all. It answers only the network's containers'
-own addresses. If another DNS server already holds port 53 on every address of
+own addresses. Over TCP, it serves 64 connections at once (8 from one container), and
+closes each 30 seconds after it was opened, however busy: a resolver opens another.
+If another DNS server already holds port 53 on every address of
 the host, the container doesn't start: "starting the network app's DNS server:
 binding 10.89.0.1:53 on shy-… (is another DNS server listening on every address,
 port 53?): Address already in use". That includes a container that publishes
@@ -341,7 +343,9 @@ sudo shipyard network disconnect back web         # and leaves it
   with IPv6), checked when you connect, a stopped container too.
 - **A container's monitor holds at most 2100 things** (its networks' addresses, its
   published ports, its volumes): a running container with that many may have to be
-  restarted to join one more. A run that would need more is refused before anything is
+  restarted to join one more. Joining isn't bound by the descriptor limit (`ulimit -n`)
+  of the shell that made the container: its monitor raises its own, within the hard
+  limit. A run that would need more is refused before anything is
   made: its published ports (two sockets per port published on every address, `-P`'s
   too) and its other holds (one per network, one per volume, a few of its own) must fit
   within 2100 and within the descriptor limit (`ulimit -n`).
@@ -349,6 +353,9 @@ sudo shipyard network disconnect back web         # and leaves it
   its next start).
 - **Root only** (bridge networks are root's): a rootless container's network is
   pasta's, and `--network host` or `none` has no bridges to join either.
+- **Cut short** (killed, or the host lost power, between saying it in the
+  container's record and doing it): run the same `network connect` (or `disconnect`)
+  again, and it finishes, saying so.
 - Events: `network connect` and `network disconnect`, with the container's ID (see
   [Events](events.md)).
 
@@ -404,7 +411,12 @@ does). For that, Shipyard turns on IPv4 forwarding on the host
 (`net.ipv4.ip_forward=1`), as Docker does. If the host didn't route before,
 Shipyard's rules keep it that way for everything but its containers: the host
 doesn't start routing between the interfaces it had then (your LAN and a VPN,
-say), until it restarts. Interfaces that come later (Docker's or libvirt's
+say), until it restarts. It keeps a note of that closing (in its networks'
+directory, `.routing-closed`), so the rules it rebuilds (after `nft flush ruleset`,
+say) close it again. If that note can't be read while forwarding is on, Shipyard
+closes routing between the host's interfaces as they are now, and warns, naming the
+file: if this host is meant to route, delete the file once Shipyard's forwarding is
+off, or after a reboot. Interfaces that come later (Docker's or libvirt's
 bridges, a VPN started after) are routed: their programs turned forwarding on for
 them, and filter them themselves. An internal network's bridge doesn't forward
 at all, firewall or not.
@@ -516,7 +528,9 @@ shipyard: published 0.0.0.0:41665 -> 80/tcp
   second `-p 8080:80` is refused with "port 8080/tcp on 0.0.0.0 is already in use".
   A TCP port that only closed connections still wait on (the minute or so after a
   program or container stopped serving it, `TIME_WAIT`) is free to publish: a
-  container started again at once gets its port back.
+  container started again at once gets its port back. (Holding such a port takes a
+  lock in your own runtime directory, which no other user can hold up; without one,
+  an older shared lock any user can take.)
 - **Published on `127.0.0.1`, it's this machine's only:** nothing that comes in on
   another interface reaches it, nor anything else on 127.0.0.0/8.
 - **It works from everywhere:** other machines, the host itself (its own

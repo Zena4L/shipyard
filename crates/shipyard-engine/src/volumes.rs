@@ -84,22 +84,6 @@ pub fn usage(engine: &Engine) -> Result<Usage> {
     Ok(usage)
 }
 
-/// Every container's record, to tell which mount a volume
-/// ([`users_of`]). None without a place for records (no container can
-/// have one).
-///
-/// # Errors
-///
-/// The records can't be listed: a container they'd name can't be ruled
-/// out, so the volume `what` names is kept.
-fn records(engine: &Engine, what: &str) -> Result<Vec<crate::containers::Record>> {
-    match crate::containers::list(engine) {
-        Ok(records) => Ok(records),
-        Err(error) if error.kind() == ErrorKind::Environment => Ok(Vec::new()),
-        Err(error) => Err(error.context(format!("{what} kept: the containers can't be listed"))),
-    }
-}
-
 /// The containers of `records` that mount the volume `name`, whatever
 /// their state (Docker's: a stopped container keeps its volumes), by name,
 /// sorted.
@@ -141,14 +125,21 @@ fn in_use_by(name: &str, users: &[String]) -> Error {
 /// is in use ([`ErrorKind::InUse`]), or can't be removed.
 pub fn remove(engine: &Engine, name: &str) -> Result<()> {
     let volumes = open(engine)?;
-    let users = users_of(&records(engine, &format!("the volume {name} is"))?, name);
-    if !users.is_empty() {
-        // Only an existing volume is in use: one that isn't is not found.
-        volumes.inspect(name)?;
-        return Err(in_use_by(name, &users));
-    }
-    let trash = volumes.trash(name)?;
-    // Gone once moved aside: what's left to delete is no volume.
+    // The check and the move aside under the container store's lock: a
+    // container made meanwhile, naming it, can't come between (F56).
+    let trash =
+        crate::containers::with_records_locked(engine, &format!("the volume {name}"), |records| {
+            let users = users_of(records, name);
+            if !users.is_empty() {
+                // Only an existing volume is in use: one that isn't is not
+                // found.
+                volumes.inspect(name)?;
+                return Err(in_use_by(name, &users));
+            }
+            Ok(volumes.trash(name)?)
+        })?;
+    // Gone once moved aside: what's left to delete is no volume. Deleted
+    // with the store's lock let go (the image store's lock comes first).
     crate::events::emit_about(engine, crate::events::Kind::Volume, "destroy", name);
     delete(engine, &[trash])
 }
@@ -174,25 +165,28 @@ pub struct PruneReport {
 /// records listed.
 pub fn prune(engine: &Engine) -> Result<PruneReport> {
     let volumes = open(engine)?;
-    let records = records(engine, "every volume is")?;
     let mut in_use = Vec::new();
     let mut trashed = Vec::new();
     let mut failed = Vec::new();
-    for volume in volumes.list()? {
-        if !users_of(&records, &volume.name).is_empty() {
-            in_use.push(volume.name);
-            continue;
-        }
-        match volumes.trash(&volume.name) {
-            Ok(trash) => trashed.push((volume.name, trash)),
-            Err(shipyard_storage::VolumeError::InUse(name)) => in_use.push(name),
-            // Removed by someone else meanwhile.
-            Err(shipyard_storage::VolumeError::NotFound(_)) => {}
-            Err(err) => {
-                failed.push(Error::from(err).context(format!("the volume {}", volume.name)));
+    // Each check and move aside under the container store's lock (F56).
+    crate::containers::with_records_locked(engine, "every volume", |records| {
+        for volume in volumes.list()? {
+            if !users_of(records, &volume.name).is_empty() {
+                in_use.push(volume.name);
+                continue;
+            }
+            match volumes.trash(&volume.name) {
+                Ok(trash) => trashed.push((volume.name, trash)),
+                Err(shipyard_storage::VolumeError::InUse(name)) => in_use.push(name),
+                // Removed by someone else meanwhile.
+                Err(shipyard_storage::VolumeError::NotFound(_)) => {}
+                Err(err) => {
+                    failed.push(Error::from(err).context(format!("the volume {}", volume.name)));
+                }
             }
         }
-    }
+        Ok(())
+    })?;
     // What removals cut short left, deleted too.
     let trash_dir = volumes.trash_dir();
     let leftovers: Vec<String> = std::fs::read_dir(&trash_dir)
@@ -277,6 +271,13 @@ mod tests {
     #[test]
     fn volume_errors_have_kinds() {
         let (engine, collect, parent) = engine_on_a_new_store("volumes");
+        let engine = Engine::new(
+            engine
+                .paths()
+                .clone()
+                .with_containers(parent.join("containers")),
+            std::sync::Arc::clone(engine.reporter()),
+        );
         create(&engine, "data").unwrap();
         let exists = create(&engine, "data").unwrap_err();
         assert_eq!(exists.kind(), ErrorKind::Exists, "{exists:#}");
@@ -296,21 +297,7 @@ mod tests {
     /// removed, `rm` removes it (Docker's).
     #[test]
     fn a_volume_a_record_mounts_is_kept() {
-        let parent = std::env::temp_dir().join(format!(
-            "shipyard-engine-volume-records-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&parent).unwrap();
-        let engine = Engine::new(
-            crate::Paths::from_env()
-                .with_image_store(parent.join("store"))
-                .with_containers(parent.join("containers")),
-            std::sync::Arc::new(crate::report::Collect::default()),
-        );
+        let (engine, parent) = engine_with_records("volume-records");
         create(&engine, "data").unwrap();
         create(&engine, "spare").unwrap();
         let request = crate::run::RunRequest {
@@ -342,6 +329,120 @@ mod tests {
         crate::containers::remove_record(&engine, &record.id).unwrap();
         remove(&engine, "data").unwrap();
         assert!(list(&engine).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A container store whose place isn't known (a relative
+    /// `SHIPYARD_CONTAINER_DIR`, no home) might hold records naming any
+    /// volume: `rm` and `prune` keep them all, saying so; with its place
+    /// known (and no record there), the same volume goes.
+    #[test]
+    fn volumes_are_kept_when_the_container_store_isnt_found() {
+        let (engine, parent) = engine_with_records("volume-store-unknown");
+        create(&engine, "data").unwrap();
+        let lost = Engine::new(
+            engine
+                .paths()
+                .clone()
+                .without_containers("SHIPYARD_CONTAINER_DIR must be absolute"),
+            std::sync::Arc::clone(engine.reporter()),
+        );
+        let refused = remove(&lost, "data").unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Environment, "{refused:#}");
+        let refused = prune(&lost).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Environment, "{refused:#}");
+        assert_eq!(list(&engine).unwrap().len(), 1, "kept");
+        remove(&engine, "data").unwrap();
+        assert!(list(&engine).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// An engine on a store of its own, its records in `parent/containers`.
+    fn engine_with_records(name: &str) -> (Engine, std::path::PathBuf) {
+        let parent = std::env::temp_dir().join(format!(
+            "shipyard-engine-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let engine = Engine::new(
+            crate::Paths::from_env()
+                .with_image_store(parent.join("store"))
+                .with_containers(parent.join("containers")),
+            std::sync::Arc::new(crate::report::Collect::default()),
+        );
+        (engine, parent)
+    }
+
+    /// A record that can't be read might name any volume (F56): `rm` of
+    /// one no readable record names is refused, and `prune` removes
+    /// nothing; once it can be read (here, gone), both go ahead (the
+    /// control).
+    #[test]
+    fn an_unreadable_record_keeps_the_volumes() {
+        let (engine, parent) = engine_with_records("volume-unreadable");
+        create(&engine, "spare").unwrap();
+        crate::containers::create_record(
+            &engine,
+            crate::containers::NewContainer {
+                name: Some(crate::containers::Name::parse("other").unwrap()),
+                config: crate::containers::Config::from_request(&crate::run::RunRequest {
+                    command: vec!["true".into()],
+                    ..crate::run::RunRequest::default()
+                })
+                .unwrap(),
+                labels: crate::containers::Labels::default(),
+                image_id: None,
+                auto_remove: false,
+            },
+        )
+        .unwrap();
+        // Another container's record, torn: unknown what it mounts.
+        let torn = parent.join("containers").join("a".repeat(64));
+        std::fs::create_dir(&torn).unwrap();
+        std::fs::write(torn.join("record.json"), "{ not json").unwrap();
+        let refused = remove(&engine, "spare").unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Storage, "{refused:#}");
+        assert_eq!(prune(&engine).unwrap_err().kind(), ErrorKind::Storage);
+        assert_eq!(list(&engine).unwrap().len(), 1, "kept");
+        std::fs::remove_dir_all(&torn).unwrap();
+        assert_eq!(prune(&engine).unwrap().removed, ["spare"]);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// `prune` decides under the container store's lock (F56): held by
+    /// another (a `create` publishing a record), a `prune` waits for it,
+    /// and goes ahead once it's let go, having waited; never past it.
+    #[test]
+    fn prune_waits_for_the_container_store() {
+        let (engine, parent) = engine_with_records("volume-store-lock");
+        create(&engine, "spare").unwrap();
+        std::fs::create_dir_all(parent.join("containers")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(parent.join("containers").join(".lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let held = std::time::Duration::from_millis(300);
+        let pruning = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let pruned = prune(&engine);
+            (pruned, began.elapsed())
+        });
+        let letting_go = std::time::Instant::now();
+        while letting_go.elapsed() < held {
+            std::thread::yield_now();
+        }
+        drop(lock);
+        let (pruned, took) = pruning.join().unwrap();
+        assert_eq!(pruned.unwrap().removed, ["spare"]);
+        assert!(took >= held, "it went ahead past the lock: {took:?}");
         let _ = std::fs::remove_dir_all(&parent);
     }
 }

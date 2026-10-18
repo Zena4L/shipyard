@@ -468,20 +468,7 @@ pub fn lock_file(
     mode: LockMode,
     wait: std::time::Duration,
 ) -> nix::Result<nix::fcntl::Flock<OwnedFd>> {
-    // macOS can answer ENOENT to an `O_CREAT` open while another process
-    // creates the same name at that moment: the name exists by the retry.
-    let open = || {
-        openat(
-            dir,
-            name,
-            OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::from_bits_truncate(0o600),
-        )
-    };
-    let fd = match open() {
-        Err(Errno::ENOENT) => open(),
-        opened => opened,
-    }?;
+    let fd = shipyard_sys::fs::open_lock_file_at(dir.as_fd(), name)?;
     lock(fd, mode, wait)
 }
 
@@ -491,23 +478,13 @@ fn lock(
     mode: LockMode,
     wait: std::time::Duration,
 ) -> nix::Result<nix::fcntl::Flock<OwnedFd>> {
-    use nix::fcntl::{Flock, FlockArg};
-    let how = match mode {
-        LockMode::Exclusive => FlockArg::LockExclusiveNonblock,
-        LockMode::Shared => FlockArg::LockSharedNonblock,
+    use shipyard_sys::lock::Mode;
+    let mode = match mode {
+        LockMode::Exclusive => Mode::Exclusive,
+        LockMode::Shared => Mode::Shared,
     };
     let deadline = std::time::Instant::now() + wait;
-    let mut fd = fd;
-    loop {
-        match Flock::lock(fd, how) {
-            Ok(lock) => return Ok(lock),
-            Err((back, Errno::EWOULDBLOCK)) if std::time::Instant::now() < deadline => {
-                fd = back;
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err((_, errno)) => return Err(errno),
-        }
-    }
+    shipyard_sys::lock::lock_until(fd, mode, deadline, std::time::Duration::from_millis(20))
 }
 
 /// Renames `name` in `dir` to a fresh `.trash-…` name, which it returns;

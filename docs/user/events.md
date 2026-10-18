@@ -111,7 +111,8 @@ The journal is a file of JSON lines in a private directory:
 - when `SHIPYARD_CONTAINER_DIR` moves the containers' records, beside them:
   `events/` beside a directory named `containers`, else `NAME.events/`
   (`/tmp/c`'s is `/tmp/c.events/`);
-- wherever `SHIPYARD_EVENTS_DIR` says, when it's set.
+- wherever `SHIPYARD_EVENTS_DIR` says, when it's set (an absolute path: a relative
+  one is refused, as for every `SHIPYARD_*` store variable).
 
 Every command adds to the end of `events.log` with one write, so events written at
 the same moment by several commands never mix. Past 1 MiB, it's moved to

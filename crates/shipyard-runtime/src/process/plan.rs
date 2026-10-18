@@ -813,22 +813,9 @@ fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
 /// `close_range`.
 #[cfg(any(target_os = "linux", test))]
 fn ranges_excluding(kept: &[u32]) -> Vec<(u32, u32)> {
-    let mut kept: Vec<u32> = kept.iter().copied().filter(|&fd| fd >= 3).collect();
+    let mut kept = kept.to_vec();
     kept.sort_unstable();
-    kept.dedup();
-    let mut ranges = Vec::new();
-    let mut first = 3_u32;
-    for fd in kept {
-        if fd > first {
-            ranges.push((first, fd - 1));
-        }
-        match fd.checked_add(1) {
-            Some(next) => first = next,
-            None => return ranges,
-        }
-    }
-    ranges.push((first, u32::MAX));
-    ranges
+    super::child::Gaps::new(kept.into_iter()).collect()
 }
 
 fn c_string(bytes: &[u8], field: &'static str) -> Result<CString, SpecError> {
@@ -1243,6 +1230,22 @@ mod tests {
         assert_eq!(
             ranges_excluding(&[4, u32::MAX]),
             [(3, 3), (5, u32::MAX - 1)]
+        );
+    }
+
+    /// The joiner's sweep: its own kept descriptors and the passed ones,
+    /// two ascending lists walked as one, a number in both kept once, and
+    /// one below 3 (an unset slot, `-1` read as 0) never a gap's start:
+    /// stdio stays.
+    #[test]
+    fn two_kept_lists_merge_and_repeats_count_once() {
+        let merged = crate::process::child::Merged::new(
+            [0_u32, 4, 9].into_iter(),
+            [4_u32, 6, 20].into_iter(),
+        );
+        assert_eq!(
+            crate::process::child::Gaps::new(merged).collect::<Vec<_>>(),
+            [(3, 3), (5, 5), (7, 8), (10, 19), (21, u32::MAX)]
         );
     }
 

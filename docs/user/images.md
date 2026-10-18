@@ -188,8 +188,9 @@ removed, and the command exits 125.
 | root | `/var/lib/shipyard/images` |
 | anyone else | `$XDG_DATA_HOME/shipyard/images`, or `~/.local/share/shipyard/images` |
 
-Set `SHIPYARD_IMAGE_STORE` to override it — useful where the default is on an
-overlay filesystem, which can't hold an image's writable layer. The store keeps
+Set `SHIPYARD_IMAGE_STORE` to an absolute path to override it (a relative one is
+refused) — useful where the default is on an overlay filesystem, which can't hold an
+image's writable layer. The store keeps
 blobs under `blobs/sha256/`, extracted layers under `layers/`, per-container
 writable areas under `containers/`, and the reference index in `index.json`.
 

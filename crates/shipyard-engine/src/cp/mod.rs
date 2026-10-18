@@ -339,16 +339,16 @@ pub fn helper_entry_point() {
 /// This side's streams for a copy: where a copy out writes its tar stream
 /// (when it goes to no host path), and where a copy in reads one (when it
 /// comes from none).
-pub struct Streams<'a> {
+pub struct CpStreams<'a> {
     /// A copy in's stream.
     pub input: &'a mut dyn Read,
     /// A copy out's stream.
     pub output: &'a mut dyn Write,
 }
 
-impl std::fmt::Debug for Streams<'_> {
+impl std::fmt::Debug for CpStreams<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Streams").finish_non_exhaustive()
+        f.debug_struct("CpStreams").finish_non_exhaustive()
     }
 }
 
@@ -377,7 +377,7 @@ impl std::fmt::Debug for Streams<'_> {
 pub fn copy_by_name(
     engine: &crate::Engine,
     transfer: &Transfer,
-    streams: &mut Streams<'_>,
+    streams: &mut CpStreams<'_>,
     options: CpOptions,
 ) -> crate::Result<CpReport> {
     #[cfg(target_os = "linux")]

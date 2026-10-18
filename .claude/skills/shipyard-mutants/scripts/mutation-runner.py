@@ -40,7 +40,7 @@ DETACHED = "cargo test -p shipyard-engine --test detached -- --exact "
 # name: (where, file, the exact text (must occur once), its replacement, test command)
 # where: "mac" (cargo here), "tester" or "root" (the Linux container).
 MUTANTS = {
-    # "example": ("root", N + "nft/ruleset.rs", "old text", "new text",
+    # "example": ("root", N + "nft/ruleset/rules.rs", "old text", "new text",
     #             "cargo test -p shipyard-cli --test firewall -- --include-ignored some_test"),
 }
 

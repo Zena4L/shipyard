@@ -12,6 +12,8 @@ publish.workspace = true
 [dependencies]
 # `flock`: a volume a run uses is held, so nothing removes it.
 nix.workspace = true
+# Lock files opened safely, a volume's hold handed over (stage 10).
+shipyard-sys.workspace = true
 thiserror.workspace = true
 
 [lints]

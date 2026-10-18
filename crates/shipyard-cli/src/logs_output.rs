@@ -1,22 +1,24 @@
 //! Printing a container's logs, for `shipyard logs` and `shipyard-runtime
 //! logs` alike: the program's stdout to stdout, its stderr to stderr, each
-//! line as it was (with its time first, if asked). The engine reads them.
+//! line as it was (with its time first, if asked). The runtime's reader
+//! reads them (by name, through the engine).
 
-use shipyard_engine::logs::{Entry, LogsError, ReadSummary};
 use shipyard_runtime::logs::cri::Stream;
+use shipyard_runtime::logs::reader::{Entry, LogsError, ReadSummary};
 
 /// Prints what `read` hands on (`timestamps`: each line's time first):
-/// how many lines weren't records (skipped). A reader that closes its end
-/// (`logs NAME | head`) has seen what it wanted: not an error.
+/// how many lines weren't records (skipped). A reader of stdout that
+/// closes its end (`logs NAME | head`, `2>&1 | head` too) has seen what it
+/// wanted: not an error. Stderr's reader gone while stdout's is there is a
+/// failure, as any other (F70): asked of the kernel, whichever stream's
+/// write failed.
 ///
 /// # Errors
 ///
-/// What `read` fails with, stdout or stderr aside.
-pub(crate) fn printed(
+/// What `read` fails with, stdout's reader gone aside.
+pub fn printed(
     timestamps: bool,
-    read: impl FnOnce(
-        &mut dyn FnMut(Entry) -> std::io::Result<()>,
-    ) -> shipyard_engine::Result<ReadSummary>,
+    read: impl FnOnce(&mut dyn FnMut(Entry) -> std::io::Result<()>) -> anyhow::Result<ReadSummary>,
 ) -> anyhow::Result<usize> {
     let (mut stdout, mut stderr) = (std::io::stdout().lock(), std::io::stderr().lock());
     // Whether each stream is in the middle of a line (a piece printed, its
@@ -38,24 +40,37 @@ pub(crate) fn printed(
         *midline = !entry.complete;
         out.flush()
     };
-    // A reader gone (`logs | head`) ends it quietly. Here, not in
+    // Stdout's reader gone (`logs | head`) ends it quietly. Here, not in
     // `shipyard`'s `fail` alone: `shipyard-runtime logs` shares this file,
     // not that `main`.
     match read(&mut sink) {
         Ok(read) => Ok(read.skipped),
-        Err(error)
-            if error.find::<LogsError>().is_some_and(|error| {
-                matches!(error, LogsError::Sink(io) if io.kind() == std::io::ErrorKind::BrokenPipe)
-            }) =>
-        {
-            Ok(0)
-        }
-        Err(error) => Err(error.into()),
+        Err(error) if quiet(&error, crate::pipe::stdout_gone()) => Ok(0),
+        Err(error) => Err(error),
     }
 }
 
+/// Whether a read that failed with `error` ends quietly: the sink's
+/// `EPIPE`, with stdout's reader gone (`stdout_gone`).
+fn quiet(error: &anyhow::Error, stdout_gone: bool) -> bool {
+    stdout_gone && is_sink_epipe(error)
+}
+
+/// Whether `error` is the sink's `EPIPE`: the runtime's own
+/// ([`LogsError::Sink`], `shipyard-runtime logs`), or in the engine's
+/// error (`shipyard logs`).
+fn is_sink_epipe(error: &anyhow::Error) -> bool {
+    let logs = error.downcast_ref::<LogsError>().or_else(|| {
+        error
+            .downcast_ref::<shipyard_engine::Error>()
+            .and_then(shipyard_engine::Error::find::<LogsError>)
+    });
+    matches!(logs, Some(LogsError::Sink(io)) if io.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 /// The warning for `skipped` lines that weren't records (none if none were).
-pub(crate) fn skipped_warning(skipped: usize) -> Option<String> {
+#[must_use]
+pub fn skipped_warning(skipped: usize) -> Option<String> {
     let lines = match skipped {
         0 => return None,
         1 => "line",
@@ -68,7 +83,7 @@ pub(crate) fn skipped_warning(skipped: usize) -> Option<String> {
 
 /// `--since` (and `events --until`): RFC 3339, Unix seconds
 /// (`1760000000`), or a duration ago (`10m`, `2h`, `30s`, `3d`).
-pub(crate) fn parse_since(text: &str) -> Result<shipyard_runtime::logs::time::Timestamp, String> {
+pub fn parse_since(text: &str) -> Result<shipyard_runtime::logs::time::Timestamp, String> {
     use shipyard_runtime::logs::time::Timestamp;
     if let Ok(time) = Timestamp::parse(text) {
         return Ok(time);
@@ -95,7 +110,7 @@ pub(crate) fn parse_since(text: &str) -> Result<shipyard_runtime::logs::time::Ti
 
 /// A duration, as Docker's and runc's (Go) durations most often are: a
 /// number and its unit, `500ms`, `5s` (or `5`), `1m`, `2h`; never zero.
-pub(crate) fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
+pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     use std::time::Duration;
     let bad = || format!("{text:?} isn't a duration (such as 5s, 500ms or 1m)");
     let (number, unit) = number_and_unit(text);
@@ -114,7 +129,7 @@ pub(crate) fn parse_duration(text: &str) -> Result<std::time::Duration, String> 
 }
 
 /// `text`'s leading digits, and the rest (`10m`: `10`, `m`).
-pub(crate) fn number_and_unit(text: &str) -> (&str, &str) {
+fn number_and_unit(text: &str) -> (&str, &str) {
     text.find(|c: char| !c.is_ascii_digit())
         .map_or((text, ""), |at| text.split_at(at))
 }
@@ -122,7 +137,43 @@ pub(crate) fn number_and_unit(text: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use shipyard_runtime::logs::time::Timestamp;
+
+    /// Only stdout's reader gone is quiet: the sink's `EPIPE` with stdout
+    /// still read (stderr's reader gone: its lines lost while stdout's go
+    /// on) isn't, nor another failure with stdout's gone (F70).
+    #[test]
+    fn only_stdouts_gone_reader_is_quiet() {
+        let pipe = || anyhow::Error::from(LogsError::Sink(std::io::ErrorKind::BrokenPipe.into()));
+        assert!(quiet(&pipe(), true));
+        assert!(!quiet(&pipe(), false));
+        let replaced = anyhow::Error::from(LogsError::Replaced {
+            dir: "/logs".into(),
+        });
+        assert!(!quiet(&replaced, true));
+    }
+
+    /// The sink's `EPIPE` is found whether the runtime's error says so
+    /// (`shipyard-runtime logs`) or the engine's holds it (`shipyard logs`);
+    /// any other failure isn't one.
+    #[test]
+    fn a_sinks_epipe_is_found_in_either_error() {
+        let pipe = || LogsError::Sink(std::io::ErrorKind::BrokenPipe.into());
+        assert!(is_sink_epipe(&anyhow::Error::from(pipe())));
+        assert!(is_sink_epipe(&anyhow::Error::from(
+            shipyard_engine::Error::from(pipe())
+        )));
+        let denied = || LogsError::Sink(std::io::ErrorKind::PermissionDenied.into());
+        assert!(!is_sink_epipe(&anyhow::Error::from(denied())));
+        assert!(!is_sink_epipe(&anyhow::Error::from(
+            shipyard_engine::Error::from(denied())
+        )));
+        let replaced = LogsError::Replaced {
+            dir: "/logs".into(),
+        };
+        assert!(!is_sink_epipe(&anyhow::Error::from(replaced)));
+    }
 
     /// `--interval` and the `--health-*` times: as runc and Docker write
     /// them.

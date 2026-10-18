@@ -9,7 +9,8 @@
 //!
 //! A few operations keep an enum of their own, where each case is something
 //! a caller handles differently: [`StreamsError`] here, and
-//! `attach::AttachError`, `logs::LogsError`, `cp::CpError` in their modules.
+//! `cp::CpError` in its module (and the runtime's `AttachError` and
+//! `LogsError`, re-exported in `attach` and `logs`).
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -433,6 +434,20 @@ impl From<crate::attach::AttachError> for Error {
     }
 }
 
+impl From<shipyard_runtime::attach::client::SettleError> for Error {
+    fn from(error: shipyard_runtime::attach::client::SettleError) -> Self {
+        use shipyard_runtime::attach::client::SettleError;
+        match error {
+            // Each with the kind it has on its own.
+            SettleError::Container(error) => error.into(),
+            SettleError::Attach(error) => error.into(),
+            // `Dropped`: let go of (it fell behind). A later case is the
+            // runtime's too until it's given a kind here.
+            error => Self::wrap(ErrorKind::Runtime, error),
+        }
+    }
+}
+
 impl From<crate::cp::CpError> for Error {
     fn from(error: crate::cp::CpError) -> Self {
         use crate::cp::CpError;
@@ -458,7 +473,9 @@ impl From<crate::cp::CpError> for Error {
 
 impl From<crate::logs::LogsError> for Error {
     fn from(error: crate::logs::LogsError) -> Self {
-        let kind = match &error {
+        let kind = match error {
+            // The runtime's own kinds (no such container, made without logs).
+            crate::logs::LogsError::Container(error) => return error.into(),
             crate::logs::LogsError::Sink(_) => ErrorKind::Io,
             _ => ErrorKind::Storage,
         };
@@ -486,7 +503,7 @@ impl From<StreamsError> for Error {
 }
 
 /// Why a run's standard input and output can't be set up as asked (see
-/// [`streams::plan`](crate::streams::plan)).
+/// the engine's `streams::plan`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StreamsError {
@@ -637,6 +654,57 @@ mod tests {
         assert_eq!(
             kind(crate::attach::AttachError::Refused("too many".into()).into()),
             ErrorKind::Busy
+        );
+    }
+
+    /// The attach client's and the logs reader's errors (the runtime's since
+    /// 10.1e4a) have, through the engine, the kinds they had in it, and the
+    /// same words as on their own (`shipyard-runtime`'s).
+    #[test]
+    fn the_runtimes_attach_and_logs_errors_keep_their_kinds_and_words() {
+        use shipyard_runtime::attach::client::{AttachError, SettleError};
+        use shipyard_runtime::container::ContainerError;
+        use shipyard_runtime::logs::reader::LogsError;
+        fn same<E: StdError + Send + Sync + 'static>(error: impl Fn() -> E, kind: ErrorKind)
+        where
+            Error: From<E>,
+        {
+            let own = format!("{:#}", anyhow::Error::from(error()));
+            let engine = Error::from(error());
+            assert_eq!(engine.kind(), kind, "{own}");
+            assert_eq!(format!("{:#}", anyhow::Error::from(engine)), own);
+        }
+        let dropped = || SettleError::Dropped("too slow".into());
+        assert_eq!(
+            dropped().to_string(),
+            "the container's monitor let go of this attach: too slow"
+        );
+        same(dropped, ErrorKind::Runtime);
+        same(
+            || SettleError::Container(ContainerError::NotFound("c".into())),
+            ErrorKind::NotFound,
+        );
+        same(
+            || SettleError::Attach(AttachError::Refused("full".into())),
+            ErrorKind::Busy,
+        );
+        same(
+            || SettleError::Attach(AttachError::NotLetIn),
+            ErrorKind::Runtime,
+        );
+        same(
+            || LogsError::Container(ContainerError::NotFound("c".into())),
+            ErrorKind::NotFound,
+        );
+        same(
+            || LogsError::Sink(std::io::ErrorKind::BrokenPipe.into()),
+            ErrorKind::Io,
+        );
+        same(
+            || LogsError::Replaced {
+                dir: "/logs".into(),
+            },
+            ErrorKind::Storage,
         );
     }
 

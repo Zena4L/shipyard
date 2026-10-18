@@ -13,6 +13,12 @@ use std::path::{Path, PathBuf};
 /// Files that may print and read their arguments and environment: helper
 /// entry points.
 const ENTRY_POINTS: &[&str] = &[
+    "doctor/probe.rs",
+    "guest/agent.rs",
+    "guest/doctor.rs",
+    "guest/init.rs",
+    "guest/mod.rs",
+    "guest/ports.rs",
     "image/helper.rs",
     "network/dns_server.rs",
     "run/cleanup.rs",
@@ -22,23 +28,21 @@ const ENTRY_POINTS: &[&str] = &[
 /// The one file that reads the environment for places.
 const PATHS: &str = "paths.rs";
 
-fn sources() -> Vec<(String, String)> {
+/// Every `.rs` file under `root`, by its path under it, with its text.
+fn rust_files(root: &Path) -> Vec<(String, String)> {
     fn walk(dir: &Path, root: &Path, found: &mut Vec<(String, String)>) {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-            .expect("reading the engine's sources")
-            .map(|entry| entry.expect("reading the engine's sources").path())
+            .expect("reading the sources")
+            .map(|entry| entry.expect("reading the sources").path())
             .collect();
         entries.sort();
         for path in entries {
             if path.is_dir() {
                 walk(&path, root, found);
-            } else if path.extension().is_some_and(|extension| extension == "rs")
-                // A module of tests alone (`mod tests;`) is test code whole.
-                && path.file_name().is_some_and(|name| name != "tests.rs")
-            {
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
                 let name = path
                     .strip_prefix(root)
-                    .expect("a source under src")
+                    .expect("a source under its root")
                     .to_string_lossy()
                     .into_owned();
                 let text = std::fs::read_to_string(&path).expect("reading a source");
@@ -46,9 +50,20 @@ fn sources() -> Vec<(String, String)> {
             }
         }
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut found = Vec::new();
-    walk(&root, &root, &mut found);
+    walk(root, root, &mut found);
+    found
+}
+
+/// The engine's sources, but for modules of tests alone (`mod tests;` is
+/// test code whole, a file or a directory).
+fn sources() -> Vec<(String, String)> {
+    let found: Vec<_> = rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.ends_with("tests.rs") && !name.split('/').any(|part| part == "tests")
+        })
+        .collect();
     assert!(
         found.iter().any(|(name, _)| name == PATHS),
         "the walk finds the sources: {found:?}",
@@ -143,5 +158,55 @@ fn the_checks_find_what_they_look_for() {
     assert!(
         lines_with(text, &["env::temp_dir"]).is_empty(),
         "a test's own"
+    );
+}
+
+/// Lines that name the engine's `containers::testing` (its record writers,
+/// which skip the store's locks): anywhere `testing` is said beside
+/// `containers` or the engine.
+fn testing_uses(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .flat_map(|(name, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("testing")
+                        && (line.contains("containers") || line.contains("shipyard_engine"))
+                })
+                .map(move |(number, line)| format!("{name}:{}: {}", number + 1, line.trim()))
+        })
+        .collect()
+}
+
+/// `containers::testing` is for the engine's own tests and example: no
+/// other crate (the CLI, stage 11's API) may write records past the
+/// store's locks. Positive control: the engine's own tests are found.
+#[test]
+fn only_the_engines_tests_write_records_directly() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !testing_uses(&rust_files(&manifest.join("tests"))).is_empty(),
+        "the check finds the engine's own tests' uses"
+    );
+    let mut found = Vec::new();
+    for root in [
+        "../shipyard-cli/src",
+        "../shipyard-cli/tests",
+        "../shipyard-test-support/src",
+        "../../fuzz/fuzz_targets",
+    ] {
+        let files = rust_files(&manifest.join(root));
+        assert!(!files.is_empty(), "{root} has sources");
+        found.extend(
+            testing_uses(&files)
+                .into_iter()
+                .map(|line| format!("{root}/{line}")),
+        );
+    }
+    assert!(
+        found.is_empty(),
+        "containers::testing is the engine's tests' only:\n{}",
+        found.join("\n")
     );
 }

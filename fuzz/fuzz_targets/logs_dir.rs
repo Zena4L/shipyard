@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use shipyard_engine::logs::{Options, read};
+use shipyard_runtime::logs::reader::{LogsOptions, read};
 
 /// One scratch directory for the run, its `log.json` written once.
 fn dir() -> &'static PathBuf {
@@ -29,12 +29,12 @@ fuzz_target!(|data: &[u8]| {
     let dir = dir();
     std::fs::write(dir.join("container.log"), data).unwrap();
     for tail in [None, Some(3)] {
-        let options = Options {
+        let options = LogsOptions {
             tail,
-            ..Options::default()
+            ..LogsOptions::default()
         };
         let _ = read(dir, &options, || true, |entry| {
-            assert!(entry.text.len() <= shipyard_engine::logs::MAX_LINE);
+            assert!(entry.text.len() <= shipyard_runtime::logs::reader::MAX_LINE);
             Ok(())
         });
     }

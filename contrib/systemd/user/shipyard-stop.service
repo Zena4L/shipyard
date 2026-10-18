@@ -1,0 +1,26 @@
+# Stops your (rootless) Shipyard containers when your user manager stops
+# (a shutdown, or your last logout without linger), each with its own stop
+# signal and timeout. Install it with shipyard-recover.service. See
+# ../README.md.
+[Unit]
+Description=Shipyard: stop your containers when your user manager stops
+Documentation=https://github.com/Zena4L/shipyard/tree/main/contrib/systemd
+# Started before the recover unit, so stopped after it: a shutdown stops
+# units in the reverse of their start order.
+Before=shipyard-recover.service
+
+[Service]
+Type=oneshot
+# Nothing to start: it's started at once, so its stop below runs at any
+# shutdown, even one while the recover unit is still starting containers.
+RemainAfterExit=yes
+# At a shutdown (or a stop of the unit): every container stopped with its
+# own stop signal and timeout, all at once; then whatever is left of this
+# unit's own is killed. A container whose stop timeout is longer than this
+# unit's is killed before its own: `shipyard doctor` says so.
+ExecStop=/usr/local/bin/shipyard system stop
+KillMode=mixed
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=default.target

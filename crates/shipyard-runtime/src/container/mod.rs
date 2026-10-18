@@ -266,15 +266,18 @@ pub const HOLD_LABELS_ENV: &str = "SHIPYARD_HOLD_LABELS";
 /// The most descriptors a container's monitor holds for its caller (see
 /// [`CreateOptions::holds`]): room for a container publishing a whole `-p`
 /// range (1024 ports, on IPv4 and IPv6: two sockets each), beside its
-/// networks and volumes. The caller's descriptor limit (which the monitor
-/// inherits, and which a run publishing that many has met already) is the
-/// other bound.
+/// networks and volumes. The caller's descriptor limit bounds those given
+/// at `create` (they're open in the caller first); the monitor raises its
+/// own towards this many and room beside them once its container is
+/// spawned, as far as the hard limit lets it (F49), so the holds added
+/// since aren't bound by the caller's soft limit.
 pub const MOST_HOLDS: usize = 2_100;
 
 /// What a monitor says, after the number, when it holds all it can (in a
-/// refused hold's [`ContainerError::NotHeld`]): its caller tells this
-/// refusal from the others by it, as the protocol has no code for it. A
-/// monitor since 9.7b1 says it so; keep it so.
+/// refused hold's [`ContainerError::NotHeld`]). A version 4 monitor says
+/// [`HoldRefusal::Full`](crate::attach::HoldRefusal::Full) too; the words
+/// are read only from a version 3 one (9.7b1 to 10.2c1), and stay as long
+/// as one may still run.
 pub const HOLDS_FULL: &str = "descriptors are held already";
 
 /// The most bytes of hold labels a monitor keeps, all told: they reach the
@@ -484,6 +487,14 @@ pub enum Status {
     Stopped,
 }
 
+impl Status {
+    /// Whether its program is there to reach: running, or frozen (paused).
+    #[must_use]
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Paused)
+    }
+}
+
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -661,7 +672,9 @@ pub enum ContainerError {
     NotHeld {
         /// Its ID.
         id: String,
-        /// Why.
+        /// Why: what a caller tells refusals apart by (F73).
+        reason: crate::attach::HoldRefusal,
+        /// Why, in words.
         why: String,
     },
     /// The container's monitor turned a control client away (too many of
@@ -752,11 +765,11 @@ pub enum ContainerError {
         found: u32,
     },
     /// A hold (`--hold-fd`) that isn't one: not open, a standard stream
-    /// (0 to 2), given twice, or one of the descriptors passed to the
-    /// container's process.
+    /// (0 to 2), given twice, one of the descriptors passed to the
+    /// container's process, or not a file, a directory or a socket.
     #[error(
         "--hold-fd {0}: not a descriptor the monitor can hold (it must be open, above 2, given \
-         once, and not passed to the container)"
+         once, not passed to the container, and a file, a directory or a socket)"
     )]
     BadHold(i32),
     /// A hold whose label isn't one ([`crate::attach::is_label`]).

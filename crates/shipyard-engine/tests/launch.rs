@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use shipyard_engine::report::{Collect, Event, Reporter};
+use shipyard_engine::report::{Collect, Message, Reporter};
 use shipyard_engine::run::{Outcome, RunRequest, run};
 use shipyard_engine::{Engine, Paths};
 use shipyard_runtime::process::passed::PassedFds;
@@ -45,7 +45,7 @@ fn a_run_ends_as_its_command_does() {
     );
     let events = collect.events();
     assert!(
-        matches!(&events[..], [Event::Failure(message)] if message.contains("not found")),
+        matches!(&events[..], [Message::Failure(message)] if message.contains("not found")),
         "{events:?}"
     );
 }

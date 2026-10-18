@@ -29,23 +29,51 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use nix::errno::Errno;
 
-/// A terminal's size: rows, columns.
-pub(crate) type Size = (u16, u16);
+/// A terminal's size: its rows and columns. On disk (`plan.json`) it's
+/// `[rows, cols]`, as it has been since it was first written (H2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "(u16, u16)", into = "(u16, u16)")]
+pub struct Size {
+    /// Its rows (lines).
+    pub rows: u16,
+    /// Its columns.
+    pub cols: u16,
+}
+
+impl Size {
+    /// A size of `rows` by `cols`.
+    #[must_use]
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self { rows, cols }
+    }
+}
+
+impl From<(u16, u16)> for Size {
+    fn from((rows, cols): (u16, u16)) -> Self {
+        Self { rows, cols }
+    }
+}
+
+impl From<Size> for (u16, u16) {
+    fn from(size: Size) -> Self {
+        (size.rows, size.cols)
+    }
+}
 
 /// The size a pseudo-terminal gets when there's no terminal to copy it
 /// from (`-t` with output to a pipe), or a console when the bundle gives
 /// none (`process.consoleSize`): a new one would be 0x0 (probe T7), which
 /// full-screen programs can't draw in (runc leaves it so; a shim resizes it
 /// anyway).
-pub(crate) const DEFAULT_SIZE: Size = (24, 80);
+pub const DEFAULT_SIZE: Size = Size::new(24, 80);
 
 /// `size` as the kernel's `winsize` (no pixel sizes).
-fn winsize((rows, cols): Size) -> libc::winsize {
+fn winsize(Size { rows, cols }: Size) -> libc::winsize {
     libc::winsize {
         ws_row: rows,
         ws_col: cols,
@@ -65,12 +93,12 @@ pub(crate) fn window_size(fd: RawFd) -> Option<Size> {
     }
     // SAFETY: filled in by the successful call.
     let size = unsafe { size.assume_init() };
-    (size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+    (size.ws_row > 0 && size.ws_col > 0).then_some(Size::new(size.ws_row, size.ws_col))
 }
 
 /// Sets the size of the terminal on `fd` (a pseudo-terminal's master: the
 /// kernel then sends SIGWINCH to its foreground job, probe T7).
-pub(crate) fn set_window_size(fd: RawFd, size: Size) -> Result<(), Errno> {
+pub fn set_window_size(fd: RawFd, size: Size) -> Result<(), Errno> {
     let size = winsize(size);
     // SAFETY: `TIOCSWINSZ` reads one `winsize`, which `size` is.
     Errno::result(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &raw const size) }).map(drop)
@@ -144,61 +172,38 @@ pub(crate) fn send_fd(
     fd: BorrowedFd<'_>,
     name: &[u8],
 ) -> Result<(), Errno> {
-    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
-    let fds = [fd.as_raw_fd()];
-    let iov = [std::io::IoSlice::new(name)];
-    loop {
-        match sendmsg::<()>(
-            socket.as_raw_fd(),
-            &iov,
-            &[ControlMessage::ScmRights(&fds)],
-            MsgFlags::empty(),
-            None,
-        ) {
-            Ok(_) => return Ok(()),
-            Err(Errno::EINTR) => {}
-            Err(errno) => return Err(errno),
-        }
-    }
+    shipyard_sys::fdpass::send(socket, &[fd], name, nix::sys::socket::MsgFlags::empty()).map(drop)
 }
 
 /// Receives a descriptor [`send_fd`] sent, without blocking. `Ok(None)`:
 /// nothing yet. `Err(Errno::ENODATA)`: the other end closed without sending
-/// (it failed). The descriptor is close-on-exec; any more than one, or a
-/// truncated message, is refused (and what came is closed). Its name is
-/// read with it, and not used.
+/// (it failed). The descriptor is close-on-exec; any more than one is
+/// refused (and closed), as is a truncated message (what it brought,
+/// closed: F54). Its name is read with it, and not used.
 pub(crate) fn receive_fd(socket: BorrowedFd<'_>) -> Result<Option<OwnedFd>, Errno> {
-    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use nix::sys::socket::MsgFlags;
     let mut name = [0_u8; MAX_NAME_LEN];
-    let mut iov = [std::io::IoSliceMut::new(&mut name)];
-    let mut space = nix::cmsg_space!([RawFd; 2]);
+    let mut space = shipyard_sys::fdpass::Room::new(2);
     #[cfg(target_os = "linux")]
     let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC;
     // (Elsewhere, close-on-exec is set right after: Shipyard forks from one
     // thread only.)
     #[cfg(not(target_os = "linux"))]
     let flags = MsgFlags::MSG_DONTWAIT;
-    let message = match recvmsg::<()>(socket.as_raw_fd(), &mut iov, Some(&mut space), flags) {
+    let message = match shipyard_sys::fdpass::receive(socket, &mut name, &mut space, flags) {
         Ok(message) => message,
         Err(Errno::EAGAIN | Errno::EINTR) => return Ok(None),
         Err(errno) => return Err(errno),
     };
-    let mut received: Vec<OwnedFd> = Vec::new();
-    for cmsg in message.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            // SAFETY: the kernel just installed these descriptors in this
-            // process; nothing else owns them.
-            received.extend(
-                fds.into_iter()
-                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
-            );
-        }
+    // A message cut short: refused, what it brought dropped, so closed.
+    if message.truncated {
+        return Err(Errno::ENOBUFS);
     }
+    let mut received = message.fds;
     if message.bytes == 0 && received.is_empty() {
         return Err(Errno::ENODATA);
     }
-    let truncated = message.flags.contains(MsgFlags::MSG_CTRUNC);
-    if truncated || received.len() != 1 {
+    if received.len() != 1 {
         // Dropped, so closed.
         return Err(Errno::EBADMSG);
     }
@@ -224,6 +229,9 @@ pub(crate) fn socket_pair() -> Result<(OwnedFd, OwnedFd), Errno> {
     Ok((a, b))
 }
 
+/// Sets `fd` close-on-exec, where it can't be made so (macOS has no
+/// `SOCK_CLOEXEC`, nor `O_CLOEXEC` for a pseudo-terminal).
+#[cfg(not(target_os = "linux"))]
 fn cloexec(fd: &OwnedFd) -> Result<(), Errno> {
     nix::fcntl::fcntl(
         fd,
@@ -233,8 +241,32 @@ fn cloexec(fd: &OwnedFd) -> Result<(), Errno> {
 }
 
 /// A pseudo-terminal of Shipyard's own (no isolation: the command runs on
+/// the host), `size` big: (master, slave), both close-on-exec. On Linux,
+/// from their opening: a process another thread starts meanwhile (the
+/// macOS guest's agent runs a command per connection) never inherits one,
+/// which would keep the terminal's other end open past its command's end.
+#[cfg(target_os = "linux")]
+pub fn host_pty(size: Size) -> Result<(OwnedFd, OwnedFd), Errno> {
+    use nix::fcntl::OFlag;
+    use std::os::fd::AsRawFd as _;
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let master = nix::pty::posix_openpt(flags)?;
+    nix::pty::grantpt(&master)?;
+    nix::pty::unlockpt(&master)?;
+    let slave = nix::fcntl::open(
+        nix::pty::ptsname_r(&master)?.as_str(),
+        flags,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let master = OwnedFd::from(master);
+    set_window_size(master.as_raw_fd(), size)?;
+    Ok((master, slave))
+}
+
+/// A pseudo-terminal of Shipyard's own (no isolation: the command runs on
 /// the host), `size` big: (master, slave), both close-on-exec.
-pub(crate) fn host_pty(size: Size) -> Result<(OwnedFd, OwnedFd), Errno> {
+#[cfg(not(target_os = "linux"))]
+pub fn host_pty(size: Size) -> Result<(OwnedFd, OwnedFd), Errno> {
     let pty = nix::pty::openpty(Some(&winsize(size)), None)?;
     for fd in [&pty.master, &pty.slave] {
         cloexec(fd)?;
@@ -654,6 +686,8 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd as _;
+
     use super::*;
 
     #[test]
@@ -709,10 +743,46 @@ mod tests {
 
     #[test]
     fn a_pty_takes_the_size_it_is_given() {
-        let (master, _slave) = host_pty((40, 100)).unwrap();
-        assert_eq!(window_size(master.as_raw_fd()), Some((40, 100)));
-        set_window_size(master.as_raw_fd(), (30, 90)).unwrap();
-        assert_eq!(window_size(master.as_raw_fd()), Some((30, 90)));
+        let (master, _slave) = host_pty(Size::new(40, 100)).unwrap();
+        assert_eq!(window_size(master.as_raw_fd()), Some(Size::new(40, 100)));
+        set_window_size(master.as_raw_fd(), Size::new(30, 90)).unwrap();
+        assert_eq!(window_size(master.as_raw_fd()), Some(Size::new(30, 90)));
+    }
+
+    /// Both ends are close-on-exec: a command started beside it never
+    /// holds Shipyard's terminal open; the slave is the master's own.
+    #[test]
+    fn a_pty_is_close_on_exec_and_paired() {
+        let (master, slave) = host_pty(Size::new(24, 80)).unwrap();
+        for fd in [&master, &slave] {
+            let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+            assert!(
+                nix::fcntl::FdFlag::from_bits_truncate(flags)
+                    .contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+            );
+        }
+        nix::unistd::write(&master, b"x\n").unwrap();
+        let mut read = [0_u8; 8];
+        let got = nix::unistd::read(&slave, &mut read).unwrap();
+        assert_eq!(&read[..got], b"x\n");
+    }
+
+    /// Anything but one descriptor (two in one message, as a hostile sender
+    /// might) is refused, and what came closed.
+    #[test]
+    fn two_descriptors_at_once_are_refused() {
+        let (a, b) = socket_pair().unwrap();
+        let (one, two) = nix::unistd::pipe().unwrap();
+        let fds = [
+            std::os::fd::AsFd::as_fd(&one),
+            std::os::fd::AsFd::as_fd(&two),
+        ];
+        let flags = nix::sys::socket::MsgFlags::empty();
+        shipyard_sys::fdpass::send(std::os::fd::AsFd::as_fd(&a), &fds, MASTER_NAME, flags).unwrap();
+        assert_eq!(
+            receive_fd(std::os::fd::AsFd::as_fd(&b)).unwrap_err(),
+            Errno::EBADMSG
+        );
     }
 
     #[test]

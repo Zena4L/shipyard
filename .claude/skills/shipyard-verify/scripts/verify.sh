@@ -5,6 +5,10 @@
 #                        rustdoc and the clippy targets the passes don't run)
 #   verify.sh --mac      fmt, clippy, the macOS suite, cargo deny
 #   verify.sh --linux    the Linux half only
+#   verify.sh --vm       the macOS VM's: the guest built from this tree, then
+#                        the VM tests (each boots a VM; four at once)
+#
+# On a Mac, everything includes the VM's part.
 #
 # Each check's full output goes to $VERIFY_LOGS (default target/verify/), and a
 # summary with the test totals is printed at the end. It exits non-zero if any
@@ -17,9 +21,9 @@ logs=${VERIFY_LOGS:-$repo/target/verify}
 mkdir -p "$logs"
 mode=${1:---all}
 case $mode in
---all | --mac | --linux) ;;
+--all | --mac | --linux | --vm) ;;
 *)
-    echo "usage: verify.sh [--all|--mac|--linux]" >&2
+    echo "usage: verify.sh [--all|--mac|--linux|--vm]" >&2
     exit 2
     ;;
 esac
@@ -47,7 +51,7 @@ run() {
     fi
 }
 
-if [ "$mode" != --linux ]; then
+if [ "$mode" != --linux ] && [ "$mode" != --vm ]; then
     run "fmt" "$logs/fmt.log" cargo fmt --all --check
     run "clippy (macOS)" "$logs/clippy-mac.log" \
         cargo clippy --workspace --all-targets -- -D warnings
@@ -56,12 +60,21 @@ if [ "$mode" != --linux ]; then
     run "cargo deny" "$logs/deny.log" cargo deny check
 fi
 
-if [ "$mode" != --mac ]; then
+if [ "$mode" = --all ] || [ "$mode" = --linux ]; then
     run "Linux: clippy + tests as tester + as root" "$logs/test-linux.log" \
         timeout 7200 scripts/test-linux.sh
     summary+=("        tests (Linux, both passes): $(totals "$logs/test-linux.log")")
     run "Linux: rustdoc, clippy glibc + musl" "$logs/linux-lints.log" \
         timeout 3000 "$here/run-in-linux.sh" root "$here/linux-lints.sh"
+fi
+
+if [ "$mode" = --vm ] || { [ "$mode" = --all ] && [ "$(uname)" = Darwin ]; }; then
+    run "the macOS guest, built from this tree" "$logs/guest.log" \
+        timeout 3600 scripts/guest/build.sh
+    run "macOS VM tests" "$logs/test-vm.log" \
+        env SHIPYARD_TEST_VM=required timeout 3600 \
+        cargo test -p shipyard-cli --test vm --test vm_terminal --no-fail-fast
+    summary+=("        tests (macOS VM): $(totals "$logs/test-vm.log")")
 fi
 
 echo

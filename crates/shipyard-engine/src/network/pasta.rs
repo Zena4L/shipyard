@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::HOST_INSTEAD;
 use super::attach::announce;
-use crate::report::{Event, Reporter};
+use crate::report::{Message, Reporter};
 
 /// What a pasta run starts once its container exists.
 pub(super) struct PastaPlan {
@@ -64,7 +64,7 @@ impl PastaPlan {
     /// network wasn't asked for.
     fn failed(&self, error: &shipyard_network::pasta::PastaError) -> String {
         if self.defaulted {
-            self.reporter.report(Event::Hint(HOST_INSTEAD.to_owned()));
+            self.reporter.report(Message::Hint(HOST_INSTEAD.to_owned()));
         }
         error.to_string()
     }

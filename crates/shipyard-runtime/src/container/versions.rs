@@ -33,6 +33,10 @@ use super::{ContainerError, Result};
 /// `state.json`'s version.
 pub(crate) const STATE_VERSION: u32 = 1;
 
+/// The most of `state.json` read: it holds a plan's annotations and hooks
+/// again, so twice the plan's own bound (`MAX_PLAN_SIZE`).
+pub(crate) const STATE_MAX: u64 = 2 * super::plan::MAX_PLAN_SIZE;
+
 /// The exit record's version: 2 since 9.4a (`started`).
 pub(crate) const EXIT_VERSION: u32 = 2;
 

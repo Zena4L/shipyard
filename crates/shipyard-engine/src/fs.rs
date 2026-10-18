@@ -1,63 +1,43 @@
 //! Writing files that must survive a crash whole or not at all.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{Context as _, Error, ErrorKind, Result, bail};
 
 /// Writes `bytes` as `dir/name` (mode `mode`), so that a reader sees the old
 /// file or the new one, never part of one, and so that the new one is on
-/// the disk once this returns: a temporary file of its own (`O_EXCL`), its
-/// data synced (`fsync`), renamed over `name` (atomic, TLPI §18.4), then
-/// the directory synced, which makes the rename itself durable (TLPI
-/// §13.3). The temporary file is removed if anything fails.
+/// the disk once this returns (`shipyard_sys::fs::write_atomically`: a
+/// temporary file of its own, synced, renamed over `name`, then the
+/// directory synced).
 ///
 /// # Errors
 ///
 /// Any step failed (as [`ErrorKind::Io`], with what
-/// was being written).
+/// was being written, or the directory being synced).
 pub(crate) fn write_atomically(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<()> {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let temporary = dir.join(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, dir.join(name))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written.with_context(|| format!("writing {}", dir.join(name).display()))?;
-    sync_directory(dir)
+    let path = dir.join(name);
+    shipyard_sys::fs::write_atomically(&path, bytes, &shipyard_sys::fs::Write::new(mode)).map_err(
+        |error| {
+            let doing = match error.step {
+                shipyard_sys::fs::Step::SyncDirectory => format!("syncing {}", dir.display()),
+                _ => format!("writing {}", path.display()),
+            };
+            Error::from(error.source).context(doing)
+        },
+    )
 }
 
 /// Syncs directory `dir`: what was made, renamed or removed in it is on the
-/// disk once this returns. A file system that can't sync a directory at
-/// all (`EINVAL`: 9p and some FUSE ones) has nothing more to give: that's
-/// done too.
+/// disk once this returns (a file system that can't sync a directory at
+/// all counts as done: `shipyard_sys::fs::sync_directory`).
 ///
 /// # Errors
 ///
 /// It couldn't be opened or synced.
 pub(crate) fn sync_directory(dir: &Path) -> Result<()> {
-    match File::open(dir).and_then(|dir| dir.sync_all()) {
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Ok(()),
-        synced => synced.with_context(|| format!("syncing {}", dir.display())),
-    }
+    shipyard_sys::fs::sync_directory(dir).with_context(|| format!("syncing {}", dir.display()))
 }
 
 /// Opens `path`, a lock file (made if it's missing, the caller's alone, a
@@ -67,15 +47,7 @@ pub(crate) fn sync_directory(dir: &Path) -> Result<()> {
 ///
 /// It couldn't be opened.
 pub(crate) fn open_lock_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))
+    shipyard_sys::fs::open_lock_file(path).with_context(|| format!("opening {}", path.display()))
 }
 
 /// An exclusive `flock` on the lock file `path`, held until dropped,
@@ -91,26 +63,17 @@ pub(crate) fn lock_waiting(
     wait: Duration,
     what: &str,
 ) -> Result<nix::fcntl::Flock<File>> {
-    use nix::errno::Errno;
-    use nix::fcntl::{Flock, FlockArg};
-    let mut file = open_lock_file(path)?;
+    use shipyard_sys::lock::{Mode, lock_until};
+    let file = open_lock_file(path)?;
     let deadline = Instant::now() + wait;
-    loop {
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(locked) => return Ok(locked),
-            Err((unlocked, Errno::EWOULDBLOCK)) if Instant::now() < deadline => {
-                file = unlocked;
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err((_, Errno::EWOULDBLOCK)) => bail!(
-                Busy,
-                "{what} is busy: another command has held its lock for over {} seconds",
-                wait.as_secs()
-            ),
-            Err((_, errno)) => {
-                return Err(Error::from(errno).context(format!("locking {}", path.display())));
-            }
-        }
+    match lock_until(file, Mode::Exclusive, deadline, Duration::from_millis(20)) {
+        Ok(locked) => Ok(locked),
+        Err(nix::errno::Errno::EWOULDBLOCK) => bail!(
+            Busy,
+            "{what} is busy: another command has held its lock for over {} seconds",
+            wait.as_secs()
+        ),
+        Err(errno) => Err(Error::from(errno).context(format!("locking {}", path.display()))),
     }
 }
 

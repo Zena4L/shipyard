@@ -18,8 +18,13 @@
 //! - **Created or exited:** its record only, for its next start.
 //!
 //! Either way its record keeps the change (`config.network`), so its next
-//! start (a restart too) joins what it's on now. Lock order: the operation
-//! lock, a network's (one at a time), the container store's.
+//! start (a restart too) joins what it's on now. The record is written
+//! first: a command killed after it leaves the record saying what the
+//! container isn't yet, and the same command run again finishes it (F57: a
+//! `connect` whose record names the network, its lease not there, joins;
+//! a `disconnect` whose record no longer does, its lease still there,
+//! leaves). Lock order: the operation lock, a network's (one at a time),
+//! the container store's.
 
 use std::net::{IpAddr, Ipv6Addr};
 
@@ -76,11 +81,26 @@ impl ConnectRequest {
 ///   couldn't be joined (its address taken, the monitor not holding the
 ///   lease: then nothing is left joined).
 pub fn connect(engine: &Engine, request: &ConnectRequest) -> Result<()> {
+    connect_with(engine, request, || {})
+}
+
+/// [`connect`], `between` run after its record is written and before the
+/// container joins (tests cut it short there).
+///
+/// # Errors
+///
+/// As [`connect`].
+#[doc(hidden)]
+pub fn connect_with(
+    engine: &Engine,
+    request: &ConnectRequest,
+    between: impl FnOnce(),
+) -> Result<()> {
     #[cfg(target_os = "linux")]
-    return linux::connect(engine, request);
+    return linux::connect(engine, request, between);
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (engine, request);
+        let _ = (engine, request, between);
         crate::error::bail!(Unsupported, "networks need Linux");
     }
 }
@@ -97,11 +117,28 @@ pub fn connect(engine: &Engine, request: &ConnectRequest) -> Result<()> {
 /// if it's its only network, or (without `force`) the one its way out goes
 /// through.
 pub fn disconnect(engine: &Engine, network: &str, container: &str, force: bool) -> Result<()> {
+    disconnect_with(engine, network, container, force, || {})
+}
+
+/// [`disconnect`], `between` run after its record is written and before
+/// the container leaves (tests cut it short there).
+///
+/// # Errors
+///
+/// As [`disconnect`].
+#[doc(hidden)]
+pub fn disconnect_with(
+    engine: &Engine,
+    network: &str,
+    container: &str,
+    force: bool,
+    between: impl FnOnce(),
+) -> Result<()> {
     #[cfg(target_os = "linux")]
-    return linux::disconnect(engine, network, container, force);
+    return linux::disconnect(engine, network, container, force, between);
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (engine, network, container, force);
+        let _ = (engine, network, container, force, between);
         crate::error::bail!(Unsupported, "networks need Linux");
     }
 }
@@ -120,7 +157,7 @@ mod linux {
     use crate::events::{self, Event, Kind};
     use crate::network::{self, Joined, Joining, RunId};
     use crate::report::WarningKind;
-    use crate::run::detached::linux::{HeldOff, OP_WAIT};
+    use crate::run::held_off::HeldOff;
     use crate::run::holds::HoldKind;
 
     /// What's done with a container, by its state now.
@@ -139,9 +176,10 @@ mod linux {
         reference: &str,
     ) -> Result<(nix::fcntl::Flock<std::fs::File>, Record, Now)> {
         let _root = network::networks(engine)?;
-        let found = containers::find(engine, reference)?;
-        let lock = containers::operation_lock(engine, &found.id, OP_WAIT)?;
-        let record = containers::find(engine, found.id.as_str())?;
+        let containers::Locked {
+            record,
+            operation: lock,
+        } = containers::lock_found(engine, reference, containers::OP_WAIT)?;
         let now = match containers::state(engine, &record)? {
             ContainerState::Running { .. } | ContainerState::Paused => Now::Live,
             ContainerState::Created | ContainerState::Exited { .. } => Now::Later,
@@ -159,6 +197,22 @@ mod linux {
         Ok((lock, record, now))
     }
 
+    /// Whether running container `record` has a live lease on the network
+    /// `name` (its monitor holds it: it's on it now).
+    fn leased(engine: &Engine, record: &Record, name: &str) -> Result<bool> {
+        Ok(network::container_leases(engine, record)?
+            .iter()
+            .any(|(network, _)| network == name))
+    }
+
+    /// Whether `asked` (a `connect`'s settings) asks for what `recorded`
+    /// has: each setting given equal to the recorded one (none given, any).
+    fn asks_the_same(recorded: &Bridge, asked: &Bridge) -> bool {
+        asked.ip.is_none_or(|ip| recorded.ip == Some(ip))
+            && asked.ip6.is_none_or(|ip| recorded.ip6 == Some(ip))
+            && (asked.aliases.is_empty() || asked.aliases == recorded.aliases)
+    }
+
     /// The label its monitor holds a network's lease by: a start's own
     /// (`lease:NAME`), so its clean-up releases one connected later alike.
     fn label(network: &str) -> String {
@@ -168,7 +222,11 @@ mod linux {
         .to_arg()
     }
 
-    pub(super) fn connect(engine: &Engine, request: &ConnectRequest) -> Result<()> {
+    pub(super) fn connect(
+        engine: &Engine,
+        request: &ConnectRequest,
+        between: impl FnOnce(),
+    ) -> Result<()> {
         let name = request.network.as_str();
         network::check_bridge(name)?;
         let (_lock, record, now) = found(engine, &request.container)?;
@@ -186,20 +244,39 @@ mod linux {
         bridge.ip = request.ip;
         bridge.ip6 = request.ip6;
         bridge.aliases.clone_from(&aliases);
-        let changed = record
-            .config
-            .with_bridge(bridge, DEFAULT_NETWORK)
-            .map_err(|error| error.context(format!("container {}", record.name)))?;
+        let live = matches!(now, Now::Live);
+        // On it already: a `connect` cut short (killed after its record's
+        // write) if it's up and has no lease there, asked again as it was
+        // asked then (F57): finished, its record as it is.
+        let (changed, settings) = match record.config.with_bridge(bridge.clone(), DEFAULT_NETWORK) {
+            Ok(changed) => (Some(changed), bridge),
+            Err(error)
+                if error.kind() == ErrorKind::Exists && live && !leased(engine, &record, name)? =>
+            {
+                match record.config.bridge(name, DEFAULT_NETWORK) {
+                    Some(recorded) if asks_the_same(&recorded, &bridge) => (None, recorded),
+                    _ => return Err(error.context(format!("container {}", record.name))),
+                }
+            }
+            Err(error) => return Err(error.context(format!("container {}", record.name))),
+        };
+        let finishing = changed.is_none();
         // From here a Ctrl-C waits: the record and the container agree at
         // the end. The record first: one that says a network the container
-        // isn't on yet is what a failure leaves at worst (and is put back).
+        // isn't on yet is what a failure leaves at worst (and is put back,
+        // or the same `connect` finishes).
         let _held = HeldOff::new();
         let original = record.config.clone();
-        let updated = containers::update(engine, &record.id, |kept| kept.config = changed)?;
-        if matches!(now, Now::Live) {
-            // Its aliases there: those asked, and its own for every network
-            // with names (as a start gives them), each name once.
-            let mut aliases = aliases;
+        let updated = match changed {
+            Some(changed) => containers::update(engine, &record.id, |kept| kept.config = changed)?,
+            None => record.clone(),
+        };
+        between();
+        if live {
+            // Its aliases there: those asked (or recorded), and its own for
+            // every network with names (as a start gives them), each name
+            // once.
+            let mut aliases = settings.aliases;
             if named {
                 aliases.extend(record.config.network_alias.iter().cloned());
             }
@@ -207,15 +284,23 @@ mod linux {
             aliases.retain(|alias| seen.insert(alias.to_ascii_lowercase()));
             let joined = Joined {
                 name: config.name.clone(),
-                ip: request.ip,
-                ip6: request.ip6,
+                ip: settings.ip,
+                ip6: settings.ip6,
                 mac: None,
                 aliases,
             };
             if let Err(error) = join_now(engine, &record, &joined) {
-                put_back(engine, &record, original);
+                if !finishing {
+                    put_back(engine, &record, original);
+                }
                 return Err(error);
             }
+        }
+        if finishing {
+            engine.report(crate::report::Message::Notice(format!(
+                "finished a `network connect` of {} to {name} that was cut short",
+                record.name
+            )));
         }
         events::emit(engine, &events::container(&updated, "update"));
         events::emit(
@@ -358,16 +443,17 @@ mod linux {
                 let _ = runtime::release(runtime_root, record.id.as_str(), &label);
             }
             let error = match error {
-                ContainerError::NotHeld { why, .. } if why.contains(runtime::HOLDS_FULL) => {
-                    Error::new(
-                        ErrorKind::InvalidRequest,
-                        format!(
-                            "container {}'s monitor holds as much as it can (its networks, \
+                ContainerError::NotHeld {
+                    reason: shipyard_runtime::attach::HoldRefusal::Full,
+                    ..
+                } => Error::new(
+                    ErrorKind::InvalidRequest,
+                    format!(
+                        "container {}'s monitor holds as much as it can (its networks, \
                              ports and volumes): restart it with this network to join it",
-                            record.name
-                        ),
-                    )
-                }
+                        record.name
+                    ),
+                ),
                 other => Error::from(other),
             };
             return Err(error.context(format!(
@@ -384,27 +470,49 @@ mod linux {
         name: &str,
         container: &str,
         force: bool,
+        between: impl FnOnce(),
     ) -> Result<()> {
         network::check_bridge(name)?;
         let (_lock, record, now) = found(engine, container)?;
-        let changed = record
-            .config
-            .without_bridge(name, DEFAULT_NETWORK)
-            .map_err(|error| error.context(format!("container {}", record.name)))?;
-        if matches!(now, Now::Live) {
+        let live = matches!(now, Now::Live);
+        // Not on it: a `disconnect` cut short (killed after its record's
+        // write) if it's up and still has a lease there (F57): finished.
+        let changed = match record.config.without_bridge(name, DEFAULT_NETWORK) {
+            Ok(changed) => Some(changed),
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    && live
+                    && leased(engine, &record, name)? =>
+            {
+                None
+            }
+            Err(error) => return Err(error.context(format!("container {}", record.name))),
+        };
+        let finishing = changed.is_none();
+        if live {
             check_way_out(engine, &record, name, force)?;
         }
         // As for a connect: a Ctrl-C waits; the record first (a record that
         // no longer says a network the container is still on is undone if
-        // the rest fails).
+        // the rest fails, or the same `disconnect` finishes).
         let _held = HeldOff::new();
         let original = record.config.clone();
-        let updated = containers::update(engine, &record.id, |kept| kept.config = changed)?;
-        if matches!(now, Now::Live)
-            && let Err(error) = leave_now(engine, &record, name)
-        {
-            put_back(engine, &record, original);
+        let updated = match changed {
+            Some(changed) => containers::update(engine, &record.id, |kept| kept.config = changed)?,
+            None => record.clone(),
+        };
+        between();
+        if live && let Err(error) = leave_now(engine, &record, name) {
+            if !finishing {
+                put_back(engine, &record, original);
+            }
             return Err(error);
+        }
+        if finishing {
+            engine.report(crate::report::Message::Notice(format!(
+                "finished a `network disconnect` of {} from {name} that was cut short",
+                record.name
+            )));
         }
         events::emit(engine, &events::container(&updated, "update"));
         events::emit(

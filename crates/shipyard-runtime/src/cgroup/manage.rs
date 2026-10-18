@@ -625,37 +625,23 @@ impl Cgroup {
     /// Says whether it's done with: signalled, or no longer one of its own;
     /// `false` if it couldn't be pinned.
     fn signal_member(&self, pid: Pid, signal: libc::c_int) -> bool {
-        // SAFETY: `pidfd_open` takes a PID and flags, and returns a new
-        // descriptor or -1.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
-        let pidfd = libc::c_int::try_from(raw)
-            .ok()
-            .filter(|&fd| fd >= 0)
-            // SAFETY: `pidfd_open` just returned it; nothing else owns it.
-            .map(|fd| unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-        if pidfd.is_none() {
-            match Errno::last() {
-                Errno::ENOSYS => {}
+        let pidfd = match shipyard_sys::pidfd::open(pid.as_raw()) {
+            Ok(pidfd) => Some(pidfd),
+            Err(error) => match error.raw_os_error() {
+                Some(libc::ENOSYS) => None,
                 // Gone already.
-                Errno::ESRCH => return true,
+                Some(libc::ESRCH) => return true,
                 _ => return false,
-            }
-        }
+            },
+        };
         if !self.holds(pid) {
             return true;
         }
         match pidfd {
-            // SAFETY: a valid pidfd, a signal number (any, a real-time one
-            // too), no siginfo, no flags.
-            Some(pidfd) => unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-                    signal,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                );
-            },
+            // Any signal, a real-time one too.
+            Some(pidfd) => {
+                let _ = shipyard_sys::pidfd::send_signal(&pidfd, signal);
+            }
             // SAFETY: `kill` takes any PID and signal number.
             None => unsafe {
                 libc::kill(pid.as_raw(), signal);
@@ -703,6 +689,18 @@ impl Cgroup {
             std::thread::sleep(POLL);
         }
         Ok(())
+    }
+
+    /// Asks the kernel to thaw it (`cgroup.freeze` 0), and doesn't wait for
+    /// it: a no-op on one that isn't frozen, and one still freezing (a
+    /// pause under way) is let go too (F46's stop).
+    ///
+    /// # Errors
+    ///
+    /// `cgroup.freeze` can't be written (gone, or before Linux 5.2).
+    pub fn thaw(&self) -> Result<(), CgroupError> {
+        write_file(&self.path.join("cgroup.freeze"), "0")
+            .map_err(|err| self.error("thawing", io_errno(&err)))
     }
 
     /// Whether it's frozen (`cgroup.events`' `frozen`).

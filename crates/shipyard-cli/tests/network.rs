@@ -269,13 +269,16 @@ fn a_container_on_the_default_network_has_its_address_and_default_route() {
             root.arg(),
             "sh",
             "-c",
-            "cat /sys/class/net/eth0/address /sys/class/net/eth0/operstate; cat /proc/net/route",
+            "cat /sys/class/net/eth0/address /sys/class/net/eth0/flags; cat /proc/net/route",
         ]);
         assert_eq!(run.code, Some(0), "{}", run.stderr);
         let lines: Vec<&str> = run.stdout.lines().collect();
         // The first address of 10.88.0.0/16 after the gateway, and its MAC.
         assert_eq!(lines[0], "02:42:0a:58:00:02", "{}", run.stdout);
-        assert_eq!(lines[1], "up");
+        // Up (`IFF_UP`, set as the run brings it up), not its `operstate`,
+        // which the kernel sets a moment later (F85).
+        let flags = u32::from_str_radix(lines[1].trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(flags & 0x1, 0x1, "IFF_UP: {}", lines[1]);
         // The default route, via 10.88.0.1 (little-endian hex in /proc).
         assert!(
             run.stdout

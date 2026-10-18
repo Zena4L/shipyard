@@ -5,7 +5,8 @@ use std::path::Path;
 use shipyard_runtime::hooks::ContainerHooks;
 use shipyard_runtime::process::{self, StopPolicy};
 
-use super::{Generated, Invocation};
+use super::Invocation;
+use super::plan::Generated;
 use crate::error::{Context as _, Result, bail};
 use crate::report::{Warning, WarningKind};
 
@@ -68,7 +69,7 @@ pub(super) fn from_bundle(
             bundle.annotations,
         ));
     }
-    warnings.extend(super::root_on_host_files(&isolation));
+    warnings.extend(super::finish::root_on_host_files(&isolation));
     Ok(Invocation {
         spec: bundle.spec,
         stop,

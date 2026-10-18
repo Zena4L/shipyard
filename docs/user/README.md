@@ -30,14 +30,15 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > It isn't a hardened boundary yet. It starts the command the way a container
 > runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
-> leaves behind), and reports exactly how it ended. On macOS, commands aren't
-> isolated yet. These docs describe only what works in the current version, and
+> leaves behind), and reports exactly how it ended. On an Apple Silicon Mac, commands
+> run in a Linux VM of Shipyard's own ([macOS](macos.md)). These docs describe only what works in the current version, and
 > they are updated with every release.
 
 ## Pages
 
 | Page | What it covers |
 |---|---|
+| [macOS](macos.md) | Shipyard on a Mac: its Linux VM, your files, input, signals and variables |
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
 | [Containers](containers.md) | `run -d`, `create`, `start`, `ps`, `inspect`, `rm`: containers that outlive the command, by name, ID or serial; their kept files |
 | [Images](images.md) | `shipyard pull`, `run IMAGE`, `images`, `rmi`, `image prune`, `system df`: pulling, private registries and the local store |
@@ -77,8 +78,8 @@ sudo dnf install shadow-utils passt      # Fedora
 mounts, overlayfs where the image store goes, a cgroup), and says what to fix. It finds
 pasta, but doesn't start it.
 
-On macOS, Shipyard builds and runs, but doesn't isolate yet (see
-[Limitations](#limitations-in-v02)).
+On an Apple Silicon Mac, Shipyard runs containers in a Linux VM of its own: see
+[macOS](macos.md).
 
 ## Install from source
 
@@ -205,9 +206,10 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
   `inspect`/`history`/`save`/`load` and `--mount` come next. `shipyard-runtime` has
   live stats (`events --stats`), `ps`, `pause`/`resume` and `update` by a container's
   runtime ID.
-- **macOS doesn't isolate yet:** commands run as ordinary processes
-  (`shipyard run --no-image …`), and images don't run there, until Shipyard runs
-  them in a Linux VM of its own (planned, for Apple Silicon Macs).
+- **macOS is new:** commands run in Shipyard's Linux VM (on a terminal there when you're
+  on one, published TCP ports on your Mac's `localhost`, the VM stopping by itself when
+  idle); the guest is built from the source tree, and UDP ports aren't forwarded yet
+  ([macOS](macos.md#limits-this-version)).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge
   networks, and names between containers, are root's
   (see [Networking](networking.md#rootless-containers-pasta)).
@@ -220,10 +222,10 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
 - **The default network reaches the host and the cloud's metadata:** `bridge` can't
   have `--isolate-host`; put containers that mustn't on a network of your own made
   with it (see [Networking](networking.md#networks)).
-- **Restart policies have edges:** a full disk turns them off without a word; the
-  boot unit doesn't know stores you set with environment variables
-  (`SHIPYARD_IMAGE_STORE`, `XDG_DATA_HOME`); and a shutdown while the boot unit is
-  still starting containers ends them without their stop signal
+- **Restart policies have edges:** the boot unit doesn't know stores you set with
+  environment variables (`SHIPYARD_IMAGE_STORE`, `XDG_DATA_HOME`) until you give it
+  them (`shipyard doctor` says how). On a full disk, a container's end is recorded,
+  and its policy applied, once there's room again
   (see [Containers](containers.md#after-a-reboot)).
 - **Not every Docker flag yet:** no `-v` (use `--volume`), `-h`, `--env-file`, `-l`,
   `logs -n` (use `--tail`) or `inspect -f`; `inspect` and `images` print Shipyard's

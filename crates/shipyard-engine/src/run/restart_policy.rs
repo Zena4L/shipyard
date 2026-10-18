@@ -31,19 +31,21 @@ use shipyard_runtime::container as runtime;
 use crate::Engine;
 use crate::containers::{self, ContainerId, Record, RestartPolicy};
 use crate::report::WarningKind;
-use crate::run::detached::linux::{Input, Taken, start_taken};
+use crate::run::start::Input;
+use crate::run::start::start_taken;
+use crate::run::take::Taken;
 
 /// The first restart's delay.
-const FIRST_DELAY: Duration = Duration::from_millis(100);
+pub(in crate::run) const FIRST_DELAY: Duration = Duration::from_millis(100);
 /// The longest delay: the backoff stops doubling there.
-const LONGEST_DELAY: Duration = Duration::from_secs(60);
+pub(in crate::run) const LONGEST_DELAY: Duration = Duration::from_secs(60);
 /// A run at least this long resets the backoff.
 const LONG_RUN: Duration = Duration::from_secs(10);
 /// The starts' logs a start keeps (a policy's restart, or its user's
 /// `start`, `restart` or boot's): its own, and the latest before it.
 const KEPT_STARTS: usize = 10;
 /// How often a waiting restart looks at the record and tries the locks.
-const STEP: Duration = Duration::from_millis(100);
+pub(in crate::run) const STEP: Duration = Duration::from_millis(100);
 /// How long a clean-up waits for another's restart to let go (one that
 /// started the container a moment ago, and hasn't let go yet).
 const RESTARTING_WAIT: Duration = Duration::from_secs(15);
@@ -318,13 +320,12 @@ fn wait_for_turn(
                 give_up(engine, id, at);
                 return None;
             }
-            return Some(Taken {
-                restarts: Some(record.restart_count.saturating_add(1)),
+            return Some(Taken::for_restart(
                 record,
                 running,
-                runtime_root: root.to_path_buf(),
-                _operation: operation,
-            });
+                root.to_path_buf(),
+                operation,
+            ));
         }
         std::thread::sleep(STEP);
     }

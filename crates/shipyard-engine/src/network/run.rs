@@ -32,7 +32,7 @@ enum Connection {
 /// when the run ends, in that order (fields drop in order): the directory
 /// goes last.
 #[derive(Debug)]
-pub struct RunNetwork {
+pub(crate) struct RunNetwork {
     connection: Connection,
     dir: Option<RunDir>,
 }
@@ -45,7 +45,7 @@ impl RunNetwork {
     ///
     /// If a network can't be joined (taken, refused by the kernel), its
     /// ports can't be had, or the run's files can't be made.
-    pub fn set_up(
+    pub(crate) fn set_up(
         engine: &Engine,
         plan: Option<&NetworkPlan>,
         exposed: &[String],
@@ -100,7 +100,8 @@ impl RunNetwork {
                     )
                 })?;
                 // pasta publishes on both families, as the firewall does.
-                let held = shipyard_network::ports::hold(&requests)?;
+                let held =
+                    shipyard_network::ports::hold(&requests, engine.paths().runtime_root().ok())?;
                 let ports = held.iter().map(|held| held.published).collect();
                 // pasta answers DNS itself, for the host's resolver.
                 let resolver = std::net::IpAddr::V4(shipyard_network::pasta::DNS_ADDRESS);
@@ -173,7 +174,7 @@ impl RunNetwork {
         not(target_os = "linux"),
         allow(clippy::unused_self, reason = "networks are Linux's")
     )]
-    pub fn release_ports(&self) {
+    pub(crate) fn release_ports(&self) {
         #[cfg(target_os = "linux")]
         if let Connection::Pasta(pasta) = &self.connection {
             pasta.held.borrow_mut().clear();
@@ -182,7 +183,7 @@ impl RunNetwork {
 
     /// The run's `/etc` files, if it gets them.
     #[must_use]
-    pub fn etc(&self) -> Option<&RunDir> {
+    pub(crate) fn etc(&self) -> Option<&RunDir> {
         self.dir.as_ref()
     }
 
@@ -246,7 +247,7 @@ impl RunNetwork {
     /// The runtime's network hook: it connects a container on a bridge
     /// network, or starts its pasta.
     #[must_use]
-    pub fn hook(
+    pub(crate) fn hook(
         &self,
     ) -> Option<impl FnMut(shipyard_runtime::process::NetworkTarget<'_>) -> Result<(), String> + '_>
     {

@@ -4,8 +4,8 @@
 
 #![allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 
-use std::ffi::OsStr;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use proptest::prelude::*;
@@ -17,7 +17,8 @@ use shipyard_runtime::security::{Capabilities, Capability, CapabilitySet, Seccom
 use super::command::add_image_env;
 use super::network::with_network_defaults;
 use super::*;
-use crate::network::Joined;
+use crate::Engine;
+use crate::network::{Joined, NetworkMode, RunId};
 use crate::report::{Collect, WarningKind};
 use crate::{ErrorKind, Paths};
 

@@ -26,14 +26,10 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    shipyard_runtime::process::init_entry_point();
-    shipyard_engine::run::cleanup_entry_point();
-    shipyard_engine::run::health_entry_point();
-    shipyard_runtime::container::monitor_entry_point();
-    shipyard_engine::cp::helper_entry_point();
-    shipyard_engine::image::storage_helper_entry_point(|| {});
-    shipyard_engine::network::dns_entry_point();
-    shipyard_network::pasta::entry_point(|| Ok(()), shipyard_engine::network::pasta_lost);
+    shipyard_engine::entry_points(shipyard_engine::Hooks {
+        init_logging: || {},
+        refuse_privileged_start: || Ok(()),
+    });
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(target_os = "linux")]
     if args.first().map(String::as_str) == Some("launch") {
@@ -50,7 +46,7 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     if let Some(
         command @ ("start" | "start-abort" | "start-kill-init" | "rm" | "stop" | "attach"
-        | "start-a" | "exec" | "exec-i" | "cp"),
+        | "start-a" | "exec" | "exec-i" | "cp" | "connect-abort" | "disconnect-abort"),
     ) = args.first().map(String::as_str)
     {
         return linux::container_command(command, &args[1..]);
@@ -114,7 +110,7 @@ mod linux {
     use shipyard_engine::ErrorKind;
     use shipyard_engine::containers::{self, ContainerId, ContainerState, Record};
     use shipyard_engine::network::NetworkMode;
-    use shipyard_engine::report::{Collect, Event, Reporter, WarningKind};
+    use shipyard_engine::report::{Collect, Message, Reporter, WarningKind};
     use shipyard_engine::run::RunRequest;
     use shipyard_engine::{Engine, Paths};
     use shipyard_runtime::container as runtime;
@@ -238,6 +234,10 @@ mod linux {
             a_restart_leaves_the_open_cleanup_log,
         ),
         (
+            "an_end_the_store_refused_is_retried",
+            an_end_the_store_refused_is_retried,
+        ),
+        (
             "a_start_while_restarting_takes_over",
             a_start_while_restarting_takes_over,
         ),
@@ -248,6 +248,10 @@ mod linux {
         (
             "the_host_stop_is_graceful_and_not_a_users",
             the_host_stop_is_graceful_and_not_a_users,
+        ),
+        (
+            "a_paused_container_stops_gracefully",
+            a_paused_container_stops_gracefully,
         ),
         (
             "a_restart_waiting_for_its_lock_sees_the_host_stopping",
@@ -415,6 +419,18 @@ mod linux {
             "cp_reaches_a_stopped_container",
             cp_reaches_a_stopped_container,
         ),
+        (
+            "a_held_area_refuses_a_view_and_a_start",
+            a_held_area_refuses_a_view_and_a_start,
+        ),
+        (
+            "a_failed_start_keeps_what_its_user_stopped",
+            a_failed_start_keeps_what_its_user_stopped,
+        ),
+        (
+            "a_stop_of_a_dead_start_stays_stopped",
+            a_stop_of_a_dead_start_stays_stopped,
+        ),
         ("cp_into_a_created_container", cp_into_a_created_container),
         (
             "cp_reaches_a_stopped_containers_volumes",
@@ -564,6 +580,10 @@ mod linux {
             a_start_killed_after_recording_itself_keeps_its_history,
         ),
         (
+            "an_end_settled_by_a_pass_forgets_the_start_kept_aside",
+            an_end_settled_by_a_pass_forgets_the_start_kept_aside,
+        ),
+        (
             "an_exit_command_that_never_started_is_said",
             an_exit_command_that_never_started_is_said,
         ),
@@ -574,6 +594,10 @@ mod linux {
         (
             "connect_and_disconnect_refuse_by_kind",
             connect_and_disconnect_refuse_by_kind,
+        ),
+        (
+            "a_cut_short_connect_is_finished_by_its_rerun",
+            a_cut_short_connect_is_finished_by_its_rerun,
         ),
     ];
 
@@ -666,6 +690,20 @@ mod linux {
                 shipyard_engine::run::start_with(&engine, &args[0], |_| std::process::abort())
                     .map(drop)
             }
+            // `connect-abort NETWORK CONTAINER`: killed once its record says
+            // the network, before the container joins (F57).
+            "connect-abort" => shipyard_engine::run::connect_with(
+                &engine,
+                &shipyard_engine::run::ConnectRequest::new(&args[0], &args[1]),
+                || std::process::abort(),
+            ),
+            // `disconnect-abort NETWORK CONTAINER`: killed once its record no
+            // longer says the network, before the container leaves.
+            "disconnect-abort" => {
+                shipyard_engine::run::disconnect_with(&engine, &args[0], &args[1], false, || {
+                    std::process::abort()
+                })
+            }
             "stop" => shipyard_engine::run::stop(
                 &engine,
                 &args[0],
@@ -710,8 +748,8 @@ mod linux {
     }
 
     /// Attaching without input, with the usual detach keys.
-    fn quiet() -> shipyard_engine::attach::Options {
-        shipyard_engine::attach::Options {
+    fn quiet() -> shipyard_engine::attach::AttachOptions {
+        shipyard_engine::attach::AttachOptions {
             detach_keys: shipyard_runtime::attach::DetachKeys::default_keys(),
             stdin: false,
             held: false,
@@ -933,8 +971,8 @@ mod linux {
     struct Stderr;
 
     impl Reporter for Stderr {
-        fn report(&self, event: Event) {
-            eprintln!("{event:?}");
+        fn report(&self, message: Message) {
+            eprintln!("{message:?}");
         }
     }
 
@@ -1022,7 +1060,7 @@ mod linux {
                 nix::sys::signal::Signal::SIGKILL,
             )
             .unwrap();
-            let running = containers::record_dir(&self.engine(), id)
+            let running = containers::testing::record_dir(&self.engine(), id)
                 .unwrap()
                 .join("running");
             eventually("the monitor's holds gone", || !locked(&running));
@@ -1037,15 +1075,17 @@ mod linux {
 
         /// Container `id`'s starts' log directories.
         fn starts(&self, id: &ContainerId) -> usize {
-            names(&containers::logs_dir(&self.engine(), id).unwrap()).len()
+            names(&containers::testing::logs_dir(&self.engine(), id).unwrap()).len()
         }
 
         /// Container `id` (a crash loop, up): its next restart made to wait
         /// about 8 s (its last delay said to be 4 s, doubled after a short
         /// run), for a test to act in, once it's waiting.
         fn slow_restart(&self, id: &ContainerId) {
-            containers::update(&self.engine(), id, |record| record.restart_delay_ms = 4000)
-                .unwrap();
+            containers::testing::update(&self.engine(), id, |record| {
+                record.restart_delay_ms = 4000;
+            })
+            .unwrap();
             eventually("its restart waiting", || {
                 matches!(self.state(id), ContainerState::Restarting { .. })
             });
@@ -1165,7 +1205,11 @@ mod linux {
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(containers::record_dir(&engine, id).unwrap().join("op.lock"))
+                .open(
+                    containers::testing::record_dir(&engine, id)
+                        .unwrap()
+                        .join("op.lock"),
+                )
                 .is_ok_and(|lock| lock.try_lock().is_err())
         }
 
@@ -1176,7 +1220,11 @@ mod linux {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(containers::record_dir(&engine, id).unwrap().join("running"))
+                .open(
+                    containers::testing::record_dir(&engine, id)
+                        .unwrap()
+                        .join("running"),
+                )
                 .unwrap()
         }
 
@@ -1282,7 +1330,7 @@ mod linux {
         /// Every event in the journal (`SHIPYARD_EVENTS_DIR` unset: beside
         /// the container store), oldest first.
         fn events(&self) -> Vec<shipyard_engine::events::Event> {
-            let options = shipyard_engine::events::Options {
+            let options = shipyard_engine::events::EventsOptions {
                 since: Some(SystemTime::UNIX_EPOCH),
                 until: Some(SystemTime::now()),
                 ..Default::default()
@@ -1306,7 +1354,7 @@ mod linux {
         }
 
         fn record(&self, id: &ContainerId) -> Record {
-            containers::find(&self.engine(), id.as_str()).unwrap()
+            containers::testing::find(&self.engine(), id.as_str()).unwrap()
         }
 
         fn state(&self, id: &ContainerId) -> ContainerState {
@@ -1324,7 +1372,12 @@ mod linux {
 
         /// The default bridge network's lease files.
         fn leases(&self) -> Vec<PathBuf> {
-            std::fs::read_dir(self.scratch.0.join("networks/bridge/leases"))
+            self.leases_on("bridge")
+        }
+
+        /// The network `network`'s lease files.
+        fn leases_on(&self, network: &str) -> Vec<PathBuf> {
+            std::fs::read_dir(self.scratch.0.join("networks").join(network).join("leases"))
                 .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
                 .unwrap_or_default()
         }
@@ -1576,7 +1629,7 @@ mod linux {
             "0000000000000000",
             "the monitor's mask"
         );
-        let logs = containers::logs_dir(&stores.engine(), &id).unwrap();
+        let logs = containers::testing::logs_dir(&stores.engine(), &id).unwrap();
         eventually("hello in the logs", || {
             names(&logs).iter().any(|start| {
                 std::fs::read_to_string(logs.join(start).join("container.log"))
@@ -1650,7 +1703,7 @@ mod linux {
         // Removed: its area, its image's pin and its record go.
         shipyard_engine::run::remove(&stores.engine(), id.as_str(), false).unwrap();
         assert!(!area.exists(), "the area goes with the container");
-        assert!(containers::find(&stores.engine(), id.as_str()).is_err());
+        assert!(containers::testing::find(&stores.engine(), id.as_str()).is_err());
         assert!(
             !std::fs::read_to_string(stores.scratch.store().join("index.json"))
                 .unwrap_or_default()
@@ -1710,8 +1763,19 @@ mod linux {
                 .unwrap()
                 .is_none()
         });
-        // Its clean-up has run too (it writes `finished` last).
-        std::thread::sleep(Duration::from_millis(500));
+        // Its clean-up has run too (it lets go of `running` last, after its
+        // record and its event).
+        eventually("the clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
+        });
+        // One `die`, its first start's: the start that never ran has none,
+        // though its record has the first start's end again (F80).
+        let actions = stores.actions(id.as_str());
+        assert_eq!(
+            actions.iter().filter(|action| *action == "die").count(),
+            1,
+            "{actions:?}"
+        );
         let record = stores.record(&id);
         assert_eq!(record.started, first.started, "its last start");
         assert_eq!(record.exit, first.exit, "its last end");
@@ -1743,14 +1807,18 @@ mod linux {
                 .is_none()
         });
         assert_eq!(stores.state(&id), ContainerState::Created);
-        // Its clean-up (it writes `finished` last) recorded no exit: a forced
-        // end isn't one. (The runtime state went with `detached`'s own
-        // forced delete, before the clean-up ran.)
-        eventually("the clean-up's record", || {
-            stores.record(&id).finished.is_some()
+        // Its clean-up (done when `running` is free) recorded no start, no
+        // end and no exit: a forced end of a start that never ran isn't one
+        // (F64). (The runtime state went with `detached`'s own forced
+        // delete, before the clean-up ran.)
+        eventually("the clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
         });
         let record = stores.record(&id);
-        assert_eq!((record.started, record.exit), (None, None));
+        assert_eq!(
+            (record.started, record.finished, record.exit),
+            (None, None, None)
+        );
         areas_let_go(&stores, &id);
         if is_root() {
             eventually("the lease gone", || stores.leases().is_empty());
@@ -2042,7 +2110,7 @@ mod linux {
         let other =
             shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
         assert_eq!(
-            containers::find(&stores.engine(), id.as_str())
+            containers::testing::find(&stores.engine(), id.as_str())
                 .unwrap_err()
                 .kind(),
             ErrorKind::NotFound
@@ -2072,7 +2140,7 @@ mod linux {
             "sleep",
             "300",
         ]));
-        let record = containers::record_dir(&engine, &id)
+        let record = containers::testing::record_dir(&engine, &id)
             .unwrap()
             .join("record.json");
         std::fs::write(&record, r#"{"version": 4}"#).unwrap();
@@ -2140,7 +2208,9 @@ mod linux {
         let error = shipyard_engine::run::start(&engine, id.as_str()).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound, "{error:#}");
         assert_eq!(
-            containers::find(&engine, id.as_str()).unwrap_err().kind(),
+            containers::testing::find(&engine, id.as_str())
+                .unwrap_err()
+                .kind(),
             ErrorKind::NotFound
         );
     }
@@ -2173,7 +2243,7 @@ mod linux {
             .unwrap();
         let booted = SystemTime::UNIX_EPOCH + Duration::from_secs(btime);
         // Started before this boot, in another.
-        containers::update(&stores.engine(), &id, |record| {
+        containers::testing::update(&stores.engine(), &id, |record| {
             record.boot_id = Some("an-earlier-boot".to_owned());
             record.started = Some(booted - Duration::from_secs(60));
         })
@@ -2205,7 +2275,7 @@ mod linux {
             .read(true)
             .write(true)
             .open(
-                containers::record_dir(&stores.engine(), &id)
+                containers::testing::record_dir(&stores.engine(), &id)
                     .unwrap()
                     .join("op.lock"),
             )
@@ -2465,7 +2535,7 @@ mod linux {
         ];
         for id in all {
             runtime::delete(&stores.runtime_root(), id.as_str(), true).ok();
-            containers::update(&engine, id, |record| {
+            containers::testing::update(&engine, id, |record| {
                 record.boot_id = Some("an-earlier-boot".to_owned());
             })
             .unwrap();
@@ -2566,6 +2636,56 @@ mod linux {
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
 
+    /// A paused container's stop (F46): its stop signal is had at once, as
+    /// the monitor thaws it, so its trap runs well within its timeout,
+    /// where it would have waited the timeout out frozen, then been killed
+    /// (137). The control: it was paused. Root: a pause needs the
+    /// container's own cgroup. (`unless-stopped` only as the helper's
+    /// policy: a user's stop holds it off.)
+    fn a_paused_container_stops_gracefully() {
+        if !is_root() {
+            return;
+        }
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = stores.launch_restarting(
+            "unless-stopped",
+            "trap 'exit 7' TERM; touch /ready; sleep 300 & wait",
+        );
+        let ready = stores.upper(&id).join("ready");
+        eventually("its trap set", || ready.exists());
+        runtime::pause(&stores.runtime_root(), id.as_str()).unwrap();
+        assert!(
+            matches!(stores.state(&id), ContainerState::Paused),
+            "{:?}",
+            stores.state(&id)
+        );
+        let began = Instant::now();
+        shipyard_engine::run::stop(
+            &engine,
+            id.as_str(),
+            shipyard_engine::run::StopOptions {
+                timeout: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "it waited its timeout: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            matches!(
+                stores.state(&id),
+                ContainerState::Exited { code: Some(7), .. }
+            ),
+            "{:?}",
+            stores.state(&id)
+        );
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
+    }
+
     /// A restart past its backoff, waiting for the container's operation
     /// lock (held here, as another command working on it would): the host
     /// starts stopping meanwhile, and once it has the lock it gives up
@@ -2577,7 +2697,7 @@ mod linux {
         let id = stores.launch_restarting("always", "sleep 1; exit 1");
         let held = nix::fcntl::Flock::lock(
             std::fs::File::open(
-                containers::record_dir(&engine, &id)
+                containers::testing::record_dir(&engine, &id)
                     .unwrap()
                     .join("op.lock"),
             )
@@ -2646,7 +2766,9 @@ mod linux {
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
         Stores::waiter_gone(waiter);
         assert_eq!(
-            containers::find(&engine, id.as_str()).unwrap_err().kind(),
+            containers::testing::find(&engine, id.as_str())
+                .unwrap_err()
+                .kind(),
             ErrorKind::NotFound
         );
     }
@@ -2731,7 +2853,7 @@ mod linux {
     fn a_restart_keeps_the_latest_ten_starts_logs() {
         let stores = Stores::new();
         let id = stores.launch_restarting("on-failure:1", "sleep 1; exit 1");
-        let logs = containers::logs_dir(&stores.engine(), &id).unwrap();
+        let logs = containers::testing::logs_dir(&stores.engine(), &id).unwrap();
         let first = names(&logs);
         for older in 0..12 {
             std::fs::create_dir(logs.join(format!("{}", 1000 + older))).unwrap();
@@ -2948,9 +3070,15 @@ mod linux {
         let records = containers::list(&stores.engine()).unwrap();
         assert_eq!(records.len(), 1);
         let id = records[0].id.clone();
-        eventually("the clean-up's record", || {
-            stores.record(&id).finished.is_some()
+        eventually("the clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
         });
+        let record = stores.record(&id);
+        assert_eq!(
+            (record.started, record.finished, record.exit),
+            (None, None, None),
+            "never started (F64)"
+        );
         assert_eq!(stores.state(&id), ContainerState::Created);
         areas_let_go(&stores, &id);
         // Root's runtime root is shared: only this run's directory counts.
@@ -2982,9 +3110,15 @@ mod linux {
             processes_with("sleep 61").is_empty()
         });
         let id = containers::list(&stores.engine()).unwrap()[0].id.clone();
-        eventually("the clean-up's record", || {
-            stores.record(&id).finished.is_some()
+        eventually("the clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
         });
+        let record = stores.record(&id);
+        assert_eq!(
+            (record.started, record.finished, record.exit),
+            (None, None, None),
+            "never started (F64)"
+        );
         assert_eq!(stores.state(&id), ContainerState::Created);
         areas_let_go(&stores, &id);
         eventually("the run directory gone", || {
@@ -3036,9 +3170,15 @@ mod linux {
         eventually("the fake pasta gone", || {
             processes_with("sleep 62").is_empty()
         });
-        eventually("the clean-up's record", || {
-            stores.record(&id).finished.is_some()
+        eventually("the clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
         });
+        let record = stores.record(&id);
+        assert_eq!(
+            (record.started, record.finished, record.exit),
+            (None, None, None),
+            "never started (F64)"
+        );
         areas_let_go(&stores, &id);
     }
 
@@ -3246,7 +3386,7 @@ mod linux {
         assert!(upper.join("data.txt").exists(), "kept while it's stopped");
         shipyard_engine::run::start(&engine, id.as_str()).unwrap();
         assert_eq!(stores.record(&id).exit, None, "its last end cleared");
-        let logs = containers::logs_dir(&engine, &id).unwrap();
+        let logs = containers::testing::logs_dir(&engine, &id).unwrap();
         eventually("the second start's log", || {
             std::fs::read_to_string(logs.join("0000000002").join("container.log"))
                 .is_ok_and(|log| log.matches(" x").count() == 2)
@@ -3287,7 +3427,7 @@ mod linux {
                 .exit
                 .is_some_and(|exit| exit.code == Some(3))
         });
-        let logs = containers::logs_dir(&engine, &id).unwrap();
+        let logs = containers::testing::logs_dir(&engine, &id).unwrap();
         assert_eq!(names(&logs).len(), 3, "three starts");
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
@@ -3607,7 +3747,7 @@ mod linux {
         );
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
         eventually("theirs ended", || {
-            containers::find(&other, theirs.as_str())
+            containers::testing::find(&other, theirs.as_str())
                 .unwrap()
                 .exit
                 .is_some()
@@ -3644,7 +3784,10 @@ mod linux {
                     || String::from_utf8_lossy(&start.stdout).contains("error=NotFound"),
                 "{start:?}"
             );
-            assert!(containers::find(&engine, id.as_str()).is_err(), "removed");
+            assert!(
+                containers::testing::find(&engine, id.as_str()).is_err(),
+                "removed"
+            );
             assert!(
                 runtime::status(&stores.runtime_root(), id.as_str())
                     .unwrap()
@@ -3652,7 +3795,9 @@ mod linux {
                 "no runtime state left"
             );
             assert!(
-                !containers::record_dir(&engine, &id).unwrap().exists(),
+                !containers::testing::record_dir(&engine, &id)
+                    .unwrap()
+                    .exists(),
                 "no directory left"
             );
             eventually("no area left", || {
@@ -3676,7 +3821,7 @@ mod linux {
         ] {
             assert!(started.status.success(), "{started:?}");
         }
-        let logs = containers::logs_dir(&engine, &id).unwrap();
+        let logs = containers::testing::logs_dir(&engine, &id).unwrap();
         assert_eq!(names(&logs).len(), 1, "started once");
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
@@ -3697,7 +3842,7 @@ mod linux {
         assert!(output.status.success(), "{output:?}");
         let id = Stores::id(&output);
         eventually("the container gone", || {
-            containers::find(&stores.engine(), id.as_str()).is_err()
+            containers::testing::find(&stores.engine(), id.as_str()).is_err()
         });
         eventually("its area gone", || stores.areas().is_empty());
         assert!(
@@ -3977,7 +4122,7 @@ mod linux {
         drop(detached);
         assert_eq!(shipyard_engine::run::wait(&engine, id.as_str()).unwrap(), 3);
         eventually("removed", || {
-            containers::find(&engine, id.as_str()).is_err()
+            containers::testing::find(&engine, id.as_str()).is_err()
         });
     }
 
@@ -4006,7 +4151,7 @@ mod linux {
         eventually("its second start", || {
             std::fs::read_to_string(&starts).is_ok_and(|text| text.lines().count() == 2)
         });
-        let logs = containers::logs_dir(&engine, &id).unwrap();
+        let logs = containers::testing::logs_dir(&engine, &id).unwrap();
         assert_eq!(names(&logs).len(), 2, "two starts");
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
@@ -4304,7 +4449,7 @@ mod linux {
     fn logged(
         engine: &shipyard_engine::Engine,
         reference: &str,
-        options: &shipyard_engine::logs::Options,
+        options: &shipyard_engine::logs::LogsOptions,
     ) -> Vec<String> {
         let mut lines = Vec::new();
         shipyard_engine::logs::of_container(engine, reference, options, |entry| {
@@ -4338,7 +4483,7 @@ mod linux {
                 stores.running_file(&id).try_lock().is_ok()
             });
         }
-        let options = |tail| shipyard_engine::logs::Options {
+        let options = |tail| shipyard_engine::logs::LogsOptions {
             tail,
             ..Default::default()
         };
@@ -4356,7 +4501,7 @@ mod linux {
         );
         // A start that never wrote its logs (it failed early), and what
         // isn't a start: left out, followed or not (it isn't up).
-        let logs = shipyard_engine::containers::logs_dir(&engine, &id).unwrap();
+        let logs = shipyard_engine::containers::testing::logs_dir(&engine, &id).unwrap();
         std::fs::create_dir(logs.join("0000000003")).unwrap();
         std::fs::create_dir(logs.join("notes")).unwrap();
         std::fs::write(logs.join("0000000004"), "").unwrap();
@@ -4365,7 +4510,7 @@ mod linux {
                 (None, &["line-1-a", "line-1-b", "line-2-a", "line-2-b"][..]),
                 (Some(3), &["line-1-b", "line-2-a", "line-2-b"][..]),
             ] {
-                let options = shipyard_engine::logs::Options {
+                let options = shipyard_engine::logs::LogsOptions {
                     tail,
                     follow,
                     ..Default::default()
@@ -4399,7 +4544,7 @@ mod linux {
         });
         shipyard_engine::run::start(&engine, id.as_str()).unwrap();
         let began = Instant::now();
-        let options = shipyard_engine::logs::Options {
+        let options = shipyard_engine::logs::LogsOptions {
             follow: true,
             ..Default::default()
         };
@@ -4419,7 +4564,7 @@ mod linux {
         let lines = logged(
             &engine,
             id.as_str(),
-            &shipyard_engine::logs::Options {
+            &shipyard_engine::logs::LogsOptions {
                 tail: Some(1),
                 ..options
             },
@@ -4448,14 +4593,14 @@ mod linux {
             logged(
                 &engine,
                 id.as_str(),
-                &shipyard_engine::logs::Options::default(),
+                &shipyard_engine::logs::LogsOptions::default(),
             ) == ["up"]
         });
         let follower = {
             let engine = stores.engine();
             let id = id.clone();
             std::thread::spawn(move || {
-                let options = shipyard_engine::logs::Options {
+                let options = shipyard_engine::logs::LogsOptions {
                     follow: true,
                     ..Default::default()
                 };
@@ -4729,7 +4874,7 @@ mod linux {
         input: &mut dyn std::io::Read,
         archive: bool,
     ) -> shipyard_engine::Result<shipyard_engine::cp::CpReport> {
-        use shipyard_engine::cp::{CpOptions, Operand, Streams, Transfer, copy_by_name};
+        use shipyard_engine::cp::{CpOptions, CpStreams, Operand, Transfer, copy_by_name};
         let transfer = Transfer::of(
             Operand::parse(std::ffi::OsStr::new(from)),
             Operand::parse(std::ffi::OsStr::new(to)),
@@ -4739,7 +4884,7 @@ mod linux {
             archive,
             ..CpOptions::default()
         };
-        let mut streams = Streams {
+        let mut streams = CpStreams {
             input,
             output: &mut std::io::sink(),
         };
@@ -4803,9 +4948,196 @@ mod linux {
         shipyard_engine::run::start(&engine, name).unwrap();
         shipyard_engine::run::wait(&engine, name).unwrap();
         assert!(
-            logged(&engine, name, &shipyard_engine::logs::Options::default())
-                .contains(&"copied in".to_owned())
+            logged(
+                &engine,
+                name,
+                &shipyard_engine::logs::LogsOptions::default()
+            )
+            .contains(&"copied in".to_owned())
         );
+        shipyard_engine::run::remove(&engine, name, true).unwrap();
+    }
+
+    /// A start that fails after it rewrote the record (here its runtime
+    /// start, broken) puts back what it rewrote (F55): here its user's stop,
+    /// the restart count and backoff, and its last end (the next start and
+    /// the ports are the unit's, `a_previous_start_puts_back_all_a_start_rewrote`);
+    /// so its `unless-stopped` policy doesn't bring back what its user
+    /// stopped. (`between` runs after the record says what the start
+    /// rewrites, before the runtime starts it.)
+    fn a_failed_start_keeps_what_its_user_stopped() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let mut request = stores.request(&["sleep", "300"]);
+        request.restart = shipyard_engine::containers::RestartPolicy::UnlessStopped;
+        let id = shipyard_engine::run::create(&engine, request, false)
+            .unwrap()
+            .id;
+        shipyard_engine::run::start(&engine, id.as_str()).unwrap();
+        let fast = shipyard_engine::run::StopOptions {
+            timeout: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
+        eventually("its end settled", || {
+            stores.running_file(&id).try_lock().is_ok()
+        });
+        containers::testing::update(&engine, &id, |record| {
+            record.restart_count = 2;
+            record.restart_delay_ms = 400;
+        })
+        .unwrap();
+        let before = stores.record(&id);
+        assert!(
+            before.stopped_by_user && before.finished.is_some(),
+            "{before:?}"
+        );
+        let root = stores.runtime_root();
+        let failed = shipyard_engine::run::start_with(&engine, id.as_str(), |id| {
+            std::fs::remove_file(root.join(id.as_str()).join("exec.fifo")).unwrap();
+        });
+        assert!(failed.is_err(), "{failed:?}");
+        eventually("its clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
+                && runtime::status(&stores.runtime_root(), id.as_str())
+                    .unwrap()
+                    .is_none()
+        });
+        let after = stores.record(&id);
+        let kept = |record: &containers::Record| {
+            (
+                record.stopped_by_user,
+                record.restart_count,
+                record.restart_delay_ms,
+                record.next_start,
+                record.ports.clone(),
+                record.started,
+                record.finished,
+                record.exit.clone(),
+            )
+        };
+        assert_eq!(kept(&after), kept(&before));
+        assert!(
+            matches!(stores.state(&id), ContainerState::Exited { .. }),
+            "not brought back: {:?}",
+            stores.state(&id)
+        );
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
+    }
+
+    /// A `stop` of a container whose start died after it recorded itself
+    /// (its CLI killed: faked as `a_start_killed_after_recording_itself_keeps_its_history`
+    /// does, with a v2 `previous-start.json`) stays a stop: the dead start's
+    /// undo puts back its last end but not "not stopped by its user"
+    /// (10.2b1's Murphy review), so its `unless-stopped` policy doesn't
+    /// bring it back.
+    fn a_stop_of_a_dead_start_stays_stopped() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = Stores::id(&stores.launch(&[
+            "--network",
+            "none",
+            "--restart",
+            "unless-stopped",
+            stores.image.as_str(),
+            "sleep",
+            "300",
+        ]));
+        // Stopped by its user (its policy leaves it so), its end settled;
+        // then the mark cleared, as a start does before it dies.
+        let fast = shipyard_engine::run::StopOptions {
+            timeout: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
+        eventually("its first end, settled", || {
+            matches!(stores.state(&id), ContainerState::Exited { .. })
+                && stores.running_file(&id).try_lock().is_ok()
+        });
+        containers::testing::update(&engine, &id, |record| record.stopped_by_user = false).unwrap();
+        let first = stores.record(&id);
+        let killed = stores
+            .container_command("start-abort", id.as_str())
+            .output()
+            .unwrap();
+        assert!(!killed.status.success(), "{killed:?}");
+        let kept = serde_json::json!({
+            "version": 2,
+            "started": first.started,
+            "finished": first.finished,
+            "exit": first.exit,
+            "boot_id": first.boot_id,
+            "rewritten": {
+                "stopped_by_user": false,
+                "restart_count": first.restart_count,
+                "restart_delay_ms": first.restart_delay_ms,
+                "next_start": null,
+                "ports": [],
+            },
+        });
+        let dir = containers::testing::record_dir(&engine, &id).unwrap();
+        std::fs::write(
+            dir.join("previous-start.json"),
+            serde_json::to_vec(&kept).unwrap(),
+        )
+        .unwrap();
+        containers::testing::update(&engine, &id, |record| {
+            record.started = Some(SystemTime::now());
+            record.finished = None;
+            record.exit = None;
+        })
+        .unwrap();
+        shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
+        eventually("its clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
+        });
+        let record = stores.record(&id);
+        assert!(record.stopped_by_user, "the stop kept: {record:?}");
+        assert_eq!(record.next_start, None);
+        assert_eq!(record.finished, first.finished, "its last end back");
+        // What its policy reads (`restart_policy::after_end`): stopped by
+        // its user, so no restart (no sleep then a negative check: AGENTS §9).
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
+    }
+
+    /// A container's writable layer is mounted once at a time (F60): its
+    /// area's exclusive lock, which a start and a stopped container's `cp`
+    /// view both take (`image::prepare_owned`), is the guarantee (overlay
+    /// is mounted with `index=off`, so the kernel's own refusal is off).
+    /// Held by another, a view and a start are each refused as in use;
+    /// let go, both work (the positive control).
+    fn a_held_area_refuses_a_view_and_a_start() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let record =
+            shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
+        let name = record.name.as_str();
+        shipyard_engine::run::start(&engine, name).unwrap();
+        shipyard_engine::run::wait(&engine, name).unwrap();
+        eventually("its end settled", || {
+            stores.running_file(&record.id).try_lock().is_ok()
+        });
+        let area = stores.upper(&record.id).parent().unwrap().to_owned();
+        let holder = std::fs::File::open(&area).unwrap();
+        holder.try_lock().unwrap();
+        let host = stores.scratch.0.join("marker");
+        let host = host.to_str().unwrap();
+        let viewed = cp(&engine, &format!("{name}:/marker"), host);
+        assert_eq!(
+            viewed.as_ref().map_err(shipyard_engine::Error::kind).err(),
+            Some(shipyard_engine::ErrorKind::InUse),
+            "a view while the area is held: {viewed:?}"
+        );
+        let started = shipyard_engine::run::start(&engine, name);
+        assert_eq!(
+            started.as_ref().map_err(shipyard_engine::Error::kind).err(),
+            Some(shipyard_engine::ErrorKind::InUse),
+            "a start while the area is held: {started:?}"
+        );
+        drop(holder);
+        cp(&engine, &format!("{name}:/marker"), host).unwrap();
+        shipyard_engine::run::start(&engine, name).unwrap();
+        shipyard_engine::run::wait(&engine, name).unwrap();
         shipyard_engine::run::remove(&engine, name, true).unwrap();
     }
 
@@ -4827,7 +5159,11 @@ mod linux {
         shipyard_engine::run::start(&engine, name).unwrap();
         assert_eq!(shipyard_engine::run::wait(&engine, name).unwrap(), 0);
         assert_eq!(
-            logged(&engine, name, &shipyard_engine::logs::Options::default()),
+            logged(
+                &engine,
+                name,
+                &shipyard_engine::logs::LogsOptions::default()
+            ),
             ["before its start", "before its start"]
         );
         shipyard_engine::run::remove(&engine, name, true).unwrap();
@@ -4977,7 +5313,11 @@ mod linux {
         assert!(copied.status.success(), "{copied:?}");
         assert_eq!(shipyard_engine::run::wait(&engine, name).unwrap(), 0);
         assert_eq!(
-            logged(&engine, name, &shipyard_engine::logs::Options::default()),
+            logged(
+                &engine,
+                name,
+                &shipyard_engine::logs::LogsOptions::default()
+            ),
             ["copied first"]
         );
         shipyard_engine::run::remove(&engine, name, true).unwrap();
@@ -5116,7 +5456,7 @@ mod linux {
             logged(
                 &engine,
                 record.id.as_str(),
-                &shipyard_engine::logs::Options::default()
+                &shipyard_engine::logs::LogsOptions::default()
             ),
             ["first", "apart"]
         );
@@ -5143,7 +5483,7 @@ mod linux {
         let logs = logged(
             &engine,
             record.id.as_str(),
-            &shipyard_engine::logs::Options::default(),
+            &shipyard_engine::logs::LogsOptions::default(),
         );
         assert!(logs.iter().any(|line| line.contains("first")), "{logs:?}");
         shipyard_engine::run::remove(&engine, record.id.as_str(), true).unwrap();
@@ -5238,7 +5578,7 @@ mod linux {
                 .unwrap()
                 .first()
                 .and_then(|record| shipyard_engine::containers::state(engine, record).ok())
-                .is_some_and(|state| state.is_up())
+                .is_some_and(|state| state.is_active())
         });
     }
 
@@ -5333,7 +5673,7 @@ mod linux {
             assert!(
                 shipyard_engine::containers::state(&engine, &record)
                     .unwrap()
-                    .is_up(),
+                    .is_active(),
                 "{signal}: the container ended with its run"
             );
             assert_eq!(
@@ -5517,7 +5857,11 @@ mod linux {
             shipyard_engine::run::start(&engine, name).unwrap();
             assert_eq!(shipyard_engine::run::wait(&engine, name).unwrap(), 0);
             assert_eq!(
-                logged(&engine, name, &shipyard_engine::logs::Options::default()),
+                logged(
+                    &engine,
+                    name,
+                    &shipyard_engine::logs::LogsOptions::default()
+                ),
                 ["1000:1001"],
                 "mapped: {mapped}"
             );
@@ -5553,7 +5897,7 @@ mod linux {
         assert_eq!(attach.unwrap_err().kind(), ErrorKind::NotRunning);
         cp(&engine, &format!("{id}:/marker"), "-").unwrap();
         assert_eq!(
-            logged(&engine, id, &shipyard_engine::logs::Options::default()),
+            logged(&engine, id, &shipyard_engine::logs::LogsOptions::default()),
             ["said"]
         );
         shipyard_engine::run::remove(&engine, id, true).unwrap();
@@ -5619,7 +5963,7 @@ mod linux {
             );
         }
         eventually("the container gone", || {
-            containers::find(&engine, id.as_str()).is_err()
+            containers::testing::find(&engine, id.as_str()).is_err()
         });
         eventually("its area gone", || stores.areas().is_empty());
     }
@@ -5971,7 +6315,7 @@ mod linux {
         assert!(
             seen.events().iter().any(|event| matches!(
                 event,
-                Event::Warning(warning) if warning.kind == WarningKind::RecordUnreadable
+                Message::Warning(warning) if warning.kind == WarningKind::RecordUnreadable
             )),
             "{:?}",
             seen.events()
@@ -6162,7 +6506,7 @@ mod linux {
         };
         shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
         std::thread::sleep(Duration::from_secs(3));
-        let logs = containers::logs_dir(&engine, &id).unwrap();
+        let logs = containers::testing::logs_dir(&engine, &id).unwrap();
         let start = std::fs::read_dir(&logs)
             .unwrap()
             .flatten()
@@ -6470,7 +6814,7 @@ mod linux {
             });
         };
         ended();
-        let logs = containers::logs_dir(&engine, &id).unwrap();
+        let logs = containers::testing::logs_dir(&engine, &id).unwrap();
         let first = names(&logs);
         for older in 0..12 {
             std::fs::create_dir(logs.join(format!("{}", 1000 + older))).unwrap();
@@ -6483,6 +6827,107 @@ mod linux {
         assert_eq!(kept.len(), 10, "{kept:?}");
         assert!(!kept.contains(&first[0]), "the oldest kept: {kept:?}");
         shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
+    }
+
+    /// An end `__cleanup` couldn't record (the store refused the write: a
+    /// full disk's `ENOSPC`; here, a read-only record directory) is retried
+    /// until the store takes it (F45): until then the end isn't recorded,
+    /// the runtime keeps its exit record, and a refused retry tries again;
+    /// then it's recorded, and the `always` policy starts it again.
+    /// Rootless: root's writes aren't refused.
+    fn an_end_the_store_refused_is_retried() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if is_root() {
+            return;
+        }
+        let stores = Stores::new();
+        let id = stores.launch_restarting("always", "sleep 300");
+        eventually("it runs", || {
+            matches!(stores.state(&id), ContainerState::Running { .. })
+        });
+        let dir = stores.scratch.0.join("containers").join(id.as_str());
+        // Its log made first: written to, read-only directory or not.
+        let log = dir.join("cleanup.log");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let first = stores.record(&id);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        runtime::kill(
+            &stores.runtime_root(),
+            id.as_str(),
+            shipyard_runtime::process::Signal::KILL,
+        )
+        .unwrap();
+        eventually("the refused write, said", || {
+            stores.cleanup_log(&id).contains("the record:")
+        });
+        assert_eq!(stores.record(&id).finished, first.finished, "not recorded");
+        assert!(
+            runtime::status(&stores.runtime_root(), id.as_str())
+                .unwrap()
+                .is_some(),
+            "the runtime keeps how it ended"
+        );
+        // A retry refused too, so a retry that gave up at its first
+        // refusal would never record it.
+        eventually("a retry refused, said", || {
+            stores
+                .cleanup_log(&id)
+                .contains("the end's retry: still refused")
+        });
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eventually("recorded, and started again", || {
+            let record = stores.record(&id);
+            record.restart_count >= 1 && matches!(stores.state(&id), ContainerState::Running { .. })
+        });
+        shipyard_engine::run::remove(&stores.engine(), id.as_str(), true).unwrap();
+    }
+
+    /// The pass that settles an end nothing recorded forgets what that
+    /// start kept aside (stage 10's close, Murphy): left, a later start
+    /// cut short (its own keeping aside failed) would restore a start two
+    /// back.
+    fn an_end_settled_by_a_pass_forgets_the_start_kept_aside() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = Stores::id(&stores.launch(&[
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sh",
+            "-c",
+            "exit 3",
+        ]));
+        eventually("its end, recorded", || {
+            matches!(
+                stores.state(&id),
+                ContainerState::Exited { code: Some(3), .. }
+            ) && stores.running_file(&id).try_lock().is_ok()
+        });
+        // An end nothing recorded (its clean-up killed before it wrote),
+        // and an older start's file left beside it.
+        let dir = containers::testing::record_dir(&engine, &id).unwrap();
+        let older = serde_json::json!({"version": 1, "started": null, "finished": null,
+                                       "exit": null, "boot_id": null});
+        std::fs::write(dir.join("previous-start.json"), older.to_string()).unwrap();
+        containers::testing::update(&engine, &id, |record| {
+            record.finished = None;
+            record.exit = None;
+        })
+        .unwrap();
+        // The next pass (any container-changing command's) settles it.
+        let other =
+            shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
+        shipyard_engine::run::remove(&engine, other.id.as_str(), false).unwrap();
+        assert!(stores.record(&id).finished.is_some(), "its end settled");
+        assert!(
+            !dir.join("previous-start.json").exists(),
+            "an older start's file, left to be restored by a later undone start"
+        );
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
 
     /// A start killed after it recorded itself started, its container made
@@ -6525,13 +6970,13 @@ mod linux {
             "exit": first.exit,
             "boot_id": first.boot_id,
         });
-        let dir = containers::record_dir(&engine, &id).unwrap();
+        let dir = containers::testing::record_dir(&engine, &id).unwrap();
         std::fs::write(
             dir.join("previous-start.json"),
             serde_json::to_vec(&kept).unwrap(),
         )
         .unwrap();
-        containers::update(&engine, &id, |record| {
+        containers::testing::update(&engine, &id, |record| {
             record.started = Some(SystemTime::now());
             record.finished = None;
             record.exit = None;
@@ -6673,6 +7118,88 @@ mod linux {
         for id in [a, b] {
             shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
         }
+    }
+
+    /// A `network connect` killed once its record says the network, before
+    /// the container joined, is finished by the same `connect` run again
+    /// (F57): its record names the network and it has no lease there; the
+    /// rerun joins it (a lease). A `connect` asking other settings isn't the
+    /// same command: still `Exists`, and joins nothing. `disconnect` alike:
+    /// killed once its record no longer says it, its lease still held, the
+    /// rerun takes it off. The controls: once finished, each again is
+    /// refused as before (`Exists`, `NotFound`). Root (bridge networks).
+    fn a_cut_short_connect_is_finished_by_its_rerun() {
+        use shipyard_engine::run::{ConnectRequest, connect, disconnect};
+        if !is_root() {
+            return;
+        }
+        let stores = Stores::new();
+        let engine = stores.engine();
+        for name in ["home", "extra"] {
+            shipyard_engine::network::create(
+                &engine,
+                &shipyard_network::store::NetworkSpec {
+                    name: name.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let mut request = stores.request(&["sleep", "300"]);
+        request.name = Some("joiner".to_owned());
+        request.network = vec![NetworkMode::bridge("home")];
+        let id = shipyard_engine::run::create(&engine, request, false)
+            .unwrap()
+            .id;
+        shipyard_engine::run::start(&engine, id.as_str()).unwrap();
+        let cut = |command: &str| {
+            let mut child = stores.container_command(command, "extra");
+            child.arg("joiner");
+            let output = child.output().unwrap();
+            assert!(
+                !output.status.success(),
+                "{command} wasn't cut short: {output:?}"
+            );
+        };
+        let on_extra = || {
+            stores.record(&id).config.network.iter().any(|network| {
+                matches!(network, shipyard_engine::containers::Network::Bridges(bridges)
+                if bridges.iter().any(|bridge| bridge.name == "extra"))
+            })
+        };
+        cut("connect-abort");
+        assert!(on_extra(), "its record says it");
+        assert!(stores.leases_on("extra").is_empty(), "not joined");
+        // Another request (other settings) isn't the cut-short one: refused.
+        let mut other = ConnectRequest::new("extra", "joiner");
+        other.aliases = vec!["elsewhere".to_owned()];
+        assert_eq!(
+            connect(&engine, &other).unwrap_err().kind(),
+            ErrorKind::Exists
+        );
+        assert!(stores.leases_on("extra").is_empty(), "nor joined by it");
+        connect(&engine, &ConnectRequest::new("extra", "joiner")).unwrap();
+        assert_eq!(stores.leases_on("extra").len(), 1, "joined by the rerun");
+        // Joined, the same again is refused as before (the control).
+        assert_eq!(
+            connect(&engine, &ConnectRequest::new("extra", "joiner"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Exists
+        );
+        cut("disconnect-abort");
+        assert!(!on_extra(), "its record no longer says it");
+        assert_eq!(stores.leases_on("extra").len(), 1, "not left");
+        disconnect(&engine, "extra", "joiner", false).unwrap();
+        assert!(stores.leases_on("extra").is_empty(), "left by the rerun");
+        // Done, the same again is refused as before (the control).
+        assert_eq!(
+            disconnect(&engine, "extra", "joiner", false)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
 
     /// `network connect` and `disconnect` fail with the kinds their docs

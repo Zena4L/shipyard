@@ -12,9 +12,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// The file that says a start lost its network, in its log directory.
-pub const FILE: &str = "network-lost";
+pub(crate) const FILE: &str = "network-lost";
 /// The file's version: what's written.
 pub(crate) const VERSION: u32 = 1;
+
+/// The most of the file read: a few dozen bytes.
+const MAX_FILE: u64 = 64 * 1024;
 
 /// When, and how, a start lost its network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -38,7 +41,7 @@ struct V1 {
 impl NetworkLost {
     /// As the file keeps it.
     #[must_use]
-    pub fn to_json(&self) -> Vec<u8> {
+    pub(crate) fn to_json(&self) -> Vec<u8> {
         serde_json::to_vec(&V1 {
             v: VERSION,
             time: self.time.clone(),
@@ -49,7 +52,7 @@ impl NetworkLost {
 
     /// What `bytes` say, if they're a file of a version this reads.
     #[must_use]
-    pub fn from_json(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn from_json(bytes: &[u8]) -> Option<Self> {
         let read: V1 = serde_json::from_slice(bytes).ok()?;
         (read.v == VERSION).then_some(Self {
             time: read.time,
@@ -60,14 +63,14 @@ impl NetworkLost {
     /// The file in the start's log directory `dir`, if there's one this
     /// reads.
     #[must_use]
-    pub fn read(dir: &Path) -> Option<Self> {
-        Self::from_json(&std::fs::read(dir.join(FILE)).ok()?)
+    pub(crate) fn read(dir: &Path) -> Option<Self> {
+        Self::from_json(&shipyard_sys::fs::read_bounded(&dir.join(FILE), MAX_FILE).ok()?)
     }
 }
 
 /// The hook pasta's launcher calls (give it to
 /// `shipyard_network::pasta::entry_point`): a detached container's pasta
-/// died while its init ran. Writes [`FILE`] in the start's log directory,
+/// died while its init ran. Writes `network-lost` in the start's log directory,
 /// and says `network_lost` in the events journal of the store the
 /// directory is in (`<containers>/<id>/logs/<N>`; `SHIPYARD_EVENTS_DIR`
 /// honoured, as everywhere). Never fails the launcher: what can't be done
@@ -125,7 +128,7 @@ struct Quiet;
 
 #[cfg(target_os = "linux")]
 impl crate::report::Reporter for Quiet {
-    fn report(&self, _event: crate::report::Event) {}
+    fn report(&self, _event: crate::report::Message) {}
 }
 
 #[cfg(test)]

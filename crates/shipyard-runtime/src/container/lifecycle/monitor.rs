@@ -22,7 +22,9 @@ use super::{
     remove_cgroup_at_with, start_time, without_cgroup, write_atomically_at, write_record_at,
 };
 use crate::cgroup;
-use crate::container::{EXIT_RECORD_ENV, ExitCommand, HOLD_LABELS_ENV, HOLDS_ENV, MONITOR_PID_ENV};
+use crate::container::{
+    EXIT_RECORD_ENV, ExitCommand, HOLD_LABELS_ENV, HOLDS_ENV, MONITOR_PID_ENV, MOST_HOLDS,
+};
 use crate::hooks::ContainerHooks;
 use crate::oci::load_bundle_for_caller;
 use crate::process::ExitStatus;
@@ -112,9 +114,22 @@ pub fn monitor_entry_point() {
                 std::process::exit(125);
             }
         }
-        // SAFETY: all passed by `create` across the exec, and distinct
-        // (checked); this process owns them.
-        let owned = |fd: RawFd| unsafe { OwnedFd::from_raw_fd(fd) };
+        let owned = |fd: RawFd| {
+            use shipyard_sys::fd::{OnExec, take_inherited};
+            // SAFETY: all passed by `create` across the exec, and distinct
+            // (checked); this process owns them. Left as they came: some go
+            // on to the container's process or the clean-up.
+            match unsafe { take_inherited(fd, OnExec::Keep) } {
+                Ok(fd) => fd,
+                Err(err) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "shipyard-monitor: descriptor {fd}: {err}"
+                    );
+                    std::process::exit(125);
+                }
+            }
+        };
         monitor(
             &owned(given.dir),
             Path::new(&given.bundle),
@@ -352,13 +367,19 @@ fn monitor(
     }
     answer(&Answer::Created(pid));
     drop(ready);
+    // After the init's spawn (and its `exec` snapshot): the container keeps
+    // the caller's limit, the monitor takes what its holds may need.
+    let callers = raise_descriptor_limit();
     // The container holds the caller's stdio now (or its logs' pipes); the
     // monitor lets go of the caller's, so a reader sees end-of-file when the
     // container closes it.
     null_stdio();
     // Beside the container (held at its gate) until its end is recorded.
-    let companion = companion.as_ref().and_then(spawn_companion);
-    let (status, kept) = wait_serving_holds(dir, pid, child, capture.as_mut(), companion, holds);
+    let companion = companion
+        .as_ref()
+        .and_then(|command| spawn_companion(command, callers));
+    let beside = Beside::new(companion, cgroup.as_ref());
+    let (status, kept) = wait_serving_holds(dir, pid, child, capture.as_mut(), beside, holds);
     // Read before the cgroup goes: whether the OOM killer struck, and the
     // SIGKILL wasn't someone's `kill`.
     let killed =
@@ -400,7 +421,7 @@ fn monitor(
         None => kept,
     };
     if let Some(command) = &exit_command {
-        run_exit_command(command, dir, &holds, &ended);
+        run_exit_command(command, dir, &holds, &ended, callers);
     }
     std::process::exit(0);
 }
@@ -416,14 +437,14 @@ fn wait_serving_holds(
     pid: i32,
     child: Child,
     mut capture: Option<&mut Capture>,
-    companion: Option<nix::unistd::Pid>,
+    beside: Beside<'_>,
     holds: super::holds::Holds,
 ) -> (crate::Result<ExitStatus>, super::holds::Holds) {
     let Some(serving) = capture.as_deref_mut() else {
-        return (wait_for_the_end(dir, pid, child, None, companion), holds);
+        return (wait_for_the_end(dir, pid, child, None, beside), holds);
     };
     serving.serve_holds(holds);
-    let status = wait_for_the_end(dir, pid, child, capture.as_deref_mut(), companion);
+    let status = wait_for_the_end(dir, pid, child, capture.as_deref_mut(), beside);
     if let Some(capture) = capture {
         capture.stop_taking_holds();
     }
@@ -481,8 +502,12 @@ fn serve_for_a_moment(capture: &mut Capture, outputs: bool) {
 /// the earliest stop's timeout is up. The init is this process's child,
 /// unreaped, so its PID can't be another's; the signal goes by number, a
 /// real-time one too. Killed, it's marked so first (`killed`: the OOM
-/// killer isn't blamed).
-fn watch(dir: &OwnedFd, pid: i32, capture: &mut Capture) {
+/// killer isn't blamed). A paused container (its `cgroup` frozen, or
+/// freezing) is thawed right after a stop's signal that isn't SIGKILL
+/// (F46): the signal waits, pending, until it runs again, and would never
+/// be had before the timeout's SIGKILL (which ends a frozen process). As
+/// Docker does.
+fn watch(dir: &OwnedFd, pid: i32, capture: &mut Capture, cgroup: Option<&cgroup::Cgroup>) {
     let pidfd = super::pidfd_open(pid);
     let mut kill_at: Option<Instant> = None;
     let signal = |number: i32| {
@@ -502,6 +527,14 @@ fn watch(dir: &OwnedFd, pid: i32, capture: &mut Capture) {
             // Too far off to be had: no SIGKILL, as `StopPolicy` says.
             if let Some(at) = Instant::now().checked_add(stop.timeout) {
                 kill_at = Some(kill_at.map_or(at, |earlier| earlier.min(at)));
+            }
+            // Asked, not waited for: frozen or still freezing, it runs
+            // again; gone (the container ended), the timeout's SIGKILL
+            // still comes.
+            if stop.signal != libc::SIGKILL
+                && let Some(cgroup) = cgroup
+            {
+                let _ = cgroup.thaw();
             }
         }
         if kill_at.is_some_and(|at| Instant::now() >= at) {
@@ -559,32 +592,23 @@ fn container_setup(dir: &OwnedFd) -> Result<Setup> {
 /// (never by path, nor through a symlink).
 fn read_plan(dir: &OwnedFd) -> Result<crate::container::Plan> {
     use super::super::plan::{MAX_PLAN_SIZE, PLAN_FILE};
-    use std::io::Read as _;
+    use shipyard_sys::fs::{Refusal, refusal};
     // Not blocking, so a FIFO put there can't stall the open: it's then
     // refused as not a regular file.
-    let file = nix::fcntl::openat(
-        dir,
-        PLAN_FILE,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(errno_io(format!("reading {PLAN_FILE}")))?;
-    let stat = nix::sys::stat::fstat(&file).map_err(errno_io(format!("reading {PLAN_FILE}")))?;
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(ContainerError::Setup(format!(
-            "{PLAN_FILE} isn't a regular file"
-        )));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::from(file)
-        .take(MAX_PLAN_SIZE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(super::io(format!("reading {PLAN_FILE}")))?;
-    if bytes.len() as u64 > MAX_PLAN_SIZE {
-        return Err(ContainerError::Setup(format!(
-            "{PLAN_FILE} is more than {MAX_PLAN_SIZE} bytes"
-        )));
-    }
+    let bytes = match shipyard_sys::fs::read_bounded_at(dir.as_fd(), PLAN_FILE, MAX_PLAN_SIZE) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Err(match refusal(&err) {
+                Some(Refusal::NotAFile) => {
+                    ContainerError::Setup(format!("{PLAN_FILE} isn't a regular file"))
+                }
+                Some(Refusal::TooLarge { .. }) => {
+                    ContainerError::Setup(format!("{PLAN_FILE} is more than {MAX_PLAN_SIZE} bytes"))
+                }
+                None => super::io(format!("reading {PLAN_FILE}"))(err),
+            });
+        }
+    };
     crate::container::Plan::parse(&bytes)
 }
 
@@ -872,6 +896,7 @@ fn run_exit_command(
     dir: &OwnedFd,
     holds: &super::holds::Holds,
     ended: &ExitRecord,
+    callers: Option<libc::rlimit>,
 ) {
     use std::os::unix::process::CommandExt as _;
     let Ok(count) = RawFd::try_from(holds.len()) else {
@@ -879,6 +904,7 @@ fn run_exit_command(
         return;
     };
     let targets = 3..3 + count;
+    let limit = exit_command_limit(callers, targets.end);
     // The state directory, above the targets too (its own number may be
     // one), to say a failure in: close-on-exec, so not the command's.
     let dir = nix::fcntl::fcntl(dir, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(targets.end))
@@ -926,13 +952,14 @@ fn run_exit_command(
             String::from_utf8_lossy(&ended.to_json()).as_ref(),
         );
     // SAFETY: between `fork` and `exec`, the closure calls only `setsid`,
-    // `sigaction` and `fcntl` (async-signal-safe), on numbers known before
-    // the fork.
+    // `sigaction`, `setrlimit` and `fcntl` (async-signal-safe), on values
+    // known before the fork.
     unsafe {
         program.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            set_descriptor_limit(limit);
             // The monitor ignores SIGXFSZ (its logs); the command needn't.
             let mut default: libc::sigaction = std::mem::zeroed();
             default.sa_sigaction = libc::SIG_DFL;
@@ -986,7 +1013,7 @@ fn say_exit_command_failed(dir: &OwnedFd) {
 }
 
 /// Waits for the container's init `pid` (`child`) to end, its output
-/// captured (if it is) meanwhile, and ends its `companion` once it has:
+/// captured (if it is) meanwhile, and ends its companion (`beside`) once it has:
 /// before the init is reaped, while it can, so that nothing the companion
 /// does then is taken for the container's (a zombie init still counts as
 /// running). Without a capture, the monitor only waits for the reap: the
@@ -996,16 +1023,88 @@ fn wait_for_the_end(
     pid: i32,
     mut child: Child,
     capture: Option<&mut Capture>,
-    companion: Option<nix::unistd::Pid>,
+    beside: Beside<'_>,
 ) -> crate::Result<ExitStatus> {
     if let Some(capture) = capture {
-        watch(dir, pid, capture);
-        end_companion(companion);
+        watch(dir, pid, capture, beside.cgroup);
+        end_companion(beside.companion);
         return child.reap();
     }
     let status = child.reap();
-    end_companion(companion);
+    end_companion(beside.companion);
     status
+}
+
+/// What's beside the container while it runs: its companion (ended once
+/// it has), and its cgroup (thawed for a stop, F46). `Copy`: passed on
+/// by value, as its two parts were.
+#[derive(Clone, Copy)]
+struct Beside<'a> {
+    companion: Option<nix::unistd::Pid>,
+    cgroup: Option<&'a cgroup::Cgroup>,
+}
+
+impl<'a> Beside<'a> {
+    /// (A constructor, so the call fits `monitor`'s one line.)
+    fn new(companion: Option<nix::unistd::Pid>, cgroup: Option<&'a cgroup::Cgroup>) -> Self {
+        Self { companion, cgroup }
+    }
+}
+
+/// The descriptors a process of the monitor's may want of its own, beside
+/// those it holds (its sockets, logs and state; an exit command's files).
+const OWN_DESCRIPTORS: usize = 64;
+
+/// The descriptors the monitor may want open once its container is
+/// spawned: the most holds, one message's worth more (a hold's read), and
+/// its own.
+const DESCRIPTORS: usize = MOST_HOLDS + super::attach::MOST_PASSED + OWN_DESCRIPTORS;
+
+/// Raises the monitor's soft descriptor limit (`RLIMIT_NOFILE`) towards
+/// [`DESCRIPTORS`], as far as the hard limit lets it (F49): holds added
+/// after `create` (`network connect`) are bound by [`MOST_HOLDS`], not by
+/// the soft limit the caller happened to have. The caller's limit, if it
+/// was raised, for the helpers to start with again
+/// ([`set_descriptor_limit`]). Never lowered; a refusal leaves it as it was.
+fn raise_descriptor_limit() -> Option<libc::rlimit> {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+    let wanted = libc::rlim_t::try_from(DESCRIPTORS).ok()?.min(hard);
+    (soft < wanted && setrlimit(Resource::RLIMIT_NOFILE, wanted, hard).is_ok()).then_some(
+        libc::rlimit {
+            rlim_cur: soft,
+            rlim_max: hard,
+        },
+    )
+}
+
+/// In a helper's `pre_exec`, after `fork`: the caller's descriptor limit
+/// back (for the exit command, [`exit_command_limit`]'s), if the monitor
+/// raised its own, so the companion and the exit command have what the
+/// caller had. Below the descriptors already open is allowed; a refusal
+/// (none is expected) leaves the monitor's. Async-signal-safe: one
+/// `setrlimit`, no allocation or lock.
+fn set_descriptor_limit(limit: Option<libc::rlimit>) {
+    if let Some(limit) = limit {
+        // SAFETY: `limit` is a valid `rlimit`; `setrlimit` is a direct
+        // system call wrapper.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
+    }
+}
+
+/// The descriptor limit the exit command starts with: the caller's, if
+/// the monitor raised its own, but with room for the holds it's given
+/// (placed below `placed_end`) and [`OWN_DESCRIPTORS`] more, where those
+/// are past it (D10.2-12): an exit command (`__cleanup`) must open files
+/// beside them, and its restart opens as many again (the container's
+/// networks, ports and volumes, counted against its soft limit). The
+/// container it restarts has that limit too.
+fn exit_command_limit(callers: Option<libc::rlimit>, placed_end: RawFd) -> Option<libc::rlimit> {
+    let mut limit = callers?;
+    let own = libc::rlim_t::try_from(OWN_DESCRIPTORS).ok()?;
+    let needed = libc::rlim_t::try_from(placed_end).ok()?.saturating_add(own);
+    limit.rlim_cur = limit.rlim_cur.max(needed.min(limit.rlim_max));
+    Some(limit)
 }
 
 /// A helper the monitor runs (its exit command, or its companion): the
@@ -1029,13 +1128,16 @@ fn helper(command: &ExitCommand) -> std::process::Command {
 /// (a monitor killed outright takes it). Its PID; none if it couldn't be
 /// started (silent, as an exit command's failure: the container runs on
 /// without it).
-fn spawn_companion(command: &ExitCommand) -> Option<nix::unistd::Pid> {
+fn spawn_companion(
+    command: &ExitCommand,
+    callers: Option<libc::rlimit>,
+) -> Option<nix::unistd::Pid> {
     use std::os::unix::process::CommandExt as _;
     let monitor = libc::pid_t::try_from(std::process::id()).ok()?;
     let mut program = helper(command);
     // SAFETY: between `fork` and `exec`, the closure calls only `setsid`,
-    // `prctl`, `getppid` and `sigaction` (async-signal-safe), on values
-    // known before the fork.
+    // `prctl`, `getppid`, `setrlimit` and `sigaction` (async-signal-safe),
+    // on values known before the fork.
     unsafe {
         program.pre_exec(move || {
             if libc::setsid() == -1 {
@@ -1049,6 +1151,7 @@ fn spawn_companion(command: &ExitCommand) -> Option<nix::unistd::Pid> {
             if libc::getppid() != monitor {
                 return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
+            set_descriptor_limit(callers);
             let mut default: libc::sigaction = std::mem::zeroed();
             default.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(libc::SIGXFSZ, &raw const default, std::ptr::null_mut());
@@ -1249,7 +1352,17 @@ mod tests {
         std::fs::remove_file(dir.join(PLAN_FILE)).unwrap();
         nix::unistd::mkfifo(&dir.join(PLAN_FILE), Mode::S_IRWXU).unwrap();
         let err = read_plan(&fd).unwrap_err();
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(err.to_string().contains("isn't a regular file"), "{err}");
+        // Nor is one larger than any plan read: refused unread.
+        std::fs::remove_file(dir.join(PLAN_FILE)).unwrap();
+        let file = std::fs::File::create(dir.join(PLAN_FILE)).unwrap();
+        file.set_len(crate::container::plan::MAX_PLAN_SIZE + 1)
+            .unwrap();
+        let err = read_plan(&fd).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(&err, ContainerError::Setup(why) if why.contains("is more than")),
+            "{err}"
+        );
     }
 }
