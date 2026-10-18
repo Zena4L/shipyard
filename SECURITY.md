@@ -17,7 +17,8 @@ Shipyard is before 1.0: only the latest release gets fixes.
 
 ## What Shipyard defends, and what it doesn't yet
 
-Shipyard v0.2 confines containers, but **isn't a hardened security boundary yet**. Run
+Shipyard (0.3, an internal milestone before 1.0) confines containers, but **isn't a
+hardened security boundary yet**. Run
 only code you would run as your own user (rootless) or trust with root (as root).
 
 What a container is kept from, and tested for:
@@ -52,6 +53,26 @@ Shipyard's binaries make user namespaces through them, where Ubuntu otherwise
 restricts them: the kernel code user namespaces expose is then within those users'
 reach, as with Podman's profile. Install it only where that's what you want, which it
 is wherever rootless containers are.
+
+**On a Mac**, containers run in Shipyard's own Linux VM, and the VM is part of what
+you trust:
+
+- **Your home, shared:** the VM can read and write your whole home (as Docker
+  Desktop's file sharing can), so a container that escaped into the VM could too. A
+  container sees only what you bind into it, and a path outside your home is refused
+  before anything runs. Set-user-ID bits and device files in your home mean nothing in
+  the VM, nor in a container you bind them into (a file copied into a container with
+  `shipyard cp` keeps its mode, as on Linux). The VM's own files (its disk, its
+  socket) are hidden from a bind of your home.
+- **Ports:** a published port listens on your Mac's loopback only, never on its
+  network. One published on every address also answers on the VM's address on the
+  Mac's private virtual network (`192.168.64.x`), which other VMs on your Mac using
+  that shared network can reach.
+- **The Mac, from a container:** a container can reach your Mac's own services at the
+  VM's gateway (`192.168.64.1`), as it can a Linux host's.
+- **The VM's agent** answers only the Mac (vsock's host, CID 2). A container started
+  with `--security-opt seccomp=unconfined` can open vsock sockets (the default profile
+  refuses them), and could take the agent's port while the agent is down.
 
 What isn't done yet (tracked in the [roadmap](docs/ROADMAP.md#open-findings)):
 

@@ -318,30 +318,39 @@ Shipyard has three layers, mirroring how the established tools split up:
 Decided 2026-10-15 (ROADMAP D23, D24).
 
 - **The refactor, with no behaviour change** (checked against the v0.2 binary):
-  - the persisted container record split from `Config` and from the API's types, so a
-    record version is a frozen type of its own (before any v4);
   - one `take` ("find, lock, read again") for every command that works on a container;
   - one safe-file module: atomic writes, capped no-follow reads, lock files, one `pidfd`
-    helper, using `rustix` beside `nix` (closes F61);
-  - `doctor`'s checks into the engine (`system::diagnose`, for the UI's backend panel),
-    `cp`'s helper into the runtime, `run/detached.rs` split by job;
+    helper, using `rustix` beside `nix` (closes F61's reads);
+  - `doctor`'s checks into the engine (`doctor::checks`, for the UI's backend panel),
+    attach's and logs' runtime halves into the runtime (`cp`'s stays: F69),
+    `run/detached.rs` split by job;
   - F48's list.
-- **Stage 9's book chapter.**
-- **A minimal macOS path, used daily:**
+
+  Done as step 10.1 (2026-10-16), the record's split from `Config` moved to stage 11
+  (D10.1d-1).
+- **Stage 9's book chapter:** skipped at the user's request (D10-close-4).
+- **The F-rows homed in stage 10:** done as step 10.2 (a–f, 2026-10-16 to 10-17).
+- **A minimal macOS path, used daily** (D24), done as step 10.3 (2026-10-17 to 10-18;
+  [macOS](user/macos.md), [notes](stages/10-foundations.md)):
   - Virtualization.framework driven from Rust (`objc2-virtualization`), in a VM-host
-    process that starts on first use and exits when idle;
-  - one shared VM: a minimal Alpine root filesystem with Alpine's `linux-virt` kernel,
-    built reproducibly by a script, running the static `shipyard` as its agent;
-  - the Mac CLI forwards commands to the guest's `shipyard` over vsock (stdio and the
-    terminal);
-  - the project directory shared (virtiofs), published ports on `localhost`;
-  - every kernel feature the engine needs checked in the guest by the probes (cgroup
-    v2, overlayfs, nftables, user namespaces, virtiofs, vsock).
+    process that starts on first use and stops after 5 minutes idle (D10.3-11);
+  - one shared VM: an Alpine 3.24 initramfs root with Alpine's `linux-virt` kernel and a
+    data disk for the engine's state (D10.3-2), built by a script from pinned sources,
+    running the static `shipyard` as its init and agent;
+  - the Mac CLI forwards every command to the guest's `shipyard` over vsock, its output,
+    exit code, input, signals and terminal (raw, resized) as on Linux;
+  - the user's home shared at its own path (virtiofs, D10.3-3), the VM's own files in it
+    hidden from containers; published TCP ports on the Mac's loopback (D10.3-10);
+  - the engine's kernel needs checked in the guest by its own `doctor` (cgroups v2,
+    overlayfs, nf_tables bridges), shown by a Mac's `doctor` (D10-close-1); virtiofs and
+    vsock exercised by every VM test.
 
 ## 11. Docker compatibility — stage 11
 
 Decided 2026-10-15 (ROADMAP D25–D27).
 
+- **The container record split from `Config` and from the API's types** (moved from
+  stage 10, D10.1d-1), so a record version is a frozen type of its own, before any v4.
 - **The Docker Engine API, as a subset,** over a UNIX socket that starts on first use and
   exits when idle (systemd socket activation on Linux; forwarded from the VM over vsock
   on macOS), plus an event stream. Shipyard's own data (serials, health history, observed
@@ -380,8 +389,8 @@ Decided 2026-10-15 (ROADMAP D29). Apple Silicon only.
 - **Ports and DNS** from macOS into the VM.
 - **Lifecycle:** the VM starts on first use and stops when idle.
 - **Entitlements and notarization** (`com.apple.security.virtualization`).
-- **The macOS version floor:** 13 (Rosetta in Virtualization.framework) or 14, decided in
-  stage 10.
+- **The macOS version floor:** macOS 13 Ventura (decided in step 10.3, D10.3-4: what
+  Rosetta in Virtualization.framework needs).
 
 ## 14. Desktop UI — stage 14
 

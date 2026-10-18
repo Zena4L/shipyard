@@ -947,3 +947,33 @@ fn a_bundles_seccomp_is_its_own() {
         refused.stderr
     );
 }
+
+/// The macOS guest's init and agent, asked for on a Linux host (by a typo,
+/// a script, a `sudo shipyard *` rule), are refused before they do
+/// anything: the init would move the host's root into memory and remove
+/// the rest, or power it off. A positive control: an ordinary internal
+/// argument isn't refused this way. Never run as root: without the guard,
+/// a root run is the harm itself.
+#[test]
+fn the_guests_processes_are_refused_on_a_host() {
+    if shipyard_test_support::is_root() {
+        return;
+    }
+    for what in ["__guest-init", "__shipyard-agent"] {
+        let refused = run(SHIPYARD.command(&[what]));
+        assert_eq!(refused.code, Some(125), "{what}: {refused:?}");
+        assert!(
+            refused.stderr.contains(&format!(
+                "{what} runs only in Shipyard's own macOS VM: refused"
+            )),
+            "{what}: {refused:?}"
+        );
+    }
+    let other = run(SHIPYARD.command(&["--version"]));
+    assert_eq!(other.code, Some(0), "{other:?}");
+    assert!(
+        !other
+            .stderr
+            .contains("runs only in Shipyard's own macOS VM")
+    );
+}

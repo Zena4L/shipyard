@@ -4,7 +4,7 @@
 //!
 //! **What goes here:** decisions and orchestration, behind typed APIs that
 //! return data. The CLI only parses arguments and prints what comes back;
-//! stage 11's API and stage 13's UI will call the same functions. Nothing
+//! stage 11's API and stage 14's UI will call the same functions. Nothing
 //! here prints.
 //!
 //! **What doesn't:** anything that talks to the kernel directly (ptys and
@@ -28,14 +28,17 @@
 //! caller's layer work, [`image::storage_helper_entry_point`]), a network's
 //! DNS server ([`network::dns_entry_point`]), `cp`'s helper
 //! ([`cp::helper_entry_point`]), a detached container's clean-up
-//! (`__cleanup`, [`run::cleanup_entry_point`]) and its health checks
-//! (`__health`, [`run::health_entry_point`]) start the running binary
-//! again, so a binary that uses them must call their entry points first
-//! thing in `main`, before anything starts a thread. Pasta's entry point
-//! (in `shipyard-network`) is given [`network::pasta_lost`] as its hook.
+//! (`__cleanup`, [`run::cleanup_entry_point`]), its health checks
+//! (`__health`, [`run::health_entry_point`]) and `doctor`'s probe
+//! ([`doctor::probe_entry_point`]) start the running binary
+//! again, so a binary that uses them calls [`entry_points`] first thing in
+//! `main`, before anything starts a thread: every helper's, in their one
+//! order. Pasta's entry point (in `shipyard-network`) is given
+//! [`network::pasta_lost`] as its hook.
 //!
 //! It holds what the CLI's commands do: runs and containers, images,
-//! volumes, networks, logs, attach, `exec`, `cp`, events and health checks;
+//! volumes, networks, logs, attach, `exec`, `cp`, events, health checks and
+//! `doctor`'s checks of the host;
 //! the CLI parses and prints.
 
 // Nothing here prints (`tests/boundaries.rs` checks what this can't).
@@ -47,10 +50,13 @@ compile_error!("shipyard-engine only supports UNIX platforms (Linux, macOS)");
 pub mod attach;
 pub mod containers;
 pub mod cp;
+pub mod doctor;
+mod entry;
 mod error;
 pub mod events;
 pub mod exec;
 mod fs;
+pub mod guest;
 pub mod health;
 pub mod image;
 pub mod logs;
@@ -59,15 +65,16 @@ mod paths;
 mod random;
 pub mod report;
 pub mod run;
-pub mod streams;
+pub(crate) mod streams;
 pub mod volumes;
 
 use std::sync::Arc;
 
+pub use entry::{Hooks, entry_points};
 pub use error::{Error, ErrorKind, Result, StreamsError};
 pub use paths::Paths;
 
-use report::{Event, Reporter, WarningKind};
+use report::{Message, Reporter, WarningKind};
 
 /// What every engine operation works with: where things are kept, and where
 /// what it has to say goes. Cheap to clone (the reporter is shared).
@@ -96,9 +103,9 @@ impl Engine {
         &self.reporter
     }
 
-    /// Reports `event`.
-    pub(crate) fn report(&self, event: Event) {
-        self.reporter.report(event);
+    /// Reports `message`.
+    pub(crate) fn report(&self, message: Message) {
+        self.reporter.report(message);
     }
 
     /// Reports a warning of `kind`.

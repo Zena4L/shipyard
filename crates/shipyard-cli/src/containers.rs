@@ -50,8 +50,8 @@ pub(crate) fn start_attached(
     let [reference] = references else {
         anyhow::bail!("start -a takes one container");
     };
-    let engine = crate::engine();
-    let options = shipyard_engine::attach::Options {
+    let engine = crate::reporter::engine();
+    let options = shipyard_engine::attach::AttachOptions {
         detach_keys: shipyard_runtime::attach::DetachKeys::parse(detach_keys)?,
         stdin: interactive,
         held: false,
@@ -62,8 +62,8 @@ pub(crate) fn start_attached(
 
 /// `shipyard attach`: until detached (0) or the container ends (its code).
 pub(crate) fn attach(reference: &str, detach_keys: &str, stdin: bool) -> Result<ExitCode> {
-    let engine = crate::engine();
-    let options = shipyard_engine::attach::Options {
+    let engine = crate::reporter::engine();
+    let options = shipyard_engine::attach::AttachOptions {
         detach_keys: shipyard_runtime::attach::DetachKeys::parse(detach_keys)?,
         stdin,
         held: false,
@@ -78,12 +78,21 @@ fn each_said(
     references: &[String],
     mut act: impl FnMut(&shipyard_engine::Engine, &str) -> shipyard_engine::Result<()>,
 ) -> ExitCode {
-    let engine = crate::engine();
-    crate::each(references, |reference| {
+    let engine = crate::reporter::engine();
+    crate::output::each(references, |reference| {
         act(&engine, reference)?;
         writeln!(std::io::stdout().lock(), "{reference}")?;
         Ok(())
     })
+}
+
+/// The containers a command acts on, each by any reference: what start,
+/// stop, restart, update, kill, wait, inspect and rm share.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ContainerRefs {
+    /// The containers: names, IDs, serials or ID prefixes.
+    #[arg(value_name = "CONTAINER", required = true)]
+    pub(crate) containers: Vec<String>,
 }
 
 /// How `stop` and `restart` stop a container: its own stop signal and
@@ -152,7 +161,7 @@ pub(crate) fn update(
 
 /// `shipyard rename`: the container renamed; nothing printed (as Docker).
 pub(crate) fn rename(reference: &str, new_name: &str) -> Result<ExitCode> {
-    let engine = crate::engine();
+    let engine = crate::reporter::engine();
     shipyard_engine::run::rename(&engine, reference, new_name)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -190,7 +199,7 @@ pub(crate) struct ExecArgs {
 /// couldn't be run), 0 once it runs detached, 125 for Shipyard's own
 /// failures.
 pub(crate) fn exec(args: ExecArgs) -> ExitCode {
-    let engine = crate::engine();
+    let engine = crate::reporter::engine();
     let request = shipyard_engine::exec::ExecRequest {
         args: args.command,
         interactive: args.interactive,
@@ -204,7 +213,7 @@ pub(crate) fn exec(args: ExecArgs) -> ExitCode {
     match shipyard_engine::exec::in_container(&engine, &args.container, &request) {
         Ok(shipyard_engine::exec::Ran::Exited(code)) => ExitCode::from(code),
         Ok(_) => ExitCode::SUCCESS,
-        Err(error) => crate::report(&error, shipyard_engine::exec::exit_code(&error)),
+        Err(error) => crate::reporter::report(&error, shipyard_engine::exec::exit_code(&error)),
     }
 }
 
@@ -223,12 +232,64 @@ pub(crate) struct CpArgs {
     destination: std::ffi::OsString,
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only a Mac forwards; its rules are tested everywhere"
+    )
+)]
+impl ExecArgs {
+    /// What a forwarded `exec` needs of a Mac (step 10.3b): its input with
+    /// `-i`.
+    pub(crate) fn needs(&self) -> crate::forward::Needs {
+        crate::forward::Needs {
+            input: self.interactive,
+            ..crate::forward::Needs::default()
+        }
+    }
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only a Mac forwards; its rules are tested everywhere"
+    )
+)]
+impl CpArgs {
+    /// Whether it writes a tar stream to stdout (`-` as its destination).
+    pub(crate) fn writes_to_stdout(&self) -> bool {
+        self.destination == "-"
+    }
+
+    /// What a forwarded `cp` needs of a Mac (step 10.3b): its input when it
+    /// reads a tar stream (`-`), and its host side, which the copy may make
+    /// as its destination.
+    pub(crate) fn needs(&self) -> crate::forward::Needs {
+        use shipyard_engine::cp::Operand;
+        let host = |operand: &std::ffi::OsString, new| match Operand::parse(operand) {
+            Operand::Host(path) if new => Some(crate::forward::HostPath::new_or_existing(path)),
+            Operand::Host(path) => Some(crate::forward::HostPath::existing(path)),
+            _ => None,
+        };
+        crate::forward::Needs {
+            input: self.source == "-",
+            paths: [host(&self.source, false), host(&self.destination, true)]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ..crate::forward::Needs::default()
+        }
+    }
+}
+
 /// `shipyard cp`: the copy, its container by name, running or stopped;
 /// what it left out or changed said as warnings.
 pub(crate) fn cp(args: &CpArgs) -> Result<ExitCode> {
-    use shipyard_engine::cp::{CpOptions, Operand, Streams, Transfer};
+    use shipyard_engine::cp::{CpOptions, CpStreams, Operand, Transfer};
     use std::io::IsTerminal as _;
-    let engine = crate::engine();
+    let engine = crate::reporter::engine();
     let transfer = Transfer::of(
         Operand::parse(&args.source),
         Operand::parse(&args.destination),
@@ -243,7 +304,7 @@ pub(crate) fn cp(args: &CpArgs) -> Result<ExitCode> {
         follow_link: args.follow_link,
     };
     let mut stdout = std::io::stdout().lock();
-    let mut streams = Streams {
+    let mut streams = CpStreams {
         input: &mut std::io::stdin().lock(),
         output: &mut stdout,
     };
@@ -251,7 +312,7 @@ pub(crate) fn cp(args: &CpArgs) -> Result<ExitCode> {
     stdout.flush()?;
     drop(stdout);
     for warning in copied.warnings {
-        crate::warn(warning)?;
+        crate::reporter::warn(warning)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -268,7 +329,7 @@ pub(crate) struct LogsArgs {
     tail: Option<usize>,
     /// Only lines from TIME on: RFC 3339 (2026-10-10T06:16:19Z), Unix
     /// seconds, or a duration ago (10m, 2h, 30s, 3d).
-    #[arg(long, value_name = "TIME", value_parser = crate::logs_output::parse_since)]
+    #[arg(long, value_name = "TIME", value_parser = shipyard_cli::logs_output::parse_since)]
     since: Option<shipyard_runtime::logs::time::Timestamp>,
     /// Start each line with the time it was written (RFC 3339).
     #[arg(short, long)]
@@ -279,18 +340,24 @@ pub(crate) struct LogsArgs {
 
 /// `shipyard logs`: the container's logs, every start's, as `args` say.
 pub(crate) fn logs(args: &LogsArgs) -> Result<ExitCode> {
-    let engine = crate::engine();
-    let options = shipyard_engine::logs::Options {
+    let engine = crate::reporter::engine();
+    let options = shipyard_engine::logs::LogsOptions {
         tail: args.tail,
         since: args.since,
         follow: args.follow,
         identity: None,
+        gone: Some(shipyard_cli::pipe::stdout_gone),
     };
-    let skipped = crate::logs_output::printed(args.timestamps, |sink| {
-        shipyard_engine::logs::of_container(&engine, &args.container, &options, sink)
+    let skipped = shipyard_cli::logs_output::printed(args.timestamps, |sink| {
+        Ok(shipyard_engine::logs::of_container(
+            &engine,
+            &args.container,
+            &options,
+            sink,
+        )?)
     })?;
-    if let Some(warning) = crate::logs_output::skipped_warning(skipped) {
-        crate::warn(warning)?;
+    if let Some(warning) = shipyard_cli::logs_output::skipped_warning(skipped) {
+        crate::reporter::warn(warning)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -298,8 +365,8 @@ pub(crate) fn logs(args: &LogsArgs) -> Result<ExitCode> {
 /// `shipyard wait`: each container's exit code once it has ended, one per
 /// line; exits 125 if any couldn't be waited for.
 pub(crate) fn wait(references: &[String]) -> ExitCode {
-    let engine = crate::engine();
-    crate::each(references, |reference| {
+    let engine = crate::reporter::engine();
+    crate::output::each(references, |reference| {
         let code = shipyard_engine::run::wait(&engine, reference)?;
         writeln!(std::io::stdout().lock(), "{code}")?;
         Ok(())
@@ -317,9 +384,9 @@ pub(crate) fn rm(references: &[String], force: bool) -> ExitCode {
 /// `shipyard inspect`: the containers as a JSON array (the ones found);
 /// exits 125 if any wasn't.
 pub(crate) fn inspect(references: &[String]) -> Result<ExitCode> {
-    let engine = crate::engine();
+    let engine = crate::reporter::engine();
     let mut found = Vec::new();
-    let code = crate::each(references, |reference| {
+    let code = crate::output::each(references, |reference| {
         found.push(shipyard_engine::containers::inspect(&engine, reference)?);
         Ok(())
     });
@@ -357,7 +424,7 @@ fn host_side(port: &BoundPort) -> String {
 /// each (`80/tcp -> 0.0.0.0:8080`); or, for one of its ports, only the
 /// host side, and exit 1 if nothing is published there (Docker's).
 pub(crate) fn port(reference: &str, wanted: Option<&(u16, String)>) -> Result<ExitCode> {
-    let engine = crate::engine();
+    let engine = crate::reporter::engine();
     let found = shipyard_engine::containers::ports(
         &engine,
         reference,
@@ -384,7 +451,7 @@ pub(crate) fn port(reference: &str, wanted: Option<&(u16, String)>) -> Result<Ex
         }
         Some((number, protocol)) if found.ports.is_empty() => {
             drop(out);
-            return Ok(crate::report(
+            return Ok(crate::reporter::report(
                 &format!(
                     "no public port '{number}/{protocol}' published for {}",
                     found.name
@@ -404,7 +471,7 @@ pub(crate) fn port(reference: &str, wanted: Option<&(u16, String)>) -> Result<Ex
 /// `shipyard port --sockets`: the container's sockets, as a table (`PROTO
 /// LOCAL REMOTE STATE PEER`) or JSON.
 pub(crate) fn sockets(reference: &str, format: Format) -> Result<ExitCode> {
-    let found = shipyard_engine::containers::sockets(&crate::engine(), reference)?;
+    let found = shipyard_engine::containers::sockets(&crate::reporter::engine(), reference)?;
     let mut out = std::io::stdout().lock();
     match format {
         Format::Json => {
@@ -426,7 +493,7 @@ pub(crate) fn sockets(reference: &str, format: Format) -> Result<ExitCode> {
                     ]
                 })
                 .collect();
-            crate::table(
+            crate::output::table(
                 &mut out,
                 &["PROTO", "LOCAL", "REMOTE", "STATE", "PEER"],
                 &rows,
@@ -439,7 +506,7 @@ pub(crate) fn sockets(reference: &str, format: Format) -> Result<ExitCode> {
 /// `shipyard ps`: the containers up (all of them with `all`), as a table,
 /// their IDs alone (`quiet`), or JSON.
 pub(crate) fn ps(all: bool, quiet: bool, format: Format) -> Result<ExitCode> {
-    let summaries = shipyard_engine::containers::summaries(&crate::engine(), all)?;
+    let summaries = shipyard_engine::containers::summaries(&crate::reporter::engine(), all)?;
     let now = SystemTime::now();
     let mut out = std::io::stdout().lock();
     if quiet {
@@ -489,7 +556,7 @@ pub(crate) fn ps(all: bool, quiet: bool, format: Format) -> Result<ExitCode> {
                     ]
                 })
                 .collect();
-            crate::table(
+            crate::output::table(
                 &mut out,
                 &[
                     "CONTAINER ID",

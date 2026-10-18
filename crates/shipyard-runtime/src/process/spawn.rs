@@ -596,8 +596,7 @@ fn exec_terminal(
     Some((
         super::setup::TerminalSetup {
             socket: fd,
-            rows: size.0,
-            cols: size.1,
+            size,
             acknowledged,
         },
         joining.directory.as_raw_fd(),
@@ -806,8 +805,7 @@ impl CleanImageFiles {
                 setup.terminal =
                     terminal.map(|(fd, size, acknowledged)| super::setup::TerminalSetup {
                         socket: fd,
-                        rows: size.0,
-                        cols: size.1,
+                        size,
                         acknowledged,
                     });
                 setup.passing.clone_from(&options.passing);

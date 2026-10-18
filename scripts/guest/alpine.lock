@@ -1,0 +1,11 @@
+# The Alpine release the macOS guest is built from (step 10.3a), pinned.
+# `build.sh` reads it. The minirootfs is checked against its sha256; the
+# packages are installed at exactly these versions by the minirootfs's own
+# apk, which checks each package's signature against the keys inside the
+# (pinned) minirootfs. A version Alpine has dropped fails the build: re-pin
+# here, then rebuild.
+ALPINE_BRANCH=v3.24
+ALPINE_RELEASE=3.24.2
+MINIROOTFS=alpine-minirootfs-3.24.2-aarch64.tar.gz
+MINIROOTFS_SHA256=9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773
+PACKAGES="linux-virt=6.18.57-r0 e2fsprogs=1.47.4-r0"

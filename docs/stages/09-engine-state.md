@@ -761,9 +761,11 @@ new frames (`HelloControl`, `Stop`, `HelloHeld`, the holder's) with their protoc
   `ExecStop`: a separate stop unit) and F53 (the `TIME_WAIT` re-hold lock is an abstract
   socket name any local user can take: a lock file in the caller's runtime directory),
   both to stage 10.
-- **Stage 10's first steps:** the resource and image commands by name (`stats`, `top`,
-  `pause`/`unpause`, `update`; `tag`, image `inspect`, `history`, `save`/`load`;
-  `--mount`), asked in 9.9b.
+- **The resource and image commands by name** (`stats`, `top`, `pause`/`unpause`,
+  `update`; `tag`, image `inspect`, `history`, `save`/`load`; `--mount`), asked in 9.9b as
+  stage 10's first steps: moved by the direction reset (ROADMAP D23, D25) to stage 11
+  (the resource commands, `--mount`) and stage 12 (the image commands). Stage 10 starts
+  with the refactor (D23).
 - **Stage 14:** the libseccomp and bpftool differentials (D9.9-5).
 - **Later:**
   - waiting for a route at boot (9.5c's Murphy M2: a failed start is said, the others run);

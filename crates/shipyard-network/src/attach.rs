@@ -250,6 +250,23 @@ pub fn host_interfaces() -> Result<Vec<String>, AttachError> {
     Ok(names)
 }
 
+/// [`host_interfaces`], but for bridges and their ports (a link with a
+/// master): what routing is closed between when Shipyard can't read its
+/// record of what it closed (F65). Another engine's bridge (Docker's,
+/// libvirt's, a CNI's) and its containers' veths are that engine's to
+/// route; the host's own links (a LAN, a VPN) are what's closed.
+pub fn unbridged_host_interfaces() -> Result<Vec<String>, AttachError> {
+    let mut names: Vec<String> = Rtnetlink::new()?
+        .links()?
+        .into_iter()
+        .filter(|link| link.kind.as_deref() != Some("bridge") && link.master.is_none())
+        .map(|link| link.name)
+        .filter(|name| name != "lo" && !is_shipyards(name))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 /// The IPv6 settings of the container's `interface` (in the calling
 /// thread's network namespace), before it's up: with IPv6 (`on`), no
 /// duplicate address detection (its addresses are the network's to give,

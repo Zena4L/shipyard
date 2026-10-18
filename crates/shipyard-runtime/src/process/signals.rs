@@ -52,7 +52,8 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// TSTP, TTIN, TTOU and CONT. The shell stops and resumes shipyard and the
 /// command together; CONT is caught only to notice that shipyard was resumed
 /// (see `Signals::install`).
-pub(crate) fn is_forwardable(signal: c_int) -> bool {
+#[must_use]
+pub fn is_forwardable(signal: c_int) -> bool {
     let never = [
         libc::SIGKILL,
         libc::SIGSTOP,
@@ -155,23 +156,40 @@ impl Signals {
     /// command that has already exited; a blocked SIGTERM would make it
     /// unstoppable. So every caught signal is unblocked.
     pub(crate) fn install() -> Result<Self> {
+        let mut installed = Self::claim()?;
+        for signal in 1..=MAX_SIGNAL {
+            if always_caught(signal) || is_forwardable(signal) {
+                installed.catch(signal, !always_caught(signal))?;
+            }
+        }
+        installed.unblock_caught()?;
+        Ok(installed)
+    }
+
+    /// Installs handlers for `signals` only, each caught even if it was
+    /// ignored at startup, the signal mask left as it is: a narrow watch
+    /// ([`ResizeWatch`]) that leaves every other signal's handling alone.
+    fn install_only(signals: &[c_int]) -> Result<Self> {
+        let mut installed = Self::claim()?;
+        for &signal in signals {
+            installed.catch(signal, false)?;
+        }
+        Ok(installed)
+    }
+
+    /// This process's one set of handlers, none installed yet, and the wake
+    /// pipe. From here on, dropping it undoes whatever was done.
+    fn claim() -> Result<Self> {
         if ACTIVE.swap(true, Ordering::AcqRel) {
             return Err(Error::AlreadySupervising);
         }
-        // From here on, dropping `installed` undoes whatever was done.
-        let mut installed = Self {
+        let claimed = Self {
             previous: Vec::new(),
             previous_mask: None,
             ignored_at_startup: Vec::new(),
         };
         ensure_wake_pipe()?;
-        for signal in 1..=MAX_SIGNAL {
-            if always_caught(signal) || is_forwardable(signal) {
-                installed.catch(signal)?;
-            }
-        }
-        installed.unblock_caught()?;
-        Ok(installed)
+        Ok(claimed)
     }
 
     /// Forwardable signals that were ignored when shipyard started.
@@ -200,7 +218,9 @@ impl Signals {
         Ok(())
     }
 
-    fn catch(&mut self, signal: c_int) -> Result<()> {
+    /// Catches `signal`; with `keep_ignored`, one ignored at startup is
+    /// left ignored (and noted).
+    fn catch(&mut self, signal: c_int, keep_ignored: bool) -> Result<()> {
         // SAFETY: a zeroed `sigaction` is a valid "no handler" value; the
         // query below doesn't change anything.
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -210,7 +230,7 @@ impl Signals {
             // 32–34) can't be queried or caught; skip them.
             return Ok(());
         }
-        if current.sa_sigaction == libc::SIG_IGN && !always_caught(signal) {
+        if current.sa_sigaction == libc::SIG_IGN && keep_ignored {
             tracing::trace!(signal, "ignored at startup: left ignored, not forwarded");
             self.ignored_at_startup.push(signal);
             return Ok(());
@@ -260,9 +280,7 @@ impl Signals {
 
     /// Forgets that `signal` arrived, if it's pending.
     pub(crate) fn forget(&self, signal: c_int) {
-        if let Some(flag) = usize::try_from(signal).ok().and_then(|n| PENDING.get(n)) {
-            flag.store(0, Ordering::Release);
-        }
+        forget(signal);
     }
 
     /// Forgets the command: pending signals were meant for it, and its PID
@@ -350,6 +368,52 @@ impl SignalWatch {
     }
 }
 
+/// A terminal's resizes (SIGWINCH) and this process's resumes (SIGCONT),
+/// and nothing else, made a readable descriptor for a `poll` loop: an
+/// attach session's own watch, where its caller has none. Unlike a
+/// [`SignalWatch`], it leaves SIGINT, SIGTERM and every other signal's
+/// handling alone (`^C` outside raw mode still ends the program). The same
+/// handlers and pipe as a supervisor's, so one watch at a time. Dropping it
+/// forgets what it caught and puts the previous handlers back.
+pub(crate) struct ResizeWatch {
+    /// Always some: taken only by `drop`, to put the handlers back first.
+    signals: Option<Signals>,
+}
+
+impl ResizeWatch {
+    /// Installs the handlers for SIGWINCH and SIGCONT. Catching SIGCONT
+    /// doesn't change what it does: the kernel resumes a stopped process
+    /// whatever its handler.
+    pub(crate) fn install() -> Result<Self> {
+        Ok(Self {
+            signals: Some(Signals::install_only(&[libc::SIGWINCH, libc::SIGCONT])?),
+        })
+    }
+
+    /// The descriptor that becomes readable when either arrives.
+    #[allow(
+        clippy::unused_self,
+        reason = "`&self` proves the handlers are installed"
+    )]
+    pub(crate) fn fd(&self) -> BorrowedFd<'static> {
+        // SAFETY: the wake pipe is made before any watch exists and is
+        // never closed, so the descriptor stays valid for the whole program.
+        unsafe { BorrowedFd::borrow_raw(WAKE_READ.load(Ordering::Acquire)) }
+    }
+}
+
+impl Drop for ResizeWatch {
+    fn drop(&mut self) {
+        // The handlers put back first, then what it caught forgotten (its
+        // own two signals only: the flags are the process's): none is left
+        // for a later watch to find (a stale SIGCONT would read as a
+        // resume). A wake byte left in the pipe only wakes a loop once.
+        drop(self.signals.take());
+        forget(libc::SIGWINCH);
+        forget(libc::SIGCONT);
+    }
+}
+
 /// What a [`SignalWatch`] caught ([`SignalWatch::take`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Taken {
@@ -362,6 +426,13 @@ pub struct Taken {
 impl std::fmt::Debug for SignalWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignalWatch").finish_non_exhaustive()
+    }
+}
+
+/// Forgets that `signal` arrived, if it's pending.
+fn forget(signal: c_int) {
+    if let Some(flag) = usize::try_from(signal).ok().and_then(|n| PENDING.get(n)) {
+        flag.store(0, Ordering::Release);
     }
 }
 
@@ -514,6 +585,42 @@ mod tests {
     fn linux_realtime_signals_are_forwarded() {
         assert!(is_forwardable(34));
         assert!(is_forwardable(64));
+    }
+
+    /// A resize watch catches SIGWINCH and SIGCONT and nothing else
+    /// (F37: SIGINT and SIGTERM keep their handling, so `^C` outside raw
+    /// mode still ends the program), wakes its descriptor on a resize, and
+    /// puts every handler back when dropped. (The only handlers this test
+    /// binary installs: one watch per process.)
+    #[test]
+    fn a_resize_watch_catches_resizes_and_nothing_else() {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        let handler = |signal| {
+            // SAFETY: a zeroed `sigaction` is valid storage for the query.
+            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a NULL new action only reads the current one.
+            unsafe { libc::sigaction(signal, std::ptr::null(), &raw mut current) };
+            current.sa_sigaction
+        };
+        let signals = [libc::SIGWINCH, libc::SIGCONT, libc::SIGINT, libc::SIGTERM];
+        let before = signals.map(handler);
+        let watch = ResizeWatch::install().unwrap();
+        let ours = on_signal as *const () as libc::sighandler_t;
+        let [winch, cont, int, term] = signals.map(handler);
+        let [_, _, int_before, term_before] = before;
+        assert_eq!((winch, cont), (ours, ours));
+        assert_eq!((int, term), (int_before, term_before));
+        let mut fds = [PollFd::new(watch.fd(), PollFlags::POLLIN)];
+        assert_eq!(
+            poll(&mut fds, PollTimeout::ZERO).unwrap(),
+            0,
+            "no wakeup yet"
+        );
+        // SAFETY: `raise` with a signal whose handler only records and wakes.
+        unsafe { libc::raise(libc::SIGWINCH) };
+        assert_eq!(poll(&mut fds, PollTimeout::from(1000_u16)).unwrap(), 1);
+        drop(watch);
+        assert_eq!(signals.map(handler), before);
     }
 
     #[test]

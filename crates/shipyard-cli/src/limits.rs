@@ -14,7 +14,7 @@ use shipyard_runtime::resources::{self, CpuMax, IoLimit, Limit, Resources};
 /// them at once.
 #[derive(Debug, Default, Args)]
 #[group(id = "limits", multiple = true)]
-pub(crate) struct LimitArgs {
+pub struct LimitArgs {
     /// The most memory the container may use (such as 512m or 2g); past it,
     /// the kernel's OOM killer stops a process (Linux; rootless where a cgroup
     /// subtree is delegated).
@@ -87,7 +87,8 @@ pub(crate) struct LimitArgs {
 impl LimitArgs {
     /// The flags' first name, if any limit is given: for refusing them where
     /// they can't work.
-    pub(crate) fn first_given(&self) -> Option<&'static str> {
+    #[must_use]
+    pub fn first_given(&self) -> Option<&'static str> {
         let resources_asked = [
             (self.memory.is_some(), "--memory"),
             (self.memory_reservation.is_some(), "--memory-reservation"),
@@ -118,7 +119,7 @@ impl LimitArgs {
     ///
     /// A value the kernel wouldn't take, flags that contradict each other, or
     /// a device that isn't a block device.
-    pub(crate) fn resources(&self) -> Result<Resources> {
+    pub fn resources(&self) -> Result<Resources> {
         self.limits(true, None)
     }
 
@@ -130,7 +131,7 @@ impl LimitArgs {
     /// # Errors
     ///
     /// As [`LimitArgs::resources`].
-    pub(crate) fn resources_as_given(&self, memory_now: Option<u64>) -> Result<Resources> {
+    pub fn resources_as_given(&self, memory_now: Option<u64>) -> Result<Resources> {
         let mut limits = self.limits(false, memory_now)?;
         // Only what was given: the memory it counted from stays as it is.
         if !self.memory_given() {
@@ -141,7 +142,8 @@ impl LimitArgs {
 
     /// Whether `--memory-swap` is given without `--memory` (for an update,
     /// it then needs the container's own memory limit).
-    pub(crate) fn swap_without_memory(&self) -> bool {
+    #[must_use]
+    pub fn swap_without_memory(&self) -> bool {
         self.memory_swap.is_some_and(|total| total != 0) && !self.memory_given()
     }
 
@@ -241,7 +243,7 @@ fn block_device(path: &Path) -> Result<(u32, u32)> {
 }
 
 /// A size (`64k`, `10m`, `1g`), as `--memory` takes it.
-pub(crate) fn parse_size(text: &str) -> Result<u64, String> {
+pub fn parse_size(text: &str) -> Result<u64, String> {
     resources::parse_size(text).map_err(|err| err.to_string())
 }
 

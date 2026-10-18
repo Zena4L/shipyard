@@ -11,6 +11,10 @@ publish.workspace = true
 # `cargo run` runs `shipyard`; the runtime needs `--bin shipyard-runtime`.
 default-run = "shipyard"
 
+# What both binaries share (internal, not an API).
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "shipyard"
 path = "src/main.rs"
@@ -19,21 +23,25 @@ path = "src/main.rs"
 # cgroup commands: pause, resume, update, ps, events).
 [[bin]]
 name = "shipyard-runtime"
-path = "src/bin/shipyard-runtime.rs"
+path = "src/bin/shipyard-runtime/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 # Block device numbers for the I/O limit flags (`major`, `minor`).
 libc.workspace = true
-# `events --follow`'s polling, and `geteuid`.
-nix = { workspace = true, features = ["poll", "user"] }
+# `events --follow`'s polling.
+nix = { workspace = true, features = ["poll"] }
 serde_json.workspace = true
 shipyard-engine.workspace = true
-shipyard-image.workspace = true
-# Parsing the network flags; pasta's entry point; `doctor`'s network checks.
+# Parsing the network flags.
 shipyard-network.workspace = true
 shipyard-runtime.workspace = true
+# The runtime binary's `--pid-file`, written whole.
+shipyard-sys.workspace = true
+# A run's `--volume`s, told apart (a bind's source or a named volume) on a Mac (step 10.3b).
+shipyard-storage.workspace = true
+shipyard-vm.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -54,6 +62,13 @@ tar.workspace = true
 [[test]]
 name = "terminal"
 path = "tests/terminal.rs"
+harness = false
+
+# A terminal through the macOS VM (step 10.3b2): the same fake shell,
+# single-threaded for the same reason. See tests/vm_terminal.rs.
+[[test]]
+name = "vm_terminal"
+path = "tests/vm_terminal.rs"
 harness = false
 
 [lints]

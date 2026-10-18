@@ -1,0 +1,34 @@
+[package]
+name = "shipyard-vm"
+description = "Shipyard's macOS VM (step 10.3): the guest booted with Virtualization.framework, its host process, and the client the Mac CLI forwards through."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The VM directory's lock, its socket's peer, the host's own session.
+nix.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The frames a forwarded command travels in (the attach protocol's).
+shipyard-runtime.workspace = true
+shipyard-sys.workspace = true
+# The guest's files checked against their manifest.
+sha2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Virtualization.framework, from Rust (D29): only the classes used.
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-virtualization.workspace = true
+block2.workspace = true
+dispatch2.workspace = true
+
+[lints]
+workspace = true

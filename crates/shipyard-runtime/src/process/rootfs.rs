@@ -460,9 +460,12 @@ mod linux {
     /// Always `index=off` (a container's own upper layer is mounted again
     /// at each start, over layers that may have been extracted again since:
     /// with overlay's index on, a kernel's default on some, that mount would
-    /// fail). And a root overlay mounted read-only (its kernel's quiet
-    /// fallback when the work directory can't be used) is refused (`EROFS`):
-    /// what the container writes would be lost.
+    /// fail). That turns off the kernel's refusal of an upper directory
+    /// already mounted: one mount at a time is the caller's to keep (the
+    /// engine's area lock, which a start and a `cp` view both take). And a
+    /// root overlay mounted read-only (its kernel's quiet fallback when the
+    /// work directory can't be used) is refused (`EROFS`): what the
+    /// container writes would be lost.
     fn mount_overlay(
         merged: &Path,
         lower: &[&Path],

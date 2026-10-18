@@ -22,7 +22,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::{ContainerError, Result, Status, io};
-use crate::attach::{CONTROL_VERSION, Decoder, Frame, FrameError, HOLD_VERSION, VERSION};
+use crate::attach::{
+    CONTROL_VERSION, Decoder, Frame, FrameError, HOLD_VERSION, HoldRefusal, VERSION,
+};
 use crate::process::Signal;
 
 /// How long the monitor has to let the client in.
@@ -142,26 +144,15 @@ impl Control {
         frame: &Frame,
         fd: BorrowedFd<'_>,
     ) -> std::result::Result<(), Option<ContainerError>> {
-        use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
-        use std::os::fd::AsRawFd as _;
+        use std::os::fd::AsFd as _;
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
-        let fds = [fd.as_raw_fd()];
-        let iov = [std::io::IoSlice::new(&bytes)];
-        let sent = loop {
-            match sendmsg::<()>(
-                self.stream.as_raw_fd(),
-                &iov,
-                &[ControlMessage::ScmRights(&fds)],
-                MsgFlags::MSG_NOSIGNAL,
-                None,
-            ) {
-                Ok(sent) => break sent,
-                Err(nix::errno::Errno::EINTR) => {}
-                Err(errno) => {
-                    let error = std::io::Error::from(errno);
-                    return Err((!let_go(&error)).then(|| self.write_error(error)));
-                }
+        let flags = nix::sys::socket::MsgFlags::MSG_NOSIGNAL;
+        let sent = match shipyard_sys::fdpass::send(self.stream.as_fd(), &[fd], &bytes, flags) {
+            Ok(sent) => sent,
+            Err(errno) => {
+                let error = std::io::Error::from(errno);
+                return Err((!let_go(&error)).then(|| self.write_error(error)));
             }
         };
         // The descriptor went with the first byte: the rest, if the socket
@@ -289,6 +280,45 @@ fn holder_error(error: ContainerError) -> ContainerError {
     }
 }
 
+/// What a monitor answered a holder's request.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// Done.
+    Done,
+    /// Refused: why, and in words.
+    Refused(HoldRefusal, String),
+    /// It let go (or the container ended) without answering.
+    LetGo,
+    /// It turned the holder away, or didn't answer in time: why.
+    Unanswered(String),
+}
+
+/// Reads the monitor's answer to a holder's request from `control`: a
+/// version 4 monitor's refusal says its reason; a version 3 one's says
+/// only words, from which [`HoldRefusal::Full`] is read
+/// ([`HOLDS_FULL`](super::super::HOLDS_FULL)'s), else
+/// [`HoldRefusal::Other`]`(0)` (a reason not said).
+fn answer(control: &mut Control) -> Result<Answer> {
+    loop {
+        return Ok(match control.next() {
+            Ok(Some(Frame::Done { ok: true, .. })) => Answer::Done,
+            Ok(Some(Frame::NotDone { reason, why })) => Answer::Refused(reason, why),
+            Ok(Some(Frame::Done { ok: false, why })) => {
+                let reason = if why.contains(super::super::HOLDS_FULL) {
+                    HoldRefusal::Full
+                } else {
+                    HoldRefusal::Other(0)
+                };
+                Answer::Refused(reason, why)
+            }
+            Ok(Some(Frame::Exited(_)) | None) => Answer::LetGo,
+            Ok(Some(_)) => continue,
+            Err(ContainerError::MonitorRefused { reason, .. }) => Answer::Unanswered(reason),
+            Err(error) => return Err(error),
+        });
+    }
+}
+
 /// Connects to container `id`'s monitor as a holder, for `request`, and
 /// returns once the monitor has answered.
 ///
@@ -297,8 +327,9 @@ fn holder_error(error: ContainerError) -> ContainerError {
 /// the caller must allow for both. [`ContainerError::NotHeld`] is a definite
 /// no.
 fn as_holder(root: &Path, id: &str, request: &Request<'_>) -> Result<()> {
-    let not_held = |why: &str| ContainerError::NotHeld {
+    let not_held = |reason: HoldRefusal, why: &str| ContainerError::NotHeld {
         id: id.to_owned(),
+        reason,
         why: why.to_owned(),
     };
     let unanswered = |why: &str| ContainerError::HoldUnanswered {
@@ -310,13 +341,15 @@ fn as_holder(root: &Path, id: &str, request: &Request<'_>) -> Result<()> {
         if up(root, id) {
             unanswered("it let go without answering")
         } else {
-            not_held("the container has ended")
+            not_held(HoldRefusal::Ending, "the container has ended")
         }
     };
     let hello = Frame::HelloHolder { version: VERSION };
     let mut control = match Control::connect(root, id, &hello, HOLD_VERSION, true) {
         Ok(Connected::In(control)) => control,
-        Ok(Connected::Ended) => return Err(not_held("the container has ended")),
+        Ok(Connected::Ended) => {
+            return Err(not_held(HoldRefusal::Ending, "the container has ended"));
+        }
         Err(error) => return Err(holder_error(error)),
     };
     let sent = match *request {
@@ -335,17 +368,11 @@ fn as_holder(root: &Path, id: &str, request: &Request<'_>) -> Result<()> {
         Err(None) => return Err(gone()),
         Err(Some(error)) => return Err(error),
     }
-    loop {
-        match control.next() {
-            Ok(Some(Frame::Done { ok: true, .. })) => return Ok(()),
-            Ok(Some(Frame::Done { ok: false, why })) => return Err(not_held(&why)),
-            Ok(Some(Frame::Exited(_)) | None) => return Err(gone()),
-            Ok(Some(_)) => {}
-            Err(ContainerError::MonitorRefused { reason, .. }) => {
-                return Err(unanswered(&reason));
-            }
-            Err(error) => return Err(error),
-        }
+    match answer(&mut control)? {
+        Answer::Done => Ok(()),
+        Answer::Refused(reason, why) => Err(not_held(reason, &why)),
+        Answer::LetGo => Err(gone()),
+        Answer::Unanswered(why) => Err(unanswered(&why)),
     }
 }
 
@@ -447,6 +474,68 @@ impl std::fmt::Debug for Waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal's reason, read from the monitor's side of a socket: a
+    /// version 4 monitor's as it says; a version 3 one's (`Done`, words
+    /// only) from its words, full only by [`HOLDS_FULL`]'s (F73); a monitor
+    /// that lets go without a word, let go.
+    #[test]
+    fn a_refusal_says_why_from_either_version() {
+        let answered = |frames: &[Frame]| {
+            let (ours, mut monitor) = UnixStream::pair().unwrap();
+            let mut bytes = Vec::new();
+            for frame in frames {
+                frame.encode(&mut bytes);
+            }
+            monitor.write_all(&bytes).unwrap();
+            drop(monitor);
+            let mut control = Control {
+                stream: ours,
+                decoder: Decoder::new(),
+                id: "web".to_owned(),
+            };
+            answer(&mut control).unwrap()
+        };
+        let full = format!("2100 {}", crate::container::HOLDS_FULL);
+        assert_eq!(
+            answered(&[Frame::Done {
+                ok: false,
+                why: full.clone(),
+            }]),
+            Answer::Refused(HoldRefusal::Full, full),
+            "a version 3 monitor, full"
+        );
+        assert_eq!(
+            answered(&[Frame::Done {
+                ok: false,
+                why: "nothing is held as lease:x".to_owned(),
+            }]),
+            Answer::Refused(
+                HoldRefusal::Other(0),
+                "nothing is held as lease:x".to_owned()
+            ),
+            "a version 3 monitor, another refusal"
+        );
+        assert_eq!(
+            answered(&[
+                Frame::Stdout(b"skipped".to_vec()),
+                Frame::NotDone {
+                    reason: HoldRefusal::LabelTaken,
+                    why: "held already".to_owned(),
+                },
+            ]),
+            Answer::Refused(HoldRefusal::LabelTaken, "held already".to_owned()),
+            "a version 4 monitor"
+        );
+        assert_eq!(
+            answered(&[Frame::Done {
+                ok: true,
+                why: String::new(),
+            }]),
+            Answer::Done
+        );
+        assert_eq!(answered(&[]), Answer::LetGo);
+    }
 
     /// A monitor that drops a holder's hello (no control channel, or one
     /// from before holders) is too old for one; other errors are as they

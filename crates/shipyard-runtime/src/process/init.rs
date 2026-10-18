@@ -359,8 +359,7 @@ pub(super) fn terminal_from(
     // SAFETY: `TIOCSPTLCK` reads one int, which `unlock` is.
     Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSPTLCK, &raw const unlock) })
         .map_err(step(1))?;
-    super::terminal::set_window_size(master.as_raw_fd(), (terminal.rows, terminal.cols))
-        .map_err(step(2))?;
+    super::terminal::set_window_size(master.as_raw_fd(), terminal.size).map_err(step(2))?;
     let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
     // SAFETY: `TIOCGPTPEER` takes the open flags and returns a new
     // descriptor, which nothing else owns.

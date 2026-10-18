@@ -30,7 +30,7 @@
 //! can't rely on; overlayfs refuses an upper layer on NFS anyway.)
 
 use std::ffi::OsStr;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
@@ -110,21 +110,10 @@ pub struct ContainerArea {
     /// own, taken again) as its `layers` file says: every start mounts the
     /// same stack under the same upper layer.
     layers: Vec<String>,
-    /// Its directory, locked (`flock`, exclusive): unlocked when this value
-    /// goes (another thread's child, forked meanwhile, may hold a copy
-    /// until it execs), unless it was given up ([`give_up`](Self::give_up)):
-    /// then this copy is only closed, and the area stays alive while a
-    /// copy (a container's monitor's) is open.
-    lock: std::fs::File,
-    given_up: bool,
-}
-
-impl Drop for ContainerArea {
-    fn drop(&mut self) {
-        if !self.given_up {
-            let _ = self.lock.unlock();
-        }
-    }
+    /// Its directory, locked (`flock`, exclusive), to hand over: the area
+    /// stays alive while a copy (a container's monitor's) is open once it's
+    /// [given up](Self::give_up).
+    lock: shipyard_sys::lock::HeldFile,
 }
 
 impl ContainerArea {
@@ -167,8 +156,7 @@ impl ContainerArea {
                 path: store.root().join(CONTAINERS).join(&name),
                 name,
                 layers: layers.to_vec(),
-                lock,
-                given_up: false,
+                lock: shipyard_sys::lock::HeldFile::new(lock),
             }),
             Err(err) => {
                 // Only this process knows the temporary name: nothing else
@@ -243,8 +231,7 @@ impl ContainerArea {
                 path,
                 name,
                 layers: layers.to_vec(),
-                lock,
-                given_up: false,
+                lock: shipyard_sys::lock::HeldFile::new(lock),
             }),
             Err(err) => {
                 let _ = fsat::remove_tree_at(&containers, OsStr::new(&temporary));
@@ -279,18 +266,14 @@ impl ContainerArea {
         };
         let lock = std::fs::File::from(dir.try_clone().map_err(failed("opening", &name))?);
         let deadline = std::time::Instant::now() + wait;
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => return Err(AreaError::InUse(name)),
-                Err(std::fs::TryLockError::Error(err)) => {
-                    return Err(failed("locking", &name)(err));
-                }
-            }
-        }
+        let poll = std::time::Duration::from_millis(5);
+        let mode = shipyard_sys::lock::Mode::Exclusive;
+        let lock = match shipyard_sys::lock::try_lock_until(&lock, mode, deadline, poll) {
+            // Let go even if what follows fails.
+            Ok(true) => shipyard_sys::lock::HeldFile::new(lock),
+            Ok(false) => return Err(AreaError::InUse(name)),
+            Err(err) => return Err(failed("locking", &name)(err)),
+        };
         let Some(stack) = read_list(&dir, LAYERS, &name)? else {
             return Err(failed("reading", format!("{name}/{LAYERS}"))(Errno::ENOENT));
         };
@@ -299,7 +282,6 @@ impl ContainerArea {
             name,
             layers: stack.lines().map(str::to_owned).collect(),
             lock,
-            given_up: false,
         }))
     }
 
@@ -319,14 +301,14 @@ impl ContainerArea {
     /// container's monitor), once this value is [given up](Self::give_up).
     #[must_use]
     pub fn hold(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(&self.lock)
+        self.lock.hold()
     }
 
     /// Gives the area up to whoever holds a copy of its
     /// [`hold`](Self::hold): this value's copy is closed, never unlocked,
     /// so the area stays alive while any copy is open.
     pub fn give_up(mut self) {
-        self.given_up = true;
+        self.lock.give_up();
     }
 
     /// The overlay's upper (writable) layer.
@@ -518,22 +500,14 @@ pub fn areas(store: &Store) -> Result<Vec<Area>, AreaError> {
 
 /// Reads one of an area's small files; `None` if it's gone.
 fn read_list(dir: &OwnedFd, file: &str, area: &str) -> Result<Option<String>, AreaError> {
-    let fd = match openat(
-        dir,
-        file,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::ENOENT) => return Ok(None),
-        Err(errno) => return Err(failed("reading", format!("{area}/{file}"))(errno)),
+    let bytes = match shipyard_sys::fs::read_bounded_at(dir, file, LIST_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(failed("reading", format!("{area}/{file}"))(err)),
     };
-    let mut text = String::new();
-    std::fs::File::from(fd)
-        .take(LIST_LIMIT)
-        .read_to_string(&mut text)
-        .map_err(failed("reading", format!("{area}/{file}")))?;
-    Ok(Some(text))
+    shipyard_sys::fs::text(bytes)
+        .map(Some)
+        .map_err(failed("reading", format!("{area}/{file}")))
 }
 
 /// Moves areas aside to trash, by name (`run-…`), and returns the trash

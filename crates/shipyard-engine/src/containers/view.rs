@@ -12,6 +12,7 @@ use crate::Engine;
 use crate::error::Result;
 use crate::events::rfc3339;
 use crate::report::WarningKind;
+use shipyard_runtime::attach::forward::{PortsAnswer, PublishedPort};
 
 /// A container as `ps` lists it: its record and its state.
 #[derive(Debug, Clone)]
@@ -48,7 +49,7 @@ pub fn summaries(engine: &Engine, all: bool) -> Result<Vec<Summary>> {
                 continue;
             }
         };
-        if all || state.is_up() {
+        if all || state.is_active() {
             let health = super::health(engine, &record, &state);
             let network_lost = super::network_lost(engine, &record, &state);
             found.push(Summary {
@@ -271,7 +272,7 @@ pub struct Sockets {
 /// Linux.
 pub fn sockets(engine: &Engine, reference: &str) -> Result<Sockets> {
     let record = super::find(engine, reference)?;
-    super::require(engine, &record, super::Needs::Up, "see its sockets")?;
+    super::require(engine, &record, super::Needs::Attachable, "see its sockets")?;
     #[cfg(target_os = "linux")]
     {
         use shipyard_network::observe::ObserveError;
@@ -373,31 +374,58 @@ pub fn inspect(engine: &Engine, reference: &str) -> Result<Inspected> {
         let last = super::last_logs_name(&logs)?;
         Some(logs.join(last).display().to_string())
     });
-    Ok(Inspected {
-        id: record.id.as_str().to_owned(),
-        serial: record.serial.to_string(),
-        name: record.name.as_str().to_owned(),
-        created: rfc3339(record.created),
-        image: record.config.image.clone(),
-        image_id: record.image_id.clone(),
-        state: InspectedState {
-            status: state.word(),
-            running: state.is_up(),
-            pid: state.is_up().then(|| init_pid(engine, &record)).flatten(),
-            exit_code,
-            oom,
-            started_at: record.started.map(rfc3339),
-            finished_at: finished.or(record.finished).map(rfc3339),
-            health: super::health(engine, &record, &state),
-            network_lost: super::network_lost(engine, &record, &state),
-        },
-        ports: record.ports.clone(),
-        labels: record.labels.as_map().clone(),
-        auto_remove: record.auto_remove,
-        restart_count: record.restart_count,
+    let state = InspectedState {
+        status: state.word(),
+        running: state.is_active(),
+        pid: state
+            .is_active()
+            .then(|| init_pid(engine, &record))
+            .flatten(),
+        exit_code,
+        oom,
+        started_at: record.started.map(rfc3339),
+        finished_at: finished.or(record.finished).map(rfc3339),
+        health: super::health(engine, &record, &state),
+        network_lost: super::network_lost(engine, &record, &state),
+    };
+    Ok(inspected(record, state, log_dir))
+}
+
+/// What `inspect` shows of `record`, in `state`, its last start's logs in
+/// `log_dir`.
+pub(super) fn inspected(
+    record: Record,
+    state: InspectedState,
+    log_dir: Option<String>,
+) -> Inspected {
+    let Record {
+        id,
+        serial,
+        name,
+        created,
+        config,
+        labels,
+        image_id,
+        auto_remove,
+        ports,
+        restart_count,
+        ..
+    } = record;
+    Inspected {
+        id: id.as_str().to_owned(),
+        serial: serial.to_string(),
+        name: name.as_str().to_owned(),
+        created: rfc3339(created),
+        image: config.image.clone(),
+        image_id,
+        state,
+        ports,
+        labels: labels.as_map().clone(),
+        auto_remove,
+        restart_count,
         log_dir,
-        config: record.config,
-    })
+        config,
+    }
 }
 
 /// Container `record`'s init's PID, from its runtime state, read without
@@ -408,4 +436,102 @@ fn init_pid(engine: &Engine, record: &Record) -> Option<i32> {
         .ok()
         .flatten()
         .map(|(pid, _)| pid)
+}
+
+/// What the macOS guest's VM host asks (step 10.3c1): how many containers
+/// are active (running, paused, stopping, waiting to restart: what keeps
+/// the VM from being idle), and the TCP ports those running or paused
+/// publish, once each (the UDP ones counted). Read without taking any
+/// lock; a container whose state can't be read is left out.
+///
+/// # Errors
+///
+/// As [`super::list`].
+pub fn published(engine: &Engine) -> Result<PortsAnswer> {
+    let mut answer = PortsAnswer::new();
+    for record in super::list(engine)? {
+        if let Ok(state) = super::state(engine, &record) {
+            count_published(&mut answer, &state, &record.ports);
+        }
+    }
+    answer.ports.sort_unstable();
+    answer.ports.dedup();
+    Ok(answer)
+}
+
+/// Adds a container in `state`, publishing `ports`, to `answer`.
+fn count_published(answer: &mut PortsAnswer, state: &ContainerState, ports: &[BoundPort]) {
+    if state.is_active() {
+        answer.active = answer.active.saturating_add(1);
+    }
+    if !matches!(
+        state,
+        ContainerState::Running { .. } | ContainerState::Paused
+    ) {
+        return;
+    }
+    for port in ports {
+        match port.protocol.as_str() {
+            "tcp" => answer.ports.push(PublishedPort {
+                ip: port.host_ip,
+                port: port.host_port,
+            }),
+            "udp" => answer.udp = answer.udp.saturating_add(1),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
+mod tests {
+    use super::*;
+
+    /// Every active container counts; only a running or paused one's TCP
+    /// ports are published (a stopped one's record keeps its last ports).
+    #[test]
+    fn only_up_containers_publish_and_active_ones_count() {
+        let any = std::net::Ipv4Addr::UNSPECIFIED.into();
+        let ports = [
+            BoundPort::new(any, 8080, 80, "tcp"),
+            BoundPort::new(any, 5353, 53, "udp"),
+        ];
+        let mut answer = PortsAnswer::new();
+        count_published(
+            &mut answer,
+            &ContainerState::Running { since: None },
+            &ports,
+        );
+        count_published(&mut answer, &ContainerState::Paused, &ports);
+        count_published(&mut answer, &ContainerState::Stopping, &ports);
+        let restarting = ContainerState::Restarting {
+            code: None,
+            finished: None,
+            attempt: 1,
+            at: None,
+        };
+        count_published(&mut answer, &restarting, &ports);
+        let exited = ContainerState::Exited {
+            code: Some(0),
+            oom: None,
+            finished: None,
+        };
+        count_published(&mut answer, &exited, &ports);
+        count_published(&mut answer, &ContainerState::Created, &ports);
+        assert_eq!(answer.active, 4);
+        assert_eq!(answer.udp, 2);
+        assert_eq!(
+            answer.ports,
+            [
+                PublishedPort {
+                    ip: any,
+                    port: 8080
+                },
+                PublishedPort {
+                    ip: any,
+                    port: 8080
+                }
+            ]
+        );
+    }
 }

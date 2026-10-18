@@ -6,7 +6,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Only the pinned toolchain (rust-toolchain.toml) is built and tested.
 rust-version = "1.98"
@@ -26,9 +26,38 @@ shipyard-storage = { path = "crates/shipyard-storage" }
 shipyard-network = { path = "crates/shipyard-network" }
 # Stage 8: the engine itself (H1), above the runtime.
 shipyard-engine = { path = "crates/shipyard-engine" }
+# Stage 10: the safe file plumbing every crate shares (D10.1-4).
+shipyard-sys = { path = "crates/shipyard-sys" }
+# Step 10.3: the macOS VM (D29).
+shipyard-vm = { path = "crates/shipyard-vm" }
 
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
+# Virtualization.framework from Rust (step 10.3, D29): the objc2 family,
+# with only what the VM uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std", "NSString", "NSURL", "NSArray", "NSError", "NSFileHandle", "NSObject",
+] }
+objc2-virtualization = { version = "0.3", default-features = false, features = [
+  "std", "block2", "dispatch2",
+  "VZVirtualMachineConfiguration", "VZVirtualMachine",
+  "VZBootLoader", "VZLinuxBootLoader",
+  "VZPlatformConfiguration", "VZGenericPlatformConfiguration",
+  "VZSerialPortConfiguration", "VZVirtioConsoleDeviceSerialPortConfiguration",
+  "VZSerialPortAttachment", "VZFileHandleSerialPortAttachment",
+  "VZEntropyDeviceConfiguration", "VZVirtioEntropyDeviceConfiguration",
+  "VZSocketDeviceConfiguration", "VZVirtioSocketDeviceConfiguration",
+  "VZSocketDevice", "VZVirtioSocketDevice", "VZVirtioSocketConnection",
+  "VZStorageDeviceConfiguration", "VZVirtioBlockDeviceConfiguration",
+  "VZStorageDeviceAttachment", "VZDiskImageStorageDeviceAttachment",
+  "VZDirectorySharingDeviceConfiguration", "VZVirtioFileSystemDeviceConfiguration",
+  "VZDirectoryShare", "VZSingleDirectoryShare", "VZSharedDirectory",
+  "VZNetworkDeviceConfiguration", "VZVirtioNetworkDeviceConfiguration",
+  "VZNetworkDeviceAttachment", "VZNATNetworkDeviceAttachment",
+] }
+block2 = "0.6"
+dispatch2 = "0.3"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # Features are added as each stage needs them.
@@ -43,6 +72,7 @@ nix = { version = "0.31", default-features = false, features = [
   "net",
   "poll",
   "process",
+  "reboot",
   "resource",
   "sched",
   "signal",
@@ -58,6 +88,10 @@ nix = { version = "0.31", default-features = false, features = [
 # `config.json` (OCI bundles) and the container init's setup description
 # (stage 3). `std` has no JSON.
 serde = { version = "1", features = ["derive"] }
+# pidfds (stage 10, `shipyard-sys`), and a `recvmsg` that owns a truncated
+# message's descriptors (F54): what nix lacks. Already locked through `tar`'s
+# `xattr`.
+rustix = { version = "1.1", default-features = false, features = ["std", "process", "net"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"

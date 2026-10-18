@@ -15,7 +15,7 @@ use super::{Joined, NetworkPlan, networks, open_network};
 use crate::Engine;
 #[cfg(target_os = "linux")]
 use crate::error::{Context as _, Result, bail};
-use crate::report::{Event, Reporter, WarningKind, warn};
+use crate::report::{Message, Reporter, WarningKind, warn};
 
 /// Why `-p` can't go on `config`'s network: an internal one, or an IPv6
 /// host address on a network without IPv6.
@@ -301,7 +301,7 @@ impl Attachment {
         let networks = networks(engine)?;
         let config = open_network(engine, &networks, name)?;
         check_ports(&config, ports)?;
-        let held = shipyard_network::ports::hold(ports)?;
+        let held = shipyard_network::ports::hold(ports, engine.paths().runtime_root().ok())?;
         let network = networks.lock(name)?;
         let mut nft = Nftables::new()?;
         sweep_gone(&network, &mut nft, engine.reporter().as_ref())?;
@@ -309,7 +309,7 @@ impl Attachment {
         // Again: it may have been made again since it was looked at.
         check_ports(&config, ports)?;
         attach::ensure_bridge(&config).with_context(|| format!("the network {name}"))?;
-        ensure_firewall(&networks, &mut nft, &config)
+        ensure_firewall(&networks, &mut nft, &config, engine.reporter().as_ref())
             .with_context(|| format!("the network {name}'s firewall rules"))?;
         let guarded = ensure_bridge_table(&networks, &mut nft, engine.reporter().as_ref());
         if !config.internal {
@@ -590,7 +590,7 @@ pub(super) fn announce(
 ) {
     for (request, published) in requests.iter().zip(published) {
         if request.host_port.is_none() {
-            reporter.report(Event::Notice(format!("published {published}")));
+            reporter.report(Message::Notice(format!("published {published}")));
         }
     }
 }

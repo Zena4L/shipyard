@@ -13,8 +13,10 @@ numbers (passed / failed / ignored per pass), never just "green".
 ```sh
 S=.claude/skills/shipyard-verify/scripts
 $S/verify.sh --mac      # minutes: fmt, clippy, macOS suite, cargo deny
-$S/verify.sh            # ~1 hour: the above, then both Linux passes, rustdoc, musl
+$S/verify.sh            # ~1 hour: the above, then both Linux passes, rustdoc, musl (and the VM's part on a Mac)
 $S/verify.sh --linux    # the Linux half only
+$S/verify.sh --vm       # the macOS VM's: the guest built from this tree, the VM tests
+                        # (no flag runs it too, on a Mac)
 ```
 
 Logs land in `target/verify/` (one per check); the summary prints the test totals. Run
@@ -28,6 +30,19 @@ What it runs, if you need a piece alone:
   `--conformance [NAME…]`.
 - [scripts/linux-lints.sh](scripts/linux-lints.sh) (as root in the container): rustdoc with
   `-D warnings --document-private-items`, clippy glibc, clippy musl.
+
+## Against the previous release (a change that must change nothing)
+
+```sh
+$S/differential.sh mac tester root   # v0.2.0's binaries against this tree's
+```
+
+[scripts/differential.sh](scripts/differential.sh) builds the tag in a worktree of its
+own, runs [the corpus](scripts/differential-corpus.sh) (≈170 invocations: refusals,
+`--help`, the whole lifecycle by name, networks, volumes, images, the runtime binary)
+with both, and diffs stdout, stderr, exit codes and the files left behind, with IDs,
+times and ports normalised. "identical (N cases)" or the diff. 10.1's oracle; keep the
+corpus growing with what a step changes.
 
 ## One script in the Linux container
 

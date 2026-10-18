@@ -100,8 +100,16 @@ impl RunRequest {
                 );
             };
             // Asked now, before anything is made: never while a container
-            // waits for its network.
-            let features = shipyard_network::pasta::Features::of(&program)?;
+            // waits for its network. Once per pasta binary, kept in the
+            // runtime directory (F50: pasta writes its help to the system
+            // log too; a first run's directory may not be there yet: the
+            // next keeps it).
+            let kept = engine
+                .paths()
+                .runtime_root()
+                .ok()
+                .map(|root| root.join("pasta-features.json"));
+            let features = shipyard_network::pasta::Features::cached(&program, kept.as_deref())?;
             Some((program, features))
         } else {
             None

@@ -57,7 +57,10 @@ A volume a container uses is never removed, whether the container is running or
 stopped (as Docker's): `volume rm` refuses it, naming the containers ("the volume
 data is in use by web, db"; "in use by a running container" if what holds it has no
 record, such as a `--no-image` run), and `volume prune` keeps it and says so. Once
-the container is removed (`shipyard rm`), both remove it.
+the container is removed (`shipyard rm`), both remove it. A container's record that
+can't be read (damaged, or a newer Shipyard's) might use any volume, so while there's
+one, `volume rm` refuses and `volume prune` removes nothing, naming it; and a
+container made while either runs is waited for, never missed.
 
 `volume prune` deletes data, so it asks first:
 

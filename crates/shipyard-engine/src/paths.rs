@@ -19,11 +19,12 @@ pub struct Paths {
     /// The runtime's state root (containers' state directories), or why
     /// there's none.
     runtime_root: std::result::Result<PathBuf, String>,
-    /// Where networks are kept.
-    networks: PathBuf,
-    /// Where the events journal is kept, if given (`SHIPYARD_EVENTS_DIR`);
-    /// else beside the containers' records.
-    events: Option<PathBuf>,
+    /// Where networks are kept, or why not (a relative
+    /// `SHIPYARD_NETWORK_DIR`).
+    networks: std::result::Result<PathBuf, String>,
+    /// Where the events journal is kept, if given (`SHIPYARD_EVENTS_DIR`,
+    /// or why not: a relative one); else beside the containers' records.
+    events: Option<std::result::Result<PathBuf, String>>,
     /// The caller's runtime directory (`XDG_RUNTIME_DIR`), if it has one.
     runtime_dir: Option<PathBuf>,
     /// The temporary directory (`TMPDIR`, else `/tmp`).
@@ -33,7 +34,72 @@ pub struct Paths {
     dns_env: Vec<(OsString, OsString)>,
     /// Where programs are found (`PATH`): pasta, for a run.
     program_path: Option<OsString>,
+    /// Started through `sudo` (`SUDO_USER` set): a user's own session's
+    /// fate at logout is theirs, not root's (`doctor`).
+    started_by_sudo: bool,
+    /// The variables that moved a store from its default place (F44): the
+    /// boot unit, which runs with systemd's environment, won't see them.
+    store_overrides: Vec<&'static str>,
 }
+
+/// The variables that move a store (for [`Paths::store_overrides`]).
+const STORE_VARIABLES: [&str; 4] = [
+    "SHIPYARD_IMAGE_STORE",
+    "SHIPYARD_CONTAINER_DIR",
+    "SHIPYARD_NETWORK_DIR",
+    "SHIPYARD_EVENTS_DIR",
+];
+
+/// Which of [`STORE_VARIABLES`] move a store from where it would be
+/// without them (one set to its default place moves nothing), and
+/// `XDG_DATA_HOME` for anyone but root, where it moves a store none of
+/// them placed from `~/.local/share`.
+fn store_overrides_from_env() -> Vec<&'static str> {
+    let defaults = [
+        default_store("images").ok(),
+        default_store("containers").ok(),
+        Some(PathBuf::from(DEFAULT_NETWORKS)),
+        default_store("events").ok(),
+    ];
+    store_overrides(
+        |name| std::env::var_os(name),
+        nix::unistd::geteuid().is_root(),
+        &defaults,
+    )
+}
+
+/// [`store_overrides_from_env`]'s choice, given the environment's
+/// variables (`value`), whether it's root, and each store's default place
+/// in [`STORE_VARIABLES`]' order.
+fn store_overrides(
+    value: impl Fn(&str) -> Option<OsString>,
+    root: bool,
+    defaults: &[Option<PathBuf>; 4],
+) -> Vec<&'static str> {
+    let value = |name: &str| value(name).filter(|value| !value.is_empty());
+    let mut overrides: Vec<&'static str> = STORE_VARIABLES
+        .into_iter()
+        .zip(defaults)
+        .filter(|(name, default)| {
+            value(name).is_some_and(|set| default.as_deref() != Some(Path::new(&set)))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    let placed_by_data_home =
+        !overrides.contains(&STORE_VARIABLES[0]) || !overrides.contains(&STORE_VARIABLES[1]);
+    if !root
+        && placed_by_data_home
+        && let Some(data) = value("XDG_DATA_HOME")
+        && value("HOME")
+            .is_none_or(|home| Path::new(&home).join(".local/share") != Path::new(&data))
+    {
+        overrides.push("XDG_DATA_HOME");
+    }
+    overrides
+}
+
+/// Where networks are kept, unless `SHIPYARD_NETWORK_DIR` says.
+const DEFAULT_NETWORKS: &str = "/var/lib/shipyard/networks";
 
 impl Paths {
     /// The places the environment gives. The image store: an explicit
@@ -58,11 +124,12 @@ impl Paths {
     /// The events journal: `SHIPYARD_EVENTS_DIR` if set, else beside the
     /// containers' records (`/var/lib/shipyard/events` for root: see
     /// [`events`](Self::events)).
+    ///
+    /// Which of these moved a store is kept for
+    /// [`store_overrides`](Self::store_overrides) (F44).
     #[must_use]
     pub fn from_env() -> Self {
-        let dns_env = std::env::vars_os()
-            .filter(|(name, _)| DNS_ENV.iter().any(|kept| name.as_os_str() == *kept))
-            .collect();
+        let dns_env = dns_env_of(std::env::vars_os(), cfg!(debug_assertions));
         Self {
             image_store: image_store_from_env(),
             containers: containers_from_env(),
@@ -70,32 +137,40 @@ impl Paths {
             networks: std::env::var_os("SHIPYARD_NETWORK_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map_or_else(
-                    || PathBuf::from("/var/lib/shipyard/networks"),
-                    PathBuf::from,
+                    || Ok(PathBuf::from(DEFAULT_NETWORKS)),
+                    |dir| absolute("network store", "SHIPYARD_NETWORK_DIR", PathBuf::from(dir)),
                 ),
             events: std::env::var_os("SHIPYARD_EVENTS_DIR")
                 .filter(|dir| !dir.is_empty())
-                .map(PathBuf::from),
+                .map(|dir| absolute("events journal", "SHIPYARD_EVENTS_DIR", PathBuf::from(dir))),
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
             temp_dir: std::env::temp_dir(),
             dns_env,
             program_path: std::env::var_os("PATH"),
+            started_by_sudo: std::env::var_os("SUDO_USER").is_some(),
+            store_overrides: store_overrides_from_env(),
         }
     }
 
     /// These places, with networks kept in `dir`.
     #[must_use]
     pub fn with_networks(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.networks = dir.into();
+        self.networks = Ok(dir.into());
         self
     }
 
     /// Where networks are kept.
-    #[must_use]
-    pub fn networks(&self) -> &Path {
-        &self.networks
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Environment`]: `SHIPYARD_NETWORK_DIR` isn't an absolute
+    /// path.
+    pub fn networks(&self) -> Result<&Path> {
+        self.networks
+            .as_deref()
+            .map_err(|why| Error::new(ErrorKind::Environment, why.clone()))
     }
 
     /// The caller's runtime directory, if it has one.
@@ -116,6 +191,21 @@ impl Paths {
         self.program_path.as_deref()
     }
 
+    /// Whether this was started through `sudo` (`SUDO_USER` set).
+    #[must_use]
+    pub fn started_by_sudo(&self) -> bool {
+        self.started_by_sudo
+    }
+
+    /// The environment variables that moved a store from its default place
+    /// (`SHIPYARD_IMAGE_STORE`, `SHIPYARD_*_DIR`, a non-root user's
+    /// `XDG_DATA_HOME`), as `from_env` found them: what a boot unit, with
+    /// systemd's environment, won't see (F44).
+    #[must_use]
+    pub fn store_overrides(&self) -> &[&'static str] {
+        &self.store_overrides
+    }
+
     /// What a network's DNS server is given of the caller's environment.
     #[must_use]
     pub fn dns_env(&self) -> &[(OsString, OsString)] {
@@ -125,7 +215,7 @@ impl Paths {
     /// These places, with the events journal kept in `dir`.
     #[must_use]
     pub fn with_events(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.events = Some(dir.into());
+        self.events = Some(Ok(dir.into()));
         self
     }
 
@@ -140,7 +230,9 @@ impl Paths {
     /// As [`containers`](Self::containers), when none was given.
     pub fn events(&self) -> Result<PathBuf> {
         if let Some(dir) = &self.events {
-            return Ok(dir.clone());
+            return dir
+                .clone()
+                .map_err(|why| Error::new(ErrorKind::Environment, why));
         }
         let containers = self.containers()?;
         Ok(match containers.file_name() {
@@ -171,6 +263,14 @@ impl Paths {
         self.containers
             .as_deref()
             .map_err(|why| Error::new(ErrorKind::Environment, why.clone()))
+    }
+
+    /// These places, with the container store's place unknown (`why`), as a
+    /// wrong environment leaves it.
+    #[cfg(test)]
+    pub(crate) fn without_containers(mut self, why: &str) -> Self {
+        self.containers = Err(why.to_owned());
+        self
     }
 
     /// These places, with the runtime's state root at `dir`.
@@ -219,24 +319,27 @@ const DNS_ENV: [&str; 2] = [
     crate::network::DNS_IDLE_ENV,
 ];
 
+/// The DNS server's variables among `variables` (see [`DNS_ENV`]): in a
+/// debug build (the tests') only (F61), so a release's DNS server never takes its
+/// upstreams or its idle time from whoever started it.
+fn dns_env_of(
+    variables: impl Iterator<Item = (OsString, OsString)>,
+    debug_build: bool,
+) -> Vec<(OsString, OsString)> {
+    if !debug_build {
+        return Vec::new();
+    }
+    variables
+        .filter(|(name, _)| DNS_ENV.iter().any(|kept| name.as_os_str() == *kept))
+        .collect()
+}
+
 fn image_store_from_env() -> std::result::Result<PathBuf, String> {
-    store_from_env("SHIPYARD_IMAGE_STORE", "images")
+    store_from_env("SHIPYARD_IMAGE_STORE", "image store", "images")
 }
 
 fn containers_from_env() -> std::result::Result<PathBuf, String> {
-    // Absolute only: a store relative to wherever the caller happens to
-    // be would hold other containers in each directory.
-    store_from_env("SHIPYARD_CONTAINER_DIR", "containers").and_then(|dir| {
-        if dir.is_absolute() {
-            Ok(dir)
-        } else {
-            Err(format!(
-                "the container store {} isn't an absolute path (from SHIPYARD_CONTAINER_DIR, \
-                 XDG_DATA_HOME or HOME)",
-                dir.display()
-            ))
-        }
-    })
+    store_from_env("SHIPYARD_CONTAINER_DIR", "container store", "containers")
 }
 
 fn runtime_root_from_env() -> std::result::Result<PathBuf, String> {
@@ -269,10 +372,32 @@ fn runtime_root_from_env() -> std::result::Result<PathBuf, String> {
 /// A store's place: `variable` if it's set, else `name` in Shipyard's data
 /// directory (`/var/lib/shipyard` for root, `$XDG_DATA_HOME/shipyard` or
 /// `~/.local/share/shipyard` for anyone else).
-fn store_from_env(variable: &str, name: &str) -> std::result::Result<PathBuf, String> {
+fn store_from_env(variable: &str, what: &str, name: &str) -> std::result::Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os(variable).filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir));
+        return absolute(what, variable, PathBuf::from(dir));
     }
+    default_store(name).and_then(|dir| absolute(what, "XDG_DATA_HOME or HOME", dir))
+}
+
+/// `dir`, the place of `what` (the image store, say) as `placed_by` (the
+/// variables) gave it, if it's absolute: a store relative to wherever the
+/// caller happens to be would be another in each directory (F61; the XDG
+/// spec treats a relative `XDG_DATA_HOME` as invalid too).
+fn absolute(what: &str, placed_by: &str, dir: PathBuf) -> std::result::Result<PathBuf, String> {
+    if dir.is_absolute() {
+        Ok(dir)
+    } else {
+        Err(format!(
+            "the {what} {} isn't an absolute path (from {placed_by})",
+            dir.display()
+        ))
+    }
+}
+
+/// The store `name`'s place in Shipyard's data directory, where it is
+/// without its variable: `/var/lib/shipyard` for root,
+/// `$XDG_DATA_HOME/shipyard` or `~/.local/share/shipyard` for anyone else.
+fn default_store(name: &str) -> std::result::Result<PathBuf, String> {
     if nix::unistd::geteuid().is_root() {
         return Ok(Path::new("/var/lib/shipyard").join(name));
     }
@@ -319,10 +444,138 @@ mod tests {
         );
     }
 
+    /// A store variable moves a store unless it names its default place;
+    /// `XDG_DATA_HOME` does for anyone but root, unless it's
+    /// `~/.local/share` or both stores it places are placed by others.
+    #[test]
+    fn store_overrides_are_what_moved_a_store() {
+        let home = "/home/u/.local/share/shipyard";
+        let defaults = [
+            Some(PathBuf::from(format!("{home}/images"))),
+            Some(PathBuf::from(format!("{home}/containers"))),
+            Some(PathBuf::from(DEFAULT_NETWORKS)),
+            Some(PathBuf::from(format!("{home}/events"))),
+        ];
+        let given = |pairs: &[(&str, &str)], root: bool| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            store_overrides(
+                |name| {
+                    pairs
+                        .iter()
+                        .find(|(set, _)| set == name)
+                        .map(|(_, value)| OsString::from(value))
+                },
+                root,
+                &defaults,
+            )
+        };
+        let none: &[&str] = &[];
+        assert_eq!(given(&[("HOME", "/home/u")], false), none);
+        assert_eq!(
+            given(
+                &[
+                    ("SHIPYARD_CONTAINER_DIR", "/tmp/c"),
+                    ("SHIPYARD_EVENTS_DIR", "")
+                ],
+                false
+            ),
+            ["SHIPYARD_CONTAINER_DIR"]
+        );
+        assert_eq!(
+            given(&[("SHIPYARD_NETWORK_DIR", DEFAULT_NETWORKS)], true),
+            none,
+            "its default place moves nothing"
+        );
+        let data = [("HOME", "/home/u"), ("XDG_DATA_HOME", "/data")];
+        assert_eq!(given(&data, false), ["XDG_DATA_HOME"]);
+        assert_eq!(given(&data, true), none, "root's stores aren't its");
+        assert_eq!(
+            given(
+                &[
+                    ("HOME", "/home/u"),
+                    ("XDG_DATA_HOME", "/home/u/.local/share")
+                ],
+                false
+            ),
+            none
+        );
+        assert_eq!(
+            given(
+                &[
+                    ("XDG_DATA_HOME", "/data"),
+                    ("SHIPYARD_IMAGE_STORE", "/i"),
+                    ("SHIPYARD_CONTAINER_DIR", "/c"),
+                ],
+                false
+            ),
+            ["SHIPYARD_IMAGE_STORE", "SHIPYARD_CONTAINER_DIR"],
+            "both stores it places are placed by others"
+        );
+    }
+
     #[test]
     fn networks_go_where_they_are_told() {
         let paths = Paths::from_env().with_networks("/elsewhere/networks");
-        assert_eq!(paths.networks(), Path::new("/elsewhere/networks"));
+        assert_eq!(paths.networks().unwrap(), Path::new("/elsewhere/networks"));
+    }
+
+    /// A store variable must give an absolute path (F61): a relative one is
+    /// refused, as an `Environment` error naming it; an absolute one is
+    /// taken (the control).
+    #[test]
+    fn a_relative_store_is_refused() {
+        let refused = absolute("events journal", "SHIPYARD_EVENTS_DIR", "rel/events".into());
+        assert!(
+            refused
+                .as_ref()
+                .unwrap_err()
+                .contains("isn't an absolute path (from SHIPYARD_EVENTS_DIR)"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            absolute(
+                "events journal",
+                "SHIPYARD_EVENTS_DIR",
+                "/abs/events".into()
+            )
+            .unwrap(),
+            Path::new("/abs/events")
+        );
+        let paths = Paths {
+            events: Some(refused),
+            networks: absolute("network store", "SHIPYARD_NETWORK_DIR", "rel".into()),
+            image_store: absolute("image store", "SHIPYARD_IMAGE_STORE", "rel".into()),
+            ..Paths::from_env()
+        };
+        assert_eq!(paths.events().unwrap_err().kind(), ErrorKind::Environment);
+        assert_eq!(paths.networks().unwrap_err().kind(), ErrorKind::Environment);
+        assert_eq!(
+            paths.image_store().unwrap_err().kind(),
+            ErrorKind::Environment
+        );
+    }
+
+    /// The DNS server's test variables are taken in a test build only
+    /// (F61): a release collects none; a test build collects them, and
+    /// nothing else.
+    #[test]
+    fn the_dns_test_variables_are_a_test_builds() {
+        let given = || {
+            [
+                (DNS_ENV[0], "192.0.2.53"),
+                (DNS_ENV[1], "5"),
+                ("PATH", "/bin"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        };
+        assert!(dns_env_of(given(), false).is_empty(), "a release's");
+        let taken = dns_env_of(given(), true);
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        assert!(taken.iter().all(|(name, _)| name != "PATH"));
     }
 
     #[test]

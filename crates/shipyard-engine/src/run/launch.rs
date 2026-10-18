@@ -14,11 +14,12 @@ use shipyard_runtime::process::{self, ExitStatus, Signal};
 use shipyard_runtime::security::Security;
 use shipyard_storage::VolumeHold;
 
-use super::{Checked, Generated, Invocation, RunRequest, check};
+use super::plan::Generated;
+use super::{Checked, Invocation, RunRequest, check};
 use crate::Engine;
 use crate::error::{Error, Result, bail};
 use crate::network::{HOST_INSTEAD, NetworkMode, RunNetwork};
-use crate::report::Event;
+use crate::report::Message;
 
 /// How a run ended: what its caller ends with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,7 @@ pub enum Outcome {
         code: u8,
     },
     /// The command couldn't be started or supervised: said as it happened
-    /// ([`Event::Failure`]); this is the code to end with (125, 126, 127).
+    /// ([`Message::Failure`]); this is the code to end with (125, 126, 127).
     Failed(u8),
 }
 
@@ -92,7 +93,7 @@ pub fn run(
                 .is_some_and(|plan| plan.defaulted && matches!(plan.mode, NetworkMode::Bridges(_)))
                 && network_refused(&error)
             {
-                engine.report(Event::Hint(HOST_INSTEAD.to_owned()));
+                engine.report(Message::Hint(HOST_INSTEAD.to_owned()));
             }
             return Err(error);
         }
@@ -168,7 +169,7 @@ fn launch(
         generated,
     } = invocation;
     for warning in warnings {
-        engine.report(Event::Warning(warning));
+        engine.report(Message::Warning(warning));
     }
     tracing::debug!(?spec, ?stop, ?isolation, "running");
     let mut supervisor = process::Supervisor::install()?;
@@ -186,7 +187,7 @@ fn launch(
         Err(err) => {
             let code = err.exit_code();
             let isolation_failed = is_isolation_failure(&err);
-            engine.report(Event::Failure(format!("{:#}", Error::from(err))));
+            engine.report(Message::Failure(format!("{:#}", Error::from(err))));
             // The runtime can't name the request's setting; this is where
             // it's known. Only when it would work: no isolation can't be
             // combined with a root filesystem, a hostname, a domain name or
@@ -196,7 +197,7 @@ fn launch(
                     .as_ref()
                     .is_some_and(|isolation| only_namespaces(isolation, generated))
             {
-                engine.report(Event::Hint(
+                engine.report(Message::Hint(
                     "--no-isolation runs the command without namespaces".to_owned(),
                 ));
             }

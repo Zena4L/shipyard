@@ -433,7 +433,7 @@ mod linux {
         }
         // Held from before the read to after: whether the same process is
         // still there at the end (before Linux 5.3, unchecked).
-        let pidfd = match crate::pidfd::open(pid) {
+        let pidfd = match shipyard_sys::pidfd::open(pid) {
             Ok(pidfd) => Some(pidfd),
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                 return Err(ObserveError::Gone(pid));
@@ -504,7 +504,7 @@ mod linux {
 
     /// [`ObserveError::Gone`] if the process `pidfd` is has ended.
     fn still_there(pid: i32, pidfd: &OwnedFd) -> Result<(), ObserveError> {
-        match crate::pidfd::send_signal(pidfd, 0) {
+        match shipyard_sys::pidfd::send_signal(pidfd, 0) {
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Err(ObserveError::Gone(pid)),
             // Running (EPERM: someone else's, running).
             _ => Ok(()),

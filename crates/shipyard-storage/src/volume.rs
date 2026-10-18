@@ -225,12 +225,13 @@ impl Volumes {
         let lock = self.lock_file(name)?;
         lock.lock_shared()
             .map_err(|source| Self::locking(name, source))?;
+        // Let go even if what follows fails.
+        let lock = shipyard_sys::lock::HeldFile::new(lock);
         let (volume, created) = self.get_or_create(name)?;
         Ok(VolumeHold {
             volume,
             lock,
             created,
-            given_up: false,
         })
     }
 
@@ -247,6 +248,8 @@ impl Volumes {
         let lock = self.lock_file(name)?;
         lock.lock_shared()
             .map_err(|source| Self::locking(name, source))?;
+        // Let go even if what follows fails.
+        let lock = shipyard_sys::lock::HeldFile::new(lock);
         let data = self.root.join(name).join(DATA_DIR);
         if !data.is_dir() {
             return Err(VolumeError::NotFound(name.to_owned()));
@@ -258,7 +261,6 @@ impl Volumes {
             },
             lock,
             created: false,
-            given_up: false,
         })
     }
 
@@ -376,19 +378,11 @@ impl Volumes {
     /// volume can be named), made if needed: never through a symlink, and
     /// closed in any program this one runs.
     fn lock_file(&self, name: &str) -> Result<File, VolumeError> {
-        use std::os::unix::fs::OpenOptionsExt as _;
         let path = self.root.join(LOCKS_DIR).join(name);
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(lock_open_flags())
-            .open(&path)
-            .map_err(|source| VolumeError::Io {
-                context: format!("opening {}", path.display()),
-                source,
-            })
+        shipyard_sys::fs::open_lock_file(&path).map_err(|source| VolumeError::Io {
+            context: format!("opening {}", path.display()),
+            source,
+        })
     }
 
     fn locking(name: &str, source: impl Into<std::io::Error>) -> VolumeError {
@@ -403,11 +397,6 @@ impl Volumes {
 mod libc_errno {
     pub(super) const ENOTEMPTY: i32 = nix::errno::Errno::ENOTEMPTY as i32;
     pub(super) const EEXIST: i32 = nix::errno::Errno::EEXIST as i32;
-}
-
-/// `O_NOFOLLOW | O_CLOEXEC`, for lock files.
-fn lock_open_flags() -> i32 {
-    (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC).bits()
 }
 
 /// The directory of the volumes' lock files.
@@ -444,21 +433,10 @@ pub fn is_trash(name: &str) -> bool {
 #[derive(Debug)]
 pub struct VolumeHold {
     volume: Volume,
-    /// Its lock file, locked (`flock`, shared): unlocked when this value goes
-    /// (another thread's child, forked meanwhile, may hold a copy until it
-    /// execs), unless it was given up: then this copy is only closed.
-    lock: File,
+    /// Its lock file, locked (`flock`, shared), to hand over.
+    lock: shipyard_sys::lock::HeldFile,
     /// Whether holding it made it.
     created: bool,
-    given_up: bool,
-}
-
-impl Drop for VolumeHold {
-    fn drop(&mut self) {
-        if !self.given_up {
-            let _ = self.lock.unlock();
-        }
-    }
 }
 
 impl VolumeHold {
@@ -478,14 +456,14 @@ impl VolumeHold {
     /// container's monitor), once this value is [given up](Self::give_up).
     #[must_use]
     pub fn hold(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(&self.lock)
+        self.lock.hold()
     }
 
     /// Gives the volume up to whoever holds a copy of its
     /// [`hold`](Self::hold): this value's copy is closed, never unlocked, so
     /// the volume stays held while any copy is open.
     pub fn give_up(mut self) {
-        self.given_up = true;
+        self.lock.give_up();
     }
 }
 

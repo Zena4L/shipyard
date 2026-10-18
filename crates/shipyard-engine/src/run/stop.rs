@@ -160,7 +160,7 @@ pub fn wait(engine: &Engine, reference: &str) -> Result<i32> {
 ///
 /// # Errors
 ///
-/// As [`stop`] and [`start`](crate::run::start); a container removed as it
+/// As [`stop`] and [`start`](fn@crate::run::start); a container removed as it
 /// stopped (`--rm`) ([`ErrorKind::NotFound`]).
 pub fn restart(engine: &Engine, reference: &str, options: StopOptions) -> Result<Record> {
     #[cfg(target_os = "linux")]
@@ -201,8 +201,6 @@ pub(crate) fn stop_up(
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::time::Duration;
-
     use shipyard_runtime::container::{self as runtime, ContainerError, Status};
     use shipyard_runtime::process::Signal;
 
@@ -210,10 +208,9 @@ mod linux {
     use crate::Engine;
     use crate::containers::{self, ContainerState, Record};
     use crate::error::{Error, ErrorKind, Result, bail};
-    use crate::run::detached::linux::{Input, Taken, Took, WhenUp, start_taken, take};
-
-    /// How long `wait` waits for a settled end at a time (it waits on).
-    const SETTLE_WAIT: Duration = Duration::from_secs(60);
+    use crate::run::start::Input;
+    use crate::run::start::start_taken;
+    use crate::run::take::{Taken, Took, WhenUp, take};
 
     pub(super) fn stop(engine: &Engine, reference: &str, options: StopOptions) -> Result<Record> {
         options.check()?;
@@ -222,7 +219,6 @@ mod linux {
                 crate::events::emit(engine, &crate::events::container(&record, "stop"));
                 Ok(record)
             }
-            Took::Up(record) => bail!(Busy, "container {} didn't stop", record.name),
         }
     }
 
@@ -231,10 +227,7 @@ mod linux {
         let runtime_root = engine.paths.runtime_root()?;
         // Only one that runs: one still starting (its init at the gate)
         // would get it when started.
-        if !matches!(
-            runtime::peek_status(runtime_root, record.id.as_str())?,
-            Some(Status::Running | Status::Paused)
-        ) {
+        if !runtime::peek_status(runtime_root, record.id.as_str())?.is_some_and(Status::is_live) {
             bail!(NotRunning, "container {} is not running", record.name);
         }
         // SIGKILL or its stop signal is the user's stop: recorded before
@@ -245,7 +238,7 @@ mod linux {
                 .policy(&record)
                 .is_ok_and(|policy| policy.signal.as_raw() == signal.as_raw())
         {
-            crate::run::detached::linux::mark_stopped_by_user(engine, &record.id);
+            crate::run::take::mark_stopped_by_user(engine, &record.id);
         }
         match runtime::kill(runtime_root, record.id.as_str(), signal) {
             Ok(()) => {
@@ -279,7 +272,7 @@ mod linux {
             ContainerState::Created => return Ok(0),
             // Ended (how it last ended, while its policy restarts it).
             ContainerState::Exited { code, .. } | ContainerState::Restarting { code, .. } => {
-                return Ok(code.unwrap_or(125));
+                return Ok(code.unwrap_or(containers::UNKNOWN_EXIT));
             }
         }
         // Ended, its monitor letting go: once its end is settled (its
@@ -293,18 +286,18 @@ mod linux {
                 ),
             )
         };
+        // (It waits on: `wait` waits as long as the container runs.)
         loop {
-            match containers::running_lock(engine, &record.id, SETTLE_WAIT) {
-                Ok(Some(_)) => break,
+            match containers::settled(engine, &record.id, containers::SETTLE_WAIT) {
+                Ok(Some(settled)) => {
+                    return Ok(settled
+                        .exit
+                        .map_or(containers::UNKNOWN_EXIT, |exit| exit.code_or_unknown()));
+                }
                 Ok(None) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => return Err(removed()),
                 Err(error) => return Err(error),
             }
-        }
-        match containers::find(engine, record.id.as_str()) {
-            Ok(settled) => Ok(settled.exit.map_or(125, |exit| exit.code.unwrap_or(125))),
-            Err(error) if error.kind() == ErrorKind::NotFound => Err(removed()),
-            Err(error) => Err(error),
         }
     }
 
@@ -326,7 +319,6 @@ mod linux {
                 "container {} was removed as it stopped (--rm): nothing to start",
                 record.name
             ),
-            Took::Up(record) => bail!(Busy, "container {} didn't stop", record.name),
         }
     }
 }

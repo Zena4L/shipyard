@@ -6,7 +6,13 @@
 //! ([`Frame::Release`](crate::attach::Frame::Release)); what's left at the
 //! end is the exit command's.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
+
+use crate::attach::HoldRefusal;
+
+/// Why a hold or a release was refused: its reason, and in words (what a
+/// version 3 holder is told alone).
+pub(super) type Refused = (HoldRefusal, String);
 
 /// The most descriptors a monitor holds ([`MOST_HOLDS`](super::super::MOST_HOLDS)).
 pub(in crate::container) const MOST: usize = super::super::MOST_HOLDS;
@@ -22,6 +28,30 @@ pub(in crate::container) fn labels_fit<'a>(labels: impl IntoIterator<Item = &'a 
         .map(|label| label.len().saturating_add(1))
         .fold(0_usize, usize::saturating_add)
         <= MOST_LABEL_BYTES
+}
+
+/// Whether the monitor can hold `fd`: a file, a directory or a socket (a
+/// socket set to close at once, `SO_LINGER` 0, rather than wait over
+/// unsent data: a close that waits would hold up the monitor's one loop).
+/// Anything else (a pipe, a device) is refused. Holds given at `create`
+/// are checked so too (F73).
+pub(in crate::container) fn holdable(fd: BorrowedFd<'_>) -> Result<(), Refused> {
+    let mode = nix::sys::stat::fstat(fd).map_or(0, |stat| stat.st_mode) & libc::S_IFMT;
+    if mode == libc::S_IFSOCK {
+        let linger = libc::linger {
+            l_onoff: 0,
+            l_linger: 0,
+        };
+        let _ = nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Linger, &linger);
+    }
+    if [libc::S_IFREG, libc::S_IFDIR, libc::S_IFSOCK].contains(&mode) {
+        Ok(())
+    } else {
+        Err((
+            HoldRefusal::NotHoldable,
+            "only a file, a directory or a socket is held".to_owned(),
+        ))
+    }
 }
 
 /// The descriptors a monitor holds, in order, each with its label. Its
@@ -52,15 +82,24 @@ impl Holds {
     /// Holds `fd` as `label` too, unless none are taken now, something is
     /// held as `label` already, or [`MOST`] are held: then `fd` is closed,
     /// and the answer says why.
-    pub(super) fn add(&mut self, fd: OwnedFd, label: String) -> Result<(), String> {
+    pub(super) fn add(&mut self, fd: OwnedFd, label: String) -> Result<(), Refused> {
         if !self.taking {
-            return Err("the container is starting or ending: nothing more is held".to_owned());
+            return Err((
+                HoldRefusal::Ending,
+                "the container is starting or ending: nothing more is held".to_owned(),
+            ));
         }
         if self.held.iter().any(|(_, held)| *held == label) {
-            return Err(format!("something is held as {label} already"));
+            return Err((
+                HoldRefusal::LabelTaken,
+                format!("something is held as {label} already"),
+            ));
         }
         if self.held.len() >= MOST {
-            return Err(format!("{MOST} {}", crate::container::HOLDS_FULL));
+            return Err((
+                HoldRefusal::Full,
+                format!("{MOST} {}", crate::container::HOLDS_FULL),
+            ));
         }
         if !labels_fit(
             self.held
@@ -68,8 +107,9 @@ impl Holds {
                 .map(|(_, held)| held.as_str())
                 .chain([label.as_str()]),
         ) {
-            return Err(format!(
-                "the labels held already come to almost {MOST_LABEL_BYTES} bytes"
+            return Err((
+                HoldRefusal::LabelsTooLong,
+                format!("the labels held already come to almost {MOST_LABEL_BYTES} bytes"),
             ));
         }
         self.held.push((fd, label));
@@ -78,7 +118,7 @@ impl Holds {
 
     /// Lets go of (closes) the one held as `label`, unless there's none,
     /// or more than one (two ports, say: which isn't said).
-    pub(super) fn release(&mut self, label: &str) -> Result<(), String> {
+    pub(super) fn release(&mut self, label: &str) -> Result<(), Refused> {
         let mut found = self
             .held
             .iter()
@@ -90,8 +130,11 @@ impl Holds {
                 drop(self.held.remove(at));
                 Ok(())
             }
-            (None, _) => Err(format!("nothing is held as {label}")),
-            (Some(_), Some(_)) => Err(format!("more than one descriptor is held as {label}")),
+            (None, _) => Err((HoldRefusal::NotHeld, format!("nothing is held as {label}"))),
+            (Some(_), Some(_)) => Err((
+                HoldRefusal::HeldTwice,
+                format!("more than one descriptor is held as {label}"),
+            )),
         }
     }
 
@@ -135,19 +178,29 @@ mod tests {
             (fd(), "port".to_owned()),
             (fd(), "lease:app".to_owned()),
         ]);
-        let refused = |result: Result<(), String>, why: &str| {
-            let error = result.unwrap_err();
-            assert!(error.contains(why), "{error}");
+        let refused = |result: Result<(), Refused>, reason: HoldRefusal, why: &str| {
+            let (said, words) = result.unwrap_err();
+            assert_eq!(said, reason, "{words}");
+            assert!(words.contains(why), "{words}");
         };
         assert_eq!(holds.labels(), "port,port,lease:app");
         refused(
             holds.add(fd(), "lease:app".to_owned()),
+            HoldRefusal::LabelTaken,
             "held as lease:app already",
         );
         holds.add(fd(), "lease:db".to_owned()).unwrap();
         assert_eq!(holds.labels(), "port,port,lease:app,lease:db");
-        refused(holds.release("port"), "more than one");
-        refused(holds.release("lease:none"), "nothing is held as lease:none");
+        refused(
+            holds.release("port"),
+            HoldRefusal::HeldTwice,
+            "more than one",
+        );
+        refused(
+            holds.release("lease:none"),
+            HoldRefusal::NotHeld,
+            "nothing is held as lease:none",
+        );
         holds.release("lease:app").unwrap();
         assert_eq!(holds.labels(), "port,port,lease:db");
         assert_eq!(holds.len(), 3);
@@ -169,10 +222,11 @@ mod tests {
         assert_eq!(holds.len(), MOST);
         refused(
             holds.add(fd(), "one-more".to_owned()),
+            HoldRefusal::Full,
             &format!("{MOST} descriptors are held"),
         );
-        // The words a caller tells it by (the engine's `network connect`),
-        // as older ones match them too.
+        // The words a version 3 monitor says it in, which a newer client
+        // still reads from one.
         assert_eq!(crate::container::HOLDS_FULL, "descriptors are held already");
         // Ending: none taken, a release still done; none before the
         // monitor has its holds either.
@@ -180,11 +234,13 @@ mod tests {
         holds.stop_taking();
         refused(
             holds.add(fd(), "lease:app".to_owned()),
+            HoldRefusal::Ending,
             "starting or ending",
         );
         holds.release("lease:db").unwrap();
         refused(
             Holds::default().add(fd(), "a".to_owned()),
+            HoldRefusal::Ending,
             "starting or ending",
         );
     }

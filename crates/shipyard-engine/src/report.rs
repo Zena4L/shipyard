@@ -6,22 +6,22 @@
 //! middle of an operation, or after it (a run's network cleaned up as it
 //! ends, a pull's layers as they arrive), so it can't all wait to be
 //! returned: the caller passes a [`Reporter`], and the engine reports each
-//! [`Event`] as it happens. The CLI prints them; an API can send them on, or
+//! [`Message`] as it happens. The CLI prints them; an API can send them on, or
 //! [`Collect`] them.
 
 use std::sync::{Mutex, PoisonError};
 
-/// Where the engine's [`Event`]s go. Called from any thread the engine
+/// Where the engine's [`Message`]s go. Called from any thread the engine
 /// works on, and from destructors: it must not panic.
 pub trait Reporter: Send + Sync {
-    /// Takes one event.
-    fn report(&self, event: Event);
+    /// Takes one message.
+    fn report(&self, message: Message);
 }
 
 /// Something the engine has to say. Not `non_exhaustive`: a caller that
-/// prints should be told, when it's compiled, of an event it doesn't print.
+/// prints should be told, when it's compiled, of a message it doesn't print.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
+pub enum Message {
     /// Something asked for that the engine goes on without, or something
     /// it couldn't clean up.
     Warning(Warning),
@@ -80,6 +80,10 @@ pub enum WarningKind {
     /// `CAP_NET_ADMIN`, a read-only `/proc/sys`): the container gets the
     /// host's network.
     HostNetworkFallback,
+    /// The record of the host's routing Shipyard closed can't be read: the
+    /// firewall closes routing for the forwarding that's on now instead
+    /// (F65); the message names the file and when it's safe to delete.
+    RoutingRecordUnreadable,
     /// A bundle asks for what `shipyard run` doesn't do (its
     /// `cgroupsPath`, settings it ignores).
     BundleIgnored,
@@ -140,24 +144,24 @@ pub enum Progress {
 
 /// Reports a warning of `kind` to `reporter`.
 pub(crate) fn warn(reporter: &dyn Reporter, kind: WarningKind, message: impl Into<String>) {
-    reporter.report(Event::Warning(Warning {
+    reporter.report(Message::Warning(Warning {
         kind,
         message: message.into(),
     }));
 }
 
-/// A [`Reporter`] that keeps every event, in order: for a caller that
+/// A [`Reporter`] that keeps every message, in order: for a caller that
 /// wants them as data (and for tests).
 #[derive(Debug, Default)]
 pub struct Collect {
-    events: Mutex<Vec<Event>>,
+    messages: Mutex<Vec<Message>>,
 }
 
 impl Collect {
-    /// The events reported so far.
+    /// The messages reported so far.
     #[must_use]
-    pub fn events(&self) -> Vec<Event> {
-        self.events
+    pub fn events(&self) -> Vec<Message> {
+        self.messages
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -168,8 +172,8 @@ impl Collect {
     pub fn warnings(&self) -> Vec<Warning> {
         self.events()
             .into_iter()
-            .filter_map(|event| match event {
-                Event::Warning(warning) => Some(warning),
+            .filter_map(|message| match message {
+                Message::Warning(warning) => Some(warning),
                 _ => None,
             })
             .collect()
@@ -177,10 +181,10 @@ impl Collect {
 }
 
 impl Reporter for Collect {
-    fn report(&self, event: Event) {
-        self.events
+    fn report(&self, message: Message) {
+        self.messages
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
+            .push(message);
     }
 }

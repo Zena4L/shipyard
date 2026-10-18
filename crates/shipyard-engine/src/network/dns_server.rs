@@ -41,7 +41,7 @@ mod linux {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Write as _};
     use std::net::SocketAddr;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::path::Path;
     use std::time::Duration;
@@ -82,6 +82,16 @@ mod linux {
             );
             return 2;
         };
+        // Two different descriptors: one number twice would be owned, and
+        // closed, twice.
+        let number = |text: &OsString| text.to_str().and_then(|text| text.parse::<RawFd>().ok());
+        if number(lock).is_some() && number(lock) == number(ready) {
+            let _ = writeln!(
+                io::stderr(),
+                "shipyard-dns: started without its descriptors"
+            );
+            return 2;
+        }
         let (Some(lock), Some(ready)) = (inherited(lock), inherited(ready)) else {
             let _ = writeln!(
                 io::stderr(),
@@ -297,21 +307,11 @@ mod linux {
         if fd <= 2 {
             return None;
         }
-        // SAFETY: `F_GETFD` only reads the descriptor's flags; an fd that
-        // isn't open is EBADF.
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-            return None;
-        }
-        // SAFETY: the starter passed it for this process to own, and nothing
-        // else here uses it (it's open, as just checked).
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         // Close-on-exec, now it's here.
-        nix::fcntl::fcntl(
-            &fd,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .ok()?;
-        Some(fd)
+        // SAFETY: the starter passed it for this process to own, a number
+        // apart from the other's (checked in `serve`), and nothing else here
+        // uses it.
+        unsafe { shipyard_sys::fd::take_inherited(fd, shipyard_sys::fd::OnExec::Close) }.ok()
     }
 
     /// Everything the server needs, opened while it's root: then its

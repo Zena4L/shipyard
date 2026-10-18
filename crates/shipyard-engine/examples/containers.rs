@@ -5,6 +5,10 @@
 //! to put it elsewhere), finds each by every kind of reference, removes
 //! one, and leaves the other two for a look at the files. Run it on a
 //! store of its own: a second run finds the name `web` taken.
+//!
+//! It writes records through `containers::testing`, the store's own
+//! writers, past the locks a run takes: it shows the store, not the API
+//! (that's `run::create`, `run::remove`, `containers::list`).
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -24,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_request(&request)?;
     let mut made = Vec::new();
     for name in [Some("web"), None, None] {
-        let record = containers::create_record(
+        let record = containers::testing::create_record(
             &engine,
             NewContainer {
                 name: name.map(Name::parse).transpose()?,
@@ -51,14 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("shpu{:06}", web.serial.number()),
         web.id.short().to_owned(),
     ] {
-        let found = containers::find(&engine, &reference)?;
+        let found = containers::testing::find(&engine, &reference)?;
         writeln!(out, "find {reference:?} -> {}", found.name)?;
     }
-    match containers::find(&engine, "SHPU 000000 9") {
+    match containers::testing::find(&engine, "SHPU 000000 9") {
         Ok(found) => writeln!(out, "a wrong check digit found {}", found.name)?,
         Err(err) => writeln!(out, "a wrong check digit: {err}")?,
     }
-    containers::remove_record(&engine, &made[2].id)?;
+    containers::testing::remove_record(&engine, &made[2].id)?;
     for record in containers::list(&engine)? {
         let state = containers::state(&engine, &record)?;
         writeln!(

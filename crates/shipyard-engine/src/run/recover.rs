@@ -44,17 +44,11 @@ pub(crate) fn host_stopping(root: &std::path::Path) -> bool {
 
 /// Whether restart policies are held off now: [`stop_for_the_host`] ran
 /// (`shipyard system stop`) and [`boot`] hasn't since, so a container that
-/// ends isn't restarted. `false` without a runtime state root (or off
-/// Linux).
+/// ends isn't restarted. `false` without a runtime state root.
 #[must_use]
-pub fn restarts_held_off(engine: &Engine) -> bool {
-    #[cfg(target_os = "linux")]
-    return engine.paths.runtime_root().is_ok_and(host_stopping);
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = engine;
-        false
-    }
+#[cfg(target_os = "linux")]
+pub(crate) fn restarts_held_off(engine: &Engine) -> bool {
+    engine.paths.runtime_root().is_ok_and(host_stopping)
 }
 
 /// What [`stop_for_the_host`] did.
@@ -67,8 +61,9 @@ pub struct Stopped {
     pub failed: Vec<(Name, crate::Error)>,
 }
 
-/// What the host's shutdown runs (`shipyard system stop`, the boot unit's
-/// `ExecStop`: stage 9, step 9.5c): every container that's up stopped, all
+/// What the host's shutdown runs (`shipyard system stop`, the stop unit's
+/// `ExecStop`, `shipyard-stop.service`: stage 9, step 9.5c; a unit of its
+/// own since 10.2d1, F52): every container that's up stopped, all
 /// at once, each with its own stop signal and timeout (`docker stop`'s).
 /// Not as its user's stop: its restart policy brings it back when the host
 /// starts again. Until [`boot`] (or the reboot), no restart policy fires.
@@ -173,7 +168,8 @@ mod linux {
     const EXIT_COMMAND_FAILED: &str = "exit-command-failed";
 
     pub(super) fn boot(engine: &Engine) -> Result<super::Booted> {
-        // The host's stop is over (a stop of the boot unit without a reboot).
+        // The host's stop is over (a stop of the stop unit, or a `system
+        // stop` by hand, without a reboot).
         let root = engine.paths.runtime_root()?;
         match std::fs::remove_file(root.join(super::HOST_STOPPING)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -188,11 +184,11 @@ mod linux {
         recover_others(engine, None);
         let mut booted = super::Booted::default();
         for record in containers::list(engine)? {
-            let up = containers::state(engine, &record).is_ok_and(|state| state.is_up());
+            let up = containers::state(engine, &record).is_ok_and(|state| state.is_active());
             if !starts_at_boot(&record, up) {
                 continue;
             }
-            match crate::run::detached::linux::start_recovered(engine, record.id.as_str()) {
+            match crate::run::start::start_recovered(engine, record.id.as_str()) {
                 Ok(_) => booted.started.push(record.name),
                 Err(error) => booted.failed.push((record.name, error)),
             }
@@ -230,11 +226,9 @@ mod linux {
                 .iter()
                 .map(|record| {
                     scope.spawn(move || {
-                        let host_stop = crate::run::detached::linux::WhenUp::HostStop(
-                            crate::run::StopOptions::default(),
-                        );
-                        crate::run::detached::linux::take(engine, record.id.as_str(), host_stop)
-                            .map(drop)
+                        let host_stop =
+                            crate::run::take::WhenUp::HostStop(crate::run::StopOptions::default());
+                        crate::run::take::take(engine, record.id.as_str(), host_stop).map(drop)
                     })
                 })
                 .collect();
@@ -391,13 +385,14 @@ mod linux {
         id: &ContainerId,
         boot: Option<&str>,
     ) -> Result<Option<Recovery>> {
-        // Busy, or removed meanwhile: left alone.
-        let Ok(_operation) = containers::operation_lock(engine, id, Duration::ZERO) else {
-            return Ok(None);
-        };
-        // Again, under it: the look without it may be out of date. (By its
-        // path: the whole store isn't read again for each.)
-        let Ok(record) = containers::read_one(engine, id) else {
+        // Busy, or removed meanwhile: left alone. Read again under its lock:
+        // the look without it may be out of date. (By its path: the whole
+        // store isn't read again for each.)
+        let Ok(containers::Locked {
+            record,
+            operation: _operation,
+        }) = containers::lock_again(engine, id, Duration::ZERO)
+        else {
             return Ok(None);
         };
         match runtime::status(root, id.as_str())? {
@@ -408,7 +403,7 @@ mod linux {
             // the gate with what it was given. Deleted, as `take` deletes
             // one: its monitor with it, so its holds go.
             Some(Status::Created | Status::Creating) => {
-                crate::run::detached::linux::delete_state(root, id)?;
+                crate::run::take::delete_state(root, id)?;
                 undo_a_dead_start(engine, &record)?;
                 return Ok(Some(Recovery::DeadStart));
             }
@@ -434,7 +429,7 @@ mod linux {
         // Its monitor's word that its exit command never started: read
         // before `reconcile` deletes the runtime state it's in.
         let exit_command_failed = root.join(id.as_str()).join(EXIT_COMMAND_FAILED).exists();
-        crate::run::detached::linux::reconcile(engine, root, id)?;
+        crate::run::take::reconcile(engine, root, id)?;
         let record = settle_unrecorded_end(engine, id, boot)?;
         if exit_command_failed {
             engine.warn(
@@ -450,7 +445,7 @@ mod linux {
         if record.auto_remove && record.started.is_some() {
             crate::image::remove_owned_area(engine, id.as_str())
                 .map_err(|error| error.context("removing the container's writable layer"))?;
-            crate::run::detached::forget(engine, id)?;
+            crate::run::remove::forget(engine, id)?;
             drop(running);
             return Ok(Some(Recovery::Removed));
         }
@@ -471,17 +466,10 @@ mod linux {
     pub(in crate::run) fn undo_a_dead_start(engine: &Engine, record: &Record) -> Result<()> {
         let id = &record.id;
         if record.started.is_some() && record.finished.is_none() {
-            let previous = containers::previous_start(engine, id);
-            containers::update(engine, id, |record| {
-                if let Some(previous) = previous {
-                    previous.restore(record);
-                } else {
-                    record.started = None;
-                    record.exit = None;
-                }
-            })?;
+            containers::settle_never_ran(engine, id)?;
+        } else {
+            containers::forget_previous_start(engine, id);
         }
-        containers::forget_previous_start(engine, id);
         Ok(())
     }
 
@@ -505,6 +493,8 @@ mod linux {
         };
         let ended = ended_at(started, record.boot_id.as_deref(), boot);
         let record = containers::update(engine, id, |record| record.finished = Some(ended))?;
+        // It ran: what it kept aside is no start's to restore now.
+        containers::forget_previous_start(engine, id);
         crate::events::emit(engine, &crate::events::container(&record, "die").at(ended));
         Ok(record)
     }

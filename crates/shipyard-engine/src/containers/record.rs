@@ -12,8 +12,18 @@
 //! ROADMAP's H2).
 //! A record of a version above this Shipyard's is refused, never misread or
 //! rewritten.
+//!
+//! **The upgrade rule** (F43): a record is rewritten at the version it was
+//! read at, unless what's set in it needs a newer one
+//! ([`Record::needed_version`], [`written_version`]). An older binary still
+//! at work (a container's monitor and `__cleanup`, started by the Shipyard
+//! the host ran before an upgrade) can then still read, and record the end
+//! of, a container a newer CLI changed meanwhile: only what an older one
+//! couldn't hold makes a newer version.
+//!
+//! [`Config`]'s serde form is part of the record (and, until stage 11,
+//! `inspect`'s JSON too): a change to it is a new version.
 
-use std::io::Read as _;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -25,8 +35,21 @@ use super::labels::Labels;
 use super::names::Name;
 use crate::error::{Context as _, Result, bail};
 
-/// The record's version: what's written.
-pub(crate) const VERSION: u32 = 3;
+/// A version of the record's format.
+pub(crate) type Version = u32;
+
+/// The record's version: the newest this Shipyard reads and writes.
+pub(crate) const VERSION: Version = 3;
+
+/// The version a record read at `read_at` is written at again, when what's
+/// set in it needs `needed`: the higher of the two (see the module's upgrade
+/// rule). A record is never written below the version it was read at, nor
+/// above the one it needs (older ones, 1 and 2, need 3: no binary that
+/// writes them is still in use).
+#[must_use]
+pub(crate) fn written_version(read_at: Version, needed: Version) -> Version {
+    read_at.max(needed)
+}
 
 /// The most of a record read (and written): far more than any record
 /// within its bounds (labels, names) takes.
@@ -34,7 +57,8 @@ pub(crate) const MAX_SIZE: u64 = 1024 * 1024;
 
 /// What the engine keeps of a container, for as long as the container
 /// exists: who it is, how to run it, and how it last ran. Read and
-/// written through its versions only (`Record::parse`'s, `to_json`'s).
+/// written through its versions only (`Record::read_versioned`'s,
+/// `to_json_at`'s).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Record {
@@ -126,6 +150,20 @@ pub struct Exit {
     pub oom: Option<String>,
 }
 
+/// The exit code said for an end whose own isn't known: Shipyard's own
+/// failure's, 125.
+#[cfg(target_os = "linux")]
+pub(crate) const UNKNOWN_EXIT: i32 = shipyard_runtime::process::EXIT_ENGINE_ERROR as i32;
+
+#[cfg(target_os = "linux")]
+impl Exit {
+    /// Its exit code, or [`UNKNOWN_EXIT`] if it isn't known.
+    #[must_use]
+    pub(crate) fn code_or_unknown(&self) -> i32 {
+        self.code.unwrap_or(UNKNOWN_EXIT)
+    }
+}
+
 impl From<&shipyard_runtime::container::ExitRecord> for Exit {
     fn from(exit: &shipyard_runtime::container::ExitRecord) -> Self {
         Self {
@@ -167,7 +205,7 @@ struct V3 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct V2 {
-    /// Checked before (`parse`): here only so it's no unknown field.
+    /// Checked before (`parse_versioned`): here only so it's no unknown field.
     #[serde(rename = "version")]
     _version: u32,
     id: ContainerId,
@@ -188,7 +226,7 @@ struct V2 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct V1 {
-    /// Checked before (`parse`): here only so it's no unknown field.
+    /// Checked before (`parse_versioned`): here only so it's no unknown field.
     #[serde(rename = "version")]
     _version: u32,
     id: ContainerId,
@@ -203,6 +241,20 @@ struct V1 {
 }
 
 impl Record {
+    /// Marks its last start as never having started (its command never
+    /// ran): no start, no end, no exit, whichever path settled it (F64:
+    /// one meaning). An earlier end a failed start put back is kept by its
+    /// callers, which don't call this then.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "starts, and their ends, need Linux")
+    )]
+    pub(crate) fn mark_never_started(&mut self) {
+        self.started = None;
+        self.finished = None;
+        self.exit = None;
+    }
+
     /// A new container's record.
     pub(crate) fn new(
         id: ContainerId,
@@ -237,18 +289,75 @@ impl Record {
     /// # Errors
     ///
     /// As [`Config::to_request`].
-    pub fn to_request(&self) -> Result<crate::run::RunRequest> {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "starts are Linux's")
+    )]
+    pub(crate) fn to_request(&self) -> Result<crate::run::RunRequest> {
         self.config.to_request(&self.name)
     }
 
-    /// What's written: version 3.
+    /// The least version that holds what's set in this record: 3, the only
+    /// one written, while it's the newest. A version 4 field, once there is
+    /// one, makes 4 needed here only when it's set (not when it holds its
+    /// default), so a record nothing new was asked of stays readable by the
+    /// binaries before it.
+    ///
+    /// **The constraint that keeps F43 fixed:** that protects only a field
+    /// a user asks for. A field the engine itself sets on a container that
+    /// may be running (as `stopped_by_user`, `restart_count`, `boot_id` and
+    /// `next_start` were for version 3: by `stop`, a start, the restart
+    /// policy, the recovery pass) would make every routine rewrite need the
+    /// new version, and an older binary's monitor still running refuse it.
+    /// Such a field goes in a file of its own beside the record (as
+    /// `previous-start.json`, a start's `health.json` and `network-lost`
+    /// do), or waits for a version no older monitor can meet (F67).
+    #[must_use]
+    #[allow(
+        clippy::unused_self,
+        reason = "what's set in it decides, once a version 4 field is there"
+    )]
+    pub(crate) fn needed_version(&self) -> Version {
+        #[cfg(test)]
+        if let Some(needed) = tests_hook::NEEDED.get() {
+            return needed;
+        }
+        VERSION
+    }
+
+    /// What's written for a new record (one never read: nothing to keep
+    /// the version of): [`to_json_at`](Self::to_json_at) the version it
+    /// needs. A record read and changed is written with `to_json_at` the
+    /// version it was read at (`store::rewrite`), never this.
+    ///
+    /// # Errors
+    ///
+    /// As [`to_json_at`](Self::to_json_at)'s.
+    pub(crate) fn to_json_new(&self) -> Result<Vec<u8>> {
+        self.to_json_at(self.needed_version())
+    }
+
+    /// What's written for a record read at `read_at`: at
+    /// [`written_version`]`(read_at, needed)`, version 3 while it's the
+    /// newest.
     ///
     /// # Errors
     ///
     /// It can't be written as JSON (a time before 1970), or it's bigger
     /// than [`MAX_SIZE`] ([`ErrorKind::InvalidRequest`](crate::ErrorKind::InvalidRequest):
     /// too much asked of it).
-    pub(crate) fn to_json(&self) -> Result<Vec<u8>> {
+    pub(crate) fn to_json_at(&self, read_at: Version) -> Result<Vec<u8>> {
+        let version = written_version(read_at, self.needed_version());
+        // Nothing above 3 is read (refused), nor needed, while 3 is the
+        // newest: the one shape there is to write. Any other is a mistake
+        // (a version 4 needed with no writer for it): refused, never
+        // written in version 3's shape under another number.
+        if version != VERSION {
+            bail!(
+                Storage,
+                "no writer for a container's record at version {version}"
+            );
+        }
         let Self {
             id,
             serial,
@@ -269,7 +378,7 @@ impl Record {
             restart_delay_ms,
         } = self.clone();
         let json = serde_json::to_vec_pretty(&V3 {
-            version: VERSION,
+            version,
             id,
             serial,
             name,
@@ -308,20 +417,45 @@ impl Record {
     /// [`ErrorKind::Storage`](crate::ErrorKind::Storage): no version, a
     /// newer one, not a record, or it couldn't be read.
     pub(crate) fn read(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut bytes = Vec::new();
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-            .and_then(|file| file.take(MAX_SIZE + 1).read_to_end(&mut bytes))
-            .with_context(|| format!("reading {}", path.display()))
-            .map_err(|err| err.io_as(crate::ErrorKind::Storage))?;
-        Self::parse(&bytes).with_context(|| path.display().to_string())
+        Self::read_versioned(path).map(|(record, _)| record)
+    }
+
+    /// [`read`](Self::read), and the version it was read at (for
+    /// [`to_json_at`](Self::to_json_at)).
+    ///
+    /// # Errors
+    ///
+    /// As [`read`](Self::read)'s.
+    pub(crate) fn read_versioned(path: &Path) -> Result<(Self, Version)> {
+        let bytes = match shipyard_sys::fs::read_bounded(path, MAX_SIZE) {
+            // Said as `parse_versioned` says it.
+            Err(err)
+                if matches!(
+                    shipyard_sys::fs::refusal(&err),
+                    Some(shipyard_sys::fs::Refusal::TooLarge { .. })
+                ) =>
+            {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::Storage,
+                    format!("a container's record of more than {MAX_SIZE} bytes"),
+                )
+                .context(path.display()));
+            }
+            read => read
+                .with_context(|| format!("reading {}", path.display()))
+                .map_err(|err| err.io_as(crate::ErrorKind::Storage))?,
+        };
+        Self::parse_versioned(&bytes).with_context(|| path.display().to_string())
     }
 
     /// A record from `bytes` (see [`read`](Self::read)).
+    #[cfg(test)]
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_versioned(bytes).map(|(record, _)| record)
+    }
+
+    /// A record from `bytes`, and the version it was read at.
+    fn parse_versioned(bytes: &[u8]) -> Result<(Self, Version)> {
         #[derive(Deserialize)]
         struct Versioned {
             version: Option<serde_json::Value>,
@@ -337,8 +471,8 @@ impl Record {
             .version
             .and_then(|version| version.as_u64());
         match version {
-            Some(1) => return Self::parse_v1(bytes),
-            Some(2) => return Self::parse_v2(bytes),
+            Some(1) => return Self::parse_v1(bytes).map(|record| (record, 1)),
+            Some(2) => return Self::parse_v2(bytes).map(|record| (record, 2)),
             Some(3) => {}
             Some(found) if found > u64::from(VERSION) => bail!(
                 Storage,
@@ -370,7 +504,7 @@ impl Record {
             next_start,
             restart_delay_ms,
         } = serde_json::from_slice(bytes).context("a container's record")?;
-        Ok(Self {
+        let record = Self {
             id,
             serial,
             name,
@@ -388,7 +522,8 @@ impl Record {
             boot_id,
             next_start,
             restart_delay_ms,
-        })
+        };
+        Ok((record, 3))
     }
 
     /// A version 2 record (9.4a's): no restart policy (`no`), never stopped
@@ -464,5 +599,18 @@ impl Record {
             next_start: None,
             restart_delay_ms: 0,
         })
+    }
+}
+
+/// A test's say over [`Record::needed_version`]: what a version 4 field set
+/// would make it (above or below what was read), with no version 4 to write.
+#[cfg(test)]
+pub(crate) mod tests_hook {
+    use std::cell::Cell;
+
+    use super::Version;
+
+    thread_local! {
+        pub(crate) static NEEDED: Cell<Option<Version>> = const { Cell::new(None) };
     }
 }

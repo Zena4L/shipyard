@@ -1,0 +1,13 @@
+# Cargo's settings for this repository.
+
+# On a Mac, every binary cargo runs (`cargo run`, each test binary) is
+# signed first with the virtualization entitlement (step 10.3): macOS refuses
+# a VM to a binary without it, and the linker's signature carries none.
+[target.aarch64-apple-darwin]
+runner = "scripts/macos/sign-and-run.sh"
+
+# Cargo's runs (`cargo test`, `cargo run`) on a Mac run commands on the Mac
+# itself, not in Shipyard's VM (step 10.3b, D10.3-8): the macOS tests check
+# that native path. A value in your shell wins; the VM tests unset it.
+[env]
+SHIPYARD_VM = { value = "off", force = false }

@@ -46,6 +46,26 @@ pub const DEVICE_PREFIX: &str = "shy";
 /// How long a change waits for a network another command is changing.
 pub const LOCK_WAIT: Duration = Duration::from_secs(15);
 
+/// The most of a network's `config.json` read: a few hundred bytes, its
+/// labels and options among them.
+const CONFIG_MAX: u64 = 1024 * 1024;
+
+/// The most of a lease read: a few dozen bytes.
+const LEASE_MAX: u64 = 64 * 1024;
+
+/// The most of `next` read: one address.
+const LINE_MAX: u64 = 4 * 1024;
+
+/// The most of a `.routing-closed` record read: the boot's ID, then one line
+/// for each of the host's interfaces (other engines' veths among them), so
+/// room for tens of thousands.
+const ROUTING_CLOSED_MAX: u64 = 1024 * 1024;
+
+/// A file's text, read with a bound: as `fs::read_to_string` would have it.
+fn read_text(path: &Path, cap: u64) -> io::Result<String> {
+    shipyard_sys::fs::text(shipyard_sys::fs::read_bounded(path, cap)?)
+}
+
 /// The container's end of its veth pair on its first network (on the
 /// others, `eth1`, `eth2`…).
 pub const CONTAINER_INTERFACE: &str = "eth0";
@@ -54,6 +74,16 @@ pub const CONTAINER_INTERFACE: &str = "eth0";
 #[must_use]
 pub fn interface_name(n: usize) -> String {
     format!("eth{n}")
+}
+
+/// What [`Networks::routing_closed`] read: the closing its records say,
+/// and each family whose record couldn't be read, with why (F65).
+#[derive(Debug, Default)]
+pub struct RoutingRecords {
+    /// The routing closed, by the records read.
+    pub closed: crate::nft::ClosedRouting,
+    /// The families whose record is there but couldn't be read.
+    pub unread: Vec<(crate::Family, StoreError)>,
 }
 
 /// The file that records [`Networks::routing_closed`] for IPv4.
@@ -71,11 +101,14 @@ fn routing_closed_file(family: crate::Family) -> &'static str {
 
 /// This boot's ID: what a routing-closed file holds, so that one from
 /// another boot (when forwarding was reset, and maybe turned on since by
-/// someone else) counts for nothing.
-fn boot_id() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|id| id.trim().to_owned())
-        .unwrap_or_default()
+/// someone else) counts for nothing. Empty on a system without one (not
+/// Linux); one that can't be read is an error, never "another boot" (F65).
+fn boot_id() -> io::Result<String> {
+    match fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        Ok(id) => Ok(id.trim().to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
 }
 
 /// The longest network name.
@@ -500,7 +533,7 @@ impl Networks {
     pub fn get(&self, name: &str) -> Result<Option<NetworkConfig>, StoreError> {
         validate_name(name)?;
         let path = self.dir.join(name).join("config.json");
-        let text = match fs::read_to_string(&path) {
+        let text = match read_text(&path, CONFIG_MAX) {
             Ok(text) => text,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -695,14 +728,7 @@ impl Networks {
     pub fn open_dns_lock(&self, name: &str) -> Result<File, StoreError> {
         validate_name(name)?;
         let path = self.dns_lock_path(name);
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
+        shipyard_sys::fs::open_lock_file(&path)
             .map_err(|error| StoreError::io(format!("opening {}", path.display()), error))
     }
 
@@ -723,18 +749,43 @@ impl Networks {
     /// anyone (see `nft`). Recorded, so a rebuilt firewall does too; but not
     /// past a reboot, after which the forwarding is someone else's to turn
     /// on.
+    ///
+    /// A family whose record is there but can't be read (its permissions,
+    /// the disk, past its bound, not a regular file, a symbolic link, not
+    /// text), or whose boot can't be told (this boot's ID unread), is in
+    /// [`RoutingRecords::unread`], never taken as "not closed": a table
+    /// rebuilt so would let the host route for anyone (F65). The engine
+    /// decides what to close instead. No record is no closing.
     #[must_use]
-    pub fn routing_closed(&self) -> crate::nft::ClosedRouting {
-        let boot = boot_id();
-        let mut closed = crate::nft::ClosedRouting::default();
+    pub fn routing_closed(&self) -> RoutingRecords {
+        let mut records = RoutingRecords::default();
         for family in [crate::Family::V4, crate::Family::V6] {
-            let Ok(text) = fs::read_to_string(self.dir.join(routing_closed_file(family))) else {
-                continue;
+            let path = self.dir.join(routing_closed_file(family));
+            let text = match read_text(&path, ROUTING_CLOSED_MAX) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    let error = StoreError::io(format!("reading {}", path.display()), error);
+                    records.unread.push((family, error));
+                    continue;
+                }
+            };
+            let boot = match boot_id() {
+                Ok(boot) => boot,
+                Err(error) => {
+                    let error = StoreError::io(
+                        format!("reading this boot's ID, to tell {}'s boot", path.display()),
+                        error,
+                    );
+                    records.unread.push((family, error));
+                    continue;
+                }
             };
             let mut lines = text.lines();
             if lines.next().map(str::trim) != Some(boot.as_str()) {
                 continue;
             }
+            let closed = &mut records.closed;
             closed.families.push(family);
             for interface in lines.map(str::trim).filter(|line| !line.is_empty()) {
                 if !closed.interfaces.iter().any(|known| known == interface) {
@@ -742,7 +793,7 @@ impl Networks {
                 }
             }
         }
-        closed
+        records
     }
 
     /// Records that Shipyard turned forwarding on for `family`, when the
@@ -753,13 +804,25 @@ impl Networks {
         family: crate::Family,
         interfaces: &[String],
     ) -> Result<(), StoreError> {
-        let mut text = boot_id();
+        let path = self.dir.join(routing_closed_file(family));
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            return Err(StoreError::io(
+                format!(
+                    "writing {}: a directory is in its place (remove it: it's Shipyard's \
+                     record of the routing it closed, never a directory)",
+                    path.display()
+                ),
+                io::Error::from(io::ErrorKind::IsADirectory),
+            ));
+        }
+        let mut text =
+            boot_id().map_err(|error| StoreError::io("reading this boot's ID", error))?;
         for interface in interfaces {
             text.push('\n');
             text.push_str(interface);
         }
         text.push('\n');
-        write_atomically(&self.dir.join(routing_closed_file(family)), text.as_bytes())
+        write_atomically(&path, text.as_bytes())
     }
 
     /// The lock that makes changes to the whole store, or to what all
@@ -1017,11 +1080,11 @@ impl LockedNetwork {
         {
             return Ok(false);
         }
-        bytes_lock(&file, BytesLock::Write).map_err(|error| failed("locking", error))?;
-        let mut text = Vec::new();
-        (&file)
-            .take(64 * 1024)
-            .read_to_end(&mut text)
+        // A range lock is Linux's alone (elsewhere, nothing): so is renaming
+        // a running container, the one rewrite of a lease.
+        shipyard_sys::lock::byte_range(&file, shipyard_sys::lock::ByteRange::Write)
+            .map_err(|error| failed("locking", error))?;
+        let text = shipyard_sys::fs::read_bounded_from(&file, LEASE_MAX)
             .map_err(|error| failed("reading", error))?;
         let mut json: serde_json::Value = serde_json::from_slice(&text).map_err(|error| {
             StoreError::io(
@@ -1029,8 +1092,16 @@ impl LockedNetwork {
                 io::Error::other(error),
             )
         })?;
-        json["name"] = serde_json::Value::from(new);
-        json["container"] = serde_json::Value::from(container);
+        // Anything but an object (an array, say: serde reads a struct from
+        // one) is refused, never indexed into (F61: that panics).
+        let Some(object) = json.as_object_mut() else {
+            return Err(StoreError::io(
+                format!("reading {}", path.display()),
+                io::Error::other("not a JSON object"),
+            ));
+        };
+        object.insert("name".to_owned(), serde_json::Value::from(new));
+        object.insert("container".to_owned(), serde_json::Value::from(container));
         let mut written = serde_json::to_vec(&json)
             .map_err(|error| StoreError::io("writing the lease", io::Error::other(error)))?;
         if (written.len() as u64) < (text.len() as u64) {
@@ -1131,8 +1202,7 @@ impl LockedNetwork {
         Ok(HeldLease {
             lease,
             path,
-            lock,
-            given_up: false,
+            lock: shipyard_sys::lock::HeldFile::new(lock),
         })
     }
 
@@ -1177,7 +1247,7 @@ impl LockedNetwork {
 
     /// The last address handed out, if it's recorded.
     fn read_next(&self) -> Option<IpAddr> {
-        fs::read_to_string(self.dir.join("next"))
+        read_text(&self.dir.join("next"), LINE_MAX)
             .ok()
             .and_then(|text| IpAddr::from_str(text.trim()).ok())
     }
@@ -1190,19 +1260,8 @@ impl LockedNetwork {
 pub struct HeldLease {
     lease: Lease,
     path: PathBuf,
-    /// The lease file, locked (`flock`, exclusive): unlocked when this value
-    /// goes (another thread's child, forked meanwhile, may hold a copy until
-    /// it execs), unless it was given up: then this copy is only closed.
-    lock: File,
-    given_up: bool,
-}
-
-impl Drop for HeldLease {
-    fn drop(&mut self) {
-        if !self.given_up {
-            let _ = self.lock.unlock();
-        }
-    }
+    /// The lease file, locked (`flock`, exclusive), to hand over.
+    lock: shipyard_sys::lock::HeldFile,
 }
 
 impl HeldLease {
@@ -1216,7 +1275,7 @@ impl HeldLease {
     /// container's monitor), once this value is [given up](Self::give_up).
     #[must_use]
     pub fn hold(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(&self.lock)
+        self.lock.hold()
     }
 
     /// Gives the lease up to whoever holds a copy of its
@@ -1224,7 +1283,7 @@ impl HeldLease {
     /// the lease stays the run's while any copy is open, and the network's
     /// sweep reclaims it once none is.
     pub fn give_up(mut self) {
-        self.given_up = true;
+        self.lock.give_up();
     }
 
     /// Gives the address back: the file goes while it's still locked, so no
@@ -1290,50 +1349,6 @@ fn live_lease_of<'a>(
         })
 }
 
-/// A lock on a lease file's bytes (see [`bytes_lock`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BytesLock {
-    /// To read them (shared).
-    Read,
-    /// To rewrite them.
-    Write,
-    /// Let go.
-    Off,
-}
-
-/// A lock on all of `file`'s bytes, `kind`, waited for, held until let go
-/// or `file` is closed: an open file description lock (Linux 3.15;
-/// `F_OFD_SETLKW`), apart from `flock`'s, which says a lease is alive.
-/// Elsewhere, nothing (no lease is rewritten there: renaming a running
-/// container is Linux's).
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(clippy::unnecessary_wraps, reason = "Linux's can fail")
-)]
-fn bytes_lock(file: &File, kind: BytesLock) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: an all-zero `flock` is a valid one to fill.
-        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        let kind = match kind {
-            BytesLock::Read => libc::F_RDLCK,
-            BytesLock::Write => libc::F_WRLCK,
-            BytesLock::Off => libc::F_UNLCK,
-        };
-        lock.l_type = libc::c_short::try_from(kind).map_err(io::Error::other)?;
-        lock.l_whence = libc::c_short::try_from(libc::SEEK_SET).map_err(io::Error::other)?;
-        // Start 0, length 0: the whole file, however long.
-        nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_OFD_SETLKW(&lock))
-            .map(drop)
-            .map_err(io::Error::from)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (file, kind);
-        Ok(())
-    }
-}
-
 /// Whether a run holds the lease open as `file`: its exclusive lock is the
 /// proof, so a shared one can't be had (tried without waiting, and let go
 /// at once).
@@ -1361,7 +1376,7 @@ fn read_lease(
     opened: io::Result<File>,
     path: &Path,
 ) -> Result<Option<(Option<Lease>, File)>, StoreError> {
-    let mut file = match opened {
+    let file = match opened {
         Ok(file) => file,
         // Gone, a symbolic link (`O_NOFOLLOW`), or a FIFO nothing writes.
         Err(error)
@@ -1383,13 +1398,13 @@ fn read_lease(
     }
     // Never half of a rename's rewrite (`LockedNetwork::rename`); a lock
     // that can't be had (an old kernel) reads as before.
-    let _ = bytes_lock(&file, BytesLock::Read);
-    let mut text = String::new();
-    let lease = match (&mut file).take(64 * 1024).read_to_string(&mut text) {
-        Ok(_) => serde_json::from_str(&text).ok(),
+    let _ = shipyard_sys::lock::byte_range(&file, shipyard_sys::lock::ByteRange::Read);
+    // One too large to be a lease reads as one that isn't.
+    let lease = match shipyard_sys::fs::read_bounded_from(&file, LEASE_MAX) {
+        Ok(text) => serde_json::from_slice(&text).ok(),
         Err(_) => None,
     };
-    let _ = bytes_lock(&file, BytesLock::Off);
+    let _ = shipyard_sys::lock::byte_range(&file, shipyard_sys::lock::ByteRange::Off);
     Ok(Some((lease, file)))
 }
 
@@ -1466,11 +1481,8 @@ impl NetworksDir {
         validate_name(name).ok()?;
         let relative = format!("{name}/config.json");
         let file = self.open_at(&relative, libc::O_RDONLY).ok()?;
-        let mut text = String::new();
-        File::from(file)
-            .take(64 * 1024)
-            .read_to_string(&mut text)
-            .ok()?;
+        let text = shipyard_sys::fs::read_bounded_from(&File::from(file), CONFIG_MAX).ok()?;
+        let text = String::from_utf8(text).ok()?;
         read_config(name, &text, self.path.join(relative)).ok()
     }
 
@@ -1654,13 +1666,7 @@ fn servers_group(file: &File) -> io::Result<()> {
 
 /// Makes the lock file `path` if it isn't there.
 fn make_lock_file(path: &Path) -> Result<(), StoreError> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    shipyard_sys::fs::open_lock_file(path)
         .map(drop)
         .map_err(|error| StoreError::io(format!("making {}", path.display()), error))
 }
@@ -1679,8 +1685,13 @@ fn lock_path(path: &Path, name: &str) -> Result<Flock<File>, StoreError> {
                 io::ErrorKind::NotFound => StoreError::NotFound(name.to_owned()),
                 _ => StoreError::io(format!("opening {}", path.display()), error),
             })?;
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let lock = lock_waiting(file, wait).map_err(|errno| match errno {
+        let lock = shipyard_sys::lock::lock_until(
+            file,
+            shipyard_sys::lock::Mode::Exclusive,
+            deadline,
+            Duration::from_millis(20),
+        )
+        .map_err(|errno| match errno {
             Errno::EWOULDBLOCK => StoreError::Busy(name.to_owned()),
             errno => StoreError::io(
                 format!("locking {}", path.display()),
@@ -1707,53 +1718,18 @@ fn lock_path(path: &Path, name: &str) -> Result<Flock<File>, StoreError> {
     }
 }
 
-/// Takes an exclusive `flock` on `file`, trying every 20 ms for up to `wait`.
-fn lock_waiting(file: File, wait: Duration) -> Result<Flock<File>, Errno> {
-    let deadline = Instant::now() + wait;
-    let mut file = file;
-    loop {
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => return Ok(lock),
-            Err((back, Errno::EWOULDBLOCK)) if Instant::now() < deadline => {
-                file = back;
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err((_, errno)) => return Err(errno),
-        }
-    }
-}
-
 /// Writes `bytes` to `path` through a temporary file and a rename, synced:
 /// a reader sees the old file or the new one, never half of one.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o640)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&temporary)?;
-        {
-            // Readable by the networks' DNS servers and no one else,
-            // whatever the umask.
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(fs::Permissions::from_mode(0o640))?;
-            servers_group(&file)?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    written.map_err(|error: io::Error| {
-        let _ = fs::remove_file(&temporary);
-        StoreError::io(format!("writing {}", path.display()), error)
-    })
+    // Readable by the networks' DNS servers and no one else, whatever the
+    // umask.
+    let readable_by_servers = |file: &File| {
+        shipyard_sys::fs::set_mode(file, 0o640)?;
+        servers_group(file)
+    };
+    let how = shipyard_sys::fs::Write::new(0o640).prepared_by(&readable_by_servers);
+    shipyard_sys::fs::write_atomically(path, bytes, &how)
+        .map_err(|error| StoreError::io(format!("writing {}", path.display()), error.into()))
 }
 
 /// The network `name`'s config, from `text` (its `config.json`, at `path`),
@@ -2223,6 +2199,57 @@ mod tests {
         drop(held);
     }
 
+    /// A lease that's a JSON array (serde reads a lease from one, in its
+    /// fields' order) is refused by a rename, not panicked on (F61), and
+    /// left as it was; read the same, it's found (the control: the rename
+    /// reached it).
+    #[test]
+    fn a_lease_that_isnt_an_object_is_refused_by_a_rename() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let held = network
+            .allocate(&LeaseRequest {
+                name: Some("old".into()),
+                ..request("a1")
+            })
+            .unwrap();
+        let object: serde_json::Value =
+            serde_json::from_slice(&fs::read(&held.path).unwrap()).unwrap();
+        let array = serde_json::json!([
+            object["ip"],
+            object["mac"],
+            object["run"],
+            object["hostname"],
+            object["host_veth"],
+            [],
+            "old"
+        ]);
+        let text = serde_json::to_vec(&array).unwrap();
+        assert!(
+            serde_json::from_slice::<Lease>(&text).is_ok(),
+            "read as a lease, as `rename` finds it"
+        );
+        {
+            use std::os::unix::fs::FileExt as _;
+            let file = OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(&held.path)
+                .unwrap();
+            file.set_len(0).unwrap();
+            file.write_all_at(&text, 0).unwrap();
+        }
+        let refused = network.rename("c9", Some("old"), "new");
+        assert!(
+            format!("{refused:?}").contains("not a JSON object"),
+            "refused for being one: {refused:?}"
+        );
+        assert_eq!(fs::read(&held.path).unwrap(), text, "left as it was");
+        drop(held);
+    }
+
     /// A container's live lease is the one that says its ID, before one of
     /// its name that says no container (a run with no record named so);
     /// that one is found by its name only when the caller gives it (all the
@@ -2452,7 +2479,16 @@ mod tests {
         lease.give_up();
         assert!(network.sweep().unwrap().is_empty(), "held by the copy");
         drop(copy);
-        let swept = network.sweep().unwrap();
+        // Free once the copy is closed: once, too, any stray copy another
+        // test's child holds between its fork and its exec is (AGENTS §10).
+        let began = std::time::Instant::now();
+        let swept = loop {
+            let swept = network.sweep().unwrap();
+            if !swept.is_empty() || began.elapsed() > std::time::Duration::from_secs(10) {
+                break swept;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(swept.len(), 1, "free once the copy is closed");
         assert_eq!(swept[0].run, "a");
     }
@@ -2676,6 +2712,26 @@ mod tests {
         assert_eq!(names, ["app"]);
     }
 
+    /// The record of closed routing names every interface the host had, so
+    /// a host with hundreds (another engine's veths) still reads as closed.
+    #[test]
+    fn routing_closed_on_a_host_of_many_interfaces_reads() {
+        use crate::Family;
+        if !Path::new("/proc/sys/kernel/random/boot_id").exists() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        let many: Vec<String> = (0..300).map(|n| format!("veth{n:011}")).collect();
+        networks.close_routing(Family::V4, &many).unwrap();
+        assert!(fs::metadata(scratch.0.join(ROUTING_CLOSED)).unwrap().len() > LINE_MAX);
+        let closed = networks.routing_closed().closed;
+        assert_eq!(
+            (closed.families, closed.interfaces),
+            (vec![Family::V4], many)
+        );
+    }
+
     #[test]
     fn routing_is_closed_per_family_and_for_this_boot_only() {
         use crate::Family;
@@ -2683,7 +2739,7 @@ mod tests {
         let scratch = Scratch::new();
         let networks = Networks::open(&scratch.0).unwrap();
         let names = |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.into()).collect() };
-        assert_eq!(networks.routing_closed(), ClosedRouting::default());
+        assert_eq!(networks.routing_closed().closed, ClosedRouting::default());
         networks
             .close_routing(Family::V6, &names(&["eth0", "wlan0"]))
             .unwrap();
@@ -2691,7 +2747,7 @@ mod tests {
         // another boot is nothing.
         if Path::new("/proc/sys/kernel/random/boot_id").exists() {
             assert_eq!(
-                networks.routing_closed(),
+                networks.routing_closed().closed,
                 ClosedRouting {
                     families: vec![Family::V6],
                     interfaces: names(&["eth0", "wlan0"]),
@@ -2702,7 +2758,7 @@ mod tests {
                 .close_routing(Family::V4, &names(&["eth0", "eth1"]))
                 .unwrap();
             assert_eq!(
-                networks.routing_closed(),
+                networks.routing_closed().closed,
                 ClosedRouting {
                     families: vec![Family::V4, Family::V6],
                     interfaces: names(&["eth0", "eth1", "wlan0"]),
@@ -2710,12 +2766,89 @@ mod tests {
             );
             fs::write(scratch.0.join(ROUTING_CLOSED6), "another-boot\nwlan0\n").unwrap();
             assert_eq!(
-                networks.routing_closed(),
+                networks.routing_closed().closed,
                 ClosedRouting {
                     families: vec![Family::V4],
                     interfaces: names(&["eth0", "eth1"]),
                 }
             );
+        }
+    }
+
+    /// A record that's there but can't be read fails the reading, never
+    /// reads as "not closed" (F65); a missing one is no closing, and a
+    /// readable one this boot's is read (the positive control).
+    #[test]
+    fn routing_closed_fails_closed_on_a_record_it_cant_read() {
+        use crate::Family;
+        use std::os::unix::fs::PermissionsExt as _;
+        if !Path::new("/proc/sys/kernel/random/boot_id").exists() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        assert_eq!(networks.routing_closed().closed.families, vec![]);
+        networks
+            .close_routing(Family::V4, &["eth0".to_owned()])
+            .unwrap();
+        let record = scratch.0.join(ROUTING_CLOSED);
+        assert_eq!(networks.routing_closed().closed.families, vec![Family::V4]);
+        let fails = |what: &str| {
+            let records = networks.routing_closed();
+            assert!(
+                matches!(
+                    records.unread.as_slice(),
+                    [(Family::V4, StoreError::Io { .. })]
+                ),
+                "{what} must be unread: {records:?}"
+            );
+            assert!(records.closed.families.is_empty(), "{what}: {records:?}");
+        };
+        // A symbolic link to a good record (read without following).
+        let good = scratch.0.join("good");
+        fs::rename(&record, &good).unwrap();
+        std::os::unix::fs::symlink(&good, &record).unwrap();
+        fails("a symbolic link");
+        fs::remove_file(&record).unwrap();
+        // Past its bound.
+        let mut big = fs::read_to_string(&good).unwrap();
+        big.push_str(&"x".repeat(usize::try_from(ROUTING_CLOSED_MAX).unwrap()));
+        fs::write(&record, big).unwrap();
+        fails("a record past its bound");
+        fs::remove_file(&record).unwrap();
+        // Not a regular file.
+        fs::create_dir(&record).unwrap();
+        fails("a directory");
+        fs::remove_dir(&record).unwrap();
+        // Not text.
+        fs::write(&record, b"\xff\xfe\n").unwrap();
+        fails("a record that isn't text");
+        fs::remove_file(&record).unwrap();
+        // A directory in its place can't be written over either: said.
+        fs::create_dir(&record).unwrap();
+        assert!(matches!(
+            networks.close_routing(Family::V4, &["eth0".to_owned()]),
+            Err(StoreError::Io { .. })
+        ));
+        fs::remove_dir(&record).unwrap();
+        // One family's record unreadable keeps the other's.
+        networks
+            .close_routing(Family::V6, &["wlan0".to_owned()])
+            .unwrap();
+        fs::write(&record, b"\xff").unwrap();
+        let records = networks.routing_closed();
+        assert_eq!(records.closed.families, vec![Family::V6]);
+        assert!(matches!(records.unread.as_slice(), [(Family::V4, _)]));
+        fs::remove_file(&record).unwrap();
+        fs::remove_file(scratch.0.join(ROUTING_CLOSED6)).unwrap();
+        // Unreadable: only the mapping (the store is root's, and root reads
+        // it all the same).
+        fs::rename(&good, &record).unwrap();
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o000)).unwrap();
+        if nix::unistd::geteuid().is_root() {
+            assert_eq!(networks.routing_closed().closed.families, vec![Family::V4]);
+        } else {
+            fails("an unreadable record");
         }
     }
 
@@ -2986,6 +3119,70 @@ mod tests {
         assert!(leases.read_live().unwrap().settled);
     }
 
+    /// A lease larger than any Shipyard writes reads as no lease (one being
+    /// written, or something else), never as an error that would hide the
+    /// network's other leases.
+    #[test]
+    fn a_lease_over_its_bound_reads_as_none() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let live = network.allocate(&request("a")).unwrap();
+        let path = scratch.0.join("app/leases/10.89.0.2");
+        // The control: the lease as written reads.
+        let (lease, _) = open_lease(&path).unwrap().unwrap();
+        assert_eq!(lease.as_ref(), Some(live.lease()));
+        let mut bloated = fs::read(&path).unwrap();
+        bloated.resize(usize::try_from(LEASE_MAX).unwrap() + 1, b' ');
+        fs::write(&path, &bloated).unwrap();
+        let (lease, _) = open_lease(&path).unwrap().unwrap();
+        assert_eq!(lease, None);
+    }
+
+    /// A config larger than any Shipyard writes is refused: an error, not
+    /// a network made of part of it.
+    #[test]
+    fn a_config_over_its_bound_is_refused() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        assert!(networks.get("app").unwrap().is_some(), "the control");
+        let path = scratch.0.join("app/config.json");
+        let mut bloated = fs::read(&path).unwrap();
+        bloated.resize(usize::try_from(CONFIG_MAX).unwrap() + 1, b' ');
+        fs::write(&path, &bloated).unwrap();
+        let err = networks.get("app").unwrap_err();
+        let StoreError::Io { source, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(
+            shipyard_sys::fs::refusal(source),
+            Some(shipyard_sys::fs::Refusal::TooLarge { cap: CONFIG_MAX })
+        );
+        assert!(
+            NetworksDir::open(&networks)
+                .unwrap()
+                .config("app")
+                .is_none()
+        );
+    }
+
+    /// A config is the DNS servers' to read from the moment it's written,
+    /// not only once a lease is handed out (`allocate` shares it again).
+    #[test]
+    fn a_config_is_written_for_the_servers_to_read() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let config = fs::metadata(scratch.0.join("app/config.json")).unwrap();
+        assert_eq!(config.permissions().mode() & 0o777, 0o640);
+        if nix::unistd::geteuid().is_root() {
+            assert_eq!(config.gid(), SERVERS_GROUP);
+        }
+    }
+
     #[test]
     fn a_lease_directory_lists_live_leases_through_its_descriptor() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3206,14 +3403,22 @@ mod tests {
         let scratch = Scratch::new();
         let networks = Networks::open(&scratch.0).unwrap();
         networks.create(&spec("app"), &[]).unwrap();
-        let _held = networks.lock("app").unwrap();
-        let file = OpenOptions::new()
-            .read(true)
-            .open(scratch.0.join("app").join("lock"))
-            .unwrap();
-        assert_eq!(
-            lock_waiting(file, Duration::from_millis(50)).unwrap_err(),
-            Errno::EWOULDBLOCK
-        );
+        let held = networks.lock("app").unwrap();
+        let try_lock = || {
+            let file = OpenOptions::new()
+                .read(true)
+                .open(scratch.0.join("app").join("lock"))
+                .unwrap();
+            shipyard_sys::lock::lock_until(
+                file,
+                shipyard_sys::lock::Mode::Exclusive,
+                Instant::now() + Duration::from_millis(50),
+                Duration::from_millis(20),
+            )
+        };
+        assert_eq!(try_lock().unwrap_err(), Errno::EWOULDBLOCK);
+        // The control: let go, it's had.
+        drop(held);
+        try_lock().unwrap();
     }
 }

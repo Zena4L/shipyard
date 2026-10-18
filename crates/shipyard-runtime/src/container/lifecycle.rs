@@ -3,15 +3,14 @@
 
 use std::collections::BTreeMap;
 use std::fs::DirBuilder;
-use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg, OFlag};
+use nix::fcntl::{Flock, OFlag};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
@@ -335,14 +334,9 @@ fn create_from(
         _ => None,
     };
     let (annotations, mut warnings) = (loaded.annotations, loaded.warnings);
-    if let (Err(why), Some(_)) = (&tree, &loaded.cgroups_path) {
-        warnings.push(format!(
-            "linux.cgroupsPath is ignored: the container can't have a cgroup of its own here: \
-             {why}"
-        ));
-    }
     if let Err(why) = &tree {
-        warnings.extend(cgroup::devices_without_cgroup(&loaded.isolation, why));
+        let given_a_path = loaded.cgroups_path.is_some();
+        warnings.extend(without_a_cgroup(why, given_a_path, &loaded.isolation));
     }
     let (dir, dir_fd) = make_state_dir(root, id)?;
     let planned = matches!(origin, Origin::Plan(_));
@@ -406,7 +400,12 @@ fn create_from(
         cgroup: monitor_cgroup.as_ref().map(AsFd::as_fd),
     };
     match start_monitor(id, &dir_fd, record, given, fifo_owner(&loaded.isolation)) {
-        Ok(pid) => Ok(Created { pid, warnings }),
+        Ok((pid, monitor)) => {
+            if monitor_cgroup.is_some() {
+                monitor_joined_or_said(tree.as_ref().ok(), id, monitor, &mut warnings);
+            }
+            Ok(Created { pid, warnings })
+        }
         Err(err) => Err(failed_create(
             err,
             (&dir, &dir_fd),
@@ -415,6 +414,25 @@ fn create_from(
             hooks,
         )),
     }
+}
+
+/// What `create` says of a container that can't have a cgroup of its own
+/// here (`why`): the `linux.cgroupsPath` it was given (`given_a_path`) is
+/// ignored, and the device rules of its `isolation` it can't be held to.
+fn without_a_cgroup(
+    why: &cgroup::NoTree,
+    given_a_path: bool,
+    isolation: &crate::isolation::Isolation,
+) -> Vec<String> {
+    let mut said = Vec::new();
+    if given_a_path {
+        said.push(format!(
+            "linux.cgroupsPath is ignored: the container can't have a cgroup of its own here: \
+             {why}"
+        ));
+    }
+    said.extend(cgroup::devices_without_cgroup(isolation, why));
+    said
 }
 
 /// After a `create` that failed (`err`) once its state directory `dir`
@@ -501,9 +519,12 @@ fn write_plan(json: &[u8], dir: &Path, dir_fd: &OwnedFd) -> Result<PathBuf> {
 }
 
 /// Refuses holds that aren't descriptors the monitor can keep: a standard
-/// stream, one given twice, or one of those passed to the container's
-/// process (their targets, 3 and up, or this process's copies of them); or
-/// whose label isn't one.
+/// stream, one given twice, one of those passed to the container's process
+/// (their targets, 3 and up, or this process's copies of them), or one
+/// that isn't a file, a directory or a socket (a pipe, a device: as a hold
+/// added since is checked, F73); or whose label isn't one. A socket is set
+/// not to linger on close as it's checked, as the monitor would (on the
+/// caller's open file too, which it shares).
 fn check_holds(options: &CreateOptions<'_>) -> Result<()> {
     let (count, copies) = options.passed.map_or((0, Vec::new()), |passed| {
         (passed.len(), passed.plan().sources)
@@ -517,7 +538,11 @@ fn check_holds(options: &CreateOptions<'_>) -> Result<()> {
     let mut seen = Vec::new();
     for hold in options.holds {
         let fd = hold.fd.as_raw_fd();
-        if fd < first_free || seen.contains(&fd) || copies.contains(&fd) {
+        if fd < first_free
+            || seen.contains(&fd)
+            || copies.contains(&fd)
+            || holds::holdable(hold.fd).is_err()
+        {
             return Err(ContainerError::BadHold(fd));
         }
         if !crate::attach::is_label(hold.label) {
@@ -773,7 +798,8 @@ fn fifo_owner(isolation: &crate::isolation::Isolation) -> Option<(u32, u32)> {
 }
 
 /// Fills the state directory open at `dir` in, starts the monitor and
-/// waits for its answer.
+/// waits for its answer: the init's PID, and the monitor's PID and start
+/// time.
 ///
 /// Locked only while the directory is filled in: the setup can take a
 /// while, and meanwhile `state` must say "creating", and `delete` must be
@@ -785,7 +811,7 @@ fn start_monitor(
     mut record: Record,
     given: ForTheMonitor<'_>,
     fifo_owner: Option<(u32, u32)>,
-) -> Result<i32> {
+) -> Result<(i32, Option<(i32, u64)>)> {
     let (mut answers, monitor) = {
         let _lock = lock_at(dir).map_err(locking(id))?;
         let poststart = record
@@ -852,14 +878,14 @@ fn start_monitor(
     match answer {
         Ok(Answer::Created(_)) => {}
         // It ends by itself: what it made is gone with it before the state
-        // is.
-        Ok(Answer::Failed(_)) => wait_gone(monitor),
+        // is. One still there past the wait is ended (F82).
+        Ok(Answer::Failed(_)) => after_failure(monitor, LOCK_WAIT),
         // Not heard (gone, or it said nothing that makes sense): it's
         // ended, with its setup and hooks, before the state is removed.
         _ => end_monitor(monitor),
     }
     match answer? {
-        Answer::Created(pid) => Ok(pid),
+        Answer::Created(pid) => Ok((pid, monitor)),
         Answer::Failed(message) => Err(ContainerError::Setup(message)),
         Answer::Monitor(_) => Err(ContainerError::Setup(
             "the container's monitor answered out of order".to_owned(),
@@ -880,18 +906,34 @@ fn end_monitor(monitor: Option<(i32, u64)>) {
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
-        wait_gone(Some((pid, started)));
+        wait_gone(Some((pid, started)), LOCK_WAIT);
     }
 }
 
-/// Waits (bounded, as long as a lock is waited for) for the monitor
-/// `monitor` names to have ended: it isn't this process's child to reap.
-fn wait_gone(monitor: Option<(i32, u64)>) {
+/// Waits up to `bound` for a monitor that said its setup failed to end by
+/// itself, and ends it if it hasn't (F82): its caller, told the start
+/// failed, lets go of the `running` lock it gave it a copy of, so no
+/// monitor may outlive the failure.
+fn after_failure(monitor: Option<(i32, u64)>, bound: Duration) {
+    if !wait_gone(monitor, bound) {
+        end_monitor(monitor);
+    }
+}
+
+/// Waits (up to `bound`) for the monitor `monitor` names to have ended (it
+/// isn't this process's child to reap): whether it has.
+fn wait_gone(monitor: Option<(i32, u64)>, bound: Duration) -> bool {
     let Some((pid, started)) = monitor else {
-        return;
+        return true;
     };
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
-    while is_alive(pid, started) && std::time::Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if !is_alive(pid, started) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -987,12 +1029,58 @@ fn monitor_procs_or_said(
     warnings: &mut Vec<String>,
 ) -> Option<std::fs::File> {
     monitor_procs(tree?, id).unwrap_or_else(|why| {
-        warnings.push(format!(
-            "its monitor stays in this process's cgroup (a login session's, a unit's): a \
-             shutdown may end it before `system stop` reaches it ({why})"
-        ));
+        warnings.push(monitor_elsewhere(&why));
         None
     })
+}
+
+/// What a monitor left out of its own cgroup is said as, with `why`.
+fn monitor_elsewhere(why: &str) -> String {
+    format!(
+        "its monitor stays in this process's cgroup (a login session's, a unit's): a shutdown \
+         may end it before `system stop` reaches it ({why})"
+    )
+}
+
+/// Whether a monitor's cgroup has it, by its `cgroup.procs` (`procs`): any
+/// process there is it, or one it started.
+fn monitor_joined(procs: &str) -> bool {
+    procs.lines().any(|line| !line.trim().is_empty())
+}
+
+/// Whether a monitor's join of its own cgroup failed: its cgroup's
+/// `procs` empty while it's still there (`alive`). One gone already (its
+/// container ended at once) has left it, and says nothing (F110).
+fn join_failed(procs: &str, alive: bool) -> bool {
+    alive && !monitor_joined(procs)
+}
+
+/// Once the monitor has answered (`Created`: it's in its own cgroup, or
+/// isn't), its join is said in `warnings` if it failed (F61): its cgroup in
+/// `tree` read, and found empty while the monitor (its PID and start time)
+/// is still there. A read that fails says nothing (a monitor gone since,
+/// its cgroup removed, can't be told from one that failed).
+fn monitor_joined_or_said(
+    tree: Option<&cgroup::Tree>,
+    id: &str,
+    monitor: Option<(i32, u64)>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(tree) = tree else {
+        return;
+    };
+    let procs = tree
+        .base()
+        .join(cgroup::monitor_cgroup(id))
+        .join("cgroup.procs");
+    if let Ok(procs) = std::fs::read_to_string(procs)
+        && join_failed(
+            &procs,
+            monitor.is_some_and(|(pid, started)| is_alive(pid, started)),
+        )
+    {
+        warnings.push(monitor_elsewhere("it couldn't join its own"));
+    }
 }
 
 /// Removes container `id`'s monitor's cgroup. Its last processes (the
@@ -1087,13 +1175,9 @@ fn spawn_monitor(
             // Out of the caller's cgroup first: the monitor forked from
             // this process, and all it starts, live in its own. (Joined by
             // writing "0", this process; a failure leaves it where it is,
-            // said, as `create` has said nothing of it.)
-            if let Some(procs) = cgroup_procs
-                && libc::write(procs, b"0".as_ptr().cast(), 1) != 1
-            {
-                const SAID: &[u8] =
-                    b"shipyard: the container's monitor couldn't join its own cgroup\n";
-                let _ = libc::write(libc::STDERR_FILENO, SAID.as_ptr().cast(), SAID.len());
+            // and `create` says so in its warnings, once it has answered.)
+            if let Some(procs) = cgroup_procs {
+                let _ = libc::write(procs, b"0".as_ptr().cast(), 1);
             }
             let mut none: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&raw mut none);
@@ -1516,7 +1600,7 @@ pub fn init_process(root: &Path, id: &str) -> Result<super::InitProcess> {
 /// No such container, or the file couldn't be read.
 pub fn exit_record(root: &Path, id: &str) -> Result<Option<ExitRecord>> {
     let dir = existing(root, id)?;
-    let file = match std::fs::File::open(dir.join(EXIT_FILE)) {
+    let file = match shipyard_sys::fs::open_for_reading(&dir.join(EXIT_FILE)) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -1525,11 +1609,19 @@ pub fn exit_record(root: &Path, id: &str) -> Result<Option<ExitRecord>> {
             ));
         }
     };
-    let mut bytes = Vec::new();
-    (&file)
-        .take(versions::EXIT_MAX)
-        .read_to_end(&mut bytes)
-        .map_err(io(format!("reading {}", dir.join(EXIT_FILE).display())))?;
+    // One larger than any the monitor writes isn't read: it's a record
+    // that can't be made sense of, which still says it ended.
+    let bytes = match shipyard_sys::fs::read_bounded_from(&file, versions::EXIT_MAX) {
+        Err(err)
+            if matches!(
+                shipyard_sys::fs::refusal(&err),
+                Some(shipyard_sys::fs::Refusal::TooLarge { .. })
+            ) =>
+        {
+            Vec::new()
+        }
+        read => read.map_err(io(format!("reading {}", dir.join(EXIT_FILE).display())))?,
+    };
     let mut ended = ExitRecord::parse(&bytes);
     // Version 0 says nothing of when (nor one that can't be read): the
     // monitor wrote it last, so the file's modification time is the end's.
@@ -1769,6 +1861,30 @@ pub fn peek_init(root: &Path, id: &str) -> Result<Option<(i32, u64)>> {
         Err(err) => return Err(err),
     };
     Ok(read_record(&dir)?.and_then(|record| record.init))
+}
+
+/// Container `id`'s monitor's PID and start time, as its state records
+/// them, read without taking its lock (as [`peek_init`]): `None` if it has
+/// none (or no such container). Each start has a monitor of its own: what
+/// tells one start's state from the next's.
+///
+/// # Errors
+///
+/// Its state can't be read.
+pub fn peek_monitor(root: &Path, id: &str) -> Result<Option<(i32, u64)>> {
+    let dir = match existing(root, id) {
+        Ok(dir) => dir,
+        Err(ContainerError::NotFound(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(read_record(&dir)?.and_then(|record| record.monitor))
+}
+
+/// Process `pid`'s start time (clock ticks since boot, as [`peek_init`]
+/// and [`peek_monitor`] give them), if it's there (a zombie isn't).
+#[must_use]
+pub fn process_started(pid: i32) -> Option<u64> {
+    start_time(pid)
 }
 
 /// Whether process `pid` is still the one that started at `started` (clock
@@ -2195,24 +2311,15 @@ fn lock_at(dir: &OwnedFd) -> nix::Result<Flock<OwnedFd>> {
 /// [`lock_at`], calling `between` between tries instead of sleeping: the
 /// monitor serves its clients meanwhile (F41), waiting on them for about
 /// [`POLL_INTERVAL`].
-fn lock_at_with(dir: &OwnedFd, mut between: impl FnMut()) -> nix::Result<Flock<OwnedFd>> {
+fn lock_at_with(dir: &OwnedFd, between: impl FnMut()) -> nix::Result<Flock<OwnedFd>> {
     let deadline = Instant::now() + LOCK_WAIT;
-    let mut fd = nix::fcntl::openat(
+    let fd = nix::fcntl::openat(
         dir,
         ".",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )?;
-    loop {
-        match Flock::lock(fd, FlockArg::LockExclusiveNonblock) {
-            Ok(locked) => return Ok(locked),
-            Err((unlocked, Errno::EWOULDBLOCK)) if Instant::now() < deadline => {
-                fd = unlocked;
-                between();
-            }
-            Err((_, errno)) => return Err(errno),
-        }
-    }
+    shipyard_sys::lock::lock_until_with(fd, shipyard_sys::lock::Mode::Exclusive, deadline, between)
 }
 
 /// The error for container `id` when [`lock_at`] fails: busy if it timed
@@ -2284,7 +2391,7 @@ fn init_gone(dir: &Path) -> Result<bool> {
 }
 
 fn read_record(dir: &Path) -> Result<Option<Record>> {
-    match std::fs::read(dir.join(STATE_FILE)) {
+    match shipyard_sys::fs::read_bounded(&dir.join(STATE_FILE), versions::STATE_MAX) {
         Ok(bytes) => parse_record(&bytes, &dir.join(STATE_FILE).display()).map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(io(format!("reading {}", dir.join(STATE_FILE).display()))(
@@ -2295,23 +2402,11 @@ fn read_record(dir: &Path) -> Result<Option<Record>> {
 
 /// `state.json` in the directory open at `dir` (`None` if it's missing).
 fn read_record_at(dir: &OwnedFd) -> Result<Option<Record>> {
-    let file = match nix::fcntl::openat(
-        dir,
-        STATE_FILE,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => std::fs::File::from(fd),
-        Err(Errno::ENOENT) => return Ok(None),
-        Err(errno) => return Err(errno_io(format!("reading {STATE_FILE}"))(errno)),
-    };
-    // Read whole (no bound): it's this runtime's own file, in the caller's
-    // directory.
-    let mut bytes = Vec::new();
-    (&file)
-        .read_to_end(&mut bytes)
-        .map_err(io(format!("reading {STATE_FILE}")))?;
-    parse_record(&bytes, &STATE_FILE).map(Some)
+    match shipyard_sys::fs::read_bounded_at(dir.as_fd(), STATE_FILE, versions::STATE_MAX) {
+        Ok(bytes) => parse_record(&bytes, &STATE_FILE).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io(format!("reading {STATE_FILE}"))(err)),
+    }
 }
 
 /// A record of any version this Shipyard reads (`file` names it in an
@@ -2337,20 +2432,15 @@ fn write_record_at(dir: &OwnedFd, record: &Record) -> Result<()> {
     write_atomically_at(dir, STATE_FILE, &json).map_err(errno_io(format!("writing {STATE_FILE}")))
 }
 
-/// Writes `name` in the directory open at `dir` whole or not at all: a
-/// temporary file, then `rename`. In a removed directory, ENOENT.
+/// Writes `name` in the directory open at `dir` whole or not at all
+/// (`shipyard_sys::fs::write_atomically_at`): the runtime's own files, the
+/// caller's alone. Not synced: the runtime's root is under `/run`, which a
+/// restart empties anyway. In a removed directory, ENOENT.
 fn write_atomically_at(dir: &OwnedFd, name: &str, bytes: &[u8]) -> nix::Result<()> {
-    let temporary = format!("{name}.tmp");
-    let fd = nix::fcntl::openat(
-        dir,
-        temporary.as_str(),
-        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::S_IRUSR | Mode::S_IWUSR,
-    )?;
-    std::fs::File::from(fd)
-        .write_all(bytes)
-        .map_err(|err| crate::process::io_errno(&err))?;
-    nix::fcntl::renameat(dir, temporary.as_str(), dir, name)
+    use shipyard_sys::fs::{Durability, Write};
+    let how = Write::new(0o600).durability(Durability::Atomic);
+    shipyard_sys::fs::write_atomically_at(dir.as_fd(), name, bytes, &how)
+        .map_err(|error| crate::process::io_errno(&error.source))
 }
 
 /// A process's start time (`/proc/PID/stat` field 22), if it exists and
@@ -2366,57 +2456,103 @@ fn is_alive(pid: i32, started: u64) -> bool {
     start_time(pid) == Some(started)
 }
 
+/// The signal's error when `pidfd_open` refused (`error`), or `None` where
+/// pidfds can't be had at all ([`shipyard_sys::pidfd::unsupported`]: then
+/// a checked `kill`). Any other refusal (`ESRCH`: gone; `EMFILE`) is
+/// returned, never the PID-reuse race the pidfd closes (F110).
+fn unpinned(error: &std::io::Error) -> Option<Errno> {
+    if shipyard_sys::pidfd::unsupported(error) {
+        return None;
+    }
+    Some(error.raw_os_error().map_or(Errno::EIO, Errno::from_raw))
+}
+
 /// A pidfd for `pid` (`pidfd_open`, Linux 5.3): readable once it has
 /// exited. None where it can't be had (an older kernel, a seccomp policy
 /// that refuses it): then the clock wakes the loop.
 fn pidfd_open(pid: i32) -> Option<OwnedFd> {
-    // SAFETY: `pidfd_open` takes a PID and flags, and returns a new
-    // descriptor or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let fd = RawFd::try_from(fd).ok().filter(|&fd| fd >= 0)?;
-    // SAFETY: just made by the kernel, ours alone.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    shipyard_sys::pidfd::open(pid).ok()
 }
 
 /// Sends `signal` to process `pid`, if it's still the one that started at
 /// `started` (an init or a monitor). Through a pidfd where
 /// the kernel has them (5.3): once open, it names that process even if it
 /// dies and its PID is reused, so the check and the signal can't be split
-/// by a reuse. Without pidfds, a plain `kill` after the check.
+/// by a reuse. Without pidfds (an old kernel, a policy refusing them), a
+/// plain `kill` after the check; any other refusal is the error (F110).
 fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()> {
-    // SAFETY: `pidfd_open` takes a PID and flags, and returns a new
-    // descriptor (or -1).
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let pidfd = libc::c_int::try_from(pidfd).unwrap_or(-1);
-    if pidfd < 0 {
+    let pidfd = match shipyard_sys::pidfd::open(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(error) => match unpinned(&error) {
+            Some(errno) => return Err(errno),
+            None => None,
+        },
+    };
+    let Some(pidfd) = pidfd else {
         if !is_alive(pid, started) {
             return Err(Errno::ESRCH);
         }
         // By number: a real-time signal too (nix's `Signal` has none).
         // SAFETY: `kill` with plain integers.
         return Errno::result(unsafe { libc::kill(pid, signal) }).map(drop);
-    }
-    // SAFETY: `pidfd_open` just returned it; nothing else owns it.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    };
     if !is_alive(pid, started) {
         return Err(Errno::ESRCH);
     }
-    // SAFETY: a valid pidfd, a signal number, no siginfo, no flags.
-    let sent = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    Errno::result(sent).map(drop)
+    shipyard_sys::pidfd::send_signal(pidfd.as_fd(), signal)
+        .map_err(|error| Errno::from_raw(error.raw_os_error().unwrap_or(libc::EIO)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only where pidfds can't be had does a signal go by number (F110):
+    /// running out of descriptors, or the process gone, is the signal's
+    /// error, not the PID-reuse race.
+    #[test]
+    fn only_a_kernel_without_pidfds_signals_by_number() {
+        let refused = |code| unpinned(&std::io::Error::from_raw_os_error(code));
+        assert_eq!(refused(libc::ENOSYS), None);
+        assert_eq!(refused(libc::EPERM), None, "a policy's refusal");
+        for code in [libc::EMFILE, libc::ESRCH, libc::ENOMEM] {
+            assert_eq!(refused(code), Some(Errno::from_raw(code)), "{code}");
+        }
+        assert_eq!(
+            unpinned(&std::io::Error::other("no number")),
+            Some(Errno::EIO)
+        );
+    }
+
+    /// A monitor that said its setup failed and is still there past the
+    /// wait is ended (F82); one that ends by itself within it is left to
+    /// (the control: not killed, and not waited for to the bound).
+    #[test]
+    fn a_monitor_that_outlives_its_failure_is_ended() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        let spawn = |script: &str| {
+            let child = std::process::Command::new("sh")
+                .args(["-c", script])
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            (child, Some((pid, start_time(pid).unwrap())))
+        };
+        let (mut stuck, monitor) = spawn("exec sleep 60");
+        after_failure(monitor, Duration::from_millis(50));
+        let status = stuck.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        let (mut ending, monitor) = spawn("sleep 0.3; exit 0");
+        let began = std::time::Instant::now();
+        after_failure(monitor, Duration::from_secs(10));
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(ending.wait().unwrap().success());
+    }
 
     /// A monitor's cgroup that was there and empty (removed now), or wasn't
     /// there, is made again, new (a sweep spares it for a minute); one with
@@ -2715,8 +2851,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// An exit record is read up to [`versions::EXIT_MAX`], however big the
-    /// file; and stage 8's text, given the time it was written.
+    /// A `state.json` larger than [`versions::STATE_MAX`] isn't read, by
+    /// path or through its directory: refused, a failure to read it.
+    #[test]
+    fn a_state_file_over_its_bound_is_refused() {
+        let dir = std::env::temp_dir().join(format!("shipyard-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fd = open_directory(&dir).unwrap();
+        // The control: none there reads as none.
+        assert!(read_record(&dir).unwrap().is_none());
+        let file = std::fs::File::create(dir.join(STATE_FILE)).unwrap();
+        file.set_len(versions::STATE_MAX + 1).unwrap();
+        let refused = |err: ContainerError| match err {
+            ContainerError::Io { error, .. } => shipyard_sys::fs::refusal(&error),
+            other => panic!("{other}"),
+        };
+        let too_large = Some(shipyard_sys::fs::Refusal::TooLarge {
+            cap: versions::STATE_MAX,
+        });
+        assert_eq!(refused(read_record(&dir).unwrap_err()), too_large);
+        assert_eq!(refused(read_record_at(&fd).unwrap_err()), too_large);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An exit record is read up to [`versions::EXIT_MAX`]: a larger one
+    /// isn't read at all, and counts as one that can't be made sense of (it
+    /// ended, with no code); stage 8's text is given the time it was
+    /// written.
     #[test]
     fn an_exit_record_is_read_within_bounds() {
         let root = std::env::temp_dir().join(format!("shipyard-exit-{}", std::process::id()));
@@ -2727,14 +2889,15 @@ mod tests {
             .create(root.join("big"))
             .unwrap();
         assert_eq!(exit_record(&root, "big").unwrap(), None, "not ended yet");
-        let mut huge = b"exited (exit code 4)".to_vec();
-        huge.resize(4 * 1024 * 1024, b' ');
-        huge.extend_from_slice(b"end");
-        std::fs::write(root.join("big").join(EXIT_FILE), &huge).unwrap();
+        // The control: stage 8's text, within the bound, gives its code.
+        std::fs::write(root.join("big").join(EXIT_FILE), b"exited (exit code 4)").unwrap();
         let ended = exit_record(&root, "big").unwrap().unwrap();
         assert_eq!((ended.version, ended.code), (0, Some(4)));
-        assert!(ended.description.len() <= usize::try_from(versions::EXIT_MAX).unwrap());
-        assert!(!ended.description.contains("end"));
+        let mut huge = b"exited (exit code 4)".to_vec();
+        huge.resize(usize::try_from(versions::EXIT_MAX).unwrap() + 1, b' ');
+        std::fs::write(root.join("big").join(EXIT_FILE), &huge).unwrap();
+        let ended = exit_record(&root, "big").unwrap().unwrap();
+        assert_eq!((ended.version, ended.code), (0, None));
         let written = std::fs::metadata(root.join("big").join(EXIT_FILE))
             .unwrap()
             .modified()
@@ -2743,13 +2906,32 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A monitor's cgroup has it when its `cgroup.procs` lists anyone
+    /// (F61: an empty one means its join failed, said in `create`'s
+    /// warnings).
+    #[test]
+    fn a_monitor_has_joined_when_its_cgroup_lists_it() {
+        assert!(!monitor_joined(""));
+        assert!(!monitor_joined("\n"));
+        assert!(monitor_joined("4242\n"));
+        assert!(monitor_joined("4242\n4243\n"));
+        // Said only while the monitor is there: one gone already (its
+        // container ended at once) left it (F110).
+        assert!(join_failed("", true));
+        assert!(!join_failed("", false), "gone: nothing to say");
+        assert!(!join_failed("4242\n", true));
+    }
+
     /// A hold must be above the standard streams and the descriptors passed
-    /// to the container, and given once.
+    /// to the container, given once, and a file, a directory or a socket
+    /// (F73: a pipe's end is refused, as a hold added since is).
     #[test]
     fn holds_are_checked() {
         use super::super::Hold;
-        let one = std::fs::File::open("/dev/null").unwrap();
-        let other = std::fs::File::open("/dev/null").unwrap();
+        let one = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let other = std::fs::File::open("/").unwrap();
+        let (socket, _) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (reading, _writing) = std::io::pipe().unwrap();
         let held = |fd, label| Hold { fd, label };
         let check = |holds: &[Hold<'_>]| {
             check_holds(&CreateOptions {
@@ -2758,6 +2940,11 @@ mod tests {
             })
         };
         assert!(check(&[held(one.as_fd(), "lease:app"), held(other.as_fd(), "port")]).is_ok());
+        assert!(check(&[held(socket.as_fd(), "port")]).is_ok(), "a socket");
+        assert!(matches!(
+            check(&[held(reading.as_fd(), "a")]),
+            Err(ContainerError::BadHold(_))
+        ));
         // Two of a label are fine (two ports): only a hold since must be
         // the only one of its label.
         assert!(check(&[held(one.as_fd(), "port"), held(other.as_fd(), "port")]).is_ok());

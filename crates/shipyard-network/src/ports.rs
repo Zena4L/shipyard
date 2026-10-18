@@ -19,6 +19,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::OwnedFd;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -287,13 +288,20 @@ impl HeldPort {
 
 /// Holds the host's port for each of `requests`, in order: the ports asked
 /// for, or free ones the kernel picks. Either all are held, or none.
-pub fn hold(requests: &[PortRequest]) -> Result<Vec<HeldPort>, PortError> {
-    requests.iter().map(hold_one).collect()
+/// `lock_dir`, the caller's own runtime directory, holds the lock a port
+/// that only closed connections wait on is held under (Linux: see
+/// `after_time_wait`); without one, it's held under an abstract socket
+/// name, as before, which any user can take.
+pub fn hold(requests: &[PortRequest], lock_dir: Option<&Path>) -> Result<Vec<HeldPort>, PortError> {
+    requests
+        .iter()
+        .map(|request| hold_one(request, lock_dir))
+        .collect()
 }
 
 /// Holds one port: on its address (in that address's family); or, on every
 /// address, on IPv4 and on IPv6 (if the host has IPv6), the same port.
-fn hold_one(request: &PortRequest) -> Result<HeldPort, PortError> {
+fn hold_one(request: &PortRequest, lock_dir: Option<&Path>) -> Result<HeldPort, PortError> {
     use nix::sys::socket::{AddressFamily, SockaddrIn, SockaddrIn6, getsockname};
     use std::os::fd::AsRawFd as _;
     let address = request.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
@@ -317,6 +325,7 @@ fn hold_one(request: &PortRequest) -> Result<HeldPort, PortError> {
             AddressFamily::Inet6,
             &SockaddrIn6::from(std::net::SocketAddrV6::new(ip, port, 0, 0)),
             port,
+            lock_dir,
         )
     };
     let (first, host_port) = match address {
@@ -327,6 +336,7 @@ fn hold_one(request: &PortRequest) -> Result<HeldPort, PortError> {
                 AddressFamily::Inet,
                 &SockaddrIn::new(a, b, c, d, asked),
                 asked,
+                lock_dir,
             )
             .map_err(|errno| fail(asked, errno))?;
             let port = getsockname::<SockaddrIn>(socket.as_raw_fd())
@@ -370,14 +380,15 @@ fn bind_port(
     family: nix::sys::socket::AddressFamily,
     address: &dyn nix::sys::socket::SockaddrLike,
     port: u16,
+    lock_dir: Option<&Path>,
 ) -> Result<OwnedFd, nix::errno::Errno> {
     match bind_socket(protocol, family, address) {
         #[cfg(target_os = "linux")]
         Err(nix::errno::Errno::EADDRINUSE) if protocol == Protocol::Tcp && port != 0 => {
-            after_time_wait::bind(family, address, port)
+            after_time_wait::bind(family, address, port, lock_dir)
         }
         bound => {
-            let _ = port;
+            let _ = (port, lock_dir);
             bound
         }
     }
@@ -444,10 +455,16 @@ fn unbound_socket(
 /// `bind` is refused, with `SO_REUSEADDR` or not, listening or not). That
 /// leaves the moment between the two calls, and what else is on the port:
 ///
-/// 1. Under a lock every Shipyard holding a port this way takes: an
-///    abstract Unix socket's name (`@shipyard/port-reservations`). Its
-///    scope is the network namespace, as the ports'; any user can take it;
-///    and the kernel frees it when its holder ends, even killed.
+/// 1. Under a lock every run of this user's Shipyard holding a port this
+///    way takes: `port-reservations.lock` in its own runtime directory
+///    (mode 0700: no other user can take it, F53), freed when its holder
+///    ends, even killed. Without one (a rootless run with no
+///    `XDG_RUNTIME_DIR`, a root whose `/run` isn't writable), the abstract
+///    socket name `@shipyard/port-reservations`, as before: any user can
+///    take that one. Two users' Shipyards, or a v0.2.0 restart waiter
+///    beside this one, don't share a lock: each still passes step 3, but
+///    two asking for one port at the same instant could both pass step 2's
+///    moment and both hold it (Linux shares `SO_REUSEADDR` across users).
 /// 2. Bound with `SO_REUSEADDR`, which is cleared at once.
 /// 3. Kept only if every socket the kernel's tables list on the port
 ///    (`/proc/net/tcp` and `tcp6`) is in `TIME_WAIT`: a listener, a
@@ -470,8 +487,12 @@ mod after_time_wait {
 
     use crate::observe::{self, State, Table};
 
-    /// The lock's name, in the abstract namespace (no file).
-    const LOCK_NAME: &[u8] = b"shipyard/port-reservations";
+    /// The lock's file, in the caller's runtime directory.
+    const LOCK_FILE: &str = "port-reservations.lock";
+
+    /// The lock's name without a runtime directory, in the abstract
+    /// namespace (no file: any user can bind it).
+    pub(super) const LOCK_NAME: &[u8] = b"shipyard/port-reservations";
 
     /// How long the lock is waited for.
     pub(super) const LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -482,8 +503,9 @@ mod after_time_wait {
         family: AddressFamily,
         address: &dyn SockaddrLike,
         port: u16,
+        lock_dir: Option<&std::path::Path>,
     ) -> Result<OwnedFd, Errno> {
-        let Some(_lock) = Lock::take(LOCK_WAIT) else {
+        let Some(_lock) = Lock::take(lock_dir, LOCK_WAIT) else {
             return Err(Errno::EADDRINUSE);
         };
         let socket = super::unbound_socket(super::Protocol::Tcp, family)?;
@@ -520,34 +542,70 @@ mod after_time_wait {
         })
     }
 
-    /// The lock: an abstract Unix socket bound to [`LOCK_NAME`], held while
-    /// this lives.
+    /// The lock, held while this lives: [`LOCK_FILE`] in the caller's
+    /// runtime directory, or [`LOCK_NAME`] without one (held by a socket
+    /// bound to it).
     pub(super) struct Lock {
-        _held: OwnedFd,
+        _file: Option<nix::fcntl::Flock<std::fs::File>>,
+        _name: Option<OwnedFd>,
     }
 
     impl Lock {
-        /// The lock, waited for up to `wait`: `None` if it isn't had by
-        /// then (or can't be).
-        pub(super) fn take(wait: Duration) -> Option<Lock> {
-            use nix::sys::socket::{SockFlag, SockType, UnixAddr, socket};
-            let name = UnixAddr::new_abstract(LOCK_NAME).ok()?;
+        /// The lock in `dir` (made, the caller's alone, if it's missing, as
+        /// the runtime makes it), or the abstract name if there's none or
+        /// it can't be made or opened, waited for up to `wait`: `None` if
+        /// it isn't had by then.
+        pub(super) fn take(dir: Option<&std::path::Path>, wait: Duration) -> Option<Lock> {
             let deadline = Instant::now() + wait;
-            loop {
-                let socket = socket(
-                    AddressFamily::Unix,
-                    SockType::Stream,
-                    SockFlag::SOCK_CLOEXEC,
-                    None,
+            match dir.and_then(lock_file) {
+                Some(file) => shipyard_sys::lock::lock_until(
+                    file,
+                    shipyard_sys::lock::Mode::Exclusive,
+                    deadline,
+                    Duration::from_millis(5),
                 )
-                .ok()?;
-                match nix::sys::socket::bind(socket.as_raw_fd(), &name) {
-                    Ok(()) => return Some(Lock { _held: socket }),
-                    Err(Errno::EADDRINUSE) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => return None,
+                .ok()
+                .map(|file| Lock {
+                    _file: Some(file),
+                    _name: None,
+                }),
+                None => abstract_name(deadline).map(|name| Lock {
+                    _file: None,
+                    _name: Some(name),
+                }),
+            }
+        }
+    }
+
+    /// [`LOCK_FILE`] in `dir`, opened (`dir` made if it's missing).
+    fn lock_file(dir: &std::path::Path) -> Option<std::fs::File> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .ok()?;
+        shipyard_sys::fs::open_lock_file(&dir.join(LOCK_FILE)).ok()
+    }
+
+    /// A socket bound to [`LOCK_NAME`], tried until `deadline`.
+    fn abstract_name(deadline: Instant) -> Option<OwnedFd> {
+        use nix::sys::socket::{SockFlag, SockType, UnixAddr, socket};
+        let name = UnixAddr::new_abstract(LOCK_NAME).ok()?;
+        loop {
+            let socket = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .ok()?;
+            match nix::sys::socket::bind(socket.as_raw_fd(), &name) {
+                Ok(()) => return Some(socket),
+                Err(Errno::EADDRINUSE) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
+                Err(_) => return None,
             }
         }
     }
@@ -657,44 +715,67 @@ mod tests {
 
     #[test]
     fn a_held_port_is_taken_and_a_free_one_is_chosen() {
-        let held = hold(&[PortRequest {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: None,
-            container_port: 80,
-            protocol: Protocol::Tcp,
-        }])
+        let held = hold(
+            &[PortRequest {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: None,
+                container_port: 80,
+                protocol: Protocol::Tcp,
+            }],
+            None,
+        )
         .unwrap();
         let port = held[0].published.host_port;
         assert_ne!(port, 0);
-        let again = hold(&[PortRequest {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(port),
-            container_port: 80,
-            protocol: Protocol::Tcp,
-        }]);
+        let again = hold(
+            &[PortRequest {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: Some(port),
+                container_port: 80,
+                protocol: Protocol::Tcp,
+            }],
+            None,
+        );
         assert!(
             matches!(again, Err(PortError::InUse { port: p, .. }) if p == port),
             "{again:?}"
         );
-        // Free again once dropped.
+        // Free again once dropped: once every copy is closed. A test beside
+        // this one that spawns a process holds a copy of every descriptor
+        // here between its `fork` and its `exec` (close-on-exec closes them
+        // only then), so it's waited for, with a bound.
         drop(held);
-        hold(&[PortRequest {
-            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            host_port: Some(port),
-            container_port: 80,
-            protocol: Protocol::Tcp,
-        }])
-        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match hold(
+                &[PortRequest {
+                    host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    host_port: Some(port),
+                    container_port: 80,
+                    protocol: Protocol::Tcp,
+                }],
+                None,
+            ) {
+                Ok(_) => break,
+                Err(PortError::InUse { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("not free again: {error:?}"),
+            }
+        }
     }
 
     #[test]
     fn a_port_on_every_address_is_held_on_ipv6_too() {
-        let held = hold(&[PortRequest {
-            host_ip: None,
-            host_port: None,
-            container_port: 80,
-            protocol: Protocol::Tcp,
-        }])
+        let held = hold(
+            &[PortRequest {
+                host_ip: None,
+                host_port: None,
+                container_port: 80,
+                protocol: Protocol::Tcp,
+            }],
+            None,
+        )
         .unwrap();
         let port = held[0].published.host_port;
         // Where the host has IPv6 at all: an IPv6-only socket (which the
@@ -711,6 +792,54 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    /// A port whose server side closed first: that side waits on it.
+    fn time_wait_port() -> u16 {
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        drop(served);
+        std::thread::sleep(Duration::from_millis(50));
+        drop(client);
+        drop(listener);
+        std::thread::sleep(Duration::from_millis(50));
+        port
+    }
+
+    #[cfg(target_os = "linux")]
+    /// `port` held on every address, TCP, the lock in `locks`.
+    fn hold_tcp(port: u16, locks: Option<&Path>) -> Result<Vec<HeldPort>, PortError> {
+        hold(
+            &[PortRequest {
+                host_ip: None,
+                host_port: Some(port),
+                container_port: 80,
+                protocol: Protocol::Tcp,
+            }],
+            locks,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Whether `held` failed as `port` in use.
+    fn in_use(held: &Result<Vec<HeldPort>, PortError>, port: u16) -> bool {
+        matches!(held, Err(PortError::InUse { port: p, .. }) if *p == port)
+    }
+
+    #[cfg(target_os = "linux")]
+    /// A runtime directory of the test's own, for the reservation lock.
+    fn locks_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shipyard-ports-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     /// A TCP port only a closed connection waits on (`TIME_WAIT`) is held
     /// (F42), then as any held port: refused to a second hold, and to a
     /// program binding with `SO_REUSEADDR` (std's listeners do). One that
@@ -722,28 +851,9 @@ mod tests {
         use nix::sys::socket::{AddressFamily, SockaddrIn, setsockopt, sockopt};
         use std::os::fd::AsRawFd as _;
         use std::time::Duration;
-        // A port whose server side closed first: that side waits on it.
-        let time_wait = || {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let (served, _) = listener.accept().unwrap();
-            drop(served);
-            std::thread::sleep(Duration::from_millis(50));
-            drop(client);
-            drop(listener);
-            std::thread::sleep(Duration::from_millis(50));
-            port
-        };
-        let on_every_address = |port| {
-            hold(&[PortRequest {
-                host_ip: None,
-                host_port: Some(port),
-                container_port: 80,
-                protocol: Protocol::Tcp,
-            }])
-        };
-        let in_use = |held: &Result<Vec<HeldPort>, PortError>, port| matches!(held, Err(PortError::InUse { port: p, .. }) if *p == port);
+        let locks = locks_dir();
+        let time_wait = time_wait_port;
+        let on_every_address = |port| hold_tcp(port, Some(&locks));
         let port = time_wait();
         assert_eq!(
             bind_socket(
@@ -790,11 +900,64 @@ mod tests {
 
         // The lock held by another: in use, as before.
         let port = time_wait();
-        let lock = after_time_wait::Lock::take(Duration::ZERO).unwrap();
+        let lock = after_time_wait::Lock::take(Some(&locks), Duration::ZERO).unwrap();
         let locked = on_every_address(port);
         assert!(in_use(&locked, port), "{locked:?}");
         drop(lock);
         on_every_address(port).unwrap();
+
+        std::fs::remove_dir_all(&locks).unwrap();
+    }
+
+    /// The reservation lock is the caller's own (F53): the abstract name it
+    /// once was, held by anyone (another user could), is no longer in the
+    /// way. Without a runtime directory it's that name, as before: held by
+    /// another, the port is in use; free, it's held. (The lock file held by
+    /// another run is in the way: the test above.)
+    /// A socket bound to the reservation lock's abstract name: held as any
+    /// local user could hold it.
+    #[cfg(target_os = "linux")]
+    fn squat() -> OwnedFd {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, socket};
+        use std::os::fd::AsRawFd as _;
+        let squatter = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        let name = UnixAddr::new_abstract(after_time_wait::LOCK_NAME).unwrap();
+        nix::sys::socket::bind(squatter.as_raw_fd(), &name).unwrap();
+        squatter
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_reservation_lock_is_the_callers_own() {
+        let locks = locks_dir();
+        // The abstract name the lock once was, held by anyone (another user
+        // could): no longer in the way (F53). Positive control above: the
+        // lock file held is.
+        let port = time_wait_port();
+        let squatter = squat();
+        let started = std::time::Instant::now();
+        hold_tcp(port, Some(&locks)).unwrap();
+        assert!(
+            started.elapsed() < after_time_wait::LOCK_WAIT,
+            "waited for the abstract name"
+        );
+        drop(squatter);
+
+        // No runtime directory: the abstract name, as before. Held by
+        // another, the port is in use; free, it's held.
+        let port = time_wait_port();
+        let squatter = squat();
+        let without = hold_tcp(port, None);
+        assert!(in_use(&without, port), "{without:?}");
+        drop(squatter);
+        hold_tcp(port, None).unwrap();
+        std::fs::remove_dir_all(&locks).unwrap();
     }
 
     #[test]

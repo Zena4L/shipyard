@@ -25,8 +25,6 @@ mod netlink;
 pub mod nft;
 pub mod observe;
 pub mod pasta;
-#[cfg(target_os = "linux")]
-mod pidfd;
 pub mod ports;
 pub mod route;
 pub mod store;

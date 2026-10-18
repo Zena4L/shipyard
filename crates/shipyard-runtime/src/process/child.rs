@@ -406,7 +406,10 @@ fn reexec_into_clean_image(plan: &ChildPlan, reexec: &super::plan::Reexec) -> Fa
         unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) == 0 }
     });
     if !closed {
-        // No `close_range` (before Linux 5.9, or seccomp): the plan's list.
+        // No `close_range` (before Linux 5.9, or seccomp): the plan's list
+        // (the descriptors open when it was made, from `/proc`, where it
+        // could be read) rather than every number to a bound, as
+        // `close_all_but` sweeps: the gaps above are `Gaps`' too.
         let keep = |fd: RawFd| {
             reexec.inherited.contains(&fd)
                 || fd == reexec.exe
@@ -680,45 +683,112 @@ pub(super) fn make_undumpable() -> Result<(), Failure> {
 }
 
 /// Closes every descriptor from 3 up but those `exec` keeps (really closed,
-/// not only close-on-exec): `close_range` around them, or one by one up to
-/// the plan's bound where it's missing.
+/// not only close-on-exec): the plan's own and the passed ones (ascending,
+/// checked by the joiner), merged as they're walked.
 #[cfg(target_os = "linux")]
 fn close_host_fds(exec: &super::plan::ExecChild, passed: &[RawFd]) -> Result<(), Failure> {
     let as_u32 = |fd: RawFd| u32::try_from(fd).unwrap_or(0);
-    // Between the kept ones (in order; none below 3: 0, 1 and 2 stay): the
-    // plan's own, and the passed ones (ascending, checked by the joiner),
-    // merged as they're walked.
     let mut keep = exec.keep;
     keep.sort_unstable();
-    let (mut mine, mut theirs) = (keep.iter().peekable(), passed.iter().peekable());
-    let mut start = 3_u32;
-    loop {
-        let fd = match (mine.peek(), theirs.peek()) {
-            (Some(&&a), Some(&&b)) if a <= b => a,
-            (Some(_) | None, Some(&&b)) => b,
-            (Some(&&a), None) => a,
-            (None, None) => break,
-        };
-        if mine.peek() == Some(&&fd) {
-            mine.next();
-        } else {
-            theirs.next();
-        }
-        let fd = as_u32(fd);
-        if fd < start {
-            continue;
-        }
-        close_from(start, fd.saturating_sub(1), exec.fd_bound)?;
-        start = fd.saturating_add(1);
+    close_all_but(
+        Merged::new(
+            keep.iter().copied().map(as_u32),
+            passed.iter().copied().map(as_u32),
+        ),
+        exec.fd_bound,
+    )
+}
+
+/// Closes every descriptor from 3 up but `kept` (ascending): `close_range`
+/// around them, or one by one up to `bound` where it's missing. The one
+/// close-all-but (F37): the joiner's after `fork`, the helper's.
+#[cfg(target_os = "linux")]
+pub(super) fn close_all_but(kept: impl Iterator<Item = u32>, bound: RawFd) -> Result<(), Failure> {
+    for (first, last) in Gaps::new(kept) {
+        close_from(first, last, bound)?;
     }
-    close_from(start, u32::MAX, exec.fd_bound)
+    Ok(())
+}
+
+/// The descriptor ranges from 3 up that leave out `kept` (ascending; any
+/// below 3, and repeats, skipped): the gaps around them, each `(first,
+/// last)` inclusive as `close_range` takes them, the last one to the
+/// largest number. Without allocating, for code after `fork`.
+#[cfg(any(target_os = "linux", test))]
+pub(super) struct Gaps<I> {
+    kept: I,
+    /// Where the next gap may begin (none: past the largest number).
+    first: Option<u32>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<I: Iterator<Item = u32>> Gaps<I> {
+    pub(super) fn new(kept: I) -> Self {
+        Self {
+            kept,
+            first: Some(3),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<I: Iterator<Item = u32>> Iterator for Gaps<I> {
+    type Item = (u32, u32);
+
+    fn next(&mut self) -> Option<(u32, u32)> {
+        loop {
+            let first = self.first?;
+            let Some(fd) = self.kept.next() else {
+                self.first = None;
+                return Some((first, u32::MAX));
+            };
+            if fd < first {
+                continue;
+            }
+            self.first = fd.checked_add(1);
+            if fd > first {
+                return Some((first, fd.saturating_sub(1)));
+            }
+        }
+    }
+}
+
+/// Two ascending sequences walked as one, in order (without allocating).
+#[cfg(any(target_os = "linux", test))]
+pub(super) struct Merged<A: Iterator, B: Iterator> {
+    a: std::iter::Peekable<A>,
+    b: std::iter::Peekable<B>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<A: Iterator<Item = u32>, B: Iterator<Item = u32>> Merged<A, B> {
+    pub(super) fn new(a: A, b: B) -> Self {
+        Self {
+            a: a.peekable(),
+            b: b.peekable(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<A: Iterator<Item = u32>, B: Iterator<Item = u32>> Iterator for Merged<A, B> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        match (self.a.peek(), self.b.peek()) {
+            (Some(a), Some(b)) if a <= b => self.a.next(),
+            (_, Some(_)) => self.b.next(),
+            (Some(_), None) => self.a.next(),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Closes descriptors `start` to `end`: `close_range`, or one by one up to
 /// `bound` where it's missing (descriptors above it were never opened: the
 /// joiner is single-threaded).
 #[cfg(target_os = "linux")]
-pub(super) fn close_from(start: u32, end: u32, bound: RawFd) -> Result<(), Failure> {
+fn close_from(start: u32, end: u32, bound: RawFd) -> Result<(), Failure> {
     if start > end {
         return Ok(());
     }

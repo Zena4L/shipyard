@@ -53,17 +53,17 @@ mod linux {
     use crate::Engine;
     use crate::containers::{self, Record, RestartPolicy};
     use crate::error::{Result, bail};
-    use crate::run::detached::linux::OP_WAIT;
 
     pub(super) fn update(
         engine: &Engine,
         reference: &str,
         request: &UpdateRequest,
     ) -> Result<Record> {
-        let found = containers::find(engine, reference)?;
-        let _operation = containers::operation_lock(engine, &found.id, OP_WAIT)?;
-        // Again, under the lock: renamed, changed or removed meanwhile.
-        let record = containers::read_one(engine, &found.id)?;
+        // Read again under the lock: renamed, changed or removed meanwhile.
+        let containers::Locked {
+            record,
+            operation: _operation,
+        } = containers::lock_found(engine, reference, containers::OP_WAIT)?;
         let Some(policy) = request.restart else {
             return Ok(record);
         };

@@ -1,0 +1,687 @@
+//! A command forwarded to the macOS guest (step 10.3, D24): what the Mac
+//! CLI asks the guest's agent to run, as [`Frame::HelloRun`]'s request.
+//! Answered as an attach client is: [`Frame::Welcome`], the output, then
+//! [`Frame::Exited`] (or [`Frame::Refused`]). Stage 11's API replaces it.
+//!
+//! [`Frame::HelloRun`]: super::Frame::HelloRun
+//! [`Frame::Welcome`]: super::Frame::Welcome
+//! [`Frame::Exited`]: super::Frame::Exited
+//! [`Frame::Refused`]: super::Frame::Refused
+
+use serde::{Deserialize, Serialize};
+
+use super::{Decoder, Frame, FrameError, VERSION};
+
+/// The request's format, written in it from the first (H2): a newer one is
+/// refused, never guessed at.
+pub const REQUEST_VERSION: u32 = 2;
+
+/// The guest agent's vsock port.
+pub const AGENT_PORT: u32 = 1024;
+
+/// A request that isn't a command: the guest's stop, which the VM's host
+/// asks of the agent (PID 1 then stops the containers and powers off).
+pub const STOP_REQUEST: &str = "__guest-stop";
+
+/// A request that isn't a command: the ports the guest's active containers
+/// publish, which the VM's host asks of the agent to listen on the Mac
+/// (step 10.3c1). The agent runs it as any command (`shipyard
+/// __guest-ports`, a process of its own): [`Frame::Welcome`], a
+/// [`PortsAnswer`] in [`Frame::Stdout`] frames, then [`Frame::Exited`].
+///
+/// [`Frame::Stdout`]: super::Frame::Stdout
+pub const PORTS_REQUEST: &str = "__guest-ports";
+
+/// A request that isn't a command: the guest's own `doctor` checks (the
+/// engine's, as on a Linux host), which a Mac's `doctor` shows (stage 10's
+/// close). Run as any command: a `GuestDoctor` (the engine's) in
+/// [`Frame::Stdout`] frames, then [`Frame::Exited`].
+pub const DOCTOR_REQUEST: &str = "__guest-doctor";
+
+/// The most the guest's checks are read as.
+pub const MAX_DOCTOR_ANSWER: usize = 1024 * 1024;
+
+/// A request that isn't a command: a connection to one of those ports
+/// (`FORWARD_REQUEST IP PORT`, the port as the guest publishes it on `IP`).
+/// Answered by [`Frame::Welcome`] (or
+/// [`Frame::Refused`]), after which the connection carries the port's bytes
+/// both ways, raw ([`Connection::into_parts`]).
+pub const FORWARD_REQUEST: &str = "__guest-forward";
+
+/// What the VM's host refuses a client with while it's stopping (idle,
+/// step 10.3c2): the client's command never reached the guest, and its
+/// CLI tries again once the VM has stopped (starting it again).
+pub const STOPPING: &str = "the VM is stopping";
+
+/// The ports answer's format, written in it from the first (H2).
+pub const PORTS_VERSION: u32 = 1;
+
+/// What [`PORTS_REQUEST`] answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortsAnswer {
+    /// [`PORTS_VERSION`] when written.
+    pub version: u32,
+    /// How many containers are active (running, paused, stopping, waiting
+    /// to restart): what keeps the VM from being idle.
+    pub active: u32,
+    /// The TCP ports they publish.
+    pub ports: Vec<PublishedPort>,
+    /// How many UDP ports they publish (not forwarded to the Mac: said).
+    pub udp: u32,
+}
+
+/// A TCP port published in the guest, on `ip` (every address, if
+/// unspecified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedPort {
+    /// The address it's published on in the guest.
+    pub ip: std::net::IpAddr,
+    /// The port.
+    pub port: u16,
+}
+
+/// The most a [`PortsAnswer`] is read as: every port of a 65,535-port
+/// range, on two addresses, fits.
+pub const MAX_PORTS_ANSWER: usize = 8 * 1024 * 1024;
+
+impl Default for PortsAnswer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PortsAnswer {
+    /// An answer of this version: none active, nothing published.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            version: PORTS_VERSION,
+            active: 0,
+            ports: Vec::new(),
+            udp: 0,
+        }
+    }
+
+    /// The answer, as its output carries it (in as many frames as it takes:
+    /// a wide `-p` range's is long).
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::Unreadable`] if it can't be written (it always can).
+    pub fn encode(&self) -> Result<Vec<u8>, RequestError> {
+        serde_json::to_vec(self).map_err(|error| RequestError::Unreadable(error.to_string()))
+    }
+
+    /// An answer read back.
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::Newer`] for a newer version, else
+    /// [`RequestError::Unreadable`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
+        #[derive(Deserialize)]
+        struct Versioned {
+            version: u32,
+        }
+        let versioned: Versioned = serde_json::from_slice(bytes)
+            .map_err(|error| RequestError::Unreadable(error.to_string()))?;
+        if versioned.version > PORTS_VERSION {
+            return Err(RequestError::Newer(versioned.version));
+        }
+        serde_json::from_slice(bytes).map_err(|error| RequestError::Unreadable(error.to_string()))
+    }
+}
+
+/// The virtiofs tag the Mac's home is shared by.
+pub const HOME_TAG: &str = "home";
+
+/// The kernel command line's key for the home's path in the guest.
+pub const HOME_KEY: &str = "shipyard.home=";
+
+/// The kernel command line's key for places in the shared home the guest
+/// hides from what runs in it (the VM's own disk and boot files: a
+/// container given the home mustn't rewrite them, stage 10's close): each
+/// path in hex (the line can't carry a space), comma-separated.
+pub const HIDE_KEY: &str = "shipyard.hide=";
+
+/// `paths` as [`HIDE_KEY`]'s value.
+#[must_use]
+pub fn hidden_value(paths: &[&str]) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::new();
+    for (at, path) in paths.iter().enumerate() {
+        if at > 0 {
+            value.push(',');
+        }
+        for byte in path.bytes() {
+            let _ = write!(value, "{byte:02x}");
+        }
+    }
+    value
+}
+
+/// The paths a kernel command line's [`HIDE_KEY`] names (those it can't
+/// read, left out).
+#[must_use]
+pub fn hidden_of(cmdline: &str) -> Vec<String> {
+    let Some(value) = cmdline
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix(HIDE_KEY))
+    else {
+        return Vec::new();
+    };
+    value
+        .split(',')
+        .filter_map(|hex| {
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()?;
+            String::from_utf8(bytes).ok()
+        })
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+/// The caller's variables a command may get: how its terminal behaves, and
+/// its language. Nothing else (a store's place, a credential) is sent: the
+/// Mac filters with it, and the guest again.
+pub const PASSED_ENV: &[&str] = &[
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "NO_COLOR",
+];
+
+/// Whether `name` is one a command may not be given from the caller's
+/// shell (a bare `-e KEY`): one the guest's own `shipyard` reads (its
+/// `PATH`, `HOME`, `TMPDIR`, its stores, its log level) or the loader's. The
+/// Mac refuses it, and the guest again.
+#[must_use]
+pub fn reserved(name: &str) -> bool {
+    matches!(name, "PATH" | "HOME" | "TMPDIR" | "RUST_LOG" | "USER")
+        || ["SHIPYARD_", "XDG_", "LD_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// The variable a forwarded command's `shipyard` in the guest finds the
+/// caller's named variables in (a bare `-e KEY`'s, [`Request::named_env`]),
+/// as a JSON object: never its own environment, which would change what
+/// that `shipyard` does (`HTTPS_PROXY` its pulls, `SSL_CERT_FILE` its
+/// trust), where Docker's CLI resolves them on the client.
+pub const CALLER_ENV: &str = "SHIPYARD_CALLER_ENV";
+
+/// `named` as [`CALLER_ENV`] carries them.
+#[must_use]
+pub fn caller_env_value(named: &[(String, String)]) -> String {
+    let object: serde_json::Map<String, serde_json::Value> = named
+        .iter()
+        .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    serde_json::Value::Object(object).to_string()
+}
+
+/// The caller's value of `name` in a [`CALLER_ENV`] `value`: `None` if it
+/// has none (or the value isn't one).
+#[must_use]
+pub fn caller_var(value: &str, name: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(value)
+        .ok()?
+        .get(name)?
+    {
+        serde_json::Value::String(found) => Some(found.clone()),
+        _ => None,
+    }
+}
+
+/// Of `vars`, those a command gets ([`PASSED_ENV`]), as text (a variable
+/// that isn't UTF-8 is left out).
+pub fn passed_env<I, K, V>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    vars.into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_ref().to_str()?;
+            let value = value.as_ref().to_str()?;
+            PASSED_ENV
+                .contains(&name)
+                .then(|| (name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// A forwarded command's connection, either end: whole frames sent and
+/// read, blocking.
+#[derive(Debug)]
+pub struct Connection<S> {
+    stream: S,
+    decoder: Decoder,
+}
+
+/// Why a connection's frame can't be sent or read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConnectionError {
+    /// The stream failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The other end sent something that isn't a frame.
+    #[error(transparent)]
+    Frame(#[from] FrameError),
+}
+
+impl<S: std::io::Read + std::io::Write> Connection<S> {
+    /// A connection over `stream`.
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream,
+            decoder: Decoder::new(),
+        }
+    }
+
+    /// Sends `frame`.
+    ///
+    /// # Errors
+    ///
+    /// The stream's.
+    pub fn send(&mut self, frame: &Frame) -> Result<(), ConnectionError> {
+        send(&mut self.stream, frame)
+    }
+
+    /// The next whole frame: `None` once the other end has closed.
+    ///
+    /// # Errors
+    ///
+    /// The stream's, or a frame that can't be read.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, ConnectionError> {
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            if let Some(frame) = self.decoder.next_frame()? {
+                return Ok(Some(frame));
+            }
+            match self.stream.read(&mut buffer) {
+                Ok(0) => return Ok(None),
+                Ok(read) => self.decoder.push(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// The stream itself (another handle on it, to write from elsewhere).
+    pub fn stream(&self) -> &S {
+        &self.stream
+    }
+
+    /// The stream, and the bytes read from it past the last frame taken:
+    /// for a connection that carries raw bytes after its frames (a
+    /// forwarded port's, step 10.3c1), whose first ones the decoder may
+    /// have read already.
+    pub fn into_parts(self) -> (S, Vec<u8>) {
+        let unread = self.decoder.unread().to_vec();
+        (self.stream, unread)
+    }
+}
+
+/// Sends `frame` on `stream`, whole.
+///
+/// # Errors
+///
+/// The stream's.
+pub fn send(stream: &mut impl std::io::Write, frame: &Frame) -> Result<(), ConnectionError> {
+    let mut bytes = Vec::new();
+    frame.encode(&mut bytes);
+    stream.write_all(&bytes)?;
+    Ok(())
+}
+
+/// The hello that asks for `request`: [`Frame::HelloRun`] at this
+/// protocol's version.
+///
+/// # Errors
+///
+/// [`RequestError::TooLong`].
+pub fn hello(request: &Request) -> Result<Frame, RequestError> {
+    Ok(Frame::HelloRun {
+        version: VERSION,
+        request: request.encode()?,
+    })
+}
+
+/// The most an encoded request may be: what one frame carries, less the
+/// hello's version.
+pub const MAX_REQUEST: usize = super::MAX_PAYLOAD - 4;
+
+/// What to run in the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    /// [`REQUEST_VERSION`] when written.
+    pub version: u32,
+    /// The command line, without the program: `shipyard`'s arguments.
+    pub args: Vec<String>,
+    /// Where it runs: the caller's directory, at the same path in the
+    /// guest (the home is shared there), or `/`.
+    pub cwd: String,
+    /// The environment it gets, beyond the guest's own: a few of the
+    /// caller's (`TERM`), never a store's.
+    pub env: Vec<(String, String)>,
+    /// Variables the command names to be copied from the caller's shell
+    /// (a bare `-e KEY`), with their values there (version 2).
+    #[serde(default)]
+    pub named_env: Vec<(String, String)>,
+    /// Whether the command reads its input (`run -i`, `attach`, `cp -`):
+    /// without, its stdin is empty, and the caller's isn't read
+    /// (version 2).
+    #[serde(default)]
+    pub input: bool,
+    /// The caller's terminal's size, if the command gets a terminal in the
+    /// guest (version 2; step 10.3b2).
+    #[serde(default)]
+    pub terminal: Option<crate::terminal::Size>,
+    /// The caller's clock (seconds since the epoch), for the guest's to
+    /// follow after the Mac slept (version 2).
+    #[serde(default)]
+    pub time: Option<u64>,
+}
+
+/// Why a request can't be made or read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RequestError {
+    /// Longer, encoded, than [`MAX_REQUEST`].
+    #[error("the command is too long to forward ({0} bytes, at most {MAX_REQUEST})")]
+    TooLong(usize),
+    /// Not a request this version reads.
+    #[error("not a request this guest reads: {0}")]
+    Unreadable(String),
+    /// A version newer than [`REQUEST_VERSION`].
+    #[error("a request of version {0}, newer than this guest's {REQUEST_VERSION}")]
+    Newer(u32),
+}
+
+impl Request {
+    /// `args`, to run in `cwd` with `env`.
+    #[must_use]
+    pub fn new(args: Vec<String>, cwd: String, env: Vec<(String, String)>) -> Self {
+        Self {
+            version: REQUEST_VERSION,
+            args,
+            cwd,
+            env,
+            named_env: Vec::new(),
+            input: false,
+            terminal: None,
+            time: None,
+        }
+    }
+
+    /// A request that isn't a command (`args`: [`PORTS_REQUEST`],
+    /// [`DOCTOR_REQUEST`], [`STOP_REQUEST`], a forward), from `/`, with
+    /// this machine's clock (the guest's follows it: the VM's host asks
+    /// every few seconds, so a guest that slept with the Mac catches up
+    /// though no command is run).
+    #[must_use]
+    pub fn internal(args: &[&str]) -> Self {
+        let mut request = Self::new(
+            args.iter().map(|&arg| arg.to_owned()).collect(),
+            "/".to_owned(),
+            Vec::new(),
+        );
+        request.time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_secs());
+        request
+    }
+
+    /// The request, as [`Frame::HelloRun`] carries it.
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::TooLong`].
+    pub fn encode(&self) -> Result<Vec<u8>, RequestError> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| RequestError::Unreadable(error.to_string()))?;
+        if bytes.len() > MAX_REQUEST {
+            return Err(RequestError::TooLong(bytes.len()));
+        }
+        Ok(bytes)
+    }
+
+    /// A request read back.
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::Newer`] for a newer version, else
+    /// [`RequestError::Unreadable`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
+        #[derive(Deserialize)]
+        struct Versioned {
+            version: u32,
+        }
+        let versioned: Versioned = serde_json::from_slice(bytes)
+            .map_err(|error| RequestError::Unreadable(error.to_string()))?;
+        if versioned.version > REQUEST_VERSION {
+            return Err(RequestError::Newer(versioned.version));
+        }
+        serde_json::from_slice(bytes).map_err(|error| RequestError::Unreadable(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
+mod tests {
+    use super::*;
+
+    /// The caller's named variables go to the guest's `shipyard` in one
+    /// variable of its own, read back by name; any value (`=`, quotes, a
+    /// newline) as it was; a name it hasn't, or a value that isn't one,
+    /// is none.
+    #[test]
+    fn the_callers_variables_travel_in_one_of_their_own() {
+        let named = [
+            ("HTTPS_PROXY".to_owned(), "http://127.0.0.1:3128".to_owned()),
+            ("TOKEN".to_owned(), "a=b \"c\"\nd".to_owned()),
+        ];
+        let value = caller_env_value(&named);
+        assert_eq!(
+            caller_var(&value, "HTTPS_PROXY").as_deref(),
+            Some("http://127.0.0.1:3128")
+        );
+        assert_eq!(caller_var(&value, "TOKEN").as_deref(), Some("a=b \"c\"\nd"));
+        assert_eq!(caller_var(&value, "OTHER"), None);
+        assert_eq!(caller_var("not json", "TOKEN"), None);
+        assert_eq!(caller_var(r#"{"TOKEN":1}"#, "TOKEN"), None);
+        assert_eq!(caller_env_value(&[]), "{}");
+    }
+
+    /// The hidden places cross the kernel's command line whole, spaces and
+    /// all; one that can't be read is left out.
+    #[test]
+    fn hidden_places_cross_the_command_line() {
+        let places = [
+            "/Users/me/Library/Application Support/Shipyard/vm",
+            "/Users/me/g",
+        ];
+        let line = format!("console=hvc0 {HIDE_KEY}{} quiet", hidden_value(&places));
+        assert!(!line.contains("Application Support"));
+        assert_eq!(hidden_of(&line), places);
+        assert_eq!(hidden_of(&format!("{HIDE_KEY}zz,2f61")), ["/a"]);
+        assert!(hidden_of("console=hvc0").is_empty());
+    }
+
+    /// An internal request carries the clock (the guest follows it), from
+    /// `/`, with no environment.
+    #[test]
+    fn an_internal_request_carries_the_clock() {
+        let request = Request::internal(&[PORTS_REQUEST]);
+        assert_eq!(request.args, [PORTS_REQUEST]);
+        assert_eq!(request.cwd, "/");
+        assert!(request.env.is_empty());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(request.time.is_some_and(|time| now.abs_diff(time) <= 1));
+    }
+
+    /// A ports answer reads back as written; a newer one is refused.
+    #[test]
+    fn a_ports_answer_is_versioned() {
+        let answer = PortsAnswer {
+            version: PORTS_VERSION,
+            active: 2,
+            ports: vec![PublishedPort {
+                ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
+                port: 8080,
+            }],
+            udp: 1,
+        };
+        assert_eq!(
+            PortsAnswer::decode(&answer.encode().unwrap()).unwrap(),
+            answer
+        );
+        let v1 = br#"{"version":1,"active":0,"ports":[{"ip":"127.0.0.1","port":80}],"udp":0}"#;
+        assert_eq!(PortsAnswer::decode(v1).unwrap().ports[0].port, 80);
+        let newer = br#"{"version":2,"active":0,"ports":[],"udp":0,"more":1}"#;
+        assert_eq!(PortsAnswer::decode(newer), Err(RequestError::Newer(2)));
+    }
+
+    /// A wide range's answer (`-p 8000-9999`, on two addresses) is written
+    /// and read whole, within what's read of it.
+    #[test]
+    fn a_wide_ranges_answer_fits() {
+        let mut answer = PortsAnswer::new();
+        for port in 8000..10_000 {
+            for ip in [
+                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                std::net::Ipv6Addr::UNSPECIFIED.into(),
+            ] {
+                answer.ports.push(PublishedPort { ip, port });
+            }
+        }
+        let bytes = answer.encode().unwrap();
+        assert!(bytes.len() > super::super::MAX_PAYLOAD && bytes.len() < MAX_PORTS_ANSWER);
+        assert_eq!(PortsAnswer::decode(&bytes).unwrap(), answer);
+    }
+
+    /// Bytes that came in the same read as a frame, after it, are handed
+    /// back with the stream: none lost when the connection turns raw.
+    #[test]
+    fn raw_bytes_after_a_frame_are_kept() {
+        let mut bytes = Vec::new();
+        Frame::Exited(0).encode(&mut bytes);
+        bytes.extend_from_slice(b"raw after");
+        let mut connection = Connection::new(std::io::Cursor::new(bytes));
+        assert_eq!(connection.next_frame().unwrap(), Some(Frame::Exited(0)));
+        let (stream, unread) = connection.into_parts();
+        let mut rest = unread;
+        std::io::Read::read_to_end(&mut { stream }, &mut rest).unwrap();
+        assert_eq!(rest, b"raw after");
+    }
+
+    /// Only the terminal's and the language's variables pass, as text:
+    /// a store's place, a secret, or a variable that isn't UTF-8, doesn't.
+    #[test]
+    fn only_some_variables_pass() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let vars = [
+            (
+                std::ffi::OsStr::new("TERM"),
+                std::ffi::OsStr::new("xterm-256color"),
+            ),
+            ("LANG".as_ref(), "en_GB.UTF-8".as_ref()),
+            ("SHIPYARD_IMAGE_STORE".as_ref(), "/Users/me/images".as_ref()),
+            ("AWS_SECRET_ACCESS_KEY".as_ref(), "x".as_ref()),
+            ("LC_ALL".as_ref(), std::ffi::OsStr::from_bytes(b"\xff")),
+        ];
+        assert_eq!(
+            passed_env(vars),
+            [
+                ("TERM".to_owned(), "xterm-256color".to_owned()),
+                ("LANG".to_owned(), "en_GB.UTF-8".to_owned()),
+            ]
+        );
+    }
+
+    /// The guest's own `shipyard`'s variables, and the loader's, can't be
+    /// copied in; a command's own can.
+    #[test]
+    fn the_guests_own_variables_are_reserved() {
+        for name in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "SHIPYARD_IMAGE_STORE",
+            "XDG_RUNTIME_DIR",
+            "LD_PRELOAD",
+        ] {
+            assert!(reserved(name), "{name}");
+        }
+        for name in ["TOKEN", "DATABASE_URL", "PATHS", "HOMEBREW_PREFIX"] {
+            assert!(!reserved(name), "{name}");
+        }
+    }
+
+    /// A connection's frames, sent whole, read back one by one, then its
+    /// end.
+    #[test]
+    fn a_connection_sends_and_reads_frames() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut a = Connection::new(a);
+        let mut b = Connection::new(b);
+        a.send(&Frame::Stdout(b"out".to_vec())).unwrap();
+        a.send(&Frame::Exited(3)).unwrap();
+        drop(a);
+        assert_eq!(
+            b.next_frame().unwrap(),
+            Some(Frame::Stdout(b"out".to_vec()))
+        );
+        assert_eq!(b.next_frame().unwrap(), Some(Frame::Exited(3)));
+        assert_eq!(b.next_frame().unwrap(), None);
+    }
+
+    /// A request reads back as it was written; one too long isn't made;
+    /// a newer version is refused, not guessed at; one with a field this
+    /// version doesn't know isn't read.
+    #[test]
+    fn a_request_round_trips_and_its_limits_hold() {
+        let request = Request::new(
+            vec!["run".to_owned(), "--rm".to_owned(), "alpine".to_owned()],
+            "/Users/me/app".to_owned(),
+            vec![("TERM".to_owned(), "xterm-256color".to_owned())],
+        );
+        let bytes = request.encode().unwrap();
+        assert_eq!(Request::decode(&bytes).unwrap(), request);
+        let long = Request::new(vec!["x".repeat(MAX_REQUEST)], "/".to_owned(), Vec::new());
+        assert!(matches!(long.encode(), Err(RequestError::TooLong(_))));
+        let near = Request::new(
+            vec!["x".repeat(MAX_REQUEST - 200)],
+            "/".to_owned(),
+            Vec::new(),
+        );
+        assert!(near.encode().unwrap().len() <= MAX_REQUEST, "the control");
+        assert_eq!(
+            Request::decode(br#"{"version":3,"args":[],"cwd":"/","env":[]}"#),
+            Err(RequestError::Newer(3))
+        );
+        // Version 1, as 10.3a's CLI wrote it: read, its new fields their
+        // defaults.
+        let v1 = Request::decode(br#"{"version":1,"args":["ps"],"cwd":"/","env":[]}"#).unwrap();
+        assert_eq!((v1.input, v1.terminal, v1.time), (false, None, None));
+        assert!(v1.named_env.is_empty());
+        assert!(matches!(
+            Request::decode(br#"{"version":1,"args":[],"cwd":"/","env":[],"x":1}"#),
+            Err(RequestError::Unreadable(_))
+        ));
+    }
+}

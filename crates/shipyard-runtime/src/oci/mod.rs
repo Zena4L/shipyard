@@ -74,13 +74,13 @@ pub struct Bundle {
 #[non_exhaustive]
 pub struct BundleTerminal {
     /// `process.consoleSize`, as rows and columns, if it gives both.
-    pub size: Option<(u16, u16)>,
+    pub size: Option<crate::terminal::Size>,
 }
 
 impl BundleTerminal {
-    /// A terminal of `size` (rows, columns), if known.
+    /// A terminal of `size`, if known.
     #[must_use]
-    pub fn sized(size: Option<(u16, u16)>) -> Self {
+    pub fn sized(size: Option<crate::terminal::Size>) -> Self {
         Self { size }
     }
 }
@@ -768,7 +768,7 @@ impl Reader<'_> {
                         size.height, size.width
                     )));
                 };
-                Some((rows, cols))
+                Some(crate::terminal::Size::new(rows, cols))
             }
             _ => None,
         };
@@ -1776,7 +1776,7 @@ mod tests {
             process(json!({"terminal": true, "consoleSize": {"height": 30, "width": 100}}))
                 .unwrap(),
             Some(BundleTerminal {
-                size: Some((30, 100))
+                size: Some(crate::terminal::Size::new(30, 100))
             })
         );
         // A zero is no size (runc's rule); without a terminal it's nothing.
@@ -1968,7 +1968,7 @@ mod tests {
         assert_eq!(
             terminal.terminal,
             Some(BundleTerminal {
-                size: Some((30, 100))
+                size: Some(crate::terminal::Size::new(30, 100))
             })
         );
         assert!(read(r#"{"args": [], "cwd": "/", "user": {"uid": 0, "gid": 0}}"#).is_err());

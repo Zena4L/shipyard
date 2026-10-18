@@ -45,9 +45,9 @@ mod versions;
 pub use elsewhere::{
     attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
-    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_status,
-    ps, release, remove_failed_logs, resume, start, start_helper, start_helper_in_view, state,
-    stats, status, stop, update, wait,
+    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
+    peek_status, process_started, ps, release, remove_failed_logs, resume, start, start_helper,
+    start_helper_in_view, state, stats, status, stop, update, wait,
 };
 #[cfg(target_os = "linux")]
 pub use lifecycle::{Waiter, waiter};
@@ -55,9 +55,9 @@ pub use lifecycle::{Waiter, waiter};
 pub use lifecycle::{
     attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
-    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_status,
-    ps, release, remove_failed_logs, remove_monitor_cgroup, resume, start, start_helper,
-    start_helper_in_view, state, stats, status, stop, update, wait,
+    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
+    peek_status, process_started, ps, release, remove_failed_logs, remove_monitor_cgroup, resume,
+    start, start_helper, start_helper_in_view, state, stats, status, stop, update, wait,
 };
 
 pub use helper::{Helper, HelperFailure, HelperIo, RootView, RunningHelper};
@@ -266,15 +266,40 @@ pub const HOLD_LABELS_ENV: &str = "SHIPYARD_HOLD_LABELS";
 /// The most descriptors a container's monitor holds for its caller (see
 /// [`CreateOptions::holds`]): room for a container publishing a whole `-p`
 /// range (1024 ports, on IPv4 and IPv6: two sockets each), beside its
-/// networks and volumes. The caller's descriptor limit (which the monitor
-/// inherits, and which a run publishing that many has met already) is the
-/// other bound.
+/// networks and volumes. The caller's descriptor limit bounds those given
+/// at `create` (they're open in the caller first); the monitor raises its
+/// own towards this many and room beside them once its container is
+/// spawned, as far as the hard limit lets it (F49), so the holds added
+/// since aren't bound by the caller's soft limit.
 pub const MOST_HOLDS: usize = 2_100;
 
+/// The descriptors a monitor keeps of its own beside its holds when it
+/// hands them to its exit command.
+const PLACING_SLACK: usize = 64;
+
+/// The descriptor numbers a monitor needs to hand `holds` holds to its
+/// exit command: it copies each above where they go (3 and up) before
+/// placing them, so the holds, their copies and its own are open at once.
+#[must_use]
+pub const fn exit_command_descriptors(holds: usize) -> usize {
+    holds.saturating_mul(2).saturating_add(3 + PLACING_SLACK)
+}
+
+/// The most holds a monitor can hand its exit command under the hard
+/// descriptor limit `hard` ([`exit_command_descriptors`]), never more than
+/// [`MOST_HOLDS`]: a container given more would end without its exit
+/// command (its end unrecorded, its restart policy lost).
+#[must_use]
+pub fn most_holds_under(hard: u64) -> usize {
+    let hard = usize::try_from(hard).unwrap_or(usize::MAX);
+    (hard.saturating_sub(3 + PLACING_SLACK) / 2).min(MOST_HOLDS)
+}
+
 /// What a monitor says, after the number, when it holds all it can (in a
-/// refused hold's [`ContainerError::NotHeld`]): its caller tells this
-/// refusal from the others by it, as the protocol has no code for it. A
-/// monitor since 9.7b1 says it so; keep it so.
+/// refused hold's [`ContainerError::NotHeld`]). A version 4 monitor says
+/// [`HoldRefusal::Full`](crate::attach::HoldRefusal::Full) too; the words
+/// are read only from a version 3 one (9.7b1 to 10.2c1), and stay as long
+/// as one may still run.
 pub const HOLDS_FULL: &str = "descriptors are held already";
 
 /// The most bytes of hold labels a monitor keeps, all told: they reach the
@@ -291,6 +316,12 @@ pub const EXIT_RECORD_ENV: &str = "SHIPYARD_EXIT_RECORD";
 /// for the exit command), so what they keep alive isn't free before then.
 /// While the exit command's parent is this PID, the monitor is there.
 pub const MONITOR_PID_ENV: &str = "SHIPYARD_MONITOR_PID";
+
+/// Where an exit command finds its monitor's start time (clock ticks since
+/// boot, `/proc/PID/stat` field 22), beside [`MONITOR_PID_ENV`]: with the
+/// PID, what tells that monitor's start from another's, whose state took
+/// its place (F102). A monitor from before 10.4 sets none.
+pub const MONITOR_STARTED_ENV: &str = "SHIPYARD_MONITOR_STARTED";
 
 /// What [`exec`] runs in a container, and how (runc's `exec` flags). What
 /// isn't given is the container's own process's: its environment, working
@@ -484,6 +515,14 @@ pub enum Status {
     Stopped,
 }
 
+impl Status {
+    /// Whether its program is there to reach: running, or frozen (paused).
+    #[must_use]
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Paused)
+    }
+}
+
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -661,7 +700,9 @@ pub enum ContainerError {
     NotHeld {
         /// Its ID.
         id: String,
-        /// Why.
+        /// Why: what a caller tells refusals apart by (F73).
+        reason: crate::attach::HoldRefusal,
+        /// Why, in words.
         why: String,
     },
     /// The container's monitor turned a control client away (too many of
@@ -752,11 +793,11 @@ pub enum ContainerError {
         found: u32,
     },
     /// A hold (`--hold-fd`) that isn't one: not open, a standard stream
-    /// (0 to 2), given twice, or one of the descriptors passed to the
-    /// container's process.
+    /// (0 to 2), given twice, one of the descriptors passed to the
+    /// container's process, or not a file, a directory or a socket.
     #[error(
         "--hold-fd {0}: not a descriptor the monitor can hold (it must be open, above 2, given \
-         once, and not passed to the container)"
+         once, not passed to the container, and a file, a directory or a socket)"
     )]
     BadHold(i32),
     /// A hold whose label isn't one ([`crate::attach::is_label`]).
@@ -892,6 +933,21 @@ mod root_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A monitor needs room for its holds twice (and its own) to hand
+    /// them on; under a hard limit, the most holds are what fits that,
+    /// never past `MOST_HOLDS`.
+    #[test]
+    fn holds_are_bound_by_the_room_to_hand_them_on() {
+        assert_eq!(exit_command_descriptors(0), 67);
+        assert_eq!(exit_command_descriptors(1_300), 2_667);
+        assert_eq!(most_holds_under(4_096), 2_014);
+        assert!(exit_command_descriptors(most_holds_under(4_096)) <= 4_096);
+        assert!(exit_command_descriptors(most_holds_under(4_096) + 1) > 4_096);
+        assert_eq!(most_holds_under(1_048_576), MOST_HOLDS);
+        assert_eq!(most_holds_under(u64::MAX), MOST_HOLDS);
+        assert_eq!(most_holds_under(10), 0);
+    }
 
     /// An exit command is an absolute UTF-8 path with no NUL, its
     /// arguments without one; read from JSON, it's checked the same.

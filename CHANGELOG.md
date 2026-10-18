@@ -5,6 +5,299 @@ All notable changes to Shipyard. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change
 behaviour; each change is listed here).
 
+## 0.3.0 - unreleased
+
+### Added
+
+- **A Linux VM on the Mac** (step 10.3a, D24, D29): on Apple Silicon (macOS 13 or
+  later), Shipyard boots one small Linux VM of its own with Apple's
+  Virtualization.framework, and runs containers there. `shipyard vm start`, `status`
+  and `stop`; the VM starts on first use, stops in order (its containers stopped, then
+  the guest powered off), keeps its images and containers on a disk of its own across
+  boots, and shares your home at the same path. Its guest is built from Alpine by
+  `scripts/guest/build.sh`; the binary must be signed with the virtualization
+  entitlement (`scripts/macos/sign.sh`).
+- **Every command runs in the VM on a Mac** (step 10.3b1): `shipyard run`, `ps`, `logs`
+  and the rest run there, as on Linux, from the same directory; `vm` and `doctor` stay
+  on the Mac. Paths you name must be under your home (shared at the same path); a
+  Ctrl-C or a kill is passed on; your input is read only by commands that take it; a
+  bare `-e KEY` takes the Mac's value. See [macOS](docs/user/macos.md).
+  `SHIPYARD_VM=off` runs commands on the Mac itself, as before.
+- **A Mac's `shipyard doctor` shows the VM's own Linux checks** (stage 10's close): with
+  the VM running, the engine's checks run in the guest (cgroups, overlayfs, nf_tables,
+  the network, the runtime's state, as on a Linux host) and are listed under the VM's;
+  a failed one fails `doctor`. A stopped VM isn't started to be checked.
+- **The Mac's VM stops by itself when idle** (step 10.3c2, D20, D10.3-11): after 5
+  minutes with no command and no container up (a detached container keeps it up), its
+  containers stopped in order; the next command starts it again in about a second.
+  `SHIPYARD_VM_IDLE` sets the wait. A command that lands as it stops runs, once, after.
+- **`shipyard doctor` on a Mac checks the VM** (step 10.3c2): the macOS version and
+  Apple Silicon, the binary's virtualization entitlement, the guest (and whether it's
+  this build's), the VM's state, its ports, the shared home, its files.
+- **Published ports on a Mac's `localhost`** (step 10.3c1, D10.3-10): `-p 8080:80`
+  answers on `127.0.0.1:8080` and `[::1]:8080` on the Mac within a moment of the
+  container's start, through the VM; only the Mac's loopback, never its network. A
+  port another Mac program has is left to it and said (`shipyard vm status`), and
+  taken once it's free. TCP only.
+- **Terminals through the VM on a Mac** (step 10.3b2, D10.3-7): with your terminal as
+  both its input and output, a command runs on a terminal in the VM: `run -it`'s
+  shell, raw, at your window's size and following it, Ctrl-C reaching its job; a
+  prune asks first; closing the window hangs the command up.
+
+### Changed
+
+- **A relative store variable is refused** (F61): `SHIPYARD_EVENTS_DIR`,
+  `SHIPYARD_IMAGE_STORE` and `SHIPYARD_NETWORK_DIR` must be absolute paths, as
+  `SHIPYARD_CONTAINER_DIR` had to be, and so must `XDG_DATA_HOME` (or `HOME`) where
+  they place a store. And a release build ignores the DNS server's test
+  variables (`SHIPYARD_DNS_UPSTREAM`, `SHIPYARD_DNS_IDLE`).
+- **`shipyard-runtime create --hold-fd` refuses a pipe or a device** (F73): only a
+  file, a directory or a socket is held, as for a hold added while the container
+  runs.
+- **Internal: the engine's container code split by job** (stage 10, step 10.1a; no
+  behaviour change, checked against 0.2.0's binary by a differential run): a container's
+  create, start, foreground run, `cp` view, removal and "find, lock, read again" are
+  modules of their own, as are the record store's writers, lookups, locks and what starts
+  leave; every helper's entry point is called through one engine function, in its one
+  order.
+- **Internal: one way to take a container, wait for its end, and say it's up** (step
+  10.1b; checked against 0.2.0's binary as 10.1a was): "find, lock, read again by ID",
+  the wait for a settled end and the meanings of "up" are each written once. The one
+  difference: in a store that holds an unreadable record, `rename`, `network connect`,
+  `attach` and `wait` now warn about it once instead of twice, and a record that turns
+  unreadable while one of them waits for its lock fails with its read error instead of
+  "no container".
+- **Internal: the terminal plumbing tidied, and long modules split** (step 10.2f; no
+  behaviour change, checked against 0.2.0's binary): an attach session watches only
+  SIGWINCH and SIGCONT, through the runtime's own signal watch; the descriptor sweeps
+  after `fork` are one; a terminal's size is one type; eight long modules (the
+  container store's tests, a run's planning, the image index, `shipyard-runtime`'s
+  main, events, the monitor's attach, the firewall's ruleset) are split by job.
+- **Internal: one safe way to write and read Shipyard's own files** (step 10.1c1; checked
+  against 0.2.0's binary as 10.1a was): a new crate, `shipyard-sys`, writes every state
+  file whole or not at all (a temporary file made exclusively, synced, renamed, the
+  directory synced) and reads each one without following a symbolic link, without
+  waiting on a FIFO, and only up to a bound named beside its version. The runtime's own
+  files (under `/run`, which a restart empties) are written whole but not synced, as
+  before. A state file larger than its bound is refused instead of
+  read cut short: an exit record that large reads as one that can't be made sense of
+  (ended, no code); a lease, as no lease; an image index, as a corrupt one (moved aside);
+  a container image area's list fails `image prune` and `rmi` instead of reading part
+  of it. A store Shipyard wrote reads exactly as before.
+- **Internal: one way to wait for a lock, and one rule for a lock handed to a monitor**
+  (step 10.1c2; checked against 0.2.0's binary as 10.1a was): every lock waited for to a
+  deadline goes through one loop in `shipyard-sys`, and the leases, image areas, volumes
+  and run directories a container's monitor keeps share one holder that lets its lock go
+  when dropped unless it was handed over. A volume or an image area locked by a command
+  that then fails is now let go at once, not kept until another thread's child execs.
+- **Internal: one way to signal through a pidfd, pass a descriptor, and take one
+  inherited** (step 10.1c3; checked against 0.2.0's binary as 10.1a was): pidfds are
+  opened through `rustix`, and every signal, a real-time one or the "still there?" probe,
+  goes through one call; descriptors passed over a socket (a terminal, a hold) and those
+  a helper is started with go through one function each. The storage helper, the DNS
+  server and a container's monitor now refuse a descriptor that isn't open, or one passed
+  twice, instead of using it.
+- **Internal: a container's record is rewritten at the version it was read at** (step
+  10.1d; checked against 0.2.0's binary, and with 0.2.0's binary and this one managing
+  the same containers in turn): a newer Shipyard changing a container (`stop`, `rename`,
+  `update`, `network connect`) keeps its record readable by the older one still running
+  its monitor, unless something only the newer one has was set. Records are written as
+  before, byte for byte.
+- **Internal: `doctor`'s checks are the engine's** (step 10.1e1; its output checked byte
+  for byte against 0.2.0's, as root and rootless): the engine returns the host's checks as
+  a report, which `shipyard doctor` prints as before. The one difference: its first lines
+  (host, backend, user) now come with the rest, once the checks are done, rather than
+  before them.
+- **Internal: the engine's API narrowed, and names that clashed renamed** (step 10.1e2;
+  checked against 0.2.0's binary): what only the engine uses is no longer public (the
+  record writers reach its tests through a hidden `containers::testing`); `report::Event`
+  is `Message`, `run::Ran` is `Finished`, and the networks', streams' and options' types
+  carry their module's name (`NetworkInspected`, `RunStreams`, `AttachOptions`…), and
+  (step 10.1e4b) more of what only the engine uses is its own (its network plumbing
+  among it). Nothing a user sees changes.
+- **Internal: the command line split by job** (step 10.1e3; its reference pages
+  regenerate byte for byte, and checked against 0.2.0's binary): `shipyard`'s flags,
+  output helpers, reporter and command groups each in a module of their own, `run`'s
+  flags apart from turning them into a request, and what both binaries share in one
+  library instead of a file compiled into each.
+- **Internal: attaching and reading logs by runtime ID are the runtime's own**
+  (step 10.1e4a; checked against 0.2.0's binary): `shipyard-runtime attach` and
+  `logs` no longer go through the engine, which keeps attaching and reading logs by
+  name. Messages and exit codes are as before.
+- **On a Mac, `doctor` exits 1 when the VM runs but its checks can't be had** (a
+  guest of another build: step 10.4, F112), as when one fails.
+
+### Fixed
+
+- **`volume rm` and `volume prune` keep every volume when the container store can't
+  be found** (a relative `SHIPYARD_CONTAINER_DIR`, no home), saying why: they treated
+  it as "no containers" and deleted the volumes of stopped containers (stage 10's
+  close; F56's safeguard).
+- **On a Mac:**
+  - a container given the home (`--volume ~:/h`) no longer reaches the VM's own files
+    in it (its data disk, the guest's boot files): the guest hides them;
+  - the guest's clock follows the Mac's after a sleep even when no command runs;
+  - the VM's data disk is left out of Time Machine's backups;
+  - the guest writes its data out before it stops its containers (a shutdown that ends
+    the VM early loses less);
+  - `shipyard vm stop` no longer reports a failure when another command starts the VM
+    again while it waits;
+  - a home of `/` is refused.
+
+- **Shipyard's note of the host routing it closed, unreadable, no longer opens it**
+  (step 10.2a, F65): if the note can't be read (a symbolic link, too large, not text,
+  a disk error) while forwarding is on, the rebuilt firewall closes routing between
+  the host's interfaces as they are now, and says so, naming the file; before, it
+  rebuilt the table with routing open, so the host routed between its own
+  interfaces for anyone.
+- **Another user can no longer hold up publishing a port** (step 10.2a, F53): holding a TCP port
+  that only closed connections wait on takes a lock in the caller's own runtime
+  directory; the abstract socket name it was, any local user could hold for the
+  full minute. (Without a runtime directory, it's that name, as before.)
+- **`logs` fails when its standard error's reader is gone while its standard output's
+  isn't** (step 10.2a, F70): those lines were lost and it exited `0`. A reader of standard output
+  that stops early (`logs | head`, `2>&1 | head` too) still ends it quietly, asked of
+  the kernel, for `shipyard-runtime logs` too.
+- **A failed start no longer forgets that its user stopped the container** (step 10.2b1,
+  F55): a start that fails after it updated the container's record (its runtime start,
+  say) puts back all it changed, not only its start and end times: "stopped by user"
+  (so an `unless-stopped` container its user stopped isn't brought back, by its policy
+  or at boot), its restart count and backoff, and its ports.
+- **A container whose start never ran shows no finish time** (F64): `inspect` says
+  `created` with no start, end or exit, whichever way that start was settled.
+- **A failed start lets go of its container at once** (F66): another command no longer
+  waits for it to settle while another thread's child still holds a copy of its lock.
+- **A volume a container may need is never removed** (F56): `volume rm`
+  and `prune` decide under the container store's lock, reading every record: a record
+  that can't be read keeps every volume (`prune` removes nothing, `rm` refuses, both
+  naming it), and a container made meanwhile is waited for, never missed.
+- **A `network connect` or `disconnect` cut short is finished by running it again**
+  (F57): it used to refuse ("on the network already", "isn't on the network"), the
+  container and its record disagreeing until its next start.
+- **A full disk no longer turns restart policies off** (F45): an end the store refuses
+  is retried with the policy's backoff, up to a minute apart, until the store takes it
+  (or `system stop`, `rm` or a reboot comes first), and the policy then applied.
+- **`shipyard doctor` says when the boot unit won't see your containers** (F44):
+  containers with a restart policy on stores set by `SHIPYARD_*` variables (or a
+  user's `XDG_DATA_HOME`), with the `systemctl edit` line that gives the unit the
+  same.
+- **`network connect` is no longer refused at the descriptor limit its container was
+  made with** (F49): a container's monitor raises its own soft limit, as far as the
+  hard one allows, once the container is running. The container, its health checks
+  and its exit command keep the caller's limit; the exit command gets room for what
+  it's handed where that's more, and a container its restart policy starts again has
+  that limit too.
+- **Descriptors a monitor received at its limit are closed** (F54): a message cut
+  short (`MSG_CTRUNC`) no longer leaves the descriptors the kernel did install open in
+  the monitor.
+- **`network connect` knows a full monitor by a reason, not its words** (F73): the
+  monitor's hold protocol (version 4) says why it refused a hold. Monitors started by
+  0.2 or before are still understood.
+- **A network's DNS server closes a TCP connection 30 seconds after it was opened**
+  (F58): a container sending a query every few seconds on each of its 8 connections
+  could keep all 64 for good. A resolver opens another.
+- **A paused container stops gracefully** (F46): `stop` and `system stop` thaw it
+  after its stop signal, which it used to have only at its timeout's SIGKILL.
+  `shipyard doctor` warns when a container's stop timeout is longer than the stop
+  unit's, which would kill it first at a shutdown.
+- **Keys typed right after a resize no longer reach the container before its new size**
+  (F68): `run -it` and `attach` send a changed window size before the typing that
+  follows it, and the monitor sets it before writing that typing, where under load the
+  container could read the keys first.
+- **A made-up name no longer collides on a shared network** (F63): a container's
+  generated name is drawn against the names its bridge networks already hold, a
+  container of another store's among them, where its start used to be refused.
+- **A `cp` racing a container's end copies** (F84): one whose container ended before
+  its helper joined it is copied through the stopped container's view, where it said
+  only "no container with ID …".
+- **pasta's help no longer fills the journal** (F50): what a rootless run's pasta can
+  do is asked once per pasta binary and kept in the runtime directory
+  (`$XDG_RUNTIME_DIR/shipyard/pasta-features.json`), where every rootless run asked
+  `pasta --help`, about 60 lines in the system log each time.
+- **Small fixes from the 0.2 review** (F61): a health check's output written just
+  after it exits is kept; renaming a running container refuses a lease of its that
+  isn't a JSON object instead of panicking; a container's monitor that couldn't join
+  its own cgroup is said in the run's warnings, instead of on stderr.
+- **A shutdown during boot's start stops the containers** (F52): the stop is a unit of
+  its own, `shipyard-stop.service`, started at once; a shutdown while
+  `shipyard-recover` was still starting containers skipped its stop, and they ended
+  without their stop signal. Install both units (`contrib/systemd/README.md`);
+  `shipyard doctor` warns while the stop unit isn't enabled.
+- **`logs -f` ends once its reader has gone** (step 10.2f, F78): `logs -f web | head
+  -n1` ended only at the container's next line; it now asks, between its looks,
+  whether anyone reads its output, and ends quietly once no one does
+  (`shipyard-runtime logs --follow --log-dir`, which had no end of its own, too).
+- **A start that fails no longer says the container died** (step 10.2f, F80): on a
+  container that ran before, a start that failed after its container was made sent
+  a `die` event with the last start's exit code (a crash loop of failing restarts
+  sent one each); only an end of a start that ran is said now.
+- **A container with many published ports keeps its restart policy** (stage 10's
+  fresh review): handing well over a thousand holds (`-p` ranges) to its exit command,
+  its monitor ran out of descriptor numbers (each hold's copy sits above it while
+  they're placed), so the end went unrecorded until the next command and the
+  restart never came. The monitor raises its limit for both first, and a run asks
+  only for what the hard limit leaves room for.
+- **A prefix of an ID that a container with an unreadable record shares is refused
+  as naming more than one** (stage 10's fresh review): it found the readable
+  container alone, so `rm -f abc` could remove the wrong one.
+- **On a Mac, a bare `-e KEY` no longer changes the VM's own `shipyard`** (stage 10's
+  fresh review): the value went into its environment, so `-e HTTPS_PROXY` sent the
+  VM's pulls through a proxy at the VM's own `localhost`. It now reaches only the
+  container, as Docker's CLI does.
+- **An end recorded late is never written over a later start's** (step 10.4, F102):
+  `__cleanup` retrying an end the store had refused (a full disk) now checks the
+  runtime's state is still its own start's (its monitor's PID and start time, which
+  the monitor now tells it); before, a second start whose own end was refused too
+  could have the first's exit code written over it, and its restart policy decide on
+  that.
+- **A start that never ran, settled twice, keeps the end put back** (step 10.4,
+  F110): a container's last run's end, restored when a start failed, was cleared
+  again when a later command settled that start, so it read as never started and a
+  boot didn't bring it back.
+- **A newer Shipyard's `previous-start.json` is never read as none** (step 10.4,
+  F110): after going back to an older Shipyard, a start that never ran is settled
+  as never started and the newer file is kept for its Shipyard, said in a warning,
+  instead of being deleted unread.
+- **A change that landed is no longer reported as failed** (step 10.4, F110): a
+  record written in place whose directory couldn't be synced is now a warning
+  ("may not survive a power cut"), not an error that made a command report a change
+  it had made as failed.
+- **Signals where pidfds are refused** (step 10.4, F110): a host whose seccomp
+  policy refuses `pidfd_open` (`EPERM`) signals by PID after a check, as a kernel
+  without pidfds does; running out of descriptors is now an error, never the
+  PID-reuse race the pidfd closes.
+- **No false "its monitor stays in this process's cgroup" warning** for a
+  container that ended at once (step 10.4, F110).
+- **On a Mac, connections to a published port no longer wait for one another**
+  while the ports are read (step 10.4, F110): callers waiting for one read share it.
+- **On a Mac, an unclean stop no longer ends in deleting every image** (step 10.4,
+  F104): a data disk the boot's check (`e2fsck -p`) couldn't fix powered the VM off
+  for good, and only deleting `data.img` got out. The VM now repairs it once
+  (`e2fsck -y`), says so on its console and in `doctor` (a warning for the next ten
+  boots), and what couldn't be placed is in `lost+found` on that disk. Commands are
+  refused at once while the disk is checked or repaired ("the VM is still starting"),
+  so a long repair is never cut short by a start's time limit.
+- **On a Mac, the VM's stop is bounded** (step 10.4, F109): a process stuck in the
+  kernel (a wedged file-sharing call) could keep the VM's init waiting for it, so its
+  disk was never let go cleanly. Its agent, if it keeps failing, is now restarted
+  ever later (up to every 5 s), not at once in a loop.
+
+### Security
+
+- **`shipyard __guest-init` and `__shipyard-agent` are refused outside Shipyard's
+  own macOS VM** (stage 10's fresh review): run as root on a Linux host, the guest's
+  init moved the root into memory and removed the rest, or powered the host off.
+  They now need the kernel command line Shipyard boots its VM with (and the init,
+  PID 1), and exit with 125 otherwise.
+- **On a Mac, a path outside your home that the Mac hasn't but the VM has
+  (`/var/lib/shipyard`, `/run`) is refused** (stage 10's fresh review): it was sent
+  on, so `-v /var/lib/shipyard:/s` gave a container the VM engine's own state. A
+  path that isn't there is judged by where it would be.
+- **On a Mac, set-user-ID bits and device files in your home mean nothing in the VM**
+  (step 10.4, F108): the home is mounted `nosuid,nodev`, and binds of it keep both.
+  `SECURITY.md` says what a Mac trusts the VM with, including that a published port
+  also answers on the VM's own address on the Mac's private virtual network.
+
 ## 0.2.0 - 2026-10-15
 
 ### Added

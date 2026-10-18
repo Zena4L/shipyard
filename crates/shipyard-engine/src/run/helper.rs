@@ -8,7 +8,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::sync::{Arc, Mutex};
 
-use crate::report::{Event, Reporter};
+use crate::report::{Message, Reporter};
 
 /// The largest log kept: past it, it's moved to `NAME.1` (the one before
 /// dropped) when it's opened.
@@ -56,8 +56,8 @@ impl Log {
 }
 
 impl Reporter for Log {
-    fn report(&self, event: Event) {
-        if let Event::Warning(warning) = event {
+    fn report(&self, message: Message) {
+        if let Message::Warning(warning) = message {
             self.line(&format!("warning: {}", warning.message));
         }
     }

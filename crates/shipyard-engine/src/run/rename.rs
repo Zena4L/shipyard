@@ -60,7 +60,7 @@ mod linux {
     use crate::containers::{self, Name, Record};
     use crate::error::{ErrorKind, Result, bail};
     use crate::report::WarningKind;
-    use crate::run::detached::linux::{HeldOff, OP_WAIT};
+    use crate::run::held_off::HeldOff;
 
     pub(super) fn rename(engine: &Engine, reference: &str, new: &str) -> Result<Record> {
         // `--name`'s rule (a DNS label, so its networks can answer to it),
@@ -69,10 +69,12 @@ mod linux {
             .map_err(|why| crate::error::Error::new(ErrorKind::InvalidRequest, why))?;
         let new = Name::parse(new)?;
         let found = containers::find(engine, reference)?;
-        let _operation = containers::operation_lock(engine, &found.id, OP_WAIT)?;
         // Again, by its ID, now nothing else works on it (as `take`). Found
         // by its name, it must still have it: another rename went first.
-        let record = containers::find(engine, found.id.as_str())?;
+        let containers::Locked {
+            record,
+            operation: _operation,
+        } = containers::lock_again(engine, &found.id, containers::OP_WAIT)?;
         if found.name.as_str() == reference && record.name != found.name {
             bail!(
                 NotFound,
@@ -141,10 +143,8 @@ mod linux {
     /// is said, and left out.
     fn leased(engine: &Engine, record: &Record) -> Result<(Vec<LockedNetwork>, bool)> {
         let runtime_root = engine.paths.runtime_root()?;
-        let up = matches!(
-            runtime::peek_status(runtime_root, record.id.as_str()),
-            Ok(Some(Status::Running | Status::Paused))
-        );
+        let up = runtime::peek_status(runtime_root, record.id.as_str())
+            .is_ok_and(|status| status.is_some_and(Status::is_live));
         if !up {
             return Ok((Vec::new(), false));
         }

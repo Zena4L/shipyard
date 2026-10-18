@@ -80,7 +80,7 @@ pub struct Pty {
     /// Its size (rows, columns) when none of Shipyard's stdout, stdin and
     /// stderr is a terminal to copy it from: a bundle's
     /// `process.consoleSize`. Without either, 24x80.
-    pub size: Option<(u16, u16)>,
+    pub size: Option<super::terminal::Size>,
 }
 
 impl Stdio {

@@ -14,12 +14,15 @@ use crate::report::{Reporter, WarningKind, warn};
 /// in its sets. A missing table (after a reboot, or `nft flush ruleset`) or
 /// an older one is made whole again, from every network and every live
 /// run's published ports, under the store's lock, so two runs never build
-/// it at once.
+/// it at once. The host's routing Shipyard closed is closed again; if its
+/// record can't be read, it's closed for the forwarding that's on now, and
+/// said ([`closed_now`]).
 #[cfg(target_os = "linux")]
 pub(super) fn ensure_firewall(
     networks: &shipyard_network::store::Networks,
     nft: &mut shipyard_network::nft::Nftables,
     config: &shipyard_network::store::NetworkConfig,
+    reporter: &dyn Reporter,
 ) -> Result<()> {
     use shipyard_network::nft::{NetworkRules, Ruleset};
     // A newer Shipyard's table is left as it is (rebuilt by this one, it
@@ -31,11 +34,54 @@ pub(super) fn ensure_firewall(
             let rules: Vec<NetworkRules> =
                 networks.list()?.iter().map(NetworkRules::from).collect();
             let ports = networks.live_port_rules()?;
-            nft.install(&rules, &ports, &networks.routing_closed())?;
+            let closed = closed_now(networks.routing_closed(), reporter)?;
+            nft.install(&rules, &ports, &closed)?;
         }
     }
     nft.add_network(&NetworkRules::from(config))?;
     Ok(())
+}
+
+/// The routing to close, from `records`: what they say, and, for each
+/// family whose record can't be read and whose forwarding is on (whoever
+/// turned it on: a table rebuilt open would let the host route for anyone,
+/// F65), the host's own links now, bridges and their ports left out
+/// (another engine's, routed by it). Said, for each. A family whose
+/// forwarding is off needs nothing: [`open_routing`] closes routing before
+/// it turns forwarding on, and records it again.
+#[cfg(target_os = "linux")]
+fn closed_now(
+    records: shipyard_network::store::RoutingRecords,
+    reporter: &dyn Reporter,
+) -> Result<shipyard_network::nft::ClosedRouting> {
+    use shipyard_network::attach;
+    let mut closed = records.closed;
+    for (family, unread) in records.unread {
+        if attach::forwarding(family)? != Some(true) {
+            continue;
+        }
+        if !closed.families.contains(&family) {
+            closed.families.push(family);
+        }
+        for interface in attach::unbridged_host_interfaces()? {
+            if !closed.interfaces.contains(&interface) {
+                closed.interfaces.push(interface);
+            }
+        }
+        warn(
+            reporter,
+            WarningKind::RoutingRecordUnreadable,
+            format!(
+                "the record of the host's {family} routing Shipyard closed couldn't be read \
+                 ({unread}): its routing between its own links (bridges and their ports left \
+                 out, another engine's) is closed, as if Shipyard had turned forwarding on, until \
+                 Shipyard's table is next rebuilt (a reboot); if this host is meant to route, \
+                 delete Shipyard's routing records (`.routing-closed*` in its networks \
+                 directory), so the next rebuild doesn't close it again"
+            ),
+        );
+    }
+    Ok(closed)
 }
 
 /// Makes Shipyard's bridge table current (the module `nft::spoofing`:
@@ -207,7 +253,11 @@ pub(super) fn warn_about_other_firewalls(
 /// What to tell the user about another firewall in the way: whose, what it
 /// keeps from the containers, and the fix.
 #[must_use]
-pub fn describe_conflict(conflict: &shipyard_network::firewalls::Conflict) -> String {
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "doctor's firewall check is Linux's")
+)]
+pub(crate) fn describe_conflict(conflict: &shipyard_network::firewalls::Conflict) -> String {
     use shipyard_network::firewalls::Firewall;
     let blocks = conflict.blocks;
     let drops = if blocks.way_out || blocks.ports || blocks.each_other {
@@ -325,5 +375,61 @@ mod tests {
                  shy-x would get no answer"
             )
         );
+    }
+
+    /// A routing record that can't be read (F65): routing is closed for the
+    /// forwarding that's on now, between the host's own links (a bridge
+    /// and its port left out; a link with no master in), and said; with
+    /// forwarding off, nothing's closed and nothing's said (the control).
+    /// In a network namespace of the test's own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root"]
+    fn an_unread_routing_record_closes_the_forwarding_on_now() {
+        use crate::report::Collect;
+        use shipyard_network::Family;
+        use shipyard_network::route::{LinkChange, Rtnetlink};
+        use shipyard_network::store::{RoutingRecords, StoreError};
+        shipyard_test_support::in_new_netns(|| {
+            let mut links = Rtnetlink::new().unwrap();
+            links.create_bridge("br-other").unwrap();
+            links.create_veth("v-own", "v-port", None, None).unwrap();
+            let bridge = links.link("br-other").unwrap().unwrap().index;
+            let port = links.link("v-port").unwrap().unwrap().index;
+            links.change(port, LinkChange::Master(bridge)).unwrap();
+            let unread = || RoutingRecords {
+                closed: shipyard_network::nft::ClosedRouting::default(),
+                unread: vec![(
+                    Family::V4,
+                    StoreError::Io {
+                        context: "reading .routing-closed".to_owned(),
+                        source: std::io::ErrorKind::PermissionDenied.into(),
+                    },
+                )],
+            };
+            let set = |path: &str, on: &str| {
+                // IPv6 may be off in the kernel: then there's nothing to set.
+                let _ = std::fs::write(path, on);
+            };
+            set("/proc/sys/net/ipv4/ip_forward", "0");
+            set("/proc/sys/net/ipv6/conf/all/forwarding", "0");
+            let quiet = Collect::default();
+            let closed = closed_now(unread(), &quiet).unwrap();
+            assert!(closed.families.is_empty(), "{closed:?}");
+            assert!(quiet.warnings().is_empty());
+
+            set("/proc/sys/net/ipv4/ip_forward", "1");
+            let said = Collect::default();
+            let closed = closed_now(unread(), &said).unwrap();
+            assert_eq!(closed.families, vec![Family::V4]);
+            assert_eq!(
+                closed.interfaces,
+                ["v-own"],
+                "a bridge and its port left out"
+            );
+            let warnings = said.warnings();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].kind, WarningKind::RoutingRecordUnreadable);
+        });
     }
 }

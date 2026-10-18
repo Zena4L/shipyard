@@ -1,6 +1,7 @@
 //! A run's directory: the `/etc` files bound into its container, and
 //! pasta's files.
 
+use shipyard_sys::lock::HeldFile;
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
@@ -20,12 +21,11 @@ pub struct RunDir {
     pub(super) path: PathBuf,
     /// Held while the run lives (see [`sweep_runs`]): its [`RUN_LOCK`],
     /// and the directory itself, which an older Shipyard's sweep probes.
-    /// Unlocked when this value goes (another thread's child, forked
-    /// meanwhile, may hold a copy until it execs), unless it was given up:
-    /// then these copies are only closed.
-    lock: Option<[File; 2]>,
+    /// Handed over with the directory when it's given up.
+    lock: Option<[HeldFile; 2]>,
     /// Given up to a container's monitor ([`give_up`](Self::give_up)):
-    /// its holder removes it, not this value.
+    /// its holder removes it, not this value. (Whether its locks are let go
+    /// is each [`HeldFile`]'s own, given up with it.)
     given_up: bool,
 }
 
@@ -40,7 +40,7 @@ const RUN_LOCK: &str = "lock";
 const RUNTIME_RUNS: &str = ".runs";
 
 /// The files a run gets, by name: each goes in the container's `/etc`.
-pub const ETC_FILES: [&str; 3] = ["hosts", "hostname", "resolv.conf"];
+pub(crate) const ETC_FILES: [&str; 3] = ["hosts", "hostname", "resolv.conf"];
 
 impl RunDir {
     /// Makes the run's directory with its `/etc` files, as `plan` says, for
@@ -106,7 +106,10 @@ impl RunDir {
             lock: None,
             given_up: false,
         };
-        dir.lock = Some([lock_run(&dir.path, true)?, lock_dir(&dir.path)?]);
+        dir.lock = Some([
+            HeldFile::new(lock_run(&dir.path, true)?),
+            HeldFile::new(lock_dir(&dir.path)?),
+        ]);
         drop(sweeping);
         let own = plan.mode.own_namespace();
         // With the host's network, its files as they are (its resolvers work
@@ -165,13 +168,17 @@ impl RunDir {
 
     /// Where it is.
     #[must_use]
-    pub fn path(&self) -> &Path {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "detached containers are Linux's")
+    )]
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
     /// Where its file `name` is.
     #[must_use]
-    pub fn file(&self, name: &str) -> PathBuf {
+    pub(crate) fn file(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
 
@@ -182,7 +189,7 @@ impl RunDir {
         allow(dead_code, reason = "detached containers are Linux's")
     )]
     pub(crate) fn holds(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
-        self.lock.iter().flatten().map(std::os::fd::AsFd::as_fd)
+        self.lock.iter().flatten().map(HeldFile::hold)
     }
 
     /// Gives the directory up to whoever holds copies of its
@@ -195,18 +202,18 @@ impl RunDir {
     )]
     pub(crate) fn give_up(mut self) {
         self.given_up = true;
+        for lock in self.lock.iter_mut().flatten() {
+            lock.give_up();
+        }
     }
 }
 
 impl Drop for RunDir {
     fn drop(&mut self) {
-        // Removed while it's still locked (the lock goes after, with the
+        // Removed while it's still locked (the locks go after, with the
         // fields), so no sweep can take a directory half gone.
         if !self.given_up {
             let _ = fs::remove_dir_all(&self.path);
-            for lock in self.lock.iter().flatten() {
-                let _ = lock.unlock();
-            }
         }
     }
 }
@@ -417,7 +424,10 @@ mod tests {
         let path = runs.join("handed");
         fs::create_dir_all(&path).unwrap();
         let dir = RunDir {
-            lock: Some([lock_run(&path, true).unwrap(), lock_dir(&path).unwrap()]),
+            lock: Some([
+                HeldFile::new(lock_run(&path, true).unwrap()),
+                HeldFile::new(lock_dir(&path).unwrap()),
+            ]),
             path: path.clone(),
             given_up: false,
         };

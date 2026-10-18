@@ -579,6 +579,32 @@ fn rename_gives_a_container_a_new_name() {
     stores.ok(&["rm", "site", "db"]);
 }
 
+/// `shipyard logs` ends as its readers do (F70): 125 when stderr's reader
+/// goes while stdout's is read.
+#[test]
+fn logs_end_as_their_readers_do_by_name() {
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "both",
+        "--network",
+        "none",
+        &stores.image,
+        "sh",
+        "-c",
+        "n=0; while [ $n -lt 20000 ]; do echo out $n; echo err $n >&2; n=$((n+1)); done",
+    ]);
+    assert_eq!(stores.ok(&["wait", "both"]).trim(), "0");
+    shipyard_test_support::pipes::logs_end_as_their_readers_do(
+        || stores.command(&["logs", "both"]),
+        125,
+    );
+}
+
 /// `logs`, `exec`, `cp` and `attach` by name: a stopped container's logs,
 /// and its files copied out and in; exec's exit codes (the command's, 127
 /// for one that isn't there); a running container's file copied out;
@@ -642,6 +668,59 @@ fn logs_exec_cp_and_attach_by_name() {
         "shipyard test root filesystem\n"
     );
     stores.ok(&["rm", "-f", "web", "once"]);
+}
+
+/// `logs -f` ends, quietly, once its reader has gone (`logs -f web | head
+/// -n1`), though the container runs on and writes nothing more: between
+/// its looks it asks whether stdout's reader is there (F78).
+#[test]
+fn logs_follow_ends_when_its_reader_goes() {
+    use std::io::BufRead as _;
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "quiet",
+        "--network",
+        "none",
+        &stores.image,
+        "sh",
+        "-c",
+        "echo first; exec sleep 300",
+    ]);
+    let mut follow = stores
+        .command(&["logs", "-f", "quiet"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Its first line read (the control: it follows), then its reader gone.
+    let mut stdout = std::io::BufReader::new(follow.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "first\n");
+    drop(stdout);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = follow.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = follow.kill();
+            panic!("it followed with no reader");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(follow.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert_eq!(stderr, "");
+    // It ended for its reader, not its container's end.
+    assert!(stores.ok(&["ps"]).contains("Up"));
+    stores.ok(&["rm", "-f", "quiet"]);
 }
 
 /// Stage 9's milestone (v0.2), through the `shipyard` binary, on one
@@ -1112,6 +1191,79 @@ fn ports_that_leave_no_room_for_the_other_holds_are_refused_first() {
             said.contains("sockets, which a container's monitor holds with up to"),
             "{said}"
         );
+        assert!(
+            !stores.ok(&["ps", "-a"]).contains("no-room"),
+            "nothing made"
+        );
+    });
+}
+
+/// Under a hard descriptor limit of 1,024, a run asks only for the holds
+/// its monitor can hand its exit command (each hold's copy sits above it
+/// while they're placed: 478 here), where its soft limit alone would let
+/// 960 by: 300 ports on both families (605 holds) are refused before
+/// anything is made, saying the bound; 200 (405) run (the control). As
+/// root, in a network namespace of the test's own.
+#[test]
+fn ports_are_bound_by_the_room_to_hand_them_on() {
+    use std::os::unix::process::CommandExt as _;
+    if !is_root() {
+        eprintln!("skipping: a network of its own needs root");
+        return;
+    }
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    shipyard_test_support::in_new_netns(move || {
+        use nix::sys::resource::{Resource, setrlimit};
+        use shipyard_network::route::{LinkChange, Rtnetlink};
+        let mut host = Rtnetlink::new().unwrap();
+        let lo = host.link("lo").unwrap().unwrap().index;
+        host.change(lo, LinkChange::Up(true)).unwrap();
+        stores.ok(&["network", "create", "--ipv6", "app"]);
+        let limited = |args: &[&str]| {
+            let mut command = stores.command(args);
+            // SAFETY: `setrlimit` is an async-signal-safe system call;
+            // nothing is allocated.
+            unsafe {
+                command.pre_exec(|| {
+                    setrlimit(Resource::RLIMIT_NOFILE, 1_024, 1_024)?;
+                    Ok(())
+                });
+            }
+            command.output().expect("running shipyard")
+        };
+        let ran = limited(&[
+            "run",
+            "-d",
+            "--name",
+            "fits",
+            "--network",
+            "app",
+            "-p",
+            "20000-20199:20000-20199",
+            &stores.image,
+            "sleep",
+            "300",
+        ]);
+        assert!(ran.status.success(), "{ran:?}");
+        stores.ok(&["rm", "-f", "fits"]);
+        let refused = limited(&[
+            "run",
+            "-d",
+            "--name",
+            "no-room",
+            "--network",
+            "app",
+            "-p",
+            "21000-21299:21000-21299",
+            &stores.image,
+            "sleep",
+            "300",
+        ]);
+        assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(said.contains("at most 478 in all here"), "{said}");
         assert!(
             !stores.ok(&["ps", "-a"]).contains("no-room"),
             "nothing made"

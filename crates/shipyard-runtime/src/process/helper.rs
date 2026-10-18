@@ -54,9 +54,7 @@ use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 
-use super::child::{
-    SETUP_FAILED, close_from, confine_after_switch, confine_before_switch, make_undumpable,
-};
+use super::child::{SETUP_FAILED, confine_after_switch, confine_before_switch, make_undumpable};
 use super::internal::{
     Internal, close_on_exec, decode_namespaces, fd_bound, internal_entry, join, setgroups_allowed,
     split_namespaces, start_sealed,
@@ -449,7 +447,7 @@ fn enter<'h>(
     //    and its own /proc/self/fd.
     let mut keep = vec![setup.report, own_fds.as_raw_fd()];
     keep.extend(mounted.as_ref().map(AsRawFd::as_raw_fd));
-    close_all_but(keep, bound)?;
+    close_host_files(keep, bound)?;
     if setup.pause_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(u64::from(setup.pause_ms)));
     }
@@ -599,21 +597,13 @@ fn become_root(setgroups_allowed: bool) -> std::result::Result<(), HelperFailure
     setresuid(uid, uid, uid).map_err(setting_up("becoming root in the container"))
 }
 
-/// Closes every descriptor from 3 up but `keep`.
-fn close_all_but(mut keep: Vec<RawFd>, bound: RawFd) -> std::result::Result<(), HelperFailure> {
-    let closing =
-        |failure: super::child::Failure| setup_failure(failure.errno(), "closing the host's files");
+/// Closes every descriptor from 3 up but `keep` (the joiner's sweep,
+/// [`super::child::close_all_but`]).
+fn close_host_files(mut keep: Vec<RawFd>, bound: RawFd) -> std::result::Result<(), HelperFailure> {
     keep.sort_unstable();
-    let mut start = 3_u32;
-    for fd in keep {
-        let fd = u32::try_from(fd).unwrap_or(0);
-        if fd < start {
-            continue;
-        }
-        close_from(start, fd.saturating_sub(1), bound).map_err(closing)?;
-        start = fd.saturating_add(1);
-    }
-    close_from(start, u32::MAX, bound).map_err(closing)
+    let kept = keep.into_iter().map(|fd| u32::try_from(fd).unwrap_or(0));
+    super::child::close_all_but(kept, bound)
+        .map_err(|failure| setup_failure(failure.errno(), "closing the host's files"))
 }
 
 /// The ranges in an ID map (`/proc/PID/uid_map`), as `(first, count)` on

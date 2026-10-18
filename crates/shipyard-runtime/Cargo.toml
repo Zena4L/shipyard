@@ -17,6 +17,9 @@ serde_json.workspace = true
 # Netlink (stage 7): bringing a container's loopback up, and moving network
 # devices into its namespace; interface names checked as the kernel does.
 shipyard-network.workspace = true
+# The state files written whole and read with a bound, locks, pidfds,
+# descriptors passed and inherited (stage 10).
+shipyard-sys.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

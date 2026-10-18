@@ -19,6 +19,7 @@ pub mod console;
 pub mod harness;
 #[cfg(target_os = "linux")]
 pub mod net;
+pub mod pipes;
 pub mod pty;
 pub mod registry;
 pub mod rootfs;

@@ -7,7 +7,10 @@ use std::time::SystemTime;
 
 use shipyard_runtime::container::{ExitRecord, Status};
 
+use super::id::ContainerId;
 use super::record::Record;
+use crate::Engine;
+use crate::error::{Result, bail};
 
 /// A container's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,10 +65,11 @@ impl ContainerState {
         }
     }
 
-    /// Whether it's up (running, paused, still stopping, or about to
-    /// restart): what `ps` lists without `-a`.
+    /// Whether it's active: running, paused, still stopping, or about to
+    /// restart. What `ps` lists without `-a`, and (until stage 11) what
+    /// `inspect` says is `running`.
     #[must_use]
-    pub fn is_up(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         matches!(
             self,
             Self::Running { .. } | Self::Paused | Self::Stopping | Self::Restarting { .. }
@@ -133,5 +137,130 @@ pub(crate) fn derive_state(
         // Creating, created, and whatever a later runtime adds: not yet
         // running.
         Some(_) => ContainerState::Created,
+    }
+}
+
+/// Where container `record` is in its life, from its runtime's state
+/// (under [`Paths::runtime_root`](crate::Paths::runtime_root)), read
+/// without taking its lock: a listing never waits behind another command.
+/// Without Linux nothing runs, and a container has no runtime state.
+///
+/// # Errors
+///
+/// - [`ErrorKind::Environment`]: there's no runtime state root to look in
+///   (`XDG_RUNTIME_DIR` unset, say): its state can't be known.
+/// - [`ErrorKind::Runtime`]: its runtime state can't be read.
+///
+/// [`ErrorKind::Environment`]: crate::error::ErrorKind::Environment
+/// [`ErrorKind::Runtime`]: crate::error::ErrorKind::Runtime
+pub fn state(engine: &Engine, record: &Record) -> Result<ContainerState> {
+    use shipyard_runtime::container::{self as runtime, ContainerError, Status};
+    if cfg!(not(target_os = "linux")) {
+        return Ok(derive_state(record, None, None));
+    }
+    let root = engine.paths.runtime_root()?;
+    let id = record.id.as_str();
+    let status = runtime::peek_status(root, id)?;
+    let exit = match status {
+        Some(Status::Stopped) => match runtime::exit_record(root, id) {
+            Ok(exit) => exit,
+            // Deleted since: it has no runtime state any more.
+            Err(ContainerError::NotFound(_)) => {
+                return Ok(derive_state(record, None, None));
+            }
+            Err(err) => return Err(err.into()),
+        },
+        _ => None,
+    };
+    Ok(derive_state(record, status, exit))
+}
+
+/// What a command needs of a container to reach it (stage 9, step 9.4c1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only `sockets` needs one off Linux (`Attachable`)"
+    )
+)]
+pub(crate) enum Needs {
+    /// Its program running, not frozen (`exec`).
+    Running,
+    /// Its init there to reach: running, frozen, or being started
+    /// (`attach`, its sockets). Not one stopping: its init is gone.
+    Attachable,
+}
+
+/// Its runtime's word on container `id`: whether it has a monitor (being
+/// started, running, frozen or stopping) or not. Read without its lock, and
+/// cheap (one file): a follower asks it again and again. Without Linux
+/// nothing ever has one.
+pub(crate) fn has_monitor(engine: &Engine, id: &ContainerId) -> bool {
+    use shipyard_runtime::container as runtime;
+    monitor_there(
+        engine
+            .paths
+            .runtime_root()
+            .ok()
+            .and_then(|root| runtime::peek_status(root, id.as_str()).ok().flatten()),
+    )
+}
+
+/// [`has_monitor`]'s answer for a runtime state of `status`.
+pub(super) fn monitor_there(status: Option<Status>) -> bool {
+    status.is_some_and(|status| status != Status::Stopped)
+}
+
+/// Why a container whose runtime state is `status` isn't as `needs` says,
+/// if it isn't ([`require`]'s refusals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unmet {
+    /// Frozen, where its program must run.
+    Paused,
+    /// Not running at all.
+    NotRunning,
+}
+
+/// [`require`]'s answer for a runtime state of `status`.
+pub(crate) fn unmet(status: Option<Status>, needs: Needs) -> Option<Unmet> {
+    match (status, needs) {
+        (Some(Status::Running), _)
+        | (Some(Status::Paused | Status::Created | Status::Creating), Needs::Attachable) => None,
+        (Some(Status::Paused), Needs::Running) => Some(Unmet::Paused),
+        _ => Some(Unmet::NotRunning),
+    }
+}
+
+/// Checks container `record` is as `needs` says, so that what's wanted
+/// (`to`: "run a command in it") can be done; if it isn't, says why and what
+/// would do.
+///
+/// # Errors
+///
+/// - [`ErrorKind::NotRunning`]: it isn't (paused, for [`Needs::Running`]).
+/// - As [`state()`]'s runtime root and runtime state.
+///
+/// [`ErrorKind::NotRunning`]: crate::error::ErrorKind::NotRunning
+pub(crate) fn require(engine: &Engine, record: &Record, needs: Needs, to: &str) -> Result<()> {
+    use shipyard_runtime::container as runtime;
+    let status = if cfg!(target_os = "linux") {
+        runtime::peek_status(engine.paths.runtime_root()?, record.id.as_str())?
+    } else {
+        None
+    };
+    match unmet(status, needs) {
+        None => Ok(()),
+        Some(Unmet::Paused) => bail!(
+            NotRunning,
+            "container {} is paused: its processes are frozen until it's resumed, so it can't \
+             {to}",
+            record.name
+        ),
+        Some(Unmet::NotRunning) => bail!(
+            NotRunning,
+            "container {} is not running: start it to {to}",
+            record.name
+        ),
     }
 }

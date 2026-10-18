@@ -65,6 +65,9 @@ const SERVER_TASKS: usize = shipyard_network::dns::server::MOST_TASKS + 1 + 4;
 /// The file in a network's directory that names its DNS server's cgroup.
 const CGROUP_FILE: &str = "dns.cgroup";
 
+/// The most of [`CGROUP_FILE`] read: a cgroup's name, a few bytes.
+const CGROUP_FILE_MAX: u64 = 4 * 1024;
+
 /// How long an empty cgroup under `shipyard/dns` must have been there for
 /// a server's start to remove it, as a network's left over: one made just
 /// now is about to be joined.
@@ -81,15 +84,20 @@ fn cgroup_name(dir: &Path, network: &str) -> std::result::Result<String, String>
     }
     let random = crate::random::bytes::<4>().map_err(|error| error.to_string())?;
     let made = format!("{network}-{}", crate::random::hex(&random));
-    crate::fs::write_atomically(dir, CGROUP_FILE, made.as_bytes(), 0o600)
-        .map_err(|error| error.to_string())?;
+    // (A name lost to a power cut is made again: nothing to say.)
+    let _ = crate::fs::write_atomically(dir, CGROUP_FILE, made.as_bytes(), 0o600)
+        .map_err(|error| error.to_string())?
+        .unsynced();
     Ok(made)
 }
 
 /// The cgroup name kept in the network directory `dir`, if it's one: a
 /// single path component.
 fn kept_cgroup_name(dir: &Path) -> Option<String> {
-    let kept = std::fs::read_to_string(dir.join(CGROUP_FILE)).ok()?;
+    let kept = String::from_utf8(
+        shipyard_sys::fs::read_bounded(&dir.join(CGROUP_FILE), CGROUP_FILE_MAX).ok()?,
+    )
+    .ok()?;
     let mut parts = Path::new(&kept).components();
     match (parts.next(), parts.next()) {
         (Some(std::path::Component::Normal(_)), None) => Some(kept),

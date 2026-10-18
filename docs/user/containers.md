@@ -224,6 +224,11 @@ shipyard update --restart no web        # change it, the container kept
 - **It waits a little first:** 100 ms, doubling after each run shorter than 10 seconds,
   up to a minute; a run of 10 seconds or more starts it over. Meanwhile `ps` shows it
   `Restarting`, and it counts as up: `rm` refuses it (stop it first, or `rm -f`).
+- **A full disk delays it:** when a container's end can't be recorded, Shipyard
+  keeps how it ended and tries again, waiting as above (up to a minute apart), until
+  there's room, then applies the policy. It stops trying at `shipyard system stop`,
+  `rm` or a reboot. A `stop` that couldn't be recorded on a full disk either isn't
+  known then: the policy may start the container again.
   `update --restart` takes effect at once, also on one waiting to restart.
 - **Each restart is a start of its own**, from its record, as `start` makes one: new
   logs (`logs` shows every start's), and a new address unless it has `--ip`. Only the
@@ -356,10 +361,16 @@ the shutdown's stop reaches one you made from a login session (`sudo shipyard ru
 over SSH) as surely as one the boot unit started.
 
 To run both, install the systemd units in `contrib/systemd` (see its README):
-`shipyard-recover.service` for root's containers, and a user unit for yours. Rootless,
-your user manager runs at boot only with linger (`sudo loginctl enable-linger $USER`); without
-it, the user unit runs at your first login after the boot. `shipyard doctor` says
-whether the unit is enabled, and whether linger is on.
+`shipyard-recover.service` runs `system recover` at boot, and `shipyard-stop.service`
+runs `system stop` at a shutdown, even one that comes while the boot's start is still
+going; for root's containers, and user units for yours. Rootless, your user manager
+runs at boot only with linger (`sudo loginctl enable-linger $USER`); without it, the
+user units run at your first login after the boot. `shipyard doctor` says whether the
+units are enabled, whether linger is on, and when a container's stop timeout is
+longer than the stop unit's.
+
+A paused container (`shipyard-runtime pause`) is thawed for its stop, so its stop
+signal is had at once, as Docker does.
 
 ## Logging out (rootless)
 
@@ -467,7 +478,8 @@ Each start's output is kept in its own log directory, beside the container's rec
 (`logs/0000000001`, `logs/0000000002`, …), the latest 10 starts' kept; `logs` reads
 them all, a stopped container's too. Its stdout goes to your stdout and its stderr to your stderr.
 `-f` follows the newest start until the container stops, as Docker's does: if it's
-started again, run `logs -f` again for the new start. `--tail` counts lines across
+started again, run `logs -f` again for the new start; it also ends once nothing reads
+its output (`logs -f web | head -n1`). `--tail` counts lines across
 starts. A line a start left unfinished (it ended mid-line) is ended before the next
 start's output. `--since` takes a time (RFC 3339), Unix seconds, or a duration ago
 (`10m`, `2h`, `3d`); `-t` starts each line with the time it was written.

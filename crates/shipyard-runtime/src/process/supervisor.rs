@@ -272,7 +272,7 @@ impl Supervisor {
         spec: &ProcessSpec,
         stop: StopPolicy,
         join: &Join,
-        console: Option<(std::os::fd::RawFd, (u16, u16))>,
+        console: Option<(std::os::fd::RawFd, super::terminal::Size)>,
         running: impl FnOnce() + 'static,
     ) -> Result<ExitStatus> {
         self.running = Some(Box::new(running));
@@ -304,7 +304,7 @@ impl Supervisor {
         &mut self,
         spec: &ProcessSpec,
         join: &Join,
-        console: Option<(std::os::fd::RawFd, (u16, u16))>,
+        console: Option<(std::os::fd::RawFd, super::terminal::Size)>,
     ) -> Result<u32> {
         // Taken first: a refusal below lets go of them too.
         let held = self.take_passed();
@@ -787,7 +787,7 @@ struct RunExtras {
     exact_env: bool,
     /// `exec`'s terminal goes to this OCI console socket (open, and the
     /// terminal's size), not to a relay.
-    console: Option<(std::os::fd::RawFd, (u16, u16))>,
+    console: Option<(std::os::fd::RawFd, super::terminal::Size)>,
 }
 
 /// Rejects a join that can't work here, before anything starts.

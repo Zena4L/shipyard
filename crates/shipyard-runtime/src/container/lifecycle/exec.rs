@@ -29,6 +29,10 @@ pub(super) const EXEC_FILE: &str = "exec.json";
 /// The snapshot's format: what this Shipyard writes and reads.
 const EXEC_VERSION: u32 = 1;
 
+/// The most of a snapshot read: the process again, with its security
+/// (a seccomp profile among it), so the state file's bound.
+const EXEC_MAX: u64 = super::super::versions::STATE_MAX;
+
 /// Only a snapshot's version: read first, whatever else the file holds.
 #[derive(Deserialize)]
 struct Versioned {
@@ -84,7 +88,7 @@ fn read_snapshot(dir: &Path, id: &str) -> Result<(ProcessSpec, Security)> {
         id: id.to_owned(),
         why,
     };
-    let bytes = match std::fs::read(dir.join(EXEC_FILE)) {
+    let bytes = match shipyard_sys::fs::read_bounded(&dir.join(EXEC_FILE), EXEC_MAX) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(not_executable(

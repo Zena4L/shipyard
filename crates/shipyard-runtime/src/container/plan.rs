@@ -100,7 +100,7 @@ impl Plan {
             if !plan.isolation.has(Namespace::Mount) {
                 return Err(PlanError::TerminalWithoutMount.into());
             }
-            terminal.size = terminal.size.filter(|&(rows, cols)| rows > 0 && cols > 0);
+            terminal.size = terminal.size.filter(|size| size.rows > 0 && size.cols > 0);
         }
         let warning = crate::oci::without_unusable_cgroup_mount(&mut plan.isolation);
         plan.isolation.validate().map_err(PlanError::from)?;
@@ -248,7 +248,8 @@ struct PlanFile {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TerminalFile {
-    size: Option<(u16, u16)>,
+    /// `[rows, cols]` (a [`Size`](crate::process::terminal::Size) keeps that shape).
+    size: Option<crate::process::terminal::Size>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -307,13 +308,20 @@ mod tests {
             hard: crate::process::RlimitValue::Unlimited,
         });
         let mut plan = Plan::new(spec, isolation.clone());
-        plan.terminal = Some(crate::oci::BundleTerminal::sized(Some((24, 80))));
-        let read = Plan::parse(&plan.to_json().unwrap()).unwrap();
+        plan.terminal = Some(crate::oci::BundleTerminal::sized(Some(
+            crate::process::terminal::Size::new(24, 80),
+        )));
+        let json = plan.to_json().unwrap();
+        // The size's shape on disk, as earlier versions wrote it (H2):
+        // `[rows, cols]`.
+        let file: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(file["terminal"]["size"], serde_json::json!([24, 80]));
+        let read = Plan::parse(&json).unwrap();
         assert_eq!(read.isolation, isolation);
         assert_eq!(read.spec, plan.spec);
         assert_eq!(
             read.terminal.and_then(|terminal| terminal.size),
-            Some((24, 80))
+            Some(crate::process::terminal::Size::new(24, 80))
         );
     }
 
@@ -364,9 +372,12 @@ mod tests {
         isolation.root = Some(Root::new("/rootfs"));
         let mut plan = Plan::new(ProcessSpec::new(vec!["true".into()]), isolation);
         for (size, kept) in [((24, 80), Some((24, 80))), ((0, 80), None), ((24, 0), None)] {
-            plan.terminal = Some(crate::oci::BundleTerminal::sized(Some(size)));
+            plan.terminal = Some(crate::oci::BundleTerminal::sized(Some(size.into())));
             let (checked, _) = plan.for_caller().unwrap();
-            assert_eq!(checked.terminal.and_then(|terminal| terminal.size), kept);
+            assert_eq!(
+                checked.terminal.and_then(|terminal| terminal.size),
+                kept.map(Into::into)
+            );
         }
     }
 
