@@ -23,6 +23,16 @@ pub fn open(pid: i32) -> io::Result<OwnedFd> {
     rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).map_err(io::Error::from)
 }
 
+/// Whether `error`, from [`open`], says this process can't have pidfds:
+/// a kernel before 5.3 (`ENOSYS`), or a seccomp or LSM policy refusing the
+/// call (`EPERM`: `pidfd_open` itself never returns it). The caller falls
+/// back to the PID, checked first; any other error is its own (`ESRCH`:
+/// gone; `EMFILE`).
+#[must_use]
+pub fn unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM))
+}
+
 /// Sends signal `signal`, by number, to the process `pidfd` is: 0 sends
 /// none, only asks whether it's still there.
 ///

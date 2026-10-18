@@ -40,7 +40,7 @@ const SHIPYARD: &str = "/usr/bin/shipyard";
 
 /// The data disk (the VM's first virtio block device) and where it goes.
 const DATA_DISK: &str = "/dev/vda";
-const DATA: &str = "/var/lib/shipyard";
+pub(super) const DATA: &str = "/var/lib/shipyard";
 
 /// Modules the engine can't work without, in their load order (the
 /// kernel loads what each needs first, and the rest on demand: `nf_tables`'
@@ -83,7 +83,7 @@ fn say(line: &str) {
 /// Says why, then powers the VM off: the VM host sees it stop.
 fn power_off(why: &str) -> ! {
     say(&format!("{why}; powering off"));
-    nix::unistd::sync();
+    sync_data();
     let _ = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
     // (Reboot only returns on failure; PID 1 may not exit.)
     loop {
@@ -176,8 +176,9 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Stage 2, up to the agent: the system set up, the agent started, then the
-/// containers the last boot left settled in the background.
+/// Stage 2: the system set up, the agent started (refusing requests until
+/// the guest is ready), the data disk and the home, the guest made ready;
+/// then the containers the last boot left settled in the background.
 fn boot() -> Result<Child, String> {
     // Blocked first: a child's end (the agent's, early) or a stop that
     // comes while booting waits for `serve` instead of being lost (PID 1
@@ -188,9 +189,13 @@ fn boot() -> Result<Child, String> {
     let _ = nix::unistd::sethostname("shipyard");
     load_modules()?;
     network();
+    // The agent first: until the guest is ready it refuses every request
+    // at once, saying why, so a long check or repair of the data disk
+    // never runs against the host's boot bound (D10.4-3).
+    let agent = start_agent()?;
     data_disk()?;
     home();
-    let agent = start_agent()?;
+    std::fs::write(super::READY, b"").map_err(|e| format!("making {}: {e}", super::READY))?;
     // Containers the last boot left (killed with the VM, or stopped), as a
     // Linux host's boot unit settles them: after the agent, so a slow
     // recovery doesn't count against the VM's boot (`serve` reaps it).
@@ -305,9 +310,12 @@ fn network() {
     }
 }
 
-/// The data disk, formatted the first time, checked every time, mounted.
+/// The data disk, formatted the first time, checked every time (and
+/// repaired if the check leaves errors: D10.4-2), mounted; a repair said
+/// in its marker for [`disk::BOOTS_SAID`] boots.
 fn data_disk() -> Result<(), String> {
     let found = examine(DATA_DISK)?;
+    let mut repaired = None;
     match disk::step(found) {
         Step::Refuse => {
             return Err(format!(
@@ -323,19 +331,7 @@ fn data_disk() -> Result<(), String> {
                 &["-q", "-F", "-L", disk::LABEL, DATA_DISK],
             )?;
         }
-        Step::CheckAndMount => {
-            let code = Command::new("/sbin/e2fsck")
-                .args(["-p", DATA_DISK])
-                .status()
-                .map_err(|e| format!("running e2fsck: {e}"))?
-                .code()
-                .unwrap_or(-1);
-            if !disk::checked(code) {
-                return Err(format!(
-                    "{DATA_DISK}'s file system has errors e2fsck couldn't fix (exit {code})"
-                ));
-            }
-        }
+        Step::CheckAndMount => repaired = check_data_disk()?,
     }
     std::fs::create_dir_all(DATA).map_err(|e| format!("making {DATA}: {e}"))?;
     mount(
@@ -346,7 +342,25 @@ fn data_disk() -> Result<(), String> {
         None::<&str>,
     )
     .map_err(|e| format!("mounting {DATA_DISK} on {DATA}: {e}"))?;
+    if let Err(error) = disk::mark(Path::new(DATA), repaired.as_deref()) {
+        say(&format!("the data disk's repair marker: {error}"));
+    }
     Ok(())
+}
+
+/// `e2fsck` on the data disk ([`disk::check`]).
+fn check_data_disk() -> Result<Option<String>, String> {
+    disk::check(
+        DATA_DISK,
+        |mode| {
+            Command::new("/sbin/e2fsck")
+                .args([mode, DATA_DISK])
+                .status()
+                .map_err(|e| format!("running e2fsck: {e}"))
+                .map(|status| status.code().unwrap_or(-1))
+        },
+        say,
+    )
 }
 
 /// What the data disk holds, before it's mounted (its first MiB read).
@@ -372,6 +386,12 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// How the Mac's home is mounted (F108): its set-user-ID bits and device
+/// files mean nothing in the guest, nor in a container a bind of it gives
+/// them to (a bind keeps both flags): a file made on the Mac is never a
+/// way to root in the VM.
+const HOME_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
+
 /// The Mac's home, shared at its own path (`shipyard.home=` on the kernel's
 /// command line). Without it, commands run, but no path of the Mac's does.
 fn home() {
@@ -387,7 +407,7 @@ fn home() {
                 Some(forward::HOME_TAG),
                 home,
                 Some("virtiofs"),
-                MsFlags::empty(),
+                HOME_FLAGS,
                 None::<&str>,
             )
             .map_err(|e| e.to_string())
@@ -530,23 +550,79 @@ const LOOK_AGAIN: Duration = Duration::from_secs(5);
 fn serve(agent: u32) -> ! {
     let signals = waited_for();
     let mut agent = Some(agent);
+    let mut backoff = Backoff::new(Instant::now());
+    let mut next_start = Instant::now();
     loop {
-        match wait_for(&signals, LOOK_AGAIN) {
+        let wait = if agent.is_some() {
+            LOOK_AGAIN
+        } else {
+            next_start
+                .saturating_duration_since(Instant::now())
+                .min(LOOK_AGAIN)
+        };
+        match wait_for(&signals, wait) {
             Some(Signal::SIGCHLD) | None => {}
             Some(_) => stop(),
         }
         if let Some(ended) = reap(agent)
             && agent == Some(ended)
         {
+            next_start = backoff.ended(Instant::now());
             say("the agent ended; starting it again");
             agent = None;
         }
-        if agent.is_none() {
+        if agent.is_none() && Instant::now() >= next_start {
+            backoff.started(Instant::now());
             match start_agent() {
                 Ok(child) => agent = Some(child.id()),
-                Err(error) => say(&format!("{error}; trying again")),
+                Err(error) => {
+                    next_start = backoff.ended(Instant::now());
+                    say(&format!("{error}; trying again"));
+                }
             }
         }
+    }
+}
+
+/// When the agent may start again (F109): 0.1 s after it ended, then
+/// after a wait that doubles, to 5 s, while it keeps ending soon after its
+/// start (a crash loop: no spin, no flood of the console log); from 0.1 s
+/// again once it has run [`Backoff::STEADY`].
+#[derive(Debug)]
+struct Backoff {
+    next: Duration,
+    started: Instant,
+}
+
+impl Backoff {
+    /// The first wait.
+    const FIRST: Duration = Duration::from_millis(100);
+    /// The longest.
+    const MOST: Duration = Duration::from_secs(5);
+    /// How long a start must run to count as one that worked.
+    const STEADY: Duration = Duration::from_secs(30);
+
+    fn new(started: Instant) -> Self {
+        Self {
+            next: Self::FIRST,
+            started,
+        }
+    }
+
+    /// The agent is started at `now`.
+    fn started(&mut self, now: Instant) {
+        self.started = now;
+    }
+
+    /// The agent ended (or couldn't be started) at `now`: when it may
+    /// start again.
+    fn ended(&mut self, now: Instant) -> Instant {
+        if now.saturating_duration_since(self.started) >= Self::STEADY {
+            self.next = Self::FIRST;
+        }
+        let wait = self.next;
+        self.next = self.next.saturating_mul(2).min(Self::MOST);
+        now + wait
     }
 }
 
@@ -580,26 +656,48 @@ fn reap(agent: Option<u32>) -> Option<u32> {
     }
 }
 
+/// The data disk's writes on the disk (`syncfs` on it alone, F109): a
+/// global `sync` would wait on every file system, the home's virtiofs too,
+/// which a wedged Mac side never lets end. Not mounted (yet): nothing to.
+fn sync_data() {
+    if let Ok(data) = std::fs::File::open(DATA) {
+        let _ = nix::unistd::syncfs(&data);
+    }
+}
+
+/// Reaps every process (`reap_one`: `waitpid(-1, WNOHANG)`) until none is
+/// left or `deadline` passes (F109): never blocking, so a process stuck in
+/// the kernel (an uninterruptible wait on a wedged virtiofs call, which
+/// even SIGKILL doesn't end) can't hold PID 1 past it.
+fn reap_all(deadline: Instant, mut reap_one: impl FnMut() -> nix::Result<WaitStatus>) {
+    while Instant::now() < deadline {
+        match reap_one() {
+            Ok(WaitStatus::StillAlive) => std::thread::sleep(Duration::from_millis(20)),
+            // One reaped, or interrupted: look again.
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            // None left (`ECHILD`), or a failure that would only repeat.
+            Err(_) => return,
+        }
+    }
+}
+
 /// The VM's stop: the containers stopped (as `system stop` does on a Linux
 /// host's shutdown), every process ended, the disk synced and let go.
 fn stop() -> ! {
     say("stopping");
     // What's written so far, on the disk first: a Mac that shuts down may
     // end the VM before its containers have all stopped.
-    nix::unistd::sync();
+    sync_data();
     shipyard(&["system", "stop"], SETTLE);
     let _ = nix::sys::signal::kill(Pid::from_raw(-1), Signal::SIGTERM);
     std::thread::sleep(Duration::from_secs(2));
     let _ = nix::sys::signal::kill(Pid::from_raw(-1), Signal::SIGKILL);
     // Every process reaped (they hold the disk's files open), then the disk
     // let go cleanly: its journal needs no replay at the next boot.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !matches!(
-        waitpid(Pid::from_raw(-1), None),
-        Err(nix::errno::Errno::ECHILD)
-    ) && Instant::now() < deadline
-    {}
-    nix::unistd::sync();
+    reap_all(Instant::now() + Duration::from_secs(5), || {
+        waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
+    });
+    sync_data();
     if let Err(error) = nix::mount::umount(DATA) {
         say(&format!(
             "unmounting {DATA}: {error}; made read-only instead"
@@ -618,6 +716,76 @@ fn stop() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The home is mounted without set-user-ID bits or device files.
+    #[test]
+    fn the_home_is_mounted_nosuid_and_nodev() {
+        assert!(HOME_FLAGS.contains(MsFlags::MS_NOSUID));
+        assert!(HOME_FLAGS.contains(MsFlags::MS_NODEV));
+    }
+
+    /// The stop's reaping ends once nothing is left, or at its deadline
+    /// though a process never ends (F109): it never blocks.
+    #[test]
+    fn reaping_ends_by_its_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        reap_all(deadline, || Ok(WaitStatus::StillAlive));
+        let late = Instant::now().saturating_duration_since(deadline);
+        assert!(late < Duration::from_secs(1), "{late:?} past it");
+        let mut looked = 0;
+        reap_all(Instant::now() + Duration::from_secs(60), || {
+            looked += 1;
+            Err(nix::errno::Errno::ECHILD)
+        });
+        assert_eq!(looked, 1, "none left: at once");
+        // One reaped, then none: looked at twice, no wait.
+        let mut answers = [
+            Ok(WaitStatus::Exited(Pid::from_raw(7), 0)),
+            Err(nix::errno::Errno::ECHILD),
+        ]
+        .into_iter();
+        let mut looked = 0;
+        reap_all(Instant::now() + Duration::from_secs(60), || {
+            looked += 1;
+            answers.next().unwrap()
+        });
+        assert_eq!(looked, 2);
+    }
+
+    /// The agent's restarts wait longer each time it ends soon after its
+    /// start, up to 5 s, and from 0.1 s again after a start that ran.
+    #[test]
+    fn a_crash_looping_agent_is_restarted_ever_later() {
+        let start = Instant::now();
+        let mut backoff = Backoff::new(start);
+        let waits: Vec<Duration> = (0..8)
+            .map(|_| {
+                backoff.started(start);
+                backoff.ended(start) - start
+            })
+            .collect();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            waits,
+            [
+                ms(100),
+                ms(200),
+                ms(400),
+                ms(800),
+                ms(1600),
+                ms(3200),
+                ms(5000),
+                ms(5000)
+            ]
+        );
+        backoff.started(start);
+        let later = start + Backoff::STEADY;
+        assert_eq!(
+            backoff.ended(later) - later,
+            ms(100),
+            "after a start that ran"
+        );
+    }
 
     /// Only places inside the home are hidden: not the home itself, not
     /// one elsewhere, nothing that steps out of it.

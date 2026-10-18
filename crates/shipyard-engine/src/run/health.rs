@@ -354,10 +354,13 @@ mod linux {
     /// `health` written to the start's directory (a failure said in the
     /// log).
     fn write(start_dir: &std::path::Path, health: &Health, log: &Log) {
-        if let Err(error) =
-            crate::fs::write_atomically(start_dir, health::FILE, &health.to_json(), 0o600)
+        match crate::fs::write_atomically(start_dir, health::FILE, &health.to_json(), 0o600)
+            .map(crate::fs::Placed::unsynced)
         {
-            log.line(&format!("warning: the health file: {error:#}"));
+            Ok(None) => {}
+            Ok(Some(error)) | Err(error) => {
+                log.line(&format!("warning: the health file: {error:#}"));
+            }
         }
     }
 

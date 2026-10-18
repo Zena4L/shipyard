@@ -6,7 +6,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Only the pinned toolchain (rust-toolchain.toml) is built and tested.
 rust-version = "1.98"

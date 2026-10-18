@@ -620,15 +620,15 @@ impl Cgroup {
     /// a moment ago, it may have exited since, and its PID gone to another
     /// process anywhere on the host: the process is pinned first (a pidfd),
     /// then checked, and signalled through the pin, so a PID reused after
-    /// the check isn't hit either. Before Linux 5.3 (no `pidfd_open`), the
-    /// check and a plain `kill`. Best effort: a process gone is skipped.
+    /// the check isn't hit either. Without pidfds (before Linux 5.3, or a
+    /// policy refusing them), the check and a plain `kill`. Best effort: a process gone is skipped.
     /// Says whether it's done with: signalled, or no longer one of its own;
     /// `false` if it couldn't be pinned.
     fn signal_member(&self, pid: Pid, signal: libc::c_int) -> bool {
         let pidfd = match shipyard_sys::pidfd::open(pid.as_raw()) {
             Ok(pidfd) => Some(pidfd),
+            Err(error) if shipyard_sys::pidfd::unsupported(&error) => None,
             Err(error) => match error.raw_os_error() {
-                Some(libc::ENOSYS) => None,
                 // Gone already.
                 Some(libc::ESRCH) => return true,
                 _ => return false,

@@ -163,7 +163,7 @@ fn a_previous_start_puts_back_all_a_start_rewrote() {
     })
     .unwrap();
     assert_ne!(rewritten, before, "the test shows nothing otherwise");
-    let previous = previous_start(&engine, &made.id).unwrap();
+    let previous = previous_start(&engine, &made.id).start().unwrap();
     let mut restored = rewritten.clone();
     previous.restore(&mut restored);
     assert_eq!(restored, before);
@@ -176,6 +176,7 @@ fn a_previous_start_puts_back_all_a_start_rewrote() {
     .unwrap();
     let mut kept_stop = stopped_since.clone();
     previous_start(&engine, &made.id)
+        .start()
         .unwrap()
         .restore(&mut kept_stop);
     assert!(kept_stop.stopped_by_user, "a stop since wins");
@@ -204,6 +205,7 @@ fn a_previous_start_puts_back_all_a_start_rewrote() {
     );
     let mut back = rewritten.clone();
     previous_start(&engine, &made.id)
+        .start()
         .unwrap()
         .restore(&mut back);
     assert_eq!(back.ports, many);
@@ -228,7 +230,9 @@ fn a_version_1_previous_start_is_read() {
         r#"{"version":1,"started":null,"finished":null,"exit":null,"boot_id":null}"#,
     )
     .unwrap();
-    let previous = previous_start(&engine, &made.id).expect("a v1 file read");
+    let previous = previous_start(&engine, &made.id)
+        .start()
+        .expect("a v1 file read");
     let mut restored = record.clone();
     previous.restore(&mut restored);
     assert_eq!(restored.started, None, "v1's fields put back");
@@ -241,7 +245,10 @@ fn a_version_1_previous_start_is_read() {
         r#"{"version":3,"started":null,"finished":null,"exit":null,"boot_id":null}"#,
     )
     .unwrap();
-    assert!(previous_start(&engine, &made.id).is_none());
+    // A newer version than this Shipyard knows is known as one (H2), never
+    // read as what it says.
+    let kept = previous_start(&engine, &made.id);
+    assert!(matches!(kept, Kept::Newer(3)), "{kept:?}");
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -274,5 +281,61 @@ fn running_is_let_go_at_once_unless_given_up() {
         "given up: the monitor's copy keeps it"
     );
     drop((monitors, copy));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A start that never ran is settled only in a record without an end
+/// (F110): one whose start's own undoing already put its last end back is
+/// left as it is (its start, end and exit kept, so a boot still brings it
+/// back); one without, settled as never started (the control). What it
+/// kept aside goes, unless it's a newer Shipyard's: never read (the record
+/// says never started, which is true of this start), kept, and said.
+#[test]
+fn a_never_run_start_is_settled_once() {
+    let (engine, collect, dir) = engine("never-ran");
+    let made = create_record(&engine, new(Some("ran-before"))).unwrap();
+    let kept_file = dir
+        .join("containers")
+        .join(made.id.as_str())
+        .join("previous-start.json");
+    let ended = update(&engine, &made.id, |record| {
+        record.started = Some(SystemTime::now());
+        record.finished = Some(SystemTime::now());
+    })
+    .unwrap();
+    assert_eq!(
+        settle_never_ran(&engine, &made.id).unwrap(),
+        ended,
+        "its end, put back, kept"
+    );
+    // Without an end, and a newer Shipyard's file kept aside.
+    update(&engine, &made.id, |record| record.finished = None).unwrap();
+    let newer = r#"{"version":3,"started":null,"finished":null,"exit":null,"boot_id":null}"#;
+    fs::write(&kept_file, newer).unwrap();
+    let settled = settle_never_ran(&engine, &made.id).unwrap();
+    assert_eq!(
+        (settled.started, settled.finished),
+        (None, None),
+        "never started"
+    );
+    assert!(kept_file.exists(), "a newer Shipyard's file, kept");
+    assert!(
+        collect.warnings().iter().any(|warning| warning.kind
+            == crate::report::WarningKind::LeftForLater
+            && warning.message.contains("previous-start.json is version 3")),
+        "{:?}",
+        collect.warnings()
+    );
+    // The control: one this Shipyard reads is let go of once used.
+    update(&engine, &made.id, |record| {
+        record.started = Some(SystemTime::now());
+    })
+    .unwrap();
+    keep_previous_start(&engine, &made.id, &PreviousStart::of(&ended)).unwrap();
+    assert_eq!(
+        settle_never_ran(&engine, &made.id).unwrap().finished,
+        ended.finished
+    );
+    assert!(!kept_file.exists(), "used, and let go of");
     fs::remove_dir_all(dir).unwrap();
 }

@@ -278,11 +278,13 @@ pub(super) fn check_holds(planned: &crate::run::Planned, exposed: &[String]) -> 
     let others = FIXED
         .saturating_add(leases)
         .saturating_add(planned.volumes.len());
-    let (soft, _) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+    let (soft, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
         .unwrap_or((u64::MAX, u64::MAX));
+    // Open here first (the soft limit), and handed on by the monitor to
+    // its exit command at the end (the hard one: twice over).
     let room = usize::try_from(soft.saturating_sub(SPARE))
         .unwrap_or(usize::MAX)
-        .min(runtime::MOST_HOLDS);
+        .min(runtime::most_holds_under(hard));
     if sockets.saturating_add(others) > room {
         bail!(
             InvalidRequest,

@@ -224,14 +224,92 @@ impl PreviousStart {
     }
 }
 
-/// What a start that never ran leaves in `record` (F64): what its last
-/// start left, put back from `previous` (kept aside before it: an earlier
-/// end, whole), or, with none kept, never started.
+/// What a start kept aside of its last one ([`previous_start`]).
 #[cfg(target_os = "linux")]
-pub(crate) fn settle_unstarted(record: &mut Record, previous: Option<PreviousStart>) {
-    match previous {
-        Some(previous) => previous.restore(record),
-        None => record.mark_never_started(),
+#[derive(Debug)]
+pub(crate) enum Kept {
+    /// Nothing: none was kept, or what's there can't be read.
+    None,
+    /// What the record said before the start.
+    Start(PreviousStart),
+    /// A newer Shipyard's file, of this version: never read as what it
+    /// says (H2), but kept for that Shipyard.
+    Newer(u32),
+}
+
+#[cfg(target_os = "linux")]
+impl Kept {
+    /// A newer Shipyard's file's version, if it's one.
+    pub(crate) fn newer(&self) -> Option<u32> {
+        match self {
+            Self::Newer(version) => Some(*version),
+            Self::None | Self::Start(_) => None,
+        }
+    }
+
+    /// What it kept, if it's one this Shipyard reads.
+    #[cfg(test)]
+    pub(crate) fn start(self) -> Option<PreviousStart> {
+        match self {
+            Self::Start(previous) => Some(previous),
+            Self::None | Self::Newer(_) => None,
+        }
+    }
+}
+
+/// What a start that never ran leaves in `record` (F64): what its last
+/// start left, put back from `kept` (kept aside before it: an earlier end,
+/// whole), or, with none kept, never started. A newer Shipyard's file is
+/// never read as what it says (H2): never started, then, which is true of
+/// this start (its last run's end, in that file, isn't put back).
+#[cfg(target_os = "linux")]
+pub(crate) fn settle_unstarted(record: &mut Record, kept: Kept) {
+    match kept {
+        Kept::Start(previous) => previous.restore(record),
+        Kept::None | Kept::Newer(_) => record.mark_never_started(),
+    }
+}
+
+/// Container `id`'s record settled for a start that never ran (F64): by
+/// what its start kept aside ([`settle_unstarted`]), unless the record has
+/// an end already (put back by the start's own undoing: left as it is,
+/// F110); then what was kept let go of ([`done_with_previous_start`]).
+/// One meaning for `take`'s reconciling and the recovery pass alike
+/// (`__cleanup`'s, deciding inside its own rewrite, matches it).
+///
+/// # Errors
+///
+/// The record can't be read or written.
+#[cfg(target_os = "linux")]
+pub(crate) fn settle_never_ran(engine: &Engine, id: &ContainerId) -> Result<Record> {
+    let kept = previous_start(engine, id);
+    let newer = kept.newer();
+    let record = super::update(engine, id, |record| {
+        if record.finished.is_none() {
+            settle_unstarted(record, kept);
+        }
+    })?;
+    done_with_previous_start(engine, id, newer);
+    Ok(record)
+}
+
+/// Lets go of what container `id`'s start kept aside, once it's been used
+/// or is no start's to restore (`newer`: [`Kept::Newer`]'s version, if it
+/// was a newer Shipyard's: then kept, for it, and said).
+#[cfg(target_os = "linux")]
+pub(crate) fn done_with_previous_start(engine: &Engine, id: &ContainerId, newer: Option<u32>) {
+    match newer {
+        None => forget_previous_start(engine, id),
+        Some(version) => engine.warn(
+            crate::report::WarningKind::LeftForLater,
+            format!(
+                "container {}'s previous-start.json is version {version}, newer than this \
+                 Shipyard's ({}): not read (what it kept isn't put back), and left for the \
+                 Shipyard that wrote it",
+                id.short(),
+                PreviousStart::VERSION
+            ),
+        ),
     }
 }
 
@@ -250,17 +328,30 @@ pub(crate) fn keep_previous_start(
     let json = serde_json::to_vec(previous)?;
     crate::fs::write_atomically(&record_dir(engine, id)?, PREVIOUS_START, &json, 0o600)
         .map_err(|err| err.io_as(ErrorKind::Storage))
+        .map(|placed| placed.said(engine))
 }
 
-/// What [`keep_previous_start`] kept for container `id`, if it's there and
-/// readable (v1 or v2; one of another version is passed over).
+/// What [`keep_previous_start`] kept for container `id`: v1 or v2 read; a
+/// newer version known as one, never guessed at (H2); none, or one that
+/// can't be read, is [`Kept::None`].
 #[cfg(target_os = "linux")]
-pub(crate) fn previous_start(engine: &Engine, id: &ContainerId) -> Option<PreviousStart> {
-    let path = record_dir(engine, id).ok()?.join(PREVIOUS_START);
-    let bytes = shipyard_sys::fs::read_bounded(&path, PreviousStart::MAX_FILE).ok()?;
-    serde_json::from_slice::<PreviousStart>(&bytes)
-        .ok()
-        .filter(|previous| PreviousStart::READ.contains(&previous.version))
+pub(crate) fn previous_start(engine: &Engine, id: &ContainerId) -> Kept {
+    #[derive(serde::Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    let Some(bytes) = record_dir(engine, id).ok().and_then(|dir| {
+        shipyard_sys::fs::read_bounded(&dir.join(PREVIOUS_START), PreviousStart::MAX_FILE).ok()
+    }) else {
+        return Kept::None;
+    };
+    match serde_json::from_slice::<Versioned>(&bytes) {
+        Ok(Versioned { version }) if version > PreviousStart::VERSION => Kept::Newer(version),
+        _ => serde_json::from_slice::<PreviousStart>(&bytes)
+            .ok()
+            .filter(|previous| PreviousStart::READ.contains(&previous.version))
+            .map_or(Kept::None, Kept::Start),
+    }
 }
 
 /// Removes what [`keep_previous_start`] kept for container `id`: its start

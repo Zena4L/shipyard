@@ -66,23 +66,38 @@ ok    files            /Users/you/Library/Application Support/Shipyard/vm
   this `shipyard`'s is a warning.
 - **`ports`:** while the VM runs, a published port that can't be forwarded (another
   program has it) is a warning, with why.
+- **`data disk`** (among the VM's own checks): after an unclean stop (a power cut, a
+  Mac that ended the VM before it had stopped), the VM checks its disk at boot, and
+  repairs it if the check leaves errors. While it does, every command is refused at
+  once with "the VM is still starting", so try again shortly; a large disk can take
+  minutes. A repair is then said, as a warning, for the next ten boots. What it
+  couldn't place is in `lost+found` on that disk: files of your images, containers or
+  named volumes may be among them, and nothing reaches that folder from your Mac yet.
+  If even the repair fails, the VM powers off at each start, saying why in its console
+  log (`~/Library/Application Support/Shipyard/vm/console.log`); the way out today is
+  to move its disk (`data.img` there) aside, which loses every image, container and
+  volume in it.
 
 With the VM running, the VM's own Linux is checked too, as on a Linux host, and listed
 after (`guest:     Linux 6.18…`, then cgroups, images on overlayfs, the network with
 nf_tables, the runtime's state). A stopped VM isn't started to be checked: `doctor` says
 so.
 
-Its exit code is 1 if a check failed (the Mac's or the VM's), so a script can ask.
+Its exit code is 1 if a check failed (the Mac's or the VM's), or if the VM runs but its
+checks can't be had (a guest of another build), so a script can ask.
 
 ## Your files
 
 The VM shares your home, at the same path: a command run from a directory under
 your home runs in that directory in the VM, and `--volume "$PWD":/app` binds it. A path
 outside your home (`/tmp`, `/Volumes/…`), or one a symbolic link takes out of it, is
-refused before anything runs: it would mean something else in the VM.
+refused before anything runs: it would mean something else in the VM. So is one that
+isn't on your Mac but would be outside your home (`/var/lib/shipyard`, `/run`: the
+VM's own files); one in your home that isn't there is refused by the VM, as on Linux.
 
 The VM can read and write your whole home, as Docker Desktop's file sharing can. A
-container sees only what you bind into it.
+container sees only what you bind into it. Set-user-ID bits and device files in your
+home mean nothing in the VM, nor in a container you bind them into.
 
 ## Your terminal, your input, your signals, your variables
 
@@ -99,8 +114,9 @@ container sees only what you bind into it.
 - **Signals:** a Ctrl-C, or a `kill` of `shipyard`, is passed on to the command in
   the VM (and from there to the container, as a foreground `run` passes them).
 - **Variables:** a command gets your terminal's and your language's (`TERM`, `LANG`,
-  `LC_*`, `NO_COLOR`), and those you name with a bare `-e KEY`. Nothing else of your
-  environment reaches the VM.
+  `LC_*`, `NO_COLOR`), and those you name with a bare `-e KEY` (those reach the
+  container only, never the VM's own `shipyard`: `-e HTTPS_PROXY` is the container's
+  proxy, not the VM's). Nothing else of your environment reaches the VM.
 
 ## Ports
 
@@ -115,7 +131,10 @@ shipyard run -d -p 8080:80 nginx:alpine     # http://localhost:8080
   `[::1]:8080`, so `localhost` reaches it from both; `-p 127.0.0.1:8080:80` on
   `127.0.0.1` only. Nothing on your Mac's network (your Wi-Fi's other devices) can
   reach a container. Other users of your Mac can, as they can any program's port on
-  `localhost`.
+  `localhost`. A port published on every address (`-p 8080:80`) also answers on the
+  VM's own address on the Mac's private virtual network (`192.168.64.x`), which only
+  your Mac and other VMs on it (another Virtualization.framework, Lima or UTM VM using
+  its shared network) can reach.
 - **A port another program on your Mac already has** (Postgres on 5432, say) is left to
   it: `shipyard vm status` says `not forwarded: 127.0.0.1:5432 (in use on this Mac)`, and
   it's forwarded as soon as that program lets it go. `localhost:5432` keeps reaching

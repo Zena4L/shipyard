@@ -20,7 +20,7 @@ on macOS and for Linux hosts.
 > command runs in a small Linux VM of Shipyard's own: [macOS](docs/user/macos.md).
 > **Not yet:** Docker API compatibility and image building (planned). It isn't a hardened security boundary yet: see [SECURITY.md](SECURITY.md). Everything that
 > works is in the [user docs](docs/user/README.md), and the
-> [limitations](docs/user/README.md#limitations-in-v02) are listed there.
+> [limitations](docs/user/README.md#limitations) are listed there.
 
 The project is built step by step, from first principles, with
 [*The Linux Programming Interface*](https://man7.org/tlpi/) as the primary reference.

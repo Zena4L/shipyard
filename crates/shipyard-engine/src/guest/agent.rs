@@ -163,6 +163,9 @@ fn handle(stream: std::fs::File) -> Result<(), String> {
         let _ = send(&writer, &Frame::Exited(i32::from(told.is_err())));
         return told.map_err(|e| format!("telling the guest's init to stop: {e}"));
     }
+    if !std::path::Path::new(super::READY).exists() {
+        return refuse(&writer, super::NOT_READY);
+    }
     if let [kind, ip, port] = request.args.as_slice()
         && kind == forward::FORWARD_REQUEST
     {
@@ -270,22 +273,42 @@ const PORTS_FRESH: Duration = Duration::from_secs(1);
 static LAST_PORTS: Mutex<Option<(std::time::Instant, forward::PortsAnswer)>> = Mutex::new(None);
 
 /// Whether a running container publishes `wanted`: by the last answer if
-/// it's fresh and says so, else by one read again ([`read_published`]: a
-/// port published within the last second isn't refused).
+/// it was read since this asked (yes or no: callers waiting for one read
+/// share it, F110), or if it's fresh and says so; else by one read again
+/// ([`read_published`]: a port published within the last second isn't
+/// refused).
 fn is_published(wanted: forward::PublishedPort) -> Result<bool, String> {
+    let asked = std::time::Instant::now();
     let mut last = LAST_PORTS
         .lock()
         .map_err(|_| "the ports' lock, poisoned".to_owned())?;
-    if let Some((at, answer)) = last.as_ref()
-        && at.elapsed() < PORTS_FRESH
-        && answer.ports.contains(&wanted)
-    {
-        return Ok(true);
+    if let Some((at, answer)) = last.as_ref() {
+        let has = answer.ports.contains(&wanted);
+        if answers(*at, asked, std::time::Instant::now(), has) {
+            return Ok(has);
+        }
     }
+    // Stamped with when the read began, not ended: a caller that asked
+    // while it ran may have asked after what it saw (a port published
+    // since), and is answered by it only if it asked before.
+    let reading = std::time::Instant::now();
     let answer = read_published()?;
     let published = answer.ports.contains(&wanted);
-    *last = Some((std::time::Instant::now(), answer));
+    *last = Some((reading, answer));
     Ok(published)
+}
+
+/// Whether the last ports answer, whose read began at `read`, answers a
+/// caller that asked at `asked` (`now`, `has`: whether it has the port):
+/// read since it asked, either way; or fresh ([`PORTS_FRESH`]) and saying
+/// yes.
+fn answers(
+    read: std::time::Instant,
+    asked: std::time::Instant,
+    now: std::time::Instant,
+    has: bool,
+) -> bool {
+    read >= asked || (has && now.saturating_duration_since(read) < PORTS_FRESH)
 }
 
 /// What the guest's containers publish, from `__guest-ports` run as a
@@ -477,13 +500,17 @@ fn spawn(request: &Request, terminal: Option<&OwnedFd>) -> Result<Child, String>
     let env = request.env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
     let mut command = guest_command(&args, &request.cwd);
-    command.envs(forward::passed_env(env)).envs(
-        request
-            .named_env
-            .iter()
-            .filter(|(name, _)| !forward::reserved(name))
-            .map(|(k, v)| (k, v)),
-    );
+    // The caller's named variables in one of their own, for its `-e KEY`
+    // to find: never `shipyard`'s own environment ([`forward::CALLER_ENV`]).
+    let named: Vec<(String, String)> = request
+        .named_env
+        .iter()
+        .filter(|(name, _)| !forward::reserved(name))
+        .cloned()
+        .collect();
+    command
+        .envs(forward::passed_env(env))
+        .env(forward::CALLER_ENV, forward::caller_env_value(&named));
     if let Some(slave) = terminal {
         let end = |slave: &OwnedFd| {
             slave
@@ -673,6 +700,23 @@ fn refuse(writer: &Stream, why: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ports answer read after a caller asked answers it, yes or no
+    /// (waiters share one read, F110); an older one, only while fresh
+    /// and saying yes.
+    #[test]
+    fn a_ports_answer_since_the_ask_is_shared() {
+        use std::time::{Duration, Instant};
+        let asked = Instant::now();
+        let later = asked + Duration::from_millis(5);
+        assert!(answers(later, asked, later, false), "read since: a no");
+        assert!(answers(later, asked, later, true), "read since: a yes");
+        let before = asked.checked_sub(Duration::from_millis(5)).unwrap();
+        assert!(answers(before, asked, asked, true), "fresh, a yes");
+        assert!(!answers(before, asked, asked, false), "read before: a no");
+        let stale = asked + PORTS_FRESH + Duration::from_millis(10);
+        assert!(!answers(before, asked, stale, true), "stale");
+    }
 
     /// A signal goes to the terminal's foreground group, else the command's
     /// own; a terminal with no session left (0), or 1, is never a target.

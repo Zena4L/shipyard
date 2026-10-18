@@ -238,6 +238,10 @@ mod linux {
             an_end_the_store_refused_is_retried,
         ),
         (
+            "a_retry_leaves_another_starts_state",
+            a_retry_leaves_another_starts_state,
+        ),
+        (
             "a_start_while_restarting_takes_over",
             a_start_while_restarting_takes_over,
         ),
@@ -6883,6 +6887,60 @@ mod linux {
             let record = stores.record(&id);
             record.restart_count >= 1 && matches!(stores.state(&id), ContainerState::Running { .. })
         });
+        shipyard_engine::run::remove(&stores.engine(), id.as_str(), true).unwrap();
+    }
+
+    /// A retry of an end the store refused settles only its own start's
+    /// runtime state (F102): the state found made by another start's
+    /// monitor (its own end refused too), the retry gives up, saying why,
+    /// and writes this start's end over nothing (nor restarts it). The
+    /// control is `an_end_the_store_refused_is_retried`: its own state,
+    /// settled. Rootless: root's writes aren't refused.
+    fn a_retry_leaves_another_starts_state() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if is_root() {
+            return;
+        }
+        let stores = Stores::new();
+        let id = stores.launch_restarting("always", "sleep 300");
+        eventually("it runs", || {
+            matches!(stores.state(&id), ContainerState::Running { .. })
+        });
+        let dir = stores.scratch.0.join("containers").join(id.as_str());
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("cleanup.log"))
+            .unwrap();
+        let first = stores.record(&id);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        runtime::kill(
+            &stores.runtime_root(),
+            id.as_str(),
+            shipyard_runtime::process::Signal::KILL,
+        )
+        .unwrap();
+        eventually("the refused write, said", || {
+            stores.cleanup_log(&id).contains("the record:")
+        });
+        // Another start's state in its place: a monitor of its own (a start
+        // time no process has, so nothing is ever signalled for it). The
+        // runtime's `state.json` written by hand: its `monitor` is a PID and
+        // a start time, as `peek_monitor` reads it.
+        let state = stores.runtime_root().join(id.as_str()).join("state.json");
+        let mut recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        recorded["monitor"] = serde_json::json!([1, u64::MAX]);
+        std::fs::write(&state, recorded.to_string()).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eventually("the retry, given up", || {
+            stores
+                .cleanup_log(&id)
+                .contains("the runtime's state is another start's")
+        });
+        let after = stores.record(&id);
+        assert_eq!(after.finished, first.finished, "no end written over it");
+        assert_eq!(after.restart_count, first.restart_count, "not restarted");
         shipyard_engine::run::remove(&stores.engine(), id.as_str(), true).unwrap();
     }
 

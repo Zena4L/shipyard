@@ -276,6 +276,21 @@ pub fn peek_init(_root: &Path, _id: &str) -> Result<Option<(i32, u64)>> {
     Err(ContainerError::LinuxOnly)
 }
 
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn peek_monitor(_root: &Path, _id: &str) -> Result<Option<(i32, u64)>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// No `/proc` to read a start time from: none.
+#[must_use]
+pub fn process_started(_pid: i32) -> Option<u64> {
+    None
+}
+
 /// No containers, so no process is a container's: false.
 #[must_use]
 pub fn is_process(_pid: i32, _started: u64) -> bool {

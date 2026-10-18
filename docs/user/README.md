@@ -199,7 +199,7 @@ hello from PID 2
 
 PID 2: the command sees only its own processes, under Shipyard's small init (PID 1).
 
-## Limitations in v0.2
+## Limitations
 
 - **No `stats`, `top`, `pause` or image commands by name yet:** `shipyard stats`,
   `top`, `pause`/`unpause`, `update` of a running container's limits, `tag`, image

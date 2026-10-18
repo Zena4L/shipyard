@@ -124,6 +124,8 @@ behaviour; each change is listed here).
   (step 10.1e4a; checked against 0.2.0's binary): `shipyard-runtime attach` and
   `logs` no longer go through the engine, which keeps attaching and reading logs by
   name. Messages and exit codes are as before.
+- **On a Mac, `doctor` exits 1 when the VM runs but its checks can't be had** (a
+  guest of another build: step 10.4, F112), as when one fails.
 
 ### Fixed
 
@@ -229,6 +231,72 @@ behaviour; each change is listed here).
   container that ran before, a start that failed after its container was made sent
   a `die` event with the last start's exit code (a crash loop of failing restarts
   sent one each); only an end of a start that ran is said now.
+- **A container with many published ports keeps its restart policy** (stage 10's
+  fresh review): handing well over a thousand holds (`-p` ranges) to its exit command,
+  its monitor ran out of descriptor numbers (each hold's copy sits above it while
+  they're placed), so the end went unrecorded until the next command and the
+  restart never came. The monitor raises its limit for both first, and a run asks
+  only for what the hard limit leaves room for.
+- **A prefix of an ID that a container with an unreadable record shares is refused
+  as naming more than one** (stage 10's fresh review): it found the readable
+  container alone, so `rm -f abc` could remove the wrong one.
+- **On a Mac, a bare `-e KEY` no longer changes the VM's own `shipyard`** (stage 10's
+  fresh review): the value went into its environment, so `-e HTTPS_PROXY` sent the
+  VM's pulls through a proxy at the VM's own `localhost`. It now reaches only the
+  container, as Docker's CLI does.
+- **An end recorded late is never written over a later start's** (step 10.4, F102):
+  `__cleanup` retrying an end the store had refused (a full disk) now checks the
+  runtime's state is still its own start's (its monitor's PID and start time, which
+  the monitor now tells it); before, a second start whose own end was refused too
+  could have the first's exit code written over it, and its restart policy decide on
+  that.
+- **A start that never ran, settled twice, keeps the end put back** (step 10.4,
+  F110): a container's last run's end, restored when a start failed, was cleared
+  again when a later command settled that start, so it read as never started and a
+  boot didn't bring it back.
+- **A newer Shipyard's `previous-start.json` is never read as none** (step 10.4,
+  F110): after going back to an older Shipyard, a start that never ran is settled
+  as never started and the newer file is kept for its Shipyard, said in a warning,
+  instead of being deleted unread.
+- **A change that landed is no longer reported as failed** (step 10.4, F110): a
+  record written in place whose directory couldn't be synced is now a warning
+  ("may not survive a power cut"), not an error that made a command report a change
+  it had made as failed.
+- **Signals where pidfds are refused** (step 10.4, F110): a host whose seccomp
+  policy refuses `pidfd_open` (`EPERM`) signals by PID after a check, as a kernel
+  without pidfds does; running out of descriptors is now an error, never the
+  PID-reuse race the pidfd closes.
+- **No false "its monitor stays in this process's cgroup" warning** for a
+  container that ended at once (step 10.4, F110).
+- **On a Mac, connections to a published port no longer wait for one another**
+  while the ports are read (step 10.4, F110): callers waiting for one read share it.
+- **On a Mac, an unclean stop no longer ends in deleting every image** (step 10.4,
+  F104): a data disk the boot's check (`e2fsck -p`) couldn't fix powered the VM off
+  for good, and only deleting `data.img` got out. The VM now repairs it once
+  (`e2fsck -y`), says so on its console and in `doctor` (a warning for the next ten
+  boots), and what couldn't be placed is in `lost+found` on that disk. Commands are
+  refused at once while the disk is checked or repaired ("the VM is still starting"),
+  so a long repair is never cut short by a start's time limit.
+- **On a Mac, the VM's stop is bounded** (step 10.4, F109): a process stuck in the
+  kernel (a wedged file-sharing call) could keep the VM's init waiting for it, so its
+  disk was never let go cleanly. Its agent, if it keeps failing, is now restarted
+  ever later (up to every 5 s), not at once in a loop.
+
+### Security
+
+- **`shipyard __guest-init` and `__shipyard-agent` are refused outside Shipyard's
+  own macOS VM** (stage 10's fresh review): run as root on a Linux host, the guest's
+  init moved the root into memory and removed the rest, or powered the host off.
+  They now need the kernel command line Shipyard boots its VM with (and the init,
+  PID 1), and exit with 125 otherwise.
+- **On a Mac, a path outside your home that the Mac hasn't but the VM has
+  (`/var/lib/shipyard`, `/run`) is refused** (stage 10's fresh review): it was sent
+  on, so `-v /var/lib/shipyard:/s` gave a container the VM engine's own state. A
+  path that isn't there is judged by where it would be.
+- **On a Mac, set-user-ID bits and device files in your home mean nothing in the VM**
+  (step 10.4, F108): the home is mounted `nosuid,nodev`, and binds of it keep both.
+  `SECURITY.md` says what a Mac trusts the VM with, including that a published port
+  also answers on the VM's own address on the Mac's private virtual network.
 
 ## 0.2.0 - 2026-10-15
 

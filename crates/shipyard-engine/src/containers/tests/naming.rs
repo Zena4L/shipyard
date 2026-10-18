@@ -197,3 +197,33 @@ fn a_name_or_serial_two_records_have_is_ambiguous() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// A prefix a container whose record can't be read shares (torn, a newer
+/// version's) is more than one container: never the readable one alone
+/// (`rm -f abc` removing the wrong one). The control: the readable one's
+/// whole ID, and a prefix only it has, still find it.
+#[test]
+fn a_prefix_an_unreadable_record_shares_is_ambiguous() {
+    let (engine, _, dir) = engine("unreadable");
+    let kept = create_record(&engine, new(Some("web"))).unwrap();
+    let digit = &kept.id.as_str()[..1];
+    let torn = ContainerId::parse(&format!("{digit}{}", "0".repeat(63))).unwrap();
+    assert_ne!(torn, kept.id, "two containers");
+    let store = dir.join("containers");
+    fs::create_dir(store.join(torn.as_str())).unwrap();
+    fs::write(record_path(&store, &torn), b"{\"version\":").unwrap();
+    let err = find(&engine, digit).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidRequest, "{err}");
+    assert!(err.to_string().contains(kept.id.short()), "{err}");
+    assert!(err.to_string().contains(&torn.as_str()[..12]), "{err}");
+    assert_eq!(find(&engine, kept.id.as_str()).unwrap(), kept);
+    let own = kept
+        .id
+        .as_str()
+        .char_indices()
+        .map(|(at, _)| &kept.id.as_str()[..=at])
+        .find(|prefix| !torn.as_str().starts_with(prefix))
+        .unwrap();
+    assert_eq!(find(&engine, own).unwrap(), kept, "a prefix only it has");
+    fs::remove_dir_all(dir).unwrap();
+}

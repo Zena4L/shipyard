@@ -209,6 +209,36 @@ pub fn reserved(name: &str) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
+/// The variable a forwarded command's `shipyard` in the guest finds the
+/// caller's named variables in (a bare `-e KEY`'s, [`Request::named_env`]),
+/// as a JSON object: never its own environment, which would change what
+/// that `shipyard` does (`HTTPS_PROXY` its pulls, `SSL_CERT_FILE` its
+/// trust), where Docker's CLI resolves them on the client.
+pub const CALLER_ENV: &str = "SHIPYARD_CALLER_ENV";
+
+/// `named` as [`CALLER_ENV`] carries them.
+#[must_use]
+pub fn caller_env_value(named: &[(String, String)]) -> String {
+    let object: serde_json::Map<String, serde_json::Value> = named
+        .iter()
+        .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    serde_json::Value::Object(object).to_string()
+}
+
+/// The caller's value of `name` in a [`CALLER_ENV`] `value`: `None` if it
+/// has none (or the value isn't one).
+#[must_use]
+pub fn caller_var(value: &str, name: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(value)
+        .ok()?
+        .get(name)?
+    {
+        serde_json::Value::String(found) => Some(found.clone()),
+        _ => None,
+    }
+}
+
 /// Of `vars`, those a command gets ([`PASSED_ENV`]), as text (a variable
 /// that isn't UTF-8 is left out).
 pub fn passed_env<I, K, V>(vars: I) -> Vec<(String, String)>
@@ -451,6 +481,28 @@ impl Request {
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
     use super::*;
+
+    /// The caller's named variables go to the guest's `shipyard` in one
+    /// variable of its own, read back by name; any value (`=`, quotes, a
+    /// newline) as it was; a name it hasn't, or a value that isn't one,
+    /// is none.
+    #[test]
+    fn the_callers_variables_travel_in_one_of_their_own() {
+        let named = [
+            ("HTTPS_PROXY".to_owned(), "http://127.0.0.1:3128".to_owned()),
+            ("TOKEN".to_owned(), "a=b \"c\"\nd".to_owned()),
+        ];
+        let value = caller_env_value(&named);
+        assert_eq!(
+            caller_var(&value, "HTTPS_PROXY").as_deref(),
+            Some("http://127.0.0.1:3128")
+        );
+        assert_eq!(caller_var(&value, "TOKEN").as_deref(), Some("a=b \"c\"\nd"));
+        assert_eq!(caller_var(&value, "OTHER"), None);
+        assert_eq!(caller_var("not json", "TOKEN"), None);
+        assert_eq!(caller_var(r#"{"TOKEN":1}"#, "TOKEN"), None);
+        assert_eq!(caller_env_value(&[]), "{}");
+    }
 
     /// The hidden places cross the kernel's command line whole, spaces and
     /// all; one that can't be read is left out.

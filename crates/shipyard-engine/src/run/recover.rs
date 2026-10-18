@@ -466,12 +466,10 @@ mod linux {
     pub(in crate::run) fn undo_a_dead_start(engine: &Engine, record: &Record) -> Result<()> {
         let id = &record.id;
         if record.started.is_some() && record.finished.is_none() {
-            let previous = containers::previous_start(engine, id);
-            containers::update(engine, id, |record| {
-                containers::settle_unstarted(record, previous);
-            })?;
+            containers::settle_never_ran(engine, id)?;
+        } else {
+            containers::forget_previous_start(engine, id);
         }
-        containers::forget_previous_start(engine, id);
         Ok(())
     }
 

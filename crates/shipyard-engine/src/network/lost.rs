@@ -80,7 +80,9 @@ pub fn pasta_lost(lost: &shipyard_network::pasta::Lost) {
         time: crate::events::rfc3339(std::time::SystemTime::now()),
         how: format!("pasta {}", lost.how),
     };
-    let written = crate::fs::write_atomically(&lost.start_dir, FILE, &said.to_json(), 0o600);
+    // Placed is enough: a marker a power cut takes is the boot's to settle.
+    let written = crate::fs::write_atomically(&lost.start_dir, FILE, &said.to_json(), 0o600)
+        .map(crate::fs::Placed::unsynced);
     #[cfg(target_os = "linux")]
     if written.is_ok() {
         say_it(lost, &said);

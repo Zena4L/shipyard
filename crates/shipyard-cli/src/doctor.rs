@@ -107,7 +107,8 @@ enum Guest {
     Unanswered(String),
 }
 
-/// Writes the guest's section to `out`: whether one of its checks failed.
+/// Writes the guest's section to `out`: whether it failed (one of its
+/// checks, or a running guest's checks that can't be had).
 #[cfg_attr(
     not(target_os = "macos"),
     allow(dead_code, reason = "a Mac's; tested everywhere")
@@ -130,7 +131,9 @@ fn show_guest(guest: &Guest, out: &mut impl std::io::Write) -> std::io::Result<b
                 "guest:     its checks can't be had: {}",
                 printable(why)
             )?;
-            return Ok(false);
+            // A VM that runs but can't say how its Linux is: a failure, for
+            // a script that asks (F112).
+            return Ok(true);
         }
         Guest::Checked(checked) => checked,
     };
@@ -187,7 +190,10 @@ mod mac {
             Ok(None) => super::Guest::NotRunning,
             Ok(Some(bytes)) => match shipyard_engine::doctor::GuestDoctor::decode(&bytes) {
                 Ok(checked) => super::Guest::Checked(checked),
-                Err(error) => super::Guest::Unanswered(error.to_string()),
+                // A guest of another build, kept up by its containers.
+                Err(error) => super::Guest::Unanswered(format!(
+                    "{error} (a guest of another build: `shipyard vm stop`, then try again)"
+                )),
             },
             Err(error) => super::Guest::Unanswered(error.to_string()),
         })
@@ -237,6 +243,17 @@ mod tests {
         let mut out = Vec::new();
         assert!(show_guest(&Guest::Checked(broken), &mut out).unwrap());
         assert!(String::from_utf8(out).unwrap().contains("fail  network"));
+        let mut out = Vec::new();
+        let unanswered = Guest::Unanswered("a guest of another build".to_owned());
+        assert!(
+            show_guest(&unanswered, &mut out).unwrap(),
+            "can't be had: failed"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("its checks can't be had: a guest of another build")
+        );
         let mut out = Vec::new();
         assert!(!show_guest(&Guest::NotRunning, &mut out).unwrap());
         assert!(

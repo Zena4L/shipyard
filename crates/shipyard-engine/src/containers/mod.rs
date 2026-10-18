@@ -79,11 +79,14 @@ pub use names::Name;
 #[cfg(target_os = "linux")]
 pub(crate) use record::UNKNOWN_EXIT;
 pub use record::{BoundPort, Exit, Record};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use starts::Kept;
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) use starts::next_logs_name;
 #[cfg(target_os = "linux")]
 pub(crate) use starts::{
-    PreviousStart, forget_previous_start, keep_previous_start, previous_start, settle_unstarted,
+    PreviousStart, done_with_previous_start, forget_previous_start, keep_previous_start,
+    previous_start, settle_never_ran, settle_unstarted,
 };
 pub use starts::{health, last_start_lost, network_lost};
 pub(crate) use starts::{last_logs_name, starts};

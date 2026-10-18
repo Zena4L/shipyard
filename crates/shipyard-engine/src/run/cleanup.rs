@@ -48,6 +48,18 @@ pub fn cleanup_entry_point() {
     std::process::exit(1);
 }
 
+/// Whether the runtime state a retry of an end finds is its own start's
+/// (F102): made by the monitor that started this `__cleanup` (`mine`: its
+/// PID, and its start time if it could be read while it was there), as
+/// that state records its monitor (`recorded`). Another start's state (a
+/// monitor of its own) is never settled with this start's end; a state
+/// that records none can't be told, so isn't either.
+fn own_start(recorded: Option<(i32, u64)>, mine: (i32, Option<u64>)) -> bool {
+    let (my_pid, my_start) = mine;
+    recorded
+        .is_some_and(|(pid, started)| pid == my_pid && my_start.is_none_or(|own| own == started))
+}
+
 /// What `__cleanup` is told, from its arguments.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Arguments {
@@ -143,6 +155,7 @@ mod linux {
         // What its last start left, kept aside (a start that never ran
         // gets it back: F64).
         let previous = containers::previous_start(engine, id);
+        let newer = previous.newer();
         let mut wrote = false;
         let updated = containers::update(engine, id, |record| {
             // A forced end of a container that never started isn't an
@@ -171,7 +184,12 @@ mod linux {
             }
         });
         if updated.is_ok() {
-            containers::forget_previous_start(engine, id);
+            if wrote {
+                // It ran: what it kept aside is no start's to restore now.
+                containers::forget_previous_start(engine, id);
+            } else {
+                containers::done_with_previous_start(engine, id, newer);
+            }
         }
         updated.map(|record| (record, wrote))
     }
@@ -196,7 +214,13 @@ mod linux {
     /// pass settles it), or another settled the end (then the policy, as
     /// any end's). A disk that never frees keeps it trying, a minute apart
     /// at most, each step of the wait checking whether to stop.
-    fn retry_end(engine: &Engine, arguments: &Arguments, exit: Option<&ExitRecord>, log: &Log) {
+    fn retry_end(
+        engine: &Engine,
+        arguments: &Arguments,
+        exit: Option<&ExitRecord>,
+        mine: Option<(i32, Option<u64>)>,
+        log: &Log,
+    ) {
         use crate::run::restart_policy::{FIRST_DELAY, LONGEST_DELAY, STEP, after_end};
         let Ok(id) = ContainerId::parse(&arguments.id) else {
             return;
@@ -239,6 +263,23 @@ mod linux {
             }
             if !matches!(runtime::status(root, id.as_str()), Ok(Some(_))) {
                 log.line("the end's retry: given up (its runtime state is gone: the next command settles it)");
+                return;
+            }
+            // Its own start's state, not a later start's (its end failed to
+            // be written too): this end is never written over that one's.
+            let why = match (mine, runtime::peek_monitor(root, id.as_str())) {
+                (None, _) => Some("its monitor isn't known"),
+                (_, Err(_)) => Some("the runtime's state can't be read"),
+                (Some(mine), Ok(recorded)) if !super::own_start(recorded, mine) => {
+                    Some("the runtime's state is another start's")
+                }
+                _ => None,
+            };
+            if let Some(why) = why {
+                log.line(&format!(
+                    "the end's retry: given up ({why}: that start's clean-up, or the next \
+                     command, settles it)"
+                ));
                 return;
             }
             match record_end(engine, &id, exit) {
@@ -294,10 +335,13 @@ mod linux {
         let Ok(arguments) = Arguments::parse(args) else {
             return 1;
         };
+        // Which monitor started this, while it may still be there to ask:
+        // what tells this start's runtime state from a later one's (F102).
+        let mine = own_monitor();
         // The monitor that started this holds copies of the holds until it
         // has exited (it doesn't wait for this): a lease or an area isn't
         // free before then, and a sweep would pass it by.
-        monitor_gone(std::time::Duration::from_secs(10));
+        monitor_gone(mine.map(|(pid, _)| pid), std::time::Duration::from_secs(10));
         let log = Log::open(&arguments.containers, &arguments.id, "cleanup.log");
         let engine = Engine::new(
             paths(&arguments),
@@ -387,24 +431,43 @@ mod linux {
             if ended {
                 crate::run::restart_policy::after_end(&engine, &id);
             } else if retry {
-                retry_end(&engine, &arguments, exit.as_ref(), &log);
+                retry_end(&engine, &arguments, exit.as_ref(), mine, &log);
             }
         }
         i32::from(failed)
     }
 
-    /// Waits (up to `wait`) for the monitor that started this (its PID in
-    /// `SHIPYARD_MONITOR_PID`) to exit: while it lives, it's this process's
+    /// The monitor that started this: its PID (`SHIPYARD_MONITOR_PID`), and
+    /// its start time, as it told it (`SHIPYARD_MONITOR_STARTED`), or read
+    /// while it's still this process's parent (an older monitor tells
+    /// none; once it has exited, its PID may be another's). `None` without
+    /// the PID.
+    fn own_monitor() -> Option<(i32, Option<u64>)> {
+        let pid = std::env::var(runtime::MONITOR_PID_ENV)
+            .ok()?
+            .parse::<i32>()
+            .ok()?;
+        let told = std::env::var(runtime::MONITOR_STARTED_ENV)
+            .ok()
+            .and_then(|started| started.parse::<u64>().ok());
+        let parent = nix::unistd::getppid().as_raw() == pid;
+        // Read, then asked again: a parent gone in between may have had its
+        // PID taken by another process.
+        let started = told.or_else(|| {
+            runtime::process_started(pid)
+                .filter(|_| parent && nix::unistd::getppid().as_raw() == pid)
+        });
+        Some((pid, started))
+    }
+
+    /// Waits (up to `wait`) for the monitor that started this (`monitor`:
+    /// its PID, from `SHIPYARD_MONITOR_PID`) to exit: while it lives, it's this process's
     /// parent; once gone, this one is someone else's (`getppid` changes).
     /// Its PID is told, not taken from `getppid` here: the monitor may be
     /// gone already, and whoever took this process on then isn't it (a PID
     /// reused since can't be: the one that took it on existed before).
-    fn monitor_gone(wait: std::time::Duration) {
-        let Some(monitor) = std::env::var(runtime::MONITOR_PID_ENV)
-            .ok()
-            .and_then(|pid| pid.parse::<i32>().ok())
-            .map(nix::unistd::Pid::from_raw)
-        else {
+    fn monitor_gone(monitor: Option<i32>, wait: std::time::Duration) {
+        let Some(monitor) = monitor.map(nix::unistd::Pid::from_raw) else {
             return;
         };
         let deadline = std::time::Instant::now() + wait;
@@ -722,6 +785,21 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retry settles only its own start's state (F102): the monitor that
+    /// started it, by PID and start time; another start's monitor (another
+    /// PID, or the same PID reused), or a state without one, isn't.
+    #[test]
+    fn a_retry_settles_only_its_own_starts_state() {
+        assert!(own_start(Some((40, 7)), (40, Some(7))));
+        assert!(
+            own_start(Some((40, 7)), (40, None)),
+            "its start time unread"
+        );
+        assert!(!own_start(Some((41, 7)), (40, Some(7))), "another monitor");
+        assert!(!own_start(Some((40, 9)), (40, Some(7))), "its PID reused");
+        assert!(!own_start(None, (40, Some(7))), "no monitor recorded");
+    }
 
     fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
         list.iter().map(std::ffi::OsString::from).collect()

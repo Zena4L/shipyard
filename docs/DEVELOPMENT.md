@@ -373,7 +373,7 @@ Then:
 export SHIPYARD_GUEST_DIR=$PWD/target/guest
 target/debug/shipyard vm start    # boots the guest (about a second)
 target/debug/shipyard vm status
-target/debug/shipyard vm run run --rm alpine echo hi   # hidden, until 10.3b
+target/debug/shipyard run --rm alpine echo hi   # any command: run in the VM
 target/debug/shipyard vm stop     # its containers stopped, the guest powered off
 ```
 

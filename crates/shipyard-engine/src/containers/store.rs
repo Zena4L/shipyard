@@ -165,7 +165,7 @@ pub(crate) fn rename(engine: &Engine, id: &ContainerId, name: &Name) -> Result<R
     let _lock = store.lock(LOCK_WAIT)?;
     let existing = store.read_all(engine, Strict::Yes)?;
     refuse_taken_name(&existing, name, Some(id))?;
-    rewrite(&store, id, |record| record.name = name.clone())
+    rewrite(engine, &store, id, |record| record.name = name.clone())
 }
 
 /// A serial no record in `existing` has.
@@ -274,12 +274,17 @@ pub fn update(
         bail!(NotFound, "no container {}", id.short());
     };
     let _lock = store.lock(LOCK_WAIT)?;
-    rewrite(&store, id, change)
+    rewrite(engine, &store, id, change)
 }
 
 /// Container `id`'s record re-read, changed by `change` and written again
 /// (atomically), its store's lock held by the caller.
-fn rewrite(store: &Store, id: &ContainerId, change: impl FnOnce(&mut Record)) -> Result<Record> {
+fn rewrite(
+    engine: &Engine,
+    store: &Store,
+    id: &ContainerId,
+    change: impl FnOnce(&mut Record),
+) -> Result<Record> {
     let dir = store.dir.join(id.as_str());
     if !dir.is_dir() {
         bail!(NotFound, "no container {}", id.short());
@@ -298,7 +303,8 @@ fn rewrite(store: &Store, id: &ContainerId, change: impl FnOnce(&mut Record)) ->
     change(&mut record);
     let json = record.to_json_at(read_at)?;
     crate::fs::write_atomically(&dir, RECORD, &json, 0o600)
-        .map_err(|err| err.io_as(ErrorKind::Storage))?;
+        .map_err(|err| err.io_as(ErrorKind::Storage))?
+        .said(engine);
     Ok(record)
 }
 
@@ -503,7 +509,13 @@ impl Store {
                 .mode(0o700)
                 .create(&staging)
                 .with_context(|| format!("making {}", staging.display()))?;
-            crate::fs::write_atomically(&staging, RECORD, &json, 0o600)?;
+            // A new container's directory must hold its record on the disk
+            // before it's renamed into place: unsynced is a failure here.
+            if let Some(unsynced) =
+                crate::fs::write_atomically(&staging, RECORD, &json, 0o600)?.unsynced()
+            {
+                return Err(unsynced);
+            }
             fs::rename(&staging, &dir).with_context(|| format!("making {}", dir.display()))
         })();
         if placed.is_err() {
@@ -550,8 +562,8 @@ pub(crate) fn store_id(engine: &Engine, make: bool) -> Result<Option<String>> {
     }
     let id = crate::random::hex(&crate::random::bytes::<16>()?);
     crate::fs::write_atomically(&store.dir, STORE_ID, id.as_bytes(), 0o600)
-        .map_err(|err| err.io_as(ErrorKind::Storage))?;
-    store.synced(engine);
+        .map_err(|err| err.io_as(ErrorKind::Storage))?
+        .said(engine);
     Ok(Some(id))
 }
 

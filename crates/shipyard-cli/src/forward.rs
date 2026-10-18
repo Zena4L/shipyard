@@ -136,11 +136,13 @@ pub(crate) fn needs(command: &Command) -> Needs {
 }
 
 /// Checks that `path` (relative to `cwd`) is under `home` once its links
-/// are followed (both canonical). A path that isn't there is left to the
-/// guest to refuse, unless it may be new (then its directory is what's
-/// checked), or unless a link on its way leads nowhere here: that link may
-/// lead somewhere in the guest (its own files), so it's refused. Any other
-/// error resolving it is a refusal too.
+/// are followed (both canonical). A path that isn't there is judged by
+/// where it would be: its directory if it may be new, else the nearest of
+/// its directories that is there (the guest has files of its own outside
+/// the home, `/var/lib/shipyard` or `/run`, that the Mac hasn't: never
+/// sent); one under the home is the guest's to refuse. A link on its way
+/// that leads nowhere here is refused (it may lead somewhere in the
+/// guest), as is any other error resolving it.
 ///
 /// # Errors
 ///
@@ -165,7 +167,10 @@ pub(crate) fn within_home(path: &HostPath, cwd: &Path, home: &Path) -> Result<()
                     Ok(parent) => parent.join(name),
                     Err(error) => return refused(&format!("can't be resolved ({error})")),
                 },
-                _ => return Ok(()),
+                _ => match where_it_would_be(&absolute) {
+                    Some(real) => real,
+                    None => return refused("can't be resolved: it isn't there"),
+                },
             }
         }
         Err(error) => return refused(&format!("can't be resolved ({error})")),
@@ -175,6 +180,21 @@ pub(crate) fn within_home(path: &HostPath, cwd: &Path, home: &Path) -> Result<()
     } else {
         refused(&format!("is {}, outside your home", real.display()))
     }
+}
+
+/// Where `path`, which isn't there, would be: the nearest of its
+/// directories that is, canonical, with the rest of it. `None` if the rest
+/// climbs (`..` past what isn't there can't be judged here).
+fn where_it_would_be(path: &Path) -> Option<std::path::PathBuf> {
+    let (there, real) = path
+        .ancestors()
+        .skip(1)
+        .find_map(|ancestor| Some((ancestor, std::fs::canonicalize(ancestor).ok()?)))?;
+    let rest = path.strip_prefix(there).ok()?;
+    let climbs = rest
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir));
+    (!climbs).then(|| real.join(rest))
 }
 
 /// Whether one of `path`'s components is a symbolic link whose target
@@ -356,8 +376,9 @@ mod tests {
 
     /// A path in the home passes, relative or not; one a link takes out of
     /// it (to the guest's own files, say), or one outside, is refused; a
-    /// new destination is judged by its directory; one that isn't there
-    /// is left to the guest.
+    /// new destination is judged by its directory; one that isn't there,
+    /// by where it would be: in the home, the guest's to refuse; outside
+    /// (the guest's own `/var/lib/shipyard`, which the Mac hasn't), refused.
     #[test]
     fn only_paths_in_the_home_are_forwarded() {
         let root = scratch("paths");
@@ -378,6 +399,14 @@ mod tests {
         assert!(
             check(HostPath::existing("missing")).is_ok(),
             "the guest's to refuse"
+        );
+        assert!(check(HostPath::existing("missing/deeper")).is_ok());
+        let nowhere = format!("/shipyard-nowhere-{}/state", std::process::id());
+        assert!(check(HostPath::existing(&nowhere)).is_err(), "{nowhere}");
+        assert!(check(HostPath::existing(root.join("elsewhere/missing"))).is_err());
+        assert!(
+            check(HostPath::existing("missing/../../../elsewhere/x")).is_err(),
+            "a climb past what isn't there"
         );
         assert!(
             check(HostPath::existing("guest-state")).is_err(),

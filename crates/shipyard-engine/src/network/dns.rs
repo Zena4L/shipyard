@@ -84,8 +84,10 @@ fn cgroup_name(dir: &Path, network: &str) -> std::result::Result<String, String>
     }
     let random = crate::random::bytes::<4>().map_err(|error| error.to_string())?;
     let made = format!("{network}-{}", crate::random::hex(&random));
-    crate::fs::write_atomically(dir, CGROUP_FILE, made.as_bytes(), 0o600)
-        .map_err(|error| error.to_string())?;
+    // (A name lost to a power cut is made again: nothing to say.)
+    let _ = crate::fs::write_atomically(dir, CGROUP_FILE, made.as_bytes(), 0o600)
+        .map_err(|error| error.to_string())?
+        .unsynced();
     Ok(made)
 }
 

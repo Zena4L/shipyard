@@ -61,3 +61,15 @@ fn a_pid_that_cant_be_one_is_refused() {
         );
     }
 }
+
+/// Only "no pidfds here" falls back to the PID: an old kernel's `ENOSYS`
+/// and a policy's `EPERM`; gone or out of descriptors is the caller's.
+#[test]
+fn only_no_pidfds_falls_back() {
+    let error = io::Error::from_raw_os_error;
+    assert!(unsupported(&error(libc::ENOSYS)));
+    assert!(unsupported(&error(libc::EPERM)));
+    for code in [libc::ESRCH, libc::EMFILE, libc::EINVAL, libc::ENOMEM] {
+        assert!(!unsupported(&error(code)), "{code}");
+    }
+}

@@ -23,7 +23,8 @@ use super::{
 };
 use crate::cgroup;
 use crate::container::{
-    EXIT_RECORD_ENV, ExitCommand, HOLD_LABELS_ENV, HOLDS_ENV, MONITOR_PID_ENV, MOST_HOLDS,
+    EXIT_RECORD_ENV, ExitCommand, HOLD_LABELS_ENV, HOLDS_ENV, MONITOR_PID_ENV, MONITOR_STARTED_ENV,
+    MOST_HOLDS,
 };
 use crate::hooks::ContainerHooks;
 use crate::oci::load_bundle_for_caller;
@@ -877,7 +878,8 @@ fn ended(
 /// session of its own, `/dev/null` for its standard streams, in `/`, with
 /// this process's environment, the `holds` at 3 and up ([`HOLDS_ENV`], their
 /// labels in [`HOLD_LABELS_ENV`]) and nothing else open, how it ended in
-/// [`EXIT_RECORD_ENV`], this monitor's PID in [`MONITOR_PID_ENV`] (it holds
+/// [`EXIT_RECORD_ENV`], this monitor's PID in [`MONITOR_PID_ENV`] and its
+/// start time in [`MONITOR_STARTED_ENV`] (empty if unread) (it holds
 /// its copies until it exits). A `spawn` that fails for want of a process
 /// or memory (`EAGAIN` under `RLIMIT_NPROC`, `ENOMEM`) is tried again, a few
 /// times ([`retry_after`]); one that can't start at all leaves the holds to
@@ -912,7 +914,10 @@ fn run_exit_command(
         .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .ok();
     // Copies above the targets first, so that placing one can't overwrite
-    // another not yet placed.
+    // another not yet placed: room for the holds and their copies at once
+    // (descriptor numbers, not counts, are bound), as far as the hard
+    // limit lets it.
+    let _ = raise_descriptor_limit_to(super::super::exit_command_descriptors(holds.len()));
     let Ok(copies) = holds
         .fds()
         .map(|hold| {
@@ -947,6 +952,12 @@ fn run_exit_command(
         .env(HOLDS_ENV, holds.len().to_string())
         .env(HOLD_LABELS_ENV, holds.labels())
         .env(MONITOR_PID_ENV, std::process::id().to_string())
+        .env(
+            MONITOR_STARTED_ENV,
+            super::start_time(nix::unistd::getpid().as_raw())
+                .map(|started| started.to_string())
+                .unwrap_or_default(),
+        )
         .env(
             EXIT_RECORD_ENV,
             String::from_utf8_lossy(&ended.to_json()).as_ref(),
@@ -1067,9 +1078,15 @@ const DESCRIPTORS: usize = MOST_HOLDS + super::attach::MOST_PASSED + OWN_DESCRIP
 /// was raised, for the helpers to start with again
 /// ([`set_descriptor_limit`]). Never lowered; a refusal leaves it as it was.
 fn raise_descriptor_limit() -> Option<libc::rlimit> {
+    raise_descriptor_limit_to(DESCRIPTORS)
+}
+
+/// Raises the monitor's soft descriptor limit to `wanted`, as far as the
+/// hard limit lets it: [`raise_descriptor_limit`]'s, for any number.
+fn raise_descriptor_limit_to(wanted: usize) -> Option<libc::rlimit> {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
-    let wanted = libc::rlim_t::try_from(DESCRIPTORS).ok()?.min(hard);
+    let wanted = libc::rlim_t::try_from(wanted).ok()?.min(hard);
     (soft < wanted && setrlimit(Resource::RLIMIT_NOFILE, wanted, hard).is_ok()).then_some(
         libc::rlimit {
             rlim_cur: soft,

@@ -142,14 +142,33 @@ fn commands_are_forwarded_as_on_linux() {
     let bind = format!("{}:/w", dir.display());
     let read = vm.shipyard(&["run", "--rm", "--volume", &bind, IMAGE, "cat", "/w/note"]);
     assert_eq!(text(&read.stdout), "from the mac\n", "{read:?}");
-    std::os::unix::fs::symlink("/var/lib", dir.join("escape")).unwrap();
+    // The bind keeps the home's mount flags (F108): no set-user-ID bits, no
+    // device files, from the Mac (its line found: the control).
+    let flags = vm.shipyard(&[
+        "run",
+        "--rm",
+        "--volume",
+        &bind,
+        IMAGE,
+        "sh",
+        "-c",
+        "grep ' /w ' /proc/self/mountinfo",
+    ]);
+    let line = text(&flags.stdout);
+    assert!(line.contains(" /w "), "{flags:?}");
+    assert!(line.contains("nosuid") && line.contains("nodev"), "{line}");
+    // (`/usr` is on every Mac: the link leads somewhere here.)
+    std::os::unix::fs::symlink("/usr", dir.join("escape")).unwrap();
     let escape = format!("{}:/x", dir.join("escape").display());
-    let refused = vm.shipyard(&["run", "--rm", "--volume", &escape, IMAGE, "true"]);
-    assert_eq!(refused.status.code(), Some(125), "{refused:?}");
-    assert!(
-        text(&refused.stderr).contains("outside your home"),
-        "{refused:?}"
-    );
+    // The guest's own state, which the Mac hasn't: refused, never sent.
+    for bind in [escape.as_str(), "/var/lib/shipyard:/x", "/run/shipyard:/x"] {
+        let refused = vm.shipyard(&["run", "--rm", "--volume", bind, IMAGE, "true"]);
+        assert_eq!(refused.status.code(), Some(125), "{bind}: {refused:?}");
+        assert!(
+            text(&refused.stderr).contains("outside your home"),
+            "{bind}: {refused:?}"
+        );
+    }
 
     // Ctrl-C: the CLI's SIGINT, passed on to the container (its trap says
     // it came).
@@ -209,7 +228,8 @@ fn commands_are_forwarded_as_on_linux() {
 }
 
 /// 10.3b1: what crosses to the guest is what the command names. `-e KEY`
-/// takes the Mac's value; a variable not named doesn't cross; one the
+/// takes the Mac's value, for the container only (`HTTPS_PROXY` isn't the
+/// guest's shipyard's); a variable not named doesn't cross; one the
 /// guest's own shipyard reads (`PATH`) is refused; a command reads its
 /// input with `-i`, and without, leaves it unread.
 #[test]
@@ -219,6 +239,27 @@ fn variables_and_input_cross_as_named() {
     };
     let started = vm.shipyard(&["vm", "start"]);
     assert!(started.status.success(), "{started:?}");
+    // `-e HTTPS_PROXY` is the container's, never the guest's shipyard's: its
+    // pull (the image isn't in this VM yet) doesn't go through a proxy
+    // that isn't there (the guest's own port 9).
+    let proxied = vm
+        .command(&[
+            "run",
+            "--rm",
+            "-e",
+            "HTTPS_PROXY",
+            SERVER_IMAGE,
+            "sh",
+            "-c",
+            "echo $HTTPS_PROXY",
+        ])
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(proxied.status.success(), "{proxied:?}");
+    assert_eq!(text(&proxied.stdout), "http://127.0.0.1:9\n", "{proxied:?}");
+
     // `-e KEY` copies the Mac's value; nothing else of the Mac's crosses.
     let copied = vm
         .command(&[
@@ -708,25 +749,38 @@ fn a_command_sent_into_a_stop_runs_after_it() {
 }
 
 /// A container given the home can't reach the VM's own files in it: the
-/// guest (here `target/guest`, under the home) is empty to it, while the
-/// repository around it is there (the bind works).
+/// VM's directory (here under the home, as a user's is: its data disk, its
+/// socket) is empty to it, and so is the guest (`target/guest`, when the
+/// repository is under the home), while the home around them is there
+/// (the bind works: the control).
 #[test]
 fn the_vms_own_files_are_hidden_from_a_home_bind() {
-    let Some(vm) = Vm::new("hidden") else {
+    let Some(vm) = Vm::new_in_home("hidden") else {
         return;
     };
     let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
-    let repo = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
-    let Ok(within) = repo.strip_prefix(&home) else {
-        eprintln!("the repository isn't under the home: nothing to hide here");
-        return;
-    };
-    let inside = Path::new("/h").join(within);
-    let script = format!(
-        "ls -A {guest} | wc -l; test -f {cargo} && echo bound",
-        guest = inside.join("target/guest").display(),
-        cargo = inside.join("Cargo.toml").display(),
+    let started = vm.shipyard(&["vm", "start"]);
+    assert!(started.status.success(), "{started:?}");
+    assert!(
+        vm.dir.join("data.img").exists(),
+        "the VM's disk, in the home"
     );
+    let inside = |path: &Path| Path::new("/h").join(path.strip_prefix(&home).unwrap());
+    let vm_dir = inside(&std::fs::canonicalize(&vm.dir).unwrap());
+    let repo = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    // Each place: there (a wrong path is no proof), and empty to it.
+    let mut hidden = vec![vm_dir];
+    if repo.starts_with(&home) {
+        hidden.push(inside(&repo.join("target/guest")));
+    }
+    let script = hidden
+        .iter()
+        .map(|place| format!("test -d {0} && ls -A {0} | wc -l", place.display()))
+        .chain(std::iter::once(
+            "test -n \"$(ls -A /h)\" && echo bound".to_owned(),
+        ))
+        .collect::<Vec<_>>()
+        .join("; ");
     let bind = format!("{}:/h", home.display());
     let ran = vm.shipyard(&["run", "--rm", "--volume", &bind, IMAGE, "sh", "-c", &script]);
     assert!(ran.status.success(), "{ran:?}");
@@ -734,5 +788,7 @@ fn the_vms_own_files_are_hidden_from_a_home_bind() {
         .lines()
         .map(|line| line.trim().to_owned())
         .collect();
-    assert_eq!(said, ["0", "bound"], "{ran:?}");
+    let mut expected = vec!["0"; hidden.len()];
+    expected.push("bound");
+    assert_eq!(said, expected, "{ran:?}");
 }

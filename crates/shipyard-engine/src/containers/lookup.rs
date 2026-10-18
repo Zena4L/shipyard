@@ -5,15 +5,15 @@ use std::fs;
 #[cfg(test)]
 use std::path::PathBuf;
 
+#[cfg(any(test, target_os = "linux"))]
+use super::RECORD;
 use super::id;
 #[cfg(target_os = "linux")]
 use super::store::record_dir;
 use super::store::{Store, Strict};
-#[cfg(any(test, target_os = "linux"))]
-use super::{ContainerId, RECORD};
-use super::{MATCHES_SHOWN, Record, Serial};
+use super::{ContainerId, MATCHES_SHOWN, Record, Serial};
 use crate::Engine;
-use crate::error::{Error, ErrorKind, Result, bail};
+use crate::error::{Error, ErrorKind, Result};
 
 /// Every container's record, oldest first. One that can't be read is
 /// reported ([`WarningKind::RecordUnreadable`]) and left out. No store yet
@@ -75,7 +75,43 @@ pub fn find(engine: &Engine, reference: &str) -> Result<Record> {
         .iter()
         .filter(|record| record.id.as_str().starts_with(&prefix))
         .collect();
+    // A container whose record can't be read (left out above) still has
+    // the prefix: with another, it's more than one, never the other alone.
+    let unread: Vec<ContainerId> = ids_in_store(engine)
+        .into_iter()
+        .filter(|id| id.as_str().starts_with(&prefix))
+        .filter(|id| !by_prefix.iter().any(|record| record.id == *id))
+        .collect();
+    if !unread.is_empty() && by_prefix.len() + unread.len() > 1 {
+        let labels = by_prefix
+            .iter()
+            .map(|record| label(record))
+            .chain(
+                unread
+                    .iter()
+                    .map(|id| format!("{} (its record unreadable)", id.short())),
+            )
+            .collect();
+        return Err(many(reference, labels));
+    }
     one(reference, &by_prefix)
+}
+
+/// The IDs the store has a directory for (a record, readable or not), with
+/// no lock: none if it can't be listed (what was read decides then).
+fn ids_in_store(engine: &Engine) -> Vec<ContainerId> {
+    let Ok(dir) = engine.paths.containers() else {
+        return Vec::new();
+    };
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|name| ContainerId::parse(&name).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The one record of `matches`, or the error for none or many.
@@ -83,22 +119,33 @@ pub(super) fn one(reference: &str, matches: &[&Record]) -> Result<Record> {
     match matches {
         [] => Err(not_found(reference)),
         [record] => Ok((*record).clone()),
-        _ => {
-            let mut named: Vec<String> = matches
-                .iter()
-                .take(MATCHES_SHOWN)
-                .map(|record| format!("{} ({})", record.id.short(), record.name))
-                .collect();
-            if matches.len() > MATCHES_SHOWN {
-                named.push(format!("and {} more", matches.len() - MATCHES_SHOWN));
-            }
-            bail!(
-                InvalidRequest,
-                "{reference:?} names more than one container: {}",
-                named.join(", ")
-            )
-        }
+        _ => Err(many(
+            reference,
+            matches.iter().map(|record| label(record)).collect(),
+        )),
     }
+}
+
+/// How a container is named among others: its short ID and its name.
+fn label(record: &Record) -> String {
+    format!("{} ({})", record.id.short(), record.name)
+}
+
+/// The error for a `reference` that names more than one container, each
+/// in `labels` (the first [`MATCHES_SHOWN`] said, then how many more).
+fn many(reference: &str, labels: Vec<String>) -> Error {
+    let count = labels.len();
+    let mut named: Vec<String> = labels.into_iter().take(MATCHES_SHOWN).collect();
+    if count > MATCHES_SHOWN {
+        named.push(format!("and {} more", count - MATCHES_SHOWN));
+    }
+    Error::new(
+        ErrorKind::InvalidRequest,
+        format!(
+            "{reference:?} names more than one container: {}",
+            named.join(", ")
+        ),
+    )
 }
 
 pub(super) fn not_found(reference: &str) -> Error {

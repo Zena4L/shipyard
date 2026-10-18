@@ -1544,6 +1544,86 @@ fn holds_go_past_the_callers_limit_and_its_helpers_keep_it() {
     );
 }
 
+/// A monitor hands its exit command more holds than its first raise has
+/// room for twice over (1,300: their copies sit above them while they're
+/// placed): it raises its limit again first, and the exit command runs
+/// with them all (before, it couldn't be started, and a restart policy's
+/// restart was lost).
+#[test]
+#[ignore = "needs root"]
+fn many_holds_are_handed_to_the_exit_command() {
+    use nix::sys::resource::{Resource, getrlimit};
+    use shipyard_runtime::container as runtime;
+    use std::os::fd::AsFd as _;
+    const CALLERS: u64 = 128;
+    const HELD: usize = 1_300;
+    let runtime = Runtime::new();
+    let dir = runtime.output_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("exit-command.txt");
+    let script = dir.join("exit-command.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "echo \"$SHIPYARD_HOLDS $SHIPYARD_MONITOR_STARTED\" > {record}.tmp && mv {record}.tmp {record}\n",
+            record = record.display()
+        ),
+    )
+    .unwrap();
+    let logs = runtime.log_dir("many");
+    let extra = [
+        "--log-dir",
+        logs.to_str().unwrap(),
+        "--exit-command",
+        "/bin/sh",
+        "--exit-command-arg",
+        script.to_str().unwrap(),
+    ];
+    let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    // A precondition, said loudly: room for the holds twice over.
+    assert!(
+        hard >= u64::try_from(runtime::exit_command_descriptors(HELD)).unwrap(),
+        "a hard limit with room: {hard}"
+    );
+    let mut command = Command::new(RUNTIME.path());
+    // SAFETY: `setrlimit` is async-signal-safe, on values known before the
+    // fork.
+    unsafe {
+        command.pre_exec(move || {
+            nix::sys::resource::setrlimit(Resource::RLIMIT_NOFILE, CALLERS, hard)
+                .map_err(std::io::Error::from)
+        });
+    }
+    let bundle = bundle_running("exec sleep 300");
+    let call = runtime.create_with("many", &bundle, &extra, command);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(runtime.call(&["start", "many"]).code, Some(0));
+    let held = dir.join("held");
+    std::fs::create_dir_all(&held).unwrap();
+    for n in 0..HELD {
+        // Each closed here once held: only the monitor's copies stay.
+        let file = std::fs::File::create(held.join(n.to_string())).unwrap();
+        runtime::hold(&runtime.root, "many", &format!("lease:h{n}"), file.as_fd())
+            .unwrap_or_else(|error| panic!("hold {n}: {error}"));
+    }
+    // The monitor, as the runtime's state records it: its start time is
+    // told to the exit command too (F102: what tells its start's state
+    // from another's).
+    let recorded: Value =
+        serde_json::from_slice(&std::fs::read(runtime.root.join("many/state.json")).unwrap())
+            .unwrap();
+    let monitor_started = recorded["monitor"][1].as_u64().unwrap();
+    assert_eq!(runtime.call(&["kill", "many", "KILL"]).code, Some(0));
+    let handed = eventually("the exit command's record", || {
+        std::fs::read_to_string(&record).ok()
+    });
+    assert_eq!(
+        handed.trim(),
+        format!("{HELD} {monitor_started}"),
+        "the holds it was given, and its monitor's start time"
+    );
+}
+
 /// A file, made and locked here (`flock`, exclusive).
 fn locked_file(path: &Path) -> std::fs::File {
     use std::os::fd::AsRawFd as _;

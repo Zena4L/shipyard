@@ -400,9 +400,9 @@ fn create_from(
         cgroup: monitor_cgroup.as_ref().map(AsFd::as_fd),
     };
     match start_monitor(id, &dir_fd, record, given, fifo_owner(&loaded.isolation)) {
-        Ok(pid) => {
+        Ok((pid, monitor)) => {
             if monitor_cgroup.is_some() {
-                monitor_joined_or_said(tree.as_ref().ok(), id, &mut warnings);
+                monitor_joined_or_said(tree.as_ref().ok(), id, monitor, &mut warnings);
             }
             Ok(Created { pid, warnings })
         }
@@ -798,7 +798,8 @@ fn fifo_owner(isolation: &crate::isolation::Isolation) -> Option<(u32, u32)> {
 }
 
 /// Fills the state directory open at `dir` in, starts the monitor and
-/// waits for its answer.
+/// waits for its answer: the init's PID, and the monitor's PID and start
+/// time.
 ///
 /// Locked only while the directory is filled in: the setup can take a
 /// while, and meanwhile `state` must say "creating", and `delete` must be
@@ -810,7 +811,7 @@ fn start_monitor(
     mut record: Record,
     given: ForTheMonitor<'_>,
     fifo_owner: Option<(u32, u32)>,
-) -> Result<i32> {
+) -> Result<(i32, Option<(i32, u64)>)> {
     let (mut answers, monitor) = {
         let _lock = lock_at(dir).map_err(locking(id))?;
         let poststart = record
@@ -884,7 +885,7 @@ fn start_monitor(
         _ => end_monitor(monitor),
     }
     match answer? {
-        Answer::Created(pid) => Ok(pid),
+        Answer::Created(pid) => Ok((pid, monitor)),
         Answer::Failed(message) => Err(ContainerError::Setup(message)),
         Answer::Monitor(_) => Err(ContainerError::Setup(
             "the container's monitor answered out of order".to_owned(),
@@ -1047,11 +1048,24 @@ fn monitor_joined(procs: &str) -> bool {
     procs.lines().any(|line| !line.trim().is_empty())
 }
 
+/// Whether a monitor's join of its own cgroup failed: its cgroup's
+/// `procs` empty while it's still there (`alive`). One gone already (its
+/// container ended at once) has left it, and says nothing (F110).
+fn join_failed(procs: &str, alive: bool) -> bool {
+    alive && !monitor_joined(procs)
+}
+
 /// Once the monitor has answered (`Created`: it's in its own cgroup, or
 /// isn't), its join is said in `warnings` if it failed (F61): its cgroup in
-/// `tree` read, and found empty. A read that fails says nothing (a monitor
-/// gone since, its cgroup removed, can't be told from one that failed).
-fn monitor_joined_or_said(tree: Option<&cgroup::Tree>, id: &str, warnings: &mut Vec<String>) {
+/// `tree` read, and found empty while the monitor (its PID and start time)
+/// is still there. A read that fails says nothing (a monitor gone since,
+/// its cgroup removed, can't be told from one that failed).
+fn monitor_joined_or_said(
+    tree: Option<&cgroup::Tree>,
+    id: &str,
+    monitor: Option<(i32, u64)>,
+    warnings: &mut Vec<String>,
+) {
     let Some(tree) = tree else {
         return;
     };
@@ -1060,7 +1074,10 @@ fn monitor_joined_or_said(tree: Option<&cgroup::Tree>, id: &str, warnings: &mut 
         .join(cgroup::monitor_cgroup(id))
         .join("cgroup.procs");
     if let Ok(procs) = std::fs::read_to_string(procs)
-        && !monitor_joined(&procs)
+        && join_failed(
+            &procs,
+            monitor.is_some_and(|(pid, started)| is_alive(pid, started)),
+        )
     {
         warnings.push(monitor_elsewhere("it couldn't join its own"));
     }
@@ -1846,6 +1863,30 @@ pub fn peek_init(root: &Path, id: &str) -> Result<Option<(i32, u64)>> {
     Ok(read_record(&dir)?.and_then(|record| record.init))
 }
 
+/// Container `id`'s monitor's PID and start time, as its state records
+/// them, read without taking its lock (as [`peek_init`]): `None` if it has
+/// none (or no such container). Each start has a monitor of its own: what
+/// tells one start's state from the next's.
+///
+/// # Errors
+///
+/// Its state can't be read.
+pub fn peek_monitor(root: &Path, id: &str) -> Result<Option<(i32, u64)>> {
+    let dir = match existing(root, id) {
+        Ok(dir) => dir,
+        Err(ContainerError::NotFound(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(read_record(&dir)?.and_then(|record| record.monitor))
+}
+
+/// Process `pid`'s start time (clock ticks since boot, as [`peek_init`]
+/// and [`peek_monitor`] give them), if it's there (a zombie isn't).
+#[must_use]
+pub fn process_started(pid: i32) -> Option<u64> {
+    start_time(pid)
+}
+
 /// Whether process `pid` is still the one that started at `started` (clock
 /// ticks since boot, as [`peek_init`] gives them): not gone, nor its PID
 /// reused.
@@ -2415,6 +2456,17 @@ fn is_alive(pid: i32, started: u64) -> bool {
     start_time(pid) == Some(started)
 }
 
+/// The signal's error when `pidfd_open` refused (`error`), or `None` where
+/// pidfds can't be had at all ([`shipyard_sys::pidfd::unsupported`]: then
+/// a checked `kill`). Any other refusal (`ESRCH`: gone; `EMFILE`) is
+/// returned, never the PID-reuse race the pidfd closes (F110).
+fn unpinned(error: &std::io::Error) -> Option<Errno> {
+    if shipyard_sys::pidfd::unsupported(error) {
+        return None;
+    }
+    Some(error.raw_os_error().map_or(Errno::EIO, Errno::from_raw))
+}
+
 /// A pidfd for `pid` (`pidfd_open`, Linux 5.3): readable once it has
 /// exited. None where it can't be had (an older kernel, a seccomp policy
 /// that refuses it): then the clock wakes the loop.
@@ -2426,9 +2478,17 @@ fn pidfd_open(pid: i32) -> Option<OwnedFd> {
 /// `started` (an init or a monitor). Through a pidfd where
 /// the kernel has them (5.3): once open, it names that process even if it
 /// dies and its PID is reused, so the check and the signal can't be split
-/// by a reuse. Without pidfds, a plain `kill` after the check.
+/// by a reuse. Without pidfds (an old kernel, a policy refusing them), a
+/// plain `kill` after the check; any other refusal is the error (F110).
 fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()> {
-    let Ok(pidfd) = shipyard_sys::pidfd::open(pid) else {
+    let pidfd = match shipyard_sys::pidfd::open(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(error) => match unpinned(&error) {
+            Some(errno) => return Err(errno),
+            None => None,
+        },
+    };
+    let Some(pidfd) = pidfd else {
         if !is_alive(pid, started) {
             return Err(Errno::ESRCH);
         }
@@ -2446,6 +2506,23 @@ fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only where pidfds can't be had does a signal go by number (F110):
+    /// running out of descriptors, or the process gone, is the signal's
+    /// error, not the PID-reuse race.
+    #[test]
+    fn only_a_kernel_without_pidfds_signals_by_number() {
+        let refused = |code| unpinned(&std::io::Error::from_raw_os_error(code));
+        assert_eq!(refused(libc::ENOSYS), None);
+        assert_eq!(refused(libc::EPERM), None, "a policy's refusal");
+        for code in [libc::EMFILE, libc::ESRCH, libc::ENOMEM] {
+            assert_eq!(refused(code), Some(Errno::from_raw(code)), "{code}");
+        }
+        assert_eq!(
+            unpinned(&std::io::Error::other("no number")),
+            Some(Errno::EIO)
+        );
+    }
 
     /// A monitor that said its setup failed and is still there past the
     /// wait is ended (F82); one that ends by itself within it is left to
@@ -2838,6 +2915,11 @@ mod tests {
         assert!(!monitor_joined("\n"));
         assert!(monitor_joined("4242\n"));
         assert!(monitor_joined("4242\n4243\n"));
+        // Said only while the monitor is there: one gone already (its
+        // container ended at once) left it (F110).
+        assert!(join_failed("", true));
+        assert!(!join_failed("", false), "gone: nothing to say");
+        assert!(!join_failed("4242\n", true));
     }
 
     /// A hold must be above the standard streams and the descriptors passed

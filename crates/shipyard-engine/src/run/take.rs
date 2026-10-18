@@ -285,11 +285,7 @@ pub(super) fn reconcile(
             }
             // Ended before it started: its record says it never did.
             Some(false) => {
-                let previous = containers::previous_start(engine, id);
-                containers::update(engine, id, |record| {
-                    containers::settle_unstarted(record, previous);
-                })?;
-                containers::forget_previous_start(engine, id);
+                containers::settle_never_ran(engine, id)?;
             }
             None => {}
         }

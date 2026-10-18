@@ -34,8 +34,24 @@ pub(crate) struct Vm {
 
 impl Vm {
     /// The test's VM, if VM tests run here (`SHIPYARD_TEST_VM=required`;
-    /// else it says why).
+    /// else it says why), its directory in `/tmp`.
     pub(crate) fn new(name: &str) -> Option<Self> {
+        Self::at(name, "/tmp/shipyard-vm-test-")
+    }
+
+    /// [`Vm::new`], its directory in the home (as a user's VM directory
+    /// is: `~/Library/Application Support/Shipyard/vm`), for a test of what
+    /// a bind of the home sees of it. Short, for its socket's path. Those a
+    /// killed test left (its process gone: no `Drop` ran) are removed
+    /// first: unlike `/tmp`, the home is never swept.
+    pub(crate) fn new_in_home(name: &str) -> Option<Self> {
+        let home = std::env::var("HOME").expect("HOME, for a VM directory in the home");
+        sweep_left_in(Path::new(&home));
+        Self::at(name, &format!("{home}/.shipyard-vm-test-"))
+    }
+
+    /// The test's VM, its directory `PREFIX` + `name` + this process's ID.
+    fn at(name: &str, prefix: &str) -> Option<Self> {
         let required = std::env::var("SHIPYARD_TEST_VM").as_deref() == Ok("required");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let guest = std::env::var_os("SHIPYARD_GUEST_DIR")
@@ -56,10 +72,7 @@ impl Vm {
                 .unwrap();
             assert!(signed.success(), "signing {SHIPYARD}");
         });
-        let dir = PathBuf::from(format!(
-            "/tmp/shipyard-vm-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir = PathBuf::from(format!("{prefix}{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (count, freed) = &RUNNING;
         let mut running = freed
@@ -108,6 +121,36 @@ impl Vm {
     pub(crate) fn console(&self) -> String {
         String::from_utf8_lossy(&std::fs::read(self.dir.join("console.log")).unwrap_or_default())
             .into_owned()
+    }
+}
+
+/// Removes the test VM directories in `home` whose test process is gone
+/// (`.shipyard-vm-test-NAME-PID`).
+fn sweep_left_in(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name
+            .strip_prefix(".shipyard-vm-test-")
+            .and_then(|rest| rest.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+            == Err(nix::errno::Errno::ESRCH);
+        if gone {
+            // Its VM's host may outlive it: stopped first, its disk let go.
+            let _ = Command::new(SHIPYARD)
+                .args(["vm", "stop"])
+                .env_remove("SHIPYARD_VM")
+                .env("SHIPYARD_VM_DIR", entry.path())
+                .stdin(Stdio::null())
+                .output();
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 

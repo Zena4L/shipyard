@@ -920,3 +920,23 @@ fn hostname_problems_are_usage_errors() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("hostname"), "{err:#}");
 }
+
+/// A bare `-e KEY` in the macOS guest copies the Mac's value, as the agent
+/// passed it on, and never the guest `shipyard`'s own (its `PATH`);
+/// elsewhere, this process's.
+#[test]
+fn a_bare_env_key_copies_the_callers_value() {
+    use std::ffi::OsString;
+    let key = |name: &str| OsString::from(name);
+    let forwarded = Some(r#"{"TOKEN":"from the mac"}"#);
+    assert_eq!(
+        super::request::caller_var(forwarded, &key("TOKEN")),
+        Some(OsString::from("from the mac"))
+    );
+    assert_eq!(super::request::caller_var(forwarded, &key("PATH")), None);
+    assert_eq!(
+        super::request::caller_var(None, &key("PATH")),
+        std::env::var_os("PATH")
+    );
+    assert!(std::env::var_os("PATH").is_some(), "a control: PATH is set");
+}

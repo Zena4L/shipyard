@@ -45,9 +45,9 @@ mod versions;
 pub use elsewhere::{
     attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
-    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_status,
-    ps, release, remove_failed_logs, resume, start, start_helper, start_helper_in_view, state,
-    stats, status, stop, update, wait,
+    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
+    peek_status, process_started, ps, release, remove_failed_logs, resume, start, start_helper,
+    start_helper_in_view, state, stats, status, stop, update, wait,
 };
 #[cfg(target_os = "linux")]
 pub use lifecycle::{Waiter, waiter};
@@ -55,9 +55,9 @@ pub use lifecycle::{Waiter, waiter};
 pub use lifecycle::{
     attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
-    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_status,
-    ps, release, remove_failed_logs, remove_monitor_cgroup, resume, start, start_helper,
-    start_helper_in_view, state, stats, status, stop, update, wait,
+    monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
+    peek_status, process_started, ps, release, remove_failed_logs, remove_monitor_cgroup, resume,
+    start, start_helper, start_helper_in_view, state, stats, status, stop, update, wait,
 };
 
 pub use helper::{Helper, HelperFailure, HelperIo, RootView, RunningHelper};
@@ -273,6 +273,28 @@ pub const HOLD_LABELS_ENV: &str = "SHIPYARD_HOLD_LABELS";
 /// since aren't bound by the caller's soft limit.
 pub const MOST_HOLDS: usize = 2_100;
 
+/// The descriptors a monitor keeps of its own beside its holds when it
+/// hands them to its exit command.
+const PLACING_SLACK: usize = 64;
+
+/// The descriptor numbers a monitor needs to hand `holds` holds to its
+/// exit command: it copies each above where they go (3 and up) before
+/// placing them, so the holds, their copies and its own are open at once.
+#[must_use]
+pub const fn exit_command_descriptors(holds: usize) -> usize {
+    holds.saturating_mul(2).saturating_add(3 + PLACING_SLACK)
+}
+
+/// The most holds a monitor can hand its exit command under the hard
+/// descriptor limit `hard` ([`exit_command_descriptors`]), never more than
+/// [`MOST_HOLDS`]: a container given more would end without its exit
+/// command (its end unrecorded, its restart policy lost).
+#[must_use]
+pub fn most_holds_under(hard: u64) -> usize {
+    let hard = usize::try_from(hard).unwrap_or(usize::MAX);
+    (hard.saturating_sub(3 + PLACING_SLACK) / 2).min(MOST_HOLDS)
+}
+
 /// What a monitor says, after the number, when it holds all it can (in a
 /// refused hold's [`ContainerError::NotHeld`]). A version 4 monitor says
 /// [`HoldRefusal::Full`](crate::attach::HoldRefusal::Full) too; the words
@@ -294,6 +316,12 @@ pub const EXIT_RECORD_ENV: &str = "SHIPYARD_EXIT_RECORD";
 /// for the exit command), so what they keep alive isn't free before then.
 /// While the exit command's parent is this PID, the monitor is there.
 pub const MONITOR_PID_ENV: &str = "SHIPYARD_MONITOR_PID";
+
+/// Where an exit command finds its monitor's start time (clock ticks since
+/// boot, `/proc/PID/stat` field 22), beside [`MONITOR_PID_ENV`]: with the
+/// PID, what tells that monitor's start from another's, whose state took
+/// its place (F102). A monitor from before 10.4 sets none.
+pub const MONITOR_STARTED_ENV: &str = "SHIPYARD_MONITOR_STARTED";
 
 /// What [`exec`] runs in a container, and how (runc's `exec` flags). What
 /// isn't given is the container's own process's: its environment, working
@@ -905,6 +933,21 @@ mod root_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A monitor needs room for its holds twice (and its own) to hand
+    /// them on; under a hard limit, the most holds are what fits that,
+    /// never past `MOST_HOLDS`.
+    #[test]
+    fn holds_are_bound_by_the_room_to_hand_them_on() {
+        assert_eq!(exit_command_descriptors(0), 67);
+        assert_eq!(exit_command_descriptors(1_300), 2_667);
+        assert_eq!(most_holds_under(4_096), 2_014);
+        assert!(exit_command_descriptors(most_holds_under(4_096)) <= 4_096);
+        assert!(exit_command_descriptors(most_holds_under(4_096) + 1) > 4_096);
+        assert_eq!(most_holds_under(1_048_576), MOST_HOLDS);
+        assert_eq!(most_holds_under(u64::MAX), MOST_HOLDS);
+        assert_eq!(most_holds_under(10), 0);
+    }
 
     /// An exit command is an absolute UTF-8 path with no NUL, its
     /// arguments without one; read from JSON, it's checked the same.

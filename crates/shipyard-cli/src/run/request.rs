@@ -102,10 +102,12 @@ impl RunArgs {
     pub(super) fn into_request(mut self) -> Result<RunRequest, clap::Error> {
         let (image, command) = self.image_and_command()?;
         // A bare `--env KEY` copies the caller's value: this process's
-        // environment is the caller's, read here, never by the engine.
+        // environment is the caller's, read here, never by the engine; in
+        // the macOS guest, the Mac's, as the agent passed them on.
+        let forwarded = std::env::var(shipyard_runtime::attach::forward::CALLER_ENV).ok();
         let caller_env = self
             .bare_env_keys()
-            .filter_map(|key| Some((key.clone(), std::env::var_os(key)?)))
+            .filter_map(|key| Some((key.clone(), caller_var(forwarded.as_deref(), key)?)))
             .collect();
         let limits = Limits {
             first_given: self.limits.first_given(),
@@ -206,5 +208,17 @@ impl RunArgs {
             retries: self.health_retries.unwrap_or(0),
             shell: Vec::new(),
         }))
+    }
+}
+
+/// The caller's value of `key`: from `forwarded` (the Mac's, a forwarded
+/// command's [`CALLER_ENV`](shipyard_runtime::attach::forward::CALLER_ENV))
+/// if there is one, else this process's environment.
+pub(super) fn caller_var(forwarded: Option<&str>, key: &OsString) -> Option<OsString> {
+    match forwarded {
+        Some(forwarded) => {
+            shipyard_runtime::attach::forward::caller_var(forwarded, key.to_str()?).map(Into::into)
+        }
+        None => std::env::var_os(key),
     }
 }

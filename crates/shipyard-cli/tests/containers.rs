@@ -1198,6 +1198,79 @@ fn ports_that_leave_no_room_for_the_other_holds_are_refused_first() {
     });
 }
 
+/// Under a hard descriptor limit of 1,024, a run asks only for the holds
+/// its monitor can hand its exit command (each hold's copy sits above it
+/// while they're placed: 478 here), where its soft limit alone would let
+/// 960 by: 300 ports on both families (605 holds) are refused before
+/// anything is made, saying the bound; 200 (405) run (the control). As
+/// root, in a network namespace of the test's own.
+#[test]
+fn ports_are_bound_by_the_room_to_hand_them_on() {
+    use std::os::unix::process::CommandExt as _;
+    if !is_root() {
+        eprintln!("skipping: a network of its own needs root");
+        return;
+    }
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    shipyard_test_support::in_new_netns(move || {
+        use nix::sys::resource::{Resource, setrlimit};
+        use shipyard_network::route::{LinkChange, Rtnetlink};
+        let mut host = Rtnetlink::new().unwrap();
+        let lo = host.link("lo").unwrap().unwrap().index;
+        host.change(lo, LinkChange::Up(true)).unwrap();
+        stores.ok(&["network", "create", "--ipv6", "app"]);
+        let limited = |args: &[&str]| {
+            let mut command = stores.command(args);
+            // SAFETY: `setrlimit` is an async-signal-safe system call;
+            // nothing is allocated.
+            unsafe {
+                command.pre_exec(|| {
+                    setrlimit(Resource::RLIMIT_NOFILE, 1_024, 1_024)?;
+                    Ok(())
+                });
+            }
+            command.output().expect("running shipyard")
+        };
+        let ran = limited(&[
+            "run",
+            "-d",
+            "--name",
+            "fits",
+            "--network",
+            "app",
+            "-p",
+            "20000-20199:20000-20199",
+            &stores.image,
+            "sleep",
+            "300",
+        ]);
+        assert!(ran.status.success(), "{ran:?}");
+        stores.ok(&["rm", "-f", "fits"]);
+        let refused = limited(&[
+            "run",
+            "-d",
+            "--name",
+            "no-room",
+            "--network",
+            "app",
+            "-p",
+            "21000-21299:21000-21299",
+            &stores.image,
+            "sleep",
+            "300",
+        ]);
+        assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(said.contains("at most 478 in all here"), "{said}");
+        assert!(
+            !stores.ok(&["ps", "-a"]).contains("no-room"),
+            "nothing made"
+        );
+    });
+}
+
 /// A volume a container mounts is kept while the container is, running or
 /// stopped (Docker's): `volume rm` refuses it naming the container (125),
 /// `volume prune` keeps it as in use; once the container is removed,
