@@ -77,7 +77,14 @@ fn a_reader_gone_ends_any_command_quietly() {
     stores.ok(&["volume", "create", "data"]);
     // The control: read, it prints.
     assert!(stores.ok(&["volume", "ls"]).contains("data"));
-    for args in [&["volume", "ls"][..], &["events", "--until", "0s"]] {
+    // `events` with a format too: a backlog written to no reader (each
+    // write fails at once, before any wait).
+    for args in [
+        &["volume", "ls"][..],
+        &["events", "--until", "0s"],
+        &["events", "--until", "0s", "--format", "json"],
+        &["events", "--until", "0s", "--format", "{{.Type}}"],
+    ] {
         let (reader, writer) = std::io::pipe().unwrap();
         drop(reader);
         let output = stores
@@ -116,7 +123,8 @@ fn a_reader_gone_ends_a_command_per_item_quietly() {
 }
 
 /// The past, with `--since` and a `--until` gone by: printed, then the
-/// command ends; JSON lines as kept, or Docker's line.
+/// command ends; Docker's event messages (`json`), a template over them,
+/// or Docker's line.
 #[test]
 fn past_events_are_listed_and_it_ends() {
     let stores = Stores::new("past");
@@ -130,11 +138,11 @@ fn past_events_are_listed_and_it_ends() {
         .lines()
         .map(|line| {
             let event: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(event["v"], 1, "{line}");
-            assert_eq!(event["type"], "volume", "{line}");
+            assert_eq!(event["Type"], "volume", "{line}");
+            assert_eq!(event["scope"], "local", "{line}");
             (
-                event["action"].as_str().unwrap().to_owned(),
-                event["id"].as_str().unwrap().to_owned(),
+                event["Action"].as_str().unwrap().to_owned(),
+                event["Actor"]["ID"].as_str().unwrap().to_owned(),
             )
         })
         .collect();
@@ -148,9 +156,30 @@ fn past_events_are_listed_and_it_ends() {
         stores.ok(&["events", "--until", "0s", "--format", "json"]),
         json
     );
+    // A template over the same messages.
+    assert_eq!(
+        stores.ok(&[
+            "events",
+            "--until",
+            "0s",
+            "--format",
+            "{{.Type}} {{.Action}} {{.Actor.ID}}",
+        ]),
+        "volume create one\nvolume create two\nvolume destroy one\n"
+    );
+    // Go's field names (`.Time`, `.Scope`, `.Status`), each there; an
+    // attribute an event hasn't is `<no value>`, never the end (Docker's).
+    let go = stores.ok(&[
+        "events",
+        "--until",
+        "0s",
+        "--format",
+        "{{.Scope}}|{{.Status}}|{{.Actor.Attributes.exitCode}}|{{gt .Time 0}}",
+    ]);
+    assert_eq!(go, "local||<no value>|true\n".repeat(3), "{go}");
     // Backwards: refused.
     let backwards = stores.run(&["events", "--since", "0s", "--until", "1h"]);
-    assert_eq!(backwards.status.code(), Some(125), "{backwards:?}");
+    assert_eq!(backwards.status.code(), Some(1), "{backwards:?}");
     let text = stores.ok(&["events", "--since", "1h", "--until", "0s"]);
     let first = text.lines().next().unwrap();
     let words: Vec<&str> = first.split(' ').collect();
@@ -160,7 +189,7 @@ fn past_events_are_listed_and_it_ends() {
     assert_eq!(stores.ok(&["events", "--since", "0s", "--until", "0s"]), "");
 }
 
-/// `--filter` narrows it; a key it doesn't know is refused (125).
+/// `--filter` narrows it; a key it doesn't know is refused (1).
 #[test]
 fn filters_narrow_it() {
     let stores = Stores::new("filter");
@@ -194,7 +223,7 @@ fn filters_narrow_it() {
         "-f",
         "colour=red",
     ]);
-    assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
 }
 
 /// Without `--until`, it waits: a new event is printed within a second of

@@ -39,9 +39,16 @@
 //! without setuid and setgid bits. `-L` follows a source that's a symlink.
 
 #[cfg(target_os = "linux")]
+mod fill;
+#[cfg(target_os = "linux")]
 mod helpers;
 #[cfg(target_os = "linux")]
 mod pack;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the `cp` helper, Linux's, walks with it")
+)]
+mod scope;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -50,6 +57,8 @@ use std::path::{Path, PathBuf};
 
 use shipyard_runtime::container::{ContainerError, HelperFailure};
 
+#[cfg(target_os = "linux")]
+pub(crate) use fill::fill;
 #[cfg(target_os = "linux")]
 pub use pack::PackError;
 
@@ -401,6 +410,75 @@ pub fn copy_by_name(
     }
 }
 
+/// A path in a container, as `stat` says it (step 11.2c3a: Docker's
+/// `X-Docker-Container-Path-Stat`): the path itself, never what a link at
+/// it leads to. Also the `cp-stat` helper's answer on its pipe (the same
+/// binary on both ends: never kept, so never versioned).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PathStat {
+    /// Its last component (`/` for the root).
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its `st_mode`: the kind and the permission bits.
+    pub mode: u32,
+    /// Its last change, seconds since the epoch.
+    pub mtime_secs: i64,
+    /// And the nanoseconds of it.
+    pub mtime_nanos: u32,
+    /// For a symlink, what it leads to as a path in the container: its
+    /// chain of links followed in the container's root, as Docker's
+    /// `FollowSymlinkInScope` does (at most 255 links, F121); else empty.
+    pub link_target: String,
+}
+
+impl PathStat {
+    /// Its mode as Go's `os.FileMode` (Docker's): the permission bits, and
+    /// the kind and special bits each in a bit of their own.
+    #[must_use]
+    pub fn docker_mode(&self) -> u32 {
+        /// `S_IFMT` and the kinds within it, as POSIX numbers them.
+        const KIND: u32 = 0o170_000;
+        let kind = match self.mode & KIND {
+            0o040_000 => 1 << 31,               // a directory
+            0o120_000 => 1 << 27,               // a symlink
+            0o060_000 => 1 << 26,               // a block device
+            0o020_000 => (1 << 26) | (1 << 21), // a character device
+            0o010_000 => 1 << 25,               // a named pipe
+            0o140_000 => 1 << 24,               // a socket
+            _ => 0,                             // a regular file
+        };
+        let special = [(0o4000, 1 << 23), (0o2000, 1 << 22), (0o1000, 1 << 20)]
+            .iter()
+            .filter(|(bit, _)| self.mode & bit != 0)
+            .fold(0, |bits, (_, go)| bits | go);
+        kind | special | (self.mode & 0o777)
+    }
+}
+
+/// `path` in the container `container` names (name, ID, serial or ID
+/// prefix), running or not, as Docker's archive endpoints stat it: the
+/// path itself (a symlink is one).
+///
+/// # Errors
+///
+/// No such container, or path ([`CpError::NotFound`], found with
+/// [`Error::find`](crate::Error::find)); what [`copy_by_name`] can't do
+/// either.
+pub fn stat(engine: &crate::Engine, container: &str, path: &Path) -> crate::Result<PathStat> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::run::container_files(engine, container, |files| {
+            helpers::stat(files, path).map_err(crate::Error::from)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, container, path);
+        Err(crate::error::linux_only("containers"))
+    }
+}
+
 /// Copies `path` out of container `id`, to the host path `to` or, if `None`,
 /// as a tar stream to `stream`.
 ///
@@ -466,6 +544,40 @@ pub fn copy_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go's `os.FileMode` bits, as Docker's stat header carries them.
+    #[test]
+    fn a_mode_is_go_s() {
+        let mode = |mode: u32| {
+            PathStat {
+                name: String::new(),
+                size: 0,
+                mode,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                link_target: String::new(),
+            }
+            .docker_mode()
+        };
+        assert_eq!(mode(0o100_644), 0o644, "a file");
+        assert_eq!(mode(0o040_755), (1 << 31) | 0o755, "a directory");
+        assert_eq!(mode(0o120_777), (1 << 27) | 0o777, "a symlink");
+        assert_eq!(mode(0o104_755), (1 << 23) | 0o755, "setuid");
+        assert_eq!(
+            mode(0o042_775),
+            (1 << 31) | (1 << 22) | 0o775,
+            "setgid directory"
+        );
+        assert_eq!(mode(0o041_777), (1 << 31) | (1 << 20) | 0o777, "sticky");
+        assert_eq!(
+            mode(0o020_666),
+            (1 << 26) | (1 << 21) | 0o666,
+            "a character device"
+        );
+        assert_eq!(mode(0o060_660), (1 << 26) | 0o660, "a block device");
+        assert_eq!(mode(0o010_600), (1 << 25) | 0o600, "a pipe");
+        assert_eq!(mode(0o140_755), (1 << 24) | 0o755, "a socket");
+    }
 
     fn parse(text: &str) -> Operand {
         Operand::parse(OsStr::new(text))

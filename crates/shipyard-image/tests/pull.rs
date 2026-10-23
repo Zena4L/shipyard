@@ -538,6 +538,7 @@ fn a_single_arch_image_pulls_verifies_and_is_stored_whole() {
     let pulled = pull(&serving, "localhost/library/alpine:3.20", &amd64(), &store).unwrap();
     assert_eq!(pulled.manifest.layers.len(), 3);
     assert_eq!(pulled.manifest_digest, hosted.manifest);
+    assert_eq!(pulled.index_digest, None, "no index named");
     assert!(store.contains(&pulled.manifest.config.digest));
     assert!(store.contains(&hosted.manifest), "the manifest is stored");
     for layer in &pulled.manifest.layers {
@@ -618,6 +619,15 @@ fn a_multi_arch_index_selects_the_platform_and_is_stored() {
     assert_eq!(pulled.manifest.layers.len(), 2);
     let index_digest = Digest::sha256(&index);
     assert!(store.contains(&index_digest), "the index is stored");
+    // Its index named (F118: Docker's `RepoDigests`), found again by its
+    // tag once recorded with it.
+    assert_eq!(pulled.index_digest.as_ref(), Some(&index_digest));
+    let record = shipyard_image::ImageRecord::of(&pulled, None);
+    shipyard_image::index::Index::record(store.root(), "localhost/multi:v1", record).unwrap();
+    let tagged = shipyard_image::from_store(&reference("localhost/multi:v1"), &arm64, &store)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tagged.index_digest.as_ref(), Some(&index_digest));
 
     // Pinned to the index, it's found by its digest alone (nothing
     // recorded), through the stored index to the platform's manifest.
@@ -626,6 +636,7 @@ fn a_multi_arch_index_selects_the_platform_and_is_stored() {
         .unwrap()
         .unwrap();
     assert_eq!(found.manifest_digest, arm.manifest);
+    assert_eq!(found.index_digest.as_ref(), Some(&index_digest));
     std::fs::remove_file(store.path(&arm.manifest)).unwrap();
     assert!(
         shipyard_image::from_store(&pinned, &arm64, &store)
@@ -916,16 +927,7 @@ fn a_pulled_image_is_found_in_the_store_without_the_registry() {
     );
     let pulled = pull(&serving, "localhost/app:v1", &amd64(), &store).unwrap();
     // Recorded, as the CLI does after a pull.
-    let record = shipyard_image::ImageRecord {
-        manifest: pulled.manifest_digest.to_string(),
-        config: pulled.manifest.config.digest.to_string(),
-        layers: pulled
-            .manifest
-            .layers
-            .iter()
-            .map(|l| l.digest.to_string())
-            .collect(),
-    };
+    let record = shipyard_image::ImageRecord::of(&pulled, None);
     shipyard_image::index::Index::record(store.root(), &wanted.to_string(), record).unwrap();
     let before = serving.requests();
     let found = shipyard_image::from_store(&wanted, &amd64(), &store)
@@ -1032,6 +1034,107 @@ fn an_identity_token_is_exchanged_by_the_refresh_grant() {
     let form = serving.seen.token_form.lock().unwrap().clone().unwrap();
     assert!(form.contains("client_id=shipyard"), "{form}");
     assert!(form.contains("scope=repository%3Aacr%3Apull"), "{form}");
+}
+
+/// A registry's own bearer token (Docker's `registrytoken`, F118): sent
+/// to it as it is, its token realm never asked; one it refuses, named.
+#[test]
+fn a_registry_token_is_sent_as_it_is() {
+    let mut fixture = FixtureRegistry {
+        require_auth: true,
+        token_auth: TokenAuth::Header("never".to_owned()),
+        ..FixtureRegistry::default()
+    };
+    host_image(&mut fixture, "bearer", "v1", "amd64", 1);
+    let serving = fixture.serve();
+    let scratch = Scratch::new();
+    let given = |token: &str| {
+        shipyard_image::Credentials::given(
+            shipyard_image::Credential::RegistryToken(token.to_owned()),
+            Some("localhost"),
+        )
+    };
+    let refused = pull_signed(
+        &serving,
+        "localhost/bearer:v1",
+        &scratch.store(),
+        given("wrong"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(refused, PullError::Registry(RegistryError::Refused { .. })),
+        "{refused}"
+    );
+    pull_signed(
+        &serving,
+        "localhost/bearer:v1",
+        &scratch.store(),
+        given(TOKEN),
+    )
+    .unwrap();
+    assert!(serving.seen.token_used.load(Ordering::Relaxed));
+    assert!(
+        serving.seen.token_request.lock().unwrap().is_none(),
+        "no token realm asked"
+    );
+    let config = docker_config(
+        &scratch.0,
+        &format!(
+            r#"{{"auths":{{"localhost":{{"registrytoken":"{TOKEN}","auth":"bm86cGFzcw=="}}}}}}"#
+        ),
+    );
+    pull_signed(&serving, "localhost/bearer:v1", &scratch.store(), config).unwrap();
+}
+
+/// A sign-in (`docker login`'s `POST /auth`, F118): the credential checked
+/// against `/v2/` by a token from the realm, asked with no scope; a
+/// password the registry takes itself; a refused one named; a registry
+/// that asks nothing, signed in to.
+#[test]
+fn a_sign_in_checks_the_credential_at_the_api_root() {
+    let signed = |serving: &Serving, credential: shipyard_image::Credential| {
+        serving
+            .registry()
+            .with_credentials(
+                shipyard_image::Credentials::given(credential, Some("localhost")),
+                "localhost",
+            )
+            .check()
+    };
+    let password = |password: &str| shipyard_image::Credential::Basic {
+        username: "me".to_owned(),
+        password: password.to_owned(),
+    };
+    // `/v2/` answers `{}`, as a registry's API root does.
+    let root = |mut fixture: FixtureRegistry| {
+        fixture.route("/v2/", Response::ok("application/json", b"{}".to_vec()));
+        fixture.serve()
+    };
+    let token = root(FixtureRegistry {
+        require_auth: true,
+        token_auth: TokenAuth::Header(basic("me", "pw")),
+        ..FixtureRegistry::default()
+    });
+    signed(&token, password("pw")).unwrap();
+    let asked = token.seen.token_request.lock().unwrap().clone().unwrap();
+    assert!(!asked.contains("scope="), "no scope: {asked}");
+    assert!(asked.contains("account=me"), "{asked}");
+    let refused = signed(&token, password("wrong")).unwrap_err();
+    assert!(
+        matches!(refused, RegistryError::Refused { .. }),
+        "{refused}"
+    );
+    let plain = root(FixtureRegistry {
+        basic: Some(basic("me", "pw")),
+        ..FixtureRegistry::default()
+    });
+    signed(&plain, password("pw")).unwrap();
+    assert!(matches!(
+        signed(&plain, password("wrong")),
+        Err(RegistryError::Refused { .. })
+    ));
+    let open = root(FixtureRegistry::default());
+    signed(&open, password("anything")).unwrap();
 }
 
 #[test]

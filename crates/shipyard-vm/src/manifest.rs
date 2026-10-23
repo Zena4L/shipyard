@@ -182,16 +182,12 @@ impl Manifest {
     ///
     /// [`ManifestError`].
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
-        #[derive(Deserialize)]
-        struct Versioned {
-            version: u32,
-        }
-        let unreadable = |error: serde_json::Error| ManifestError::Unreadable(error.to_string());
-        let versioned: Versioned = serde_json::from_slice(bytes).map_err(unreadable)?;
-        if versioned.version > MANIFEST_VERSION {
-            return Err(ManifestError::Newer(versioned.version));
-        }
-        serde_json::from_slice(bytes).map_err(unreadable)
+        shipyard_sys::versioned::read(bytes, MANIFEST_VERSION).map_err(|error| match error {
+            shipyard_sys::versioned::Error::Newer(version) => ManifestError::Newer(version),
+            shipyard_sys::versioned::Error::Unreadable(e) => {
+                ManifestError::Unreadable(e.to_string())
+            }
+        })
     }
 }
 

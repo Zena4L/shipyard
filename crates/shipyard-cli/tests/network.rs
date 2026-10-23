@@ -230,8 +230,10 @@ fn bridge_networks_need_root() {
     let run = shipyard(&["--network", "bridge"], "true");
     assert_eq!(run.code, Some(125), "{}", run.stderr);
     assert!(run.stderr.contains("need root for now"), "{}", run.stderr);
-    let network = run_cli(&["network", "ls"]);
-    assert_eq!(network.code, Some(125), "{}", network.stderr);
+    // Listed, as Docker's: the built-ins rootless has (step 11.3c).
+    let network = run_cli(&["network", "ls", "--format", "{{.Name}}"]);
+    assert_eq!(network.code, Some(0), "{}", network.stderr);
+    assert_eq!(network.stdout, "host\nnone\npasta\n");
 }
 
 #[test]
@@ -335,7 +337,7 @@ fn the_host_reaches_containers_on_a_network() {
             refused_at("10.90.0.2:9"),
             "the second container doesn't answer"
         );
-        let inspect = networks.run(&["network", "inspect", "app"]);
+        let inspect = networks.run(&["network", "inspect", "--shipyard", "app"]);
         assert!(
             inspect.stdout.contains("\"10.90.0.50\""),
             "{}",
@@ -355,7 +357,7 @@ fn the_host_reaches_containers_on_a_network() {
         assert!(taken.stderr.contains("taken"), "{}", taken.stderr);
         // In use: can't be removed.
         let busy = networks.run(&["network", "rm", "app"]);
-        assert_eq!(busy.code, Some(125), "{}", busy.stderr);
+        assert_eq!(busy.code, Some(1), "{}", busy.stderr);
         // Named: by name; the other (a run with no record, unnamed) by its
         // run's ID.
         assert!(busy.stderr.contains("in use by "), "{}", busy.stderr);
@@ -416,7 +418,7 @@ fn a_killed_runs_address_is_swept_by_the_next() {
             "true",
         ]);
         assert_eq!(next.code, Some(0), "{}", next.stderr);
-        let inspect = networks.run(&["network", "inspect", "app"]);
+        let inspect = networks.run(&["network", "inspect", "--shipyard", "app"]);
         assert!(
             inspect.stdout.contains("\"Containers\": []"),
             "{}",

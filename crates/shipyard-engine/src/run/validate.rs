@@ -59,46 +59,53 @@ impl RunRequest {
     /// What's asked of the process (and of a run, beside its container),
     /// and what only a container has: each with whether it's asked. Every
     /// field is named here: one added must be placed.
-    fn asked(&self) -> (Asked<14>, Asked<22>) {
+    fn asked(&self) -> (Asked<14>, Asked<25>) {
         let Self {
             default_mode: _,
             detached: _,
             container: _,
+            joined: _,
+            ipc: _,
             streams: _,
-            env,
+            // A process's: `asked_of_its_process`.
+            env: _,
             caller_env: _,
-            workdir,
-            user,
-            group_add,
-            ulimit,
-            oom_score_adj,
+            workdir: _,
+            user: _,
+            group_add: _,
+            ulimit: _,
+            oom_score_adj: _,
             device,
             device_cgroup_rule,
             stop_signal: _,
             stop_timeout: _,
             restart: _,
             health: _,
-            no_isolation,
+            // Kept by the record, and checked as it keeps them (`Labels`).
+            labels: _,
+            no_isolation: _,
             hostname,
             domainname,
             sysctl,
             network,
             name,
-            network_alias,
-            ip,
-            ip6,
-            mac_address,
+            network_alias: _,
+            ip: _,
+            ip6: _,
+            mac_address: _,
             add_host,
             dns,
             dns_search,
             dns_option,
             publish,
             publish_all,
+            expose,
+            cidfile,
             rootfs,
             image,
-            entrypoint,
+            entrypoint: _,
             pull: _,
-            read_only,
+            read_only: _,
             cap_add,
             cap_drop,
             security_opt,
@@ -107,24 +114,11 @@ impl RunRequest {
             bundle: _,
             limits,
             volume,
-            command,
+            tmpfs,
+            make_sources: _, // Made at the create; checked as any bind's source after.
+            made_sources: _,
+            command: _,
         } = self;
-        let process = [
-            ("a command", !command.is_empty()),
-            ("--env", !env.is_empty()),
-            ("--workdir", workdir.is_some()),
-            ("--user", user.is_some()),
-            ("--group-add", !group_add.is_empty()),
-            ("--ulimit", !ulimit.is_empty()),
-            ("--oom-score-adj", oom_score_adj.is_some()),
-            ("--no-isolation", *no_isolation),
-            ("--network-alias", !network_alias.is_empty()),
-            ("--ip", ip.is_some()),
-            ("--ip6", ip6.is_some()),
-            ("--mac-address", mac_address.is_some()),
-            ("--read-only", *read_only),
-            ("--entrypoint", entrypoint.is_some()),
-        ];
         let container = [
             ("--device", !device.is_empty()),
             ("--device-cgroup-rule", !device_cgroup_rule.is_empty()),
@@ -139,6 +133,8 @@ impl RunRequest {
             ("--dns-option", !dns_option.is_empty()),
             ("--publish", !publish.is_empty()),
             ("--publish-all", *publish_all),
+            ("--expose", !expose.is_empty()),
+            ("--cidfile", cidfile.is_some()),
             ("--rootfs", rootfs.is_some()),
             ("an image", image.is_some()),
             ("--cap-add", !cap_add.is_empty()),
@@ -147,9 +143,47 @@ impl RunRequest {
             ("--uidmap", !uidmap.is_empty()),
             ("--gidmap", !gidmap.is_empty()),
             ("--volume", !volume.is_empty()),
+            ("--tmpfs", !tmpfs.is_empty()),
             ("a resource limit", limits.given()),
         ];
-        (process, container)
+        (self.asked_of_its_process(), container)
+    }
+
+    /// What `asked` says of a process's settings.
+    fn asked_of_its_process(&self) -> Asked<14> {
+        let Self {
+            env,
+            workdir,
+            user,
+            group_add,
+            ulimit,
+            oom_score_adj,
+            no_isolation,
+            network_alias,
+            ip,
+            ip6,
+            mac_address,
+            read_only,
+            entrypoint,
+            command,
+            ..
+        } = self;
+        [
+            ("a command", !command.is_empty()),
+            ("--env", !env.is_empty()),
+            ("--workdir", workdir.is_some()),
+            ("--user", user.is_some()),
+            ("--group-add", !group_add.is_empty()),
+            ("--ulimit", !ulimit.is_empty()),
+            ("--oom-score-adj", oom_score_adj.is_some()),
+            ("--no-isolation", *no_isolation),
+            ("--network-alias", !network_alias.is_empty()),
+            ("--ip", ip.is_some()),
+            ("--ip6", ip6.is_some()),
+            ("--mac-address", mac_address.is_some()),
+            ("--read-only", *read_only),
+            ("--entrypoint", entrypoint.is_some()),
+        ]
     }
 
     /// Refuses what's asked without what it needs, and a run without a
@@ -169,6 +203,12 @@ impl RunRequest {
             (
                 "--read-only",
                 self.read_only,
+                self.has_root(),
+                "an image or --rootfs",
+            ),
+            (
+                "--tmpfs",
+                !self.tmpfs.is_empty(),
                 self.has_root(),
                 "an image or --rootfs",
             ),

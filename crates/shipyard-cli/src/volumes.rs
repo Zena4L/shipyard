@@ -4,37 +4,42 @@ use std::io::{IsTerminal as _, Write as _};
 use std::process::ExitCode;
 
 use anyhow::Result;
-use shipyard_runtime::process::EXIT_ENGINE_ERROR;
 
 use crate::cli::VolumeCommand;
-use crate::output::{confirm, each, table};
-use crate::reporter::{engine, report};
+use crate::format::rows::{self, VolumeRow};
+use crate::output::{confirm, each};
+use crate::reporter::{EXIT_FAILURE, engine, report};
 
 /// `shipyard volume …`: create, list, inspect, remove, prune named volumes.
 pub(crate) fn command(command: &VolumeCommand) -> Result<ExitCode> {
     use shipyard_engine::volumes;
     let engine = engine();
     match command {
-        VolumeCommand::Create { name } => {
-            let volume = volumes::create(&engine, name)?;
+        VolumeCommand::Create {
+            labels,
+            driver,
+            options,
+            name,
+        } => {
+            volumes::check_driver(Some(driver), !options.is_empty())?;
+            let labels = labels.iter().cloned().collect();
+            let volume = volumes::create_with(&engine, name.as_deref(), &labels)?;
             writeln!(std::io::stdout().lock(), "{}", volume.name)?;
         }
-        VolumeCommand::Ls => {
-            let rows: Vec<Vec<String>> = volumes::list(&engine)?
-                .into_iter()
-                .map(|volume| vec![volume.name, volume.data.display().to_string()])
-                .collect();
-            table(
-                &mut std::io::stdout().lock(),
-                &["VOLUME", "MOUNTPOINT"],
-                &rows,
-            )?;
+        VolumeCommand::Ls(args) => {
+            use shipyard_engine::docker::filters::{Given, VolumeFilters};
+            let filters =
+                VolumeFilters::parse(Given::from_pairs(args.list.filter.iter().cloned()))?;
+            let listed = shipyard_engine::docker::list_volumes_where(&engine, &filters)?;
+            let rows: Vec<VolumeRow> = listed.volumes.iter().map(VolumeRow::from).collect();
+            crate::format::print(&args.list, rows::VOLUMES_TABLE, &rows)?;
         }
-        VolumeCommand::Inspect { name } => {
-            let volume = volumes::inspect(&engine, name)?;
-            let mut out = std::io::stdout().lock();
-            writeln!(out, "{:<12} {}", "Name:", volume.name)?;
-            writeln!(out, "{:<12} {}", "Mountpoint:", volume.data.display())?;
+        VolumeCommand::Inspect { names, shown } => {
+            return crate::output::shown(names, shown.format.as_deref(), |name| {
+                Ok(serde_json::to_value(
+                    shipyard_engine::docker::inspect_volume(&engine, name)?,
+                )?)
+            });
         }
         VolumeCommand::Rm { names } => {
             return Ok(each(names, |name| {
@@ -81,7 +86,7 @@ fn prune(force: bool) -> Result<ExitCode> {
     drop(out);
     let mut code = ExitCode::SUCCESS;
     for err in &pruned.failed {
-        code = report(err, EXIT_ENGINE_ERROR);
+        code = report(err, EXIT_FAILURE);
     }
     Ok(code)
 }

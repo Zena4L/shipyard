@@ -10,6 +10,8 @@ mod channel;
 mod child;
 #[cfg(target_os = "linux")]
 mod clone;
+#[cfg(target_os = "linux")]
+mod enterer;
 mod env;
 #[cfg(target_os = "linux")]
 mod exec;
@@ -23,6 +25,8 @@ mod init;
 mod internal;
 #[cfg(target_os = "linux")]
 pub(crate) mod join;
+#[cfg(target_os = "linux")]
+mod joins;
 #[cfg(target_os = "linux")]
 mod network;
 pub mod passed;

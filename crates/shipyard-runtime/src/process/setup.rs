@@ -190,6 +190,9 @@ pub(crate) struct RootSetup {
     /// An overlay real root made already (`--uidmap`: see `spawn.rs`), to
     /// attach instead: the detached mount's descriptor, inherited.
     attach: Option<RawFd>,
+    /// The mount namespace of the container whose IPC namespace it joins,
+    /// inherited: its `/dev/shm` is cloned there and attached here.
+    pub(crate) shm_mount_ns: Option<RawFd>,
 }
 
 /// The overlay layers to mount as the root, serialized for the init.
@@ -256,6 +259,9 @@ pub(crate) struct MountSetup {
     source: Option<Vec<u8>>,
     /// A bind with the mounts below its source.
     pub(crate) recursive: bool,
+    /// A made source's directory ([`MountKind::Bind`]'s `made_below`).
+    #[serde(default)]
+    made_below: Option<Vec<u8>>,
     pub(crate) read_only: bool,
     /// `nosuid`, `nodev` and `noexec`, as `MsFlags` bits.
     restrictions: u64,
@@ -264,11 +270,19 @@ pub(crate) struct MountSetup {
 
 impl MountSetup {
     fn new(mount: &Mount) -> Self {
-        let (source, recursive) = match &mount.kind {
-            MountKind::Bind { source, recursive } => {
-                (Some(source.as_os_str().as_bytes().to_vec()), *recursive)
-            }
-            MountKind::Tmpfs => (None, false),
+        let (source, recursive, made_below) = match &mount.kind {
+            MountKind::Bind {
+                source,
+                recursive,
+                made_below,
+            } => (
+                Some(source.as_os_str().as_bytes().to_vec()),
+                *recursive,
+                made_below
+                    .as_ref()
+                    .map(|dir| dir.as_os_str().as_bytes().to_vec()),
+            ),
+            MountKind::Tmpfs => (None, false, None),
         };
         let restrictions = [
             (MountFlag::NoSuid, MsFlags::MS_NOSUID),
@@ -282,6 +296,7 @@ impl MountSetup {
             destination: mount.destination.as_os_str().as_bytes().to_vec(),
             source,
             recursive,
+            made_below,
             read_only: mount.has(MountFlag::ReadOnly),
             restrictions: restrictions.bits(),
             data: mount.data.clone(),
@@ -296,6 +311,11 @@ impl MountSetup {
     /// The host path bound, if it's a bind.
     pub(crate) fn source(&self) -> Option<&Path> {
         self.source.as_deref().map(as_path)
+    }
+
+    /// The directory a made source is below, if it's one.
+    pub(crate) fn made_below(&self) -> Option<&Path> {
+        self.made_below.as_deref().map(as_path)
     }
 
     /// `nosuid`, `nodev` and `noexec`, as asked.
@@ -340,6 +360,7 @@ impl RootSetup {
             order: root.mount_order(),
             devices: devices.iter().map(DeviceSetup::new).collect(),
             attach,
+            shm_mount_ns: None,
             overlay: root
                 .overlay
                 .as_ref()
@@ -498,13 +519,15 @@ impl SpecSetup {
 
 /// The descriptors the clean image inherits besides its own three (setup,
 /// status, report): the gate's FIFOs, the hooks pipe, an overlay to attach,
-/// the terminal's socket, and what's passed on to the command. The one
+/// the mount namespace whose `/dev/shm` is shared, the terminal's socket,
+/// and what's passed on to the command. The one
 /// list: the parent clears their close-on-exec flag for the re-exec
 /// (`plan.rs`), and the clean image sets it again (`init.rs`).
 pub(crate) fn inherited_fds(
     gate: Option<super::spawn::Gate>,
     hooks: Option<RawFd>,
     overlay: Option<RawFd>,
+    shm_mount_ns: Option<RawFd>,
     terminal: Option<RawFd>,
     passed: &[RawFd],
 ) -> Vec<RawFd> {
@@ -512,6 +535,7 @@ pub(crate) fn inherited_fds(
         .flat_map(super::spawn::Gate::fds)
         .chain(hooks)
         .chain(overlay)
+        .chain(shm_mount_ns)
         .chain(terminal)
         .chain(passed.iter().copied())
         .collect()
@@ -530,6 +554,7 @@ impl Setup {
             self.gate,
             self.hooks.as_ref().map(|hooks| hooks.pipe),
             self.root.as_ref().and_then(RootSetup::attach),
+            self.root.as_ref().and_then(|root| root.shm_mount_ns),
             self.terminal.as_ref().map(|terminal| terminal.socket),
             &passed,
         )
@@ -574,11 +599,11 @@ impl Setup {
             root: isolation.root.as_ref().map(|root| {
                 RootSetup::new(
                     root,
-                    isolation.has(Namespace::Ipc),
+                    isolation.mounts_mqueue(),
                     isolation.id_maps.as_ref(),
-                    // A user namespace owns the network namespace made in
-                    // the same clone.
-                    if isolation.id_maps.is_none() || isolation.makes_network_namespace() {
+                    // Without a user namespace, `/sys` is ours to mount;
+                    // in one, only for a network namespace it owns.
+                    if isolation.id_maps.is_none() || isolation.user_namespace_owns_network() {
                         SysSetup::Own
                     } else {
                         SysSetup::HostBind

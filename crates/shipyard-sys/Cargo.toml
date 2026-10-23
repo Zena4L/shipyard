@@ -13,6 +13,9 @@ publish.workspace = true
 # `openat`, `renameat`, `fstat`, `fsync` relative to a directory descriptor.
 nix.workspace = true
 libc.workspace = true
+# Versioned JSON documents (`versioned`).
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `pidfd_open` (nix has none). Its `pidfd_send_signal` can't send signal 0 or

@@ -13,6 +13,7 @@
     reason = "test support: a panic is a test failure with a clear message"
 )]
 
+pub mod api;
 pub mod bundle;
 #[cfg(target_os = "linux")]
 pub mod console;
@@ -32,6 +33,19 @@ use std::time::{Duration, Instant};
 
 /// The longest any one shipyard run in a test may take.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits (up to `bound`) until `condition` holds, looking every 50 ms.
+///
+/// # Panics
+///
+/// It didn't hold in time (`what` says what was waited for).
+pub fn eventually(bound: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + bound;
+    while !condition() {
+        assert!(Instant::now() < deadline, "{what}: not in {bound:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// The exit code for a death by `signal`.
 #[must_use]
@@ -103,6 +117,13 @@ fn resolve(dir: Option<&std::path::Path>, compiled: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+/// Whether a volume's `name` is an anonymous one's (64 hex digits, as
+/// Shipyard and Docker name them).
+#[must_use]
+pub fn is_anonymous_volume(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Whether a reference tool the differential tests compare Shipyard with
 /// (`ip`, `nft`, `dig`) is installed. When not, the test should say so and
 /// return; with `SHIPYARD_TEST_TOOLS=required` (CI, `test-linux.sh`, where
@@ -153,19 +174,25 @@ impl Shipyard {
     }
 
     /// `shipyard ARGS…`, started in a new session with no controlling
-    /// terminal, so it behaves the same whether the tests run from a terminal
-    /// or in CI.
+    /// terminal, and SIGINT and SIGQUIT as a terminal gives them, so it
+    /// behaves the same whether the tests run from a terminal, in CI, or from
+    /// a shell's background job (`… &`, which starts them ignored: F131, a
+    /// test's SIGINT never seen). A test that wants them ignored says so
+    /// ([`Shipyard::command_with`]'s setup runs after).
     #[must_use]
     pub fn command(self, args: &[&str]) -> Command {
         let mut command = Command::new(self.path());
         command.args(for_this_kernel(args));
         with_container_places(&mut command);
-        // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
+        // SAFETY: `setsid` and `signal` are async-signal-safe, as `pre_exec`
+        // requires.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
                 Ok(())
             });
         }

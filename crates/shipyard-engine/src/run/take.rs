@@ -271,15 +271,18 @@ pub(super) fn reconcile(
             Some(true) => {
                 // Settled here only if its clean-up didn't (killed before
                 // it wrote the record): its end is said here, then.
-                let mut settled = false;
+                // Or its end recorded but not said (F88: its clean-up
+                // killed between the two): said here too.
+                let mut to_say = false;
                 let record = containers::update(engine, id, |record| {
-                    settled = record.exit.is_none();
+                    to_say = record.exit.is_none() || containers::end_unsaid(engine, record);
                     record.finished = exit.finished.or_else(|| Some(SystemTime::now()));
                     record.exit = Some(Exit::from(&exit));
                 })?;
-                if settled {
+                if to_say {
                     crate::events::container_ended(engine, &record);
                 }
+                containers::end_said(engine, id);
                 // It ran: what it kept aside is no start's to restore now.
                 containers::forget_previous_start(engine, id);
             }

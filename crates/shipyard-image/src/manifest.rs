@@ -351,6 +351,24 @@ pub struct ImageConfig {
     pub diff_ids: Vec<Digest>,
     /// The default process configuration baked into the image.
     pub config: RuntimeConfig,
+    /// What it says of itself, for Docker's inspect: when and by whom it
+    /// was built.
+    pub about: ImageAbout,
+}
+
+/// What an image config says of the image itself (Docker's inspect shows
+/// it; nothing runs by it). Each as the config has it: free text, from the
+/// registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageAbout {
+    /// When it was built (RFC 3339), if it says.
+    pub created: Option<String>,
+    /// Its author, if it says.
+    pub author: Option<String>,
+    /// The Docker version that built it, if it says.
+    pub docker_version: Option<String>,
+    /// Its CPU variant (`v8`), if it says.
+    pub variant: Option<String>,
 }
 
 /// The runtime defaults from an image config's `config` object: what the
@@ -376,6 +394,13 @@ pub struct RuntimeConfig {
     /// The shell a shell-form health check runs with (`Shell`, a
     /// Dockerfile's `SHELL`), if it sets one: `["/bin/bash", "-c"]`.
     pub shell: Vec<String>,
+    /// Its labels (`Labels`, a Dockerfile's `LABEL`), sorted by key.
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// The paths it declares volumes at (`Volumes`' keys, a Dockerfile's
+    /// `VOLUME`), sorted.
+    pub volumes: Vec<String>,
+    /// The signal that stops it (`StopSignal`), if it sets one.
+    pub stop_signal: Option<String>,
 }
 
 /// An image's health check, as its config says it. A zero means Docker's
@@ -470,6 +495,14 @@ struct RawConfig {
     rootfs: RawRootfs,
     #[serde(default)]
     config: Option<RawRuntimeConfig>,
+    #[serde(default)]
+    created: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    docker_version: Option<String>,
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 /// The `rootfs` object of an image config.
@@ -502,6 +535,13 @@ struct RawRuntimeConfig {
     healthcheck: Option<RawHealthcheck>,
     #[serde(rename = "Shell", default, deserialize_with = "null_is_empty")]
     shell: Vec<String>,
+    #[serde(rename = "Labels", default)]
+    labels: Option<std::collections::BTreeMap<String, String>>,
+    /// Like `ExposedPorts`: its keys are the paths.
+    #[serde(rename = "Volumes", default)]
+    volumes: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(rename = "StopSignal", default)]
+    stop_signal: Option<String>,
 }
 
 impl ImageConfig {
@@ -532,6 +572,7 @@ impl ImageConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let runtime = raw.config.unwrap_or_default();
+        let given = |text: Option<String>| text.filter(|text| !text.is_empty());
         Ok(Self {
             architecture: raw.architecture,
             os: raw.os,
@@ -548,6 +589,18 @@ impl ImageConfig {
                     .unwrap_or_default(),
                 healthcheck: runtime.healthcheck.and_then(RawHealthcheck::read),
                 shell: runtime.shell,
+                labels: runtime.labels.unwrap_or_default(),
+                volumes: runtime
+                    .volumes
+                    .map(|volumes| volumes.into_keys().collect())
+                    .unwrap_or_default(),
+                stop_signal: given(runtime.stop_signal),
+            },
+            about: ImageAbout {
+                created: given(raw.created),
+                author: given(raw.author),
+                docker_version: given(raw.docker_version),
+                variant: given(raw.variant),
             },
         })
     }
@@ -751,6 +804,50 @@ mod tests {
         assert_eq!(config.config.working_dir.as_deref(), Some("/work"));
         assert_eq!(config.config.user.as_deref(), Some("1000:1000"));
         assert_eq!(config.config.exposed_ports, ["53/udp", "8080/tcp"]);
+    }
+
+    /// What Docker's inspect shows of an image: its labels, volumes, stop
+    /// signal, and what it says of itself; nulls and empty strings as none.
+    #[test]
+    fn an_image_config_says_what_inspect_shows() {
+        let json = format!(
+            r#"{{
+                "architecture": "arm64", "variant": "v8", "os": "linux",
+                "created": "2026-01-02T03:04:05.123456789Z", "author": "someone",
+                "docker_version": "",
+                "rootfs": {{ "type": "layers", "diff_ids": ["{D}"] }},
+                "config": {{
+                    "Labels": {{ "b": "2", "a": "1" }},
+                    "Volumes": {{ "/data": {{}}, "/cache": {{}} }},
+                    "StopSignal": "SIGQUIT"
+                }}
+            }}"#
+        );
+        let config = ImageConfig::parse(json.as_bytes()).unwrap();
+        let labels: Vec<_> = config.config.labels.iter().collect();
+        assert_eq!(
+            labels,
+            [
+                (&"a".to_owned(), &"1".to_owned()),
+                (&"b".to_owned(), &"2".to_owned())
+            ]
+        );
+        assert_eq!(config.config.volumes, ["/cache", "/data"]);
+        assert_eq!(config.config.stop_signal.as_deref(), Some("SIGQUIT"));
+        assert_eq!(
+            config.about,
+            ImageAbout {
+                created: Some("2026-01-02T03:04:05.123456789Z".to_owned()),
+                author: Some("someone".to_owned()),
+                docker_version: None,
+                variant: Some("v8".to_owned()),
+            }
+        );
+        let bare = r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},
+            "config":{"Labels":null,"Volumes":null}}"#;
+        let bare = ImageConfig::parse(bare.as_bytes()).unwrap();
+        assert!(bare.config.labels.is_empty() && bare.config.volumes.is_empty());
+        assert_eq!(bare.about, ImageAbout::default());
     }
 
     /// An image's health check, as Docker writes it (nanoseconds); `NONE`

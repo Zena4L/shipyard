@@ -32,6 +32,23 @@ impl Index {
         in_use: &BTreeSet<String>,
         remove_layers: &mut LayerRemover<'_>,
     ) -> Result<Vec<String>, IndexError> {
+        self.remove_all(&[reference.to_owned()], held, in_use, remove_layers)
+    }
+
+    /// [`remove`](Self::remove) for several references at once: all of
+    /// them or none (one that isn't there: none is), the index saved once,
+    /// the garbage collected once.
+    ///
+    /// # Errors
+    ///
+    /// As [`remove`](Self::remove).
+    pub fn remove_all(
+        &mut self,
+        references: &[String],
+        held: &StoreLock,
+        in_use: &BTreeSet<String>,
+        remove_layers: &mut LayerRemover<'_>,
+    ) -> Result<Vec<String>, IndexError> {
         debug_assert_eq!(
             held.mode(),
             LockMode::Exclusive,
@@ -40,8 +57,13 @@ impl Index {
         self.refuse_after_corruption()?;
         // A container's pin is never removed by reference (`rmi`): only by
         // its container's removal.
-        if reference.starts_with(PIN_PREFIX) || self.images.remove(reference).is_none() {
-            return Err(IndexError::NoSuchImage(reference.to_owned()));
+        if let Some(missing) = references.iter().find(|reference| {
+            reference.starts_with(PIN_PREFIX) || !self.images.contains_key(reference.as_str())
+        }) {
+            return Err(IndexError::NoSuchImage(missing.clone()));
+        }
+        for reference in references {
+            self.images.remove(reference);
         }
         self.save()?;
         self.collect_garbage(in_use, remove_layers)

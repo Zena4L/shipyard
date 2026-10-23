@@ -1,0 +1,38 @@
+[package]
+name = "shipyard-api"
+description = "Shipyard's Docker Engine API: a subset, served over a UNIX socket (stage 11, D25)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+shipyard-engine.workspace = true
+shipyard-runtime.workspace = true
+shipyard-network.workspace = true
+shipyard-sys.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+nix.workspace = true
+tracing.workspace = true
+percent-encoding.workspace = true
+# Docker's `X-Registry-Auth` (base64url of its credentials JSON).
+base64.workspace = true
+# A `docker cp`'s gzip archive (step 11.2c3a).
+flate2.workspace = true
+
+[dev-dependencies]
+shipyard-test-support.workspace = true
+
+[lints]
+workspace = true

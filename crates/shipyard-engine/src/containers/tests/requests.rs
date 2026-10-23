@@ -154,6 +154,8 @@ fn a_request_is_kept_whole() {
         default_mode: _,
         detached: _,
         container: _,
+        joined: _,
+        ipc: _,
         caller_env: _,
         streams: _,
         env: _,
@@ -168,6 +170,7 @@ fn a_request_is_kept_whole() {
         stop_timeout: _,
         restart: _,
         health: _,
+        labels: _,
         no_isolation: _,
         hostname: _,
         domainname: _,
@@ -184,6 +187,11 @@ fn a_request_is_kept_whole() {
         dns_option: _,
         publish: _,
         publish_all: _,
+        expose: _,
+        tmpfs: _,
+        make_sources: _,
+        made_sources: _,
+        cidfile: _,
         rootfs: _,
         image: _,
         entrypoint: _,
@@ -252,9 +260,14 @@ fn a_request_is_kept_whole() {
     same!(volume);
     same!(command);
     assert_eq!(Config::from_request(&back).unwrap(), config);
-    // And through JSON.
-    let json = serde_json::to_string(&config).unwrap();
-    assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), config);
+    // And through the record's form, and its JSON: every field kept
+    // (`StoredConfig` names each one, so a field added to `Config` fails
+    // to build until the record keeps it).
+    let stored = crate::containers::StoredConfig::from(&config);
+    let json = serde_json::to_string(&stored).unwrap();
+    let read: crate::containers::StoredConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(read, stored);
+    assert_eq!(Config::try_from(read).unwrap(), config);
     // The bundle and the root filesystem, which can't go with an image.
     let mut bundle = RunRequest::default();
     bundle.bundle = Some("/b".into());

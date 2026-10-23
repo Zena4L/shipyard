@@ -353,3 +353,89 @@ fn filters_narrow_as_dockers() {
         assert_eq!(error.kind(), ErrorKind::InvalidRequest, "{bad:?}");
     }
 }
+
+/// `label=KEY` and `label=KEY=VALUE` match an event's attributes (a
+/// container's labels are there), every one asked for; an event without
+/// them passes none.
+#[test]
+fn events_are_filtered_by_label() {
+    let labelled = event()
+        .with("com.docker.compose.project", "proj")
+        .with("com.docker.compose.service", "web");
+    let passes = |given: &[&str], event: &Event| {
+        let given: Vec<String> = given.iter().map(|&text| text.to_owned()).collect();
+        Filters::parse(&given).unwrap().pass(event)
+    };
+    assert!(passes(&["label=com.docker.compose.project"], &labelled));
+    assert!(passes(
+        &["label=com.docker.compose.project=proj"],
+        &labelled
+    ));
+    assert!(passes(
+        &[
+            "label=com.docker.compose.project=proj",
+            "label=com.docker.compose.service=web"
+        ],
+        &labelled
+    ));
+    assert!(!passes(
+        &["label=com.docker.compose.project=other"],
+        &labelled
+    ));
+    assert!(
+        !passes(
+            &[
+                "label=com.docker.compose.project=proj",
+                "label=com.docker.compose.service=db"
+            ],
+            &labelled
+        ),
+        "every label asked for"
+    );
+    assert!(
+        !passes(&["label=com.docker.compose.project"], &event()),
+        "no labels"
+    );
+}
+
+/// A container's labels in its events: compose's first, each whole, within
+/// a budget that leaves the line room for the engine's own attributes: many
+/// long labels never crowd out compose's, nor cut a value.
+#[test]
+fn a_container_s_labels_fit_its_events() {
+    use std::collections::BTreeMap;
+    let mut labels: BTreeMap<String, String> = (0..200)
+        .map(|n| (format!("aaaa.long.label.key.number.{n:04}"), "v".repeat(20)))
+        .collect();
+    labels.insert("com.docker.compose.project".to_owned(), "proj".to_owned());
+    labels.insert("com.docker.compose.service".to_owned(), "web".to_owned());
+    let kept = super::emit::event_labels(&labels);
+    assert!(
+        kept.contains(&("com.docker.compose.project", "proj")),
+        "{kept:?}"
+    );
+    assert!(
+        kept.contains(&("com.docker.compose.service", "web")),
+        "{kept:?}"
+    );
+    assert!(kept.len() < labels.len(), "not all fit");
+    let bytes: usize = kept
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + 6)
+        .sum();
+    assert!(bytes <= 2048, "{bytes}");
+    let line = kept
+        .iter()
+        .fold(event(), |event, (key, value)| event.with(key, value))
+        .to_line();
+    assert!(line.len() <= MAX_LINE, "{}", line.len());
+    assert!(
+        line.contains(r#""name":"web""#),
+        "the engine's own kept whole: {line}"
+    );
+    assert!(
+        kept.iter()
+            .all(|(_, value)| value.len() == 20 || value.len() < 8),
+        "each label whole"
+    );
+}

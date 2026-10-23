@@ -50,7 +50,7 @@ fn shipyard(store: &Scratch, args: &[&str]) -> std::process::Output {
 fn an_error_never_sends_a_terminal_escape() {
     let store = Scratch::new();
     let output = shipyard(&store, &["rmi", "a\x1b]0;owned\x07b"]);
-    assert_eq!(output.status.code(), Some(125), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.stderr.contains(&0x1b), "{stderr:?}");
     assert!(stderr.contains("a\\u{1b}]0;owned\\u{7}b"), "{stderr}");
@@ -126,11 +126,10 @@ fn rootless_layers_belong_to_subordinate_ids_and_are_removed() {
         "the image's user {caller}, shifted into the caller's range"
     );
 
-    let listed = shipyard(&store, &["images"]);
+    let listed = shipyard(&store, &["images", "--format", "{{.Repository}}:{{.Tag}}"]);
     let reference = String::from_utf8_lossy(&listed.stdout)
         .lines()
-        .nth(1)
-        .and_then(|line| line.split_whitespace().next())
+        .next()
         .map(str::to_owned)
         .expect("the image is listed");
     let removed = shipyard(&store, &["rmi", &reference]);
@@ -335,7 +334,7 @@ fn a_prune_during_a_pull_waits_for_it() {
         thread::sleep(std::time::Duration::from_millis(20));
     }
     let prune = Command::new(SHIPYARD.path())
-        .args(["image", "prune"])
+        .args(["image", "prune", "-f"])
         .env("SHIPYARD_IMAGE_STORE", store.store())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -364,12 +363,11 @@ fn an_image_in_use_is_kept_until_its_container_ends() {
     let Some((_serving, image, store)) = ready() else {
         return;
     };
-    let listed = shipyard(&store, &["images"]);
+    let listed = shipyard(&store, &["images", "--format", "{{.Repository}}:{{.Tag}}"]);
     let listed = String::from_utf8_lossy(&listed.stdout);
     let reference = listed
         .lines()
-        .nth(1)
-        .and_then(|line| line.split_whitespace().next())
+        .next()
         .unwrap_or_else(|| panic!("no image listed: {listed}"))
         .to_owned();
     let mut running = start_sleeping(&store, &image, "3", 1);
@@ -384,7 +382,7 @@ fn an_image_in_use_is_kept_until_its_container_ends() {
     );
     assert_eq!(layers(&store).len(), 1, "kept while the container runs");
     assert!(running.wait().unwrap().success(), "the container ran on");
-    assert!(shipyard(&store, &["image", "prune"]).status.success());
+    assert!(shipyard(&store, &["image", "prune", "-f"]).status.success());
     assert!(layers(&store).is_empty(), "collected once it ended");
 }
 
@@ -410,7 +408,8 @@ fn a_killed_runs_container_runs_on_until_removed() {
     }
     let init = |store: &Scratch| {
         let shown: serde_json::Value =
-            serde_json::from_slice(&shipyard(store, &["inspect", &name]).stdout).unwrap();
+            serde_json::from_slice(&shipyard(store, &["inspect", "--shipyard", &name]).stdout)
+                .unwrap();
         shown[0]["state"]["pid"].as_i64()
     };
     let before = init(&store).expect("its init's PID");
@@ -449,9 +448,11 @@ fn a_pulled_image_runs_without_its_registry() {
         String::from_utf8_lossy(&pulled.stderr)
     );
     assert!(String::from_utf8_lossy(&pulled.stdout).starts_with("Digest: sha256:"));
-    let listed = shipyard(&store, &["images"]);
+    let listed = shipyard(&store, &["images", "--format", "{{.Repository}}:{{.Tag}}"]);
     assert!(
-        String::from_utf8_lossy(&listed.stdout).contains(&format!("{image}:latest")),
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .any(|line| line == format!("{image}:latest")),
         "{}",
         String::from_utf8_lossy(&listed.stdout)
     );
@@ -576,7 +577,7 @@ fn a_volume_in_use_is_never_removed() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let refused = shipyard(&store, &["volume", "rm", "keep"]);
-    assert_eq!(refused.status.code(), Some(125));
+    assert_eq!(refused.status.code(), Some(1));
     // By the container's name (a foreground run with an image has a
     // record).
     assert!(
@@ -639,7 +640,7 @@ fn a_volume_a_rootless_container_wrote_as_another_user_is_removed() {
 }
 
 /// `rmi` reports an image it can't remove and goes on with the rest,
-/// exiting 125.
+/// exiting 1.
 #[test]
 fn rmi_goes_on_past_an_image_it_cant_remove() {
     let Some((_serving, image, store)) = ready() else {
@@ -647,7 +648,7 @@ fn rmi_goes_on_past_an_image_it_cant_remove() {
     };
     let removed = shipyard(&store, &["rmi", "nosuch", &image]);
     let (stdout, stderr) = text(&removed);
-    assert_eq!(removed.status.code(), Some(125), "{stderr}");
+    assert_eq!(removed.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("nosuch"), "{stderr}");
     assert!(stdout.contains(&format!("Untagged: {image}")), "{stdout}");
     assert_eq!(text(&shipyard(&store, &["images"])).0.lines().count(), 1);
@@ -671,10 +672,19 @@ fn system_df_counts_images_containers_and_volumes() {
         .lines()
         .map(|line| line.split_whitespace().collect())
         .collect();
-    assert_eq!(rows[0], ["TYPE", "COUNT", "SIZE", "RECLAIMABLE"]);
-    assert_eq!((rows[1][0], rows[1][1]), ("Images", "1"), "{stdout}");
-    assert_eq!((rows[2][0], rows[2][1]), ("Containers", "0"), "{stdout}");
-    assert_eq!((rows[3][0], rows[3][1]), ("Volumes", "1"), "{stdout}");
+    // Docker's columns (step 11.3c2): how many, how many in use.
+    assert_eq!(rows[0], ["TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE"]);
+    assert_eq!(rows[1][..3], ["Images", "1", "0"], "{stdout}");
+    assert_eq!(rows[2][..3], ["Containers", "0", "0"], "{stdout}");
+    assert_eq!(rows[3][..4], ["Local", "Volumes", "1", "0"], "{stdout}");
+    let formatted = shipyard(
+        &store,
+        &["system", "df", "--format", "{{.Type}}={{.TotalCount}}"],
+    );
+    assert_eq!(
+        text(&formatted).0,
+        "Images=1\nContainers=0\nLocal Volumes=1\n"
+    );
 }
 
 /// A mistake in a flag is found before anything is pulled.
@@ -707,7 +717,7 @@ fn a_bad_flag_costs_no_pull() {
 fn volume_prune_without_a_terminal_needs_force() {
     let store = Scratch::new();
     let pruned = shipyard(&store, &["volume", "prune"]);
-    assert_eq!(pruned.status.code(), Some(125));
+    assert_eq!(pruned.status.code(), Some(1));
     assert!(text(&pruned).1.contains("-f"), "{}", text(&pruned).1);
 }
 
@@ -725,7 +735,7 @@ fn volumes_and_entrypoints_as_docker_has_them() {
     );
     let removed = shipyard(&store, &["volume", "rm", "missing", "a"]);
     let (stdout, stderr) = text(&removed);
-    assert_eq!(removed.status.code(), Some(125), "{stderr}");
+    assert_eq!(removed.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("no such volume: missing"), "{stderr}");
     assert_eq!(stdout.trim(), "a", "the rest still removed");
 
@@ -881,7 +891,7 @@ fn an_image_with_uidmap_belongs_to_the_containers_root() {
         layers(&store)
     );
     assert!(shipyard(&store, &["rmi", &image]).status.success());
-    assert!(shipyard(&store, &["image", "prune"]).status.success());
+    assert!(shipyard(&store, &["image", "prune", "-f"]).status.success());
     assert!(layers(&store).is_empty(), "left: {:?}", layers(&store));
 
     // Maps that leave the container's root out: refused, nothing extracted.

@@ -26,7 +26,10 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > container back when it ends, and after a reboot with the [systemd
 > units](https://github.com/Zena4L/shipyard/tree/main/contrib/systemd); **health
 > checks** (`--health-cmd`, or the image's own) show in `ps`; and `shipyard events`
-> tells what happened. 
+> tells what happened. **Docker's own clients** drive it: Shipyard serves a subset of
+> Docker's Engine API ([API](api.md)), so the `docker` CLI, `docker compose`
+> ([Compose](compose.md)) and Testcontainers work against it, root's and rootless, and
+> `shipyard` takes Docker's everyday commands and flags itself.
 > It isn't a hardened boundary yet. It starts the command the way a container
 > runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
@@ -41,10 +44,12 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | [macOS](macos.md) | Shipyard on a Mac: its Linux VM, your files, input, signals and variables |
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
 | [Containers](containers.md) | `run -d`, `create`, `start`, `ps`, `inspect`, `rm`: containers that outlive the command, by name, ID or serial; their kept files |
-| [Images](images.md) | `shipyard pull`, `run IMAGE`, `images`, `rmi`, `image prune`, `system df`: pulling, private registries and the local store |
+| [Images](images.md) | `shipyard pull`, `run IMAGE`, `images`, `rmi`, `image prune`, `system df`, `system prune`: pulling, private registries and the local store |
 | [Networking](networking.md) | `--network`, `-p`, `--name`, `shipyard network …`: networks, addresses, names, published ports, other firewalls, the hostname and the `/etc` files |
+| [The Docker API](api.md) | `shipyard system service`: Docker's Engine API (a subset) on a socket, for Docker's own clients (`DOCKER_HOST`); the systemd units that start it |
+| [Compose](compose.md) | `shipyard compose`: Docker's own `docker compose` against Shipyard, what works and what doesn't yet |
 | [Events](events.md) | `shipyard events`: what happens to containers, images, volumes and networks, as it happens or since a time, filtered |
-| [Volumes](volumes.md) | `shipyard volume …` and `--volume`: named volumes and bind mounts |
+| [Volumes](volumes.md) | `shipyard volume …` and `--volume`: named and anonymous volumes, bind mounts, tmpfs |
 | [OCI bundles](bundles.md) | `shipyard run --bundle`: a container described by a `config.json`, what's supported, refused and ignored |
 | [The OCI runtime](runtime.md) | `shipyard-runtime`, as `runc`: a container's life one step at a time (`create`, `start`, `state`, `kill`, `delete`), its terminals, logs, `attach`, `exec`, `cp`, passing descriptors, and its cgroup (`pause`, `update`, `ps`, `events`) |
 | [Runtime reference](runtime-cli.md) | Every `shipyard-runtime` command and flag, generated from the binary itself |
@@ -199,13 +204,21 @@ hello from PID 2
 
 PID 2: the command sees only its own processes, under Shipyard's small init (PID 1).
 
+## What it is: `version` and `info`
+
+`shipyard version` says what Shipyard is, as Docker's `version` does: a `Client`
+part (its version, the API version it speaks, 1.43, its revision, its OS and
+architecture) and a `Server` part (the engine: the same, with the oldest API version
+it takes, 1.24). `shipyard info` says what it has and what its host is: its
+containers (running, paused, stopped), images, storage and logging drivers, cgroup
+driver and version, security options, the kernel, the distribution, CPUs, memory and
+the host's name. Both take `--format`: a Go template over Docker's objects
+(`version --format '{{.Server.APIVersion}}'`, `info --format '{{.NCPU}}'`), or
+`json`. On a Mac both describe the VM's `shipyard` (`shipyard -v` is the Mac's own).
+
 ## Limitations
 
-- **No `stats`, `top`, `pause` or image commands by name yet:** `shipyard stats`,
-  `top`, `pause`/`unpause`, `update` of a running container's limits, `tag`, image
-  `inspect`/`history`/`save`/`load` and `--mount` come next. `shipyard-runtime` has
-  live stats (`events --stats`), `ps`, `pause`/`resume` and `update` by a container's
-  runtime ID.
+- **No image `history`, `save` or `load` yet.**
 - **macOS is new:** commands run in Shipyard's Linux VM (on a terminal there when you're
   on one, published TCP ports on your Mac's `localhost`, the VM stopping by itself when
   idle); the guest is built from the source tree, and UDP ports aren't forwarded yet
@@ -217,8 +230,10 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
   host can keep root's containers from the outside. Shipyard warns, with the exact
   fix, but never changes another program's firewall
   (see [Other firewalls](networking.md#other-firewalls)).
-- **No default limits on processes or memory:** as Docker, a container can use what
-  the host has unless it's given `--pids-limit` and `--memory`.
+- **No default limit on memory:** as Docker, a container can use what the host has
+  unless it's given `--memory`. Its processes are limited to 2,048 by default (unlike
+  Docker), where the `pids` controller reaches it (see [Running
+  commands](run.md#memory-cpu-and-io-limits)).
 - **The default network reaches the host and the cloud's metadata:** `bridge` can't
   have `--isolate-host`; put containers that mustn't on a network of your own made
   with it (see [Networking](networking.md#networks)).
@@ -227,9 +242,10 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
   them (`shipyard doctor` says how). On a full disk, a container's end is recorded,
   and its policy applied, once there's room again
   (see [Containers](containers.md#after-a-reboot)).
-- **Not every Docker flag yet:** no `-v` (use `--volume`), `-h`, `--env-file`, `-l`,
-  `logs -n` (use `--tail`) or `inspect -f`; `inspect` and `images` print Shipyard's
-  own fields, not Docker's.
+- **Not every Docker flag yet** (see each page's limits). `inspect` prints Docker's shape, but not all its fields yet: `ShmSize`, the
+  image's manifest descriptor and some resource fields are left out. Its `/etc` files'
+  paths (`ResolvConfPath`, `HostnamePath`, `HostsPath`) are there while it runs, and
+  empty once it has ended (Docker keeps them: Shipyard's go with the run).
 - **Not a hardened security boundary yet:** containers are confined (namespaces,
   capabilities, seccomp, cgroups), but don't run code you wouldn't run as your own
   user. See [SECURITY.md](https://github.com/Zena4L/shipyard/blob/main/SECURITY.md).

@@ -34,6 +34,7 @@ pub(super) fn attach_before_start(
 fn foreground_streams(
     request: &RunRequest,
     detach_keys: Option<shipyard_runtime::attach::DetachKeys>,
+    output: crate::attach::Output,
 ) -> (crate::attach::AttachOptions, Input) {
     use shipyard_runtime::attach::DetachKeys;
     let (stdin, terminal) = (request.streams.interactive, request.streams.tty);
@@ -49,6 +50,7 @@ fn foreground_streams(
         // The container waits for it: a slow reader loses no output, a
         // fast writer no input.
         held: true,
+        output,
     };
     // Its input ends at the caller's end of file, unless it's a
     // terminal's (closing a terminal is a hang-up; its Ctrl-D is a key).
@@ -71,6 +73,7 @@ pub(super) fn attached(
     let super::Foreground {
         sig_proxy,
         detach_keys,
+        output,
     } = options;
     let terminal = request.streams.tty;
     // `-it` needs a terminal to type on (Docker's rule): refused before
@@ -78,7 +81,7 @@ pub(super) fn attached(
     if request.streams.interactive && terminal && !crate::streams::Terminals::detect().stdin {
         return Err(crate::StreamsError::InputNotATerminal.into());
     }
-    let (attaching, input) = foreground_streams(&request, detach_keys);
+    let (attaching, input) = foreground_streams(&request, detach_keys, output);
     // A terminal's window resizes, from the watch (it has SIGWINCH): to
     // the session as a pipe, never to the container as a signal. Made
     // before the container: a failure leaves nothing behind.

@@ -102,6 +102,67 @@ fn the_boot_units_say_what_the_design_needs() {
     }
 }
 
+/// The API's units (contrib/systemd, step 11.2a): the socket where the
+/// engine's `Paths::api_socket` puts it (root's in the runtime's root,
+/// a user's in their runtime directory), its owner's alone (0600, in a
+/// 0700 directory); the service started by it, ending only its own process
+/// (the containers it started run on). Root's and a user's agree but for
+/// the socket's place and their descriptions.
+#[test]
+fn the_api_units_say_what_the_design_needs() {
+    let contrib = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/systemd");
+    let settings = |path: std::path::PathBuf| -> Vec<(String, String)> {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect()
+    };
+    let value = |unit: &[(String, String)], key: &str| -> Vec<String> {
+        unit.iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, value)| value.clone())
+            .collect()
+    };
+    let root = format!("{}/api.sock", shipyard_runtime::container::DEFAULT_ROOT);
+    for (dir, place) in [
+        (contrib.clone(), root.as_str()),
+        (contrib.join("user"), "%t/shipyard/api.sock"),
+    ] {
+        let socket = settings(dir.join("shipyard.socket"));
+        let service = settings(dir.join("shipyard.service"));
+        assert_eq!(value(&socket, "ListenStream"), [place], "{dir:?}");
+        assert_eq!(value(&socket, "SocketMode"), ["0600"], "{dir:?}");
+        assert_eq!(value(&socket, "DirectoryMode"), ["0700"], "{dir:?}");
+        assert_eq!(value(&socket, "WantedBy"), ["sockets.target"], "{dir:?}");
+        assert_eq!(
+            value(&service, "ExecStart"),
+            ["/usr/local/bin/shipyard system service"],
+            "{dir:?}"
+        );
+        assert_eq!(value(&service, "KillMode"), ["process"], "{dir:?}");
+        assert_eq!(value(&service, "Requires"), ["shipyard.socket"], "{dir:?}");
+        assert!(
+            value(&service, "WantedBy").is_empty(),
+            "{dir:?}: started by its socket alone"
+        );
+    }
+    let apart = |unit: Vec<(String, String)>| -> Vec<(String, String)> {
+        unit.into_iter()
+            .filter(|(key, _)| !["ListenStream", "Description"].contains(&key.as_str()))
+            .collect()
+    };
+    for name in ["shipyard.socket", "shipyard.service"] {
+        assert_eq!(
+            apart(settings(contrib.join(name))),
+            apart(settings(contrib.join("user").join(name))),
+            "{name}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::path::{Path, PathBuf};
@@ -112,13 +173,57 @@ mod linux {
 
     use super::super::Level;
     use super::super::linux::{
-        BootUnits, ProbedAt, StopLimit, boot_stores_check, boot_unit_check, controllers_check,
-        firewall_check, held_off_check, kill_user_processes, left_by_gone, linger_check,
-        logout_check, mounts, overlay_check, parse_timespan, pasta_check, stop_timeout_check,
-        sudo_logout_check, user_namespaces,
+        ApiSocket, BootUnits, ProbedAt, StopLimit, api_socket_check, boot_stores_check,
+        boot_unit_check, controllers_check, firewall_check, held_off_check, kill_user_processes,
+        left_by_gone, linger_check, logout_check, mounts, overlay_check, parse_timespan,
+        pasta_check, stop_timeout_check, sudo_logout_check, user_namespaces,
     };
     use super::super::probe::{decode, encode};
     use std::time::Duration;
+
+    /// The Docker API's line names where clients find it; it's never a
+    /// limit, but a failed socket unit is said, with the journal to read.
+    #[test]
+    fn the_api_line_says_where_clients_find_it() {
+        let path = Path::new("/run/shipyard/api.sock");
+        let socket = |enabled, failed, served| ApiSocket {
+            enabled,
+            failed,
+            served,
+        };
+        let enabled = api_socket_check(socket(true, false, true), path, false);
+        assert_eq!(enabled.level, Level::Ok);
+        assert!(
+            enabled
+                .text
+                .contains("DOCKER_HOST=unix:///run/shipyard/api.sock"),
+            "{}",
+            enabled.text
+        );
+        let by_hand = api_socket_check(socket(false, false, true), path, false);
+        assert_eq!(by_hand.level, Level::Ok);
+        assert!(
+            by_hand.text.starts_with("served (not by shipyard.socket)"),
+            "{}",
+            by_hand.text
+        );
+        let none = api_socket_check(socket(false, false, false), path, false);
+        assert_eq!(none.level, Level::Ok);
+        assert!(
+            none.text
+                .starts_with("not served at /run/shipyard/api.sock: ")
+                && none.text.contains("enable shipyard.socket"),
+            "{}",
+            none.text
+        );
+        let failed = api_socket_check(socket(true, true, false), path, true);
+        assert_eq!(failed.level, Level::Warn);
+        assert!(
+            failed.text.contains("journalctl --user -u shipyard.socket"),
+            "{}",
+            failed.text
+        );
+    }
 
     /// A refused mount fails doctor, whoever runs it, unless it's a
     /// rootless user namespace's want of privileges (that line's).
@@ -300,6 +405,19 @@ mod linux {
             one.text
         );
         assert!(one.text.ends_with("need it are refused"), "{}", one.text);
+        // F62's default can't be set without `pids`: said.
+        let no_pids = controllers_check(
+            base,
+            &[Controller::Cpu, Controller::Io, Controller::Memory],
+            true,
+        );
+        assert!(
+            no_pids
+                .text
+                .ends_with("refused, and containers get no default process limit"),
+            "{}",
+            no_pids.text
+        );
     }
 
     #[test]

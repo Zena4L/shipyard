@@ -9,6 +9,179 @@ behaviour; each change is listed here).
 
 ### Added
 
+- **`docker rename` through the API** (step 11.6b): `POST /containers/{id}/rename`.
+  `docker compose up` renames the container it recreates (a changed file,
+  `--force-recreate`) once the old one is gone; without it, a recreate stopped half
+  way, leaving the project's container under a temporary name.
+
+- **`docker login` through the API** (step 11.6a2, F118): `POST /auth` checks the
+  credentials against the registry's `/v2/`, as Docker's daemon does, and keeps
+  nothing (the CLI keeps them in its config). A registry's own bearer token
+  (`registrytoken`) is read, first, from `X-Registry-Auth` and from Docker's config,
+  and sent to the registry as it is.
+- **Images say more, as Docker's do** (step 11.6a2, F118): an image pulled through a
+  multi-platform index is named by the index in `RepoDigests` and in a pull's
+  `Digest:` (kept in the store's index; its ID is still its manifest's);
+  `Metadata.LastTagTime` is its last pull or tag.
+- **`network ls -f dangling=true`** (step 11.6a2, F120): the networks no container
+  that's up is on, never a built-in, as Docker's `dangling` filter has them. It, and
+  `network rm`, refuse while a container's record can't be read (it may name the
+  network): `network rm` used to leave such a record out.
+- **`inspect`'s `ResolvConfPath`, `HostnamePath` and `HostsPath`** (step 11.6a2,
+  F121): a container's `/etc` files on the host while it's up.
+
+- **`shipyard vm install` / `uninstall`** (step 11.5b2a): launchd holds Docker's socket
+  on the Mac while the VM is stopped and starts the VM at its first connection, so
+  `docker` works any time and nothing runs until it's used. Once installed, `shipyard`
+  starts the VM through launchd too. `vm status` and `doctor` say whether it's
+  installed, and `doctor` says when the agent runs another binary than this one.
+- **`shipyard compose` on the Mac** (step 11.5b2a): the VM started, then Docker's own
+  `docker compose` against its socket.
+
+- **Docker's API on the Mac** (step 11.5b1): while the VM runs, it serves Docker's API
+  on `docker.sock` in its directory (`~/Library/Application Support/Shipyard/vm/`), and
+  the guest starts its service on the first connection. `docker`, `docker compose` and
+  Testcontainers use Shipyard as a Docker daemon there (`DOCKER_HOST`, or a Docker
+  context of your own). The socket is yours alone; a connection open keeps the VM up.
+
+- **Testcontainers for Rust against the API** (step 11.4b1): an acceptance test
+  (`crates/shipyard-acceptance`, dev-only) runs Testcontainers' everyday calls against
+  `shipyard system service`, rootless and as root.
+
+- **A new volume gets its image's files** (step 11.4a2b, F129): at a container's
+  create, a volume (named or anonymous) still empty is filled with what the image
+  has at its place, owners, modes and links kept, its directory taking the place's
+  owner and mode, as Docker's; one fill of a volume at a time; a failed fill fails
+  the create and is finished by the next. `-v NAME:/path:nocopy`, `--mount
+  …,volume-nocopy` and the API's `NoCopy` ask for none. The API makes a bind's
+  missing host path, as Docker's daemon does (a `Binds` entry, or
+  `BindOptions.CreateMountpoint`: compose's short-syntax binds), at the create and
+  each start (kept in `created.json` v3); `shipyard run -v` still refuses one.
+
+- **Anonymous volumes** (step 11.4a2a): `-v /path`, a `--mount` volume without a
+  source and the image's own `VOLUME`s (each no mount covers) get a new volume at
+  the create, named by 64 hex digits and labelled `com.docker.volume.anonymous`;
+  the API takes `Volumes`, a `Binds` entry `/path` and a `Mounts` volume without a
+  `Source` (they were refused). `rm -v` and the API's `DELETE ?v=1` remove those
+  the container's create made (kept in `created.json`, v3), never one it was given
+  by name nor one another container names, and so does `--rm`; a plain `rm` keeps
+  them for `volume prune`. An image's `VOLUME`s under `/dev` or on the run's
+  `/etc` files are left in the container; more than 128 are refused.
+
+- **`shipyard compose`** (step 11.4a1, D27): Docker's own `docker compose`
+  against Shipyard's API, its `DOCKER_HOST` set; the API's service started when
+  nothing serves the socket (it ends once idle). `docker events` (and `shipyard
+  events`) take `--filter label=KEY[=VALUE]`: a container's events carry its labels,
+  as Docker's do (compose's attached `up` follows them).
+
+- **`--mount` and `--tmpfs`** (step 11.3e2): Docker's `--mount` (`type=bind`,
+  `volume` or `tmpfs`, `readonly`, `tmpfs-size`, `tmpfs-mode`) and `--tmpfs
+  PATH[:OPTIONS]` (`noexec,nosuid,nodev` unless asked, as Docker's), for `run` and
+  `create`; the API takes `HostConfig.Tmpfs` and `Mounts` (they were refused).
+  A tmpfs is fresh at each start, kept beside the record in `created.json` v2, and
+  shown in `inspect`'s `HostConfig.Tmpfs` and `Mounts`.
+
+- **`container prune`, `system prune`, `image prune -a`** (step 11.3e1):
+  Docker's prunes, with its warnings, sections and `Total reclaimed space`, and
+  `--filter until=… label=… label!=…`. `system prune` takes `-a` (every unused
+  image) and `--volumes` (unused anonymous volumes). The API serves `POST
+  /containers/prune`, `/images/prune` and `/build/prune` (no build cache yet).
+
+- **`top` and `stats`** (step 11.3d2): `top` lists a container's processes in
+  `ps -ef`'s columns, read from `/proc`; `stats` shows what containers use (CPU,
+  memory, network and block I/O, processes) as Docker's CLI computes it, every
+  second or once with `--no-stream`, with `--format`, `-a` and `--no-trunc`. The API
+  serves `GET /containers/{id}/top` and `/stats` (streamed, or once).
+
+- **`pause`, `unpause` and `update` of limits** (step 11.3d1): `pause` freezes a
+  running container's processes (its cgroup's freezer) until `unpause`, said as
+  Docker's events, `ps` showing `(Paused)`; `update` takes Docker's limit flags
+  (`-m`, `--cpus`, `--pids-limit`, …) beside `--restart`, changing a running
+  container's cgroup at once and its record for its next starts. The API serves
+  `POST /containers/{id}/pause`, `/unpause` and `/update`.
+
+- **`inspect` of any object, `version`, `info`** (step 11.3c2): `inspect` finds a
+  container, an image, a network or a volume by name (Docker's order; `--type` one
+  kind), with `-f` (a Go template, or `json`) and `-s`; `image`, `volume` and
+  `network inspect` take `-f`; `version` and `info` print Docker's layout, with
+  `--format` over Docker's objects (the API's `/version` and `/info` are the same,
+  now the engine's); `system df --format`.
+
+- **Docker's `--format`, filters and columns for the lists** (step 11.3c1): `ps`,
+  `images`, `volume ls` and `network ls` print Docker's default tables and take Go
+  templates (`table …`, `json`, `{{.Names}}`, Docker's functions and `.Label "KEY"`,
+  through the `gotmpl` crate), `-q`, `-f KEY=VALUE` and `--no-trunc`; `ps` also
+  `-n`, `-l` and `-s`, and Docker's `ancestor`, `exited`, `health`, `network`,
+  `volume`, `before` and `since` filters (in the API's container list too: one
+  parser, the engine's; a `name` filter's regular expression refused where Shipyard
+  can't read it, never matched as text); `images` a REPOSITORY, `--digests` and `-a`;
+  `events --format` a template over Docker's event message, by Go's field names.
+  What a template writes from an object can't act on a terminal or forge a row.
+
+- **More of Docker's everyday flags** (step 11.3b2): `exec --env-file`; `logs --until`
+  and `-n all`; `stop -t -1` (no SIGKILL); `volume create -l`, `-d local` and no name
+  (a new one); `network create -l`, `-d bridge` and `-o` (Docker's options, checked as
+  the API checks them). `exec --detach-keys` and `--privileged` are refused, saying
+  why.
+
+- **`run` and `create` take Docker's other everyday flags** (step 11.3b1): `--env-file`,
+  `-l`/`--label` and `--label-file`, `--expose` (published by `-P` beside the image's
+  ports), `--cidfile`, `-q` (no pull progress) and `-a` (only the streams asked);
+  `--privileged` and `--init` are refused, saying what to use instead. The API's
+  create keeps a body's `ExposedPorts`.
+
+- **A default process limit** (F62, step 11.3b1): a container made without
+  `--pids-limit` (or with `0`, as Docker's CLI sends it) gets 2,048 processes
+  (Podman's) at each start where the `pids` controller reaches its cgroup;
+  `--pids-limit -1` asks for none. Elsewhere that start goes without one, and `doctor`
+  says so. Containers made through the API (`docker run`) get it too.
+
+- **Docker's everyday names and short forms** (step 11.3a): `run`/`create` `-v`
+  (`--volume`) and `-h` (`--hostname`; their help is `--help`), `logs -n`, `stop`/`restart`
+  `--timeout`, `rm -v`, `cp -q` and `image prune -f` taken, `shipyard -v` for the
+  version; `tag`, `image inspect` (Docker's shape), and the `container` and `image`
+  groups (`container ls`, `image rm`, …) as the same commands.
+
+- **Shipyard's own views through the API** (step 11.2c3b): `GET
+  /shipyard/containers/{id}` and `/shipyard/networks/{name}`, what `inspect --shipyard`
+  and `network inspect` print; `inspect` gains Docker's `GraphDriver` (the overlay's
+  directories), `HostConfig.LogConfig`, the image's own `ExposedPorts` and each
+  network's `IPAMConfig`. A fuzz target for what a Docker client sends the API
+  (`api_request`).
+
+- **`docker cp` through Docker's API** (step 11.2c3a): the archive endpoints, both
+  ways, the container running or not; a path's stat in Docker's header (`docker cp`'s
+  checks and `-L`); a gzip archive taken as a plain one; a read-only root refused as
+  Docker refuses it.
+
+- **Docker's network endpoints** (step 11.2c2b): `docker network ls` (with `host` and
+  `none`, and `pasta` rootless; filters `name`, `id`, `label`, `driver`, `type`),
+  `inspect` (by name, ID or its start), `create` (labels and options kept in the
+  network's own `labels.json`, versioned; Docker's bridge options at their defaults
+  pass, what Shipyard can't honour is refused), `rm`, `connect`, `disconnect` and
+  `prune`. Each network made from now has an ID of its own, kept with it (one made
+  before has one derived from its name and when it was made); a container's
+  inspect shows it (`NetworkID`, `EndpointID`).
+- **A network can't be made with the default network's name (`bridge`)**, by the
+  CLI or the API: made with other settings, it would have changed every default run.
+
+- **Docker's volume endpoints** (step 11.2c2a): `docker volume create` (labels kept in
+  the volume's own `labels.json`, versioned; a volume without a name gets a 64-hex
+  one, marked anonymous), `ls` (filters `name`, `label`, `dangling`, `driver`),
+  `inspect`, `rm`, and `prune` (only anonymous volumes unless `--all`, as Docker's API
+  since 1.42; every unused one for an older client; the space it frees).
+- **Docker's `label` filters match every label asked for**, as Docker's do (step
+  11.2c2a): `docker ps --filter label=a --filter label=b` listed a container with
+  either.
+
+- **Docker's image endpoints** (step 11.2c1): `docker pull` (Docker's progress lines;
+  your `docker login` credentials handed in and never kept), `docker images` (filters
+  `reference`, `label`, `dangling`), `docker image inspect`, `docker tag`, `docker rmi`
+  (by reference or ID). An image's ID is its manifest's digest.
+- **`shipyard rmi` takes an image's ID** (its manifest's digest or its first 4 hex
+  digits or more, or its config's whole), removing every reference of it, all or none
+  (`--force` when they're in several repositories).
+
 - **A Linux VM on the Mac** (step 10.3a, D24, D29): on Apple Silicon (macOS 13 or
   later), Shipyard boots one small Linux VM of its own with Apple's
   Virtualization.framework, and runs containers there. `shipyard vm start`, `status`
@@ -43,9 +216,127 @@ behaviour; each change is listed here).
   both its input and output, a command runs on a terminal in the VM: `run -it`'s
   shell, raw, at your window's size and following it, Ctrl-C reaching its job; a
   prune asks first; closing the window hangs the command up.
+- **Docker's API, for Docker's own clients** (step 11.2a, D25): `shipyard system
+  service` serves a subset of Docker's Engine API (1.43) on a UNIX socket, so
+  `DOCKER_HOST=unix:///run/shipyard/api.sock docker ps` works: `version`, `info`,
+  `ps` (with `id`, `name`, `label` and `status` filters), `inspect`, `create`,
+  `start`, `stop`, `restart`, `kill`, `wait` and `rm`, and `run -d` of an image
+  already pulled. systemd's `shipyard.socket` (root's, and a user's in
+  `contrib/systemd/user`) starts it at the first connection, and it exits after 60 s
+  with nothing asked (`SHIPYARD_API_IDLE`). The socket is its owner's alone, and each
+  connection's user is checked; systemd's stop waits for the requests under way. What
+  Shipyard can't do yet (`--privileged`, `--init`, `--gpus`,
+  another container's namespaces, …) is refused, never ignored.
+  Images, volumes, networks and `cp` are served too: below.
+  See [the Docker API](docs/user/api.md).
+- **Logs and events through Docker's API** (step 11.2b1): `docker logs` (`-f`,
+  `--tail`, `--since`, `--until`, `-t`), each stream on its own as Docker frames them, a
+  terminal container's output as it is; `docker events` with Docker's JSON, `--since`,
+  `--until` and its filters (`type`, `event`, `container`, `image`, `volume`,
+  `network`), followed as things happen. A follow ends when its client goes, and when
+  the service stops.
+- **`docker run` attached, `docker attach` and `docker start -a` through Docker's API**
+  (step 11.2b2a): the connection taken over as Docker's clients ask, the output framed
+  as Docker frames it (or raw with `-t`), input with `-i`, `-it` with a terminal of its
+  own and resized as your window changes, detach keys; an attach made before the
+  container starts (as `docker run` makes it) is let in before its start, so its first
+  line is never missed.
+- **`docker exec` through Docker's API** (step 11.2b2b): `-i`, `-t` (resized as your
+  window changes), `-d`, `-u`, `-w`, `-e`, the command's exit code; each exec runs as a
+  `shipyard exec` of the service's own, its variables' values never on a command line.
+- **`shipyard exec -e KEY`** (a bare key) copies your shell's value, as `run` does and
+  as Docker's `exec` does (step 11.2b2b); before, it was refused.
+- **`--since` and `--until` take Unix seconds with a fraction** (`1760000000.5`), as
+  Docker's clients send them (step 11.2b1).
+- **`shipyard doctor` says where the Docker API is** (step 11.2a): whether systemd's
+  socket unit is enabled, and the `DOCKER_HOST` to use.
+
+- **`--ipc container:NAME`** (step 11.4b2b2, F34): a container starts in another running
+  container's IPC namespace, with its `/dev/shm` shared both ways (Docker's; compose's
+  `ipc: "service:NAME"`; the API's `IpcMode`). A mount can't be bound from another mount
+  namespace (the kernel's rule, checked by `scripts/probes/foreign-shm.c`), so the setup's
+  helper enters the other's, clones its `/dev/shm` there and hands the detached mount back.
+  `private` and `shareable` are taken; `host` and `none` are refused; IPC settings are the
+  other's; rootless, the network and IPC namespace must be one container's.
+- **`--network container:NAME`** (step 11.4b2b1, F34): a container starts in another
+  running container's network, as Docker's: its interfaces, ports and hostname, its
+  `/etc/hosts` and `/etc/resolv.conf` made as the other's. The CLI, the API
+  (`HostConfig.NetworkMode`) and compose's `network_mode: "service:NAME"`. Kept by the
+  other's ID (`created.json` v4); refused at each start while the other isn't running
+  (Docker's words); `stop`, `restart` and `rm` of the other say who loses their network;
+  `system recover` starts the joiners last. Rootless, the other's user namespace is
+  joined with it.
+- **The runtime joins another container's network and IPC namespaces** (step 11.4b2a,
+  F34's first half): a new container can be started in a running one's network and IPC
+  namespaces, named by its init's PID and start time (a reused PID is refused), with the rest
+  its own; rootless, the other's user namespace is joined too, with its own ID maps, by a
+  short-lived process of its own, so the monitor never leaves its own namespaces. `--network
+  container:NAME` and `--ipc container:NAME` use it (above).
+- **OCI bundles join an `ipc` or `uts` namespace by its `path`** as they already joined a
+  `network` one (`linux.namespaces[].path`). Nothing is written into a joined namespace: IPC
+  settings with a joined `ipc` and `hostname`/`domainname` with a joined `uts` are refused, as
+  are `net.*` settings and network devices for a container that joins another container's
+  network. A `pid` path stays refused
+  (F134), as do `mount`, `user` and `cgroup` ones. A container with a user namespace of its
+  own that joins another's IPC namespace has no `/dev/mqueue` (the kernel refuses the mount
+  there); its queues still work through `mq_open`.
 
 ### Changed
 
+- **The macOS guest's kernel is `linux-virt` 6.18.58** (Alpine 3.24's, as the rest of
+  the guest; `scripts/guest/alpine.lock`'s `KERNEL_BRANCH` can name another branch):
+  6.18.57, pinned first, was dropped upstream.
+
+- **A stopped container no longer keeps its networks** (step 11.4a1, D11.4a-2):
+  `network rm` and `network prune` refuse only a network a container that's up is
+  on, as Docker's do; the stopped container's next start fails, its network gone.
+  (Stage 9 kept them, so it could always start again.)
+
+- **A start refuses a container whose `created.json` can't be read** (step
+  11.3e2) instead of a warning: it may hold tmpfs mounts, without which the
+  container would write to disk what it meant for memory.
+
+- **`image prune` asks first** (step 11.3e1), with Docker's warning, unless
+  given `-f`; without a terminal to ask on, it's refused. It now removes
+  dangling images too (with `-a`, every image no container was made from), and
+  prints Docker's `Deleted Images:` and `Total reclaimed space:` instead of
+  `Deleted:` lines and a count.
+
+- **The API's network prune, rootless, prunes nothing** (step 11.3e1) instead of
+  refusing (`403`): there are no networks of Shipyard's to prune there, and
+  Docker's `system prune` asks for them. Nothing deleted is `null`, as Docker's.
+  It takes `until` too (made before), as Docker's.
+
+- **`volume inspect`, `network inspect` and `system df` are Docker's** (step
+  11.3c2): `volume inspect` prints Docker's volume as JSON (it printed text lines);
+  `network inspect` Docker's network (Shipyard's own view is `network inspect
+  --shipyard`); `system df` `TYPE TOTAL ACTIVE SIZE RECLAIMABLE`, volumes as `Local
+  Volumes`, sizes in Docker's units. `inspect`'s JSON is indented 4 spaces, as
+  Docker's.
+
+- **The lists' output is Docker's** (step 11.3c1): `ps --format json` (and every
+  list's) is Docker's row, one object per line, not Shipyard's own array (`inspect
+  --shipyard` keeps Shipyard's fields); `images` shows `REPOSITORY TAG IMAGE ID
+  CREATED SIZE`, `volume ls` `DRIVER VOLUME NAME`, `network ls` `NETWORK ID NAME
+  DRIVER SCOPE` (subnets are `network inspect`'s); `events --format json` writes
+  Docker's event message, not the journal's line. A rootless `network ls` lists the
+  built-in `host`, `none` and `pasta` instead of failing. `ps` lists newest first.
+
+- **Exit codes are Docker's** (step 11.3a): a failure of any command but `run` exits
+  `1` (it was `125`): `rm`, `stop`, `inspect`, `logs`, `exec`, `start -a`, `attach`,
+  `create` and the rest, as Docker's CLI. `run`'s own failures and a command line
+  that can't be taken still exit `125`.
+  `system recover` and `system stop` exit `125` when some containers (not all)
+  couldn't be started or stopped, what the boot units count as done, and `1` when
+  nothing could be done (the unit then fails). The API's exec start of a container
+  that stopped since the exec was made is Docker's `409`.
+
+- **`inspect` prints Docker's shape** (step 11.1): `docker inspect`'s
+  (`Id`, `Name`, `State`, `Config`, `HostConfig`, `NetworkSettings`, …), so a script or
+  tool written for Docker reads it. Shipyard's own view, with its serial, health
+  history and the config as its record keeps it, is `inspect --shipyard`. A container on the
+  host's network, or none, lists it under `NetworkSettings.Networks` (`host`, `none`),
+  as Docker's does (step 11.2a).
 - **A relative store variable is refused** (F61): `SHIPYARD_EVENTS_DIR`,
   `SHIPYARD_IMAGE_STORE` and `SHIPYARD_NETWORK_DIR` must be absolute paths, as
   `SHIPYARD_CONTAINER_DIR` had to be, and so must `XDG_DATA_HOME` (or `HOME`) where
@@ -128,6 +419,126 @@ behaviour; each change is listed here).
   guest of another build: step 10.4, F112), as when one fails.
 
 ### Fixed
+
+- **The API's streams go at the client's pace** (step 11.7): `docker logs`, `docker cp`
+  both ways, pull progress and events waited 50 ms whenever 16 chunks were queued, so
+  50,000 log lines took 153 s through the API (0.01 s with `shipyard logs`) and a
+  256 MiB copy out took 27 s. They now go on as soon as the client takes a chunk.
+- **A Docker client killed in a quiet session on a Mac is hung up** (step 11.7): a
+  `docker exec -i` or `docker attach` whose client died while nothing was written
+  ran on in the VM, and the Mac's host kept its connection. The host now sees the
+  client go and tells the guest, whose service hangs the session up as on Linux.
+- **`docker ps` reads each network once** (step 11.7): listing containers read every
+  network's leases once per container, so its cost grew with their square (116 ms at
+  200 running containers).
+- **A refused `update` leaves the container as it was** (step 11.7): a limit newly
+  set and then followed by one the kernel refused (no swap accounting) stayed in force
+  while `inspect` said none; each limit is now put back as the kernel had it.
+- **A volume filled from an image is on the disk before it's marked whole** (step
+  11.7), and a fill another container's create left unfinished is given up, never
+  copied over, when another container mounts the volume too (one made with `nocopy`).
+- **Test pauses do nothing in a release build** (step 11.7): `__cleanup` honoured a
+  test's variable in any build, and held a container's locks for a minute.
+- **Stage 11's review, smaller fixes** (step 11.6b): `docker volume create` of a
+  volume a running container uses says it exists at once (it waited 15 s, then
+  failed); `shipyard logs --since` takes Go's durations, as Docker's (`1h30m`,
+  `1.5h`); `shipyard network create default` is refused, as the API refuses it;
+  `shipyard port --sockets --format json` escapes what a terminal would act on.
+
+- **A volume's unfinished fill is never finished over another container's data**
+  (step 11.6b): once another container's create finds the volume in use, the fill a
+  killed create left is given up; its container's first start used to copy the
+  image's files over what was written there.
+- **The API's exec never ends the service when a thread is refused** (step 11.6b):
+  a task limit made a thread spawn panic, and the whole service abort; such an exec
+  now fails alone. An exec's variables are measured as the child gets them (escaped),
+  never past what the kernel takes in one.
+
+- **A detached `docker exec` no longer keeps the API service up** (step 11.6a3, F117):
+  `docker exec -d` (a `sleep infinity`, say) held the service from its idle exit for
+  good; it now lets it go after 10 s, and the command runs on. An exec's inspect says
+  its command's `Pid` (it said the service's helper's), and its detach keys
+  (`DetachKeys`, Docker's ctrl-p,ctrl-q by default) end a terminal session and leave
+  the exec running (holding the service up until it ends: its terminal is the
+  service's).
+
+- **`docker cp` follows a link to a link as Docker does** (step 11.6a2, F121): a
+  link's `linkTarget` is its chain followed in the container (at most 255 links), so
+  `docker cp -L` of a link to a link copies the file at its end, not the second link.
+  A PUT to a container that doesn't exist is `404` whatever its body, as Docker's.
+
+- **A failed `start` no longer sets off a restart policy** (step 11.6a1, F81): an
+  `always` container that had ended, whose `start` failed, was restarted by its policy as
+  if it had run. Docker's policy follows a run; Shipyard's does now too.
+- **A container's health after its end is Docker's** (step 11.6a1, F133): `inspect`'s
+  `State.Health`, `ps --filter health=` and the API's `Health` say `unhealthy`, its
+  failing streak and latest results kept, as Docker 29.8 does once its checks stop;
+  `ps`'s status shows health only while it runs, as Docker's does.
+- **The API service raises its own descriptor limit** (step 11.6a1, F114): started by
+  systemd with a soft limit of 1024, it could run out under many creates and connections.
+  Its containers keep the limit it was started with.
+- **Waiting attaches are let in together, and `StdinOnce` is kept with the container**
+  (step 11.6a1, F116): attaches waiting for a container's start were welcomed one by one,
+  holding a `stop` or `rm` back; and a container made with `StdinOnce` by a service that
+  then ended started with its input open. Both fixed. A foreground `shipyard run -i`
+  (no terminal) now makes its container `StdinOnce` too, as `docker run -i` does: a
+  later `start -ai` ends its input at the first end of file.
+- **A container whose process ends before its start is said plainly** (step 11.5b2b,
+  F119): its start failed with "container … is stopped; connect needs it created", which
+  read as a start gone wrong. It now says "its process ended before it could start
+  (killed by SIGKILL …): its command never ran", with how it ended when that's known.
+- **The macOS VM's refusals are known by a code** (step 11.5b2b, F99): a host stopping, or
+  a guest still starting, said why only in words the Mac's `shipyard` compared; a
+  rewording would have stopped it retrying. Older hosts and guests are still understood.
+- **Docker's CLI from 29 creates containers on the default network** (step 11.5b1): it
+  names the default's endpoint `default`, which the API took for a network of that name
+  ("there's no network named default"). It's the default network, as Docker keeps the
+  name for it.
+- **An address, alias or hardware address without a network of your own is refused**
+  (step 11.5b1): `docker run --ip …`, `--network-alias` or `--mac-address` on the default
+  network was taken and its setting dropped. Docker's API also refuses a network named
+  `default` (`403`), the name Docker keeps for the default network.
+- **`-p 0:80` publishes on any free port** (step 11.5b1), as Docker does; it was refused
+  ("a port is 1 to 65535"). `shipyard run -p` and the API alike.
+- **The macOS VM keeps one network address** (step 11.5a): its network card had a new
+  random MAC address at every boot, and each took another of the Mac's NAT leases
+  (253, an hour each). Booted often enough (the VM tests, or many idle stops and
+  starts), the VM used them all up, and then neither it nor any other VM on the Mac got
+  an address: every pull failed with "failed to lookup address information". The
+  address is now made at the first boot and kept in the VM's directory
+  (`network.json`).
+- **A container with a health check is `starting` from its start** (step 11.4b1):
+  before its first check's result, `inspect` showed no `State.Health` (and `ps` no
+  `(health: starting)`), where Docker shows `starting`; Testcontainers' health wait
+  read that as "no health check" and failed.
+
+- **`rm` without `-f` no longer removes a container its restart policy is about
+  to start again** (step 11.3e1, the Murphy review): in the moment between its
+  end being recorded and its restart being scheduled, it's refused as restarting,
+  as Docker's restart manager sees it; a prune keeps it too.
+
+- **`ps` and `inspect` show the command a container runs** (F101, step 11.3b2): its
+  image's entrypoint, command, variables, working directory and user where it gave
+  none, merged by the start's own rules (it showed only what was given, so an image's
+  own command was an empty `COMMAND`). The API's container list and inspect too.
+
+- **`shipyard vm start` returns once its guest is ready** (step 11.3a's verify), as
+  its help says: it returned once the VM's host answered, while the guest could still
+  be checking its data disk, so `doctor` right after said "the VM is still starting".
+  `doctor` now waits up to 30 s for a guest that's starting.
+
+- **A container's end is said once, even if its clean-up is killed after recording
+  it** (F88): the `die` event was lost then, a reboot in between too; a start now
+  leaves an `end-unsaid` marker beside the record, and whoever settles the end (the
+  next command on the container, or the recovery pass after a reboot) says it and
+  removes the marker.
+
+- **The runtime library puts the child-subreaper setting back** when a supervisor is
+  dropped (F29), so a program that embeds it doesn't stay every orphan's parent.
+
+- **On a Mac, closing the terminal of a `shipyard run -it`** always ends it with 129 as
+  a hung-up command does; it could die of a second SIGHUP instead (the shell's), about
+  one time in six.
 
 - **`volume rm` and `volume prune` keep every volume when the container store can't
   be found** (a relative `SHIPYARD_CONTAINER_DIR`, no home), saying why: they treated
@@ -277,12 +688,55 @@ behaviour; each change is listed here).
   boots), and what couldn't be placed is in `lost+found` on that disk. Commands are
   refused at once while the disk is checked or repaired ("the VM is still starting"),
   so a long repair is never cut short by a start's time limit.
+- **On a Mac, the first command after the VM starts no longer fails with "the VM is
+  still starting"** (step 11.1's verification, from 10.4): the VM's agent answers
+  before the guest is ready, so a command sent at once was refused. The command now
+  waits for the guest (saying so if it takes more than a few seconds, Ctrl-C to stop
+  waiting), however long its disk's check or repair takes.
 - **On a Mac, the VM's stop is bounded** (step 10.4, F109): a process stuck in the
   kernel (a wedged file-sharing call) could keep the VM's init waiting for it, so its
   disk was never let go cleanly. Its agent, if it keeps failing, is now restarted
   ever later (up to every 5 s), not at once in a loop.
 
+### Known limitations
+
+- **The macOS guest's kernel sometimes crashes with several VMs at once** (F132): with
+  four VMs booting on a Mac that's already swapping, about one boot in 40 found its
+  memory corrupted a few seconds in, and hung; one VM alone (as Shipyard runs it) didn't
+  in 157 boots. The cause isn't found yet (stage 13).
+
+- **A container made with `--tmpfs` and started by Shipyard 0.2.0 runs without its
+  tmpfs mounts** (step 11.3e2): 0.2.0 doesn't read `created.json`, where they're
+  kept beside the record (F67's rule), so what was meant for memory is written to
+  the container's layer on disk. Start it with this version.
+- **A container with anonymous volumes keeps them under an older 0.3 build**
+  (step 11.4a2a): their list is `created.json` v3, which a build from before it
+  refuses (its start refused, as for any newer file); 0.2.0 ignores the file, and
+  its `rm -v` takes nothing.
+- **`inspect` shows every tmpfs in both `HostConfig.Tmpfs` and `Mounts`, and a
+  `--mount` bind or volume in `HostConfig.Binds`**: Shipyard keeps one form of each,
+  where Docker keeps the flag it came from.
+
 ### Security
+
+- **A bind source Shipyard made is never reached through a symlink** (step 11.7): the
+  API makes a missing `Binds` path, and made and bound it again by path at each start,
+  so a container sharing a directory above it could put a symlink there and have the
+  next start bind (or make a directory in) what it named. What Shipyard made is now
+  made and bound by descriptor, and a symlink in its place refuses the start.
+- **An image can't multiply its files in a volume** (step 11.7): past a million files
+  with more than one name, a fill wrote each further name as a copy of its data; it's
+  refused now.
+- **The volume store is its user's alone** (step 11.6b): a volume filled from an image
+  keeps its files' set-user-ID bits, and the volume store was only as private as the
+  directory above it. It's made 0700 now, an older one narrowed.
+- **`SECURITY.md` says what Docker's API sockets are** (step 11.6b): root's is
+  root-equivalent, a user's is that user; on a Mac, `docker.sock` is root in the VM.
+
+- **Registries' certificates:** the TLS dependencies are updated past
+  RUSTSEC-2026-0381, -0382 and -0383 (`webpki-roots`, `webpki-root-certs` 1.0.10,
+  `rustls-webpki` 0.103.16), which trusted distrusted emSign intermediates. A pull
+  no longer accepts a registry certificate issued through them.
 
 - **`shipyard __guest-init` and `__shipyard-agent` are refused outside Shipyard's
   own macOS VM** (stage 10's fresh review): run as root on a Linux host, the guest's

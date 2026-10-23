@@ -27,7 +27,7 @@ use std::fmt;
 use crate::digest::{Digest, DigestError};
 
 /// Docker Hub's canonical name in a reference.
-const DOCKER_HUB_NAME: &str = "docker.io";
+pub(crate) const DOCKER_HUB_NAME: &str = "docker.io";
 /// Other names Docker Hub goes by.
 const DOCKER_HUB_ALIASES: [&str; 2] = ["index.docker.io", DOCKER_HUB_HOST];
 /// The host that actually serves Docker Hub's registry API.
@@ -193,11 +193,36 @@ impl ImageReference {
     /// is served from `registry-1.docker.io`.
     #[must_use]
     pub fn host(&self) -> &str {
-        if self.registry == DOCKER_HUB_NAME {
-            DOCKER_HUB_HOST
-        } else {
-            &self.registry
+        api_host(&self.registry)
+    }
+
+    /// The repository as Docker shows it: Docker Hub's registry left out,
+    /// and its `library/` too (`alpine`, `owner/app`, `ghcr.io/owner/app`).
+    #[must_use]
+    pub fn familiar_name(&self) -> String {
+        if self.registry != DOCKER_HUB_NAME {
+            return format!("{}/{}", self.registry, self.repository);
         }
+        self.repository
+            .strip_prefix(&format!("{DOCKER_HUB_LIBRARY}/"))
+            .unwrap_or(&self.repository)
+            .to_owned()
+    }
+
+    /// The reference as Docker shows it ([`familiar_name`](Self::familiar_name),
+    /// then its tag and digest): `alpine:3.20`.
+    #[must_use]
+    pub fn familiar(&self) -> String {
+        let mut shown = self.familiar_name();
+        if let Some(tag) = &self.tag {
+            shown.push(':');
+            shown.push_str(tag);
+        }
+        if let Some(digest) = &self.digest {
+            shown.push('@');
+            shown.push_str(&digest.to_string());
+        }
+        shown
     }
 
     /// What goes in the registry URL's `manifests/<here>`: the digest if
@@ -314,6 +339,16 @@ fn valid_tag(tag: &str) -> bool {
             .next()
             .is_some_and(|first| first.is_ascii_alphanumeric() || first == b'_')
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// The host (and port) the registry `registry` serves its API from: its
+/// own, but Docker Hub's (`docker.io`) is `registry-1.docker.io`.
+pub(crate) fn api_host(registry: &str) -> &str {
+    if registry == DOCKER_HUB_NAME {
+        DOCKER_HUB_HOST
+    } else {
+        registry
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +480,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Docker's familiar form: Docker Hub and its `library/` left out,
+    /// any other registry kept.
+    #[test]
+    fn a_reference_is_shown_as_docker_shows_it() {
+        let familiar = |text: &str| ImageReference::parse(text).unwrap().familiar();
+        assert_eq!(familiar("alpine"), "alpine:latest");
+        assert_eq!(familiar("docker.io/library/alpine:3.20"), "alpine:3.20");
+        assert_eq!(familiar("owner/app:v1"), "owner/app:v1");
+        assert_eq!(familiar("ghcr.io/owner/app:v1"), "ghcr.io/owner/app:v1");
+        assert_eq!(
+            familiar("localhost:5000/library/x"),
+            "localhost:5000/library/x:latest"
+        );
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            familiar(&format!("alpine@{digest}")),
+            format!("alpine@{digest}")
+        );
+        assert_eq!(
+            ImageReference::parse("alpine:3.20")
+                .unwrap()
+                .familiar_name(),
+            "alpine"
+        );
     }
 }

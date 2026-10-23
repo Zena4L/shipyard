@@ -206,6 +206,14 @@ pub enum ResourceError {
          one of the cgroup.* files, which move or kill processes rather than limit them"
     )]
     BadUnifiedKey(String),
+    /// A device rate given for a path that isn't a block device.
+    #[error("{path} isn't a block device (such as /dev/sda): {why}")]
+    NotABlockDevice {
+        /// The path given.
+        path: std::path::PathBuf,
+        /// Why.
+        why: String,
+    },
 }
 
 /// The smallest memory limit accepted: below a few MiB a container can't
@@ -217,6 +225,60 @@ impl Resources {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// These limits with `given`'s over them: each limit `given` sets wins,
+    /// the rest stay (an `update` of what a container keeps). `cpu.max`'s
+    /// quota and period each (a period given alone keeps the quota); a
+    /// default swap (as much as memory) follows a new memory limit; a
+    /// device's `io.max` given replaces that device's; other files are
+    /// added.
+    #[must_use]
+    pub fn overlaid(&self, given: &Self) -> Self {
+        fn take<T: Clone>(mine: &mut Option<T>, theirs: Option<&T>) {
+            if let Some(theirs) = theirs {
+                *mine = Some(theirs.clone());
+            }
+        }
+        let mut limits = self.clone();
+        take(&mut limits.memory_max, given.memory_max.as_ref());
+        take(&mut limits.memory_low, given.memory_low.as_ref());
+        take(&mut limits.pids_max, given.pids_max.as_ref());
+        take(&mut limits.cpu_weight, given.cpu_weight.as_ref());
+        take(&mut limits.io_weight, given.io_weight.as_ref());
+        take(&mut limits.cpuset_cpus, given.cpuset_cpus.as_ref());
+        take(&mut limits.cpuset_mems, given.cpuset_mems.as_ref());
+        if given.swap_max.is_some() {
+            limits.swap_max = given.swap_max;
+            limits.swap_is_default = given.swap_is_default;
+        } else if self.swap_is_default
+            && let Some(memory) = given.memory_max
+        {
+            // Docker's default: as much swap as memory, the new memory.
+            limits.swap_max = Some(Limit::Value(memory));
+        }
+        if let Some(cpu) = given.cpu_max {
+            let (quota, period) = self
+                .cpu_max
+                .map_or((None, None), |kept| (kept.quota, kept.period));
+            limits.cpu_max = Some(CpuMax {
+                quota: cpu.quota.or(quota),
+                period: cpu.period.or(period),
+            });
+        }
+        for device in &given.io_max {
+            limits
+                .io_max
+                .retain(|io| (io.major, io.minor) != (device.major, device.minor));
+            limits.io_max.push(*device);
+        }
+        limits.unified.extend(
+            given
+                .unified
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        limits
     }
 
     /// Checks the values as the kernel would take them, so a mistake is
@@ -570,9 +632,96 @@ pub fn swap_from_total(total: i64, memory: Option<u64>) -> Result<Limit, Resourc
         .ok_or(ResourceError::SwapBelowMemory { total, memory })
 }
 
+mod docker;
+
+pub use docker::DockerLimits;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An update's limits over a container's: each one given wins (swap
+    /// with its being Docker's default or not, a device's `io.max` by
+    /// device), the rest stay.
+    #[test]
+    fn given_limits_win_over_kept_ones() {
+        let kept = Resources {
+            memory_max: Some(64 << 20),
+            swap_max: Some(Limit::Value(64 << 20)),
+            swap_is_default: true,
+            pids_max: Some(2048),
+            cpu_weight: Some(100),
+            cpuset_cpus: Some("0".to_owned()),
+            io_max: vec![IoMax {
+                major: 8,
+                minor: 0,
+                rbps: Some(1),
+                ..IoMax::default()
+            }],
+            ..Resources::default()
+        };
+        let given = Resources {
+            memory_max: Some(128 << 20),
+            swap_max: Some(Limit::Max),
+            pids_max: Some(50),
+            cpu_max: Some(CpuMax {
+                quota: Some(50_000),
+                period: Some(100_000),
+            }),
+            io_max: vec![IoMax {
+                major: 8,
+                minor: 0,
+                wbps: Some(2),
+                ..IoMax::default()
+            }],
+            ..Resources::default()
+        };
+        let both = kept.overlaid(&given);
+        assert_eq!(both.memory_max, Some(128 << 20));
+        assert_eq!(both.swap_max, Some(Limit::Max));
+        assert!(!both.swap_is_default, "asked for, now");
+        assert_eq!(both.pids_max, Some(50));
+        assert_eq!(both.cpu_max, given.cpu_max);
+        assert_eq!(both.cpu_weight, Some(100), "kept");
+        assert_eq!(both.cpuset_cpus.as_deref(), Some("0"), "kept");
+        assert_eq!(
+            both.io_max, given.io_max,
+            "the device's replaced, not added"
+        );
+        assert_eq!(kept.overlaid(&Resources::default()), kept, "nothing given");
+        // A default swap follows memory; one asked for stays.
+        let memory = Resources {
+            memory_max: Some(256 << 20),
+            ..Resources::default()
+        };
+        let followed = kept.overlaid(&memory);
+        assert_eq!(followed.swap_max, Some(Limit::Value(256 << 20)));
+        assert!(followed.swap_is_default);
+        let asked = Resources {
+            swap_is_default: false,
+            ..kept.clone()
+        };
+        assert_eq!(
+            asked.overlaid(&memory).swap_max,
+            Some(Limit::Value(64 << 20)),
+            "asked for: kept"
+        );
+        // `cpu.max`'s halves each: a period alone keeps the quota.
+        let period = Resources {
+            cpu_max: Some(CpuMax {
+                quota: None,
+                period: Some(50_000),
+            }),
+            ..Resources::default()
+        };
+        assert_eq!(
+            both.overlaid(&period).cpu_max,
+            Some(CpuMax {
+                quota: Some(50_000),
+                period: Some(50_000),
+            })
+        );
+    }
 
     #[test]
     fn sizes_parse_as_docker_reads_them() {

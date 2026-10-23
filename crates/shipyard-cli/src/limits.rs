@@ -3,11 +3,11 @@
 //! runtime's `resources` helpers, so `--memory 512m --cpus 1.5` means here
 //! what it means to `docker run`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use clap::Args;
-use shipyard_runtime::resources::{self, CpuMax, IoLimit, Limit, Resources};
+use shipyard_runtime::resources::{self, DockerLimits, Resources};
 
 /// The limit flags. One group, so `--bundle` (which has its own
 /// `linux.resources`) and `--no-isolation` (no cgroup) conflict with all of
@@ -84,7 +84,92 @@ pub struct LimitArgs {
     device_write_iops: Vec<(PathBuf, u64)>,
 }
 
+/// The limits `update` changes, Docker's `update`'s: those a running
+/// container's cgroup takes at once (no device rates: those are given when
+/// it's made). Each not given stays as it is.
+#[derive(Debug, Default, Args)]
+#[group(id = "update_limits", multiple = true)]
+pub struct UpdateLimitArgs {
+    /// The most memory the container may use (such as 512m or 2g). Its
+    /// swap, if it's the default (as much as its memory), follows.
+    #[arg(short, long, value_name = "SIZE", value_parser = parse_size)]
+    memory: Option<u64>,
+
+    /// Memory kept for the container when the host runs short.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    memory_reservation: Option<u64>,
+
+    /// Memory plus swap: counted from --memory, or the container's own
+    /// memory limit without it; -1 for unlimited swap.
+    #[arg(long, value_name = "SIZE", value_parser = parse_swap_total, allow_hyphen_values = true)]
+    memory_swap: Option<i64>,
+
+    /// How many CPUs' worth of time the container may use (such as 1.5).
+    #[arg(long, value_name = "NUMBER", conflicts_with_all = ["cpu_period", "cpu_quota"])]
+    cpus: Option<String>,
+
+    /// The CPU period, in microseconds (1000 to 1000000); its quota stays.
+    #[arg(long, value_name = "MICROSECONDS")]
+    cpu_period: Option<u64>,
+
+    /// CPU time per period, in microseconds; its period stays.
+    #[arg(long, value_name = "MICROSECONDS")]
+    cpu_quota: Option<u64>,
+
+    /// The container's CPU share against others, in Docker's units (1024 is
+    /// the default share).
+    #[arg(short = 'c', long, value_name = "SHARES", alias = "cpu-share")]
+    cpu_shares: Option<u64>,
+
+    /// The CPUs the container may run on (such as 0-3 or 0,2).
+    #[arg(long, value_name = "LIST")]
+    cpuset_cpus: Option<String>,
+
+    /// The memory nodes the container may use (such as 0 or 0-1).
+    #[arg(long, value_name = "LIST")]
+    cpuset_mems: Option<String>,
+
+    /// The most processes (and threads) in the container, its init included
+    /// (a number: a limit isn't lifted yet).
+    #[arg(long, value_name = "NUMBER")]
+    pids_limit: Option<u64>,
+
+    /// The container's disk-time share, in Docker's units (10 to 1000).
+    #[arg(long, value_name = "WEIGHT")]
+    blkio_weight: Option<u16>,
+}
+
+impl UpdateLimitArgs {
+    /// The flags as Docker's limits (the engine's one mapping of them).
+    #[must_use]
+    pub fn docker(&self) -> DockerLimits {
+        let signed =
+            |value: Option<u64>| value.map(|value| i64::try_from(value).unwrap_or(i64::MAX));
+        let mut limits = DockerLimits::default();
+        limits.memory = self.memory;
+        limits.memory_reservation = self.memory_reservation;
+        limits.memory_swap = self.memory_swap;
+        limits.cpus.clone_from(&self.cpus);
+        limits.cpu_period = self.cpu_period;
+        limits.cpu_quota = signed(self.cpu_quota);
+        limits.cpu_shares = self.cpu_shares;
+        limits.cpuset_cpus.clone_from(&self.cpuset_cpus);
+        limits.cpuset_mems.clone_from(&self.cpuset_mems);
+        limits.pids_limit = signed(self.pids_limit);
+        limits.blkio_weight = self.blkio_weight;
+        limits
+    }
+}
+
 impl LimitArgs {
+    /// Whether `--pids-limit` asks something: a limit, or `-1` (none).
+    /// Not given, or `0` (Docker's "unset", what its CLI sends without the
+    /// flag), the engine's default applies (F62).
+    #[must_use]
+    pub fn pids_given(&self) -> bool {
+        self.pids_limit.is_some_and(|limit| limit != 0)
+    }
+
     /// The flags' first name, if any limit is given: for refusing them where
     /// they can't work.
     #[must_use]
@@ -120,7 +205,7 @@ impl LimitArgs {
     /// A value the kernel wouldn't take, flags that contradict each other, or
     /// a device that isn't a block device.
     pub fn resources(&self) -> Result<Resources> {
-        self.limits(true, None)
+        Ok(self.docker().resources()?)
     }
 
     /// The limits given, and nothing else, for a running container (runc's
@@ -132,114 +217,37 @@ impl LimitArgs {
     ///
     /// As [`LimitArgs::resources`].
     pub fn resources_as_given(&self, memory_now: Option<u64>) -> Result<Resources> {
-        let mut limits = self.limits(false, memory_now)?;
-        // Only what was given: the memory it counted from stays as it is.
-        if !self.memory_given() {
-            limits.memory_max = None;
-        }
-        Ok(limits)
+        Ok(self.docker().resources_as_given(memory_now)?)
     }
 
     /// Whether `--memory-swap` is given without `--memory` (for an update,
     /// it then needs the container's own memory limit).
     #[must_use]
     pub fn swap_without_memory(&self) -> bool {
-        self.memory_swap.is_some_and(|total| total != 0) && !self.memory_given()
+        self.docker().swap_without_memory()
     }
 
-    /// Whether `--memory` asks for a limit (0 is Docker's "not set").
-    fn memory_given(&self) -> bool {
-        self.memory.is_some_and(|bytes| bytes > 0)
-    }
-
-    fn limits(&self, docker_swap: bool, memory_now: Option<u64>) -> Result<Resources> {
-        // Docker's: 0 is "not set" for each of these (as for --cpu-shares,
-        // --pids-limit and --blkio-weight below).
-        let memory = self.memory.filter(|&bytes| bytes > 0);
-        let memory_swap = self.memory_swap.filter(|&total| total != 0);
-        let mut limits = Resources::default();
-        limits.memory_max = memory;
-        limits.memory_low = self.memory_reservation.filter(|&bytes| bytes > 0);
-        limits.cpu_weight = self.cpu_shares.and_then(resources::weight_from_shares);
+    /// The flags as Docker's limits, for the runtime's one mapping of them
+    /// (the API's too: `DockerLimits`).
+    fn docker(&self) -> DockerLimits {
+        let mut limits = DockerLimits::default();
+        limits.memory = self.memory;
+        limits.memory_reservation = self.memory_reservation;
+        limits.memory_swap = self.memory_swap;
+        limits.cpus.clone_from(&self.cpus);
+        limits.cpu_period = self.cpu_period;
+        limits.cpu_quota = self.cpu_quota;
+        limits.cpu_shares = self.cpu_shares;
         limits.cpuset_cpus.clone_from(&self.cpuset_cpus);
         limits.cpuset_mems.clone_from(&self.cpuset_mems);
-        limits.pids_max = self.pids_limit.and_then(resources::positive);
-        (limits.swap_max, limits.swap_is_default) = match (memory_swap, memory.or(memory_now)) {
-            (Some(total), memory) => (Some(resources::swap_from_total(total, memory)?), false),
-            // Docker's rule: as much swap as memory.
-            (None, Some(memory)) if docker_swap => (Some(Limit::Value(memory)), true),
-            (None, _) => (None, false),
-        };
-        limits.cpu_max = self.cpu_max()?;
-        if let Some(weight) = self.blkio_weight {
-            limits.io_weight = resources::io_weight_from_blkio(weight)?;
-        }
-        self.limit_io(&mut limits)?;
-        limits.validate()?;
-        Ok(limits)
+        limits.pids_limit = self.pids_limit;
+        limits.blkio_weight = self.blkio_weight;
+        limits.device_read_bps.clone_from(&self.device_read_bps);
+        limits.device_write_bps.clone_from(&self.device_write_bps);
+        limits.device_read_iops.clone_from(&self.device_read_iops);
+        limits.device_write_iops.clone_from(&self.device_write_iops);
+        limits
     }
-
-    /// `cpu.max`: from `--cpus`, or `--cpu-quota` and `--cpu-period`.
-    fn cpu_max(&self) -> Result<Option<CpuMax>> {
-        if let Some(cpus) = self.cpus.as_deref().filter(|cpus| !is_zero(cpus)) {
-            return Ok(Some(resources::cpus(cpus)?));
-        }
-        Ok(CpuMax::from_parts(self.cpu_quota, self.cpu_period))
-    }
-
-    /// `io.max`: one line per device, with every limit given for it.
-    fn limit_io(&self, limits: &mut Resources) -> Result<()> {
-        // (The first constructor's type is spelled out; the others follow.)
-        let flags = [
-            (
-                self.device_read_bps.as_slice(),
-                IoLimit::ReadBps as fn(u64) -> IoLimit,
-            ),
-            (&self.device_write_bps, IoLimit::WriteBps),
-            (&self.device_read_iops, IoLimit::ReadIops),
-            (&self.device_write_iops, IoLimit::WriteIops),
-        ];
-        for (given, limit) in flags {
-            // 0 is "not set", as for every flag (and as the OCI reader takes
-            // it): `io.max` would refuse it.
-            for (path, rate) in given.iter().filter(|(_, rate)| *rate > 0) {
-                let (major, minor) = block_device(path)?;
-                limits.limit_io(major, minor, limit(*rate));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Whether `text` is a decimal zero (`0`, `0.0`, `.0`): Docker's "no limit"
-/// for `--cpus`.
-fn is_zero(text: &str) -> bool {
-    let text = text.trim();
-    text.contains('0')
-        && text.chars().all(|c| c == '0' || c == '.')
-        && text.matches('.').count() <= 1
-}
-
-/// The major and minor numbers of the block device at `path`.
-fn block_device(path: &Path) -> Result<(u32, u32)> {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-    let metadata = std::fs::metadata(path).with_context(|| path.display().to_string())?;
-    if !metadata.file_type().is_block_device() {
-        bail!("{} isn't a block device (such as /dev/sda)", path.display());
-    }
-    let device = metadata.rdev();
-    #[cfg(target_os = "linux")]
-    let numbers = (libc::major(device), libc::minor(device));
-    #[cfg(not(target_os = "linux"))]
-    let numbers = {
-        let too_large = || anyhow::anyhow!("{}'s device number is too large", path.display());
-        let device = libc::dev_t::try_from(device).map_err(|_| too_large())?;
-        (
-            u32::try_from(libc::major(device)).map_err(|_| too_large())?,
-            u32::try_from(libc::minor(device)).map_err(|_| too_large())?,
-        )
-    };
-    Ok(numbers)
 }
 
 /// A size (`64k`, `10m`, `1g`), as `--memory` takes it.
@@ -287,6 +295,7 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use shipyard_runtime::resources::{CpuMax, Limit};
 
     #[derive(Debug, Parser)]
     struct Cli {

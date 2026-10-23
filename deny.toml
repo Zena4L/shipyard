@@ -22,12 +22,13 @@ allow = [
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
-# The engine sits above the runtime (H1): only the CLI may depend on it, so
+# The engine sits above the runtime (H1): only its front ends may depend on
+# it, the CLI and the API (`shipyard-api`, stage 11's server), so
 # the `shipyard-runtime` crate (and the image, network and storage crates)
 # never do. The rule is per package: the `shipyard-runtime` *binary* is in
 # `shipyard-cli`, so this allows it; it's a front end, like `shipyard`.
 deny = [
-  { crate = "shipyard-engine", wrappers = ["shipyard-cli"] },
+  { crate = "shipyard-engine", wrappers = ["shipyard-cli", "shipyard-api"] },
 ]
 
 [sources]

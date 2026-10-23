@@ -9,6 +9,7 @@ A container's network is chosen with `shipyard run --network MODE`. On Linux:
 | `pasta` | One of its own, connected through [pasta](https://passt.top): a way out and published ports. **The default without root.** |
 | `host` | The host's: its interfaces, addresses and ports. |
 | `none` | One of its own, with only a loopback interface (`lo`): nothing in or out. |
+| `container:NAME` | Another running container's, as it is: its interfaces, addresses, ports and hostname (see [Another container's network](#another-containers-network)). |
 
 ```sh
 sudo shipyard run alpine:3.20 wget -qO- example.com      # the default network
@@ -22,7 +23,7 @@ sudo shipyard run --network front --network back alpine:3.20 ip addr   # two net
 > **Status:** as root, containers on a network reach each other, the host and
 > the internet, and you can publish their ports. Without root, each container
 > gets its own network through pasta: a way out and published ports, but no
-> networks shared with others (those come later). A network made with `--ipv6`
+> networks shared with others (one can join another's: `--network container:NAME`). A network made with `--ipv6`
 > gives its containers IPv6 too; pasta gives them the host's IPv6. Networking
 > isn't available on macOS yet.
 
@@ -55,8 +56,8 @@ your distribution's `passt` package.
 - **Signals:** pasta is out of the terminal's reach (Ctrl-C is the container's),
   and goes after the container. If pasta itself fails while a container runs
   (killed, or it crashes), the container runs on with only its loopback, as with
-  Podman: that's said. `ps` shows `Up 3 minutes (no network)`, `inspect` gives
-  `state.network_lost` (when, and how pasta ended), the events journal has a
+  Podman: that's said. `ps` shows `Up 3 minutes (no network)`, `inspect --shipyard`
+  gives `state.network_lost` (when, and how pasta ended), the events journal has a
   `network_lost` event, and a foreground run warns when it ends. Starting the
   container again gives it a new pasta. A run that isn't a container (`--no-image`,
   say) isn't watched so.
@@ -78,6 +79,12 @@ your distribution's `passt` package.
   ends, even if `shipyard` is killed outright.
 
 ## Networks
+
+`docker network` works against Shipyard's [API](api.md) too (root's: bridges are the
+host's). A network made there can have labels and Docker's bridge options at their
+defaults, kept beside it in `labels.json` and shown by `docker network inspect`;
+Shipyard's own `--isolate-host` and `--conntrack-limit` are the options
+`com.shipyard.network.isolate-host=true` and `com.shipyard.network.conntrack-limit=true`.
 
 A network is a **bridge** on the host (a switch in the kernel) with a subnet of
 its own. The bridge has an address on it, the **gateway** (the subnet's first by
@@ -116,6 +123,9 @@ Makes the network and its bridge, and prints its name.
 | `--internal` | No way in or out of the network: its containers reach each other and the host only, and publish no ports. |
 | `--isolate-host` | Its containers can't reach the host itself (its services, on any of its addresses) nor the cloud's metadata addresses, but for the network's DNS server (see [What gets in](#the-way-out-and-what-gets-in)). Not for the default network, `bridge`, which has no DNS server. |
 | `--conntrack-limit` | Each container address on it may have at most 8,192 connections open of those it opened; the next is refused (see [What gets in](#the-way-out-and-what-gets-in)). |
+| `-l`, `--label KEY[=VALUE]` | A label on it (repeatable), kept beside it, as the API keeps them. |
+| `-d`, `--driver bridge` | The only driver. |
+| `-o`, `--opt KEY=VALUE` | A driver option, as the API's create takes it: Docker's bridge options at their defaults, and Shipyard's own (`com.shipyard.network.isolate-host=true` is `--isolate-host`, `com.shipyard.network.conntrack-limit=true` is `--conntrack-limit`); any other is refused (see [Through Docker's API](api.md)). |
 
 A name is letters, digits, `_`, `.` and `-`, starting with a letter or digit, at
 most 64 characters. `bridge` is the default network's.
@@ -123,16 +133,32 @@ most 64 characters. `bridge` is the default network's.
 ### `shipyard network ls`
 
 ```text
-NETWORK  SUBNET        SUBNET6                   GATEWAY    BRIDGE          CONTAINERS
-app      10.89.0.0/24  fd3c:91a2:7d04:5e10::/64  10.89.0.1  shy-3f9a0c2e71  2
-bridge   10.88.0.0/16  -                         10.88.0.1  shipyard0       0
+NETWORK ID     NAME      DRIVER    SCOPE
+5c1d0e7a93f2   app       bridge    local
+8e0b4f61a2c7   bridge    bridge    local
+1a2b3c4d5e6f   host      host      local
+9f8e7d6c5b4a   none      null      local
 ```
 
-`CONTAINERS` counts the running containers on each.
+As Docker's `network ls`, by name, the built-in `host` and `none` beside the
+networks made (rootless: `host`, `none` and `pasta`, the only ones it has). `-q`
+the IDs, `--no-trunc` the whole ones; `-f` Docker's `name`, `id`, `label`,
+`driver`, `type` (`builtin` or `custom`), `dangling` (`true`: no container up on
+it, never a built-in, as `network rm` and `network prune` count it; refused while a
+container's record can't be read); `--format` its fields (`ID`, `Name`,
+`Driver`, `Scope`, `IPv4`, `IPv6`, `Internal`, `Labels`, `.Label "KEY"`,
+`CreatedAt`), as [`ps`'s](containers.md#formats). Subnets, gateways and the
+containers on each are `network inspect`'s.
 
 ### `shipyard network inspect NETWORK...`
 
-The networks as JSON: the name, subnet, gateway, IPv6 prefix and gateway
+The networks in Docker's shape (`docker network inspect`'s: `Name`, `Id`, `Driver`,
+`IPAM` with the subnets and gateways, `Internal`, `Options`, `Labels`, and the
+`Containers` on it now with their addresses), as a JSON array; `-f` a Go template
+over each (`-f '{{.Name}} {{.Driver}}'`).
+
+`network inspect --shipyard` shows Shipyard's own view instead: the name, subnet,
+gateway, IPv6 prefix and gateway
 (`Subnet6`, `Gateway6`), bridge, whether it's internal,
 when it was made, whether its DNS server is running (`DNSRunning`, see
 [Names](#names)), and each running container on it: its full ID (`Container`,
@@ -143,16 +169,20 @@ and IPv6 address, MAC address, host-side veth and published ports, each with its
 
 ### `shipyard network rm NETWORK...`
 
-Removes networks and their bridges. A network a container is on is refused,
-whether it's running or stopped: a stopped one would join it again when it
-starts ("the network app is in use by web, db": up to five, by name; a run with
-no record, such as `--no-image`, by its run ID). Disconnect it first
-(`shipyard network disconnect`), or remove it. `bridge` is refused too. It
-carries on past a network it can't remove, and exits with 125 if any failed.
+Removes networks and their bridges. A network a container that's up is on
+(running, paused, or about to restart) is refused ("the network app is in use by
+web, db": up to five, by name; a run with no record, such as `--no-image`, by its
+run ID): stop it, disconnect it (`shipyard network disconnect`), or remove it. A
+stopped container doesn't keep its networks, as Docker's don't: the network goes,
+and the container's next start fails ("there's no network named app") until it's
+connected elsewhere or removed. `bridge` is refused too. It
+carries on past a network it can't remove, and exits with 1 if any failed.
 
 ### `shipyard network prune [-f]`
 
-Removes every network no container is on, running or stopped, except `bridge`.
+Removes every network no container that's up is on, except `bridge`. `--filter`
+takes `until` (made before; a time, or a duration such as `24h`), `label` and
+`label!`.
 It asks first on a terminal; elsewhere it needs `-f`.
 
 ## Addresses
@@ -594,8 +624,8 @@ sudo firewall-cmd --permanent --zone=trusted --add-interface=shy-1a2b3c4d5e && s
 ```
 
 The binding is kept across reboots and holds even while the bridge doesn't exist.
-Each network's bridge needs its own line: `shipyard network inspect NAME` names
-it, and the warning gives the line in full.
+Each network's bridge needs its own line: `shipyard network inspect --shipyard
+NAME` names it (`Bridge`), and the warning gives the line in full.
 
 **Docker** drops forwarded traffic by default, and keeps its `DOCKER-USER` chain for
 your own rules. Add three:
@@ -649,6 +679,34 @@ rules that let in port 53 from the network's bridge.
 
 Rules made with the older iptables (iptables-legacy rather than iptables-nft) live
 outside nftables, where Shipyard can't read them: they get no warning.
+
+## Another container's network
+
+`--network container:NAME` starts a container in another's network: the same
+interfaces, addresses and ports (a server in one is reached from the other on
+`localhost`), the other's hostname, and `/etc/hosts` and `/etc/resolv.conf` made as
+the other's are. Everything else (its processes, its files, its mounts) is its own.
+Compose's `network_mode: "service:NAME"` is the same.
+
+```sh
+shipyard run -d --name web nginx:alpine
+shipyard run --rm --network container:web alpine:3.20 wget -qO- localhost
+```
+
+- The other container must be running (or paused) at each start: `cannot join network of
+  a non running container: NAME` otherwise. It's kept by its ID, so a rename changes
+  nothing.
+- Nothing of its own can go in that network: `--hostname`, `--add-host`, `--dns*`,
+  `-p`/`-P`, `--ip`, `--mac-address`, `--network-alias`, another `--network` and `net.*`
+  settings are refused, and so is `network connect`. A container that joins one that
+  joins another's is refused too: join that one.
+- When the other stops, restarts or goes, those that join it lose their network (it was
+  the other's), and `stop`, `restart` and `rm` say so. Start them again once it's up. At
+  boot, `system recover` starts them after the others.
+- Without root, the other's user namespace is joined too (it owns that network), with its
+  ID maps.
+- `inspect` shows `HostConfig.NetworkMode` as `container:ID` and no networks of its own;
+  `stats` shows no network traffic of its own.
 
 ## The hostname and `/etc` files
 
@@ -706,7 +764,7 @@ shipyard run --dns 1.1.1.1 --add-host db:10.0.0.5 alpine:3.20 \
 
 ## Errors
 
-These exit with 125, before the command starts:
+These stop a run before the command starts (`run` exits with 125, `create` with 1):
 
 - `--network bridge` or a name without root: "bridge networks need root for now:
   a bridge and its veth pairs are the host's devices (rootless containers get a

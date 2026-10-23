@@ -56,8 +56,9 @@ pub use lifecycle::{
     attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
     monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
-    peek_status, process_started, ps, release, remove_failed_logs, remove_monitor_cgroup, resume,
-    start, start_helper, start_helper_in_view, state, stats, status, stop, update, wait,
+    peek_status, process_started, ps, raise_own_descriptor_limit, release, remove_failed_logs,
+    remove_monitor_cgroup, resume, running_init, start, start_helper, start_helper_in_view, state,
+    stats, status, stop, update, wait,
 };
 
 pub use helper::{Helper, HelperFailure, HelperIo, RootView, RunningHelper};
@@ -376,6 +377,10 @@ pub struct ExecOptions {
     /// command: its signal, then SIGKILL to all it started after its
     /// timeout (by default SIGTERM, then 10 s).
     pub stop: crate::process::StopPolicy,
+    /// Where to write the command's PID (as the host sees it) once it runs,
+    /// detached or not (runc's `--pid-file`; F117: the API's exec inspect).
+    /// A failure to write it is logged, never the exec's.
+    pub pid_file: Option<PathBuf>,
 }
 
 impl ExecOptions {
@@ -781,10 +786,11 @@ pub enum ContainerError {
     /// Found before anything is made, as a bundle's mistakes are.
     #[error("the container's plan can't be run: {0}")]
     InvalidPlan(#[from] PlanError),
-    /// A `plan.json` of another version than this binary's (one binary
-    /// writes and reads it, so another can only be a mistake).
+    /// A `plan.json` of a version this binary doesn't read (one binary
+    /// writes and reads it, so another can only be a mistake, or a newer
+    /// binary's plan).
     #[error(
-        "{} has version {found}, and this Shipyard writes and reads version {}",
+        "{} has version {found}, and this Shipyard reads versions 1 to {}",
         plan::PLAN_FILE,
         plan::PLAN_VERSION
     )]

@@ -13,7 +13,7 @@
 
 mod bundle;
 mod cleanup;
-mod command;
+pub(crate) mod command;
 mod connect;
 #[cfg(target_os = "linux")]
 mod create;
@@ -30,8 +30,11 @@ mod held_off;
 mod helper;
 pub(crate) mod holds;
 mod isolation;
+mod joined;
 mod launch;
+mod mounts;
 mod network;
+mod pause;
 mod plan;
 mod prepare;
 mod recover;
@@ -56,23 +59,34 @@ pub use cleanup::cleanup_entry_point;
 pub use command::{parse_name_or_id, parse_user};
 pub use connect::{ConnectRequest, connect, connect_with, disconnect, disconnect_with};
 pub use detached::{
-    Detached, Finished, Foreground, attached, create, detached, detached_with, remove, start,
-    start_attached, start_with,
+    Detached, Finished, Foreground, RemoveOptions, attached, create, detached, detached_with,
+    remove, remove_with, start, start_attached, start_with,
 };
+pub(crate) use detached::{remove_for_prune, settle_for_prune};
 pub use devices::DeviceArg;
 #[cfg(target_os = "linux")]
 pub(crate) use files::{Files, container_files};
 pub use health::health_entry_point;
+pub(crate) use joined::resolve_joins;
 pub use launch::{Outcome, run};
+pub use mounts::{DockerMount, MountRequest, TmpfsMount, parse_mount};
 pub(crate) use network::MAX_NETWORKS;
+pub use pause::{pause, unpause};
 pub use plan::{Checked, Invocation, Planned, check};
 pub use prepare::ImageDefaults;
 #[cfg(target_os = "linux")]
 pub(crate) use prepare::{prepare_image, prepare_owned_image};
 #[cfg(target_os = "linux")]
+pub(crate) use recover::boot_time;
+#[cfg(target_os = "linux")]
 pub(crate) use recover::restarts_held_off;
 pub use recover::{Booted, Stopped, boot, stop_for_the_host};
 pub use rename::rename;
-pub use request::{CapabilityArg, Limits, RunRequest, RunStreams, SecurityOpt, Supervision};
+pub(crate) use request::Joined;
+pub use request::{
+    CapabilityArg, DEFAULT_PIDS_MAX, IpcMode, Limits, RunRequest, RunStreams, SecurityOpt,
+    Supervision,
+};
 pub use stop::{StopOptions, kill, restart, stop, wait};
 pub use update::{UpdateRequest, update};
+pub use volumes::{MadeSource, bind_source, covers, make_bind_source};

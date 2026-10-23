@@ -198,7 +198,9 @@ pub fn parse_publish(spec: &str) -> Result<Vec<PortRequest>, PortError> {
     // `0.0.0.0` and `[::]` are every address, as no address is.
     let host_ip = host_ip.filter(|ip| !ip.is_unspecified());
     let container = parse_range(container).ok_or_else(|| invalid("a port is 1 to 65535"))?;
+    // Host port 0 is any free one, as none is (Docker's `-p 0:80`).
     let host = host
+        .filter(|host| *host != "0")
         .map(|host| parse_range(host).ok_or_else(|| invalid("a port is 1 to 65535")))
         .transpose()?;
     let count = u32::from(container.1 - container.0) + 1;
@@ -224,8 +226,10 @@ pub fn parse_publish(spec: &str) -> Result<Vec<PortRequest>, PortError> {
         .collect())
 }
 
-/// `N` or `N-M` (N ≤ M), each 1 to 65535.
-fn parse_range(text: &str) -> Option<(u16, u16)> {
+/// `N` or `N-M` (N ≤ M), each 1 to 65535, in digits only: a port range
+/// as `-p`, `--expose` and an image's `ExposedPorts` write it.
+#[must_use]
+pub fn parse_range(text: &str) -> Option<(u16, u16)> {
     let port = |text: &str| {
         text.parse::<u16>()
             .ok()
@@ -238,6 +242,19 @@ fn parse_range(text: &str) -> Option<(u16, u16)> {
         }
         None => port(text).map(|port| (port, port)),
     }
+}
+
+/// An `ExposedPorts` key as one form (`80/tcp`, `53/udp`; a bare `80` is
+/// TCP's), so the same port written two ways is one; `None` for one that
+/// can't be read.
+#[must_use]
+pub fn exposed_key(key: &str) -> Option<String> {
+    let port = parse_exposed(key)?;
+    let protocol = match port.protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+    };
+    Some(format!("{}/{protocol}", port.container_port))
 }
 
 /// An image's `ExposedPorts` key (`80/tcp`, `53/udp`, or `8080`, TCP) as a
@@ -649,6 +666,10 @@ mod tests {
         assert_eq!(local.host_port, Some(8080));
         // An address, any port.
         assert_eq!(one("127.0.0.1::80").host_port, None);
+        // Port 0 is any port too (Docker's `-p 0:80`); a range from it isn't.
+        assert_eq!(one("127.0.0.1:0:80").host_port, None);
+        assert_eq!(one("0:80").host_port, None);
+        assert!(parse_publish("0-1:80-81").is_err());
         let range = parse_publish("8000-8002:80-82").unwrap();
         assert_eq!(
             range

@@ -41,7 +41,8 @@ pub mod security;
 #[cfg(unix)]
 pub mod terminal {
     pub use crate::process::terminal::{
-        DEFAULT_SIZE, RawMode, Size, host_pty, set_window_size, terminal_size,
+        DEFAULT_SIZE, RawMode, Size, host_pty, set_window_size, take_controlling_terminal,
+        terminal_size,
     };
 }
 mod small_file;

@@ -40,13 +40,33 @@ What a container is kept from, and tested for:
 
 What a container isn't kept from by default (as with Docker):
 
-- **The host's processes and memory running out:** there's no default limit on a
-  container's processes or memory; give `--pids-limit` and `--memory` to one you
-  don't trust.
+- **The host's memory running out:** there's no default limit on a container's
+  memory; give `--memory` to one you don't trust. Its processes are limited to 2,048
+  by default where the `pids` controller reaches its cgroup (as root; rootless where
+  it's delegated: `shipyard doctor` says), so a fork bomb can't take the host's whole
+  PID space; give a lower `--pids-limit` to one you don't trust.
 - **The host's services and the cloud's metadata:** a container on the default
   network, `bridge`, can reach the host's own addresses and `169.254.169.254`; on a
   cloud VM that can be the instance's credentials. A network made with
   `--isolate-host` keeps its containers from both.
+- **The container whose network it joins** (`--network container:NAME`): the two share
+  a network, so each sees the other's traffic and ports. Rootless, the one that joins
+  shares the other's user namespace too, whose root holds privileges over the joiner's
+  own namespaces (its mounts, processes, names): join only a container you'd trust
+  with yours, as with Docker.
+
+**Docker's API socket is root, or you:** whoever can connect to the socket of
+`shipyard system service` runs containers as its user, as with Docker's own socket:
+root's (`/run/shipyard/api.sock`, the systemd units' `shipyard.socket`) is
+root-equivalent, a user's (`$XDG_RUNTIME_DIR/shipyard/api.sock`) is that user. Each
+socket is its user's alone (mode 0600 in a 0700 directory), and the service checks
+every connection's user (`SO_PEERCRED`) before it reads a byte. Don't loosen the
+socket's mode or hand its directory to a group, as you would for Docker's `docker`
+group: that group is root.
+
+**Volumes hold what images put there:** a volume filled from an image keeps the
+image's files as they are, set-user-ID ones too. The volume store is root's alone
+(0700) as root, so no other user can reach them.
 
 **The AppArmor profile** (`contrib/apparmor/shipyard`) lets anyone who can run
 Shipyard's binaries make user namespaces through them, where Ubuntu otherwise
@@ -60,7 +80,11 @@ you trust:
 - **Your home, shared:** the VM can read and write your whole home (as Docker
   Desktop's file sharing can), so a container that escaped into the VM could too. A
   container sees only what you bind into it, and a path outside your home is refused
-  before anything runs. Set-user-ID bits and device files in your home mean nothing in
+  before anything runs, for the `shipyard` CLI's commands. Docker's socket on the
+  Mac (`docker.sock`, `shipyard vm install`) reaches the VM's own Docker API as
+  root in the VM: a `docker run -v /:/host` there sees the VM's whole file system,
+  your home included. It's yours alone (mode 0600, your user checked), as Docker
+  Desktop's is. Set-user-ID bits and device files in your home mean nothing in
   the VM, nor in a container you bind them into (a file copied into a container with
   `shipyard cp` keeps its mode, as on Linux). The VM's own files (its disk, its
   socket) are hidden from a bind of your home.

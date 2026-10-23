@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use crate::devices::{DeviceKind, DeviceNode};
 use crate::isolation::{
-    CgroupMount, IdMap, IdMaps, Isolation, Mount, MountFlag, MountKind, Namespace, NetDevice, Root,
-    StandardMount,
+    CgroupMount, IdMap, IdMaps, Isolation, JoinSource, Mount, MountFlag, MountKind, Namespace,
+    NamespaceJoin, NetDevice, Root, StandardMount,
 };
 use crate::process::{Env, ProcessSpec, Rlimit, RlimitValue, User};
 use crate::security::seccomp::Profile;
@@ -673,7 +673,12 @@ impl Reader<'_> {
         let spec = self.process(process)?;
         let mut linux = config.linux.unwrap_or_default();
         let mut isolation = Isolation::standard();
-        (isolation.namespaces, isolation.network_path) = self.namespaces(&linux.namespaces)?;
+        let listed = self.namespaces(&linux.namespaces)?;
+        (
+            isolation.namespaces,
+            isolation.network_path,
+            isolation.joins,
+        ) = (listed.namespaces, listed.network_path, listed.joins);
         // Its terminal is made from the container's own devpts, which would
         // otherwise be mounted over the host's.
         if terminal.is_some() && !isolation.has(Namespace::Mount) {
@@ -884,27 +889,33 @@ impl Reader<'_> {
         Ok(spec)
     }
 
-    /// The namespaces to create, and a network namespace to join (its
-    /// `path`) instead of creating one. One the spec knows but Shipyard can't
-    /// make yet, or a path to another kind, is refused; an unknown type is an
-    /// error (the spec says so).
-    fn namespaces(
-        &mut self,
-        listed: &[NamespaceConfig],
-    ) -> Result<(Vec<Namespace>, Option<PathBuf>), BundleError> {
+    /// The namespaces listed, and those joined by their `path` instead of
+    /// made: a network one (kept as `network_path`), an IPC or a UTS one
+    /// (joins). One the spec knows but Shipyard can't make yet, or a path to
+    /// another kind, is refused; an unknown type is an error (the spec says
+    /// so).
+    fn namespaces(&mut self, listed: &[NamespaceConfig]) -> Result<ListedNamespaces, BundleError> {
         let mut namespaces = Vec::new();
         let mut network_path = None;
+        let mut joins = Vec::new();
         for namespace in listed {
             let path = namespace.path.as_ref().filter(|path| !path.is_empty());
             if let Some(path) = path {
-                if namespace.kind != "network" {
-                    self.refuse(
-                        &format!("linux.namespaces ({}, path)", namespace.kind),
-                        "joining an existing namespace of this kind comes in a later version",
-                    );
-                    continue;
+                let path = PathBuf::from(path);
+                match namespace.kind.as_str() {
+                    "network" => network_path = Some(path),
+                    "ipc" => joins.push(NamespaceJoin::new(Namespace::Ipc, JoinSource::Path(path))),
+                    "uts" => joins.push(NamespaceJoin::new(Namespace::Uts, JoinSource::Path(path))),
+                    // A PID namespace joined: F134. A user, mount or cgroup
+                    // namespace: a new root is always its own.
+                    _ => {
+                        self.refuse(
+                            &format!("linux.namespaces ({}, path)", namespace.kind),
+                            "joining an existing namespace of this kind comes in a later version",
+                        );
+                        continue;
+                    }
                 }
-                network_path = Some(PathBuf::from(path));
             }
             match namespace.kind.as_str() {
                 "pid" => namespaces.push(Namespace::Pid),
@@ -925,7 +936,11 @@ impl Reader<'_> {
                 }
             }
         }
-        Ok((namespaces, network_path))
+        Ok(ListedNamespaces {
+            namespaces,
+            network_path,
+            joins,
+        })
     }
 
     /// `linux.netDevices`: `{"HOST NAME": {"name": "NAME INSIDE"}}`, the name
@@ -1212,6 +1227,14 @@ impl Reader<'_> {
         }
         Ok(())
     }
+}
+
+/// `linux.namespaces`, read: the kinds listed, a network namespace's path,
+/// and the namespaces joined by path.
+struct ListedNamespaces {
+    namespaces: Vec<Namespace>,
+    network_path: Option<PathBuf>,
+    joins: Vec<NamespaceJoin>,
 }
 
 #[cfg(test)]
@@ -1602,16 +1625,44 @@ mod tests {
             joined.isolation.network_path.as_deref(),
             Some(Path::new("/var/run/netns/blue"))
         );
-        // A path to another kind stays refused.
-        let fields = refused(&config(&json!({
-            "linux": {"namespaces": [{"type": "mount"}, {"type": "ipc", "path": "/proc/1/ns/ipc"}]}
-        })));
-        assert!(
-            fields
-                .iter()
-                .any(|field| field.starts_with("linux.namespaces (ipc, path)")),
-            "{fields:#?}"
+    }
+
+    /// An IPC or UTS namespace's path is joined (step 11.4b2); a PID, user,
+    /// mount or cgroup namespace's stays refused.
+    #[test]
+    fn ipc_and_uts_namespaces_are_joined_by_path() {
+        let joined = TestBundle::new(&config(&json!({
+            "linux": {
+                "namespaces": [
+                    {"type": "pid"}, {"type": "mount"},
+                    {"type": "ipc", "path": "/proc/1/ns/ipc"},
+                    {"type": "uts", "path": "/proc/1/ns/uts"}
+                ]
+            }
+        })))
+        .load()
+        .unwrap();
+        assert_eq!(
+            joined.isolation.joins,
+            [
+                NamespaceJoin::new(Namespace::Ipc, JoinSource::Path("/proc/1/ns/ipc".into())),
+                NamespaceJoin::new(Namespace::Uts, JoinSource::Path("/proc/1/ns/uts".into())),
+            ]
         );
+        assert!(joined.isolation.has(Namespace::Ipc) && !joined.isolation.makes(Namespace::Ipc));
+        for kind in ["pid", "mount", "user", "cgroup"] {
+            let fields = refused(&config(&json!({
+                "linux": {"namespaces": [
+                    {"type": "mount"}, {"type": kind, "path": format!("/proc/1/ns/{kind}")}
+                ]}
+            })));
+            assert!(
+                fields
+                    .iter()
+                    .any(|field| field.starts_with(&format!("linux.namespaces ({kind}, path)"))),
+                "{kind}: {fields:#?}"
+            );
+        }
     }
 
     #[test]
@@ -1706,7 +1757,7 @@ mod tests {
             "linux": {
                 "namespaces": [
                     {"type": "pid"}, {"type": "mount"}, {"type": "time"},
-                    {"type": "uts", "path": "/proc/1/ns/uts"}
+                    {"type": "cgroup", "path": "/proc/1/ns/cgroup"}
                 ],
                 "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"},
                 "resources": {"hugepageLimits": [{"pageSize": "2MB", "limit": 1}]},
@@ -1740,7 +1791,7 @@ mod tests {
             "linux.personality",
             "linux.timeOffsets",
             "linux.namespaces (time)",
-            "linux.namespaces (uts, path)",
+            "linux.namespaces (cgroup, path)",
             "linux.resources",
             "linux.devices",
             "linux.mountLabel",
@@ -2291,7 +2342,8 @@ mod tests {
             mounts.get(1).map(|m| &m.kind),
             Some(&MountKind::Bind {
                 source: data,
-                recursive: false
+                recursive: false,
+                made_below: None,
             })
         );
         let mut cache = Mount::tmpfs("/cache");

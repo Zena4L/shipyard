@@ -62,7 +62,7 @@ impl RunNetwork {
             exposed,
             engine.reporter().as_ref(),
         );
-        if !plan.etc_files && plan.mode.own_namespace() {
+        if !plan.etc_files && plan.in_a_network_namespace() {
             warn_about_host_resolvers(engine);
         }
         #[cfg(target_os = "linux")]
@@ -125,9 +125,17 @@ impl RunNetwork {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = requests;
+        // The host's network, none, or another container's: nothing to
+        // connect; the other's files made from what it has (D11.4b2b-2).
+        let (addresses, resolver, for_pasta) = plan
+            .joined
+            .as_ref()
+            .map_or((&[][..], None, false), |joined| {
+                (joined.addresses.as_slice(), joined.resolver, joined.pasta)
+            });
         let dir = plan
             .etc_files
-            .then(|| RunDir::make(engine.paths(), plan, &[], None, false))
+            .then(|| RunDir::make(engine.paths(), plan, addresses, resolver, for_pasta))
             .transpose()?;
         Ok(RunNetwork {
             connection: Connection::Nothing,

@@ -142,6 +142,27 @@ mod linux {
     use crate::run::helper::Log;
     use crate::{Engine, Paths};
 
+    /// Says the end `record_end` recorded, if it's this start's (F80): a
+    /// start that never ran has no `die`, though its record has its last
+    /// start's again. Then its mark goes (F88): said, or nothing to say.
+    /// Whether this start's command ran (the runtime's word: its gate
+    /// opened): only then is its end one the restart policy follows (F81).
+    fn say_end(
+        engine: &Engine,
+        id: Option<&ContainerId>,
+        recorded: &crate::Result<(containers::Record, bool)>,
+    ) -> bool {
+        let (Some(id), Ok((record, wrote))) = (id, recorded) else {
+            return false;
+        };
+        if *wrote {
+            test_pause_after_the_end();
+            crate::events::container_ended(engine, record);
+        }
+        containers::end_said(engine, id);
+        *wrote
+    }
+
     /// Records how container `id`'s start ended, from the runtime's `exit`
     /// record: its end and exit if it started; if it never did, what its
     /// last start left put back (F64). Its kept-aside last start is let go.
@@ -194,6 +215,62 @@ mod linux {
         updated.map(|record| (record, wrote))
     }
 
+    /// The test hook (`SHIPYARD_TEST_CLEANUP_PAUSE`, a path): the end
+    /// recorded and not yet said, this `__cleanup` writes its PID there and
+    /// waits a minute, for a test to kill it in F88's window. Unset: nothing.
+    const PAUSE_VAR: &str = "SHIPYARD_TEST_CLEANUP_PAUSE";
+
+    /// [`PAUSE_VAR`]'s pause.
+    fn test_pause_after_the_end() {
+        pause_at(PAUSE_VAR);
+    }
+
+    /// Where the hook `var` names, this process's PID (written whole:
+    /// renamed into place, so a test never reads half of it), then a
+    /// minute's wait, for a test to act in the window. Unset, or a release
+    /// build: nothing.
+    fn pause_at(var: &str) {
+        if let Some(path) = pause_path(std::env::var_os(var), cfg!(debug_assertions)) {
+            crate::test_pause::announce(&path, &std::process::id().to_string());
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// Where a test hook's `value` asks for a pause: in a debug build (the
+    /// tests') only, as the other hooks (`Paths::from_env`), so a release's
+    /// `__cleanup` never holds a container's locks for a variable it was
+    /// started with (11.7).
+    fn pause_path(
+        value: Option<std::ffi::OsString>,
+        debug_build: bool,
+    ) -> Option<std::path::PathBuf> {
+        value
+            .filter(|value| debug_build && !value.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    /// Container `id`'s restart, taken (if no one else has it) before its
+    /// clean-up lets it go: a `rm` that waits on `running` then finds it
+    /// restarting, never ended for good in the moment before its policy
+    /// decides. Handed to the policy, which holds it while it waits.
+    fn restart_held(engine: &Engine, id: &str) -> Option<nix::fcntl::Flock<std::fs::File>> {
+        let id = ContainerId::parse(id).ok()?;
+        // A moment's wait, not none: a `restart_pending` look (a `network
+        // rm`'s, a listing's) takes this lock for an instant, and a try that
+        // met it would let the container go unheld (11.6b's engine review).
+        crate::containers::restarting_lock(engine, &id, std::time::Duration::from_millis(200)).ok()
+    }
+
+    /// The test hook (`SHIPYARD_TEST_CLEANUP_RESTART_PAUSE`, a path): the
+    /// container let go, its restart not yet decided, this `__cleanup`
+    /// pauses as [`test_pause_after_the_end`] does. Unset: nothing.
+    const RESTART_PAUSE_VAR: &str = "SHIPYARD_TEST_CLEANUP_RESTART_PAUSE";
+
+    /// [`RESTART_PAUSE_VAR`]'s pause.
+    fn test_pause_before_the_restart() {
+        pause_at(RESTART_PAUSE_VAR);
+    }
+
     /// Whether a failure to record an end is worth trying again (F45): the
     /// store refused the write (a full disk) or was held past its wait.
     fn retryable(error: &crate::Error) -> bool {
@@ -212,7 +289,7 @@ mod linux {
     /// tries. It stops when the host is stopping, the container is removed,
     /// its runtime state is gone (nothing left to record: the recovery
     /// pass settles it), or another settled the end (then the policy, as
-    /// any end's). A disk that never frees keeps it trying, a minute apart
+    /// any end's, if this start ran: F81). A disk that never frees keeps it trying, a minute apart
     /// at most, each step of the wait checking whether to stop.
     fn retry_end(
         engine: &Engine,
@@ -258,7 +335,11 @@ mod linux {
             };
             if record.finished.is_some() {
                 drop((running, operation));
-                after_end(engine, &id);
+                // (F81: as below, a start that never ran sets off no
+                // policy, though another settled its end.)
+                if exit.and_then(|exit| exit.started) != Some(false) {
+                    after_end(engine, &id, None);
+                }
                 return;
             }
             if !matches!(runtime::status(root, id.as_str()), Ok(Some(_))) {
@@ -282,18 +363,20 @@ mod linux {
                 ));
                 return;
             }
-            match record_end(engine, &id, exit) {
-                Ok((record, wrote)) => {
-                    if wrote {
-                        crate::events::container_ended(engine, &record);
-                    }
+            let recorded = record_end(engine, &id, exit);
+            let ran = say_end(engine, Some(&id), &recorded);
+            match recorded {
+                Ok(_) => {
                     match runtime::delete(root, id.as_str(), false) {
                         Ok(_) | Err(ContainerError::NotFound(_)) => {}
                         Err(error) => log.line(&format!("the runtime's state: {error}")),
                     }
                     drop((running, operation));
                     log.line("the end recorded, on a retry");
-                    after_end(engine, &id);
+                    // (F81: a start that never ran sets off no policy.)
+                    if ran {
+                        after_end(engine, &id, None);
+                    }
                     return;
                 }
                 Err(error) if retryable(&error) => {
@@ -383,13 +466,14 @@ mod linux {
         {
             fail(format!("the writable layer: {error:#}"));
         }
-        let recorded = ContainerId::parse(&arguments.id)
-            .and_then(|id| record_end(&engine, &id, exit.as_ref()));
-        // Its end said only if it's this start's (F80): a start that never
-        // ran has no `die`, though its record has its last start's again.
-        if let Ok((record, true)) = &recorded {
-            crate::events::container_ended(&engine, record);
-        }
+        let (id, recorded) = match ContainerId::parse(&arguments.id) {
+            Ok(id) => {
+                let recorded = record_end(&engine, &id, exit.as_ref());
+                (Some(id), recorded)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        let ran = say_end(&engine, id.as_ref(), &recorded);
         let ended = match recorded {
             // Only now: until the record has it, the runtime's exit record is
             // the only copy of how it ended.
@@ -410,26 +494,40 @@ mod linux {
         };
         // Only once its end is recorded and its runtime state gone: else a
         // later `rm` (or start) finds what's left and settles it.
+        let mut made = Vec::new();
         if arguments.auto_remove && ended {
             // Then the container itself (`--rm`): its pin, and its record
             // (with this log, and its logs).
-            if let Err(error) = ContainerId::parse(&arguments.id)
-                .and_then(|id| crate::run::remove::forget(&engine, &id))
-            {
-                fail(format!("removing the container: {error:#}"));
+            match ContainerId::parse(&arguments.id).and_then(|id| removed_itself(&engine, &id)) {
+                Ok(anonymous) => made = anonymous,
+                Err(error) => fail(format!("removing the container: {error:#}")),
             }
         }
+        // Only for an end the policy follows (F81): else a waiting `rm`
+        // would find it restarting for a start that never ran.
+        let restarting = (!arguments.auto_remove && ended && ran)
+            .then(|| restart_held(&engine, &arguments.id))
+            .flatten();
         // Last: free, it says everything of this start is let go (a
         // `start` or `rm` waits for it).
         drop((held.unknown, held.running));
+        // Then its anonymous volumes, as Docker's `--rm` takes them: only
+        // now, its holds on them let go.
+        crate::run::volumes::remove_anonymous(&engine, &made);
+        test_pause_before_the_restart();
         // Then its restart policy, if it has one and it ended (and wasn't
         // removed): this process waits out the backoff and starts it again.
-        // An end that couldn't be recorded is retried first.
+        // Not after a start that never ran (F81: a user's `start` that
+        // failed, its last end put back; Docker's policy follows a run, not
+        // a failed start; a policy's own failed restart is retried by its
+        // waiter). An end that couldn't be recorded is retried first.
         if !arguments.auto_remove
             && let Ok(id) = ContainerId::parse(&arguments.id)
         {
             if ended {
-                crate::run::restart_policy::after_end(&engine, &id);
+                if ran {
+                    crate::run::restart_policy::after_end(&engine, &id, restarting);
+                }
             } else if retry {
                 retry_end(&engine, &arguments, exit.as_ref(), mine, &log);
             }
@@ -489,6 +587,17 @@ mod linux {
                     .ok()
             })
             .collect()
+    }
+
+    /// A `--rm` container `id`, removed: the anonymous volumes its create
+    /// made, for the caller to remove once its holds on them are let go.
+    fn removed_itself(
+        engine: &crate::Engine,
+        id: &ContainerId,
+    ) -> crate::error::Result<Vec<String>> {
+        let made = crate::run::volumes::made_anonymous(engine, id);
+        crate::run::remove::forget(engine, id)?;
+        Ok(made)
     }
 
     /// The holds, by what they are.
@@ -654,6 +763,20 @@ mod linux {
 
         fn open(path: &std::path::Path) -> OwnedFd {
             OwnedFd::from(std::fs::File::open(path).unwrap())
+        }
+
+        /// A test hook pauses a debug build only: a release's variable,
+        /// set or not, is nothing; an empty one is nothing either.
+        #[test]
+        fn pauses_are_debug_builds_only() {
+            let set = || Some(std::ffi::OsString::from("/tmp/pause"));
+            assert_eq!(
+                pause_path(set(), true),
+                Some(std::path::PathBuf::from("/tmp/pause"))
+            );
+            assert_eq!(pause_path(set(), false), None);
+            assert_eq!(pause_path(None, true), None);
+            assert_eq!(pause_path(Some(std::ffi::OsString::new()), true), None);
         }
 
         /// The holds' kinds come from the monitor's labels when it gives

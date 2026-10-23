@@ -12,7 +12,7 @@
 //! This module owns the lifecycle: create, list, inspect, remove, prune.
 //!
 //! **A volume in use is never removed.** A run holds a shared `flock` on the
-//! volume's lock file (`volumes/.<name>.lock`) for as long as it lives
+//! volume's lock file (`volumes/.locks/<name>`) for as long as it lives
 //! ([`Volumes::hold`]); removing takes it exclusive, and gives up if anyone
 //! holds it. A lock goes with its process, however that ends, so a killed
 //! run leaves nothing to clean up. Lock files are never removed (a name's
@@ -20,7 +20,14 @@
 //! what it guards. A volume is removed by renaming it aside (`.trash-…`)
 //! under the lock, then deleting that: what a rootless container wrote as
 //! its other users needs the storage helper, which the caller runs.
+//!
+//! A volume made with labels (Docker's API, step 11.2c2a) keeps them in
+//! `volumes/<name>/labels.json` (versioned from its first write, H2),
+//! written once, before its data directory: a volume is there when its data
+//! directory is, so a half-made one is never listed. One without the file
+//! has none (every volume made before).
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +36,24 @@ use nix::fcntl::{Flock, FlockArg};
 /// The subdirectory holding a volume's actual data, as Docker names it, so a
 /// little metadata could sit beside it later without clashing.
 const DATA_DIR: &str = "_data";
+
+/// A volume's labels, beside its data directory.
+const LABELS_FILE: &str = "labels.json";
+/// The newest `labels.json` this Shipyard reads and writes.
+const LABELS_VERSION: u32 = 1;
+/// The most a `labels.json` holds: written no bigger, read no further.
+const LABELS_MAX: u64 = 64 * 1024;
+/// How long a create waits for the volume's lock (a run making it, a
+/// removal moving it aside: moments).
+const CREATE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `labels.json`: its version, and the labels.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LabelsFile {
+    version: u32,
+    labels: BTreeMap<String, String>,
+}
 
 /// Why a volume operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +78,23 @@ pub enum VolumeError {
     /// A running container uses the volume.
     #[error("the volume {0} is in use by a running container")]
     InUse(String),
+    /// Its `labels.json` isn't one this Shipyard reads: a newer version,
+    /// or not one at all.
+    #[error("the labels of the volume {name}: {source}")]
+    Labels {
+        /// The volume.
+        name: String,
+        /// Why.
+        #[source]
+        source: shipyard_sys::versioned::Error,
+    },
+    /// Labels too many to keep (their file would be over 64 KiB).
+    #[error("the labels of the volume {0} are too many: 64 KiB at most")]
+    TooManyLabels(String),
+    /// Its lock was held past the wait (a removal, a run making it, another
+    /// fill).
+    #[error("the volume {0} is busy: try again")]
+    Busy(String),
 }
 
 /// A named volume: its name and the host directory of its data.
@@ -79,12 +121,25 @@ impl Volumes {
     /// [`VolumeError::Io`] if the directory can't be created.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, VolumeError> {
         let root = root.into().join("volumes");
-        for dir in [root.join(LOCKS_DIR), root.join(TRASH_DIR)] {
+        for dir in [
+            root.join(LOCKS_DIR),
+            root.join(FILL_LOCKS_DIR),
+            root.join(TRASH_DIR),
+        ] {
             std::fs::create_dir_all(&dir).map_err(|source| VolumeError::Io {
                 context: format!("creating the volume store {}", dir.display()),
                 source,
             })?;
         }
+        // The caller's alone, whatever the directory above it is: a volume
+        // may hold what an image put there (a setuid-root file, say: the
+        // copy-up keeps the image's owners and modes), which no other user
+        // may reach (11.6b's security review). An older one is narrowed.
+        let private = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700);
+        std::fs::set_permissions(&root, private).map_err(|source| VolumeError::Io {
+            context: format!("making the volume store {} private", root.display()),
+            source,
+        })?;
         Ok(Self { root })
     }
 
@@ -111,6 +166,151 @@ impl Volumes {
         })
     }
 
+    /// Creates a volume named `name` with `labels` (Docker's API): under its
+    /// lock, exclusive, so a run making it at once (shared) waits or finds
+    /// it made; its `labels.json` first (if it has labels), then its data
+    /// directory. A failure leaves nothing of it.
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::InvalidName`], [`VolumeError::Exists`] (or held by a
+    /// run: then it exists too), or [`VolumeError::Io`].
+    pub fn create_with(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Volume, VolumeError> {
+        validate_name(name)?;
+        let dir = self.root.join(name);
+        let data = dir.join(DATA_DIR);
+        // Made already: said at once, never after waiting out a run that
+        // holds it (shared, for its whole life: 11.6b's runtime review;
+        // Docker's answers with the volume as it is).
+        if data.is_dir() {
+            return Err(VolumeError::Exists(name.to_owned()));
+        }
+        let file = self.lock_file(name)?;
+        let deadline = std::time::Instant::now() + CREATE_WAIT;
+        let _lock = shipyard_sys::lock::lock_until(
+            file,
+            shipyard_sys::lock::Mode::Exclusive,
+            deadline,
+            std::time::Duration::from_millis(20),
+        )
+        .map_err(|errno| match errno {
+            // Held by a run that made it meanwhile: it exists.
+            nix::errno::Errno::EWOULDBLOCK if data.is_dir() => VolumeError::Exists(name.to_owned()),
+            nix::errno::Errno::EWOULDBLOCK => VolumeError::Busy(name.to_owned()),
+            errno => Self::locking(name, errno),
+        })?;
+        if data.is_dir() {
+            return Err(VolumeError::Exists(name.to_owned()));
+        }
+        let creating = |source| VolumeError::Io {
+            context: format!("creating the volume {name}"),
+            source,
+        };
+        // A directory without data is what a create cut short left: taken.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(creating(error)),
+        }
+        let made = self.write_labels(name, labels).and_then(|()| {
+            std::fs::create_dir(&data).map_err(|error| {
+                // Made meanwhile by what takes no lock (`create`): it's there.
+                if error.kind() == std::io::ErrorKind::AlreadyExists && data.is_dir() {
+                    VolumeError::Exists(name.to_owned())
+                } else {
+                    creating(error)
+                }
+            })
+        });
+        if let Err(error) = made {
+            let _ = std::fs::remove_file(dir.join(LABELS_FILE));
+            let _ = std::fs::remove_dir(&dir);
+            return Err(error);
+        }
+        Ok(Volume {
+            name: name.to_owned(),
+            data,
+        })
+    }
+
+    /// Writes `labels` as the volume `name`'s `labels.json` (none: no file,
+    /// any left by a create cut short removed).
+    fn write_labels(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<(), VolumeError> {
+        let path = self.root.join(name).join(LABELS_FILE);
+        let io = |source| VolumeError::Io {
+            context: format!("writing {}", path.display()),
+            source,
+        };
+        if labels.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io(error)),
+                _ => Ok(()),
+            };
+        }
+        let file = LabelsFile {
+            version: LABELS_VERSION,
+            labels: labels.clone(),
+        };
+        let json = serde_json::to_vec(&file).map_err(|error| io(std::io::Error::other(error)))?;
+        if u64::try_from(json.len()).is_ok_and(|len| len > LABELS_MAX) {
+            return Err(VolumeError::TooManyLabels(name.to_owned()));
+        }
+        shipyard_sys::fs::write_atomically(&path, &json, &shipyard_sys::fs::Write::new(0o644))
+            .map_err(|error| io(error.source))
+    }
+
+    /// The labels of the volume `name`: none if it has no `labels.json`
+    /// (one made by a run, or before labels were kept).
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::Labels`] if the file is of a newer version or isn't
+    /// one; [`VolumeError::Io`] if it can't be read (never through a
+    /// symlink, never past 64 KiB).
+    pub fn labels(&self, name: &str) -> Result<BTreeMap<String, String>, VolumeError> {
+        validate_name(name)?;
+        let path = self.root.join(name).join(LABELS_FILE);
+        match shipyard_sys::versioned::read_file::<LabelsFile>(&path, LABELS_MAX, LABELS_VERSION) {
+            Ok(file) => Ok(file.map(|file| file.labels).unwrap_or_default()),
+            Err(shipyard_sys::versioned::FileError::Io(source)) => Err(VolumeError::Io {
+                context: format!("reading {}", path.display()),
+                source,
+            }),
+            Err(shipyard_sys::versioned::FileError::Versioned(source)) => {
+                Err(VolumeError::Labels {
+                    name: name.to_owned(),
+                    source,
+                })
+            }
+        }
+    }
+
+    /// When the volume `name` was made: its directory's last change, which
+    /// is its making (its data lives in `_data`; nothing is written beside
+    /// it after).
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::NotFound`], or [`VolumeError::Io`].
+    pub fn created(&self, name: &str) -> Result<std::time::SystemTime, VolumeError> {
+        self.inspect(name)?;
+        let dir = self.root.join(name);
+        std::fs::metadata(&dir)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|source| VolumeError::Io {
+                context: format!("reading {}", dir.display()),
+                source,
+            })
+    }
+
     /// Returns a volume, creating it if it doesn't exist (the behaviour `run
     /// --volume NAME:...` wants: a named volume is made on first use). Only
     /// under its lock: see [`hold`](Self::hold).
@@ -130,7 +330,13 @@ impl Volumes {
         } else {
             std::fs::create_dir_all(&dir).map_err(creating)?;
             match std::fs::create_dir(&data) {
-                Ok(()) => true,
+                Ok(()) => {
+                    // Made here: a `labels.json` there is what a create cut
+                    // short left (a create holds the lock alone), not this
+                    // volume's.
+                    let _ = std::fs::remove_file(dir.join(LABELS_FILE));
+                    true
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
                 Err(error) => return Err(creating(error)),
             }
@@ -356,6 +562,59 @@ impl Volumes {
         Ok(pruned)
     }
 
+    /// Volume `name`'s fill lock, taken (waiting up to `wait`, unless
+    /// `give_up` says to stop first): one fill from an image at a time
+    /// (step 11.4a2b), apart from the volume's own lock, which runs hold
+    /// shared and a fill needs held. A fill that ended before it was done
+    /// left its marker (`<name>/filling`), which [`Filling::unfinished`]
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::Busy`] if another fill holds it past `wait`, or
+    /// `give_up` said to stop; [`VolumeError::InvalidName`] or
+    /// [`VolumeError::Io`].
+    pub fn lock_fill(
+        &self,
+        name: &str,
+        wait: std::time::Duration,
+        give_up: &dyn Fn() -> bool,
+    ) -> Result<Filling, VolumeError> {
+        validate_name(name)?;
+        let path = self.root.join(FILL_LOCKS_DIR).join(name);
+        let mut file =
+            shipyard_sys::fs::open_lock_file(&path).map_err(|source| VolumeError::Io {
+                context: format!("opening {}", path.display()),
+                source,
+            })?;
+        let deadline = std::time::Instant::now() + wait;
+        let lock = loop {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => break lock,
+                Err((unlocked, nix::errno::Errno::EWOULDBLOCK)) => {
+                    if give_up() || std::time::Instant::now() >= deadline {
+                        return Err(VolumeError::Busy(name.to_owned()));
+                    }
+                    file = unlocked;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err((_, errno)) => return Err(Self::locking(name, errno)),
+            }
+        };
+        Ok(Filling {
+            _lock: lock,
+            marker: self.root.join(name).join(FILLING),
+        })
+    }
+
+    /// Who left volume `name`'s fill unfinished, if anyone did: the
+    /// container its marker names (read without its lock: a look only).
+    #[must_use]
+    pub fn unfinished_fill(&self, name: &str) -> Option<String> {
+        validate_name(name).ok()?;
+        read_marker(&self.root.join(name).join(FILLING))
+    }
+
     /// The lock of volume `name`, taken exclusive: `None` if a run holds it.
     /// (A moment's wait, for another process only looking, as `in_use`
     /// does.)
@@ -401,6 +660,11 @@ mod libc_errno {
 
 /// The directory of the volumes' lock files.
 const LOCKS_DIR: &str = ".locks";
+/// The directory of the volumes' fill locks (apart from `.locks`: a
+/// volume's name may end in anything a suffix would be).
+const FILL_LOCKS_DIR: &str = ".fill-locks";
+/// The marker of a fill under way, in a volume's directory beside `_data`.
+const FILLING: &str = "filling";
 /// The directory of the volumes moved aside.
 const TRASH_DIR: &str = ".trash";
 /// How many names a volume moved aside is tried under.
@@ -425,6 +689,74 @@ fn trash_name(name: &str) -> String {
 #[must_use]
 pub fn is_trash(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
+/// A volume's fill, its lock held ([`Volumes::lock_fill`]): dropped, the
+/// next fill may go.
+#[derive(Debug)]
+pub struct Filling {
+    _lock: Flock<File>,
+    marker: PathBuf,
+}
+
+impl Filling {
+    /// Who began a fill that ended before it was done, if one did: the
+    /// container its marker names (what's in the volume is part of that
+    /// container's fill; `Some("")` for a marker that names none).
+    #[must_use]
+    pub fn unfinished(&self) -> Option<String> {
+        read_marker(&self.marker)
+    }
+
+    /// Marks the fill under way for container `owner`, before anything is
+    /// copied (written whole, its directory synced): a fill cut short
+    /// (killed, failed, the power lost) leaves the mark, naming whose it
+    /// was.
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::Io`]: it can't be written.
+    pub fn begin(&self, owner: &str) -> Result<(), VolumeError> {
+        // Whole or not at all, its directory synced: a power loss after
+        // the copy began never loses it.
+        shipyard_sys::fs::write_atomically(
+            &self.marker,
+            owner.as_bytes(),
+            &shipyard_sys::fs::Write::new(0o600),
+        )
+        .map_err(|error| VolumeError::Io {
+            context: format!("marking {}", self.marker.display()),
+            source: error.source,
+        })
+    }
+
+    /// Marks the fill done (the mark removed, its directory synced).
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeError::Io`]: the mark can't be removed.
+    pub fn done(self) -> Result<(), VolumeError> {
+        let io = |source| VolumeError::Io {
+            context: format!("removing {}", self.marker.display()),
+            source,
+        };
+        match std::fs::remove_file(&self.marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io(source)),
+        }
+        match self.marker.parent() {
+            Some(dir) => File::open(dir).and_then(|dir| dir.sync_all()).map_err(io),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What a fill's marker at `path` says (its owner), if it's there: read
+/// with a bound, never through a link.
+fn read_marker(path: &Path) -> Option<String> {
+    let bytes = shipyard_sys::fs::read_bounded(path, 256).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// A volume a run holds (see [`Volumes::hold`]): released when dropped
@@ -563,6 +895,28 @@ impl VolumeMount {
 
 #[cfg(test)]
 mod tests {
+
+    /// The volume store is the caller's alone (0700), one made wider before
+    /// narrowed: a volume may hold an image's setuid-root file.
+    #[test]
+    fn the_volume_store_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = std::env::temp_dir().join(format!("volumes-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("volumes")).unwrap();
+        std::fs::set_permissions(
+            scratch.join("volumes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        Volumes::open(&scratch).unwrap();
+        let mode = std::fs::metadata(scratch.join("volumes"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -635,6 +989,141 @@ mod tests {
         assert!(created.data.is_dir());
         assert_eq!(volumes.inspect("data").unwrap(), created);
         assert_eq!(volumes.list().unwrap(), vec![created]);
+    }
+
+    /// A volume made with labels keeps them in its `labels.json`, read
+    /// back as written; one without (made by a run, or before 11.2c2a)
+    /// has none; its creation time is its making's.
+    #[test]
+    fn a_volume_keeps_its_labels() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let labels = BTreeMap::from([
+            ("com.docker.compose.project".to_owned(), "app".to_owned()),
+            ("empty".to_owned(), String::new()),
+        ]);
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+        let made = volumes.create_with("data", &labels).unwrap();
+        assert!(made.data.is_dir());
+        assert_eq!(volumes.labels("data").unwrap(), labels);
+        assert_eq!(volumes.list().unwrap(), vec![made]);
+        assert!(volumes.created("data").unwrap() >= before);
+        let written =
+            std::fs::read_to_string(volumes.root().join("data").join(LABELS_FILE)).unwrap();
+        assert!(written.starts_with(r#"{"version":1,"#), "{written}");
+
+        volumes.create("plain").unwrap();
+        assert!(volumes.labels("plain").unwrap().is_empty());
+        assert!(!volumes.root().join("plain").join(LABELS_FILE).exists());
+        volumes.create_with("bare", &BTreeMap::new()).unwrap();
+        assert!(!volumes.root().join("bare").join(LABELS_FILE).exists());
+        assert!(matches!(
+            volumes.create_with("data", &labels),
+            Err(VolumeError::Exists(_))
+        ));
+    }
+
+    /// A `labels.json` of a newer version, or not one at all, or a symlink,
+    /// is refused, never guessed at.
+    #[test]
+    fn labels_that_cant_be_read_are_refused() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        volumes.create("data").unwrap();
+        let path = volumes.root().join("data").join(LABELS_FILE);
+        for bad in [
+            r#"{"version":2,"labels":{}}"#,
+            "not json",
+            r#"{"labels":{}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                matches!(volumes.labels("data"), Err(VolumeError::Labels { .. })),
+                "{bad}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            volumes.root().join("elsewhere"),
+            r#"{"version":1,"labels":{"a":"b"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(volumes.root().join("elsewhere"), &path).unwrap();
+        assert!(matches!(
+            volumes.labels("data"),
+            Err(VolumeError::Io { .. })
+        ));
+    }
+
+    /// Labels whose file would be over 64 KiB are refused, and nothing
+    /// is made.
+    #[test]
+    fn too_many_labels_are_refused() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let labels = BTreeMap::from([("big".to_owned(), "x".repeat(70 * 1024))]);
+        assert!(matches!(
+            volumes.create_with("data", &labels),
+            Err(VolumeError::TooManyLabels(_))
+        ));
+        assert!(volumes.list().unwrap().is_empty());
+        assert!(!volumes.root().join("data").exists());
+    }
+
+    /// A create of a volume a run holds (shared, for its whole life) says
+    /// it exists at once, never after the create's wait (11.6b's runtime
+    /// review: `docker volume create` again, compose's `external`).
+    #[test]
+    fn a_held_volume_exists_at_once() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let _held = volumes.hold("data").unwrap();
+        let began = std::time::Instant::now();
+        assert!(matches!(
+            volumes.create_with("data", &BTreeMap::new()),
+            Err(VolumeError::Exists(_))
+        ));
+        assert!(began.elapsed() < CREATE_WAIT / 2, "{:?}", began.elapsed());
+    }
+
+    /// A run that makes a volume where a create was cut short (its labels
+    /// written, its data not) makes it without those labels.
+    #[test]
+    fn a_run_s_volume_never_takes_a_cut_short_create_s_labels() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        std::fs::create_dir(volumes.root().join("data")).unwrap();
+        std::fs::write(
+            volumes.root().join("data").join(LABELS_FILE),
+            r#"{"version":1,"labels":{"com.docker.volume.anonymous":""}}"#,
+        )
+        .unwrap();
+        let hold = volumes.hold("data").unwrap();
+        assert!(hold.created());
+        assert!(volumes.labels("data").unwrap().is_empty());
+    }
+
+    /// A create that can't finish leaves nothing: no volume listed, no
+    /// labels left to a volume made later by that name.
+    #[test]
+    fn a_create_cut_short_leaves_nothing() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        // Its data directory can't be made: a file is in its place.
+        std::fs::create_dir(volumes.root().join("data")).unwrap();
+        std::fs::write(volumes.root().join("data").join(DATA_DIR), "").unwrap();
+        let labels = BTreeMap::from([("a".to_owned(), "b".to_owned())]);
+        assert!(matches!(
+            volumes.create_with("data", &labels),
+            Err(VolumeError::Io { .. })
+        ));
+        assert!(!volumes.root().join("data").join(LABELS_FILE).exists());
+        assert!(volumes.list().unwrap().is_empty());
+        // A directory a cut-short create left (no data) is taken.
+        std::fs::remove_file(volumes.root().join("data").join(DATA_DIR)).unwrap();
+        std::fs::write(volumes.root().join("data").join(LABELS_FILE), "stale").unwrap();
+        volumes.create_with("data", &BTreeMap::new()).unwrap();
+        assert!(volumes.labels("data").unwrap().is_empty());
     }
 
     #[test]
@@ -769,5 +1258,54 @@ mod tests {
         assert!(is_named_volume("my-vol_1.2"));
         assert!(!is_named_volume("/host/path"));
         assert!(!is_named_volume("./rel"));
+    }
+
+    /// One fill of a volume at a time: a second is `Busy` past its wait, or
+    /// at once if it's asked to give up; free again once the first ends.
+    /// The marker names its fill's owner until it's done; none before.
+    #[test]
+    fn one_fill_at_a_time_and_its_marker_names_its_owner() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        volumes.create("v").unwrap();
+        let never = || false;
+        let first = volumes
+            .lock_fill("v", std::time::Duration::from_secs(1), &never)
+            .unwrap();
+        let waited = std::time::Instant::now();
+        let second = volumes.lock_fill("v", std::time::Duration::from_millis(200), &never);
+        assert!(matches!(second, Err(VolumeError::Busy(_))), "{second:?}");
+        assert!(waited.elapsed() >= std::time::Duration::from_millis(200));
+        let asked = volumes.lock_fill("v", std::time::Duration::from_secs(60), &|| true);
+        assert!(
+            matches!(asked, Err(VolumeError::Busy(_))),
+            "given up: {asked:?}"
+        );
+        assert_eq!(first.unfinished(), None);
+        assert_eq!(volumes.unfinished_fill("v"), None);
+        first.begin("c1").unwrap();
+        assert_eq!(first.unfinished().as_deref(), Some("c1"));
+        assert_eq!(volumes.unfinished_fill("v").as_deref(), Some("c1"));
+        first.done().unwrap();
+        assert_eq!(volumes.unfinished_fill("v"), None, "done: unmarked");
+        let again = volumes
+            .lock_fill("v", std::time::Duration::from_secs(1), &never)
+            .unwrap();
+        // Begun, then dropped unfinished (a fill cut short): the mark stays.
+        again.begin("c2").unwrap();
+        drop(again);
+        assert_eq!(volumes.unfinished_fill("v").as_deref(), Some("c2"));
+    }
+
+    /// A marker that's a link is never read through it.
+    #[test]
+    fn a_fill_s_marker_is_never_read_through_a_link() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        volumes.create("v").unwrap();
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::write(&elsewhere, "c9").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, volumes.root().join("v").join(FILLING)).unwrap();
+        assert_eq!(volumes.unfinished_fill("v"), None);
     }
 }

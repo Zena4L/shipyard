@@ -10,14 +10,6 @@ use shipyard_engine::run::{Limits, RunRequest, RunStreams};
 use super::RunArgs;
 
 impl RunArgs {
-    /// The keys of a bare `-e KEY`: the variables copied from the caller's
-    /// shell (its value then, if it has one).
-    pub(super) fn bare_env_keys(&self) -> impl Iterator<Item = &OsString> {
-        self.env
-            .iter()
-            .filter(|entry| !entry.as_bytes().contains(&b'='))
-    }
-
     /// The image these arguments name, and the command: the first argument
     /// is the image unless a flag says there's none (`--no-image`,
     /// `--rootfs`, `--bundle`, `--no-isolation`) or gives it (`--image`).
@@ -100,17 +92,23 @@ impl RunArgs {
     ///
     /// A usage error: see [`image_and_command`](Self::image_and_command).
     pub(super) fn into_request(mut self) -> Result<RunRequest, clap::Error> {
+        self.refuse_what_is_not_supported()?;
         let (image, command) = self.image_and_command()?;
+        // The files' variables first: `--env` wins (Docker's order).
+        let mut env = Vec::new();
+        for path in &self.env_file {
+            env.extend(super::files::env_file(path).map_err(|error| file_error(&error))?);
+        }
+        env.append(&mut self.env);
+        self.env = env;
+        let labels = self.labels()?;
         // A bare `--env KEY` copies the caller's value: this process's
         // environment is the caller's, read here, never by the engine; in
         // the macOS guest, the Mac's, as the agent passed them on.
-        let forwarded = std::env::var(shipyard_runtime::attach::forward::CALLER_ENV).ok();
-        let caller_env = self
-            .bare_env_keys()
-            .filter_map(|key| Some((key.clone(), caller_var(forwarded.as_deref(), key)?)))
-            .collect();
+        let caller_env = caller_env_of(&self.env);
         let limits = Limits {
             first_given: self.limits.first_given(),
+            pids_given: self.limits.pids_given(),
             resources: self
                 .limits
                 .resources()
@@ -118,9 +116,12 @@ impl RunArgs {
         };
         let health = self.health()?;
         let mut request = RunRequest::default();
+        // Before the fields move out.
+        let (volume, tmpfs) = self.mounts();
         request.streams = RunStreams {
             interactive: self.streams.interactive,
             tty: self.streams.tty,
+            once: false,
         };
         request.env = self.env;
         request.caller_env = caller_env;
@@ -140,6 +141,7 @@ impl RunArgs {
         request.domainname = self.domainname;
         request.sysctl = self.sysctl;
         request.network = self.network;
+        request.ipc = self.ipc.unwrap_or_default();
         request.name = self.name;
         request.network_alias = self.network_alias;
         request.ip = self.ip;
@@ -151,6 +153,9 @@ impl RunArgs {
         request.dns_option = self.dns_option;
         request.publish = self.publish.into_iter().flat_map(|spec| spec.0).collect();
         request.publish_all = self.publish_all;
+        request.expose = self.expose.into_iter().flat_map(|spec| spec.0).collect();
+        request.labels = labels;
+        request.cidfile = self.cidfile;
         request.rootfs = self.rootfs;
         request.image = image;
         request.entrypoint = self.entrypoint;
@@ -163,13 +168,63 @@ impl RunArgs {
         request.gidmap = self.gidmap;
         request.bundle = self.bundle;
         request.limits = limits;
-        request.volume = self.volume;
+        request.volume = volume;
+        request.tmpfs = tmpfs;
         request.command = command;
         Ok(request)
     }
 }
 
 impl RunArgs {
+    /// Every bind and volume (`-v`'s, then `--mount`'s, as `-v` strings),
+    /// and every tmpfs (`--tmpfs`'s, then `--mount`'s).
+    pub(super) fn mounts(&self) -> (Vec<String>, Vec<shipyard_engine::run::TmpfsMount>) {
+        let mut volume = self.volume.clone();
+        let mut tmpfs = self.tmpfs.clone();
+        for mount in &self.mount {
+            match mount {
+                shipyard_engine::run::DockerMount::Volume(spec) => volume.push(spec.clone()),
+                shipyard_engine::run::DockerMount::Tmpfs(mount) => tmpfs.push(mount.clone()),
+            }
+        }
+        (volume, tmpfs)
+    }
+
+    /// `--privileged` and `--init` refused, saying what to use instead
+    /// (D11.3-2), as the API refuses them.
+    fn refuse_what_is_not_supported(&self) -> Result<(), clap::Error> {
+        let refused = |message: &str| {
+            Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("{message}\n"),
+            ))
+        };
+        if self.privileged {
+            return refused(
+                "--privileged isn't supported: give the container the capabilities (--cap-add) \
+                 and devices (--device) it needs",
+            );
+        }
+        if self.init {
+            return refused("--init isn't supported yet: run the command without it");
+        }
+        Ok(())
+    }
+
+    /// The labels asked: each `--label-file`'s, then each `--label`
+    /// (the later of a key wins).
+    fn labels(&self) -> Result<std::collections::BTreeMap<String, String>, clap::Error> {
+        let mut labels = std::collections::BTreeMap::new();
+        for path in &self.label_file {
+            labels.extend(super::files::label_file(path).map_err(|error| file_error(&error))?);
+        }
+        for label in &self.labels {
+            let (key, value) = label.split_once('=').unwrap_or((label, ""));
+            labels.insert(key.to_owned(), value.to_owned());
+        }
+        Ok(labels)
+    }
+
     /// The health check asked: `--no-healthcheck`'s none; `--health-cmd`'s
     /// (tuned by the other flags); the other flags alone, tuning the
     /// image's own (an empty test); or nothing asked. A duration under a
@@ -209,6 +264,36 @@ impl RunArgs {
             shell: Vec::new(),
         }))
     }
+}
+
+/// An env or label file that can't be taken, as a usage error (exit 125,
+/// as Docker's).
+fn file_error(error: &super::files::FileError) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, format!("{error}\n"))
+}
+
+/// The bare `-e KEY`s of `env`: the variables copied from the caller's
+/// shell (`run`'s, `create`'s and `exec`'s alike).
+pub(crate) fn bare_env_keys(env: &[OsString]) -> impl Iterator<Item = &OsString> {
+    env.iter().filter(|entry| !entry.as_bytes().contains(&b'='))
+}
+
+/// The bare `KEY`s of `env` that are text, as a forwarded command names
+/// them to the Mac (a key that isn't text is the guest's to refuse).
+pub(crate) fn copied_env(env: &[OsString]) -> Vec<String> {
+    bare_env_keys(env)
+        .filter_map(|key| key.to_str().map(str::to_owned))
+        .collect()
+}
+
+/// The caller's values for `env`'s bare `KEY`s (those it has), as the
+/// engine takes them: read here, never by the engine. In the macOS guest,
+/// the Mac's, as its agent passed them on.
+pub(crate) fn caller_env_of(env: &[OsString]) -> Vec<(OsString, OsString)> {
+    let forwarded = std::env::var(shipyard_runtime::attach::forward::CALLER_ENV).ok();
+    bare_env_keys(env)
+        .filter_map(|key| Some((key.clone(), caller_var(forwarded.as_deref(), key)?)))
+        .collect()
 }
 
 /// The caller's value of `key`: from `forwarded` (the Mac's, a forwarded

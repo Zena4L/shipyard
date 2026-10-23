@@ -1,0 +1,16 @@
+# Your (rootless) socket for Shipyard's Docker API: your user manager listens
+# on it, and starts shipyard.service at the first connection. Point Docker's
+# clients at it with
+# `export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/shipyard/api.sock`. See
+# README.md.
+[Unit]
+Description=Shipyard: the Docker API's socket, for your containers
+Documentation=https://github.com/Zena4L/shipyard/tree/main/contrib/systemd
+
+[Socket]
+ListenStream=%t/shipyard/api.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

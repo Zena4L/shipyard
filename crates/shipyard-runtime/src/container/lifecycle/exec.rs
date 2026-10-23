@@ -252,20 +252,42 @@ pub fn exec(
         }
         supervisor.set_stdio(stdio);
     }
+    let pid_file = options.pid_file.clone();
     let outcome = if options.detach {
         let started = supervisor.start_detached(&spec, &join, console);
         drop(lock);
+        if let (Ok(pid), Some(file)) = (&started, &pid_file) {
+            write_pid_file(file, *pid);
+        }
         started.map(|pid| ExecOutcome::Detached { pid })
     } else {
         // Let go of once the command runs (or never, if it doesn't: then
-        // when the run's over).
+        // when the run's over), its PID said then.
         supervisor
-            .supervise_exec(&spec, options.stop, &join, console, move || {
+            .supervise_exec(&spec, options.stop, &join, console, move |pid| {
                 drop(lock);
+                if let Some(file) = &pid_file {
+                    write_pid_file(file, pid);
+                }
             })
             .map(ExecOutcome::Exited)
     };
     outcome.map_err(|err| exec_failed(&dir, id, err))
+}
+
+/// Writes `pid` to `file` whole or not at all (a reader may poll for it),
+/// as a new file (`O_EXCL` temporary: never through a planted link). A
+/// failure is logged: the command runs all the same.
+fn write_pid_file(file: &Path, pid: u32) {
+    let written = shipyard_sys::fs::write_atomically(
+        file,
+        pid.to_string().as_bytes(),
+        // Not synced: a PID means nothing after a restart.
+        &shipyard_sys::fs::Write::new(0o600).durability(shipyard_sys::fs::Durability::Atomic),
+    );
+    if let Err(error) = written {
+        tracing::warn!("the exec's PID file {}: {error}", file.display());
+    }
 }
 
 /// The process `options` ask for, from the container's (`base`,

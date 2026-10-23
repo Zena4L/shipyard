@@ -40,29 +40,95 @@ const MAX_RECORD_LINE: usize = crate::logs::cri::MAX_TEXT + 256;
 /// How often a follower looks for more.
 pub const POLL: Duration = Duration::from_millis(200);
 
+/// Asked between a follower's looks: `true` once its reader has gone
+/// (which a write would only find once there's more to write). A closure, so
+/// that each reader asks after its own (a pipe, a connection).
+#[derive(Clone)]
+pub struct Gone(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl Gone {
+    /// A hook that asks `gone`.
+    pub fn new(gone: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(gone))
+    }
+
+    /// Whether the reader has gone.
+    #[must_use]
+    pub fn ask(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gone")
+    }
+}
+
+/// Entries as the lines they were: each line's time first (if
+/// `timestamps`), at its start only (a line read in pieces has one time),
+/// and its newline only once it's complete. For `logs`, the CLI's and the
+/// Docker API's alike.
+#[derive(Debug, Default)]
+pub struct LineWriter {
+    timestamps: bool,
+    /// Whether each stream is in the middle of a line.
+    midline: [bool; 2],
+}
+
+impl LineWriter {
+    /// Lines, with their times first if `timestamps`.
+    #[must_use]
+    pub fn new(timestamps: bool) -> Self {
+        Self {
+            timestamps,
+            midline: [false, false],
+        }
+    }
+
+    /// The bytes `entry` is written as.
+    pub fn bytes(&mut self, entry: &Entry) -> Vec<u8> {
+        let midline = &mut self.midline[entry.stream.index()];
+        let mut bytes = Vec::with_capacity(entry.text.len() + 40);
+        if self.timestamps && !*midline {
+            bytes.extend_from_slice(format!("{} ", entry.time).as_bytes());
+        }
+        bytes.extend_from_slice(&entry.text);
+        if entry.complete {
+            bytes.push(b'\n');
+        }
+        *midline = !entry.complete;
+        bytes
+    }
+}
+
 /// What to read.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LogsOptions {
     /// Only the last this many lines (of those since [`since`](Self::since)).
     pub tail: Option<usize>,
     /// Only lines from this time on.
     pub since: Option<Timestamp>,
+    /// Only lines up to this time; a follow ends once it's past (Docker's
+    /// `--until`). The tail is of the lines up to it.
+    pub until: Option<Timestamp>,
     /// Then wait for more, until the container has ended and everything it
     /// wrote is read.
     pub follow: bool,
     /// Only the directory with this identity (the one the container was
     /// created with): another put at its path since is refused.
     pub identity: Option<crate::container::DirIdentity>,
-    /// Asked between a follower's looks: `true` ends it (its reader has
-    /// gone, which a write would only find once there's more to write).
-    pub gone: Option<fn() -> bool>,
+    /// Asked between a follower's looks: `true` ends it.
+    pub gone: Option<Gone>,
 }
 
 impl LogsOptions {
-    /// Whether its [`gone`](Self::gone) hook says the reader has gone.
+    /// Whether a follow is over: its [`gone`](Self::gone) hook says the
+    /// reader has gone, or it's past [`until`](Self::until).
     #[must_use]
-    pub fn reader_gone(&self) -> bool {
-        self.gone.is_some_and(|gone| gone())
+    pub fn follow_over(&self) -> bool {
+        self.gone.as_ref().is_some_and(Gone::ask)
+            || self.until.is_some_and(|until| Timestamp::now() > until)
     }
 }
 
@@ -178,12 +244,12 @@ pub fn read_then<'a>(
     // follower waits for it.
     let info = loop {
         match LogInfo::read_at(&directory) {
-            // Its reader gone meanwhile: nothing to read, and no one to
-            // tell (F78).
+            // Its reader gone meanwhile (no one to tell, F78), or past its
+            // `until`: nothing to read.
             Err(InfoError::Read(error))
                 if options.follow
                     && error.kind() == std::io::ErrorKind::NotFound
-                    && options.reader_gone() =>
+                    && options.follow_over() =>
             {
                 return Ok(ReadSummary::default());
             }
@@ -202,7 +268,7 @@ pub fn read_then<'a>(
             }
         }
     };
-    let mut reader = Reader::new(dir, directory, *options, sink);
+    let mut reader = Reader::new(dir, directory, options.clone(), sink);
     reader.before_tail = before_tail;
     let (files, mut current) = reader.chain(info.settings.max_files)?;
     for mut file in files {
@@ -295,10 +361,10 @@ impl<'a, S: FnMut(Entry) -> std::io::Result<()>> Reader<'a, S> {
         Self {
             dir: dir.to_owned(),
             directory,
+            tail: options.tail.map(|_| VecDeque::new()),
             options,
             lines: Lines::default(),
             joined: [None, None],
-            tail: options.tail.map(|_| VecDeque::new()),
             stats: ReadSummary::default(),
             sink,
             buffer: Vec::new(),
@@ -454,7 +520,9 @@ impl<'a, S: FnMut(Entry) -> std::io::Result<()>> Reader<'a, S> {
 
     /// Hands `entry` on, or keeps it for the tail.
     fn emit(&mut self, entry: Entry) -> Result<(), LogsError> {
-        if self.options.since.is_some_and(|since| entry.time < since) {
+        if self.options.since.is_some_and(|since| entry.time < since)
+            || self.options.until.is_some_and(|until| entry.time > until)
+        {
             return Ok(());
         }
         if let (Some(tail), Some(keep)) = (&mut self.tail, self.options.tail) {
@@ -587,10 +655,10 @@ pub fn of_runtime(
     // at its path since.
     let options = LogsOptions {
         identity,
-        ..*options
+        ..options.clone()
     };
     let finished = || {
-        options.reader_gone()
+        options.follow_over()
             || match which {
                 RuntimeLogs::Container(id) => container::logs_of(root, id).map_or(true, |logs| {
                     logs.finished
@@ -645,11 +713,11 @@ mod tests {
             std::fs::write(self.0.join(name), out).unwrap();
         }
 
-        fn read(&self, options: LogsOptions) -> (Vec<String>, ReadSummary) {
+        fn read(&self, options: &LogsOptions) -> (Vec<String>, ReadSummary) {
             let mut lines = Vec::new();
             let read = read(
                 &self.0,
-                &options,
+                options,
                 || true,
                 |entry| {
                     lines.push(format!(
@@ -688,7 +756,7 @@ mod tests {
         scratch.write(&older(2), &[(1, OUT, false, "one")]);
         scratch.write(&older(1), &[(2, OUT, true, "tw"), (2, ERR, false, "oops")]);
         scratch.write(CURRENT, &[(3, OUT, false, "o"), (4, OUT, false, "three")]);
-        let (lines, read) = scratch.read(LogsOptions::default());
+        let (lines, read) = scratch.read(&LogsOptions::default());
         assert_eq!(
             lines,
             ["stdout one", "stderr oops", "stdout two", "stdout three"]
@@ -712,20 +780,33 @@ mod tests {
             tail: Some(n),
             ..LogsOptions::default()
         };
-        assert_eq!(scratch.read(tail(2)).0, ["stdout c", "stdout d"]);
-        assert_eq!(scratch.read(tail(0)).0, Vec::<String>::new());
-        assert_eq!(scratch.read(tail(9)).0.len(), 4);
+        assert_eq!(scratch.read(&tail(2)).0, ["stdout c", "stdout d"]);
+        assert_eq!(scratch.read(&tail(0)).0, Vec::<String>::new());
+        assert_eq!(scratch.read(&tail(9)).0.len(), 4);
         let since = LogsOptions {
             since: Timestamp::from_unix(20, 0),
             tail: Some(1),
             ..LogsOptions::default()
         };
-        assert_eq!(scratch.read(since).0, ["stdout d"]);
+        assert_eq!(scratch.read(&since).0, ["stdout d"]);
         let since = LogsOptions {
             since: Timestamp::from_unix(25, 0),
             ..LogsOptions::default()
         };
-        assert_eq!(scratch.read(since).0, ["stdout c", "stdout d"]);
+        assert_eq!(scratch.read(&since).0, ["stdout c", "stdout d"]);
+        // `until`: none after it (its own second included), and the tail
+        // is of those up to it.
+        let until = |at, tail| LogsOptions {
+            until: Timestamp::from_unix(at, 0),
+            tail,
+            ..LogsOptions::default()
+        };
+        assert_eq!(
+            scratch.read(&until(30, None)).0,
+            ["stdout a", "stdout b", "stdout c"]
+        );
+        assert_eq!(scratch.read(&until(30, Some(1))).0, ["stdout c"]);
+        assert_eq!(scratch.read(&until(5, None)).0, Vec::<String>::new());
     }
 
     /// A torn line (a crash in the middle of a write) or one that isn't a
@@ -749,7 +830,7 @@ mod tests {
         );
         text.extend_from_slice(&after);
         std::fs::write(scratch.0.join(CURRENT), text).unwrap();
-        let (lines, read) = scratch.read(LogsOptions::default());
+        let (lines, read) = scratch.read(&LogsOptions::default());
         assert_eq!(lines, ["stdout before", "stdout after"]);
         assert_eq!(read.skipped, 2);
     }
@@ -851,7 +932,7 @@ mod tests {
                 |_| Ok(()),
             )
         };
-        let summary = read_with(&follow(Some(|| true))).unwrap();
+        let summary = read_with(&follow(Some(Gone::new(|| true)))).unwrap();
         assert_eq!(summary.skipped, 0);
         assert!(matches!(
             read_with(&follow(None)),

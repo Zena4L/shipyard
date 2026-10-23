@@ -23,13 +23,66 @@ pub(crate) fn emit_pruned(engine: &Engine, kind: Kind, removed: usize) {
     );
 }
 
+/// Writes that a prune of `kind`s removed `removed` things, reclaiming
+/// `reclaimed` bytes (Docker's `prune` event's attribute).
+pub(crate) fn emit_reclaimed(engine: &Engine, kind: Kind, removed: usize, reclaimed: u64) {
+    emit(
+        engine,
+        &Event::new(kind, "prune", "")
+            .with("removed", removed)
+            .with("reclaimed", reclaimed),
+    );
+}
+
+/// The most bytes of a container's labels its events carry: the journal's
+/// line is bounded (`MAX_LINE`), and what the engine says of the container
+/// (its name, image, exit code) must fit beside them, whole.
+const LABELS_BUDGET: usize = 2048;
+
+/// The labels a container's events carry, of `labels`: compose's own
+/// first (`com.docker.compose.*`: what compose's filters follow), then the
+/// rest in order, each whole, while they fit in [`LABELS_BUDGET`].
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "read by `container`, which is Linux's (and the tests)"
+    )
+)]
+pub(crate) fn event_labels(
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Vec<(&str, &str)> {
+    let compose = |key: &str| key.starts_with("com.docker.compose.");
+    let ordered = labels
+        .iter()
+        .filter(|(key, _)| compose(key))
+        .chain(labels.iter().filter(|(key, _)| !compose(key)));
+    let mut left = LABELS_BUDGET;
+    let mut kept = Vec::new();
+    for (key, value) in ordered {
+        // Quoted, a colon and a comma, in the line's JSON.
+        let size = key.len() + value.len() + 6;
+        if size <= left {
+            left -= size;
+            kept.push((key.as_str(), value.as_str()));
+        }
+    }
+    kept
+}
+
 /// An event about the container `record` is: `action`, now, with its
-/// name and image.
+/// labels (as many as fit: [`event_labels`]), then its name and image
+/// (Docker's attributes: a label of either name gives way).
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) fn container(record: &crate::containers::Record, action: &str) -> Event {
-    let event =
-        Event::new(Kind::Container, action, record.id.as_str()).with("name", record.name.as_str());
+    let event = event_labels(record.labels.as_map())
+        .into_iter()
+        .fold(
+            Event::new(Kind::Container, action, record.id.as_str()),
+            |event, (key, value)| event.with(key, value),
+        )
+        .with("name", record.name.as_str());
     match &record.config.image {
         Some(image) => event.with("image", image),
         None => event,

@@ -30,8 +30,28 @@ use crate::process::setup::SpecSetup;
 /// The plan's file in the state directory.
 pub(crate) const PLAN_FILE: &str = "plan.json";
 
-/// The plan's version: the one this binary writes and reads.
-pub(crate) const PLAN_VERSION: u32 = 1;
+/// The plan's version: the newest this binary writes and reads. v2 (step
+/// 11.7) is written only for a plan that binds a source Shipyard made
+/// (`made_below`): an older binary must refuse it, never bind that source
+/// by its path; v1 for the rest, which it reads.
+pub(crate) const PLAN_VERSION: u32 = 2;
+
+/// The version `isolation`'s plan is written at: the oldest that holds it.
+#[cfg(target_os = "linux")]
+fn version_for(isolation: &Isolation) -> u32 {
+    let made = isolation.root.as_ref().is_some_and(|root| {
+        root.mounts.iter().any(|mount| {
+            matches!(
+                &mount.kind,
+                crate::isolation::MountKind::Bind {
+                    made_below: Some(_),
+                    ..
+                }
+            )
+        })
+    });
+    if made { PLAN_VERSION } else { 1 }
+}
 
 /// The most of a plan read: far more than a real one takes. Its arguments
 /// and environment are written as arrays of numbers (they may be any
@@ -127,7 +147,7 @@ impl Plan {
     #[cfg(target_os = "linux")]
     pub(crate) fn to_json(&self) -> Result<Vec<u8>> {
         let json = serde_json::to_vec(&PlanFile {
-            version: PLAN_VERSION,
+            version: version_for(&self.isolation),
             spec: SpecSetup::new(&self.spec),
             isolation: self.isolation.clone(),
             terminal: self.terminal.map(|terminal| TerminalFile {
@@ -151,7 +171,7 @@ impl Plan {
         let unreadable =
             |why: String| ContainerError::Setup(format!("the container's {PLAN_FILE}: {why}"));
         match super::versions::version_of(bytes) {
-            Some(PLAN_VERSION) => {}
+            Some(1 | PLAN_VERSION) => {}
             // A file with no version reads as 0: not a plan this writes.
             Some(found) => {
                 return Err(ContainerError::UnknownPlanVersion { found });
@@ -381,16 +401,32 @@ mod tests {
         }
     }
 
-    /// Another version, or no plan at all, is refused.
+    /// A plan is written at the oldest version that holds it: v1, or v2
+    /// with a made source's bind (11.7: an older binary refuses it rather
+    /// than bind that source by its path); both read back. A newer
+    /// version, or no plan at all, is refused.
     #[test]
     fn another_plan_is_refused() {
         let plan = Plan::new(ProcessSpec::new(vec!["true".into()]), Isolation::standard());
         let json = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        assert!(json.contains("\"version\":1"), "{json}");
         assert!(Plan::parse(json.as_bytes()).is_ok(), "the control");
-        let newer = json.replacen("\"version\":1", "\"version\":2", 1);
+        let mut isolation = Isolation::standard();
+        let mut root = crate::isolation::Root::new("/srv/root");
+        root.mounts.push(crate::isolation::Mount::bind_made(
+            "/srv",
+            std::path::Path::new("made"),
+            "/data",
+        ));
+        isolation.root = Some(root);
+        let made = Plan::new(ProcessSpec::new(vec!["true".into()]), isolation);
+        let made = String::from_utf8(made.to_json().unwrap()).unwrap();
+        assert!(made.contains("\"version\":2"), "{made}");
+        assert!(Plan::parse(made.as_bytes()).is_ok());
+        let newer = json.replacen("\"version\":1", "\"version\":3", 1);
         assert!(matches!(
             Plan::parse(newer.as_bytes()),
-            Err(ContainerError::UnknownPlanVersion { found: 2 })
+            Err(ContainerError::UnknownPlanVersion { found: 3 })
         ));
         assert!(matches!(
             Plan::parse(b"{}"),

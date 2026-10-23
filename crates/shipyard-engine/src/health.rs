@@ -46,8 +46,7 @@ const DEFAULT_RETRIES: u32 = 3;
 /// ([`merged`](Self::merged)). A zero means Docker's default (none, for
 /// the start period). As asked, before the merge, an empty `test` tunes the
 /// image's check, and [`disabled`](Self::disabled) turns it off.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthCheck {
     /// What to run, in Docker's form: `["CMD-SHELL", "script"]` (run by
     /// `/bin/sh -c`) or `["CMD", program, args…]`.
@@ -66,7 +65,6 @@ pub struct HealthCheck {
     pub retries: u32,
     /// The shell a `CMD-SHELL` test runs with: its image's (`SHELL`), or,
     /// empty, `/bin/sh -c`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shell: Vec<String>,
 }
 

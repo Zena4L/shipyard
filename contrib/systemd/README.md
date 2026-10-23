@@ -1,4 +1,10 @@
-# Starting containers when the host starts
+# Shipyard's systemd units
+
+Two sets: the boot units (below), which start and stop containers with the host, and
+the [Docker API's units](#the-docker-api), which start `shipyard system service` when a
+Docker client connects.
+
+## Starting containers when the host starts
 
 Shipyard has no daemon, so nothing runs it when the host starts: after a reboot,
 containers with a restart policy stay ended until something runs
@@ -14,7 +20,7 @@ then starts each container whose restart policy brings it back:
 | `on-failure[:N]` | if it last ended with a failure, and N isn't used up |
 | `no` | no |
 
-## Root's containers
+### Root's containers
 
 ```sh
 sudo install -m 0644 shipyard-stop.service shipyard-recover.service /etc/systemd/system/
@@ -22,7 +28,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now shipyard-stop shipyard-recover
 ```
 
-## Your (rootless) containers
+### Your (rootless) containers
 
 Rootless containers live under your systemd user manager, which runs only while you're
 logged in unless you let it linger. With linger, it starts at boot, and so does the unit:
@@ -41,7 +47,7 @@ started. (A container made in a login session runs on after you log out where lo
 has `KillUserProcesses=no`, as on Ubuntu 24.04; with `yes`, it ends with the session:
 make it under your user manager, `systemd-run --user --scope shipyard run -d …`.)
 
-## Notes
+### Notes
 
 - **Two units, so a shutdown always stops the containers.** systemd runs a unit's
   stop only once the unit has started, and `shipyard-recover` is still starting while
@@ -70,7 +76,8 @@ make it under your user manager, `systemd-run --user --scope shipyard run -d …
 - A container that can't be started is said in the journal (`journalctl -u
   shipyard-recover`; `journalctl --user -u shipyard-recover` for the user unit), with
   exit code 125, and the unit still counts as started (`SuccessExitStatus=125`): else
-  systemd would end every container it did start.
+  systemd would end every container it did start. If nothing could be done at all
+  (the store can't be read), `system recover` exits 1 and the unit fails.
 - At shutdown, and whenever `shipyard-stop` stops (`systemctl stop shipyard-stop`),
   `shipyard system stop` stops **every** container that's up, each with its own stop
   signal and timeout, all at once (a paused one is thawed for it). That isn't your
@@ -99,3 +106,40 @@ make it under your user manager, `systemd-run --user --scope shipyard run -d …
   variables: `systemctl [--user] edit shipyard-recover`, then under `[Service]`, one
   `Environment=NAME=VALUE` line each, and the same for `shipyard-stop`. `shipyard
   doctor` says when this is so.
+
+## The Docker API
+
+`shipyard.socket` and `shipyard.service` serve Docker's Engine API (a subset: see
+[the Docker API](../../docs/user/api.md)) for Docker's own clients. systemd listens on
+the socket and starts the service at the first connection; the service exits once
+nothing has been asked for 60 s, and the next connection starts it again. Nothing runs
+while nothing asks.
+
+Root's, for root's containers (the socket is root's alone: anyone who can use it can
+run containers as root):
+
+```sh
+sudo install -m 0644 shipyard.socket shipyard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now shipyard.socket
+export DOCKER_HOST=unix:///run/shipyard/api.sock
+```
+
+Yours (rootless), for your containers:
+
+```sh
+mkdir -p ~/.config/systemd/user
+install -m 0644 user/shipyard.socket user/shipyard.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shipyard.socket
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/shipyard/api.sock
+```
+
+- Enable the socket, not the service: the service is started by its socket alone.
+- `KillMode=process`: when the service exits (idle) or is stopped, only its own
+  process ends. The containers it started run on: their monitors are in Shipyard's
+  own cgroup (or, where there's no cgroup tree, left in the unit's).
+- `Environment=SHIPYARD_API_IDLE=SECONDS` (`systemctl [--user] edit shipyard.service`)
+  sets another idle time. The stores' variables go there too, as for the boot units.
+- Edit `ExecStart` if `shipyard` isn't in `/usr/local/bin`.
+- `shipyard doctor` says whether the socket unit is enabled, and where clients find it.

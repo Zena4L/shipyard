@@ -1,0 +1,18 @@
+# Your (rootless) Docker API (a subset), served by `shipyard system service`
+# on the socket shipyard.socket passes it. Started at the first connection,
+# it exits once nothing has been asked for 60 s
+# (Environment=SHIPYARD_API_IDLE=SECONDS for another time). See README.md.
+[Unit]
+Description=Shipyard: the Docker API, for your containers
+Documentation=https://github.com/Zena4L/shipyard/tree/main/contrib/systemd
+Requires=shipyard.socket
+After=shipyard.socket
+
+[Service]
+Type=simple
+# Where `shipyard` is installed.
+ExecStart=/usr/local/bin/shipyard system service
+# Only its own process when it's stopped or exits: the containers it started
+# run on (their monitors move to Shipyard's own cgroup, and stay in this
+# unit's where there's no cgroup tree).
+KillMode=process

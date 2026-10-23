@@ -92,11 +92,26 @@ pub struct Supervisor {
     /// The command's standard descriptors (see [`set_stdio`](Self::set_stdio)).
     stdio: Stdio,
     /// Called once the command's `exec` has succeeded, during a run of
-    /// [`supervise_exec`](Self::supervise_exec).
-    running: Option<Box<dyn FnOnce()>>,
+    /// [`supervise_exec`](Self::supervise_exec), with its PID (as the host
+    /// sees it).
+    running: Option<Box<dyn FnOnce(u32)>>,
     /// Descriptors to pass on to the next command (see
     /// [`pass`](Self::pass)): closed once it has its own.
     passed: Option<super::passed::PassedFds>,
+    /// Whether this process was a child subreaper before it was installed:
+    /// put back when it's dropped (F29: a program that embeds the runtime
+    /// and lives on mustn't stay one).
+    #[cfg(target_os = "linux")]
+    subreaper_before: bool,
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if !self.subreaper_before {
+            let _ = nix::sys::prctl::set_child_subreaper(false);
+        }
+    }
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -122,8 +137,28 @@ impl Supervisor {
     /// Installs the signal handlers (see [`Supervisor`]) and, on Linux, makes
     /// shipyard a *child subreaper*: processes the command leaves behind are
     /// re-parented to shipyard instead of init, so it can clean them up.
+    /// Dropped, it lets both go (the handlers, and the subreaper setting as
+    /// it found it).
+    ///
+    /// **Install it on the thread that starts the commands:** the death
+    /// signal each child is given (`PR_SET_PDEATHSIG`) is its forking
+    /// thread's, so a child of a thread that ends before it would be
+    /// killed. And it counts on Rust's start having set SIGPIPE to be
+    /// ignored (a write to a gone reader is an error, not a death): a
+    /// program that restores SIGPIPE's default must block it around a
+    /// supervised run.
     pub fn install() -> Result<Self> {
-        let signals = Signals::install()?;
+        Self::installed_with(Signals::install()?)
+    }
+
+    /// [`install`](Self::install), with `signals` already claimed.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::unnecessary_wraps, reason = "its fallible steps are Linux's")
+    )]
+    fn installed_with(signals: Signals) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let subreaper_before = nix::sys::prctl::get_child_subreaper().unwrap_or(false);
         #[cfg(target_os = "linux")]
         nix::sys::prctl::set_child_subreaper(true)
             .map_err(|e| Error::sys("becoming a child subreaper", e))?;
@@ -137,6 +172,8 @@ impl Supervisor {
             stdio: Stdio::default(),
             running: None,
             passed: None,
+            #[cfg(target_os = "linux")]
+            subreaper_before,
         })
     }
 
@@ -258,8 +295,9 @@ impl Supervisor {
 
     /// `exec`: like [`supervise_joined`](Self::supervise_joined), with the
     /// command's environment exactly as `spec` has it (no `TERM` added), and
-    /// `running` called once its `exec` has succeeded (the container's lock
-    /// is released then: see `container::exec`). With a terminal: relayed
+    /// `running` called with its PID once its `exec` has succeeded (the
+    /// container's lock is released then, and its PID file written: see
+    /// `container::exec`). With a terminal: relayed
     /// as [`set_stdio`](Self::set_stdio)'s says, or, with `console` (an OCI
     /// console socket, open, and the terminal's size), its master sent there
     /// and nothing relayed.
@@ -273,7 +311,7 @@ impl Supervisor {
         stop: StopPolicy,
         join: &Join,
         console: Option<(std::os::fd::RawFd, super::terminal::Size)>,
-        running: impl FnOnce() + 'static,
+        running: impl FnOnce(u32) + 'static,
     ) -> Result<ExitStatus> {
         self.running = Some(Box::new(running));
         let result = self.run(
@@ -568,7 +606,7 @@ impl Supervisor {
             }
             if resolving && child.report_fd().is_none() {
                 if let Some(running) = self.running.take() {
-                    running();
+                    running(u32::try_from(child.pid().as_raw()).unwrap_or(0));
                 }
                 if let Some(hooks) = hooks {
                     // The command runs: failures are only warnings now.
@@ -1516,6 +1554,40 @@ fn report_oom(cgroup: &crate::cgroup::Cgroup, status: ExitStatus, killed_by_us: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F29: a supervisor dropped puts the subreaper setting back as it
+    /// found it (off stays off; on stays on). The setting is the
+    /// process's: changed only while this test holds the signals' one
+    /// claim (a [`Signals`] of its own, which no supervisor or other test
+    /// can install meanwhile), and tried by `install`'s own steps.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_supervisor_puts_the_subreaper_back() {
+        for before in [false, true] {
+            let claim = claimed();
+            nix::sys::prctl::set_child_subreaper(before).unwrap();
+            let supervisor = Supervisor::installed_with(claim).unwrap();
+            assert!(nix::sys::prctl::get_child_subreaper().unwrap());
+            drop(supervisor);
+            assert_eq!(nix::sys::prctl::get_child_subreaper().unwrap(), before);
+            nix::sys::prctl::set_child_subreaper(false).unwrap();
+        }
+    }
+
+    /// The signals' one claim, waited for while another test has it.
+    #[cfg(target_os = "linux")]
+    fn claimed() -> Signals {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match Signals::install() {
+                Ok(signals) => return signals,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("no signals: {error}"),
+            }
+        }
+    }
 
     #[cfg(not(target_os = "linux"))]
     #[test]

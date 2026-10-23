@@ -511,10 +511,12 @@ impl NetworkDir {
         assert_eq!(created.code, Some(0), "{}", created.stderr);
     }
 
-    /// `network inspect NAME`'s network, as JSON.
+    /// `network inspect --shipyard NAME`'s network, as JSON.
     #[must_use]
     pub fn inspect(&self, name: &str) -> serde_json::Value {
-        let inspect = self.run(&["network", "inspect", name]);
+        // Shipyard's own view (`--shipyard`): leases, the bridge, the DNS
+        // server; plain `network inspect` is Docker's (step 11.3c2).
+        let inspect = self.run(&["network", "inspect", "--shipyard", name]);
         assert_eq!(inspect.code, Some(0), "{}", inspect.stderr);
         let mut json: serde_json::Value =
             serde_json::from_str(&inspect.stdout).expect("inspect's JSON");
@@ -600,7 +602,9 @@ impl NetworkDir {
                     .get(2)
                     .map(|dir| Path::new(std::ffi::OsStr::from_bytes(dir)))
                     == Some(self.path.as_path());
-            // A zombie has no command line: it's gone already.
+            // A zombie has no command line: it's gone already. (So has one
+            // still exiting, its files maybe still open: `exit_mm` comes
+            // before `exit_files`. Wait on what it held, not on this.)
             let parent = std::fs::read_to_string(entry.path().join("status"))
                 .ok()
                 .and_then(|status| {

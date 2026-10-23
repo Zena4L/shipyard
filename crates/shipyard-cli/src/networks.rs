@@ -5,68 +5,44 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use shipyard_engine::network;
-use shipyard_runtime::process::EXIT_ENGINE_ERROR;
 
 use crate::cli::NetworkCommand;
-use crate::output::{confirm, each, table};
-use crate::reporter::{engine, report};
+use crate::format::rows::{self, NetworkRow};
+use crate::output::{confirm, each};
+use crate::reporter::{EXIT_FAILURE, engine, report};
 
 /// `shipyard network …`: create, list, inspect, remove, prune networks.
 pub(crate) fn command(command: &NetworkCommand) -> Result<ExitCode> {
     let engine = engine();
     match command {
-        NetworkCommand::Create {
-            subnet,
-            gateway,
-            ipv6,
-            internal,
-            isolate_host,
-            conntrack_limit,
-            name,
-        } => {
-            let mut options = network::SpecOptions::default();
-            options.ipv6 = *ipv6;
-            options.internal = *internal;
-            options.isolate_host = *isolate_host;
-            options.conntrack_limit = *conntrack_limit;
-            let config = network::create(&engine, &network::spec(name, subnet, gateway, options)?)?;
-            writeln!(std::io::stdout().lock(), "{}", config.name)?;
-        }
-        NetworkCommand::Ls => {
-            let rows: Vec<Vec<String>> = network::list(&engine, &[])?
-                .into_iter()
-                .map(|listed| {
-                    vec![
-                        listed.config.name,
-                        listed.config.subnet.to_string(),
-                        listed
-                            .config
-                            .subnet6
-                            .map_or_else(|| "-".to_owned(), |subnet6| subnet6.to_string()),
-                        listed.config.gateway.to_string(),
-                        listed.config.bridge,
-                        listed.leases.len().to_string(),
-                    ]
-                })
+        NetworkCommand::Create(args) => create(&engine, args)?,
+        NetworkCommand::Ls(args) => {
+            use shipyard_engine::docker::filters::{Given, NetworkFilters};
+            let filters =
+                NetworkFilters::parse(Given::from_pairs(args.list.filter.iter().cloned()))?;
+            let networks = shipyard_engine::docker::list_networks_where(&engine, &filters)?;
+            let rows: Vec<NetworkRow> = networks
+                .iter()
+                .map(|network| NetworkRow::new(network, args.no_trunc))
                 .collect();
-            table(
-                &mut std::io::stdout().lock(),
-                &[
-                    "NETWORK",
-                    "SUBNET",
-                    "SUBNET6",
-                    "GATEWAY",
-                    "BRIDGE",
-                    "CONTAINERS",
-                ],
-                &rows,
-            )?;
+            crate::format::print(&args.list, rows::NETWORKS_TABLE, &rows)?;
         }
-        NetworkCommand::Inspect { names } => {
-            let networks = network::inspect(&engine, names)?;
-            let mut out = std::io::stdout().lock();
-            serde_json::to_writer_pretty(&mut out, &networks)?;
-            writeln!(out)?;
+        NetworkCommand::Inspect {
+            shipyard: true,
+            names,
+            ..
+        } => {
+            return crate::output::shown(names, None, |name| {
+                let found = network::inspect(&engine, &[name.to_owned()])?;
+                Ok(serde_json::to_value(found.first())?)
+            });
+        }
+        NetworkCommand::Inspect { names, shown, .. } => {
+            return crate::output::shown(names, shown.format.as_deref(), |name| {
+                Ok(serde_json::to_value(
+                    shipyard_engine::docker::inspect_network(&engine, name)?,
+                )?)
+            });
         }
         NetworkCommand::Rm { names } => {
             return Ok(each(names, |name| {
@@ -132,7 +108,50 @@ fn prune(force: bool) -> Result<ExitCode> {
     drop(out);
     let mut code = ExitCode::SUCCESS;
     for error in &pruned.failed {
-        code = report(error, EXIT_ENGINE_ERROR);
+        code = report(error, EXIT_FAILURE);
     }
     Ok(code)
+}
+
+/// `shipyard network create`: its flags as Docker's create request
+/// (`--isolate-host`, `--conntrack-limit` as the options they are),
+/// checked and made as the API's (`docker::create_network`); its name
+/// printed.
+fn create(engine: &shipyard_engine::Engine, args: &crate::cli::NetworkCreateArgs) -> Result<()> {
+    let crate::cli::NetworkCreateArgs {
+        subnet,
+        gateway,
+        ipv6,
+        internal,
+        isolate_host,
+        conntrack_limit,
+        labels,
+        driver,
+        options,
+        name,
+    } = args;
+    shipyard_engine::docker::check_network_driver(Some(driver))?;
+    // Its flags as the options they are: checked, and kept, as the
+    // API's (`docker::create_network`).
+    let mut options: std::collections::BTreeMap<String, String> = options.iter().cloned().collect();
+    for (on, key) in [
+        (*isolate_host, shipyard_engine::docker::ISOLATE_HOST),
+        (*conntrack_limit, shipyard_engine::docker::CONNTRACK_LIMIT),
+    ] {
+        if on {
+            options.insert(key.to_owned(), "true".to_owned());
+        }
+    }
+    let request = shipyard_engine::docker::NetworkCreate {
+        name: name.clone(),
+        internal: *internal,
+        ipv6: *ipv6,
+        subnets: subnet.clone(),
+        gateways: gateway.clone(),
+        labels: labels.iter().cloned().collect(),
+        options,
+    };
+    shipyard_engine::docker::create_network(engine, &request)?;
+    writeln!(std::io::stdout().lock(), "{name}")?;
+    Ok(())
 }

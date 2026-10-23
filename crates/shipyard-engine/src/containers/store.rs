@@ -28,6 +28,8 @@ pub struct NewContainer {
     pub image_id: Option<String>,
     /// Removed once it ends (`--rm`).
     pub auto_remove: bool,
+    /// What its create settled beside its record (step 11.3b1).
+    pub created: super::Created,
 }
 
 /// Makes container `new`'s record: a new ID and serial, and its name
@@ -100,7 +102,7 @@ pub(super) fn create_drawing(
     let mut record = Record::new(id, serial, name, new.config, new.labels);
     record.image_id = new.image_id;
     record.auto_remove = new.auto_remove;
-    store.publish(engine, &record)?;
+    store.publish(engine, &record, &new.created)?;
     Ok(record)
 }
 
@@ -499,8 +501,8 @@ impl Store {
     /// Puts `record` in the store whole: its directory made under a
     /// temporary name, its record written and synced, then renamed into
     /// place, and the store synced (a failure there reported: the record is
-    /// in place). Under the lock.
-    fn publish(&self, engine: &Engine, record: &Record) -> Result<()> {
+    /// in place), what its create settled beside it. Under the lock.
+    fn publish(&self, engine: &Engine, record: &Record, created: &super::Created) -> Result<()> {
         let json = record.to_json_new()?;
         let staging = self.dir.join(format!("{NEW}{}", record.id));
         let dir = self.dir.join(record.id.as_str());
@@ -516,6 +518,7 @@ impl Store {
             {
                 return Err(unsynced);
             }
+            super::write_created(&staging, created)?;
             fs::rename(&staging, &dir).with_context(|| format!("making {}", dir.display()))
         })();
         if placed.is_err() {

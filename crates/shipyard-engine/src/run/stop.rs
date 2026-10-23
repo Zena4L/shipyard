@@ -45,6 +45,14 @@ pub struct StopOptions {
 const MAX_TIMEOUT: Duration = Duration::from_secs(u32::MAX as u64);
 
 impl StopOptions {
+    /// A timeout of `seconds`, as Docker's clients give it (the CLI's `-t`,
+    /// the API's `t`): a negative one (`-1`) is for as long as it takes (the
+    /// longest a stop waits, over a century).
+    #[must_use]
+    pub fn timeout_of(seconds: i64) -> Duration {
+        u64::try_from(seconds).map_or(MAX_TIMEOUT, Duration::from_secs)
+    }
+
     /// Whether the signal given (if one is) can stop a container: checked
     /// before anything is taken, so a wrong one is said whatever the
     /// container's state.
@@ -109,7 +117,9 @@ impl StopOptions {
 /// minute ([`ErrorKind::Busy`]).
 pub fn stop(engine: &Engine, reference: &str, options: StopOptions) -> Result<Record> {
     #[cfg(target_os = "linux")]
-    return linux::stop(engine, reference, options);
+    return linux::stop(engine, reference, options).inspect(|record| {
+        super::joined::warn_joiners(engine, record, "stopped");
+    });
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (engine, reference, options);
@@ -164,7 +174,10 @@ pub fn wait(engine: &Engine, reference: &str) -> Result<i32> {
 /// stopped (`--rm`) ([`ErrorKind::NotFound`]).
 pub fn restart(engine: &Engine, reference: &str, options: StopOptions) -> Result<Record> {
     #[cfg(target_os = "linux")]
-    return linux::restart(engine, reference, options);
+    return linux::restart(engine, reference, options).inspect(|record| {
+        // A new start, a new network: theirs is the old one's.
+        super::joined::warn_joiners(engine, record, "was restarted");
+    });
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (engine, reference, options);
@@ -227,7 +240,8 @@ mod linux {
         let runtime_root = engine.paths.runtime_root()?;
         // Only one that runs: one still starting (its init at the gate)
         // would get it when started.
-        if !runtime::peek_status(runtime_root, record.id.as_str())?.is_some_and(Status::is_live) {
+        let status = runtime::peek_status(runtime_root, record.id.as_str())?;
+        if !status.is_some_and(Status::is_live) {
             bail!(NotRunning, "container {} is not running", record.name);
         }
         // SIGKILL or its stop signal is the user's stop: recorded before
@@ -242,6 +256,11 @@ mod linux {
         }
         match runtime::kill(runtime_root, record.id.as_str(), signal) {
             Ok(()) => {
+                // A paused one is let run, so its processes see the signal
+                // now (Docker's; SIGKILL needs no thaw).
+                if status == Some(Status::Paused) && signal.as_raw() != Signal::KILL.as_raw() {
+                    let _ = runtime::resume(runtime_root, record.id.as_str());
+                }
                 crate::events::emit(
                     engine,
                     &crate::events::container(&record, "kill").with("signal", signal),

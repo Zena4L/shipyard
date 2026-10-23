@@ -120,7 +120,8 @@ authentication (Docker Hub does for every image, public ones too; signed in, you
 get its higher pull limits). A helper gets 60 seconds to answer (a keychain may
 ask you to unlock it first). If it fails, or isn't installed any more, Shipyard
 warns and goes on without signing in, which is all a public image needs. Identity
-tokens (Azure ACR, some single sign-on logins) work too.
+tokens (Azure ACR, some single sign-on logins) work too, and so does a registry's own
+bearer token (`registrytoken`), sent to it as it is.
 
 Credentials are sent only to the registry and to the token service it names,
 over HTTPS (plain HTTP only to a registry, and its token service, on this
@@ -135,51 +136,94 @@ says where they came from, so you know what to sign in to again.
 
 ```sh
 shipyard images                 # list images in the store
+shipyard tag alpine:3.20 base   # another name for the same image
+shipyard image inspect base     # the image, in Docker's shape (JSON)
 shipyard rmi alpine:3.20        # remove an image (shared layers survive)
-shipyard image prune            # remove everything no image references
+shipyard image prune -f         # dangling images, and everything no image references
+shipyard image prune -a -f      # every image no container was made from, too
 shipyard system df              # the store's disk usage
 ```
 
-`shipyard images` lists each reference, its manifest digest, and its layer count:
+The `image` group has Docker's names for these too: `image ls` (`images`),
+`image rm` (`rmi`), `image pull`, `image tag`, `image inspect` and `image prune`.
+
+`tag SOURCE TARGET` gives an image another name: SOURCE is a reference or an ID,
+TARGET a reference with a tag (a digest can't be given, as Docker's). The image
+isn't copied; `rmi` of one name leaves the other. `image inspect` prints each image
+as Docker's `docker image inspect` does, as one JSON array (`-f` a template, as
+[`inspect`'s](containers.md#looking-closer-inspect)); one that isn't there is
+said, and the command exits 1.
+
+`shipyard images` lists them as Docker's `docker images` does (its classic table):
+a row per name, newest first, the ID the manifest digest's first 12 hex digits.
 
 ```text
-REFERENCE                       MANIFEST       LAYERS
-docker.io/library/alpine:3.20   2c3e5c8f1a2b   1
+REPOSITORY   TAG       IMAGE ID       CREATED       SIZE
+alpine       3.20      2c3e5c8f1a2b   2 weeks ago   3.62MB
 ```
+
+`SIZE` is the compressed layers' sum (what was downloaded). `images alpine` lists
+only that repository (`alpine:3.*` a pattern); `-q` the IDs; `--digests` adds a
+`DIGEST` column; `--no-trunc` the whole ID; `-a` is taken (there are no
+intermediate images). `-f` takes Docker's `reference` (a pattern, `*` and `?`),
+`label` and `dangling`; `--format` its fields (`ID`, `Repository`, `Tag`,
+`Digest`, `CreatedSince`, `CreatedAt`, `Size`, `SharedSize`, `UniqueSize`,
+`Containers`; the last three are `N/A`), as [`ps`'s](containers.md#formats).
 
 **Deduplication and garbage collection.** Identical layers shared by two images
 are stored once. `rmi` removes a reference and reclaims only the blobs and layer
 directories no *other* image still needs — a shared base layer survives removing
-one of the images that use it. `image prune` reclaims everything unreferenced,
-and what interrupted work left behind.
+one of the images that use it. `image prune` removes the dangling images (images
+with no name: rare in Shipyard, where removing a name that was an image's last
+removes the image), then reclaims everything unreferenced and what interrupted
+work left behind. With `-a` it also removes every image no container was made
+from, running or not; the check is made again under the store's lock, so an image
+a container is made from meanwhile is kept. It prints Docker's `Deleted Images:`
+(`untagged: NAME`, then `deleted: sha256:…` for each blob) and `Total reclaimed
+space:`. `--filter` takes `until`, `label` and `label!`, as [`container
+prune`'s](containers.md#removing-whats-stopped-container-prune-system-prune). It
+asks first, with Docker's warning, unless given `-f` (without a terminal to ask
+on, it's refused: before 0.3.0 it never asked).
 
 An image a [container](containers.md) was made from isn't removed while the
 container exists, running or not (`rmi --force` removes its name; the container
 keeps what it needs to start again, until it's removed): a foreground image run
 is a container too, so its image stays until the container is removed (`run --rm`
 removes it as it ends). Nor is one a run without a record is using (`rmi --force`
-removes its name; its layers stay until the run ends and a prune collects them). A container's own writable layer is never pruned. A
-prune or
-`rmi` never takes what a pull or a starting run is using: it waits for them, up
-to 15 seconds, then says the store is busy.
+removes its name; its layers stay until the run ends and a prune collects them).
+`image prune` never takes a container's own writable layer (`container prune`
+and `rm` do). A prune or `rmi` never takes what a pull or a starting run is
+using: it waits for them, up to 15 seconds, then says the store is busy.
 
 `system df` shows what images, containers' writable layers and volumes take, and
-how much of each nothing uses now (reclaimable). `COUNT` for containers is the
-running ones; a stopped container's layer counts in `SIZE`, not as reclaimable
-(`rm` reclaims it, not a prune):
+how much of each nothing uses now (reclaimable), as Docker's: `TOTAL` how many,
+`ACTIVE` how many are in use (images a container's layers use, containers
+running, volumes a container names). A stopped container's layer counts in `SIZE`,
+not as reclaimable (as Docker's: `rm`, or a `container prune`, reclaims it). There's no `Build Cache` row:
+Shipyard builds no images yet.
 
 ```text
-TYPE         COUNT   SIZE       RECLAIMABLE
-Images       2       41.3 MiB   3.9 MiB
-Containers   1       12.0 KiB   0 B
-Volumes      1       2.1 MiB    0 B
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          2         1         43.3MB    4.09MB (9%)
+Containers      3         1         12.29kB   0B (0%)
+Local Volumes   1         1         2.2MB     0B (0%)
 ```
 
+`--format` takes Docker's fields (`Type`, `TotalCount`, `Active`, `Size`,
+`Reclaimable`), as [`ps`'s](containers.md#formats).
+
 Rootless, some directories are your subordinate IDs' (an image's other users), and
-can't all be read: a size then shows as `≥`, at least that much.
+can't all be read: a size then shows as `≥`, at least that much (in `--format`'s
+values too, where Docker's never have it). `system df` reads the image store as it
+is; `info`'s `Images` counts as its `TOTAL` does (each image once, however many names
+it has).
 
 `rmi` takes several references; one it can't remove is reported, the rest are still
-removed, and the command exits 125.
+removed, and the command exits 1. It takes an image's ID too: its manifest's
+digest, whole or its first 4 hex digits or more (as `IMAGE ID` shows it), or its
+config's, whole. That removes every reference of the image, all of them or none; one
+with references in more than one repository is refused unless `--force`, as Docker's
+`rmi` does.
 
 ## Where the store lives
 
@@ -264,7 +308,7 @@ removes partial downloads.
 ## Not yet
 
 - Building images, `push`, and signature verification (cosign/sigstore).
-- `tag`, `inspect`, `history`, `save`/`load`, `import`/`export`.
+- `history`, `save`/`load`, `import`/`export`.
 - zstd-compressed layers (gzip works today; a zstd layer is refused by name).
 - A fallback to `fuse-overlayfs` where the kernel won't let a normal user mount
   overlay.

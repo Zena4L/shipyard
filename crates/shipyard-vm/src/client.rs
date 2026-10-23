@@ -12,6 +12,7 @@ use shipyard_runtime::attach::client::{self, Act, AttachError, AttachOptions, En
 use shipyard_runtime::attach::forward::{self, Connection, Request};
 use shipyard_runtime::process::SignalWatch;
 
+use crate::forwarding::Unanswered;
 use crate::{HOST_ARG, VmError, VmPaths};
 
 /// How long a first command waits for the VM: longer than its host waits
@@ -77,6 +78,28 @@ pub fn connect(paths: &VmPaths) -> Result<UnixStream, VmError> {
     connect_watching(paths, None)
 }
 
+/// The refusal an attach client's `error` is, if it's one of the VM's: by
+/// its code (version 5), or an older host's or guest's words.
+fn refusal_of(error: &AttachError) -> Option<forward::Refusal> {
+    match error {
+        AttachError::Declined(refusal) => Some(refusal.clone()),
+        AttachError::Refused(why) => Some(forward::Refusal::from_words(why)),
+        _ => None,
+    }
+}
+
+/// Starts the VM if it isn't running, and waits for its guest to be ready
+/// (D10.4-4: its data disk checked first): what `vm start` and `shipyard
+/// compose` mean by started.
+///
+/// # Errors
+///
+/// As [`connect`]'s and [`until_guest_ready`]'s.
+pub fn start(paths: &VmPaths) -> Result<(), VmError> {
+    drop(connect(paths)?);
+    until_guest_ready(paths)
+}
+
 /// [`connect`], given up on as `watch` catches a signal that ends a
 /// wait ([`interrupted`]).
 fn connect_watching(paths: &VmPaths, watch: Option<&SignalWatch>) -> Result<UnixStream, VmError> {
@@ -90,15 +113,12 @@ fn connect_watching(paths: &VmPaths, watch: Option<&SignalWatch>) -> Result<Unix
         if let Ok(stream) = UnixStream::connect(paths.socket()) {
             return Ok(stream);
         }
-        let ended = host.try_wait().ok().flatten();
+        let ended = host.ended(paths);
         let failed = ended.is_some_and(|status| !status.success());
         if failed || Instant::now() > deadline {
             if !failed {
                 // Not killed: asked to stop, it stops its guest first.
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(i32::try_from(host.id()).unwrap_or(-1)),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
+                host.terminate(paths);
             }
             return Err(VmError::Host(format!(
                 "the VM didn't start{}: {}",
@@ -107,8 +127,9 @@ fn connect_watching(paths: &VmPaths, watch: Option<&SignalWatch>) -> Result<Unix
             )));
         }
         // Ours left (another host had the lock), and there's still no
-        // socket: once no host holds the lock, start one again.
-        if ended.is_some() && status(paths)? == Status::Stopped {
+        // socket: once no host holds the lock, start one again (launchd's
+        // job: started again, a no-op while it runs).
+        if host.may_start_again(ended, Instant::now()) && status(paths)? == Status::Stopped {
             host = start_host(paths)?;
         }
         if let Some(code) = interrupted(watch) {
@@ -118,15 +139,117 @@ fn connect_watching(paths: &VmPaths, watch: Option<&SignalWatch>) -> Result<Unix
     }
 }
 
-/// Starts the host: this binary again, in a session of its own (a closed
-/// terminal doesn't end it), in `/` (it holds no directory of the
-/// caller's), with nothing the CLI inherited, its output to its log.
-fn start_host(paths: &VmPaths) -> Result<std::process::Child, VmError> {
-    let exe = std::env::current_exe().map_err(|e| VmError::Host(format!("this binary: {e}")))?;
+/// The host as the CLI started it: a process of its own, or launchd's
+/// job (once `shipyard vm install` has loaded it: then launchd holds
+/// Docker's socket, and the one host must be its).
+enum Started {
+    /// Spawned here.
+    Spawned(std::process::Child),
+    /// launchd's, kicked into starting.
+    Launchd {
+        /// How many times launchd had started it as it was kicked: a run
+        /// past these is this start's (or a later one's).
+        runs: Option<u64>,
+        /// When it was last kicked.
+        kicked: Instant,
+    },
+}
+
+/// How often a launchd start is kicked again while no host holds the lock
+/// (launchd itself starts a job at most every 10 s).
+const KICK_AGAIN: Duration = Duration::from_secs(2);
+
+impl Started {
+    /// How it ended, if it has: a spawned one's status; launchd's, a run
+    /// since its kick that ended with an error (launchd's word on it).
+    fn ended(&mut self, paths: &VmPaths) -> Option<std::process::ExitStatus> {
+        match self {
+            Self::Spawned(host) => host.try_wait().ok().flatten(),
+            Self::Launchd { runs, .. } => {
+                let job = crate::launchd::job(paths)?;
+                ended_in_launchd(*runs, job)
+            }
+        }
+    }
+
+    /// Asks it to stop (SIGTERM: its guest stopped in order).
+    fn terminate(&self, paths: &VmPaths) {
+        match self {
+            Self::Spawned(host) => {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(i32::try_from(host.id()).unwrap_or(-1)),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            Self::Launchd { .. } => crate::launchd::terminate(paths),
+        }
+    }
+
+    /// Whether to start it again (at `now`) once no host holds the lock: a
+    /// spawned one that ended; launchd's every [`KICK_AGAIN`] (kicking it
+    /// while it runs does nothing).
+    fn may_start_again(&self, ended: Option<std::process::ExitStatus>, now: Instant) -> bool {
+        match self {
+            Self::Spawned(_) => ended.is_some(),
+            Self::Launchd { kicked, .. } => now.duration_since(*kicked) >= KICK_AGAIN,
+        }
+    }
+}
+
+/// A launchd start's end, from its job (`runs` when it was kicked): a run
+/// since then, not running now, whose exit code launchd kept. (One that
+/// ended well, a run at load that found nothing asked, isn't an end: the
+/// start goes on.)
+fn ended_in_launchd(
+    runs: Option<u64>,
+    job: crate::launchd::Job,
+) -> Option<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let since = runs.is_some_and(|runs| job.runs > runs);
+    let code = job.last_exit.filter(|&code| code != 0)?;
+    (since && !job.running)
+        .then(|| std::process::ExitStatus::from_raw(i32::try_from(code & 0xff).unwrap_or(1) << 8))
+}
+
+/// Starts the host: through launchd if its agent for this VM is loaded
+/// (`shipyard vm install`), else [`spawn_host`].
+fn start_host(paths: &VmPaths) -> Result<Started, VmError> {
+    if crate::launchd::loaded(paths) {
+        let runs = crate::launchd::job(paths).map(|job| job.runs);
+        // A host runs already (booting): no mark, no kick, only the wait
+        // (a mark it would never take would boot the VM at the next login).
+        if status(paths)? == Status::Stopped {
+            rotate_host_log(paths);
+            // Its host boots only when asked (else it takes itself for
+            // launchd's run at load): the mark says the CLI asked.
+            let mark = paths.start_asked();
+            std::fs::write(&mark, b"").map_err(|e| VmError::io(&mark, e))?;
+            crate::launchd::kickstart(paths)?;
+        }
+        return Ok(Started::Launchd {
+            runs,
+            kicked: Instant::now(),
+        });
+    }
+    spawn_host(paths).map(Started::Spawned)
+}
+
+/// The host's log moved aside past [`HOST_LOG_KEPT`] (the host appends to
+/// it, as launchd does for its agent's).
+fn rotate_host_log(paths: &VmPaths) {
     let log_path = paths.host_log();
     if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > HOST_LOG_KEPT) {
         let _ = std::fs::rename(&log_path, log_path.with_extension("log.1"));
     }
+}
+
+/// Starts the host here: this binary again, in a session of its own (a
+/// closed terminal doesn't end it), in `/` (it holds no directory of the
+/// caller's), with nothing the CLI inherited, its output to its log.
+fn spawn_host(paths: &VmPaths) -> Result<std::process::Child, VmError> {
+    let exe = std::env::current_exe().map_err(|e| VmError::Host(format!("this binary: {e}")))?;
+    rotate_host_log(paths);
+    let log_path = paths.host_log();
     let log = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -169,7 +292,7 @@ fn descriptor_bound() -> i32 {
 }
 
 /// The last `count` lines of `path` (or why there are none).
-fn last_lines(path: &std::path::Path, count: usize) -> String {
+pub(crate) fn last_lines(path: &std::path::Path, count: usize) -> String {
     std::fs::read_to_string(path).map_or_else(
         |error| format!("no log ({error})"),
         |text| {
@@ -197,13 +320,54 @@ const ASK_LIMIT: Duration = Duration::from_secs(30);
 
 /// The output of an internal request (`args`: `__guest-doctor`, say) to the
 /// guest, read up to `cap`, if the VM runs: never started for it (`None`
-/// when it isn't running, or is stopping), so asking changes nothing.
+/// when it isn't running, or is stopping), so asking changes nothing. A
+/// guest not ready yet (its data disk checked: D10.4-4) is asked again for
+/// up to [`ASK_LIMIT`].
 ///
 /// # Errors
 ///
 /// [`VmError::Gone`]: the guest didn't answer, or answered as an older
-/// guest does (the request unknown to it).
+/// guest does (the request unknown to it), or still wasn't ready.
 pub fn ask(paths: &VmPaths, args: &[&str], cap: usize) -> Result<Option<Vec<u8>>, VmError> {
+    let began = Instant::now();
+    loop {
+        match ask_once(paths, args, cap) {
+            Err(VmError::NotReady) if began.elapsed() < ASK_LIMIT => {}
+            asked => return asked,
+        }
+        std::thread::sleep(NOT_READY_REST);
+    }
+}
+
+/// Waits until the running VM's guest is ready for commands (its data
+/// disk checked or repaired: D10.4-4, so no bound cuts a repair short),
+/// said on stderr once it's taken a few seconds: what `vm start` promises.
+/// A VM that isn't running (stopped meanwhile) has nothing to wait for.
+///
+/// # Errors
+///
+/// [`VmError::Gone`]: the guest didn't answer.
+pub fn until_guest_ready(paths: &VmPaths) -> Result<(), VmError> {
+    let began = Instant::now();
+    let mut said = false;
+    loop {
+        match ask_once(paths, &[forward::PORTS_REQUEST], forward::MAX_PORTS_ANSWER) {
+            Err(VmError::NotReady) => {}
+            asked => return asked.map(drop),
+        }
+        if !said && began.elapsed() >= SAY_NOT_READY_AFTER {
+            said = true;
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!("shipyard: {}: waiting\n", forward::NOT_READY),
+            );
+        }
+        std::thread::sleep(NOT_READY_REST);
+    }
+}
+
+/// [`ask`]'s one try.
+fn ask_once(paths: &VmPaths, args: &[&str], cap: usize) -> Result<Option<Vec<u8>>, VmError> {
     if status(paths)? == Status::Stopped {
         return Ok(None);
     }
@@ -219,8 +383,11 @@ pub fn ask(paths: &VmPaths, args: &[&str], cap: usize) -> Result<Option<Vec<u8>>
     let _ = forward::send(&mut stream, &hello);
     match crate::forwarding::output(&mut Connection::new(stream), cap) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(why) if why == forward::STOPPING => Ok(None),
-        Err(why) => Err(VmError::Gone(why)),
+        Err(Unanswered::Refused(forward::Refusal::Stopping)) => Ok(None),
+        Err(Unanswered::Refused(forward::Refusal::NotReady)) => Err(VmError::NotReady),
+        Err(Unanswered::Refused(forward::Refusal::Other(why)) | Unanswered::Broken(why)) => {
+            Err(VmError::Gone(why))
+        }
     }
 }
 
@@ -256,14 +423,53 @@ fn tries(
     request: &Request,
     watch: &mut Option<SignalWatch>,
 ) -> Result<Outcome, VmError> {
-    match attempt(paths, request, watch) {
+    match until_ready(paths, request, watch) {
         // The host was stopping (idle): the command never reached the
         // guest. Once that host is gone, once more (starting the VM).
         Err(Tried::Stopping(host)) => {
             wait_until_stopped(paths, host, watch.as_ref())?;
-            attempt(paths, request, watch).map_err(Tried::into_error)
+            until_ready(paths, request, watch).map_err(Tried::into_error)
         }
         tried => tried.map_err(Tried::into_error),
+    }
+}
+
+/// How long the guest may be not ready before the wait is said.
+const SAY_NOT_READY_AFTER: Duration = Duration::from_secs(3);
+
+/// Between two asks of a guest that isn't ready.
+const NOT_READY_REST: Duration = Duration::from_millis(250);
+
+/// [`attempt`]s, again and again while the guest isn't ready (its data
+/// disk checked or repaired: D10.4-4, so no bound cuts a repair short),
+/// said on stderr once it's taken a few seconds; given up on as `watch`
+/// catches a signal that ends a wait.
+fn until_ready(
+    paths: &VmPaths,
+    request: &Request,
+    watch: &mut Option<SignalWatch>,
+) -> Result<Outcome, Tried> {
+    let began = Instant::now();
+    let mut said = false;
+    loop {
+        match attempt(paths, request, watch) {
+            Err(Tried::NotReady) => {}
+            tried => return tried,
+        }
+        if let Some(code) = interrupted(watch.as_ref()) {
+            return Err(VmError::Interrupted(code).into());
+        }
+        if !said && began.elapsed() >= SAY_NOT_READY_AFTER {
+            said = true;
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "shipyard: {}: waiting (Ctrl-C to stop waiting)\n",
+                    forward::NOT_READY
+                ),
+            );
+        }
+        std::thread::sleep(NOT_READY_REST);
     }
 }
 
@@ -271,6 +477,8 @@ fn tries(
 enum Tried {
     /// The host refused it as it stopped: that host's PID, if known.
     Stopping(Option<u32>),
+    /// The guest refused it, not ready yet (its data disk being checked).
+    NotReady,
     /// Anything else.
     Failed(VmError),
 }
@@ -278,7 +486,8 @@ enum Tried {
 impl Tried {
     fn into_error(self) -> VmError {
         match self {
-            Self::Stopping(_) => VmError::Refused(forward::STOPPING.to_owned()),
+            Self::Stopping(_) => VmError::Refused(forward::Refusal::Stopping.to_string()),
+            Self::NotReady => VmError::NotReady,
             Self::Failed(error) => error,
         }
     }
@@ -367,8 +576,15 @@ fn attempt(
     let sent = send(&writer, &hello);
     let mut connection = Connection::new(stream);
     let first = connection.next_frame();
-    if matches!(&first, Ok(Some(Frame::Refused(why))) if why == forward::STOPPING) {
-        return Err(stopping(paths));
+    match first
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(forward::Refusal::of)
+    {
+        Some(forward::Refusal::Stopping) => return Err(stopping(paths)),
+        Some(forward::Refusal::NotReady) => return Err(Tried::NotReady),
+        _ => {}
     }
     sent?;
     let first = first.map_err(|e| VmError::Gone(format!("the VM's answer can't be read: {e}")))?;
@@ -399,13 +615,17 @@ fn on_terminal(
         detach_keys: shipyard_runtime::attach::DetachKeys::none(),
         stdin: input,
         held: false,
+        output: client::Output::BOTH,
     };
     let welcomed = match client::welcomed_with(stream, hello, &options) {
         Ok(welcomed) => welcomed,
-        Err(AttachError::Refused(why)) if why == forward::STOPPING => {
-            return Err(stopping(paths));
+        Err(error) => {
+            return Err(match refusal_of(&error) {
+                Some(forward::Refusal::Stopping) => stopping(paths),
+                Some(forward::Refusal::NotReady) => Tried::NotReady,
+                _ => session_error(error).into(),
+            });
         }
-        Err(error) => return Err(session_error(error).into()),
     };
     let Some(watch) = watch.take() else {
         return Err(VmError::Host("no signal watch left".to_owned()).into());
@@ -433,8 +653,15 @@ fn on_terminal(
     Ok(match ended {
         Ended::Exited(code) => Outcome::Exited(code),
         // This terminal closed: the command is hung up on (the agent sees
-        // the connection go), as a shell's would be.
-        Ended::HungUp => Outcome::Exited(129),
+        // the connection go), as a shell's would be. The watch's handlers
+        // stay until this process exits: the shell that owned the terminal
+        // ends too, and the kernel sends this group a second SIGHUP then,
+        // which the default its drop puts back would die of (a vm_terminal
+        // run saw `Signaled(1)` for 129).
+        Ended::HungUp => {
+            std::mem::forget(watch);
+            Outcome::Exited(129)
+        }
         Ended::Left(code) => {
             if let Some(way) = left {
                 say_left(way);
@@ -510,7 +737,10 @@ fn relay(first: Option<Frame>, mut connection: Connection<UnixStream>) -> Result
             }
             Some(Frame::Welcome { .. } | Frame::Stderr(_)) => {}
             Some(Frame::Exited(code)) => return Ok(Outcome::Exited(code)),
-            Some(Frame::Refused(why)) => return Err(VmError::Refused(why)),
+            // A refusal of any kind, a newer peer's too: its words.
+            Some(frame) if let Some(refusal) = forward::Refusal::of(&frame) => {
+                return Err(VmError::Refused(refusal.to_string()));
+            }
             Some(_) => {
                 return Err(VmError::Gone(
                     "the VM sent something a forwarded command's answer can't hold".to_owned(),
@@ -753,6 +983,32 @@ fn wait_for_host_gone(paths: &VmPaths, pid: Option<u32>, deadline: Instant) -> R
 mod tests {
     use super::*;
 
+    /// A launchd start has ended when a run since its kick has ended with
+    /// an error; one that ended well (launchd's run at load), one still
+    /// running, or one from before the kick hasn't. Kicked again at most
+    /// every 2 s.
+    #[test]
+    fn a_launchd_start_ends_by_launchds_word() {
+        let job = |running, runs, last_exit| crate::launchd::Job {
+            running,
+            runs,
+            last_exit,
+        };
+        let failed = ended_in_launchd(Some(2), job(false, 3, Some(1)));
+        assert_eq!(failed.and_then(|status| status.code()), Some(1));
+        assert!(ended_in_launchd(Some(2), job(false, 3, Some(0))).is_none());
+        assert!(ended_in_launchd(Some(2), job(true, 3, Some(1))).is_none());
+        assert!(ended_in_launchd(Some(3), job(false, 3, Some(1))).is_none());
+        assert!(ended_in_launchd(None, job(false, 3, Some(1))).is_none());
+        let kicked = Instant::now();
+        let started = Started::Launchd {
+            runs: Some(1),
+            kicked,
+        };
+        assert!(!started.may_start_again(None, kicked + Duration::from_millis(500)));
+        assert!(started.may_start_again(None, kicked + KICK_AGAIN));
+    }
+
     /// A fake host on `paths`' socket: each connection, in turn, answered
     /// with the frames `answers` gives for it, its hello read first as the
     /// guest's agent reads it (a refusal, as a stopping host's, comes
@@ -890,6 +1146,70 @@ mod tests {
             tries(&paths, &request, &mut None),
             Err(VmError::Refused(why)) if why == forward::STOPPING
         ));
+        host.join().unwrap();
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// A refusal by its code (F99) is known whatever its words: a stopping
+    /// host's command is sent again, a not-ready guest's asked again.
+    #[test]
+    fn a_refusal_is_known_by_its_code() {
+        let declined = |reason| {
+            vec![Frame::Declined {
+                reason,
+                why: "words of another version".to_owned(),
+            }]
+        };
+        let welcome = Frame::Welcome {
+            version: shipyard_runtime::attach::VERSION,
+            terminal: false,
+            stdin: false,
+        };
+        let request = Request::new(vec!["ps".to_owned()], "/".to_owned(), Vec::new());
+        let paths = scratch("declined");
+        for reason in [
+            shipyard_runtime::attach::Decline::Stopping,
+            shipyard_runtime::attach::Decline::NotReady,
+        ] {
+            let host = fake_host(
+                &paths,
+                vec![declined(reason), vec![welcome.clone(), Frame::Exited(7)]],
+            );
+            let tried = tries(&paths, &request, &mut None);
+            assert!(
+                matches!(tried, Ok(Outcome::Exited(7))),
+                "{reason:?}: {tried:?}"
+            );
+            host.join().unwrap();
+            let _ = std::fs::remove_file(paths.socket());
+        }
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// A guest not ready yet (its data disk being checked) refuses each try:
+    /// asked again until it's ready, then the command runs (never cut short
+    /// by a bound: D10.4-4).
+    #[test]
+    fn a_command_waits_for_a_guest_that_isnt_ready() {
+        let not_ready = || vec![Frame::Refused(forward::NOT_READY.to_owned())];
+        let welcome = Frame::Welcome {
+            version: shipyard_runtime::attach::VERSION,
+            terminal: false,
+            stdin: false,
+        };
+        let request = Request::new(vec!["ps".to_owned()], "/".to_owned(), Vec::new());
+        let paths = scratch("not-ready");
+        let host = fake_host(
+            &paths,
+            vec![
+                not_ready(),
+                not_ready(),
+                not_ready(),
+                vec![welcome, Frame::Exited(3)],
+            ],
+        );
+        let tried = tries(&paths, &request, &mut None);
+        assert!(matches!(tried, Ok(Outcome::Exited(3))), "{tried:?}");
         host.join().unwrap();
         let _ = std::fs::remove_dir_all(&paths.dir);
     }

@@ -123,6 +123,34 @@ pub fn create(
     engine: &Engine,
     spec: &shipyard_network::store::NetworkSpec,
 ) -> Result<shipyard_network::store::NetworkConfig> {
+    create_with(
+        engine,
+        spec,
+        shipyard_network::store::NetworkMeta::default(),
+    )
+    .map(|(config, _)| config)
+}
+
+/// [`create`], with `meta` (Docker's API's labels and options, checked by
+/// the caller) kept beside it, and an ID of its own (random, made now): it
+/// and what was kept. The default network's name is taken (as Docker's:
+/// it's made only as the default, by a run or a listing).
+///
+/// # Errors
+///
+/// As [`create`]; labels and options too many (64 KiB at most).
+#[cfg(target_os = "linux")]
+pub fn create_with(
+    engine: &Engine,
+    spec: &shipyard_network::store::NetworkSpec,
+    mut meta: shipyard_network::store::NetworkMeta,
+) -> Result<(
+    shipyard_network::store::NetworkConfig,
+    shipyard_network::store::NetworkMeta,
+)> {
+    if spec.name == shipyard_network::store::DEFAULT_NETWORK {
+        return Err(shipyard_network::store::StoreError::Exists(spec.name.clone()).into());
+    }
     if RESERVED.contains(&spec.name.as_str()) {
         bail!(
             InvalidRequest,
@@ -137,7 +165,8 @@ pub fn create(
         );
     }
     let networks = networks(engine)?;
-    let config = networks.create(spec, &host_routes()?)?;
+    meta.id = Some(crate::docker::new_id()?);
+    let config = networks.create_with(spec, &host_routes()?, &meta)?;
     if let Err(error) = shipyard_network::attach::ensure_bridge(&config) {
         // A network that can't have its bridge isn't one.
         if let Ok(locked) = networks.lock(&config.name) {
@@ -146,7 +175,7 @@ pub fn create(
         return Err(Error::from(error).context(format!("the network {}", config.name)));
     }
     crate::events::emit_about(engine, crate::events::Kind::Network, "create", &config.name);
-    Ok(config)
+    Ok((config, meta))
 }
 
 /// Off Linux: no networks.
@@ -163,9 +192,27 @@ pub fn create(
     off_linux()
 }
 
+/// Off Linux: no networks.
+///
+/// # Errors
+///
+/// Always [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+#[cfg(not(target_os = "linux"))]
+pub fn create_with(
+    engine: &Engine,
+    spec: &shipyard_network::store::NetworkSpec,
+    meta: shipyard_network::store::NetworkMeta,
+) -> Result<(
+    shipyard_network::store::NetworkConfig,
+    shipyard_network::store::NetworkMeta,
+)> {
+    let _ = (engine, spec, meta);
+    off_linux()
+}
+
 /// A network, and its live leases: the containers on it now.
 #[derive(Debug)]
-pub struct NetworkListed {
+pub(crate) struct NetworkListed {
     /// The network.
     pub config: shipyard_network::store::NetworkConfig,
     /// Its live leases.
@@ -174,13 +221,13 @@ pub struct NetworkListed {
     pub dns_running: bool,
 }
 
-/// `shipyard network ls` and `inspect`: the networks named (all, for
-/// none), with their live leases.
+/// `inspect`'s networks: those named (all, for none), with their live
+/// leases (`network ls` is Docker's: [`crate::docker::list_networks`]).
 ///
 /// # Errors
 ///
 /// If one named doesn't exist, or the store can't be read.
-pub fn list(engine: &Engine, names: &[String]) -> Result<Vec<NetworkListed>> {
+pub(crate) fn list(engine: &Engine, names: &[String]) -> Result<Vec<NetworkListed>> {
     use shipyard_network::store::StoreError;
     let networks = networks(engine)?;
     let configs = if names.is_empty() {
@@ -321,7 +368,7 @@ impl From<NetworkListed> for NetworkInspected {
 ///
 /// # Errors
 ///
-/// As [`list`].
+/// If one named doesn't exist, or the store can't be read.
 pub fn inspect(engine: &Engine, names: &[String]) -> Result<Vec<NetworkInspected>> {
     Ok(list(engine, names)?
         .into_iter()
@@ -330,9 +377,9 @@ pub fn inspect(engine: &Engine, names: &[String]) -> Result<Vec<NetworkInspected
 }
 
 /// `shipyard network rm`: the network named `name`, if no container uses it
-/// (never the default one), with its bridge. A container uses it if its
-/// record joins it, running or not (a stopped one would start on it again),
-/// or a run holds a lease on it.
+/// (never the default one), with its bridge. A container uses it if it's
+/// up and its record joins it (a stopped one doesn't keep it: Docker's
+/// rule), or a run holds a lease on it.
 ///
 /// # Errors
 ///
@@ -355,7 +402,7 @@ pub fn remove(engine: &Engine, name: &str) -> Result<()> {
     {
         let networks = networks(engine)?;
         let locked = networks.lock(name)?;
-        ensure_no_record_joins(engine, name)?;
+        ensure_no_container_up_on(engine, name)?;
         // A container that's gone doesn't keep it; the network's rules and
         // bridge go with it.
         teardown(engine, &networks, &locked)?;
@@ -366,17 +413,19 @@ pub fn remove(engine: &Engine, name: &str) -> Result<()> {
 }
 
 /// [`ErrorKind::InUse`](crate::ErrorKind::InUse) naming the containers
-/// whose records join the network `name`, whatever their state. Records
-/// that can't be read refuse it too: a container they'd name can't be ruled
-/// out.
+/// on the network `name` that are up: running, paused, stopping, waiting
+/// to restart, or about to be restarted (their restart held). A stopped
+/// one doesn't keep it (Docker's rule, D11.4a-2): its next start fails,
+/// the network not found. Records that can't be read refuse it, and so
+/// does a state that can't be read: a container up can't be ruled out.
 #[cfg(target_os = "linux")]
-fn ensure_no_record_joins(engine: &Engine, name: &str) -> Result<()> {
+fn ensure_no_container_up_on(engine: &Engine, name: &str) -> Result<()> {
     use shipyard_network::store::DEFAULT_NETWORK;
-    let records = crate::containers::list(engine)
+    let records = crate::containers::list_every(engine)
         .with_context(|| format!("the network {name} is kept: its containers can't be listed"))?;
     let mut users: Vec<String> = records
         .iter()
-        .filter(|record| record.config.joins(name, DEFAULT_NETWORK))
+        .filter(|record| record.config.joins(name, DEFAULT_NETWORK) && is_up(engine, record))
         .map(|record| record.name.to_string())
         .collect();
     if users.is_empty() {
@@ -388,6 +437,35 @@ fn ensure_no_record_joins(engine: &Engine, name: &str) -> Result<()> {
         "the network {name} is in use by {}",
         shipyard_network::store::users_text(&users)
     );
+}
+
+/// Whether container `record` keeps its networks in use: up (running,
+/// paused, stopping, waiting to restart) or about to be restarted (its
+/// restart held). A state that can't be read counts as up: a container up
+/// can't be ruled out.
+#[cfg(target_os = "linux")]
+fn is_up(engine: &Engine, record: &crate::containers::Record) -> bool {
+    crate::containers::state(engine, record).map_or(true, |state| state.is_active())
+        || crate::containers::restart_pending(engine, &record.id)
+}
+
+/// The bridge networks some container that's up joins, by name (F120:
+/// `GET /networks`' `dangling`, by `network rm`'s rule, D11.4a-2).
+///
+/// # Errors
+///
+/// The containers can't be listed.
+#[cfg(target_os = "linux")]
+pub(crate) fn networks_in_use(engine: &Engine) -> Result<std::collections::BTreeSet<String>> {
+    use shipyard_network::store::DEFAULT_NETWORK;
+    let records = crate::containers::list_every(engine)
+        .context("the networks in use can't be told: the containers can't all be read")?;
+    Ok(records
+        .iter()
+        .filter(|record| is_up(engine, record))
+        .flat_map(|record| record.config.bridges(DEFAULT_NETWORK).unwrap_or_default())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Takes the network `locked` apart, if no container uses it: what gone
@@ -444,15 +522,44 @@ pub struct Pruned {
 /// If the networks can't be listed (one that can't be removed is in
 /// [`Pruned::failed`]).
 pub fn prune(engine: &Engine) -> Result<Pruned> {
+    prune_where(engine, &|_, _| true)
+}
+
+/// [`prune`], of the networks `wanted` takes by their labels and when
+/// they were made (Unix seconds: Docker's prune's `label` and `until`).
+/// One whose labels can't be read is never taken, and said in `failed`.
+///
+/// # Errors
+///
+/// As [`prune`].
+pub fn prune_where(
+    engine: &Engine,
+    wanted: &dyn Fn(&std::collections::BTreeMap<String, String>, i64) -> bool,
+) -> Result<Pruned> {
     use shipyard_network::store::DEFAULT_NETWORK;
     let mut pruned = Pruned {
         removed: Vec::new(),
         in_use: Vec::new(),
         failed: Vec::new(),
     };
-    for config in networks(engine)?.list()? {
+    let networks = networks(engine)?;
+    for config in networks.list()? {
         if config.name == DEFAULT_NETWORK {
             continue;
+        }
+        match networks.meta(&config.name) {
+            Ok(meta)
+                if wanted(
+                    &meta.labels,
+                    i64::try_from(config.created).unwrap_or(i64::MAX),
+                ) => {}
+            Ok(_) => continue,
+            Err(error) => {
+                pruned
+                    .failed
+                    .push(Error::from(error).context(format!("the network {}", config.name)));
+                continue;
+            }
         }
         match remove(engine, &config.name) {
             Ok(()) => pruned.removed.push(config.name),
@@ -467,6 +574,30 @@ pub fn prune(engine: &Engine) -> Result<Pruned> {
     }
     crate::events::emit_pruned(engine, crate::events::Kind::Network, pruned.removed.len());
     Ok(pruned)
+}
+
+/// [`prune_where`] where there are networks of Shipyard's; `None` where
+/// there are none to prune (rootless, or not Linux): not a failure.
+///
+/// # Errors
+///
+/// As [`prune`].
+pub fn prune_where_any(
+    engine: &Engine,
+    wanted: &dyn Fn(&std::collections::BTreeMap<String, String>, i64) -> bool,
+) -> Result<Option<Pruned>> {
+    match prune_where(engine, wanted) {
+        Ok(pruned) => Ok(Some(pruned)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                crate::ErrorKind::NeedsRoot | crate::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

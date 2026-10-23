@@ -29,7 +29,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::Config;
+use super::config::{Config, StoredConfig};
 use super::id::{ContainerId, Serial};
 use super::labels::Labels;
 use super::names::Name;
@@ -183,7 +183,7 @@ struct V3 {
     serial: Serial,
     name: Name,
     created: SystemTime,
-    config: Config,
+    config: StoredConfig,
     labels: Labels,
     started: Option<SystemTime>,
     finished: Option<SystemTime>,
@@ -212,7 +212,7 @@ struct V2 {
     serial: Serial,
     name: Name,
     created: SystemTime,
-    config: Config,
+    config: StoredConfig,
     labels: Labels,
     started: Option<SystemTime>,
     finished: Option<SystemTime>,
@@ -233,7 +233,7 @@ struct V1 {
     serial: Serial,
     name: Name,
     created: SystemTime,
-    config: Config,
+    config: StoredConfig,
     labels: Labels,
     started: Option<SystemTime>,
     finished: Option<SystemTime>,
@@ -377,6 +377,7 @@ impl Record {
             next_start,
             restart_delay_ms,
         } = self.clone();
+        let config = StoredConfig::from(&config);
         let json = serde_json::to_vec_pretty(&V3 {
             version,
             id,
@@ -504,6 +505,7 @@ impl Record {
             next_start,
             restart_delay_ms,
         } = serde_json::from_slice(bytes).context("a container's record")?;
+        let config = Config::try_from(config).context("a container's record")?;
         let record = Self {
             id,
             serial,
@@ -544,6 +546,7 @@ impl Record {
             auto_remove,
             ports,
         } = serde_json::from_slice(bytes).context("a container's record (version 2)")?;
+        let config = Config::try_from(config).context("a container's record")?;
         Ok(Self {
             id,
             serial,
@@ -580,6 +583,7 @@ impl Record {
             finished,
             exit,
         } = serde_json::from_slice(bytes).context("a container's record (version 1)")?;
+        let config = Config::try_from(config).context("a container's record")?;
         Ok(Self {
             id,
             serial,

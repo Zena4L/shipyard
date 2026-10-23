@@ -48,10 +48,122 @@ pub const MAX_DOCTOR_ANSWER: usize = 1024 * 1024;
 /// both ways, raw ([`Connection::into_parts`]).
 pub const FORWARD_REQUEST: &str = "__guest-forward";
 
+/// A request that isn't a command: a connection to the guest's Docker API
+/// (step 11.5b1), its service started if none answers. Answered by
+/// [`Frame::Welcome`] (or [`Frame::Refused`]), after which the connection
+/// carries the API's bytes both ways, raw, as a [`FORWARD_REQUEST`]'s.
+pub const API_REQUEST: &str = "__guest-api";
+
+/// What the host asks of the guest's agent once the client of one of its
+/// [`API_REQUEST`] connections has gone (step 11.7): `API_HANG_UP PORT`,
+/// the connection named by the host's vsock port (the guest's peer's). Its
+/// API socket is then shut both ways, which the guest's service takes for
+/// the client's hang-up: Virtualization.framework passes the host's close
+/// of a vsock on as a half-close only, which says less. Answered with no
+/// frame; an older guest runs it as an unknown command, and fails.
+pub const API_HANG_UP: &str = "__guest-api-hang-up";
+
+/// How long an API connection waits for its second end
+/// (`shipyard_sys::relay::both_ways_lingering`, the client its `one`).
+/// After the client's (its input ended: `echo x | docker run -i …`): as
+/// long as it takes, as the service ends each connection itself and a cut
+/// would lose a container's output. After the service's (it closes a
+/// pooled client's idle connection): a minute, then cut, as a client that
+/// keeps a dead pooled connection would keep the VM up for good.
+pub const API_LINGERS: shipyard_sys::relay::Lingers = shipyard_sys::relay::Lingers {
+    after_one: std::time::Duration::MAX,
+    after_other: std::time::Duration::from_secs(60),
+};
+
 /// What the VM's host refuses a client with while it's stopping (idle,
 /// step 10.3c2): the client's command never reached the guest, and its
 /// CLI tries again once the VM has stopped (starting it again).
 pub const STOPPING: &str = "the VM is stopping";
+
+/// What the guest's agent says, refusing a request, while the guest isn't
+/// ready for commands (step 10.4, D10.4-4: its data disk still checked or
+/// repaired): the Mac's client waits and asks again.
+pub const NOT_READY: &str = "the VM is still starting: it's checking its data disk, or \
+                             repairing it after an unclean stop (its console log says how far)";
+
+/// Why the VM's host or guest refused a client, as the client acts on
+/// it (step 11.5b2b, F99): the meaning of a [`Decline`](super::Decline)
+/// code (the wire's number), from a [`Frame::Declined`]'s code, or, from an
+/// older peer's [`Frame::Refused`], by its words ([`STOPPING`],
+/// [`NOT_READY`]: the only place they're compared).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The VM is stopping.
+    Stopping,
+    /// The guest is still starting.
+    NotReady,
+    /// Anything else, in words.
+    Other(String),
+}
+
+impl Refusal {
+    /// The refusal `frame` says, if it's one.
+    #[must_use]
+    pub fn of(frame: &Frame) -> Option<Self> {
+        match frame {
+            Frame::Declined { reason, why } => Some(Self::from_decline(*reason, why)),
+            Frame::Refused(why) => Some(Self::from_words(why)),
+            _ => None,
+        }
+    }
+
+    /// A [`Frame::Declined`]'s: by its code, its words kept for one this
+    /// side doesn't know.
+    #[must_use]
+    pub fn from_decline(reason: super::Decline, why: &str) -> Self {
+        match reason {
+            super::Decline::Stopping => Self::Stopping,
+            super::Decline::NotReady => Self::NotReady,
+            super::Decline::Other(_) => Self::Other(why.to_owned()),
+        }
+    }
+
+    /// An older peer's refusal by its words. Not ready is known by its
+    /// start: older guests added "; try again shortly".
+    #[must_use]
+    pub fn from_words(why: &str) -> Self {
+        if why == STOPPING {
+            Self::Stopping
+        } else if why.starts_with(NOT_READY) {
+            Self::NotReady
+        } else {
+            Self::Other(why.to_owned())
+        }
+    }
+
+    /// The frame that says it to a client of protocol version `client`:
+    /// [`Frame::Declined`] from [`DECLINE_VERSION`](super::DECLINE_VERSION),
+    /// else [`Frame::Refused`]'s words.
+    #[must_use]
+    pub fn frame(&self, client: u32) -> Frame {
+        let why = self.to_string();
+        let reason = match self {
+            Self::Stopping => super::Decline::Stopping,
+            Self::NotReady => super::Decline::NotReady,
+            Self::Other(_) => return Frame::Refused(why),
+        };
+        if client >= super::DECLINE_VERSION {
+            Frame::Declined { reason, why }
+        } else {
+            Frame::Refused(why)
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stopping => STOPPING,
+            Self::NotReady => NOT_READY,
+            Self::Other(why) => why,
+        })
+    }
+}
 
 /// The ports answer's format, written in it from the first (H2).
 pub const PORTS_VERSION: u32 = 1;
@@ -121,16 +233,7 @@ impl PortsAnswer {
     /// [`RequestError::Newer`] for a newer version, else
     /// [`RequestError::Unreadable`].
     pub fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
-        #[derive(Deserialize)]
-        struct Versioned {
-            version: u32,
-        }
-        let versioned: Versioned = serde_json::from_slice(bytes)
-            .map_err(|error| RequestError::Unreadable(error.to_string()))?;
-        if versioned.version > PORTS_VERSION {
-            return Err(RequestError::Newer(versioned.version));
-        }
-        serde_json::from_slice(bytes).map_err(|error| RequestError::Unreadable(error.to_string()))
+        shipyard_sys::versioned::read(bytes, PORTS_VERSION).map_err(RequestError::from)
     }
 }
 
@@ -393,6 +496,17 @@ pub struct Request {
     pub time: Option<u64>,
 }
 
+impl From<shipyard_sys::versioned::Error> for RequestError {
+    fn from(error: shipyard_sys::versioned::Error) -> Self {
+        match error {
+            shipyard_sys::versioned::Error::Newer(version) => Self::Newer(version),
+            shipyard_sys::versioned::Error::Unreadable(error) => {
+                Self::Unreadable(error.to_string())
+            }
+        }
+    }
+}
+
 /// Why a request can't be made or read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -464,16 +578,7 @@ impl Request {
     /// [`RequestError::Newer`] for a newer version, else
     /// [`RequestError::Unreadable`].
     pub fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
-        #[derive(Deserialize)]
-        struct Versioned {
-            version: u32,
-        }
-        let versioned: Versioned = serde_json::from_slice(bytes)
-            .map_err(|error| RequestError::Unreadable(error.to_string()))?;
-        if versioned.version > REQUEST_VERSION {
-            return Err(RequestError::Newer(versioned.version));
-        }
-        serde_json::from_slice(bytes).map_err(|error| RequestError::Unreadable(error.to_string()))
+        shipyard_sys::versioned::read(bytes, REQUEST_VERSION).map_err(RequestError::from)
     }
 }
 
@@ -481,6 +586,67 @@ impl Request {
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
     use super::*;
+
+    /// A refusal is read by its code from a version 5 peer, by its words
+    /// from an older one; it's sent as the client's version reads it, and
+    /// one without a code (its words) as words to any.
+    #[test]
+    fn a_refusal_goes_by_its_code_and_falls_back_to_words() {
+        use super::super::{DECLINE_VERSION, Decline};
+        let declined = |reason, why: &str| Frame::Declined {
+            reason,
+            why: why.to_owned(),
+        };
+        assert_eq!(
+            Refusal::of(&declined(Decline::Stopping, "other words")),
+            Some(Refusal::Stopping)
+        );
+        assert_eq!(
+            Refusal::of(&declined(Decline::NotReady, "")),
+            Some(Refusal::NotReady)
+        );
+        assert_eq!(
+            Refusal::of(&declined(Decline::Other(9), "a newer reason")),
+            Some(Refusal::Other("a newer reason".to_owned()))
+        );
+        assert_eq!(
+            Refusal::of(&Frame::Refused(STOPPING.to_owned())),
+            Some(Refusal::Stopping)
+        );
+        assert_eq!(
+            Refusal::of(&Frame::Refused(NOT_READY.to_owned())),
+            Some(Refusal::NotReady)
+        );
+        // An older guest's words, with its tail.
+        assert_eq!(
+            Refusal::from_words(&format!("{NOT_READY}; try again shortly")),
+            Refusal::NotReady
+        );
+        assert_eq!(Refusal::of(&Frame::Exited(0)), None);
+        assert_eq!(
+            Refusal::Stopping.frame(DECLINE_VERSION),
+            declined(Decline::Stopping, STOPPING)
+        );
+        assert_eq!(
+            Refusal::NotReady.frame(DECLINE_VERSION - 1),
+            Frame::Refused(NOT_READY.to_owned())
+        );
+        assert_eq!(
+            Refusal::Other("no".to_owned()).frame(DECLINE_VERSION),
+            Frame::Refused("no".to_owned())
+        );
+        // On the wire and back, an unknown code kept as its number.
+        for frame in [
+            declined(Decline::Stopping, STOPPING),
+            declined(Decline::Other(200), "?"),
+        ] {
+            let mut bytes = Vec::new();
+            frame.encode(&mut bytes);
+            let mut decoder = Decoder::new();
+            decoder.push(&bytes);
+            assert_eq!(decoder.next_frame(), Ok(Some(frame)));
+        }
+    }
 
     /// The caller's named variables go to the guest's `shipyard` in one
     /// variable of its own, read back by name; any value (`=`, quotes, a

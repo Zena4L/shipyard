@@ -227,8 +227,10 @@ fn before_go(
         match options
             .placement
             .isolation()
+            .filter(|isolation| isolation.makes(crate::isolation::Namespace::User))
             .and_then(|isolation| isolation.id_maps.as_ref())
         {
+            // A joined user namespace's maps are its own already.
             Some(maps) => super::user_namespace::write_maps(pid, maps),
             None => Ok(()),
         }
@@ -335,19 +337,23 @@ pub(crate) fn spawn(
         parent_end: go_write.as_raw_fd(),
     };
     #[cfg(target_os = "linux")]
-    let network_join = match options.placement.isolation() {
+    let joins = match options.placement.isolation() {
         Some(isolation) => {
             check_proc_numbers_children(isolation, network.is_some())?;
-            open_network_join(isolation)?
+            // Another container's network is its own to set up, never this
+            // one's hook's.
+            if network.is_some() && isolation.is_joined(crate::isolation::Namespace::Network) {
+                return Err(Error::Network(
+                    "a container that joins another's network gets no network of its own"
+                        .to_owned(),
+                ));
+            }
+            Some(open_joins(isolation)?)
         }
         None => None,
     };
     #[cfg(target_os = "linux")]
-    let isolated = options
-        .placement
-        .isolation()
-        .map(|isolation| CleanImageFiles::open(spec, options, isolation))
-        .transpose()?;
+    let isolated = CleanImageFiles::for_spawn(spec, options, joins.as_ref())?;
     #[cfg(target_os = "linux")]
     let reexec_fds = isolated
         .as_ref()
@@ -378,7 +384,7 @@ pub(crate) fn spawn(
         launch(
             options,
             #[cfg(target_os = "linux")]
-            network_join.as_ref(),
+            joins.as_ref(),
             #[cfg(target_os = "linux")]
             cgroup_dir.as_ref().map(AsRawFd::as_raw_fd),
         )
@@ -642,28 +648,26 @@ fn check_proc_numbers_children(isolation: &Isolation, hooked: bool) -> Result<()
     Ok(())
 }
 
-/// The network namespace `isolation` joins, opened before anything starts.
-/// One that's shipyard's own (the host's, usually) is the container's in
-/// nothing: its settings and devices aren't the container's to change.
+/// The namespaces `isolation` joins, opened before anything starts. A
+/// network namespace that's shipyard's own (the host's, usually) is the
+/// container's in nothing: its settings and devices aren't the container's
+/// to change.
 #[cfg(target_os = "linux")]
-fn open_network_join(isolation: &Isolation) -> Result<Option<super::network::NetworkJoin>> {
-    let Some(path) = isolation.network_path.as_deref() else {
-        return Ok(None);
-    };
-    let join = super::network::NetworkJoin::open(path)?;
+fn open_joins(isolation: &Isolation) -> Result<super::joins::NamespaceJoins> {
+    use crate::isolation::Namespace;
+    let joins = super::joins::NamespaceJoins::open(isolation)?;
     let changes_it = !isolation.net_devices.is_empty()
         || isolation
             .sysctls
             .iter()
             .any(|(key, _)| key.starts_with("net."));
-    if changes_it && join.is_shipyards_own() {
+    if changes_it && let Some(whose) = joins.shipyards_own_joined(Namespace::Network) {
         return Err(Error::Network(format!(
-            "the network namespace {} is shipyard's own (the host's): network settings and \
-             devices can't be given to a container that joins it",
-            join.path().display()
+            "the network namespace {whose} is shipyard's own (the host's): network settings and \
+             devices can't be given to a container that joins it"
         )));
     }
-    Ok(Some(join))
+    Ok(joins)
 }
 
 /// The command's result, from what the container's init sent (`report`)
@@ -749,6 +753,9 @@ struct CleanImageFiles {
     hooks: Option<(OwnedFd, OwnedFd)>,
     /// An image's overlay made here (see [`prebuilt_overlay`]).
     overlay: Option<OwnedFd>,
+    /// The mount namespace whose `/dev/shm` the container shares (the
+    /// joins hold it).
+    shm_mount_ns: Option<RawFd>,
     /// The socket the init sends the container's terminal back on (the
     /// child's end: the supervisor holds it, and closes it after the spawn).
     terminal: Option<RawFd>,
@@ -758,7 +765,39 @@ struct CleanImageFiles {
 
 #[cfg(target_os = "linux")]
 impl CleanImageFiles {
-    fn open(spec: &ProcessSpec, options: &SpawnOptions, isolation: &Isolation) -> Result<Self> {
+    /// [`open`](Self::open)'s, for an isolated spawn (none otherwise), with
+    /// the shared memory of the IPC namespace `joins` join, if any.
+    fn for_spawn(
+        spec: &ProcessSpec,
+        options: &SpawnOptions,
+        joins: Option<&super::joins::NamespaceJoins>,
+    ) -> Result<Option<Self>> {
+        options
+            .placement
+            .isolation()
+            .map(|isolation| {
+                Self::open(
+                    spec,
+                    options,
+                    isolation,
+                    // Only where a root is set up: that's where it's let go.
+                    joins
+                        .and_then(super::joins::NamespaceJoins::shm_mount_ns)
+                        .filter(|_| isolation.root.is_some()),
+                )
+            })
+            .transpose()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CleanImageFiles {
+    fn open(
+        spec: &ProcessSpec,
+        options: &SpawnOptions,
+        isolation: &Isolation,
+        shm_mount_ns: Option<RawFd>,
+    ) -> Result<Self> {
         // Already checked by the supervisor; checked again because the
         // setup trusts it (a PID namespace comes with a mount namespace, a
         // hostname with a UTS one).
@@ -809,11 +848,15 @@ impl CleanImageFiles {
                         acknowledged,
                     });
                 setup.passing.clone_from(&options.passing);
+                if let Some(root) = &mut setup.root {
+                    root.shm_mount_ns = shm_mount_ns;
+                }
                 setup.to_memfd()?
             },
             gate: options.gate,
             hooks,
             overlay,
+            shm_mount_ns,
             terminal: terminal.map(|(fd, ..)| fd),
             passing: options
                 .passing
@@ -857,6 +900,7 @@ impl CleanImageFiles {
             gate: self.gate,
             hooks: self.hooks.as_ref().map(|(read, _)| read.as_raw_fd()),
             overlay: self.overlay.as_ref().map(AsRawFd::as_raw_fd),
+            shm_mount_ns: self.shm_mount_ns,
             terminal: self.terminal,
             passing: self.passing.clone(),
         }
@@ -1056,35 +1100,47 @@ enum Launched {
 }
 
 /// Starts the child: with `clone` into new namespaces if isolated (in the
-/// cgroup whose directory is `cgroup`, where `clone3` can), with `fork`
-/// otherwise.
+/// cgroup whose directory is `cgroup`, where `clone3` can), in the
+/// namespaces `joins` opened (entered around the clone, or, with another's
+/// user namespace, by the enterer), with `fork` otherwise.
 ///
 /// # Safety
 ///
 /// As for `fork`: the child may only run async-signal-safe code.
 unsafe fn launch(
     options: &SpawnOptions,
-    #[cfg(target_os = "linux")] network_join: Option<&super::network::NetworkJoin>,
+    #[cfg(target_os = "linux")] joins: Option<&super::joins::NamespaceJoins>,
     #[cfg(target_os = "linux")] cgroup: Option<RawFd>,
 ) -> Result<Launched> {
     #[cfg(target_os = "linux")]
     if let Some(isolation) = options.placement.isolation() {
         use super::clone::{Cloned, clone_process};
-        // A network namespace to join: entered for the clone, so the child
-        // starts in it (`clone_flags` leaves `CLONE_NEWNET` out), and left
-        // right after.
-        if let Some(join) = network_join {
-            join.enter()?;
-        }
-        // SAFETY: the caller's contract; the flags are namespace flags only
-        // (`Isolation::validate` refuses CLONE_NEWTIME).
-        let cloned = unsafe { clone_process(isolation.clone_flags(), cgroup) };
-        if let Some(join) = network_join {
+        // Another container's user namespace: entered by a process of its
+        // own, which starts the child.
+        let cloned = if let Some(joins) = joins.filter(|joins| joins.joins_user()) {
+            use super::enterer::Started;
+            // SAFETY: the caller's contract.
+            match unsafe { super::enterer::start(joins, isolation.clone_flags(), cgroup) }? {
+                Started::Cloned(cloned) => cloned,
+                Started::InTheChild => return Ok(Launched::Child),
+            }
+        } else {
+            // The namespaces to join: entered for the clone, so the child
+            // starts in them (`clone_flags` leaves their flags out), and
+            // left right after.
+            if let Some(joins) = joins {
+                joins.enter()?;
+            }
+            // SAFETY: the caller's contract; the flags are namespace flags
+            // only (`Isolation::validate` refuses CLONE_NEWTIME).
+            unsafe { clone_process(isolation.clone_flags(), cgroup) }
+        };
+        if let Some(joins) = joins.filter(|joins| !joins.joins_user()) {
             match &cloned {
                 // The child stays: it's to start in that namespace.
                 Ok(Cloned::Child) => {}
-                Ok(Cloned::Parent { pid, .. }) => join.leave(Some(*pid)),
-                Err(_) => join.leave(None),
+                Ok(Cloned::Parent { pid, .. }) => joins.leave(Some(*pid)),
+                Err(_) => joins.leave(None),
             }
         }
         return match cloned {
@@ -1097,7 +1153,7 @@ unsafe fn launch(
             // the others are its own.
             // (AppArmor's restriction refuses with EACCES.)
             Err(Errno::EPERM | Errno::EACCES)
-                if isolation.has(crate::isolation::Namespace::User) =>
+                if isolation.makes(crate::isolation::Namespace::User) =>
             {
                 Err(Error::UserNamespacesRefused {
                     reason: super::user_namespace::userns_refusal(),

@@ -15,7 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli::{Command, NetworkCommand, SystemCommand, VolumeCommand};
+use crate::cli::{
+    Command, ContainerCommand, ImageCommand, NetworkCommand, SystemCommand, VolumeCommand,
+};
 
 /// Where a command runs on a Mac.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,9 +39,12 @@ pub(crate) fn vm_off(value: Option<&std::ffi::OsStr>) -> bool {
 /// Where `command` runs on a Mac.
 pub(crate) fn place(command: &Command) -> Place {
     match command {
-        Command::Vm(_) | Command::Doctor => Place::Here,
+        Command::Vm(_) | Command::Doctor | Command::Compose(_) => Place::Here,
         Command::System(SystemCommand::Recover | SystemCommand::Stop) => {
             Place::Refused("on a Mac, the VM's own start and stop settle and stop its containers")
+        }
+        Command::System(SystemCommand::Service { .. }) => {
+            Place::Refused("on a Mac, Docker's API isn't served yet: use shipyard's own commands")
         }
         _ => Place::Guest,
     }
@@ -112,16 +117,12 @@ pub(crate) fn needs(command: &Command) -> Needs {
     match command {
         Command::Run(run) => run.needs(),
         Command::Create(create) => create.needs(),
-        Command::Start {
-            attach,
-            interactive,
-            ..
-        } => Needs {
-            input: *attach && *interactive,
+        Command::Start(start) => Needs {
+            input: start.attach && start.interactive,
             ..Needs::default()
         },
-        Command::Attach { no_stdin, .. } => Needs {
-            input: !no_stdin,
+        Command::Attach(attach) => Needs {
+            input: !attach.no_stdin,
             ..Needs::default()
         },
         Command::Exec(exec) => exec.needs(),
@@ -129,6 +130,18 @@ pub(crate) fn needs(command: &Command) -> Needs {
         Command::Volume(VolumeCommand::Prune { force })
         | Command::Network(NetworkCommand::Prune { force }) => Needs {
             asks: !force,
+            ..Needs::default()
+        },
+        Command::Container(ContainerCommand::Prune(args)) => Needs {
+            asks: !args.force,
+            ..Needs::default()
+        },
+        Command::Image(ImageCommand::Prune(args)) => Needs {
+            asks: !args.prune.force,
+            ..Needs::default()
+        },
+        Command::System(SystemCommand::Prune(args)) => Needs {
+            asks: !args.prune.force,
             ..Needs::default()
         },
         _ => Needs::default(),
@@ -255,11 +268,12 @@ pub(crate) fn elsewhere(command: &Command) -> Option<std::process::ExitCode> {
         Place::Here => None,
         Place::Refused(why) => Some(crate::reporter::report(
             &anyhow::anyhow!("{why}"),
-            shipyard_runtime::process::EXIT_ENGINE_ERROR,
+            command.failure_code(),
         )),
-        Place::Guest => Some(mac::forward(command).unwrap_or_else(|error| {
-            crate::reporter::report(&error, shipyard_runtime::process::EXIT_ENGINE_ERROR)
-        })),
+        Place::Guest => Some(
+            mac::forward(command)
+                .unwrap_or_else(|error| crate::reporter::report(&error, command.failure_code())),
+        ),
     }
 }
 
@@ -475,6 +489,12 @@ mod tests {
             (&["shipyard", "network", "prune"], true),
             (&["shipyard", "volume", "prune", "-f"], false),
             (&["shipyard", "network", "prune", "--force"], false),
+            (&["shipyard", "container", "prune"], true),
+            (&["shipyard", "image", "prune", "-a"], true),
+            (&["shipyard", "system", "prune", "--volumes"], true),
+            (&["shipyard", "container", "prune", "-f"], false),
+            (&["shipyard", "image", "prune", "-a", "-f"], false),
+            (&["shipyard", "system", "prune", "-f"], false),
             (&["shipyard", "ps"], false),
         ] {
             let needs = needs(&parsed(words));

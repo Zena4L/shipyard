@@ -29,6 +29,8 @@ objc2-foundation.workspace = true
 objc2-virtualization.workspace = true
 block2.workspace = true
 dispatch2.workspace = true
+# The LaunchAgent that holds Docker's socket (step 11.5b2a).
+plist.workspace = true
 
 [lints]
 workspace = true

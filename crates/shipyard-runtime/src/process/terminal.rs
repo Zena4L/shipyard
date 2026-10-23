@@ -240,6 +240,30 @@ fn cloexec(fd: &OwnedFd) -> Result<(), Errno> {
     .map(drop)
 }
 
+/// In a child between `fork` and `exec`: a session of its own, whose
+/// controlling terminal is the one its descriptor 0 is (`setsid`, then
+/// `TIOCSCTTY`): a command on a pseudo-terminal of Shipyard's own gets its
+/// job control and its hang-up. Async-signal-safe: two system calls, no
+/// allocation, no lock.
+///
+/// # Errors
+///
+/// Either call's errno.
+pub fn take_controlling_terminal() -> std::io::Result<()> {
+    nix::unistd::setsid().map_err(std::io::Error::from)?;
+    // The request's type is the platform's: macOS's `ioctl` takes a wider
+    // one than its constant.
+    #[cfg(target_os = "macos")]
+    let request = libc::TIOCSCTTY.into();
+    #[cfg(not(target_os = "macos"))]
+    let request = libc::TIOCSCTTY;
+    // SAFETY: `TIOCSCTTY` takes no pointer; descriptor 0 is the caller's.
+    if unsafe { libc::ioctl(0, request, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// A pseudo-terminal of Shipyard's own (no isolation: the command runs on
 /// the host), `size` big: (master, slave), both close-on-exec. On Linux,
 /// from their opening: a process another thread starts meanwhile (the

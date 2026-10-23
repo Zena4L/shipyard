@@ -30,6 +30,12 @@
 //! [`HoldRefusal`] ([`Frame::NotDone`]); a version 3 holder still gets
 //! [`Frame::Done`] with only words.
 //!
+//! From version 5 (step 11.5b2b, F99), the macOS VM's host and guest,
+//! which speak this protocol to the Mac's `shipyard` ([`forward`]), refuse
+//! a client with a reason ([`Decline`], [`Frame::Declined`]): stopping, not
+//! ready. A version 4 client still gets [`Frame::Refused`]'s words.
+//! Monitors never send it.
+//!
 //! **Versions** (H2): a monitor lives as long as its container, so a client
 //! may be newer than it. The hello carries the client's highest version; the
 //! monitor answers with the one they'll use ([`negotiate`]), and a client
@@ -46,8 +52,15 @@
 pub mod client;
 pub mod forward;
 
+/// A reason's payload (`NotDone`'s, `Declined`'s): its code, then its
+/// words; `None` if it's empty or the words aren't UTF-8.
+fn coded(payload: &[u8]) -> Option<(u8, String)> {
+    let (&code, why) = payload.split_first()?;
+    Some((code, std::str::from_utf8(why).ok()?.to_owned()))
+}
+
 /// The protocol's version: what [`Frame::Hello`] and [`Frame::Welcome`] carry.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// The first version with control clients ([`Frame::HelloControl`]).
 pub const CONTROL_VERSION: u32 = 2;
@@ -58,6 +71,50 @@ pub const HOLD_VERSION: u32 = 3;
 /// The first version whose holders are refused with a reason
 /// ([`Frame::NotDone`]).
 pub const REASON_VERSION: u32 = 4;
+
+/// The first version whose forwarded-command clients (the macOS VM's wire,
+/// [`forward`]) are refused with a reason ([`Frame::Declined`], step
+/// 11.5b2b, F99); an older one gets [`Frame::Refused`]'s words.
+pub const DECLINE_VERSION: u32 = 5;
+
+/// Why the macOS VM's host or guest refused a client (version 5:
+/// [`Frame::Declined`]): the wire's number for a
+/// [`forward::Refusal`]'s meaning. Its numbers never change; one this side doesn't
+/// know (a newer peer's) is [`Other`](Self::Other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Decline {
+    /// The VM is stopping: the client starts it again once it has stopped.
+    Stopping,
+    /// The guest is still starting (its data disk checked): the client
+    /// asks again.
+    NotReady,
+    /// A reason this side doesn't know, by its number. 0 is never
+    /// assigned.
+    Other(u8),
+}
+
+impl Decline {
+    /// Its number in a frame.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Stopping => 1,
+            Self::NotReady => 2,
+            Self::Other(code) => code,
+        }
+    }
+
+    /// The reason numbered `code`.
+    #[must_use]
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Stopping,
+            2 => Self::NotReady,
+            other => Self::Other(other),
+        }
+    }
+}
 
 /// Why a monitor refused a hold or a release (version 4: [`Frame::NotDone`]).
 /// Its numbers never change; one this side doesn't know (a newer monitor's)
@@ -260,6 +317,15 @@ pub enum Frame {
         /// Why, in words.
         why: String,
     },
+    /// The macOS VM's host or guest, to a forwarded-command client of
+    /// version 5 or later: refused, why, and in words; then closed. An
+    /// older client gets [`Refused`](Self::Refused).
+    Declined {
+        /// Why.
+        reason: Decline,
+        /// Why, in words.
+        why: String,
+    },
     /// Monitor, to a client let in.
     Welcome {
         /// The monitor's protocol version.
@@ -322,6 +388,7 @@ mod kind {
     pub(super) const EXITED: u8 = 22;
     pub(super) const DONE: u8 = 23;
     pub(super) const NOT_DONE: u8 = 24;
+    pub(super) const DECLINED: u8 = 25;
 }
 
 impl Frame {
@@ -385,6 +452,11 @@ impl Frame {
                 let mut payload = vec![reason.code()];
                 payload.extend_from_slice(truncated_to(why, MAX_PAYLOAD - 1));
                 put(out, kind::NOT_DONE, &payload);
+            }
+            Self::Declined { reason, why } => {
+                let mut payload = vec![reason.code()];
+                payload.extend_from_slice(truncated_to(why, MAX_PAYLOAD - 1));
+                put(out, kind::DECLINED, &payload);
             }
             Self::Welcome {
                 version,
@@ -495,6 +567,7 @@ impl Frame {
                 }
             }
             kind::REFUSED => Self::Refused(text()?),
+            kind::DECLINED => return Self::decode_declined(payload),
             kind::STDOUT => Self::Stdout(payload.to_vec()),
             kind::STDERR => Self::Stderr(payload.to_vec()),
             kind::STDIN_END if payload.is_empty() => Self::StdinEnd,
@@ -513,6 +586,15 @@ impl Frame {
 impl Frame {
     /// A holder's frames, and the monitor's answer to one (version 3; a
     /// refusal with a reason, version 4).
+    /// A [`Frame::Declined`]'s payload: its code, then its words.
+    fn decode_declined(payload: &[u8]) -> Result<Self, FrameError> {
+        let (code, why) = coded(payload).ok_or(FrameError::Malformed(kind::DECLINED))?;
+        Ok(Self::Declined {
+            reason: Decline::from_code(code),
+            why,
+        })
+    }
+
     fn decode_holders(kind: u8, payload: &[u8]) -> Result<Self, FrameError> {
         let malformed = || FrameError::Malformed(kind);
         let label = || {
@@ -543,12 +625,10 @@ impl Frame {
                 }
             }
             kind::NOT_DONE => {
-                let (&code, why) = payload.split_first().ok_or_else(malformed)?;
+                let (code, why) = coded(payload).ok_or_else(malformed)?;
                 Self::NotDone {
                     reason: HoldRefusal::from_code(code),
-                    why: std::str::from_utf8(why)
-                        .map_err(|_| malformed())?
-                        .to_owned(),
+                    why,
                 }
             }
             _ => return Err(malformed()),

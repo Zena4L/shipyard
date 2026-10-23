@@ -37,6 +37,10 @@ pub struct RunRequest {
     /// A detached container's start: its ID, written into its leases (how
     /// `rename` finds them).
     pub(crate) container: Option<crate::containers::ContainerId>,
+    /// Another container's namespaces it joins, found for this start
+    /// ([`resolve_joins`](super::resolve_joins)): none at a create, which
+    /// needs the others only to exist.
+    pub(crate) joined: Joined,
     /// Its standard input and output (`-i` and `-t`).
     pub streams: RunStreams,
     /// `KEY=VALUE` variables to set, or bare `KEY`s to copy from the
@@ -78,8 +82,13 @@ pub struct RunRequest {
     pub sysctl: Vec<(String, String)>,
     /// The networks asked for, in order (none: the default).
     pub network: Vec<NetworkMode>,
+    /// Its IPC namespace (`--ipc`): its own, or another container's.
+    pub ipc: IpcMode,
     /// The container's name on its networks.
     pub name: Option<String>,
+    /// Its labels (the API's `Labels`): checked as the record keeps them
+    /// ([`Labels`](crate::containers::Labels)'s bounds).
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Its other names on its networks.
     pub network_alias: Vec<String>,
     /// Its address on its one bridge network.
@@ -100,6 +109,13 @@ pub struct RunRequest {
     pub publish: Vec<PortRequest>,
     /// Every port the image exposes, on free host ports.
     pub publish_all: bool,
+    /// Ports it exposes beside its image's (`--expose`, the API's
+    /// `ExposedPorts`): keys like `80/tcp`, each one port. Published only
+    /// with [`publish_all`](Self::publish_all); shown by `inspect`.
+    pub expose: Vec<String>,
+    /// A file to write the container's ID to (`--cidfile`), once it's made:
+    /// refused if it's there already, as Docker's.
+    pub cidfile: Option<PathBuf>,
     /// A root filesystem of the caller's own.
     pub rootfs: Option<PathBuf>,
     /// An image to run (a reference).
@@ -127,6 +143,18 @@ pub struct RunRequest {
     pub limits: Limits,
     /// Volumes and host paths to mount, `SOURCE:DEST[:ro]`.
     pub volume: Vec<String>,
+    /// tmpfs mounts (`--tmpfs`, `--mount type=tmpfs`), fresh at each start.
+    /// Kept beside the record (`created.json`), as `expose`.
+    pub tmpfs: Vec<super::TmpfsMount>,
+    /// Bind sources made if they're missing (the API's `Binds` host paths
+    /// and `BindOptions.CreateMountpoint`), as the caller, 0755 less the
+    /// umask: at the create, and at each start (kept beside the record, in
+    /// `created.json`), as Docker's daemon makes them.
+    pub make_sources: Vec<PathBuf>,
+    /// Which of them Shipyard made (at the create, kept in `created.json`
+    /// v6, or at this start): bound by descriptor from where they were made
+    /// (step 11.7). Set by the engine, never by a caller.
+    pub(crate) made_sources: Vec<super::volumes::MadeSource>,
     /// The command and its arguments.
     pub command: Vec<OsString>,
 }
@@ -216,12 +244,73 @@ pub enum Supervision {
     },
 }
 
+/// Another container's namespaces a start joins ([`RunRequest::joined`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Joined {
+    /// Its network's (`--network container:NAME`).
+    pub(crate) network: Option<crate::network::JoinedNetwork>,
+    /// Its IPC namespace's (`--ipc container:NAME`).
+    pub(crate) ipc: Option<crate::network::JoinedProcess>,
+}
+
+/// A container's IPC namespace (`--ipc`, the API's `IpcMode`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum IpcMode {
+    /// Its own (Docker's `private`, and `shareable`: any running
+    /// container's can be joined, D11.4b2b-4).
+    #[default]
+    Private,
+    /// Another container's (Docker's `container:NAME`), with its
+    /// `/dev/shm`: as given, then by its ID once a create has found it.
+    Container(String),
+}
+
+impl IpcMode {
+    /// Docker's words: `private`, `shareable` (the same here),
+    /// `container:NAME`; none is `private`.
+    ///
+    /// # Errors
+    ///
+    /// Another mode (`host`, `none`), or `container:` with no name.
+    pub fn parse(text: &str) -> std::result::Result<IpcMode, String> {
+        match text {
+            "" | "private" | "shareable" => Ok(IpcMode::Private),
+            other => match other.strip_prefix("container:") {
+                Some("") => Err("container: needs the container's name or ID".to_owned()),
+                Some(name) => Ok(IpcMode::Container(name.to_owned())),
+                None => Err(format!(
+                    "{other:?}: give private, shareable or container:NAME (a container has an \
+                     IPC namespace of its own, or another container's)"
+                )),
+            },
+        }
+    }
+
+    /// The container whose IPC namespace it joins, if it's another's.
+    #[must_use]
+    pub fn joined_container(&self) -> Option<&str> {
+        match self {
+            IpcMode::Container(container) => Some(container),
+            IpcMode::Private => None,
+        }
+    }
+}
+
+impl RunRequest {
+    /// The container whose network it asks to join (`--network
+    /// container:NAME`), as given.
+    pub(crate) fn network_container(&self) -> Option<&str> {
+        self.network.iter().find_map(NetworkMode::joined_container)
+    }
+}
+
 impl Default for RunRequest {
     fn default() -> Self {
         Self {
             default_mode: std::cell::OnceCell::new(),
             detached: false,
             container: None,
+            joined: Joined::default(),
             streams: RunStreams::default(),
             env: Vec::new(),
             caller_env: Vec::new(),
@@ -241,7 +330,9 @@ impl Default for RunRequest {
             domainname: None,
             sysctl: Vec::new(),
             network: Vec::new(),
+            ipc: IpcMode::Private,
             name: None,
+            labels: std::collections::BTreeMap::new(),
             network_alias: Vec::new(),
             ip: None,
             ip6: None,
@@ -252,6 +343,8 @@ impl Default for RunRequest {
             dns_option: Vec::new(),
             publish: Vec::new(),
             publish_all: false,
+            expose: Vec::new(),
+            cidfile: None,
             rootfs: None,
             image: None,
             entrypoint: None,
@@ -265,20 +358,32 @@ impl Default for RunRequest {
             bundle: None,
             limits: Limits::default(),
             volume: Vec::new(),
+            tmpfs: Vec::new(),
+            make_sources: Vec::new(),
+            made_sources: Vec::new(),
             command: Vec::new(),
         }
     }
 }
 
 /// A run's standard input and output: whether the caller's input goes to
-/// it (`-i`), and whether it gets a terminal of its own (`-t`).
+/// it (`-i`), whether it gets a terminal of its own (`-t`), and whether its
+/// input ends at its first attached client's end at each start.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunStreams {
     /// Pass the caller's input on to the command.
     pub interactive: bool,
     /// Give the command a terminal of the container's own.
     pub tty: bool,
+    /// Its input closed once its first attached client's ends, at each
+    /// start (Docker's `StdinOnce`, the API's): kept in `created.json`, not
+    /// the record's frozen config (F116).
+    pub once: bool,
 }
+
+/// A container's process limit when none was asked (F62, D11.3-3:
+/// Podman's), where the `pids` controller reaches its cgroup.
+pub const DEFAULT_PIDS_MAX: u64 = 2048;
 
 /// A run's limits, as the caller worked them out (the CLI from its limit
 /// flags): raised, if they couldn't be, where the isolation is made.
@@ -289,6 +394,10 @@ pub struct Limits {
     pub first_given: Option<&'static str>,
     /// The cgroup limits, or why they can't be had.
     pub resources: std::result::Result<Resources, String>,
+    /// Whether a process limit was asked at all (`--pids-limit`, the API's
+    /// `PidsLimit`), even "none" (-1, 0): only one never asked gets the
+    /// default ([`DEFAULT_PIDS_MAX`], F62).
+    pub pids_given: bool,
 }
 
 impl Default for Limits {
@@ -296,6 +405,7 @@ impl Default for Limits {
         Self {
             first_given: None,
             resources: Ok(Resources::default()),
+            pids_given: false,
         }
     }
 }
@@ -321,6 +431,18 @@ pub enum CapabilityArg {
     One(Capability),
 }
 
+/// `ALL` (any case), or a capability's name, with or without `CAP_`.
+impl std::str::FromStr for CapabilityArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        if s.eq_ignore_ascii_case("ALL") {
+            return Ok(Self::All);
+        }
+        s.parse().map(Self::One).map_err(|err| format!("{err}"))
+    }
+}
+
 /// `--security-opt`: Docker's spelling, `KEY=VALUE` or `KEY:VALUE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityOpt {
@@ -331,4 +453,34 @@ pub enum SecurityOpt {
     SeccompUnconfined,
     /// `seccomp=FILE`.
     SeccompProfile(PathBuf),
+}
+
+/// Docker's spelling, as `--security-opt` and the API's `SecurityOpt`
+/// give it: `no-new-privileges[=true|false]`, `seccomp=FILE|unconfined`
+/// (`:` for `=` too).
+impl std::str::FromStr for SecurityOpt {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let (key, value) = match s.split_once(['=', ':']) {
+            Some((key, value)) => (key, Some(value)),
+            None => (s, None),
+        };
+        match (key, value) {
+            ("no-new-privileges", None | Some("true")) => Ok(Self::NoNewPrivileges(true)),
+            ("no-new-privileges", Some("false")) => Ok(Self::NoNewPrivileges(false)),
+            ("no-new-privileges", Some(other)) => Err(format!(
+                "no-new-privileges takes true or false, not \"{other}\""
+            )),
+            ("seccomp", Some("unconfined")) => Ok(Self::SeccompUnconfined),
+            ("seccomp", Some(path)) if !path.is_empty() => {
+                Ok(Self::SeccompProfile(PathBuf::from(path)))
+            }
+            ("seccomp", _) => Err("seccomp takes a profile file, or unconfined".to_owned()),
+            _ => Err(format!(
+                "unknown security option \"{s}\" (known: no-new-privileges[=true|false], \
+                 seccomp=FILE|unconfined)"
+            )),
+        }
+    }
 }

@@ -32,7 +32,12 @@ clap.workspace = true
 libc.workspace = true
 # `events --follow`'s polling.
 nix = { workspace = true, features = ["poll"] }
+# `--format`'s Go templates (step 11.3c).
+gotmpl.workspace = true
+# Docker's rows for `--format`, by their keys.
+serde.workspace = true
 serde_json.workspace = true
+shipyard-api.workspace = true
 shipyard-engine.workspace = true
 # Parsing the network flags.
 shipyard-network.workspace = true
@@ -42,10 +47,16 @@ shipyard-sys.workspace = true
 # A run's `--volume`s, told apart (a bind's source or a named volume) on a Mac (step 10.3b).
 shipyard-storage.workspace = true
 shipyard-vm.workspace = true
+# Docker's table columns.
+tabwriter.workspace = true
+# The env and label files' errors, by kind (`run/files.rs`).
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# The API's archive stat header (tests/api.rs).
+base64.workspace = true
 clap-markdown.workspace = true
 libc.workspace = true
 # `hostname` for the isolation tests; `term` for the v0.1 milestone's

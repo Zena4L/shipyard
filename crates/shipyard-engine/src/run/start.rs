@@ -22,7 +22,8 @@ use crate::{Engine, Paths};
 /// How a start takes its input (`-i`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Input {
-    /// As the container was made: open for whoever attaches, or none.
+    /// As the container was made: open for whoever attaches, or none, or
+    /// once if it was made so (the API's `StdinOnce`, `created.json`'s).
     AsMade,
     /// Ending at the first typist's end of file (a foreground `run
     /// -i`'s, Docker's).
@@ -31,8 +32,9 @@ pub(super) enum Input {
 
 impl Input {
     /// The container's input, `interactive` (`-i`) or not: a foreground
-    /// `run -i`'s ends the container's at its end (Docker's); a later
-    /// start's stays open for whoever attaches.
+    /// `run -i`'s ends the container's at its end (Docker's), as does each
+    /// start of one made with `StdinOnce`; another's stays open for
+    /// whoever attaches.
     pub(super) fn stdin(self, interactive: bool) -> StdinMode {
         match (interactive, self) {
             (false, _) => StdinMode::Closed,
@@ -53,15 +55,29 @@ pub(super) fn detached(
     input: Input,
     between: impl FnOnce(&ContainerId),
 ) -> Result<(super::Detached, Record)> {
+    let cidfile = request.cidfile.clone();
     let (record, held_off) = create_holding(engine, request, auto_remove)?;
     let started = start_inner(engine, record.id.as_str(), between, Some(&held_off), input);
     let started = match started {
         Ok(started) => started,
         Err(error) => {
-            // With `--rm`, the container goes too (its clean-up removes
-            // it if it was created; else this does).
+            // With `--rm`, or a run interrupted (undone whole), the
+            // container goes too, with its anonymous volumes (its clean-up
+            // removes them if it was created; else this does).
             let removed = (auto_remove || error.kind() == ErrorKind::Interrupted)
-                && super::remove(engine, record.id.as_str(), true).is_ok();
+                && super::remove_with(
+                    engine,
+                    record.id.as_str(),
+                    super::RemoveOptions::new(true, true),
+                )
+                .is_ok();
+            // Its ID file, if it still names it: the container is gone.
+            if removed
+                && let Some(path) = &cidfile
+                && std::fs::read_to_string(path).is_ok_and(|text| text == record.id.as_str())
+            {
+                let _ = std::fs::remove_file(path);
+            }
             drop(held_off);
             // Else it's left, made (Docker's): said, with its name.
             return Err(if removed || error.kind() == ErrorKind::Interrupted {
@@ -179,24 +195,29 @@ fn start_holding(
     let before = containers::PreviousStart::of(&record);
     // Room for this start's logs, whoever starts it.
     crate::run::restart_policy::prune_before_a_start(engine, &id);
+    // Its create's fill, cut short (killed): finished before it runs.
+    if record.started.is_none() {
+        super::volumes::fill_volumes(engine, &record, &[], super::volumes::Fill::Finish, &|| {
+            held.is_some_and(HeldOff::asked_to_stop)
+        })?;
+    }
     let PlannedStart {
         planned,
         image,
         interface_sysctls,
+        stdin_once,
     } = planned_start(engine, &record)?;
+    // Made to close its input once (the API's `StdinOnce`): each start's.
+    let input = if stdin_once { Input::OnceItEnds } else { input };
     let (defaults, area) = image.unzip();
     // From here, a Ctrl-C waits: before `create`, it ends the call
     // cleanly (everything undone); after, once the container runs on.
     let own = held.is_none().then(HeldOff::new);
     let held_off = held.or(own.as_ref());
-    let exposed = defaults
-        .as_ref()
-        .map_or(&[][..], |defaults: &crate::run::ImageDefaults| {
-            &defaults.config.exposed_ports
-        });
+    let exposed = planned.exposed(defaults.as_ref());
     // With `-P`'s ports, before its network is set up.
-    check_holds(&planned, exposed)?;
-    let network = RunNetwork::set_up(engine, planned.network(), exposed)?;
+    check_holds(&planned, &exposed)?;
+    let network = RunNetwork::set_up(engine, planned.network(), &exposed)?;
     let ports = network.bound();
     let streams = planned.request.streams;
     let stdin = input.stdin(streams.interactive);
@@ -212,6 +233,8 @@ fn start_holding(
         health: health.as_ref(),
     };
     let options = create_options(engine, &id, &network, &holds, &fds, settings)?;
+    // The newest start directory before this one's: a failed start's goes.
+    let last_start = last_start(engine, &id);
     let created = if held_off.is_some_and(HeldOff::asked_to_stop) {
         Err(Error::new(
             ErrorKind::Interrupted,
@@ -267,12 +290,13 @@ fn start_holding(
         &ports,
         &running,
         restarts,
-    );
+    )
+    .map_err(|error| ended_before_start(&runtime_root, &id, error));
     drop(running);
     let started = match started {
         Ok(record) => record,
         Err(error) => {
-            unstarted(engine, &runtime_root, &id, before);
+            unstarted(engine, &runtime_root, &id, before, last_start.as_deref());
             return Err(error);
         }
     };
@@ -303,9 +327,65 @@ fn keep_aside(engine: &Engine, id: &ContainerId, before: &containers::PreviousSt
 /// its hostname its short ID unless it has one, never pulling), checked;
 /// and its image, by the digest it was made from, with its own writable
 /// area (a version 1 record's image pinned now).
+/// F62's default process limit, for a container whose create asked none
+/// ([`DEFAULT_PIDS_MAX`](crate::run::DEFAULT_PIDS_MAX)): set where the
+/// `pids` controller reaches its cgroup (root; rootless where it's
+/// delegated), so a fork bomb can't take the host's PID space. Elsewhere
+/// it starts without one, as before (D11.3b-2).
+fn default_pids(limits: &mut crate::run::Limits) {
+    if let Ok(resources) = &mut limits.resources
+        && resources.pids_max.is_none()
+        && shipyard_runtime::cgroup::Tree::find()
+            .is_ok_and(|tree| tree.offers(shipyard_runtime::cgroup::Controller::Pids))
+    {
+        resources.pids_max = Some(crate::run::DEFAULT_PIDS_MAX);
+    }
+}
+
 fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
     let id = &record.id;
     let mut request = record.to_request()?;
+    // What its create settled beside the record: its own exposed ports
+    // (`-P`'s, with its image's), the default process limit, its tmpfs
+    // mounts, the bind sources to make. One that can't be read refuses the start (D11.3e2-2): it may
+    // hold tmpfs mounts, without which the container would write to disk
+    // what it meant for memory.
+    let created = containers::created(engine, id).map_err(|error| {
+        error.context(format!(
+            "container {}'s create can't be read: remove it and make it again",
+            record.name
+        ))
+    })?;
+    request.expose = created.exposed;
+    request.tmpfs = created.tmpfs;
+    let stdin_once = created.stdin_once;
+    // Another container's network and IPC namespace: those ones', found
+    // for this start (its record keeps neither: its types are frozen).
+    request.join_by_ids(created.network_from.as_ref(), created.ipc_from.as_ref());
+    // A bind's missing host path made again (the API's, Docker's at each
+    // start), before the checks resolve it: one the create made, by
+    // descriptor from where it made it (11.7: a symlink put on its path is
+    // refused); one made only now is bound so for this start.
+    for source in &created.make_sources {
+        let source = std::path::Path::new(source);
+        match created
+            .made_sources
+            .iter()
+            .find(|made| made.source == source)
+        {
+            Some(made) => {
+                request.made_sources.extend(made.made_for_this_start()?);
+            }
+            None => {
+                if let Some(made) = super::volumes::make_bind_source(source)? {
+                    request.made_sources.push(made);
+                }
+            }
+        }
+    }
+    if created.default_pids {
+        default_pids(&mut request.limits);
+    }
     // Its interfaces' own settings (`net.ipv4.conf.eth1.*`): not its
     // init's to set (its interfaces are made after it has set the
     // others), but this start's, once it has connected them.
@@ -316,10 +396,20 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
     request.pull = None;
     request.detached = true;
     request.container = Some(id.clone());
-    // Docker's: the short ID, the same at every start.
-    if request.hostname.is_none() {
+    // Docker's: the short ID, the same at every start; with another's
+    // network, that one's name.
+    if request.hostname.is_none() && created.network_from.is_none() {
         request.hostname = Some(id.short().to_owned());
     }
+    joins_found(
+        engine,
+        record,
+        [
+            (created.network_from.as_ref(), "network"),
+            (created.ipc_from.as_ref(), "IPC namespace"),
+        ],
+        &mut request,
+    )?;
     let planned = checked(engine, request)?;
     // One for an interface its networks no longer make (a network left
     // since: `network disconnect`) is passed over, said: never a start
@@ -368,6 +458,40 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
         planned,
         image,
         interface_sysctls,
+        stdin_once,
+    })
+}
+
+/// Another container's namespaces `request` (`record`'s) joins, found for
+/// this start; one it was made to join (`made_to_join`: each container,
+/// with what it joins of it) that's removed since is said as gone.
+fn joins_found(
+    engine: &Engine,
+    record: &Record,
+    made_to_join: [(Option<&containers::ContainerId>, &str); 2],
+    request: &mut crate::run::RunRequest,
+) -> Result<()> {
+    super::resolve_joins(engine, request).map_err(|error| {
+        let gone = made_to_join.into_iter().find_map(|(other, what)| {
+            other
+                .filter(|other| {
+                    containers::read_one(engine, other)
+                        .is_err_and(|read| read.kind() == ErrorKind::NotFound)
+                })
+                .map(|other| (other, what))
+        });
+        match gone {
+            Some((other, what)) if error.kind() == ErrorKind::NotFound => crate::Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "container {}: the container whose {what} it joins ({}) is gone: make this \
+                     one again",
+                    record.name,
+                    other.short()
+                ),
+            ),
+            _ => error,
+        }
     })
 }
 
@@ -379,6 +503,9 @@ struct PlannedStart {
     image: Option<(crate::run::ImageDefaults, crate::image::RunArea)>,
     /// Its interfaces' own settings, for once they're made.
     interface_sysctls: Vec<(String, String)>,
+    /// Its input closed once its first client's ends (`StdinOnce`, kept
+    /// in `created.json`: F116).
+    stdin_once: bool,
 }
 
 /// What a start's monitor is given, besides the holds: how its input
@@ -395,7 +522,8 @@ struct StartSettings<'h> {
 /// directory for this start, stdin as `settings` say), the holds `fds`
 /// (`holds`'s), `__cleanup` to run after it, told what they are (and
 /// whether the container goes too), and, with a health check,
-/// `__health` beside it.
+/// `__health` beside it. Where its `/etc` files are is kept beside its
+/// record on the way ([`containers::keep_run_dir`]).
 fn create_options<'a>(
     engine: &Engine,
     id: &ContainerId,
@@ -409,13 +537,10 @@ fn create_options<'a>(
         auto_remove,
         health,
     } = settings;
-    let exit_command = cleanup_command(
-        &engine.paths,
-        id,
-        network.etc().map(crate::network::RunDir::path),
-        holds,
-        auto_remove,
-    )?;
+    let run_dir = network.etc().map(crate::network::RunDir::path);
+    let exit_command = cleanup_command(&engine.paths, id, run_dir, holds, auto_remove)?;
+    // Where its `/etc` files are, kept for `inspect`'s paths (F121).
+    containers::keep_run_dir(engine, id, run_dir);
     let start_dir = logs_for_settings(engine, id)?;
     // Its checks, beside it, while this start runs.
     let companion = health
@@ -450,17 +575,37 @@ fn plan_of(engine: &Engine, invocation: crate::run::Invocation, tty: bool) -> Re
     Ok(plan)
 }
 
+/// Container `id`'s newest start's logs directory, by its name.
+pub(super) fn last_start(engine: &Engine, id: &ContainerId) -> Option<String> {
+    containers::last_logs_name(&containers::logs_dir(engine, id).ok()?)
+}
+
+/// After a start that failed (a user's, or a restart's): the start
+/// directory it made (newer than `before`) removed, so failures don't push
+/// the last run's logs out, nor hide its health (F133).
+pub(super) fn drop_failed_start(engine: &Engine, id: &ContainerId, before: Option<&str>) {
+    let Ok(logs) = containers::logs_dir(engine, id) else {
+        return;
+    };
+    if let Some(newest) = containers::last_logs_name(&logs)
+        && Some(newest.as_str()) != before
+    {
+        let _ = std::fs::remove_dir_all(logs.join(newest));
+    }
+}
+
 /// After container `id` was created and couldn't be started: its record
 /// says what it said `before` again (its clean-up may have run already,
 /// its init ended by itself: what it recorded isn't an exit either; a
 /// container that ran before keeps its last end, so boot still brings
 /// it back), and it's ended (its monitor's `__cleanup` lets go of what
-/// it held). What can't be done is said.
+/// it held), the start directory it made gone. What can't be done is said.
 fn unstarted(
     engine: &Engine,
     runtime_root: &std::path::Path,
     id: &ContainerId,
     before: containers::PreviousStart,
+    last_start: Option<&str>,
 ) {
     let reset = containers::update(engine, id, |record| before.restore(record));
     if reset.is_ok() {
@@ -476,7 +621,12 @@ fn unstarted(
         );
     }
     // Gone already is ended: its clean-up ran (its init ended by itself).
-    if let Err(why) = delete_state(runtime_root, id) {
+    // Ended, its start directory goes too (none writes there now).
+    let ended = delete_state(runtime_root, id);
+    if ended.is_ok() {
+        drop_failed_start(engine, id, last_start);
+    }
+    if let Err(why) = ended {
         engine.warn(
             WarningKind::LeftForLater,
             format!(
@@ -533,6 +683,62 @@ fn logs_for_settings(engine: &Engine, id: &ContainerId) -> Result<std::path::Pat
     Ok(logs.join(containers::next_logs_name(&logs)))
 }
 
+/// A test build's pause in a start, its container made and its init
+/// waiting (`Paths::start_pause`): the container's ID written there, then
+/// a wait (a minute at most) until a test removes it, having acted in the
+/// window. A release has none.
+fn pause_for_a_test(engine: &Engine, id: &ContainerId) {
+    let Some(path) = engine.paths().start_pause() else {
+        return;
+    };
+    if !crate::test_pause::announce(path, id.as_str()) {
+        return;
+    }
+    let began = std::time::Instant::now();
+    while path.exists() && began.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A start's failure, `error`: when it's because this very container
+/// ended while it waited to be started (its init gone: killed, or the
+/// out-of-memory killer's), said so, with how it ended; the command never
+/// ran (F119: "is stopped; connect needs it created" read as a start that
+/// failed). The runtime says so three ways: the container stopped (or
+/// stopping), it's gone (a container never started is cleared once its
+/// init has ended, and this start made it a moment ago: nothing else
+/// clears it), or its init didn't answer at the start gate once it had
+/// ended. Said in place of the runtime's words, which name the step that
+/// failed, not why.
+fn ended_before_start(runtime_root: &std::path::Path, id: &ContainerId, error: Error) -> Error {
+    use runtime::{ContainerError, Status};
+    let gone = !runtime_root.join(id.as_str()).exists();
+    let exit = runtime::exit_record(runtime_root, id.as_str())
+        .ok()
+        .flatten();
+    let ended = match error.find::<ContainerError>() {
+        Some(ContainerError::WrongStatus {
+            id: theirs,
+            status: Status::Stopping | Status::Stopped,
+            ..
+        }) => theirs == id.as_str(),
+        Some(ContainerError::NotFound(theirs)) => theirs == id.as_str() && gone,
+        Some(ContainerError::Setup(_)) => gone || exit.is_some(),
+        _ => false,
+    };
+    if !ended {
+        return error;
+    }
+    let how = exit.map_or_else(
+        || "how isn't known: nothing of it is left".to_owned(),
+        |exit| exit.description,
+    );
+    Error::new(
+        ErrorKind::NotRunning,
+        format!("its process ended before it could start ({how}): its command never ran"),
+    )
+}
+
 /// Connects container `id` to its networks (its veths, or a pasta that
 /// follows its init), records it started (with the `ports` it
 /// publishes, its last end cleared), and starts it. pasta's launcher
@@ -547,6 +753,7 @@ fn connect_and_start(
     restarts: Option<u32>,
 ) -> Result<Record> {
     warn_if_subreaper(engine);
+    pause_for_a_test(engine, id);
     if !network.connects.is_empty() {
         let netns = runtime::network_namespace(runtime_root, id.as_str())?;
         for connect in &network.connects {
@@ -590,9 +797,12 @@ fn connect_and_start(
             )
             .map_err(|message| Error::new(ErrorKind::Network, message))?;
     }
+    // Its end to be said, before the last one's exit goes (F88).
+    let started = SystemTime::now();
+    containers::mark_end_unsaid(engine, id, started)?;
     // Before the start: a command that ends at once must find it set.
     let record = containers::update(engine, id, |record| {
-        record.started = Some(SystemTime::now());
+        record.started = Some(started);
         record.finished = None;
         record.exit = None;
         record.boot_id = crate::run::recover::boot_id();

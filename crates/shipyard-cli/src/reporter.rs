@@ -61,6 +61,11 @@ impl Reporter for CliReporter {
     }
 }
 
+/// The exit code of a command's own failure (Docker's CLI's): every
+/// command's but `run`'s, which is 125
+/// ([`EXIT_ENGINE_ERROR`](shipyard_runtime::process::EXIT_ENGINE_ERROR)).
+pub(crate) const EXIT_FAILURE: u8 = 1;
+
 /// Prints an error with its full cause chain ("doing X: because Y") and
 /// returns `code` as the exit code.
 pub(crate) fn report(err: &dyn std::fmt::Display, code: u8) -> ExitCode {

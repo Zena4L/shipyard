@@ -20,9 +20,10 @@ Type=oneshot
 # shipyard-stop.service's: a unit's stop runs only once it has started, and
 # this one is still starting while it starts the containers at boot (F52).
 RemainAfterExit=yes
-# Where `shipyard` is installed. A container that couldn't be started (125)
-# is said in the journal; the unit still counts as started, or systemd would
-# end every container it did start.
+# Where `shipyard` is installed. A container that couldn't be started (125:
+# some, not all) is said in the journal; the unit still counts as started, or
+# systemd would end every container it did start. Nothing done at all (1) is
+# a failed unit.
 ExecStart=/usr/local/bin/shipyard system recover
 SuccessExitStatus=125
 # At a shutdown this unit is stopped before shipyard-stop (it's ordered

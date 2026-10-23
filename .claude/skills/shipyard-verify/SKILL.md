@@ -30,6 +30,12 @@ What it runs, if you need a piece alone:
   `--conformance [NAME…]`.
 - [scripts/linux-lints.sh](scripts/linux-lints.sh) (as root in the container): rustdoc with
   `-D warnings --document-private-items`, clippy glibc, clippy musl.
+- [scripts/guest-crash-rate.sh](scripts/guest-crash-rate.sh) `N P [GUEST_DIR] [OUT_DIR]`
+  (macOS, a diagnosis tool, F132): boots N guests P at a time with the VM tests' kind of
+  work and prints the rate of crashes and hangs with its 95% bounds. Settings to compare
+  through the environment: `SHIPYARD_VM_CPUS`, `SHIPYARD_VM_MEMORY_MIB` (read only for
+  diagnosis, said in the VM's `host.log`). Run it alone, the lid open (it `caffeinate`s
+  against idle sleep), each run under two hours.
 
 ## Against the previous release (a change that must change nothing)
 

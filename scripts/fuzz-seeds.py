@@ -360,6 +360,28 @@ PROCESS_JSON = {
 }
 
 
+# What a Docker client sends the API (step 11.2c3b): the first byte picks
+# the method (GET, POST, DELETE, HEAD, PUT), the rest is a path, a query, a
+# filters map, a create body or a credentials header.
+API_REQUESTS = {
+    "ping": b"\x00/_ping",
+    "versioned": b"\x00/v1.43/containers/json",
+    "image-path": b"\x00/images/registry.example:5000/a/b:tag/json",
+    "escaped": b"\x02/containers/a%2Fb%zz",
+    "query": b"\x00all=1&filters=%7B%22label%22%3A%7B%22a%3Db%22%3Atrue%7D%7D&tail=10",
+    "filters": b'\x00{"label":{"a=b":true},"name":["x"],"dangling":["true"],"type":["custom"]}',
+    "filters-list": b'\x00{"label":["a","b=c"],"until":["10m"],"all":["true"]}',
+    "create": b'\x01{"Image":"alpine","Cmd":["sh","-c","echo hi"],"Env":["A=b"],'
+              b'"Labels":{"a":"b"},"ExposedPorts":{"80/tcp":{}},"HostConfig":{"Binds":["v:/d"],'
+              b'"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]},'
+              b'"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":3},"Memory":67108864}}',
+    "network": b'\x01{"Name":"net","Driver":"bridge","Internal":true,"EnableIPv6":true,'
+               b'"IPAM":{"Config":[{"Subnet":"10.250.1.0/24","Gateway":"10.250.1.1"}]},'
+               b'"Options":{"com.docker.network.bridge.enable_icc":"true"},"Labels":{"a":"b"}}',
+    "auth": b"\x01eyJ1c2VybmFtZSI6ImEiLCJwYXNzd29yZCI6ImIiLCJzZXJ2ZXJhZGRyZXNzIjoiciJ9",
+}
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -394,6 +416,8 @@ def main():
         write(f"{root}/attach_frames", name, frames)
     for name, process in PROCESS_JSON.items():
         write(f"{root}/process_json", name, json.dumps(process).encode())
+    for name, request in API_REQUESTS.items():
+        write(f"{root}/api_request", name, request)
 
 
 if __name__ == "__main__":

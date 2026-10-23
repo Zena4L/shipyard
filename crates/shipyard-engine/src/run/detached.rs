@@ -212,10 +212,74 @@ pub fn start_attached(
 /// ([`ErrorKind::Busy`](crate::ErrorKind::Busy)); what couldn't be removed.
 pub fn remove(engine: &Engine, reference: &str, force: bool) -> Result<ContainerId> {
     #[cfg(target_os = "linux")]
-    return super::remove::remove(engine, reference, force);
+    return super::remove::remove(engine, reference, RemoveOptions::new(force, false));
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (engine, reference, force);
+        Err(crate::error::linux_only("containers"))
+    }
+}
+
+/// How [`remove_with`] removes a container.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RemoveOptions {
+    /// A running one too: killed first (`rm -f`).
+    pub force: bool,
+    /// Its anonymous volumes too (`rm -v`): each no other container names.
+    pub volumes: bool,
+}
+
+impl RemoveOptions {
+    /// Removal with `force`, and its anonymous `volumes`.
+    #[must_use]
+    pub fn new(force: bool, volumes: bool) -> Self {
+        Self { force, volumes }
+    }
+}
+
+/// [`remove`], as `options` ask: with the anonymous volumes its create
+/// made too (`rm -v`, Docker's `DELETE ?v=1`), each no other container
+/// names (one in use is kept); a volume it was given by name never.
+///
+/// # Errors
+///
+/// As [`remove`].
+pub fn remove_with(
+    engine: &Engine,
+    reference: &str,
+    options: RemoveOptions,
+) -> Result<ContainerId> {
+    #[cfg(target_os = "linux")]
+    return super::remove::remove(engine, reference, options);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, reference, options);
+        Err(crate::error::linux_only("containers"))
+    }
+}
+
+/// What a prune does before its removals, once: the containers that
+/// ended unwatched settled, as each `rm` would settle them first.
+pub(crate) fn settle_for_prune(engine: &Engine) {
+    #[cfg(target_os = "linux")]
+    super::recover::recover_others(engine, None);
+    #[cfg(not(target_os = "linux"))]
+    let _ = engine;
+}
+
+/// [`remove`] without force, for a prune that settled the others itself
+/// ([`settle_for_prune`]): each removal doesn't read every record again.
+///
+/// # Errors
+///
+/// As [`remove`].
+pub(crate) fn remove_for_prune(engine: &Engine, reference: &str) -> Result<ContainerId> {
+    #[cfg(target_os = "linux")]
+    return super::remove::removed(engine, reference, RemoveOptions::default());
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, reference);
         Err(crate::error::linux_only("containers"))
     }
 }
@@ -273,6 +337,9 @@ pub struct Foreground {
     /// `None` for Docker's, Ctrl-P Ctrl-Q. Without `-it` none detach (any
     /// bytes may be input).
     pub detach_keys: Option<shipyard_runtime::attach::DetachKeys>,
+    /// Which of its output streams are written here (Docker's `-a`; both
+    /// unless asked).
+    pub output: crate::attach::Output,
 }
 
 /// How a foreground run ended ([`attached`]).

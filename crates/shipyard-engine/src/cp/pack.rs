@@ -19,8 +19,9 @@
 //! - **Bounded:** at most [`MAX_DEPTH`] directories deep (each level holds
 //!   one descriptor), at most [`MAX_NAMES`] names in one directory, and
 //!   [`MAX_LINKS`] files with more than one name remembered (any more are
-//!   written as copies): a container can't make the copy hold unbounded
-//!   memory (the helper isn't in its cgroup).
+//!   written as copies, or refused by a fill's packer: an image can't
+//!   multiply its data in a volume): a container can't make the copy hold
+//!   unbounded memory (the helper isn't in its cgroup).
 //!
 //! No extended attributes are written: no file capability travels with a
 //! copy.
@@ -89,6 +90,11 @@ pub enum PackError {
     /// Writing the archive failed (its reader went away, say).
     #[error("writing the archive: {0}")]
     Write(io::Error),
+    /// More files with several names than a fill remembers (a million):
+    /// each further name would be a copy of its data (11.7: an image could
+    /// turn a small layer into a volume that fills the disk).
+    #[error("`{0}` is past {MAX_LINKS} files with more than one name")]
+    TooManyLinks(String),
 }
 
 /// Reopens an `O_PATH` descriptor with real flags, as the same file.
@@ -104,6 +110,11 @@ pub(crate) struct Packer<'r, W: Write> {
     links: HashMap<(u64, u64), PathBuf>,
     /// Sockets left out (a socket can't be archived).
     pub(crate) sockets_skipped: u64,
+    /// Whether a file with several names past [`MAX_LINKS`] is refused
+    /// rather than written as a copy.
+    refuse_link_copies: bool,
+    /// How many such files it remembers ([`MAX_LINKS`]; fewer in a test).
+    max_links: usize,
 }
 
 impl<'r, W: Write> Packer<'r, W> {
@@ -116,7 +127,17 @@ impl<'r, W: Write> Packer<'r, W> {
             reopen,
             links: HashMap::new(),
             sockets_skipped: 0,
+            refuse_link_copies: false,
+            max_links: MAX_LINKS,
         }
+    }
+
+    /// One that refuses a file with several names past [`MAX_LINKS`] rather
+    /// than write a copy of it: a fill's, whose tree an image chose (a
+    /// `cp`'s copies are the user's own asking, as `tar`'s are).
+    pub(crate) fn refusing_link_copies(mut self) -> Self {
+        self.refuse_link_copies = true;
+        self
     }
 
     /// Adds what `fd` is (open `O_PATH`, a symlink itself if it is one) as
@@ -214,8 +235,10 @@ impl<'r, W: Write> Packer<'r, W> {
                     .append_link(&mut header, name, first)
                     .map_err(PackError::Write);
             }
-            if self.links.len() < MAX_LINKS {
+            if self.links.len() < self.max_links {
                 self.links.insert(identity, name.to_owned());
+            } else if self.refuse_link_copies {
+                return Err(PackError::TooManyLinks(name.display().to_string()));
             }
         }
         // Not blocking on the open (a lease a container holds), but read
@@ -519,6 +542,38 @@ mod tests {
             "the second name of one file"
         );
         assert_eq!(rows[5].3.as_deref(), Some("copy/again"));
+    }
+
+    /// Past the files with several names it remembers, a packer writes the
+    /// next one as a copy, but a fill's refuses it (its kind): an image
+    /// can't make one file's data many times over in a volume (11.7).
+    #[test]
+    fn a_fill_refuses_link_copies_past_its_limit() {
+        let scratch = Scratch::new("many-links");
+        for name in ["a", "b", "c"] {
+            std::fs::write(scratch.0.join(name), "data").unwrap();
+            std::fs::hard_link(scratch.0.join(name), scratch.0.join(format!("{name}2"))).unwrap();
+        }
+        let packed = |refusing: bool| {
+            let mut packer = Packer::new(Vec::new(), &reopen);
+            if refusing {
+                packer = packer.refusing_link_copies();
+            }
+            packer.max_links = 2;
+            packer
+                .add_contents(&path_fd(&scratch.0))
+                .and_then(|()| packer.finish())
+        };
+        let copied = listing(&packed(false).unwrap());
+        let links = copied
+            .iter()
+            .filter(|row| row.1 == tar::EntryType::Link)
+            .count();
+        assert_eq!((copied.len(), links), (6, 2), "{copied:?}");
+        assert!(
+            matches!(packed(true), Err(PackError::TooManyLinks(_))),
+            "a fill's packer past its links"
+        );
     }
 
     #[test]

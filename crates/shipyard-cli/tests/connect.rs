@@ -100,7 +100,7 @@ impl Setup {
     /// The bridge networks container `name`'s record joins.
     fn recorded(&self, name: &str) -> Vec<String> {
         let shown: serde_json::Value =
-            serde_json::from_str(&self.ok(&["inspect", name]).stdout).unwrap();
+            serde_json::from_str(&self.ok(&["inspect", "--shipyard", name]).stdout).unwrap();
         shown[0]["config"]["network"]
             .as_array()
             .unwrap()
@@ -174,12 +174,12 @@ fn a_running_container_joins_and_leaves_a_network() {
         assert_eq!(addresses(&answer), [address]);
         // Held by its monitor, the command gone.
         let busy = setup.shipyard(&["network", "rm", "back"]);
-        assert_eq!(busy.code, Some(125), "{}", busy.stderr);
+        assert_eq!(busy.code, Some(1), "{}", busy.stderr);
         assert!(busy.stderr.contains("web"), "{}", busy.stderr);
         assert_eq!(setup.recorded("web"), ["front", "back"]);
         // Twice: refused.
         let again = setup.shipyard(&["network", "connect", "back", "web"]);
-        assert_eq!(again.code, Some(125), "{}", again.stderr);
+        assert_eq!(again.code, Some(1), "{}", again.stderr);
         assert!(again.stderr.contains("already"), "{}", again.stderr);
         // Leaving: gone from the network and its names at once.
         setup.ok(&["network", "disconnect", "back", "web"]);
@@ -219,7 +219,7 @@ fn the_record_keeps_it_and_the_way_out_needs_force() {
         setup.ok(&["restart", "-t", "1", "web"]);
         assert!(setup.on("back").contains(&"web".to_owned()), "joined again");
         let refused = setup.shipyard(&["network", "disconnect", "front", "web"]);
-        assert_eq!(refused.code, Some(125), "{}", refused.stderr);
+        assert_eq!(refused.code, Some(1), "{}", refused.stderr);
         assert!(refused.stderr.contains("--force"), "{}", refused.stderr);
         let forced = setup.ok(&["network", "disconnect", "--force", "front", "web"]);
         assert!(
@@ -229,7 +229,7 @@ fn the_record_keeps_it_and_the_way_out_needs_force() {
         );
         assert!(!setup.on("front").contains(&"web".to_owned()));
         let only = setup.shipyard(&["network", "disconnect", "back", "web"]);
-        assert_eq!(only.code, Some(125), "{}", only.stderr);
+        assert_eq!(only.code, Some(1), "{}", only.stderr);
         assert!(only.stderr.contains("only network"), "{}", only.stderr);
         // Stopped: its record only, then its start.
         setup.ok(&["stop", "-t", "1", "web"]);
@@ -243,52 +243,82 @@ fn the_record_keeps_it_and_the_way_out_needs_force() {
         assert!(setup.on("back").contains(&"web".to_owned()));
         // Not a bridge network; not a container's: refused.
         let host = setup.shipyard(&["network", "connect", "host", "web"]);
-        assert_eq!(host.code, Some(125), "{}", host.stderr);
+        assert_eq!(host.code, Some(1), "{}", host.stderr);
         let nobody = setup.shipyard(&["network", "connect", "back", "nobody"]);
-        assert_eq!(nobody.code, Some(125), "{}", nobody.stderr);
+        assert_eq!(nobody.code, Some(1), "{}", nobody.stderr);
         // An address the network can't give: refused now, not at a start.
         let outside = setup.shipyard(&["network", "connect", "--ip", "192.0.2.9", "front", "web"]);
-        assert_eq!(outside.code, Some(125), "{}", outside.stderr);
+        assert_eq!(outside.code, Some(1), "{}", outside.stderr);
         assert!(outside.stderr.contains("subnet"), "{}", outside.stderr);
         setup.ok(&["rm", "-f", "web"]);
     });
 }
 
-/// A network a stopped container's record joins is kept (stage 9, step
-/// 9.9a, M2): it holds no lease, but would start on it again. `network rm`
-/// refuses it, naming the container, and `prune` keeps it as in use. Once
-/// the record leaves it (a disconnect, an `rm`), it goes.
+/// A network a stopped container names doesn't keep it (Docker's rule,
+/// D11.4a-2): `network rm` removes it and `prune` takes it, while one a
+/// running container is on is kept (its control). The stopped container's
+/// next start fails, naming the network (Docker's says it's not found).
 #[test]
 #[ignore = "needs root"]
-fn a_stopped_containers_network_is_kept() {
+fn a_stopped_containers_network_goes_as_docker_s() {
     in_new_netns(|| {
         let setup = Setup::new(&["front", "back"]);
         setup.detached("web", &["--network", "front", "--network", "back"]);
-        setup.ok(&["stop", "-t", "1", "web"]);
-        assert!(setup.on("back").is_empty(), "no lease once stopped");
+        // Up: kept.
         let busy = setup.shipyard(&["network", "rm", "back"]);
-        assert_eq!(busy.code, Some(125), "{}", busy.stderr);
+        assert_eq!(busy.code, Some(1), "{}", busy.stderr);
         assert!(
             busy.stderr.contains("the network back is in use by web"),
             "{}",
             busy.stderr
         );
-        let pruned = setup.ok(&["network", "prune", "-f"]);
-        let kept = pruned
-            .stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("Kept 2 in use: "))
-            .unwrap_or_else(|| panic!("{}", pruned.stdout));
-        let mut kept: Vec<&str> = kept.split(", ").collect();
-        kept.sort_unstable();
-        assert_eq!(kept, ["back", "front"]);
-        assert_eq!(setup.recorded("web"), ["front", "back"]);
-        // Its record leaves it: it goes.
-        setup.ok(&["network", "disconnect", "back", "web"]);
+        // Waiting to restart (its policy's backoff): as good as up, kept.
+        let image = setup.image.clone();
+        setup.ok(&[
+            "run",
+            "-d",
+            "--name",
+            "again",
+            "--network",
+            "front",
+            "--restart",
+            "always",
+            &image,
+            "sh",
+            "-c",
+            "exit 1",
+        ]);
+        shipyard_test_support::eventually(Duration::from_secs(10), "it waits to restart", || {
+            setup
+                .ok(&["inspect", "-f", "{{.State.Restarting}}", "again"])
+                .stdout
+                .trim()
+                == "true"
+        });
+        let waiting = setup.shipyard(&["network", "rm", "front"]);
+        assert_eq!(waiting.code, Some(1), "{}", waiting.stderr);
+        assert!(
+            waiting.stderr.contains("in use by again"),
+            "{}",
+            waiting.stderr
+        );
+        setup.ok(&["rm", "-f", "again"]);
+        setup.ok(&["stop", "-t", "1", "web"]);
         setup.ok(&["network", "rm", "back"]);
-        // Its record gone: so is the last.
+        let pruned = setup.ok(&["network", "prune", "-f"]);
+        assert!(
+            pruned.stdout.lines().any(|line| line == "front"),
+            "{}",
+            pruned.stdout
+        );
+        let start = setup.shipyard(&["start", "web"]);
+        assert_eq!(start.code, Some(1), "{}", start.stderr);
+        assert!(
+            start.stderr.contains("there's no network named "),
+            "{}",
+            start.stderr
+        );
         setup.ok(&["rm", "web"]);
-        setup.ok(&["network", "rm", "front"]);
     });
 }
 
@@ -305,11 +335,19 @@ fn port_sockets_shows_its_listeners_and_peers() {
         setup.detached("client", &["--network", "app"]);
         let netns_of = |name: &str| {
             let shown: serde_json::Value =
-                serde_json::from_str(&setup.ok(&["inspect", name]).stdout).unwrap();
+                serde_json::from_str(&setup.ok(&["inspect", "--shipyard", name]).stdout).unwrap();
             let pid = shown[0]["state"]["pid"].as_i64().unwrap();
             std::fs::File::open(format!("/proc/{pid}/ns/net")).unwrap()
         };
         let web = setup.networks.address("app", "web");
+        // Docker's `inspect` says its address there, from its live lease
+        // (step 11.1).
+        let docker: serde_json::Value =
+            serde_json::from_str(&setup.ok(&["inspect", "web"]).stdout).unwrap();
+        let endpoint = &docker[0]["NetworkSettings"]["Networks"]["app"];
+        assert_eq!(endpoint["IPAddress"], web.to_string(), "{docker}");
+        assert!(endpoint["IPPrefixLen"].as_u64().unwrap() > 0, "{docker}");
+        assert_eq!(docker[0]["HostConfig"]["NetworkMode"], "app");
         // A listener in web's namespace, and client's connection to it,
         // kept open.
         let listener = shipyard_test_support::net::in_netns(&netns_of("web"), || {
@@ -350,7 +388,7 @@ fn port_sockets_shows_its_listeners_and_peers() {
         );
         setup.ok(&["stop", "-t", "1", "web"]);
         let stopped = setup.shipyard(&["port", "--sockets", "web"]);
-        assert_eq!(stopped.code, Some(125), "{}", stopped.stderr);
+        assert_eq!(stopped.code, Some(1), "{}", stopped.stderr);
         assert!(
             stopped.stderr.contains("is not running"),
             "{}",
@@ -434,7 +472,7 @@ fn a_failed_live_step_puts_the_record_back() {
         let taken = setup.networks.address("back", "db").to_string();
         assert_eq!(setup.recorded("web"), ["front"]);
         let refused = setup.shipyard(&["network", "connect", "--ip", &taken, "back", "web"]);
-        assert_eq!(refused.code, Some(125), "{}", refused.stderr);
+        assert_eq!(refused.code, Some(1), "{}", refused.stderr);
         assert!(refused.stderr.contains("is taken"), "{}", refused.stderr);
         assert_eq!(setup.recorded("web"), ["front"], "its record put back");
         assert!(!setup.on("back").contains(&"web".to_owned()));
@@ -450,7 +488,7 @@ fn a_failed_live_step_puts_the_record_back() {
         let busy = setup.shipyard(&["network", "disconnect", "back", "web"]);
         lock.unlock().unwrap();
         drop(lock);
-        assert_eq!(busy.code, Some(125), "{}", busy.stderr);
+        assert_eq!(busy.code, Some(1), "{}", busy.stderr);
         assert!(busy.stderr.contains("is busy"), "{}", busy.stderr);
         assert_eq!(
             setup.recorded("web"),

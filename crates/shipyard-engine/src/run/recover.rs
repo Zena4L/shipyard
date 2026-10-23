@@ -183,7 +183,14 @@ mod linux {
         // host with many, a pass each would cost the square of their number).
         recover_others(engine, None);
         let mut booted = super::Booted::default();
-        for record in containers::list(engine)? {
+        // Those that join another's network after the others: theirs must
+        // be up first (a join of a join is refused, so one pass is enough).
+        let mut records = containers::list(engine)?;
+        records.sort_by_cached_key(|record| {
+            containers::created(engine, &record.id)
+                .is_ok_and(|created| created.network_from.is_some() || created.ipc_from.is_some())
+        });
+        for record in records {
             let up = containers::state(engine, &record).is_ok_and(|state| state.is_active());
             if !starts_at_boot(&record, up) {
                 continue;
@@ -301,7 +308,7 @@ mod linux {
             let Ok(status) = runtime::peek_status(root, record.id.as_str()) else {
                 continue;
             };
-            if !candidate(&record, status) {
+            if !candidate(engine, &record, status) {
                 continue;
             }
             let (kind, message) = match settle(engine, root, &record.id, boot.as_deref()) {
@@ -339,7 +346,7 @@ mod linux {
     /// Whether `record`, its runtime saying `status`, may need settling: a
     /// look without locks ([`settle`] looks again under them). One that's
     /// up is never touched.
-    fn candidate(record: &Record, status: Option<Status>) -> bool {
+    fn candidate(engine: &Engine, record: &Record, status: Option<Status>) -> bool {
         match status {
             Some(Status::Running | Status::Paused | Status::Stopping) => false,
             // Ended (its exit recorded or not), or a start's: settled if
@@ -347,10 +354,12 @@ mod linux {
             Some(_) => true,
             // No runtime state (a reboot, a logout, or deleted): a start
             // never recorded as finished, a `--rm` one left (its removal
-            // failed before), or a restart waiting (its waiter may be gone).
+            // failed before), a restart waiting (its waiter may be gone),
+            // or an end recorded but not said (F88).
             None => {
                 record.started.is_some() && (record.finished.is_none() || record.auto_remove)
                     || record.next_start.is_some()
+                    || containers::end_unsaid(engine, record)
             }
         }
     }
@@ -418,8 +427,12 @@ mod linux {
                 containers::update(engine, id, |record| record.next_start = None)?;
                 return Ok(Some(Recovery::RestartGone));
             }
+            // Or its end recorded but not said (F88), its runtime state
+            // gone with a reboot.
             None if record.started.is_some()
-                && (record.finished.is_none() || record.auto_remove) => {}
+                && (record.finished.is_none()
+                    || record.auto_remove
+                    || containers::end_unsaid(engine, &record)) => {}
             None => return Ok(None),
         }
         // Its last start's holders (its monitor, its clean-up) all gone.
@@ -430,7 +443,12 @@ mod linux {
         // before `reconcile` deletes the runtime state it's in.
         let exit_command_failed = root.join(id.as_str()).join(EXIT_COMMAND_FAILED).exists();
         crate::run::take::reconcile(engine, root, id)?;
+        // Only its `die` to say: said, and nothing to warn of.
+        let only_unsaid = record.finished.is_some() && !record.auto_remove;
         let record = settle_unrecorded_end(engine, id, boot)?;
+        if only_unsaid {
+            return Ok(None);
+        }
         if exit_command_failed {
             engine.warn(
                 WarningKind::LeftForLater,
@@ -445,8 +463,10 @@ mod linux {
         if record.auto_remove && record.started.is_some() {
             crate::image::remove_owned_area(engine, id.as_str())
                 .map_err(|error| error.context("removing the container's writable layer"))?;
+            let made = crate::run::volumes::made_anonymous(engine, id);
             crate::run::remove::forget(engine, id)?;
             drop(running);
+            crate::run::volumes::remove_anonymous(engine, &made);
             return Ok(Some(Recovery::Removed));
         }
         drop(running);
@@ -489,6 +509,12 @@ mod linux {
     ) -> Result<Record> {
         let record = containers::read_one(engine, id)?;
         let (Some(started), None) = (record.started, record.finished) else {
+            // Its end recorded, but not said (F88: its clean-up killed
+            // between the two, its runtime state gone since): said now.
+            if containers::end_unsaid(engine, &record) {
+                crate::events::container_ended(engine, &record);
+                containers::end_said(engine, id);
+            }
             return Ok(record);
         };
         let ended = ended_at(started, record.boot_id.as_deref(), boot);
@@ -496,6 +522,7 @@ mod linux {
         // It ran: what it kept aside is no start's to restore now.
         containers::forget_previous_start(engine, id);
         crate::events::emit(engine, &crate::events::container(&record, "die").at(ended));
+        containers::end_said(engine, id);
         Ok(record)
     }
 

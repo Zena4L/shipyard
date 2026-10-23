@@ -282,16 +282,12 @@ impl GuestDoctor {
     /// [`GuestDoctorError::Newer`] for a newer version, else
     /// [`GuestDoctorError::Unreadable`].
     pub fn decode(bytes: &[u8]) -> std::result::Result<Self, GuestDoctorError> {
-        #[derive(serde::Deserialize)]
-        struct Versioned {
-            version: u32,
-        }
-        let unreadable = |e: serde_json::Error| GuestDoctorError::Unreadable(e.to_string());
-        let versioned: Versioned = serde_json::from_slice(bytes).map_err(unreadable)?;
-        if versioned.version > GUEST_DOCTOR_VERSION {
-            return Err(GuestDoctorError::Newer(versioned.version));
-        }
-        serde_json::from_slice(bytes).map_err(unreadable)
+        shipyard_sys::versioned::read(bytes, GUEST_DOCTOR_VERSION).map_err(|error| match error {
+            shipyard_sys::versioned::Error::Newer(version) => GuestDoctorError::Newer(version),
+            shipyard_sys::versioned::Error::Unreadable(e) => {
+                GuestDoctorError::Unreadable(e.to_string())
+            }
+        })
     }
 }
 

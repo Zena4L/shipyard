@@ -158,6 +158,7 @@ pub(crate) fn attach(root: &Path, args: &AttachArgs) -> anyhow::Result<()> {
         detach_keys: shipyard_runtime::attach::DetachKeys::parse(&args.detach_keys)?,
         stdin: !args.no_stdin,
         held: false,
+        output: shipyard_runtime::attach::client::Output::BOTH,
     };
     match to_runtime(root, &args.id, &options)? {
         Settled::Exited(code) => std::process::exit(code),
@@ -247,7 +248,9 @@ pub(crate) fn logs(cli: &Cli, root: &Path, args: &LogsArgs) -> anyhow::Result<()
         tail: *tail,
         since: *since,
         follow: *follow,
-        gone: Some(shipyard_cli::pipe::stdout_gone),
+        gone: Some(shipyard_runtime::logs::reader::Gone::new(
+            shipyard_cli::pipe::stdout_gone,
+        )),
         ..LogsOptions::default()
     };
     let skipped = logs_output::printed(*timestamps, |sink| {

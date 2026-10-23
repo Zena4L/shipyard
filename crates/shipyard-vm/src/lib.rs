@@ -14,6 +14,8 @@
 //! the manifest and the checks are everyone's (and tested everywhere).
 
 #[cfg(target_os = "macos")]
+mod api;
+#[cfg(target_os = "macos")]
 pub mod client;
 #[cfg(target_os = "macos")]
 pub mod doctor;
@@ -27,11 +29,21 @@ mod host;
 )]
 mod idle;
 #[cfg(target_os = "macos")]
+pub mod launchd;
+#[cfg(target_os = "macos")]
 mod machine;
 mod manifest;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the host's; tested everywhere")
+)]
+mod network;
 mod paths;
 mod peer;
 pub mod ports;
+#[cfg(target_os = "macos")]
+mod serving;
+mod state_file;
 
 pub use manifest::{
     Build, Guest, Hashed, Kernel, MANIFEST, MANIFEST_VERSION, Manifest, ManifestError,
@@ -65,6 +77,10 @@ pub enum VmError {
     /// The guest refused a forwarded command, saying why.
     #[error("the VM refused the command: {0}")]
     Refused(String),
+    /// The guest is still starting (its data disk checked or repaired at
+    /// boot): asked again, it answers once it's ready.
+    #[error("{}", shipyard_runtime::attach::forward::NOT_READY)]
+    NotReady,
     /// The VM went (or answered nonsense) before a forwarded command ended.
     #[error("{0}")]
     Gone(String),

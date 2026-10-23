@@ -23,6 +23,7 @@ use shipyard_engine::run::{Checked, Invocation, RunRequest};
 use std::os::unix::ffi::OsStringExt as _;
 
 #[derive(Debug, Parser)]
+#[command(disable_help_flag = true)]
 struct Harness {
     #[command(flatten)]
     run: RunArgs,
@@ -556,14 +557,14 @@ fn the_root_bundle_and_isolation_reach_the_request() {
 fn capability_and_security_spellings() {
     use shipyard_runtime::security::Capability;
     let cap = |name: &str| name.parse::<Capability>().unwrap();
-    assert_eq!(parse_capability("ALL"), Ok(CapabilityArg::All));
-    assert_eq!(parse_capability("all"), Ok(CapabilityArg::All));
+    assert_eq!("ALL".parse::<CapabilityArg>(), Ok(CapabilityArg::All));
+    assert_eq!("all".parse::<CapabilityArg>(), Ok(CapabilityArg::All));
     assert_eq!(
-        parse_capability("chown"),
+        "chown".parse::<CapabilityArg>(),
         Ok(CapabilityArg::One(cap("CHOWN")))
     );
     assert_eq!(
-        parse_capability("CAP_SYS_ADMIN"),
+        "CAP_SYS_ADMIN".parse::<CapabilityArg>(),
         Ok(CapabilityArg::One(cap("SYS_ADMIN")))
     );
     for (option, on) in [
@@ -573,13 +574,13 @@ fn capability_and_security_spellings() {
         ("no-new-privileges=false", false),
     ] {
         assert_eq!(
-            parse_security_opt(option),
+            option.parse::<SecurityOpt>(),
             Ok(SecurityOpt::NoNewPrivileges(on)),
             "{option}"
         );
     }
     assert_eq!(
-        parse_security_opt("seccomp=/p.json"),
+        "seccomp=/p.json".parse::<SecurityOpt>(),
         Ok(SecurityOpt::SeccompProfile("/p.json".into()))
     );
 }
@@ -695,6 +696,114 @@ fn capability_flags_are_checked() {
             .into_invocation()
             .unwrap_err();
         assert!(err.to_string().contains("--cap-add needs Linux"), "{err}");
+    }
+}
+
+/// `--network container:NAME`: another container's network, alone, with
+/// nothing of this one's in it.
+#[test]
+fn another_container_s_network() {
+    // Another container's, by name or ID.
+    assert_eq!(
+        parse_network("container:db"),
+        Ok(NetworkMode::Container("db".to_owned()))
+    );
+    assert!(parse_network("container:").is_err());
+    // `--ipc`: its own, or another container's.
+    for (given, ipc) in [
+        ("private", shipyard_engine::run::IpcMode::Private),
+        ("shareable", shipyard_engine::run::IpcMode::Private),
+        (
+            "container:db",
+            shipyard_engine::run::IpcMode::Container("db".to_owned()),
+        ),
+    ] {
+        assert_eq!(
+            shipyard_engine::run::IpcMode::parse(given),
+            Ok(ipc),
+            "{given}"
+        );
+    }
+    for refused in ["host", "none", "container:"] {
+        assert!(
+            shipyard_engine::run::IpcMode::parse(refused).is_err(),
+            "{refused}"
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let isolation = |args: &[&str]| {
+        parse(args)
+            .unwrap()
+            .into_invocation()
+            .map(|run| run.isolation().cloned())
+    };
+    // The control: alone, it's taken (the other is found at its start).
+    assert!(
+        isolation(&["--no-image", "--network", "container:db", "true"]).is_ok(),
+        "alone"
+    );
+    // Another container's network is its own: nothing of this one's
+    // goes in it, nor another network beside it.
+    for args in [
+        &[
+            "--no-image",
+            "--network",
+            "container:db",
+            "--hostname",
+            "x",
+            "true",
+        ][..],
+        &[
+            "--no-image",
+            "--network",
+            "container:db",
+            "--network",
+            "app",
+            "true",
+        ],
+        &[
+            "--no-image",
+            "--network",
+            "container:db",
+            "--add-host",
+            "db:10.0.0.9",
+            "true",
+        ],
+        &[
+            "--no-image",
+            "--network",
+            "container:db",
+            "--dns",
+            "10.0.0.53",
+            "true",
+        ],
+        &[
+            "--no-image",
+            "--network",
+            "container:db",
+            "-p",
+            "8080:80",
+            "true",
+        ],
+        &[
+            "--no-image",
+            "--network",
+            "container:db",
+            "--sysctl",
+            "net.ipv4.ip_forward=1",
+            "true",
+        ],
+    ] {
+        let error = isolation(args).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<shipyard_engine::Error>()
+                .map(shipyard_engine::Error::kind),
+            Some(shipyard_engine::ErrorKind::InvalidRequest),
+            "{args:?}: {error:#}"
+        );
     }
 }
 
@@ -939,4 +1048,40 @@ fn a_bare_env_key_copies_the_callers_value() {
         std::env::var_os("PATH")
     );
     assert!(std::env::var_os("PATH").is_some(), "a control: PATH is set");
+}
+
+/// `--tmpfs` and `--mount` (Docker's): a bind and a volume join `-v`'s
+/// strings, after them (a volume without a source as its lone place, an
+/// anonymous one); a tmpfs joins `--tmpfs`'s; a bad one is clap's usage
+/// error.
+#[test]
+fn tmpfs_and_mount_reach_the_request() {
+    let asked = request(&[
+        "-v",
+        "a:/a",
+        "--mount",
+        "type=bind,source=/srv,target=/s,readonly",
+        "--mount",
+        "type=tmpfs,target=/t,tmpfs-size=1m",
+        "--tmpfs",
+        "/run:size=64m",
+        "alpine",
+    ])
+    .unwrap();
+    assert_eq!(asked.volume, ["a:/a", "/srv:/s:ro"]);
+    let tmpfs: Vec<String> = asked
+        .tmpfs
+        .iter()
+        .map(|mount| format!("{}:{}", mount.destination().display(), mount.options_text()))
+        .collect();
+    assert_eq!(tmpfs, ["/run:size=64m", "/t:size=1m"]);
+    // No source: an anonymous volume, named at the create.
+    let anonymous = request(&["--mount", "type=volume,target=/data,readonly", "alpine"]).unwrap();
+    assert_eq!(anonymous.volume, ["/data:ro"]);
+    for refused in [
+        &["--tmpfs", "/run:x=1", "alpine"][..],
+        &["--mount", "type=volume,target=data", "alpine"],
+    ] {
+        assert!(parse(refused).is_err(), "{refused:?}");
+    }
 }

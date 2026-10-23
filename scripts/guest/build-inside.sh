@@ -25,14 +25,16 @@ root=$work/root
 mkdir "$root"
 tar -xzf "$tarball" -C "$root"
 
-echo "== packages: $PACKAGES"
+echo "== packages: $PACKAGES $KERNEL_PACKAGE (the kernel from $KERNEL_BRANCH)"
 cp /etc/resolv.conf "$root/etc/resolv.conf"
 # Scripts not run: linux-virt's would make an initramfs of its own.
 # (Three tries: a mirror that drops the index fetch once makes apk say the
 # packages don't exist.)
 for try in 1 2 3; do
   # shellcheck disable=SC2086
-  chroot "$root" /sbin/apk add --no-cache --no-scripts --quiet $PACKAGES && break
+  chroot "$root" /sbin/apk add --no-cache --no-scripts --quiet \
+      --repository "https://dl-cdn.alpinelinux.org/alpine/$KERNEL_BRANCH/main" \
+      $PACKAGES $KERNEL_PACKAGE && break
   [ "$try" = 3 ] && exit 1
   echo "apk failed (try $try): again"; sleep 5
 done

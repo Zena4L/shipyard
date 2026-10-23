@@ -87,6 +87,11 @@ fn tests() -> Vec<(&'static str, fn())> {
     let mut tests = joining_tests().to_vec();
     if cfg!(target_os = "linux") {
         tests.extend_from_slice(PLANNED);
+        #[cfg(target_os = "linux")]
+        tests.push((
+            "a_new_container_joins_another_s_namespaces",
+            a_new_container_joins_another_s_namespaces,
+        ));
     }
     tests
 }
@@ -96,6 +101,10 @@ const PLANNED: &[(&str, fn())] = &[
     (
         "a_planned_container_runs_its_plan",
         a_planned_container_runs_its_plan,
+    ),
+    (
+        "a_made_bind_source_is_bound_by_descriptor",
+        a_made_bind_source_is_bound_by_descriptor,
     ),
     (
         "a_planned_overlay_root_writes_to_its_upper",
@@ -981,6 +990,61 @@ impl Drop for PlanTest {
     }
 }
 
+/// A bind of a source Shipyard made (step 11.7) is reached from its
+/// directory without following a symlink, whatever the engine checked
+/// before: bound while it's a directory (the control: what's written there
+/// is on the host), and refused once a symlink took its place, its target
+/// untouched. This is the runtime's half alone (the engine's check of each
+/// start is `a_made_bind_source_is_never_reached_through_a_symlink`).
+fn a_made_bind_source_is_bound_by_descriptor() {
+    use shipyard_runtime::container;
+    let test = PlanTest::new("made");
+    let rootfs = RootFs::minimal();
+    let shared = test.dir.join("shared");
+    std::fs::create_dir_all(shared.join("made")).unwrap();
+    open_to_all(&shared.join("made"));
+    let with_made = |root: &mut Root| {
+        root.mounts
+            .push(shipyard_runtime::isolation::Mount::bind_made(
+                &shared,
+                std::path::Path::new("made"),
+                "/m",
+            ));
+    };
+    let mut root = Root::new(rootfs.path());
+    with_made(&mut root);
+    let plan = test.plan(root, "echo here > /m/note; touch /out/started");
+    test.run("made", &plan);
+    assert_eq!(
+        std::fs::read_to_string(shared.join("made/note")).unwrap(),
+        "here\n"
+    );
+
+    let outside = test.dir.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    open_to_all(&outside);
+    std::fs::remove_dir_all(shared.join("made")).unwrap();
+    std::os::unix::fs::symlink(&outside, shared.join("made")).unwrap();
+    let mut root = Root::new(rootfs.path());
+    with_made(&mut root);
+    let plan = test.plan(root, "echo through > /m/note; touch /out/started");
+    let state = test.state_root();
+    let made = container::create_planned(
+        &state,
+        "through",
+        &plan,
+        &container::CreateOptions::default(),
+    )
+    .and_then(|_| container::start(&state, "through"));
+    // A failure of its setup (the monitor's: no finer kind reaches the
+    // caller, F135), not of anything before it.
+    assert!(
+        matches!(made, Err(container::ContainerError::Setup(_))),
+        "a symlink in a made source's place was bound: {made:?}"
+    );
+    assert!(!outside.join("note").exists(), "written through the link");
+}
+
 /// A container from a plan runs what the plan says, in its root, and ends
 /// with its code; its plan is beside its record. `exec` joins it, confined
 /// as the plan's process (the monitor's `exec.json` from the plan).
@@ -1278,4 +1342,263 @@ fn a_plan_is_checked_as_a_bundle_is() {
             )
         });
     }
+}
+
+#[cfg(target_os = "linux")]
+/// The namespace of `kind` of process `pid`, as `readlink` names it
+/// (`net:[INODE]`).
+fn namespace_of(pid: impl std::fmt::Display, kind: &str) -> String {
+    std::fs::read_link(format!("/proc/{pid}/ns/{kind}"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(target_os = "linux")]
+/// A new container joins a running one's network and IPC namespaces (by
+/// its init's PID and start time) and its UTS namespace (by path), and
+/// makes the rest its own; its monitor goes back to its own namespaces
+/// after the clone. A start time that isn't the init's is refused (a
+/// reused PID), as is a container that has ended. Rootless, the other's
+/// namespaces are its user namespace's: that's joined too, with its maps,
+/// by a process of its own (the monitor stays in its own).
+fn a_new_container_joins_another_s_namespaces() {
+    use shipyard_runtime::container;
+    use shipyard_runtime::isolation::JoinSource;
+    let test = PlanTest::new("joins");
+    let rootfs = RootFs::minimal();
+    let root = test.state_root();
+    let options = container::CreateOptions::default();
+    let mut first = test.plan(
+        Root::new(rootfs.path()),
+        "echo from-a > /dev/shm/marker; sleep 60",
+    );
+    first.isolation.namespaces.push(Namespace::Network);
+    container::create_planned(&root, "first", &first, &options).unwrap();
+    container::start(&root, "first").unwrap();
+    let (pid, start_time) = container::running_init(&root, "first").unwrap();
+    let process = JoinSource::Process { pid, start_time };
+    // Rootless, the first's namespaces are its user namespace's: that's
+    // joined too (with its maps, the plan's), and no path beside it.
+    let rootless = !is_root();
+    let joined: &[&str] = if rootless {
+        &["net", "ipc", "user"]
+    } else {
+        &["net", "ipc", "uts"]
+    };
+    let second = |from: JoinSource| joining_plan(&test, &rootfs, from);
+    test.run_and("second", &second(process), None::<fn(&std::path::Path)>);
+    if rootless {
+        assert_eq!(
+            test.out("uid_map"),
+            std::fs::read_to_string(format!("/proc/{pid}/uid_map")).unwrap(),
+            "the first's maps"
+        );
+    }
+    for &kind in joined {
+        assert_eq!(
+            test.out(kind).trim(),
+            namespace_of(pid, kind),
+            "{kind}: the first's"
+        );
+    }
+    // Its `/dev/shm` is the first's, both ways.
+    assert_eq!(test.out("shm"), "from-a\n", "the first's shared memory");
+    assert_eq!(
+        std::fs::read_to_string(format!("/proc/{pid}/root/dev/shm/back")).unwrap(),
+        "from-b\n"
+    );
+    // The controls: the first's network isn't the host's, and the second
+    // made its own mount namespace.
+    assert_ne!(namespace_of(pid, "net"), namespace_of("self", "net"));
+    assert_ne!(test.out("mnt").trim(), namespace_of(pid, "mnt"));
+    assert!(test.out("mnt").starts_with("mnt:["), "{}", test.out("mnt"));
+    container::delete(&root, "second", true).unwrap();
+
+    // As root, a container with a user namespace of its own joins the
+    // first's network, but not its IPC namespace: that one's shared memory
+    // is cloned in the first's mount namespace, where its own user namespace
+    // has no privileges.
+    if !rootless {
+        let mut own_user = second(JoinSource::Process { pid, start_time });
+        own_user.isolation.namespaces.push(Namespace::User);
+        own_user.isolation.id_maps = Some(shipyard_runtime::isolation::IdMaps::single((0, 0)));
+        own_user
+            .isolation
+            .joins
+            .retain(|join| join.kind != Namespace::Uts);
+        let refused =
+            container::create_planned(&root, "own-user", &own_user, &options).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                container::ContainerError::InvalidPlan(container::PlanError::Isolation(
+                    shipyard_runtime::isolation::IsolationError::SharedMemoryOfAnotherUserNamespace
+                ))
+            ),
+            "{refused}"
+        );
+        own_user
+            .isolation
+            .joins
+            .retain(|join| join.kind != Namespace::Ipc);
+        std::fs::remove_file(test.dir.join("out/net")).unwrap();
+        test.run_and("own-user", &own_user, None::<fn(&std::path::Path)>);
+        assert_eq!(
+            test.out("net").trim(),
+            namespace_of(pid, "net"),
+            "the first's"
+        );
+        assert_ne!(
+            test.out("user").trim(),
+            namespace_of(pid, "user"),
+            "its own"
+        );
+        container::delete(&root, "own-user", true).unwrap();
+    }
+
+    // Its monitor (still there, until the container's deleted) went back
+    // to its own namespaces after the clone.
+    let mut held = second(JoinSource::Process { pid, start_time });
+    held.spec = ProcessSpec::new(vec!["sleep".into(), "60".into()]);
+    container::create_planned(&root, "held", &held, &options).unwrap();
+    let (monitor, _) = container::peek_monitor(&root, "held").unwrap().unwrap();
+    for &kind in joined {
+        assert_eq!(
+            namespace_of(monitor, kind),
+            namespace_of("self", kind),
+            "the monitor's {kind}"
+        );
+    }
+    container::delete(&root, "held", true).unwrap();
+
+    a_gone_process_is_never_joined(&test, &rootfs, (pid, start_time));
+}
+
+#[cfg(target_os = "linux")]
+/// A helper of [`a_new_container_joins_another_s_namespaces`], not a test
+/// of its own: its refusals. Maps that aren't the joined user namespace's
+/// (rootless), a path that isn't a namespace of its kind (root), a start
+/// time that isn't the running `first`'s init's (`pid`, `start_time`), then
+/// the first ended.
+fn a_gone_process_is_never_joined(test: &PlanTest, rootfs: &RootFs, (pid, start_time): (u32, u64)) {
+    use shipyard_runtime::container;
+    use shipyard_runtime::isolation::JoinSource;
+    let root = test.state_root();
+    let options = container::CreateOptions::default();
+    let second = |from| joining_plan(test, rootfs, from);
+    // Rootless, maps that aren't the joined user namespace's: refused (the
+    // setup would go by the wrong ones).
+    let mut other_maps = second(JoinSource::Process { pid, start_time });
+    let uid = nix::unistd::getuid().as_raw();
+    let single = Some(shipyard_runtime::isolation::IdMaps::single((uid, uid)));
+    // (Where the first's own maps are that one ID, there's no other to give;
+    // the test container's tester has subordinate IDs.)
+    if std::env::var("SHIPYARD_TEST_ROOTLESS").as_deref() == Ok("required") {
+        assert_ne!(
+            other_maps.isolation.id_maps, single,
+            "no other maps to give"
+        );
+    }
+    if !is_root() && other_maps.isolation.id_maps != single {
+        other_maps.isolation.id_maps = single;
+        let err = container::create_planned(&root, "maps", &other_maps, &options).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("user namespace has other ID maps than the container was given"),
+            "{err}"
+        );
+        assert!(!root.join("maps").exists());
+    }
+    // As root, an IPC namespace by a path that's another kind's, or no
+    // namespace at all: refused, nothing left.
+    if is_root() {
+        for (path, said) in [
+            (format!("/proc/{pid}/ns/net"), "it isn't an IPC namespace"),
+            ("/dev/null".to_owned(), "it isn't a namespace"),
+        ] {
+            let mut plan = second(JoinSource::Process { pid, start_time });
+            plan.isolation
+                .joins
+                .retain(|join| join.kind != Namespace::Ipc);
+            plan.isolation
+                .joins
+                .push(shipyard_runtime::isolation::NamespaceJoin::new(
+                    Namespace::Ipc,
+                    JoinSource::Path(path.into()),
+                ));
+            let err = container::create_planned(&root, "kind", &plan, &options).unwrap_err();
+            assert!(err.to_string().contains(said), "{err}");
+            assert!(!root.join("kind").exists());
+        }
+    }
+    // A PID that's no longer the init's: refused, nothing left.
+    let reused = second(JoinSource::Process {
+        pid,
+        start_time: start_time + 1,
+    });
+    let err = container::create_planned(&root, "reused", &reused, &options).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("no process {pid} to join")),
+        "{err}"
+    );
+    assert!(!root.join("reused").exists());
+
+    // Ended: not running, so nothing to name.
+    container::kill(&root, "first", process::Signal::KILL).unwrap();
+    shipyard_test_support::eventually(Duration::from_secs(10), "the first's end", || {
+        container::exit_record(&root, "first").unwrap().is_some()
+    });
+    assert!(matches!(
+        container::running_init(&root, "first"),
+        Err(container::ContainerError::WrongStatus { .. })
+    ));
+    let err = container::create_planned(
+        &root,
+        "late",
+        &second(JoinSource::Process { pid, start_time }),
+        &options,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("no process {pid} to join")),
+        "{err}"
+    );
+    container::delete(&root, "first", true).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+/// A plan that joins `from`'s network and IPC namespaces, and (rootless)
+/// its user namespace, or (root) its UTS namespace by path, and says which
+/// namespaces it's in.
+fn joining_plan(
+    test: &PlanTest,
+    rootfs: &RootFs,
+    from: shipyard_runtime::isolation::JoinSource,
+) -> shipyard_runtime::container::Plan {
+    use shipyard_runtime::isolation::{JoinSource, NamespaceJoin};
+    let mut plan = test.plan(
+        Root::new(rootfs.path()),
+        "for kind in net ipc uts mnt user; do readlink /proc/self/ns/$kind > /out/$kind; done; \
+         cat /proc/self/uid_map > /out/uid_map; cat /dev/shm/marker > /out/shm; \
+         echo from-b > /dev/shm/back; touch /out/started",
+    );
+    plan.isolation.namespaces.push(Namespace::Network);
+    plan.isolation.joins = vec![
+        NamespaceJoin::new(Namespace::Network, from.clone()),
+        NamespaceJoin::new(Namespace::Ipc, from.clone()),
+    ];
+    if !is_root() {
+        plan.isolation
+            .joins
+            .push(NamespaceJoin::new(Namespace::User, from));
+    } else if let JoinSource::Process { pid, .. } = from {
+        plan.isolation.joins.push(NamespaceJoin::new(
+            Namespace::Uts,
+            JoinSource::Path(format!("/proc/{pid}/ns/uts").into()),
+        ));
+    }
+    plan
 }

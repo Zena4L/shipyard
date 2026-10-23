@@ -73,7 +73,11 @@ impl RunRequest {
         }
         let mode = self.network_mode(engine)?;
         let mut isolation = Isolation::standard();
-        isolation.hostname = self.hostname_for(run, &mode);
+        // Its own UTS namespace, with the other's name in it (Docker's).
+        isolation.hostname = match &self.joined.network {
+            Some(joined) => Some(joined.hostname.clone()),
+            None => self.hostname_for(run, &mode),
+        };
         isolation.domainname.clone_from(&self.domainname);
         isolation.security = self.security()?;
         isolation.resources = self
@@ -95,6 +99,7 @@ impl RunRequest {
             isolation.namespaces.push(Namespace::User);
         }
         self.add_network(&mut isolation, &mode)?;
+        self.add_ipc(&mut isolation)?;
         // An image's root comes once it's pulled (`Planned::finish`).
         if let Some(dir) = &self.rootfs {
             isolation.root = Some(self.rootfs_root(dir)?);

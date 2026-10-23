@@ -52,43 +52,8 @@ impl Joining {
     /// processes differently from us, and a system error otherwise.
     pub(crate) fn open(join: &Join) -> Result<Self> {
         let target = join.target;
-        // The target is a PID as our /proc numbers it. With another
-        // namespace's /proc, the same number is another process.
-        if !super::proc_is_ours() {
-            return Err(Error::ForeignProc);
-        }
-        let directory = open(
-            format!("/proc/{target}").as_str(),
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| match errno {
-            Errno::ENOENT | Errno::ESRCH => Error::NoSuchProcess { pid: target },
-            errno => Error::sys("opening the container's /proc entry", errno),
-        })?;
-        if let Some(expected) = join.start_time
-            && start_time_at(&directory) != Some(expected)
-        {
-            return Err(Error::NoSuchProcess { pid: target });
-        }
-        let namespace = |kind: Namespace| {
-            openat(
-                &directory,
-                format!("ns/{}", kind.proc_name()).as_str(),
-                OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|errno| match errno {
-                // Gone since the directory was opened (and maybe its PID
-                // reused: this descriptor never reaches the new process).
-                Errno::ESRCH => Error::NoSuchProcess { pid: target },
-                // A process that has exited but not been reaped has no
-                // namespaces left.
-                Errno::ENOENT => Error::ContainerExiting { pid: target },
-                Errno::EACCES | Errno::EPERM => permission_denied(),
-                errno => Error::sys("opening the container's namespaces", errno),
-            })
-        };
+        let directory = process_directory(target, join.start_time)?;
+        let namespace = |kind: Namespace| namespace_at(&directory, target, kind);
         let user = join
             .has(Namespace::User)
             .then(|| namespace(Namespace::User))
@@ -115,6 +80,62 @@ impl Joining {
             others,
         })
     }
+}
+
+/// The `/proc` directory of the process `target`, bound to that one
+/// process, if it started at `start_time` (when one is given).
+///
+/// # Errors
+///
+/// [`Error::ForeignProc`] if `/proc` numbers processes differently from us,
+/// [`Error::NoSuchProcess`] if it doesn't exist or started at another time.
+pub(crate) fn process_directory(target: u32, start_time: Option<u64>) -> Result<OwnedFd> {
+    // The target is a PID as our /proc numbers it. With another namespace's
+    // /proc, the same number is another process.
+    if !super::proc_is_ours() {
+        return Err(Error::ForeignProc);
+    }
+    let directory = open(
+        format!("/proc/{target}").as_str(),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| match errno {
+        Errno::ENOENT | Errno::ESRCH => Error::NoSuchProcess { pid: target },
+        errno => Error::sys("opening the container's /proc entry", errno),
+    })?;
+    if let Some(expected) = start_time
+        && start_time_at(&directory) != Some(expected)
+    {
+        return Err(Error::NoSuchProcess { pid: target });
+    }
+    Ok(directory)
+}
+
+/// The `kind` namespace of the process whose `/proc` directory (PID
+/// `target`, for errors) is open at `directory`.
+///
+/// # Errors
+///
+/// [`Error::NoSuchProcess`] if it's gone, [`Error::ContainerExiting`] if it
+/// has exited but not been reaped, a refusal if it isn't ours to open.
+pub(crate) fn namespace_at(directory: &OwnedFd, target: u32, kind: Namespace) -> Result<OwnedFd> {
+    openat(
+        directory,
+        format!("ns/{}", kind.proc_name()).as_str(),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| match errno {
+        // Gone since the directory was opened (and maybe its PID reused:
+        // this descriptor never reaches the new process).
+        Errno::ESRCH => Error::NoSuchProcess { pid: target },
+        // A process that has exited but not been reaped has no namespaces
+        // left.
+        Errno::ENOENT => Error::ContainerExiting { pid: target },
+        Errno::EACCES | Errno::EPERM => permission_denied(),
+        errno => Error::sys("opening the container's namespaces", errno),
+    })
 }
 
 /// What the command needs to join `namespaces` itself: plain descriptors

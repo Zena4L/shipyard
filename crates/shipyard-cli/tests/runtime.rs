@@ -1381,7 +1381,8 @@ fn holds_are_added_and_let_go_of_while_it_runs() {
         "{nothing:?}"
     );
     assert!(locked(&second));
-    assert_eq!(runtime.call(&["kill", "holder", "KILL"]).code, Some(0));
+    let killed = runtime.call(&["kill", "holder", "KILL"]);
+    assert_eq!(killed.code, Some(0), "{}", killed.stderr);
     let ran = eventually("the exit command", || std::fs::read_to_string(&record).ok());
     assert_eq!(recorded(&ran, "holds"), "2", "{ran}");
     assert_eq!(
@@ -6454,6 +6455,14 @@ fn exec_refuses_a_replaced_cgroup() {
     for pid in &procs {
         std::fs::write(aside.join("cgroup.procs"), pid.to_string()).unwrap();
     }
+    // Empty once the kernel says so (`populated 0`), not when its list is:
+    // an rmdir before then is refused (EBUSY).
+    let events = || std::fs::read_to_string(cgroup.join("cgroup.events")).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !events().contains("populated 0") {
+        assert!(Instant::now() < deadline, "never emptied: {}", events());
+        std::thread::sleep(Duration::from_millis(20));
+    }
     std::fs::remove_dir(&cgroup).unwrap();
     std::fs::create_dir(&cgroup).unwrap();
     for pid in &procs {
@@ -6461,6 +6470,23 @@ fn exec_refuses_a_replaced_cgroup() {
     }
     let _ = std::fs::remove_dir(&aside);
     let call = exec(&runtime, &["exec-replaced", "sh", "-c", ":"]);
+    // Its processes and cgroup gone whatever was said: the runtime won't
+    // delete a container whose cgroup was replaced, and another run here
+    // would find them.
+    for pid in &procs {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(*pid).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    // (Its monitor may remove it first, its init ended: gone is done.)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::remove_dir(&cgroup)
+        .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(call.code, Some(255), "{}", call.stderr);
     assert!(
         call.stderr.contains("isn't the one made for it"),

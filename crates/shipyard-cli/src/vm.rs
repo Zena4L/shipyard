@@ -37,12 +37,44 @@ mod mac {
         let paths = VmPaths::from_env()?;
         match command {
             VmCommand::Start => {
-                drop(client::connect(&paths)?);
+                client::start(&paths)?;
                 Ok(ExitCode::SUCCESS)
             }
             VmCommand::Status => status(&paths),
             VmCommand::Stop => {
                 client::stop(&paths)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            VmCommand::Install => {
+                let installed = shipyard_vm::launchd::install(&paths)?;
+                let mut out = std::io::stdout().lock();
+                writeln!(
+                    out,
+                    "launchd holds Docker's socket: {}",
+                    printable(&paths.docker_socket().to_string_lossy())
+                )?;
+                writeln!(
+                    out,
+                    "(its agent {}: {})",
+                    installed.label,
+                    printable(&installed.plist.to_string_lossy())
+                )?;
+                Ok(ExitCode::SUCCESS)
+            }
+            VmCommand::Uninstall => {
+                let done = shipyard_vm::launchd::uninstall(&paths)?;
+                let mut out = std::io::stdout().lock();
+                if done.was_installed {
+                    writeln!(out, "launchd no longer holds Docker's socket")?;
+                    if done.stopped_the_vm {
+                        writeln!(out, "(the VM it had started is stopped)")?;
+                    }
+                } else {
+                    writeln!(
+                        out,
+                        "nothing to uninstall: launchd held no socket of this VM's"
+                    )?;
+                }
                 Ok(ExitCode::SUCCESS)
             }
         }
@@ -78,6 +110,17 @@ mod mac {
                 printable(&paths.guest.to_string_lossy())
             )?,
             Err(error) => writeln!(out, "guest: {}", printable(&error.to_string()))?,
+        }
+        let socket = paths.docker_socket();
+        let socket = socket.to_string_lossy();
+        let docker = printable(&socket);
+        if shipyard_vm::launchd::loaded(paths) {
+            writeln!(out, "docker: {docker} (launchd's: any time)")?;
+        } else {
+            writeln!(
+                out,
+                "docker: {docker} (while the VM runs: `shipyard vm install` for any time)"
+            )?;
         }
         writeln!(out, "files: {}", printable(&paths.dir.to_string_lossy()))?;
         Ok(ExitCode::SUCCESS)

@@ -171,6 +171,7 @@ impl RunRequest {
             .map(|_| self.network_plan(engine, run))
             .transpose()?;
         let volumes = self.volume_mounts()?;
+        self.check_mounts(&volumes)?;
         if let Some(dir) = self.workdir.as_ref().filter(|dir| !dir.is_absolute()) {
             bail!(
                 InvalidRequest,
@@ -236,6 +237,37 @@ impl RunRequest {
         spec.rlimits = last_wins(self.ulimit.clone());
         spec.oom_score_adj = self.oom_score_adj;
         spec.validate()?;
+        Ok(())
+    }
+
+    /// The tmpfs mounts, checked as the runtime will, and every mount's
+    /// destination (`--volume`, `--mount`, `--tmpfs`) once: two mounts on
+    /// one place would hide each other.
+    fn check_mounts(&self, volumes: &[VolumeMount]) -> Result<()> {
+        let mut destinations: Vec<&Path> = volumes
+            .iter()
+            .map(|volume| volume.destination.as_path())
+            .collect();
+        for tmpfs in &self.tmpfs {
+            tmpfs
+                .to_runtime()
+                .validate()
+                .map_err(Error::from)
+                .with_context(|| format!("the tmpfs at {}", tmpfs.destination().display()))?;
+            destinations.push(tmpfs.destination());
+        }
+        let mut seen = Vec::new();
+        for destination in destinations {
+            let normal: PathBuf = destination.components().collect();
+            if seen.contains(&normal) {
+                bail!(
+                    InvalidRequest,
+                    "{} is mounted twice (--volume, --mount, --tmpfs): one place, one mount",
+                    normal.display()
+                );
+            }
+            seen.push(normal);
+        }
         Ok(())
     }
 

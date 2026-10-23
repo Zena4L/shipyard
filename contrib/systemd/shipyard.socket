@@ -1,0 +1,15 @@
+# Root's socket for Shipyard's Docker API: systemd listens on it, and starts
+# shipyard.service at the first connection. Point Docker's clients at it with
+# `export DOCKER_HOST=unix:///run/shipyard/api.sock`. Root's alone: anyone
+# who can connect to it can run containers as root. See README.md.
+[Unit]
+Description=Shipyard: the Docker API's socket
+Documentation=https://github.com/Zena4L/shipyard/tree/main/contrib/systemd
+
+[Socket]
+ListenStream=/run/shipyard/api.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

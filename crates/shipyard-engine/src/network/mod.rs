@@ -28,9 +28,13 @@ use shipyard_network::files::{DnsSettings, HostEntry};
 
 #[cfg(target_os = "linux")]
 pub(crate) use attach::release_lease_hold;
+#[cfg(target_os = "linux")]
+pub(crate) use attach::resolver;
+#[cfg(target_os = "linux")]
+pub(crate) use commands::networks_in_use;
 pub use commands::{
-    Attached, NetworkInspected, NetworkListed, Pruned, SpecOptions, create, inspect, list, prune,
-    remove, spec,
+    Attached, NetworkInspected, Pruned, SpecOptions, create, create_with, inspect, prune,
+    prune_where, prune_where_any, remove, spec,
 };
 pub use dns_server::entry_point as dns_entry_point;
 pub(crate) use dns_server::{IDLE_ENV as DNS_IDLE_ENV, UPSTREAM_ENV as DNS_UPSTREAM_ENV};
@@ -122,6 +126,10 @@ pub enum NetworkMode {
     Bridges(Vec<Joined>),
     /// One of its own, connected through pasta (rootless's default).
     Pasta,
+    /// Another container's (`--network container:NAME`, step 11.4b2b1):
+    /// as given, then by the other's ID once a create has found it. Joined
+    /// at each start, as it is: nothing of this container's is made in it.
+    Container(String),
 }
 
 /// A bridge network a container joins, and its settings there.
@@ -149,11 +157,83 @@ impl NetworkMode {
         }])
     }
 
-    /// Whether the container has a network namespace of its own.
+    /// Whether the container has a network namespace of its own (not the
+    /// host's, nor another container's).
     #[must_use]
     pub fn own_namespace(&self) -> bool {
-        !matches!(self, NetworkMode::Host)
+        !matches!(self, NetworkMode::Host | NetworkMode::Container(_))
     }
+
+    /// The container whose network it joins, if it's another's.
+    #[must_use]
+    pub fn joined_container(&self) -> Option<&str> {
+        match self {
+            NetworkMode::Container(container) => Some(container),
+            _ => None,
+        }
+    }
+
+    /// Docker's `container:NAME` (the CLI's `--network`, the API's
+    /// `NetworkMode`), if `text` is one: none if it isn't, a refusal if it
+    /// names nothing.
+    ///
+    /// # Errors
+    ///
+    /// `container:` with no name after it.
+    #[must_use]
+    pub fn parse_container(text: &str) -> Option<Result<NetworkMode, &'static str>> {
+        let name = text.strip_prefix("container:")?;
+        Some(if name.is_empty() {
+            Err("container: needs the container's name or ID")
+        } else {
+            Ok(NetworkMode::Container(name.to_owned()))
+        })
+    }
+}
+
+/// Another container's init, as a start joins its namespaces: by PID and
+/// start time (a reused PID is refused), with its user namespace's maps
+/// where that's joined too (this container isn't the host's root, and it
+/// isn't this process's own).
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "namespaces are joined on Linux")
+)]
+pub(crate) struct JoinedProcess {
+    /// Its PID.
+    pub(crate) pid: u32,
+    /// Its start time.
+    pub(crate) start_time: u64,
+    /// Its user namespace's maps, read from it.
+    pub(crate) maps: Option<shipyard_runtime::isolation::IdMaps>,
+}
+
+/// Another container's network, as a start joins it: its init (by PID and
+/// start time), its user namespace's maps where this one must join that
+/// too, and what its `/etc` files are made of (D11.4b2b-2).
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "networks are joined on Linux")
+)]
+pub(crate) struct JoinedNetwork {
+    /// Its init, whose network namespace is joined.
+    pub(crate) init: JoinedProcess,
+    /// Its hostname.
+    pub(crate) hostname: String,
+    /// Its addresses on its first network the host routes.
+    pub(crate) addresses: Vec<std::net::IpAddr>,
+    /// Its DNS server.
+    pub(crate) resolver: Option<std::net::IpAddr>,
+    /// Its `--add-host`.
+    pub(crate) hosts: Vec<HostEntry>,
+    /// Its `--dns*`.
+    pub(crate) dns: DnsSettings,
+    /// Whether its network is a namespace of its own (not the host's).
+    pub(crate) own: bool,
+    /// Whether it's pasta's (its run files go where pasta's do).
+    pub(crate) pasta: bool,
 }
 
 /// A run's network, as the flags ask for it: checked, but nothing made yet.
@@ -189,6 +269,19 @@ pub(crate) struct NetworkPlan {
     pub(crate) name: Option<String>,
     /// A detached container's ID, written into its leases.
     pub(crate) container: Option<crate::containers::ContainerId>,
+    /// Another container's network it joins, found for this start.
+    pub(crate) joined: Option<JoinedNetwork>,
+}
+
+impl NetworkPlan {
+    /// Whether it's in a network namespace that isn't the host's (its own,
+    /// or another container's that is), as its `/etc` files are made:
+    /// another container's as that one's are.
+    pub(crate) fn in_a_network_namespace(&self) -> bool {
+        self.joined
+            .as_ref()
+            .map_or_else(|| self.mode.own_namespace(), |joined| joined.own)
+    }
 }
 
 /// Whether this process is the host's root: user 0 in the initial user
@@ -214,6 +307,31 @@ pub fn host_root() -> bool {
 #[must_use]
 pub fn host_root() -> bool {
     false
+}
+
+/// The network a container gets when none is asked for, as a run picks it
+/// and a view says it (one decision for both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Defaulted {
+    /// The default bridge network: root, where networks can be made.
+    Bridge,
+    /// The host's: off Linux, or a root that can't make a bridge.
+    Host,
+    /// One of its own through pasta: rootless.
+    Pasta,
+}
+
+/// [`Defaulted`] here, now.
+pub(crate) fn defaulted() -> Defaulted {
+    if !cfg!(target_os = "linux") {
+        Defaulted::Host
+    } else if can_network() {
+        Defaulted::Bridge
+    } else if host_root() {
+        Defaulted::Host
+    } else {
+        Defaulted::Pasta
+    }
 }
 
 /// Whether the default bridge network can be had here: the host's root,
@@ -374,7 +492,11 @@ pub(super) fn open_network(
         name: name.to_owned(),
         ..NetworkSpec::default()
     };
-    match networks.create(&spec, &host_routes()?) {
+    let meta = shipyard_network::store::NetworkMeta {
+        id: Some(crate::docker::new_id()?),
+        ..shipyard_network::store::NetworkMeta::default()
+    };
+    match networks.create_with(&spec, &host_routes()?, &meta) {
         Ok(config) => {
             crate::events::emit_about(engine, crate::events::Kind::Network, "create", name);
             Ok(config)
@@ -388,6 +510,30 @@ pub(super) fn open_network(
         }),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The default network (`bridge`), made if it isn't there yet, as a run
+/// makes it: what Docker always lists.
+///
+/// # Errors
+///
+/// Not the host's root ([`ErrorKind::NeedsRoot`](crate::ErrorKind::NeedsRoot)),
+/// or it can't be made.
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_default(engine: &crate::Engine) -> Result<()> {
+    let networks = networks(engine)?;
+    open_network(engine, &networks, shipyard_network::store::DEFAULT_NETWORK).map(|_| ())
+}
+
+/// Off Linux: no networks.
+///
+/// # Errors
+///
+/// Always [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn ensure_default(engine: &crate::Engine) -> Result<()> {
+    let _ = engine;
+    off_linux()
 }
 
 /// `--network`'s modes: names no network can have.

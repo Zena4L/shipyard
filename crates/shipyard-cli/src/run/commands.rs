@@ -20,17 +20,23 @@ pub(crate) fn run_command(command: RunCommand) -> Result<ExitCode> {
         .map(shipyard_runtime::attach::DetachKeys::parse)
         .transpose()?;
     if !command.detach {
+        let output = match attached_streams(&command) {
+            Ok(output) => output,
+            Err(error) => return Ok(usage_error(error, "run")),
+        };
         let foreground = shipyard_engine::run::Foreground {
             sig_proxy: command.sig_proxy,
             detach_keys,
+            output,
         };
         return run(command.args, command.rm, foreground);
     }
+    let quiet = command.args.quiet;
     let request = match container_request(command.args, "run") {
         Ok(request) => request,
         Err(code) => return Ok(code),
     };
-    let engine = crate::reporter::engine();
+    let engine = engine(quiet);
     let detached = shipyard_engine::run::detached(&engine, request, command.rm)?;
     writeln!(std::io::stdout().lock(), "{}", detached.id.as_str())?;
     // Only now may a Ctrl-C held off while it was made end this process.
@@ -40,13 +46,51 @@ pub(crate) fn run_command(command: RunCommand) -> Result<ExitCode> {
 
 /// `shipyard create`: the container made, its ID printed.
 pub(crate) fn create(command: CreateCommand) -> Result<ExitCode> {
+    let quiet = command.args.quiet;
     let request = match container_request(command.args, "create") {
         Ok(request) => request,
         Err(code) => return Ok(code),
     };
-    let record = shipyard_engine::run::create(&crate::reporter::engine(), request, command.rm)?;
+    let engine = engine(quiet);
+    let record = shipyard_engine::run::create(&engine, request, command.rm)?;
     writeln!(std::io::stdout().lock(), "{}", record.id.as_str())?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The engine a run reports to: its pull's progress shown, unless `-q`.
+fn engine(quiet: bool) -> shipyard_engine::Engine {
+    crate::reporter::engine_with(crate::reporter::CliReporter { progress: !quiet })
+}
+
+/// The streams `-a` attaches (all of them without it). `-a stdin` goes
+/// with `-i` (your input passed on): one without the other is refused,
+/// Docker's would keep an input open that's never written, or attach one
+/// that's never open, which a container here can't (its input is passed
+/// on, or empty).
+///
+/// # Errors
+///
+/// That refusal, as a usage error.
+fn attached_streams(
+    command: &RunCommand,
+) -> std::result::Result<shipyard_engine::attach::Output, clap::Error> {
+    use super::AttachStream;
+    let asked = &command.attach;
+    if asked.is_empty() {
+        return Ok(shipyard_engine::attach::Output::BOTH);
+    }
+    let stdin = asked.contains(&AttachStream::Stdin);
+    if command.args.streams.interactive != stdin {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "-a stdin and -i go together (your input attached and passed on): give both, \
+             or neither\n",
+        ));
+    }
+    Ok(shipyard_engine::attach::Output {
+        stdout: asked.contains(&AttachStream::Stdout),
+        stderr: asked.contains(&AttachStream::Stderr),
+    })
 }
 
 /// A container's request (`create`, `run -d`): as a run's, without what
@@ -92,18 +136,23 @@ fn run(
     // what this process was given to pass on is 3 and up, and nothing it
     // starts in between may inherit it.
     let passed = process::passed::PassedFds::from_caller(args.preserve_fds)?;
+    let quiet = args.quiet;
     // A usage error, as clap's own: printed, exit 125 (Docker's).
-    let request = match args.into_request() {
+    let mut request = match args.into_request() {
         Ok(request) => request,
         Err(error) => return Ok(usage_error(error, "run")),
     };
+    // Its input attached (`-i`, no terminal): it ends at this run's end of
+    // file, and at each later start's, as `docker run -i` makes it
+    // (`StdinOnce`, kept with the container).
+    request.streams.once = request.streams.interactive && !request.streams.tty;
     let host_command = request
         .image
         .as_deref()
         .filter(|image| is_host_command(image))
         .map(str::to_owned);
     // One engine for the whole run: its places and reporter, read once.
-    let engine = crate::reporter::engine();
+    let engine = engine(quiet);
     match request.supervision(&engine, &passed) {
         Supervision::Container => {
             let ran = shipyard_engine::run::attached(&engine, request, auto_remove, foreground)

@@ -184,6 +184,55 @@ pub struct Isolation {
     /// Network devices of the host moved into the container's network
     /// namespace (OCI's `linux.netDevices`). Needs [`Namespace::Network`].
     pub net_devices: Vec<NetDevice>,
+    /// Namespaces joined rather than made (step 11.4b2): another running
+    /// process's (its PID and start time) or a namespace file's. Each kind
+    /// joined is also listed in `namespaces` (it isn't the host's) and left
+    /// out of the clone. `Network`, `Ipc`, `Uts` (by path only) and, to
+    /// reach a process's namespaces owned by its user namespace, `User` (a
+    /// process's only, with that namespace's own maps as `id_maps`: they're
+    /// checked against it, never written).
+    /// (Left out of a `plan.json` when there are none, so a plan without
+    /// any is as before.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<NamespaceJoin>,
+}
+
+/// A namespace joined instead of made ([`Isolation::joins`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct NamespaceJoin {
+    /// Its kind.
+    pub kind: Namespace,
+    /// Whose it is.
+    pub from: JoinSource,
+}
+
+impl NamespaceJoin {
+    /// Joining `kind` from `from`.
+    #[must_use]
+    pub fn new(kind: Namespace, from: JoinSource) -> Self {
+        Self { kind, from }
+    }
+}
+
+/// Where a joined namespace is found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum JoinSource {
+    /// A running process's (`/proc/PID/ns/<kind>`), opened through its
+    /// `/proc/PID` directory: only if it started at `start_time` (clock
+    /// ticks since boot), so a reused PID is never joined.
+    Process {
+        /// Its PID.
+        pid: u32,
+        /// When it started.
+        start_time: u64,
+    },
+    /// A namespace file (`/proc/PID/ns/<kind>`, or a bind mount of one):
+    /// the OCI runtime's `linux.namespaces[].path`.
+    Path(PathBuf),
 }
 
 /// A network device of the host, moved into the container's network
@@ -267,37 +316,77 @@ impl Isolation {
             devices: crate::devices::Devices::docker_default(),
             network_path: None,
             net_devices: Vec::new(),
+            joins: Vec::new(),
         }
     }
 
     /// The `CLONE_NEW*` flags for its namespaces, the ones made at the clone.
     /// Not the cgroup namespace: the clean image makes that one itself, once
     /// it's in its cgroup, so the namespace's root is the container's cgroup
-    /// whichever way it got there (see `init.rs`). Nor a network namespace
-    /// that's joined: the parent enters it for the clone (see `spawn.rs`).
+    /// whichever way it got there (see `init.rs`). Nor a namespace that's
+    /// joined: the clone is born in it (`process/joins.rs`).
     #[cfg(target_os = "linux")]
     pub(crate) fn clone_flags(&self) -> libc::c_int {
         self.namespaces
             .iter()
-            .filter(|&&namespace| namespace != Namespace::Cgroup)
-            .filter(|&&namespace| namespace != Namespace::Network || self.makes_network_namespace())
+            .filter(|&&namespace| namespace != Namespace::Cgroup && self.makes(namespace))
             .fold(0, |flags, namespace| flags | namespace.clone_flag())
     }
 
+    /// Whether `namespace` is joined (from [`joins`](Self::joins), the
+    /// field) rather
+    /// than made.
+    #[must_use]
+    pub fn is_joined(&self, namespace: Namespace) -> bool {
+        self.joins.iter().any(|join| join.kind == namespace)
+    }
+
+    /// Whether it makes a namespace of `namespace`'s kind: listed, and
+    /// neither joined nor (a network) given by path.
+    #[must_use]
+    pub fn makes(&self, namespace: Namespace) -> bool {
+        match namespace {
+            Namespace::Network => self.makes_network_namespace(),
+            kind => self.has(kind) && !self.is_joined(kind),
+        }
+    }
+
+    /// Whether the container mounts `/dev/mqueue`: it has an IPC namespace,
+    /// and may mount one: its own, or a joined one when it makes no user
+    /// namespace (a joined IPC namespace belongs to the other's owner, where
+    /// a user namespace of its own has no privileges: the kernel refuses
+    /// the mount). Without it, POSIX queues still work, by `mq_open`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mounts_mqueue(&self) -> bool {
+        self.has(Namespace::Ipc) && (self.makes(Namespace::Ipc) || !self.makes(Namespace::User))
+    }
+
+    /// Whether the network namespace the container starts in is its user
+    /// namespace's: one made with it, or one joined from the same process
+    /// as a joined user namespace (`/sys` is then its own to mount).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn user_namespace_owns_network(&self) -> bool {
+        self.makes_network_namespace()
+            || (self.is_joined(Namespace::User) && self.is_joined(Namespace::Network))
+    }
+
     /// Whether the container may set its network namespace's settings: one
-    /// made for it, or one it joins outside a user namespace of its own (in
+    /// made for it, or one it joins by path outside a user namespace of its
+    /// own (another container's, joined by process, never; in
     /// one, the joined namespace belongs to another user namespace, whose
     /// settings root inside can't write).
     fn owns_network_settings(&self) -> bool {
         self.makes_network_namespace()
-            || (self.has(Namespace::Network) && !self.has(Namespace::User))
+            || (self.network_path.is_some() && !self.has(Namespace::User))
     }
 
     /// Whether it makes a network namespace (rather than joining one, or
     /// sharing the host's).
     #[must_use]
     pub fn makes_network_namespace(&self) -> bool {
-        self.has(Namespace::Network) && self.network_path.is_none()
+        self.has(Namespace::Network)
+            && self.network_path.is_none()
+            && !self.is_joined(Namespace::Network)
     }
 
     /// Whether it includes a new `namespace`.
@@ -351,6 +440,12 @@ impl Isolation {
         if !self.has(Namespace::Network) {
             return Err(IsolationError::NetDevicesNeedNetwork);
         }
+        if self.is_joined(Namespace::Network) {
+            return Err(IsolationError::JoinedSetting {
+                namespace: Namespace::Network,
+                setting: "network devices",
+            });
+        }
         let (mut names, mut hosts) = (Vec::new(), Vec::new());
         for device in &self.net_devices {
             let invalid = |reason: String| IsolationError::InvalidNetDevice {
@@ -379,9 +474,79 @@ impl Isolation {
         Ok(())
     }
 
+    /// The joined namespaces: kinds that can be joined, each once, each
+    /// listed; a user namespace only a process's, with every other joined
+    /// process the same one (the namespaces its user namespace owns); a
+    /// process's IPC namespace (its `/dev/shm` with it) only with a root
+    /// filesystem (`with_root`: one now, or one that comes later), never
+    /// with a user namespace of the container's own; a network joined one
+    /// way only.
+    fn check_joins(&self, with_root: bool) -> Result<(), IsolationError> {
+        let mut seen = Vec::new();
+        for join in &self.joins {
+            let by_path = matches!(join.from, JoinSource::Path(_));
+            let joinable = match join.kind {
+                Namespace::Network | Namespace::Ipc => true,
+                Namespace::Uts => by_path,
+                Namespace::User => !by_path,
+                _ => false,
+            };
+            if !joinable {
+                return Err(IsolationError::NotJoinable(join.kind));
+            }
+            if seen.contains(&join.kind) {
+                return Err(IsolationError::Duplicate(join.kind));
+            }
+            seen.push(join.kind);
+            if !self.has(join.kind) {
+                return Err(IsolationError::JoinedNotListed(join.kind));
+            }
+            if let JoinSource::Path(path) = &join.from
+                && !is_plain_absolute(path)
+            {
+                return Err(IsolationError::InvalidJoinPath(path.clone()));
+            }
+        }
+        // A process's IPC namespace comes with its `/dev/shm`, cloned in
+        // its mount namespace: one a user namespace of the container's own
+        // has no privileges over.
+        let ipc_of_a_process = self.joins.iter().any(|join| {
+            join.kind == Namespace::Ipc && matches!(join.from, JoinSource::Process { .. })
+        });
+        if ipc_of_a_process && self.makes(Namespace::User) {
+            return Err(IsolationError::SharedMemoryOfAnotherUserNamespace);
+        }
+        if ipc_of_a_process && !with_root {
+            return Err(IsolationError::SharedMemoryNeedsARoot);
+        }
+        if self.is_joined(Namespace::Network) && self.network_path.is_some() {
+            return Err(IsolationError::NetworkJoinedTwice);
+        }
+        let user = self
+            .joins
+            .iter()
+            .find_map(|join| match (join.kind, &join.from) {
+                (Namespace::User, JoinSource::Process { pid, .. }) => Some(*pid),
+                _ => None,
+            });
+        if let Some(user) = user {
+            let other = self
+                .joins
+                .iter()
+                .any(|join| !matches!(join.from, JoinSource::Process { pid, .. } if pid == user));
+            if other || self.network_path.is_some() {
+                return Err(IsolationError::JoinedUserNotAlone);
+            }
+        }
+        Ok(())
+    }
+
     /// Every check but the root's paths, with or without a root.
     fn check(&self, with_root: bool) -> Result<(), IsolationError> {
         check_kinds(&self.namespaces)?;
+        self.check_joins(with_root)?;
+        // A joined user namespace's maps are given too: its own, checked
+        // against it at the start (never written), so the setup knows them.
         match (&self.id_maps, self.has(Namespace::User)) {
             (Some(maps), true) => maps.validate()?,
             (None, false) => {}
@@ -405,6 +570,14 @@ impl Isolation {
                 .hooks
                 .check()
                 .map_err(IsolationError::InvalidHook)?;
+        }
+        // A joined UTS namespace's names are its owner's.
+        if (self.hostname.is_some() || self.domainname.is_some()) && self.is_joined(Namespace::Uts)
+        {
+            return Err(IsolationError::JoinedSetting {
+                namespace: Namespace::Uts,
+                setting: "a hostname or domain name",
+            });
         }
         if let Some(hostname) = &self.hostname {
             if !self.has(Namespace::Uts) {
@@ -431,7 +604,7 @@ impl Isolation {
             validate_sysctl(
                 key,
                 value,
-                self.has(Namespace::Ipc),
+                self.makes(Namespace::Ipc),
                 self.owns_network_settings(),
             )?;
         }
@@ -612,6 +785,14 @@ pub enum MountKind {
         /// With the mounts below it (`rbind`), rather than the source's own
         /// mount only.
         recursive: bool,
+        /// A source Shipyard made below this directory (step 11.7): what's
+        /// below it is reached without following a symlink (each component
+        /// `O_NOFOLLOW`, from this one), and the bind made by descriptor, so
+        /// a symlink another put on its path (a container that shares a
+        /// directory above it) is refused, never followed. `None`: by its
+        /// path, as Docker binds it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        made_below: Option<PathBuf>,
     },
     /// A fresh, empty file system in memory.
     Tmpfs,
@@ -709,10 +890,30 @@ impl Mount {
             kind: MountKind::Bind {
                 source: source.into(),
                 recursive: true,
+                made_below: None,
             },
             flags: Vec::new(),
             data: None,
         }
+    }
+
+    /// [`Mount::bind`] of a source Shipyard made, `below` the directory
+    /// `made_below` (see [`MountKind::Bind`]'s `made_below`).
+    #[must_use]
+    pub fn bind_made(
+        made_below: impl Into<PathBuf>,
+        below: &Path,
+        destination: impl Into<PathBuf>,
+    ) -> Self {
+        let made_below = made_below.into();
+        let mut mount = Self::bind(made_below.join(below), destination);
+        if let MountKind::Bind {
+            made_below: made, ..
+        } = &mut mount.kind
+        {
+            *made = Some(made_below);
+        }
+        mount
     }
 
     /// A tmpfs at `destination`, with no restrictions.
@@ -761,6 +962,17 @@ impl Mount {
             && !is_plain_absolute(source)
         {
             return Err(invalid("the source must be absolute, without . or .."));
+        }
+        if let MountKind::Bind {
+            source,
+            made_below: Some(made_below),
+            ..
+        } = &self.kind
+            && !(is_plain_absolute(made_below) && source.starts_with(made_below))
+        {
+            return Err(invalid(
+                "a made source must be below its directory, both absolute without . or ..",
+            ));
         }
         if self.data.as_ref().is_some_and(|data| data.contains('\0')) {
             return Err(invalid("its options contain a NUL byte"));
@@ -1040,10 +1252,18 @@ pub const HOST_WIDE_NET_SYSCTLS: [&str; 3] = [
     "net.netfilter.nf_conntrack_helper",
 ];
 
+/// Whether `key` is an IPC namespace's setting: [`IPC_SYSCTLS`] and
+/// `fs.mqueue.*`.
+#[must_use]
+pub fn is_ipc_sysctl(key: &str) -> bool {
+    IPC_SYSCTLS.contains(&key) || key.starts_with("fs.mqueue.")
+}
+
 /// Accepts only the sysctls a container owns: [`IPC_SYSCTLS`] and
-/// `fs.mqueue.*`, with an IPC namespace (`has_ipc`), and `net.*`, with a
-/// network namespace whose settings are the container's (`has_net`: one made
-/// for it, or one it joins outside a user namespace of its own). Any other
+/// `fs.mqueue.*`, with an IPC namespace made for it (`has_ipc`: never
+/// another container's, joined), and `net.*`, with a network namespace
+/// whose settings are the container's (`has_net`: one made for it, or one
+/// it joins by path outside a user namespace of its own). Any other
 /// one isn't namespaced, so setting it from the container would change the
 /// host.
 ///
@@ -1094,7 +1314,7 @@ pub fn validate_sysctl(
     if key == "kernel.hostname" || key == "kernel.domainname" {
         return refuse("set the hostname or domain name with their own settings");
     }
-    if !(IPC_SYSCTLS.contains(&key) || key.starts_with("fs.mqueue.")) {
+    if !is_ipc_sysctl(key) {
         return refuse("it isn't namespaced: setting it would change the host");
     }
     if !has_ipc {
@@ -1230,6 +1450,52 @@ pub enum IsolationError {
         /// What's wrong with it.
         reason: &'static str,
     },
+    /// A process's IPC namespace (and its `/dev/shm`) joined with a user
+    /// namespace of the container's own, which has no privileges over the
+    /// other's mounts.
+    #[error(
+        "another container's IPC namespace can't be joined with a user namespace of this one's \
+         own (its shared memory is that one's): join that container's user namespace, or none"
+    )]
+    SharedMemoryOfAnotherUserNamespace,
+    /// A process's IPC namespace (and its `/dev/shm`) joined without a root
+    /// filesystem of the container's own, where it would be mounted.
+    #[error(
+        "another container's IPC namespace needs a root filesystem of this one's own: its \
+         /dev/shm is mounted there"
+    )]
+    SharedMemoryNeedsARoot,
+    /// A network namespace joined both by path and as a process's.
+    #[error("a network namespace is joined either by its path or as a process's, not both")]
+    NetworkJoinedTwice,
+    /// A namespace of a kind that can't be joined (as asked).
+    #[error(
+        "the {0} namespace can't be joined that way: a network or IPC namespace (a process's or \
+         by path), a UTS namespace by path, a process's user namespace"
+    )]
+    NotJoinable(Namespace),
+    /// A joined namespace that isn't listed.
+    #[error("joining a {0} namespace needs it listed")]
+    JoinedNotListed(Namespace),
+    /// A joined namespace's path that isn't absolute, or has `.` or `..`.
+    #[error("a joined namespace's path must be absolute, without . or .. (got {})", .0.display())]
+    InvalidJoinPath(PathBuf),
+    /// A joined user namespace beside a namespace of another process, or a
+    /// path.
+    #[error(
+        "a joined user namespace's process must be the only one joined (its user namespace owns \
+         the namespaces joined)"
+    )]
+    JoinedUserNotAlone,
+    /// A setting that would be written into a joined namespace (another
+    /// container's).
+    #[error("{setting} can't be given with a joined {namespace} namespace: it's another's")]
+    JoinedSetting {
+        /// The joined namespace.
+        namespace: Namespace,
+        /// What was asked.
+        setting: &'static str,
+    },
     /// A network namespace path, but no network namespace listed.
     #[error("joining a network namespace needs the network namespace listed")]
     NetworkPathNeedsNetwork,
@@ -1295,6 +1561,204 @@ pub enum IsolationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another container's (a process's) namespace of `kind`.
+    fn of_process(kind: Namespace) -> NamespaceJoin {
+        NamespaceJoin::new(
+            kind,
+            JoinSource::Process {
+                pid: 42,
+                start_time: 7,
+            },
+        )
+    }
+
+    /// A namespace file of `kind`.
+    fn by_path(kind: Namespace) -> NamespaceJoin {
+        NamespaceJoin::new(kind, JoinSource::Path("/run/netns/x".into()))
+    }
+
+    /// The standard set with a root filesystem, the network listed,
+    /// joining `joins`.
+    fn joining(joins: Vec<NamespaceJoin>) -> Isolation {
+        let mut isolation = Isolation::standard();
+        isolation.root = Some(Root::new("/rootfs"));
+        isolation.namespaces.push(Namespace::Network);
+        isolation.joins = joins;
+        isolation
+    }
+
+    /// A joined namespace is listed (not the host's), made by no clone, and
+    /// not made.
+    #[test]
+    fn a_joined_namespace_is_neither_cloned_nor_made() {
+        let isolation = joining(vec![
+            of_process(Namespace::Network),
+            by_path(Namespace::Ipc),
+        ]);
+        assert_eq!(isolation.validate(), Ok(()));
+        #[cfg(target_os = "linux")]
+        {
+            let flags = isolation.clone_flags();
+            assert_eq!(flags & libc::CLONE_NEWNET, 0);
+            assert_eq!(flags & libc::CLONE_NEWIPC, 0);
+            assert_ne!(flags & libc::CLONE_NEWUTS, 0, "the rest still made");
+            assert_ne!(flags & libc::CLONE_NEWPID, 0);
+        }
+        assert!(isolation.has(Namespace::Network) && isolation.has(Namespace::Ipc));
+        assert!(!isolation.makes(Namespace::Network));
+        assert!(!isolation.makes(Namespace::Ipc));
+        assert!(isolation.makes(Namespace::Uts));
+        assert!(!isolation.makes_network_namespace());
+        // Nothing joined: made, as before.
+        let own = joining(Vec::new());
+        assert!(own.makes(Namespace::Ipc) && own.makes_network_namespace());
+        #[cfg(target_os = "linux")]
+        assert_ne!(own.clone_flags() & libc::CLONE_NEWIPC, 0);
+    }
+
+    /// Only what can be joined is, and each kind once, listed.
+    #[test]
+    fn only_some_namespaces_are_joined() {
+        for kind in [Namespace::Pid, Namespace::Mount, Namespace::Cgroup] {
+            assert_eq!(
+                joining(vec![of_process(kind)]).validate(),
+                Err(IsolationError::NotJoinable(kind)),
+                "{kind}"
+            );
+        }
+        // A UTS namespace by path only; a user namespace a process's only.
+        assert_eq!(
+            joining(vec![of_process(Namespace::Uts)]).validate(),
+            Err(IsolationError::NotJoinable(Namespace::Uts))
+        );
+        assert_eq!(joining(vec![by_path(Namespace::Uts)]).validate(), Ok(()));
+        assert_eq!(
+            joining(vec![by_path(Namespace::User)]).validate(),
+            Err(IsolationError::NotJoinable(Namespace::User))
+        );
+        assert_eq!(
+            joining(vec![of_process(Namespace::Ipc), by_path(Namespace::Ipc)]).validate(),
+            Err(IsolationError::Duplicate(Namespace::Ipc))
+        );
+        let mut unlisted = joining(vec![of_process(Namespace::Network)]);
+        unlisted
+            .namespaces
+            .retain(|&kind| kind != Namespace::Network);
+        assert_eq!(
+            unlisted.validate(),
+            Err(IsolationError::JoinedNotListed(Namespace::Network))
+        );
+        let mut both = joining(vec![of_process(Namespace::Network)]);
+        both.network_path = Some("/run/netns/x".into());
+        assert_eq!(both.validate(), Err(IsolationError::NetworkJoinedTwice));
+        assert_eq!(
+            joining(vec![NamespaceJoin::new(
+                Namespace::Ipc,
+                JoinSource::Path("run/../x".into())
+            )])
+            .validate(),
+            Err(IsolationError::InvalidJoinPath("run/../x".into()))
+        );
+    }
+
+    /// Nothing is written into a joined namespace: it's another's.
+    #[test]
+    fn a_joined_namespace_takes_no_settings() {
+        let mut named = joining(vec![by_path(Namespace::Uts)]);
+        named.hostname = Some("box".to_owned());
+        assert!(matches!(
+            named.validate(),
+            Err(IsolationError::JoinedSetting {
+                namespace: Namespace::Uts,
+                ..
+            })
+        ));
+        let mut ipc = joining(vec![of_process(Namespace::Ipc)]);
+        ipc.sysctls = vec![("kernel.shmmax".to_owned(), "1".to_owned())];
+        assert!(matches!(ipc.validate(), Err(IsolationError::Sysctl { .. })));
+        ipc.joins.clear();
+        assert_eq!(ipc.validate(), Ok(()), "its own IPC namespace takes it");
+        let mut net = joining(vec![of_process(Namespace::Network)]);
+        net.sysctls = vec![("net.ipv4.ip_forward".to_owned(), "1".to_owned())];
+        assert!(matches!(net.validate(), Err(IsolationError::Sysctl { .. })));
+        let mut own = net.clone();
+        own.joins.clear();
+        assert_eq!(own.validate(), Ok(()), "its own network takes it");
+        net.sysctls.clear();
+        net.net_devices = vec![NetDevice {
+            host: "dummy0".to_owned(),
+            name: "eth9".to_owned(),
+        }];
+        assert!(matches!(
+            net.validate(),
+            Err(IsolationError::JoinedSetting {
+                namespace: Namespace::Network,
+                ..
+            })
+        ));
+    }
+
+    /// A process's IPC namespace (its `/dev/shm` is cloned in its mount
+    /// namespace) can't go with a user namespace made for this container;
+    /// with that process's own, or none, it can; by path, it isn't shared.
+    #[test]
+    fn another_s_shared_memory_needs_its_user_namespace() {
+        let mut own_user = joining(vec![of_process(Namespace::Ipc)]);
+        own_user.namespaces.push(Namespace::User);
+        own_user.id_maps = Some(IdMaps::single((1000, 1000)));
+        assert_eq!(
+            own_user.validate(),
+            Err(IsolationError::SharedMemoryOfAnotherUserNamespace)
+        );
+        own_user.joins.push(of_process(Namespace::User));
+        assert_eq!(own_user.validate(), Ok(()), "its user namespace joined too");
+        let mut by_path = joining(vec![by_path(Namespace::Ipc)]);
+        by_path.namespaces.push(Namespace::User);
+        by_path.id_maps = Some(IdMaps::single((1000, 1000)));
+        assert_eq!(by_path.validate(), Ok(()), "by path: its own /dev/shm");
+        assert_eq!(joining(vec![of_process(Namespace::Ipc)]).validate(), Ok(()));
+        let mut rootless_view = joining(vec![of_process(Namespace::Ipc)]);
+        rootless_view.root = None;
+        assert_eq!(
+            rootless_view.validate(),
+            Err(IsolationError::SharedMemoryNeedsARoot),
+            "its /dev/shm is mounted in a root of its own"
+        );
+    }
+
+    /// A joined user namespace's maps are given (to be checked against
+    /// it), and it owns every namespace joined with it: one process's.
+    #[test]
+    fn a_joined_user_namespace_is_one_process_s_alone() {
+        let mut user = joining(vec![
+            of_process(Namespace::User),
+            of_process(Namespace::Network),
+        ]);
+        user.namespaces.push(Namespace::User);
+        assert_eq!(user.validate(), Err(IsolationError::UserNeedsMaps));
+        user.id_maps = Some(IdMaps::single((1000, 1000)));
+        assert_eq!(user.validate(), Ok(()));
+        assert!(!user.makes(Namespace::User));
+        #[cfg(target_os = "linux")]
+        assert_eq!(user.clone_flags() & libc::CLONE_NEWUSER, 0);
+        user.joins.push(by_path(Namespace::Ipc));
+        assert_eq!(user.validate(), Err(IsolationError::JoinedUserNotAlone));
+        user.joins.pop();
+        user.joins.push(NamespaceJoin::new(
+            Namespace::Ipc,
+            JoinSource::Process {
+                pid: 43,
+                start_time: 7,
+            },
+        ));
+        assert_eq!(user.validate(), Err(IsolationError::JoinedUserNotAlone));
+        user.joins.pop();
+        assert_eq!(user.validate(), Ok(()));
+        user.network_path = Some("/run/netns/x".into());
+        user.joins.retain(|join| join.kind != Namespace::Network);
+        assert_eq!(user.validate(), Err(IsolationError::JoinedUserNotAlone));
+    }
 
     /// A root that comes later is checked as if it were there, but for its
     /// own paths.
@@ -1602,6 +2066,26 @@ mod tests {
             with(Mount::bind("relative", "/data")),
             Err(IsolationError::InvalidMount { .. })
         ));
+        // A made source (11.7): below its directory, both plain; the control
+        // passes.
+        assert_eq!(
+            with(Mount::bind_made("/srv", Path::new("made"), "/data")),
+            Ok(())
+        );
+        let mut outside = Mount::bind_made("/srv", Path::new("made"), "/data");
+        if let MountKind::Bind { made_below, .. } = &mut outside.kind {
+            *made_below = Some(PathBuf::from("/elsewhere"));
+        }
+        let mut relative = Mount::bind_made("/srv", Path::new("made"), "/data");
+        if let MountKind::Bind { made_below, .. } = &mut relative.kind {
+            *made_below = Some(PathBuf::from("srv"));
+        }
+        for refused in [outside, relative] {
+            assert!(matches!(
+                with(refused),
+                Err(IsolationError::InvalidMount { .. })
+            ));
+        }
         let mut nul = Mount::tmpfs("/t");
         nul.data = Some("size=1\0m".into());
         assert!(matches!(
@@ -1665,6 +2149,7 @@ mod tests {
             devices: crate::devices::Devices::docker_default(),
             network_path: None,
             net_devices: Vec::new(),
+            joins: Vec::new(),
         };
         assert_eq!(isolation.validate(), Err(IsolationError::PidNeedsMount));
         // A mount namespace alone is fine: its /proc still shows the host's
@@ -1683,6 +2168,7 @@ mod tests {
             devices: crate::devices::Devices::docker_default(),
             network_path: None,
             net_devices: Vec::new(),
+            joins: Vec::new(),
         };
         assert_eq!(mount_only.validate(), Ok(()));
     }
@@ -1795,6 +2281,7 @@ mod tests {
             devices: crate::devices::Devices::docker_default(),
             network_path: None,
             net_devices: Vec::new(),
+            joins: Vec::new(),
         };
         assert_eq!(isolation.validate(), Err(IsolationError::HostnameNeedsUts));
     }

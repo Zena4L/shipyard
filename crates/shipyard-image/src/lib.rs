@@ -31,10 +31,10 @@ pub mod tar_reader;
 pub mod unpack;
 
 pub use containers::{
-    Area, AreaError, ContainerArea, LiveArea, OwnedArea, areas, owned_area_name, remove_areas,
-    trash_areas,
+    Area, AreaError, AreaPlaces, ContainerArea, LiveArea, OwnedArea, areas, owned_area_layers,
+    owned_area_name, remove_areas, trash_areas,
 };
-pub use credentials::{Credential, CredentialError, Credentials, FoundCredential};
+pub use credentials::{Credential, CredentialError, Credentials, FoundCredential, login};
 pub use digest::{Digest, DigestError, Verifier, VerifyError};
 pub use images::{
     ExtractError, Extracted, extract_layers, layer_directories, layer_specs, placed_layers,
@@ -45,8 +45,8 @@ pub use images::{
 // index); its other types are re-exported.
 pub use index::{DiskUsage, ImageRecord, IndexError, ListedImage};
 pub use manifest::{
-    Descriptor, ImageConfig, ImageHealthcheck, ImageManifest, Index, ManifestError, Platform,
-    RuntimeConfig,
+    Descriptor, ImageAbout, ImageConfig, ImageHealthcheck, ImageManifest, Index, ManifestError,
+    Platform, RuntimeConfig,
 };
 pub use pull::{PullError, PullOptions, Pulled, from_store, pull};
 pub use reference::{ImageReference, ReferenceError};

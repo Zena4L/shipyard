@@ -4,7 +4,9 @@
 //! prints what it returns and reports; the work happens there and in
 //! `shipyard-runtime`.
 
+mod about;
 mod cli;
+mod compose;
 
 /// This build's revision (`build.rs`: git's, `-dirty` for local changes),
 /// to compare with the macOS guest's.
@@ -17,6 +19,7 @@ mod containers;
 mod devices;
 mod doctor;
 mod events_output;
+mod format;
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -28,8 +31,10 @@ mod forward;
 mod images;
 mod networks;
 mod output;
+mod prune;
 mod reporter;
 mod run;
+mod stats;
 mod system;
 mod vm;
 mod volumes;
@@ -45,7 +50,7 @@ use tracing_subscriber::fmt::format::{Format, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::cli::{Cli, Command, ImageCommand, LogLevel, SystemCommand};
+use crate::cli::{Cli, Command, ContainerCommand, ImageCommand, LogLevel, SystemCommand};
 
 fn main() -> ExitCode {
     // First of all: every helper of Shipyard's (a container's init, its
@@ -62,7 +67,7 @@ fn main() -> ExitCode {
     shipyard_vm::host_entry_point();
     // Before anything else: a privileged start must not get any further.
     if let Err(err) = process::refuse_privileged_start() {
-        return fail(&err.into());
+        return fail(&err.into(), EXIT_ENGINE_ERROR);
     }
 
     let cli = match Cli::try_parse() {
@@ -79,81 +84,98 @@ fn main() -> ExitCode {
         }
     };
     init_tracing(cli.log_level, cli.debug);
+    let command = cli.command.flattened();
     // On a Mac, every command but a few runs in Shipyard's VM (step 10.3b).
     #[cfg(target_os = "macos")]
-    if let Some(code) = forward::elsewhere(&cli.command) {
+    if let Some(code) = forward::elsewhere(&command) {
         return code;
     }
+    let failed = command.failure_code();
+    dispatch(command).unwrap_or_else(|err| fail(&err, failed))
+}
 
-    let result = match cli.command {
+/// Runs `command`: its exit code, or the error it failed with.
+fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
+    match command {
         Command::Run(command) => run::run_command(*command),
         Command::Create(command) => run::create(*command),
-        Command::Start {
-            attach: false,
-            refs,
-            ..
-        } => Ok(containers::start(&refs.containers)),
-        Command::Start {
-            attach: true,
-            interactive,
-            detach_keys,
-            refs,
-        } => containers::start_attached(&refs.containers, &detach_keys, interactive),
-        Command::Attach {
-            detach_keys,
-            no_stdin,
-            container,
-        } => containers::attach(&container, &detach_keys, !no_stdin),
-        Command::Stop { how, refs } => Ok(containers::stop(&refs.containers, how.options())),
-        Command::Restart { how, refs } => Ok(containers::restart(&refs.containers, how.options())),
-        Command::Kill { signal, refs } => Ok(containers::kill(&refs.containers, signal)),
-        Command::Update { restart, refs } => Ok(containers::update(&refs.containers, restart)),
-        Command::Wait { refs } => Ok(containers::wait(&refs.containers)),
+        Command::Start(args) if args.attach => {
+            containers::start_attached(&args.refs.containers, &args.detach_keys, args.interactive)
+        }
+        Command::Start(args) => Ok(containers::start(&args.refs.containers)),
+        Command::Attach(args) => {
+            containers::attach(&args.container, &args.detach_keys, !args.no_stdin)
+        }
+        Command::Stop(args) => Ok(containers::stop(&args.refs.containers, args.how.options())),
+        Command::Restart(args) => Ok(containers::restart(
+            &args.refs.containers,
+            args.how.options(),
+        )),
+        Command::Kill(args) => Ok(containers::kill(&args.refs.containers, args.signal)),
+        Command::Update(args) => Ok(containers::update(&args)),
+        Command::Pause(args) => Ok(containers::pause(&args.containers, true)),
+        Command::Top(args) => stats::top(&args),
+        Command::Stats(args) => stats::stats(&args),
+        Command::Unpause(args) => Ok(containers::pause(&args.containers, false)),
+        Command::Wait(refs) => Ok(containers::wait(&refs.containers)),
         Command::Exec(args) => Ok(containers::exec(args)),
         Command::Cp(args) => containers::cp(&args),
         Command::Logs(args) => containers::logs(&args),
         Command::Events(args) => events_output::events(&args),
-        Command::Rename {
-            container,
-            new_name,
-        } => containers::rename(&container, &new_name),
-        Command::Ps { all, quiet, format } => {
-            containers::ps(all, quiet, format.unwrap_or_default())
+        Command::Rename(args) => containers::rename(&args.container, &args.new_name),
+        Command::Ps(args) => containers::ps(&args),
+        Command::Port(args) if args.sockets => {
+            containers::sockets(&args.container, args.format.unwrap_or_default())
         }
-        Command::Port {
-            container,
-            sockets: true,
-            format,
-            ..
-        } => containers::sockets(&container, format.unwrap_or_default()),
-        Command::Port {
-            container, port, ..
-        } => containers::port(&container, port.as_ref()),
-        Command::Inspect { refs } => containers::inspect(&refs.containers),
-        Command::Rm { force, refs } => Ok(containers::rm(&refs.containers, force)),
-        Command::Pull { quiet, reference } => images::pull(&reference, quiet),
-        Command::Images | Command::Image(ImageCommand::Ls) => images::list(),
-        Command::Rmi { force, images } => Ok(images::rmi(&images, force)),
-        Command::Image(ImageCommand::Prune) => images::prune(),
+        Command::Port(args) => containers::port(&args.container, args.port.as_ref()),
+        Command::Inspect(args) => containers::inspect(&args),
+        Command::Rm(args) => Ok(containers::rm(
+            &args.refs.containers,
+            shipyard_engine::run::RemoveOptions::new(args.force, args.volumes),
+        )),
+        Command::Pull(args) => images::pull(&args.reference, args.quiet),
+        Command::Images(args) => images::list(&args),
+        Command::Rmi(args) => Ok(images::rmi(&args.images, args.force)),
+        Command::Tag(args) => images::tag(&args.source, &args.target),
+        Command::Image(ImageCommand::Prune(args)) => prune::images(&args),
+        Command::Container(ContainerCommand::Prune(args)) => prune::containers(&args),
+        Command::Image(ImageCommand::Inspect { images, shown }) => {
+            images::inspect(&images, shown.format.as_deref())
+        }
+        // A group's alias: `main` flattens it before it gets here.
+        Command::Container(_)
+        | Command::Image(
+            ImageCommand::Ls(_)
+            | ImageCommand::Rm(_)
+            | ImageCommand::Pull(_)
+            | ImageCommand::Tag(_),
+        ) => anyhow::bail!("a group's command reached the dispatch unflattened"),
         Command::Volume(command) => volumes::command(&command),
         Command::Network(command) => networks::command(&command),
-        Command::System(SystemCommand::Df) => system::df(),
+        Command::System(SystemCommand::Prune(args)) => prune::system(&args),
+        Command::System(SystemCommand::Df { format }) => system::df(format.as_deref()),
         Command::System(SystemCommand::Recover) => system::recover(),
         Command::System(SystemCommand::Stop) => system::stop(),
+        Command::System(SystemCommand::Service { socket }) => {
+            system::service(socket.as_deref(), REVISION)
+        }
         Command::Vm(command) => vm::command(&command),
+        Command::Compose(args) => compose::compose(&args),
         Command::Doctor => doctor::run(),
-    };
-    result.unwrap_or_else(|err| fail(&err))
+        Command::Version(args) => about::version(REVISION, args.format.as_deref()),
+        Command::Info(args) => about::info(REVISION, args.format.as_deref()),
+    }
 }
 
-/// Reports an error from shipyard itself and returns exit code 125. Its
-/// output's reader gone (`shipyard ps | head -1`) isn't one: quiet, and a
-/// success, for every command.
-fn fail(err: &anyhow::Error) -> ExitCode {
+/// Reports an error from shipyard itself and returns `code` (the
+/// command's [`failure_code`](Command::failure_code)). Its output's reader
+/// gone (`shipyard ps | head -1`) isn't one: quiet, and a success, for
+/// every command.
+fn fail(err: &anyhow::Error, code: u8) -> ExitCode {
     if broken_pipe(err) {
         return ExitCode::SUCCESS;
     }
-    reporter::report(err, EXIT_ENGINE_ERROR)
+    reporter::report(err, code)
 }
 
 /// Whether `err` is a write to this process's output whose reader has gone

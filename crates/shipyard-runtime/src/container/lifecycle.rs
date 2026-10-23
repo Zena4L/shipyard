@@ -486,12 +486,7 @@ fn check_options(loaded: &crate::oci::Bundle, options: &CreateOptions<'_>) -> Re
 /// [`ContainerError::Exists`]: the ID is taken. Or `root` isn't safe, or
 /// something couldn't be made.
 fn make_state_dir(root: &Path, id: &str) -> Result<(PathBuf, OwnedFd)> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(root)
-        .map_err(io(format!("making {}", root.display())))?;
-    check_root(root)?;
+    prepare_root(root)?;
     let dir = root.join(id);
     match DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
@@ -1109,6 +1104,29 @@ pub fn remove_monitor_cgroup(id: &str) {
     }
 }
 
+/// The descriptor limit this process had before
+/// [`raise_own_descriptor_limit`] raised it: every monitor started here gets
+/// it back, so its container (and its exit command's restarts) has the
+/// caller's limit, as one the CLI starts does.
+static CALLERS_DESCRIPTOR_LIMIT: std::sync::OnceLock<libc::rlimit> = std::sync::OnceLock::new();
+
+/// For a long-lived caller that starts many containers at once (the API's
+/// service, F114: started with systemd's soft limit, 1024, it ran out
+/// under concurrent creates and connections): its own soft descriptor
+/// limit raised to its hard one; the limit it had is kept for the
+/// containers it starts (`CALLERS_DESCRIPTOR_LIMIT`). Once; a failure
+/// leaves the limit as it was. Call it before any thread starts.
+pub fn raise_own_descriptor_limit() {
+    if let Some(had) = monitor::raise_descriptor_limit_to(usize::MAX) {
+        let _ = CALLERS_DESCRIPTOR_LIMIT.set(had);
+    }
+}
+
+/// Room above the highest descriptor a monitor is handed, under the
+/// caller's limit it gets back: they keep their numbers, and it opens
+/// its own files above them.
+const ROOM_ABOVE_HANDED: libc::rlim_t = 64;
+
 /// Starts the monitor for the state directory open at `dir`, with the
 /// bundle at `bundle` (and the console socket, log directory and the
 /// container's process's descriptors, `given`). Returns the pipe its
@@ -1152,6 +1170,21 @@ fn spawn_monitor(
         .into_iter()
         .chain(holds.iter().map(|&(fd, _)| fd))
         .collect();
+    // The caller's own descriptor limit, if it raised it (the API's
+    // service): the monitor's, and so its container's, never above it;
+    // never below a descriptor it's handed (they keep their numbers).
+    let callers = CALLERS_DESCRIPTOR_LIMIT.get().map(|limit| {
+        let highest = inherit.iter().max();
+        let needed = highest.map_or(0, |&fd| {
+            libc::rlim_t::try_from(fd)
+                .unwrap_or(0)
+                .saturating_add(ROOM_ABOVE_HANDED)
+        });
+        libc::rlimit {
+            rlim_cur: limit.rlim_cur.max(needed).min(limit.rlim_max),
+            rlim_max: limit.rlim_max,
+        }
+    });
     let mut command = std::process::Command::new("/proc/self/exe");
     // In `/`, not the caller's directory: it lives as long as the container,
     // and a working directory pins its mount (unmounting it fails, busy).
@@ -1167,9 +1200,9 @@ fn spawn_monitor(
     // and a caller holding off Ctrl-C while it creates (Shipyard's engine)
     // would leave the monitor, and its exit command, deaf to SIGTERM.
     // SAFETY: the closure runs between `fork` and `exec`; it only calls
-    // `write`, `sigemptyset`, `sigprocmask`, `setsid` and `fcntl`, which are
-    // async-signal-safe, reads `errno`, and walks a list made before the
-    // fork (no allocation).
+    // `write`, `sigemptyset`, `sigprocmask`, `setsid`, `setrlimit` and
+    // `fcntl`, which are async-signal-safe, reads `errno`, and walks a list
+    // made before the fork (no allocation).
     unsafe {
         command.pre_exec(move || {
             // Out of the caller's cgroup first: the monitor forked from
@@ -1187,6 +1220,7 @@ fn spawn_monitor(
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            monitor::set_descriptor_limit(callers);
             for &fd in &inherit {
                 // `fcntl` is async-signal-safe; the numbers were read
                 // before the fork.
@@ -1588,6 +1622,33 @@ pub fn init_process(root: &Path, id: &str) -> Result<super::InitProcess> {
         start_time: started,
         pidfd,
     })
+}
+
+/// Running (or paused) container `id`'s init, its PID and start time, read
+/// under its lock and checked alive: what another container names to join
+/// its namespaces ([`JoinSource::Process`](crate::isolation::JoinSource)),
+/// so a PID reused by the time it joins is refused, never joined.
+///
+/// # Errors
+///
+/// No such container, one that isn't running or paused, or its init gone.
+pub fn running_init(root: &Path, id: &str) -> Result<(u32, u64)> {
+    let dir = existing(root, id)?;
+    let _lock = lock(&dir)?;
+    let status = status_of(&dir)?;
+    if !matches!(status, Status::Running | Status::Paused) {
+        return Err(wrong(id, status, "join", "running or paused"));
+    }
+    let record = read_record(&dir)?.ok_or_else(|| ContainerError::NotFound(id.to_owned()))?;
+    let Some((pid, started)) = record.init else {
+        return Err(ContainerError::Setup(format!(
+            "container {id} has no init recorded"
+        )));
+    };
+    match u32::try_from(pid) {
+        Ok(target) if is_alive(pid, started) => Ok((target, started)),
+        _ => Err(wrong(id, Status::Stopped, "join", "running or paused")),
+    }
 }
 
 /// How container `id` ended, as its monitor recorded it, in any version
@@ -2006,7 +2067,9 @@ pub fn update(
     resources: &crate::resources::Resources,
 ) -> Result<Vec<String>> {
     with_cgroup(root, id, "update", &LIVE, LIVE_WANTED, |cgroup| {
-        Ok(cgroup.limit(resources)?)
+        // A refusal puts back what this update wrote: the container is
+        // left as it was (11.7).
+        Ok(cgroup.limit_or_put_back(resources)?)
     })
 }
 
@@ -2227,23 +2290,31 @@ fn existing(root: &Path, id: &str) -> Result<PathBuf> {
     }
 }
 
+/// Makes the state root `root` if it's missing (0700), and checks it's
+/// the caller's alone, as a container's state directory needs it.
+///
+/// # Errors
+///
+/// [`ContainerError::UnsafeRoot`]: it isn't a directory, belongs to another
+/// user, or others can write to it. Or it couldn't be made.
+fn prepare_root(root: &Path) -> Result<()> {
+    let unsafe_because =
+        shipyard_sys::fs::private_dir(root).map_err(io(format!("making {}", root.display())))?;
+    unsafe_root(root, unsafe_because)
+}
+
 /// The state root must be root's alone: a real directory (not a symlink),
 /// owned by this user, writable by nobody else. Otherwise another user
 /// could plant files (or a symlink) where root's runtime reads, writes and
 /// deletes.
 fn check_root(root: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata =
-        std::fs::symlink_metadata(root).map_err(io(format!("checking {}", root.display())))?;
-    let reason = if !metadata.is_dir() {
-        Some("it isn't a directory (or it's a symbolic link)")
-    } else if metadata.uid() != nix::unistd::geteuid().as_raw() {
-        Some("it belongs to another user")
-    } else if metadata.mode() & 0o022 != 0 {
-        Some("others can write to it")
-    } else {
-        None
-    };
+    let unsafe_because =
+        shipyard_sys::fs::unsafe_dir(root).map_err(io(format!("checking {}", root.display())))?;
+    unsafe_root(root, unsafe_because)
+}
+
+/// [`ContainerError::UnsafeRoot`] if the state root is unsafe (`reason`).
+fn unsafe_root(root: &Path, reason: Option<&'static str>) -> Result<()> {
     match reason {
         Some(reason) => Err(ContainerError::UnsafeRoot {
             path: root.to_owned(),
@@ -2855,7 +2926,9 @@ mod tests {
     /// path or through its directory: refused, a failure to read it.
     #[test]
     fn a_state_file_over_its_bound_is_refused() {
-        let dir = std::env::temp_dir().join(format!("shipyard-state-{}", std::process::id()));
+        // Its own name: another test here uses `shipyard-state-<pid>`, and
+        // tests run at once (11.6a3's root pass lost the race).
+        let dir = std::env::temp_dir().join(format!("shipyard-state-bound-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fd = open_directory(&dir).unwrap();

@@ -58,6 +58,11 @@ if [ "$mode" != --linux ] && [ "$mode" != --vm ]; then
     run "tests (macOS)" "$logs/test-mac.log" cargo test --workspace --no-fail-fast
     summary+=("        tests (macOS): $(totals "$logs/test-mac.log")")
     run "cargo deny" "$logs/deny.log" cargo deny check
+    # The fuzz targets' own code (`#[cfg(fuzzing)]`) no other build compiles:
+    # 11.6c's fuzz run found it broken by a signature change.
+    run "fuzz-only code (--cfg fuzzing)" "$logs/cfg-fuzzing.log" \
+        env RUSTFLAGS="--cfg fuzzing" CARGO_TARGET_DIR=target/cfg-fuzzing \
+        cargo check --workspace
 fi
 
 if [ "$mode" = --all ] || [ "$mode" = --linux ]; then
@@ -73,7 +78,7 @@ if [ "$mode" = --vm ] || { [ "$mode" = --all ] && [ "$(uname)" = Darwin ]; }; th
         timeout 3600 scripts/guest/build.sh
     run "macOS VM tests" "$logs/test-vm.log" \
         env SHIPYARD_TEST_VM=required timeout 3600 \
-        cargo test -p shipyard-cli --test vm --test vm_terminal --no-fail-fast
+        cargo test -p shipyard-cli --test vm --test vm_terminal --test vm_docker --test vm_launchd --no-fail-fast
     summary+=("        tests (macOS VM): $(totals "$logs/test-vm.log")")
 fi
 

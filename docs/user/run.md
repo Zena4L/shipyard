@@ -595,6 +595,10 @@ the bytes along:
 - **Not by name either:** without a root filesystem of its own (no image or
   `--rootfs`), the container's `/dev/pts` is its own, so your terminals aren't in
   it to be opened.
+- **`-a STREAM`** (`--attach`; `stdin`, `stdout`, `stderr`, repeatable) attaches only
+  those: `-a stdout` shows the output and leaves the errors out (read, and dropped).
+  `-a stdin` goes with `-i` (your input attached and passed on): one without the other
+  is refused. Without `-a`, all of them, as Docker's. Not with `-d`.
 - **`-t`** gives the command a terminal of the container's own (below). `-it`
   when your input isn't a terminal is refused as Docker refuses it: "the input
   device is not a TTY".
@@ -853,6 +857,18 @@ Your values always win over the defaults.
 
 If you set the same variable twice, the last value wins.
 
+**`--env-file FILE`** reads variables from a file, as Docker's does: one `KEY=VALUE`
+per line, the value as it is (no quotes taken off, no `$` read: it isn't a shell's),
+a bare `KEY` copied from your shell, `#` lines and blank ones skipped (leading spaces,
+a Windows line end and a byte order mark too). Its variables come before `-e`'s, so
+`-e` wins; several files are read in order. A name with a space in it, or none before
+the `=`, is refused by its line's number, never its value (exit 125).
+
+```sh
+printf 'DB_HOST=db\nDB_PASSWORD=s3cret\n# not read\nHOME\n' > app.env
+shipyard run --env-file app.env -e DB_HOST=other alpine:3.20 env
+```
+
 These are rejected:
 
 - an empty name (`-e =x`)
@@ -1002,11 +1018,19 @@ delegated to this user") unless `systemctl edit user@.service` adds them
 | `--cpu-period µs`, `--cpu-quota µs` | The same in raw terms (a quota of `-1` or `0`: none). Not with `--cpus`. A quota alone keeps the period the cgroup has (100 ms unless `--cpu-period` set another). | `cpu.max` |
 | `-c`, `--cpu-shares N` | A share of the CPU against other containers (1024 is the default share). | `cpu.weight` |
 | `--cpuset-cpus LIST`, `--cpuset-mems LIST` | Which CPUs and memory nodes (`0-3`, `0,2`). | `cpuset.cpus`, `cpuset.mems` |
-| `--pids-limit N` | The most processes and threads, the init included (`-1` or `0`: none). | `pids.max` |
+| `--pids-limit N` | The most processes and threads, the init included (`-1`: none). Without it (or `0`, as Docker's CLI sends it), a container gets 2,048 (below). | `pids.max` |
 | `--blkio-weight N` | A share of disk time (10–1000). | `io.weight` |
 | `--device-read-bps`, `--device-write-bps DEVICE:RATE` | Bytes per second from or to a block device (`/dev/sda:10mb`). Repeatable. | `io.max` |
 | `--device-read-iops`, `--device-write-iops DEVICE:RATE` | Operations per second. Repeatable. | `io.max` |
 
+- **A default process limit:** a container made without `--pids-limit` gets 2,048
+  processes and threads (Podman's default; Docker's is none), so a fork bomb inside it
+  can't take the host's whole PID space: past it, its `fork` fails with `EAGAIN`.
+  `--pids-limit -1` asks for none. The default is set at each start, where the `pids`
+  controller reaches the container's cgroup (as root; rootless where it's delegated):
+  elsewhere that start goes without one, as before, and `shipyard doctor` says so.
+  It's never the container's own limit (`inspect` shows none asked), so a container
+  starts wherever it started before. Containers made before this version have none.
 - **Swap, as Docker:** with `--memory` and no `--memory-swap`, the container may swap as
   much as its memory (512 MiB of memory, 512 MiB of swap). `--memory-swap` equal to
   `--memory` means no swap. Where the kernel doesn't account swap, that default is

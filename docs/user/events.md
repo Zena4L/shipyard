@@ -28,17 +28,24 @@ in a name is printed escaped, `\u{1b}`, never sent to your terminal):
 2026-10-14T09:01:12.554100002Z volume destroy data
 ```
 
-With `--format json`, each line is in the journal's own format (written out again
-as Shipyard writes it: times to the nanosecond): one JSON object, with its
-format's version (`v`, 1 for now) first.
+With `--format json`, each line is Docker's event message (what Docker's API
+streams): one JSON object, compact.
 
 ```json
-{"v":1,"time":"2026-10-14T09:00:04.002318554Z","type":"container","action":"die","id":"3f2a…c1","attributes":{"exitCode":"3","image":"alpine","name":"web"}}
+{"status":"die","id":"3f2a…c1","from":"alpine","Type":"container","Action":"die","Actor":{"ID":"3f2a…c1","Attributes":{"exitCode":"3","image":"alpine","name":"web"}},"scope":"local","time":1792504484,"timeNano":1792504484002318554}
 ```
+
+Any other `--format` is a Go template over that message by Go's field names, as
+Docker's: `.Status`, `.ID`, `.From`, `.Type`, `.Action`, `.Actor.ID`,
+`.Actor.Attributes`, `.Scope`, `.Time` (Unix seconds), `.TimeNano`
+(`--format '{{.Type}} {{.Action}} {{.Actor.Attributes.name}}'`), written once
+per event, with Docker's functions (see [Formats](containers.md#formats)). An
+attribute an event hasn't (`exitCode` on a `create`) is `<no value>`. As Docker's `events`, it's taken
+as typed: `table` is no table here, and `\t` stays two characters.
 
 | Type | Actions | Attributes |
 |---|---|---|
-| `container` | `create`, `start`, `stop`, `kill`, `restart`, `die`, `oom`, `rename`, `update`, `destroy`, `health_status`, `network_lost` | `name`, `image`; `exitCode` (`die`), `signal` (`kill`, by name: `SIGKILL`, where Docker gives its number), `oldName` (`rename`), `restartCount` (a [restart policy's](containers.md#restart-policies) `start`), `restartPolicy` (`update`), `healthStatus` (`health_status`: `healthy` or `unhealthy`), `how` (`network_lost`) |
+| `container` | `create`, `start`, `stop`, `kill`, `restart`, `die`, `oom`, `rename`, `update`, `pause`, `unpause`, `destroy`, `health_status`, `network_lost` | `name`, `image`; `exitCode` (`die`), `signal` (`kill`, by name: `SIGKILL`, where Docker gives its number), `oldName` (`rename`), `restartCount` (a [restart policy's](containers.md#restart-policies) `start`), `restartPolicy` (`update`), `healthStatus` (`health_status`: `healthy` or `unhealthy`), `how` (`network_lost`) |
 | `image` | `pull`, `untag`, `delete`, `prune` | `removed` (`prune`: how many blobs) |
 | `volume` | `create`, `destroy`, `prune` | `removed` (`prune`: how many volumes) |
 | `network` | `create`, `destroy`, `prune`, `connect`, `disconnect` | `removed` (`prune`: how many networks), `container` (`connect`, `disconnect`: the container's ID) |
@@ -67,7 +74,7 @@ format's version (`v`, 1 for now) first.
 - **`--until TIME`** stops there. A time already gone by (`--until 0s`: now) prints
   what there is and exits; one still to come waits until then. Without `--since`,
   it starts from the oldest event kept, as Docker's does. A `--until` before the
-  `--since` is refused (exit code 125).
+  `--since` is refused (exit code 1).
 
 `TIME` is a time (`2026-10-14T09:00:00Z`), Unix seconds (`1760432400`), or a
 duration ago (`30s`, `10m`, `2h`, `3d`).
@@ -94,13 +101,14 @@ any of its values; different keys must all match.
 | `image` | an image (`alpine` is `docker.io/library/alpine:latest`), or a container made from it |
 | `volume` | a volume's name |
 | `network` | a network's name |
+| `label` | `KEY` or `KEY=VALUE`: a container's events carry its labels (as Docker's do); give it more than once for every one of them. Events written before 0.3.0 carry none |
 
 ```sh
 shipyard events -f type=container -f event=start -f event=die
 shipyard events --since 1d --until 0s -f image=alpine
 ```
 
-A key it doesn't know is refused (exit code 125).
+A key it doesn't know is refused (exit code 1).
 
 ## Where they're kept
 
@@ -126,7 +134,6 @@ Writing an event never fails the command that does: if the journal can't be writ
 
 ## What isn't there yet
 
-- Docker's `exec_create`/`exec_start`, `attach` and `pause` events.
-- `--format` with a Go template.
+- Docker's `exec_create`/`exec_start` and `attach` events.
 - Events from `shipyard-runtime` (it has its own `events`, for a container's cgroup:
   see [the OCI runtime](runtime.md)).

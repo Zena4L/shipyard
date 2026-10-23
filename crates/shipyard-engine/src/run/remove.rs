@@ -1,8 +1,6 @@
 //! Removing a container ([`remove`]), readable or not, and the last of
 //! every removal: its pin and record let go of ([`forget`]).
 
-use std::time::Duration;
-
 use shipyard_runtime::container as runtime;
 
 use super::take::{Taken, Took, WhenUp, delete_state, take};
@@ -10,13 +8,41 @@ use crate::Engine;
 use crate::containers::{self, ContainerId};
 use crate::error::{ErrorKind, Result, bail};
 
-pub(super) fn remove(engine: &Engine, reference: &str, force: bool) -> Result<ContainerId> {
+pub(super) fn remove(
+    engine: &Engine,
+    reference: &str,
+    options: super::RemoveOptions,
+) -> Result<ContainerId> {
     crate::run::recover::recover_others(engine, Some(reference));
+    removed(engine, reference, options)
+}
+
+/// [`remove`], the others' recovery done already (a prune does it once).
+/// With `options.volumes`, the anonymous volumes its create made go too,
+/// read under its lock, removed once it's let go.
+pub(super) fn removed(
+    engine: &Engine,
+    reference: &str,
+    options: super::RemoveOptions,
+) -> Result<ContainerId> {
+    let super::RemoveOptions { force, volumes } = options;
+    let made = |id: &ContainerId| {
+        if volumes {
+            super::volumes::made_anonymous(engine, id)
+        } else {
+            Vec::new()
+        }
+    };
     let when_up = if force { WhenUp::Kill } else { WhenUp::Refuse };
     let took = match take(engine, reference, when_up) {
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return match unreadable(engine, reference) {
-                Some(id) if force => remove_unreadable(engine, &id).map(|()| id),
+                Some(id) if force => {
+                    let made = made(&id);
+                    remove_unreadable(engine, &id)?;
+                    super::volumes::remove_anonymous(engine, &made);
+                    Ok(id)
+                }
                 Some(id) => Err(containers::read_one(engine, &id)
                     .err()
                     .map_or(error, |why| {
@@ -48,26 +74,32 @@ pub(super) fn remove(engine: &Engine, reference: &str, force: bool) -> Result<Co
             return Ok(record.id);
         }
     };
-    // Its policy about to start it again: up, as Docker sees it. (Unless
-    // what was to restart it is gone: its lock free.)
-    if !force && record.next_start.is_some() {
-        if containers::restarting_lock(engine, &record.id, Duration::ZERO).is_ok() {
-            containers::update(engine, &record.id, |record| record.next_start = None)?;
-        } else {
+    // Its policy about to start it again: up, as Docker sees it. Its
+    // restart is held by whoever starts it again (its clean-up, from
+    // before it let the container go, then the backoff's waiter); free,
+    // nothing will (a waiter killed): a stale next start forgotten.
+    if !force {
+        if containers::restart_pending(engine, &record.id) {
             bail!(
                 InUse,
                 "container {} is restarting: stop it first, or remove it with -f",
                 record.name
             );
         }
+        if record.next_start.is_some() {
+            containers::update(engine, &record.id, |record| record.next_start = None)?;
+        }
     }
     let id = record.id.clone();
+    let made = made(&id);
     crate::image::remove_owned_area(engine, id.as_str())
         .map_err(|error| error.context("removing the container's writable layer"))?;
     forget(engine, &id)?;
     drop(running);
+    super::joined::warn_joiners(engine, &record, "was removed");
     // Its monitor's, from outside it: its last processes have let go.
     runtime::remove_monitor_cgroup(id.as_str());
+    super::volumes::remove_anonymous(engine, &made);
     Ok(id)
 }
 

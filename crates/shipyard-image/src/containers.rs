@@ -32,7 +32,7 @@
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg, OFlag, openat};
@@ -314,19 +314,48 @@ impl ContainerArea {
     /// The overlay's upper (writable) layer.
     #[must_use]
     pub fn upper(&self) -> PathBuf {
-        self.path.join("upper")
+        AreaPlaces::at(&self.path).upper
     }
 
     /// The overlay's work directory.
     #[must_use]
     pub fn work(&self) -> PathBuf {
-        self.path.join("work")
+        AreaPlaces::at(&self.path).work
     }
 
     /// Where the overlay is mounted: the container's root filesystem.
     #[must_use]
     pub fn merged(&self) -> PathBuf {
-        self.path.join("merged")
+        AreaPlaces::at(&self.path).merged
+    }
+}
+
+/// An area's overlay directories, by place only (nothing opened or
+/// locked): what `inspect` shows of a container's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AreaPlaces {
+    /// The overlay's upper (writable) layer.
+    pub upper: PathBuf,
+    /// The overlay's work directory.
+    pub work: PathBuf,
+    /// Where the overlay is mounted.
+    pub merged: PathBuf,
+}
+
+impl AreaPlaces {
+    /// Those of the area named `name` in `store`'s `containers/`.
+    #[must_use]
+    pub fn of(store: &Store, name: &str) -> Self {
+        Self::at(&store.root().join(CONTAINERS).join(name))
+    }
+
+    /// Those of the area at `path`.
+    fn at(path: &Path) -> Self {
+        Self {
+            upper: path.join("upper"),
+            work: path.join("work"),
+            merged: path.join("merged"),
+        }
     }
 }
 
@@ -496,6 +525,24 @@ pub fn areas(store: &Store) -> Result<Vec<Area>, AreaError> {
         }
     }
     Ok(found)
+}
+
+/// The layer directories container `id`'s own area stacks (base first),
+/// read without its lock and without the other areas: `None` if it has
+/// none (never started, or being made or removed).
+///
+/// # Errors
+///
+/// An [`AreaError`] if its directory or its list can't be read.
+pub fn owned_area_layers(store: &Store, id: &str) -> Result<Option<Vec<String>>, AreaError> {
+    let containers = containers(store)?;
+    let name = owned_area_name(id);
+    let dir = match fsat::open_dir_at(&containers, OsStr::new(&name)) {
+        Ok(dir) => dir,
+        Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => return Ok(None),
+        Err(errno) => return Err(failed("opening", &name)(errno)),
+    };
+    Ok(read_list(&dir, LAYERS, &name)?.map(|layers| layers.lines().map(str::to_owned).collect()))
 }
 
 /// Reads one of an area's small files; `None` if it's gone.

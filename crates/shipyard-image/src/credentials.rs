@@ -59,6 +59,9 @@ pub enum Credential {
     /// An `OAuth2` refresh token, exchanged at the token realm for an access
     /// token.
     IdentityToken(String),
+    /// A bearer token for the registry itself (Docker's `registrytoken`),
+    /// sent to it as it is: no token realm is asked (F118).
+    RegistryToken(String),
 }
 
 impl std::fmt::Debug for Credential {
@@ -71,6 +74,7 @@ impl std::fmt::Debug for Credential {
                 .field("password", &"<redacted>")
                 .finish(),
             Self::IdentityToken(_) => formatter.write_str("IdentityToken(<redacted>)"),
+            Self::RegistryToken(_) => formatter.write_str("RegistryToken(<redacted>)"),
         }
     }
 }
@@ -122,6 +126,18 @@ pub struct Credentials {
     helper_dir: Option<PathBuf>,
     /// How long a helper may take.
     helper_timeout: Duration,
+    /// One credential handed in ([`Credentials::given`]), in place of the
+    /// config's.
+    given: Option<Given>,
+}
+
+/// A credential handed in, and the registry it's for.
+#[derive(Debug, Clone)]
+struct Given {
+    /// The registry's key (`registry_key`); `None`: any registry.
+    registry: Option<String>,
+    /// The credential.
+    credential: Credential,
 }
 
 impl Credentials {
@@ -150,6 +166,23 @@ impl Credentials {
             config: None,
             helper_dir: None,
             helper_timeout: HELPER_TIMEOUT,
+            given: None,
+        }
+    }
+
+    /// `credential` alone, for `registry` (as a client names it: `docker.io`,
+    /// `https://index.docker.io/v1/`, `ghcr.io`), or for any registry if
+    /// it names none: what a Docker client hands its daemon with a pull
+    /// (`X-Registry-Auth`). No config is read; any other registry is pulled
+    /// from anonymously.
+    #[must_use]
+    pub fn given(credential: Credential, registry: Option<&str>) -> Self {
+        Self {
+            given: Some(Given {
+                registry: registry.filter(|name| !name.is_empty()).map(registry_key),
+                credential,
+            }),
+            ..Self::none()
         }
     }
 
@@ -186,6 +219,17 @@ impl Credentials {
     /// A config file that can't be read or parsed, or a helper that fails
     /// (other than finding nothing).
     pub fn lookup(&self, registry: &str) -> Result<Option<FoundCredential>, CredentialError> {
+        if let Some(given) = &self.given {
+            let wanted = registry_key(registry);
+            return Ok(given
+                .registry
+                .as_ref()
+                .is_none_or(|server| *server == wanted)
+                .then(|| FoundCredential {
+                    credential: given.credential.clone(),
+                    source: "the client's credentials".to_owned(),
+                }));
+        }
         let Some(path) = &self.config else {
             return Ok(None);
         };
@@ -321,11 +365,21 @@ struct AuthEntry {
     auth: Option<String>,
     #[serde(default)]
     identitytoken: Option<String>,
+    #[serde(default)]
+    registrytoken: Option<String>,
 }
 
 impl AuthEntry {
     /// Its credential, if it holds one (a `credsStore` leaves `{}` here).
     fn credential(&self, path: &Path) -> Result<Option<Credential>, CredentialError> {
+        // The registry's own bearer token first, as Docker reads it.
+        if let Some(token) = self
+            .registrytoken
+            .as_ref()
+            .filter(|token| !token.is_empty())
+        {
+            return Ok(Some(Credential::RegistryToken(token.clone())));
+        }
         if let Some(token) = self
             .identitytoken
             .as_ref()
@@ -395,6 +449,33 @@ fn read_config(path: &Path) -> Result<Option<DockerConfig>, CredentialError> {
                 err.column()
             ))
         })
+}
+
+/// Signs in to the registry `server` names (a client's
+/// `serveraddress`: `https://index.docker.io/v1/`, `ghcr.io`; Docker Hub if
+/// none) with `credential`: [`Registry::check`](crate::Registry::check), as
+/// `docker login` asks Docker's daemon to (`POST /auth`, F118). Nothing is
+/// kept.
+///
+/// # Errors
+///
+/// As [`Registry::check`](crate::Registry::check).
+pub fn login(server: Option<&str>, credential: Credential) -> Result<(), crate::RegistryError> {
+    use crate::reference::{DOCKER_HUB_NAME, api_host};
+    let registry = server
+        .filter(|server| !server.trim().is_empty())
+        .map_or_else(|| DOCKER_HUB_NAME.to_owned(), registry_key);
+    // A host alone: `localhost:80@elsewhere` would be elsewhere's, reached
+    // as if it were this machine (over plain HTTP).
+    if !crate::registry::is_host(&registry) {
+        return Err(crate::RegistryError::Auth {
+            registry,
+            reason: "the server address isn't a registry's host",
+        });
+    }
+    crate::Registry::new(api_host(&registry))
+        .with_credentials(Credentials::given(credential, Some(&registry)), &registry)
+        .check()
 }
 
 /// The registry a config key names: no scheme, no path, lowercase; Docker
@@ -635,8 +716,14 @@ mod tests {
                 "https://index.docker.io/v1/":{"auth":"bWU6cHc="},
                 "https://GHCR.io":{"auth":"Y2k6dG9rZW4="},
                 "acr.example":{"identitytoken":"refresh"},
+                "bearer.example":{"registrytoken":"b3ar","identitytoken":"refresh","auth":"bWU6cHc="},
                 "empty.example":{}
             }}"#,
+        );
+        // A registry's own token first, as Docker reads them (F118).
+        assert_eq!(
+            found(&credentials, "bearer.example"),
+            Some(Credential::RegistryToken("b3ar".to_owned()))
         );
         assert_eq!(found(&credentials, "docker.io"), Some(basic("me", "pw")));
         assert_eq!(found(&credentials, "ghcr.io"), Some(basic("ci", "token")));
@@ -773,14 +860,57 @@ mod tests {
     #[test]
     fn debug_hides_the_secrets() {
         let debug = format!(
-            "{:?} {:?}",
+            "{:?} {:?} {:?}",
             basic("me", "hunter2"),
-            Credential::IdentityToken("refresh-secret".to_owned())
+            Credential::IdentityToken("refresh-secret".to_owned()),
+            Credential::RegistryToken("bearer-secret".to_owned())
         );
         assert!(
-            !debug.contains("hunter2") && !debug.contains("refresh-secret"),
+            !debug.contains("hunter2")
+                && !debug.contains("refresh-secret")
+                && !debug.contains("bearer-secret"),
             "{debug}"
         );
         assert!(debug.contains("me"));
+    }
+
+    /// A sign-in to a server address that isn't a registry's host (a URL's
+    /// user before another host) is refused before any request.
+    #[test]
+    fn a_sign_in_to_what_isnt_a_host_is_refused() {
+        for server in [
+            "localhost:80@evil.example",
+            "http://127.0.0.1@evil.example/v2/",
+        ] {
+            let refused = login(Some(server), basic("me", "pw")).unwrap_err();
+            assert!(
+                matches!(refused, crate::RegistryError::Auth { .. }),
+                "{server}: {refused}"
+            );
+        }
+    }
+
+    /// A credential handed in is the only one: for the registry it names
+    /// (however the client spells it), or for any if it names none; never
+    /// the config's.
+    #[test]
+    fn a_credential_handed_in_is_the_only_one() {
+        let basic = Credential::Basic {
+            username: "me".to_owned(),
+            password: "s3cret".to_owned(),
+        };
+        let found = |credentials: &Credentials, registry| {
+            credentials
+                .lookup(registry)
+                .unwrap()
+                .map(|found| found.credential)
+        };
+        let hub = Credentials::given(basic.clone(), Some("https://index.docker.io/v1/"));
+        assert_eq!(found(&hub, "docker.io"), Some(basic.clone()));
+        assert_eq!(found(&hub, "ghcr.io"), None);
+        let any = Credentials::given(basic.clone(), None);
+        assert_eq!(found(&any, "ghcr.io"), Some(basic.clone()));
+        let blank = Credentials::given(basic.clone(), Some(""));
+        assert_eq!(found(&blank, "localhost:5000"), Some(basic));
     }
 }

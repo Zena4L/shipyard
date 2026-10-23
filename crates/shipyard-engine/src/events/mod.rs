@@ -41,7 +41,7 @@ use crate::error::{Error, Result};
 pub(crate) use emit::emit;
 #[cfg(target_os = "linux")]
 pub(crate) use emit::{container, container_ended};
-pub(crate) use emit::{emit_about, emit_pruned};
+pub(crate) use emit::{emit_about, emit_pruned, emit_reclaimed};
 pub use filter::Filters;
 pub use read::{EventsOptions, read};
 

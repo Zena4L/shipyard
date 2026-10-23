@@ -5,7 +5,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::store::logs_dir;
-#[cfg(target_os = "linux")]
 use super::store::record_dir;
 #[cfg(target_os = "linux")]
 use super::{ContainerId, Exit};
@@ -21,26 +20,77 @@ use crate::error::{ErrorKind, Result};
 #[cfg(target_os = "linux")]
 const PREVIOUS_START: &str = "previous-start.json";
 
-/// What container `record`'s health checks say of its current start, if
-/// it has checks and is running or paused (`state`), and its companion has said anything
-/// yet (its start's [`health::FILE`](crate::health::FILE)).
+/// The mark that a start's end is still to be said (F88): made by the
+/// start before it clears the record's last exit, removed once its `die`
+/// has been said. The end recorded and the `die` said can't be one step:
+/// a `__cleanup` killed between them leaves the record with an exit and
+/// the mark, and whoever settles the start then says it (once). It holds
+/// the start's time (nanoseconds since the epoch), so a mark left by a
+/// start that never recorded itself (killed first) names no start of the
+/// record's and says nothing.
+#[cfg(target_os = "linux")]
+const END_UNSAID: &str = "end-unsaid";
+
+/// What container `record`'s health checks say, if it has checks: while
+/// it's running or paused (`state`), its start's
+/// [`health::FILE`](crate::health::FILE), or `starting` with no results
+/// while that isn't written yet (Docker's, from the start on:
+/// Testcontainers waits on it); once it has ended (exited, or waiting to
+/// restart), `unhealthy` with its last start's streak and results, as
+/// Docker's `State.Health` says once its checks stop (F133); none for a
+/// file that can't be read, or while it's made or stopping.
 #[must_use]
 pub fn health(
     engine: &Engine,
     record: &Record,
     state: &ContainerState,
 ) -> Option<crate::health::Health> {
-    // Running or paused only: a container restarting (or stopping) has
-    // no checks under way, and the last start's would be out of date.
     let up = matches!(
         state,
         ContainerState::Running { .. } | ContainerState::Paused
     );
-    if record.config.health.is_none() || !up {
+    let ended = matches!(
+        state,
+        ContainerState::Exited { .. } | ContainerState::Restarting { .. }
+    );
+    if record.config.health.is_none() || !(up || ended) {
         return None;
     }
-    let logs = logs_dir(engine, &record.id).ok()?;
-    crate::health::Health::read(&logs.join(last_logs_name(&logs)?))
+    let start = logs_dir(engine, &record.id)
+        .ok()
+        .and_then(|logs| Some(logs.join(last_logs_name(&logs)?)));
+    // Ended: `unhealthy`, its streak and results as its last start left
+    // them (none if no check ran), as Docker's says once its checks stop
+    // (29.8's capture, 2026-10-23); never a `starting` no check will follow.
+    if ended {
+        let start = start?;
+        let mut health = match crate::health::Health::read(&start) {
+            Some(health) => health,
+            None if std::fs::symlink_metadata(start.join(crate::health::FILE))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                crate::health::Health::starting()
+            }
+            None => return None,
+        };
+        health.status = crate::health::Status::Unhealthy;
+        return Some(health);
+    }
+    let Some(start) = start else {
+        return Some(crate::health::Health::starting());
+    };
+    match crate::health::Health::read(&start) {
+        Some(health) => Some(health),
+        // Not written yet: its companion hasn't begun.
+        None if std::fs::symlink_metadata(start.join(crate::health::FILE))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some(crate::health::Health::starting())
+        }
+        // There, but unreadable (damaged, a newer version's): unknown,
+        // never a `starting` that would last for ever.
+        None => None,
+    }
 }
 
 /// Whether container `record`'s current start lost its network (its pasta
@@ -290,6 +340,8 @@ pub(crate) fn settle_never_ran(engine: &Engine, id: &ContainerId) -> Result<Reco
         }
     })?;
     done_with_previous_start(engine, id, newer);
+    // Never ran: no end to say.
+    end_said(engine, id);
     Ok(record)
 }
 
@@ -336,21 +388,130 @@ pub(crate) fn keep_previous_start(
 /// can't be read, is [`Kept::None`].
 #[cfg(target_os = "linux")]
 pub(crate) fn previous_start(engine: &Engine, id: &ContainerId) -> Kept {
-    #[derive(serde::Deserialize)]
-    struct Versioned {
-        version: u32,
-    }
     let Some(bytes) = record_dir(engine, id).ok().and_then(|dir| {
         shipyard_sys::fs::read_bounded(&dir.join(PREVIOUS_START), PreviousStart::MAX_FILE).ok()
     }) else {
         return Kept::None;
     };
-    match serde_json::from_slice::<Versioned>(&bytes) {
-        Ok(Versioned { version }) if version > PreviousStart::VERSION => Kept::Newer(version),
-        _ => serde_json::from_slice::<PreviousStart>(&bytes)
+    match shipyard_sys::versioned::read::<PreviousStart>(&bytes, PreviousStart::VERSION) {
+        Err(shipyard_sys::versioned::Error::Newer(version)) => Kept::Newer(version),
+        read => read
             .ok()
             .filter(|previous| PreviousStart::READ.contains(&previous.version))
             .map_or(Kept::None, Kept::Start),
+    }
+}
+
+/// Beside a container's record: where its current start's `/etc` files
+/// are (F121: inspect's `ResolvConfPath`, `HostnamePath` and `HostsPath`),
+/// v1 `{"version":1,"path":…}`. A file of its own, as F67's rule has it:
+/// each start sets it, the record's version untouched.
+const RUN_DIR: &str = "run-dir.json";
+
+/// The newest [`RUN_DIR`] this Shipyard reads and writes.
+const RUN_DIR_VERSION: u32 = 1;
+
+/// The most a [`RUN_DIR`] holds: read no further.
+const RUN_DIR_MAX: u64 = 8 * 1024;
+
+/// [`RUN_DIR`], as it's written.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunDirFile {
+    version: u32,
+    path: PathBuf,
+}
+
+/// Keeps where container `id`'s coming start's `/etc` files are (`dir`),
+/// or that it has none (no network of its own: its last start's forgotten).
+/// For `inspect` alone: a failure leaves its paths empty, never the start.
+#[cfg(target_os = "linux")]
+pub(crate) fn keep_run_dir(engine: &Engine, id: &ContainerId, dir: Option<&std::path::Path>) {
+    let Ok(record_dir) = record_dir(engine, id) else {
+        return;
+    };
+    let Some(path) = dir else {
+        let _ = fs::remove_file(record_dir.join(RUN_DIR));
+        return;
+    };
+    let file = RunDirFile {
+        version: RUN_DIR_VERSION,
+        path: path.to_owned(),
+    };
+    if let Ok(json) = serde_json::to_vec(&file)
+        && let Ok(placed) = crate::fs::write_atomically(&record_dir, RUN_DIR, &json, 0o600)
+    {
+        placed.said(engine);
+    }
+}
+
+/// Where container `record`'s `/etc` files are, while it's up (`state`)
+/// and they're there (its `resolv.conf`): the directory its start kept
+/// ([`RUN_DIR`]). None after its end (its `__cleanup` removes them), for a
+/// start without files of its own, or one an older Shipyard made.
+#[must_use]
+pub(crate) fn etc_dir(engine: &Engine, record: &Record, state: &ContainerState) -> Option<PathBuf> {
+    if !matches!(
+        state,
+        ContainerState::Running { .. } | ContainerState::Paused
+    ) {
+        return None;
+    }
+    let path = record_dir(engine, &record.id).ok()?.join(RUN_DIR);
+    let file: RunDirFile =
+        shipyard_sys::versioned::read_file(&path, RUN_DIR_MAX, RUN_DIR_VERSION).ok()??;
+    file.path.join("resolv.conf").exists().then_some(file.path)
+}
+
+/// [`END_UNSAID`]'s words for the start at `started`.
+#[cfg(target_os = "linux")]
+fn start_word(started: std::time::SystemTime) -> String {
+    started
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
+        .to_string()
+}
+
+/// Marks the end of container `id`'s coming start, at `started`, as
+/// unsaid ([`END_UNSAID`]): before the start records itself and clears
+/// its last exit.
+///
+/// # Errors
+///
+/// [`ErrorKind::Storage`]: it couldn't be written.
+#[cfg(target_os = "linux")]
+pub(crate) fn mark_end_unsaid(
+    engine: &Engine,
+    id: &ContainerId,
+    started: std::time::SystemTime,
+) -> Result<()> {
+    let word = start_word(started);
+    crate::fs::write_atomically(&record_dir(engine, id)?, END_UNSAID, word.as_bytes(), 0o600)
+        .map_err(|err| err.io_as(ErrorKind::Storage))
+        .map(|placed| placed.said(engine))
+}
+
+/// Whether `record`'s last start's end is still to be said: its mark is
+/// there and names that start. False for a mark another start left, and
+/// for a start an older Shipyard made: its end was said, or is to be
+/// said, by that Shipyard's rule (the record's exit).
+#[cfg(target_os = "linux")]
+pub(crate) fn end_unsaid(engine: &Engine, record: &Record) -> bool {
+    let Some(started) = record.started else {
+        return false;
+    };
+    record_dir(engine, &record.id)
+        .ok()
+        .and_then(|dir| shipyard_sys::fs::read_bounded(&dir.join(END_UNSAID), 64).ok())
+        .is_some_and(|word| word == start_word(started).as_bytes())
+}
+
+/// Container `id`'s last start's end has been said (or it never ran, so
+/// it has none to say): its mark gone. Gone already is gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn end_said(engine: &Engine, id: &ContainerId) {
+    if let Ok(dir) = record_dir(engine, id) {
+        let _ = std::fs::remove_file(dir.join(END_UNSAID));
     }
 }
 
