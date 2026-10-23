@@ -101,7 +101,7 @@ fn published_ports_reach_the_container_from_everywhere() {
             None
         );
         // A free host port, shown by `network inspect`.
-        let inspect = networks.run(&["network", "inspect", "bridge"]);
+        let inspect = networks.run(&["network", "inspect", "--shipyard", "bridge"]);
         let json: serde_json::Value = serde_json::from_str(&inspect.stdout).unwrap();
         let port = json[0]["Containers"][0]["Ports"]
             .as_array()
@@ -463,7 +463,7 @@ fn an_isolated_network_reaches_the_host_only_for_its_dns() {
         let _service = Server::start(&host, 7070, "host");
         // The default network has no DNS server to leave open.
         let default = networks.run(&["network", "create", "--isolate-host", "bridge"]);
-        assert_eq!(default.code, Some(125), "{}", default.stderr);
+        assert_eq!(default.code, Some(1), "{}", default.stderr);
         assert!(
             default.stderr.contains("default network"),
             "{}",

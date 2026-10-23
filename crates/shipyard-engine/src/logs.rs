@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use shipyard_runtime::logs::cri::Stream;
 use shipyard_runtime::logs::info::InfoError;
 use shipyard_runtime::logs::reader::{BeforeTail, POLL, read, read_then};
-pub use shipyard_runtime::logs::reader::{Entry, LogsError, LogsOptions, ReadSummary};
+pub use shipyard_runtime::logs::reader::{
+    Entry, Gone, LineWriter, LogsError, LogsOptions, ReadSummary,
+};
 use shipyard_runtime::logs::time::Timestamp;
 
 /// Every start's logs of the container `reference` names (stage 9, step
@@ -49,7 +51,7 @@ pub fn of_container(
     if options.follow {
         // Not started yet: its first start's, if it comes while it's up.
         while starts(&logs)?.is_empty() {
-            if !up() || options.reader_gone() {
+            if !up() || options.follow_over() {
                 return Ok(ReadSummary::default());
             }
             std::thread::sleep(POLL);
@@ -61,7 +63,7 @@ pub fn of_container(
         tail: None,
         follow: false,
         identity: None,
-        ..*options
+        ..options.clone()
     };
     if !options.follow {
         return Ok(older_starts(&starts, options.tail, &whole, &ends)?);
@@ -71,11 +73,11 @@ pub fn of_container(
     };
     let following = LogsOptions {
         identity: None,
-        ..*options
+        ..options.clone()
     };
     // Done once it isn't up, or once it has been started again.
     let done = || {
-        options.reader_gone()
+        options.follow_over()
             || !up()
             || containers::starts(&logs)
                 .is_ok_and(|starts| starts.last().is_some_and(|(last, _)| *last > number))
@@ -136,7 +138,15 @@ fn older_starts<S: FnMut(Entry) -> std::io::Result<()>>(
                           tail: Option<usize>,
                           sink: &mut dyn FnMut(Entry) -> std::io::Result<()>|
      -> Result<(), LogsError> {
-        match read(dir, &LogsOptions { tail, ..*whole }, || true, sink) {
+        match read(
+            dir,
+            &LogsOptions {
+                tail,
+                ..whole.clone()
+            },
+            || true,
+            sink,
+        ) {
             Err(LogsError::Info {
                 source: InfoError::Read(error),
                 ..

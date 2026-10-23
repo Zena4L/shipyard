@@ -20,11 +20,14 @@ pub struct Filters {
     pub volumes: Vec<String>,
     /// About these networks.
     pub networks: Vec<String>,
+    /// With these labels in their attributes (`KEY`, or `KEY=VALUE`):
+    /// every one (Docker's rule for labels).
+    pub labels: Vec<String>,
 }
 
 impl Filters {
     /// Filters from `KEY=VALUE`s (`type`, `event`, `container`, `image`,
-    /// `volume`, `network`).
+    /// `volume`, `network`, `label`).
     ///
     /// # Errors
     ///
@@ -47,9 +50,10 @@ impl Filters {
                 "image" => filters.images.push(value),
                 "volume" => filters.volumes.push(value),
                 "network" => filters.networks.push(value),
+                "label" => filters.labels.push(value),
                 _ => crate::error::bail!(
                     InvalidRequest,
-                    "filter {key:?}: give type, event, container, image, volume or network"
+                    "filter {key:?}: give type, event, container, image, volume, network or label"
                 ),
             }
         }
@@ -96,6 +100,10 @@ impl Filters {
                 }))
             && about(Kind::Volume, &self.volumes)
             && about(Kind::Network, &self.networks)
+            && self.labels.iter().all(|label| match label.split_once('=') {
+                Some((key, value)) => event.attributes.get(key).map(String::as_str) == Some(value),
+                None => event.attributes.contains_key(label.as_str()),
+            })
     }
 }
 

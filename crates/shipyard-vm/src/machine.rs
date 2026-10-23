@@ -19,7 +19,7 @@ use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode,
     VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
     VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment, VZSerialPortConfiguration, VZSharedDirectory,
+    VZMACAddress, VZNATNetworkDeviceAttachment, VZSerialPortConfiguration, VZSharedDirectory,
     VZSingleDirectoryShare, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
     VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
@@ -46,6 +46,8 @@ pub(crate) struct Settings {
     pub(crate) home: PathBuf,
     /// The guest's console, written to.
     pub(crate) console: std::fs::File,
+    /// The network card's address, the same at every boot.
+    pub(crate) mac: crate::network::Mac,
     /// CPUs and memory.
     pub(crate) cpus: usize,
     pub(crate) memory: u64,
@@ -172,12 +174,22 @@ fn home_share(home: &Path) -> Retained<VZDirectorySharingDeviceConfiguration> {
     }
 }
 
+/// The card's address as the framework takes it.
+fn mac_address(mac: crate::network::Mac) -> Result<Retained<VZMACAddress>, VmError> {
+    // SAFETY: a new object, given a valid string.
+    unsafe {
+        VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&mac.to_string()))
+    }
+    .ok_or_else(|| VmError::Machine(format!("the network card's address {mac} is refused")))
+}
+
 /// The VM's configuration from `settings`, validated.
 fn configuration(settings: Settings) -> Result<Retained<VZVirtualMachineConfiguration>, VmError> {
     let boot = boot_loader(&settings);
     let disk = data_disk(&settings.disk)?;
     let share = home_share(&settings.home);
     let console = console(settings.console);
+    let mac = mac_address(settings.mac)?;
     // SAFETY: property setters on a new configuration, each given valid
     // objects of the classes it takes, before any VM exists.
     unsafe {
@@ -191,6 +203,7 @@ fn configuration(settings: Settings) -> Result<Retained<VZVirtualMachineConfigur
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&[share]));
         let network = VZVirtioNetworkDeviceConfiguration::new();
         network.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
+        network.setMACAddress(&mac);
         config.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             network,
         )]));
@@ -281,7 +294,18 @@ impl Machine {
     /// A vsock connection to the guest's `port`, as a descriptor of this
     /// process's own (a copy: the framework's is closed).
     pub(crate) fn connect(&self, port: u32, limit: Duration) -> Result<OwnedFd, VmError> {
-        let (sent, connected) = mpsc::channel::<Result<OwnedFd, String>>();
+        self.connect_from(port, limit).map(|(fd, _)| fd)
+    }
+
+    /// [`Machine::connect`], with the connection's port on this side: the
+    /// guest sees it as its peer's, and a hang-up names the connection by
+    /// it (11.7).
+    pub(crate) fn connect_from(
+        &self,
+        port: u32,
+        limit: Duration,
+    ) -> Result<(OwnedFd, u32), VmError> {
+        let (sent, connected) = mpsc::channel::<Result<(OwnedFd, u32), String>>();
         let asked = self.on_queue(move |vm| {
             // SAFETY: on the VM's queue; its one socket device is a virtio
             // one (the configuration made it).
@@ -299,13 +323,15 @@ impl Machine {
                             // SAFETY: the connection's own descriptor, valid
                             // until it's closed just after: duplicated first.
                             let copy = unsafe { libc::dup(connection.fileDescriptor()) };
+                            // SAFETY: as its descriptor, before it's closed.
+                            let source = unsafe { connection.sourcePort() };
                             // SAFETY: on the VM's queue (handlers run there).
                             unsafe { connection.close() };
                             if copy < 0 {
                                 Err(std::io::Error::last_os_error().to_string())
                             } else {
                                 // SAFETY: `dup` just returned it, ours alone.
-                                Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+                                Ok((unsafe { OwnedFd::from_raw_fd(copy) }, source))
                             }
                         }
                         (None, Some(error)) => Err(described(error)),
@@ -322,7 +348,7 @@ impl Machine {
             return Err(VmError::Machine("the VM has no vsock device".to_owned()));
         }
         match connected.recv_timeout(limit) {
-            Ok(Ok(fd)) => Ok(fd),
+            Ok(Ok(connected)) => Ok(connected),
             Ok(Err(why)) => Err(VmError::Machine(format!(
                 "no connection to the guest's port {port}: {why}"
             ))),

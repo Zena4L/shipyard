@@ -180,6 +180,19 @@ mod linux {
             record,
             operation: lock,
         } = containers::lock_found(engine, reference, containers::OP_WAIT)?;
+        // Another container's network is that one's to connect (Docker's
+        // refusal, in its words).
+        if containers::created(engine, &record.id)?
+            .network_from
+            .is_some()
+        {
+            bail!(
+                InvalidRequest,
+                "container {}: container sharing network namespace with another container or \
+                 host cannot be connected to any other network",
+                record.name
+            );
+        }
         let now = match containers::state(engine, &record)? {
             ContainerState::Running { .. } | ContainerState::Paused => Now::Live,
             ContainerState::Created | ContainerState::Exited { .. } => Now::Later,

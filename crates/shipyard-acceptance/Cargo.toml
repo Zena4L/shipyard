@@ -1,0 +1,22 @@
+[package]
+name = "shipyard-acceptance"
+description = "Acceptance tests: Docker's own clients (Testcontainers) against Shipyard's API. Dev-only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Linux only, as the tests are: a Mac builds none of it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+shipyard-test-support.workspace = true
+# Testcontainers for Rust (step 11.4b1, D11.4b-4): Docker's API through
+# bollard, over the API's UNIX socket (no crypto provider: default
+# features off; bollard's buildkit client and rustls come with it anyway).
+testcontainers.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

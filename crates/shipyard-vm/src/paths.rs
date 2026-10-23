@@ -36,10 +36,17 @@ impl VmPaths {
             let home = var("HOME").ok_or_else(|| {
                 VmError::Place("HOME isn't set: no place for the VM's files".to_owned())
             })?;
-            Path::new(&home).join("Library/Application Support/Shipyard/vm")
+            Self::default_dir(Path::new(&home))
         };
         let guest = var("SHIPYARD_GUEST_DIR").map_or_else(|| dir.join("guest"), PathBuf::from);
         Self::at(dir, guest)
+    }
+
+    /// The user's VM directory when none is set: in `home`'s Application
+    /// Support, as a Mac app's.
+    #[must_use]
+    pub fn default_dir(home: &Path) -> PathBuf {
+        home.join("Library/Application Support/Shipyard/vm")
     }
 
     /// The places at `dir` and `guest`, which must be absolute.
@@ -71,6 +78,21 @@ impl VmPaths {
         self.dir.join("vm.sock")
     }
 
+    /// Docker's API, for Docker's clients on the Mac (step 11.5b1): the
+    /// longest of the host's sockets' paths, the one checked against a
+    /// socket's address.
+    #[must_use]
+    pub fn docker_socket(&self) -> PathBuf {
+        self.dir.join("docker.sock")
+    }
+
+    /// The CLI's mark that it asked launchd's agent to start the host (no
+    /// connection waits for it then: step 11.5b2a).
+    #[must_use]
+    pub fn start_asked(&self) -> PathBuf {
+        self.dir.join("start-asked")
+    }
+
     /// The guest's data disk (a sparse file).
     #[must_use]
     pub fn disk(&self) -> PathBuf {
@@ -100,6 +122,12 @@ impl VmPaths {
     #[must_use]
     pub fn ports(&self) -> PathBuf {
         self.dir.join("ports.json")
+    }
+
+    /// The network card's address, kept from boot to boot (`network.json`).
+    #[must_use]
+    pub fn network(&self) -> PathBuf {
+        self.dir.join("network.json")
     }
 
     /// Makes the VM's directory if it isn't there, and checks it's the
@@ -137,9 +165,11 @@ impl VmPaths {
         }
     }
 
-    /// The socket's path fits a socket's address.
+    /// The host's sockets' paths fit a socket's address: the longest
+    /// ([`docker_socket`](Self::docker_socket)) checked, so the host never
+    /// boots the guest and then can't serve one.
     fn check_socket(&self) -> Result<(), VmError> {
-        let socket = self.socket();
+        let socket = self.docker_socket();
         if socket.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(VmError::Place(format!(
                 "the VM's socket path is {} bytes, more than a socket's {MAX_SOCKET_PATH}: \
@@ -242,6 +272,19 @@ mod tests {
         let long = VmPaths::at(dir.join("x".repeat(120)), dir.join("guest")).unwrap();
         assert!(matches!(long.prepare(uid), Err(VmError::Place(_))));
         assert!(!long.dir.exists(), "nothing made");
+        // At the bound: the longest socket's path is what's measured (one
+        // byte past it refused, though `vm.sock`'s would fit).
+        let at_bound = |extra: usize| {
+            let base = dir.join("b").as_os_str().len() + "/docker.sock".len();
+            let name = "y".repeat(MAX_SOCKET_PATH + extra - base + 1);
+            VmPaths::at(dir.join(name), dir.join("guest")).unwrap()
+        };
+        let fits = at_bound(0);
+        assert_eq!(fits.docker_socket().as_os_str().len(), MAX_SOCKET_PATH);
+        assert!(fits.prepare(uid).is_ok());
+        let over = at_bound(1);
+        assert!(over.socket().as_os_str().len() < MAX_SOCKET_PATH);
+        assert!(matches!(over.prepare(uid), Err(VmError::Place(_))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

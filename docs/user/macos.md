@@ -146,6 +146,61 @@ shipyard run -d -p 8080:80 nginx:alpine     # http://localhost:8080
 - **TCP only:** a UDP port (`-p 53:53/udp`) isn't forwarded yet; `vm status` says how
   many.
 
+## Docker's CLI on your Mac
+
+While the VM runs, it serves Docker's API on a socket in its directory, so Docker's own
+tools (`docker`, `docker compose`, Testcontainers) use Shipyard as they would a Docker
+daemon:
+
+```sh
+export DOCKER_HOST="unix://$HOME/Library/Application Support/Shipyard/vm/docker.sock"
+docker run --rm alpine echo hi
+docker compose up -d
+```
+
+`shipyard compose` does the same for you: it starts the VM and runs Docker's own
+`docker compose` against its socket (Docker's CLI and its compose plugin installed).
+
+Or, to switch between Shipyard and another engine, a Docker context of your own:
+
+```sh
+docker context create shipyard \
+  --docker "host=unix://$HOME/Library/Application Support/Shipyard/vm/docker.sock"
+docker --context shipyard ps
+```
+
+- **What's served is Shipyard's API** ([the Docker API](api.md)): the same subset as on
+  a Linux host, run by the guest.
+- **Any time, with `shipyard vm install`** (once): launchd, macOS's own service
+  manager, then holds the socket while the VM is stopped and starts the VM at the first
+  connection, as systemd's socket does on a Linux host. Nothing runs until then (launchd
+  runs Shipyard once as it loads the agent, at install and at each login, only to make
+  the socket). `shipyard vm uninstall` undoes it; run `vm install` again after moving
+  `shipyard` (`shipyard doctor` says when the agent runs another binary). launchd starts
+  it at most every 10 seconds, so a `docker` right after a stop may wait that long.
+  `shipyard` must live outside the folders macOS guards (Desktop, Documents, Downloads,
+  iCloud Drive), as in `/usr/local/bin`: launchd's programs read there only with your
+  permission, so `vm install` refuses a `shipyard` (or a guest) there. In a VM launchd
+  started, a command run from one of those folders, or a container that binds one, makes
+  macOS ask you whether `shipyard` may read it (once for a release; a build of your own
+  is asked again after each rebuild); until you allow it, the VM can't see that folder.
+  A VM started from your terminal has the terminal's permission.
+  Without it, the socket is there while the VM runs: start it with any `shipyard`
+  command, or `shipyard vm start`.
+- **The socket is yours alone** (only your user can open it). A connection
+  open (`docker events`, an attached container) keeps the VM up, as a command does, and
+  so does a tool that keeps asking (an editor's Docker view polling `docker ps`). One
+  the service has closed and the client keeps open is let go after a minute. While the
+  VM is stopping, Docker's CLI is told so (try again once it has stopped); a large
+  upload refused so may show only "broken pipe".
+- **Paths:** a bind of a directory under your home works as it is (the VM shares your
+  home at the same path). A path outside it is the VM's own, not your Mac's, and
+  isn't refused yet: `docker run -v /tmp/proj:/w` gets an empty directory made in the
+  VM, and what's written there stays in the VM. Keep projects under your home (the
+  `shipyard` CLI refuses such paths; Docker's socket doesn't yet: F143).
+- **Ports** a container publishes reach your Mac's `localhost` as with `shipyard run -p`
+  ([Ports](#ports)).
+
 ## Without the VM
 
 `SHIPYARD_VM=off` runs a command on the Mac itself, as Shipyard did before its VM: as an
@@ -153,6 +208,10 @@ ordinary process, without isolation, and without images (`shipyard run --no-imag
 COMMAND`). It's for Shipyard's own development and tests.
 
 ## Limits (this version)
+
+- **Without `shipyard vm install`, Docker's socket is there only while the VM runs:**
+  after an idle stop, `docker` can't connect until a `shipyard` command starts the VM
+  again.
 
 - **After the Mac restarts,** containers with a restart policy come back when you next
   run `shipyard` (any command starts the VM, and the VM's start brings them back): no

@@ -8,4 +8,10 @@ ALPINE_BRANCH=v3.24
 ALPINE_RELEASE=3.24.2
 MINIROOTFS=alpine-minirootfs-3.24.2-aarch64.tar.gz
 MINIROOTFS_SHA256=9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773
-PACKAGES="linux-virt=6.18.57-r0 e2fsprogs=1.47.4-r0"
+PACKAGES="e2fsprogs=1.47.4-r0"
+# The kernel, from the same branch (KERNEL_BRANCH: another branch's, when
+# the guest's own lags; same signing keys). F132's crashes aren't the
+# version's: 6.12.114 crashed as 6.18.58 does, with several VMs at once
+# (step 11.5a).
+KERNEL_BRANCH=$ALPINE_BRANCH
+KERNEL_PACKAGE="linux-virt=6.18.58-r0"

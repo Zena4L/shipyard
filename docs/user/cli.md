@@ -16,6 +16,11 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard restart`↴](#shipyard-restart)
 * [`shipyard update`↴](#shipyard-update)
 * [`shipyard kill`↴](#shipyard-kill)
+* [`shipyard pause`↴](#shipyard-pause)
+* [`shipyard unpause`↴](#shipyard-unpause)
+* [`shipyard top`↴](#shipyard-top)
+* [`shipyard stats`↴](#shipyard-stats)
+* [`shipyard compose`↴](#shipyard-compose)
 * [`shipyard rename`↴](#shipyard-rename)
 * [`shipyard exec`↴](#shipyard-exec)
 * [`shipyard cp`↴](#shipyard-cp)
@@ -29,9 +34,37 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard pull`↴](#shipyard-pull)
 * [`shipyard images`↴](#shipyard-images)
 * [`shipyard rmi`↴](#shipyard-rmi)
+* [`shipyard tag`↴](#shipyard-tag)
+* [`shipyard container`↴](#shipyard-container)
+* [`shipyard container ls`↴](#shipyard-container-ls)
+* [`shipyard container run`↴](#shipyard-container-run)
+* [`shipyard container create`↴](#shipyard-container-create)
+* [`shipyard container start`↴](#shipyard-container-start)
+* [`shipyard container stop`↴](#shipyard-container-stop)
+* [`shipyard container restart`↴](#shipyard-container-restart)
+* [`shipyard container kill`↴](#shipyard-container-kill)
+* [`shipyard container pause`↴](#shipyard-container-pause)
+* [`shipyard container unpause`↴](#shipyard-container-unpause)
+* [`shipyard container top`↴](#shipyard-container-top)
+* [`shipyard container stats`↴](#shipyard-container-stats)
+* [`shipyard container rm`↴](#shipyard-container-rm)
+* [`shipyard container logs`↴](#shipyard-container-logs)
+* [`shipyard container exec`↴](#shipyard-container-exec)
+* [`shipyard container inspect`↴](#shipyard-container-inspect)
+* [`shipyard container cp`↴](#shipyard-container-cp)
+* [`shipyard container port`↴](#shipyard-container-port)
+* [`shipyard container rename`↴](#shipyard-container-rename)
+* [`shipyard container wait`↴](#shipyard-container-wait)
+* [`shipyard container attach`↴](#shipyard-container-attach)
+* [`shipyard container update`↴](#shipyard-container-update)
+* [`shipyard container prune`↴](#shipyard-container-prune)
 * [`shipyard image`↴](#shipyard-image)
 * [`shipyard image ls`↴](#shipyard-image-ls)
 * [`shipyard image prune`↴](#shipyard-image-prune)
+* [`shipyard image rm`↴](#shipyard-image-rm)
+* [`shipyard image pull`↴](#shipyard-image-pull)
+* [`shipyard image tag`↴](#shipyard-image-tag)
+* [`shipyard image inspect`↴](#shipyard-image-inspect)
 * [`shipyard volume`↴](#shipyard-volume)
 * [`shipyard volume create`↴](#shipyard-volume-create)
 * [`shipyard volume ls`↴](#shipyard-volume-ls)
@@ -47,14 +80,20 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard network connect`↴](#shipyard-network-connect)
 * [`shipyard network disconnect`↴](#shipyard-network-disconnect)
 * [`shipyard system`↴](#shipyard-system)
+* [`shipyard system prune`↴](#shipyard-system-prune)
 * [`shipyard system df`↴](#shipyard-system-df)
 * [`shipyard system recover`↴](#shipyard-system-recover)
 * [`shipyard system stop`↴](#shipyard-system-stop)
+* [`shipyard system service`↴](#shipyard-system-service)
 * [`shipyard vm`↴](#shipyard-vm)
 * [`shipyard vm start`↴](#shipyard-vm-start)
 * [`shipyard vm status`↴](#shipyard-vm-status)
 * [`shipyard vm stop`↴](#shipyard-vm-stop)
+* [`shipyard vm install`↴](#shipyard-vm-install)
+* [`shipyard vm uninstall`↴](#shipyard-vm-uninstall)
 * [`shipyard doctor`↴](#shipyard-doctor)
+* [`shipyard version`↴](#shipyard-version)
+* [`shipyard info`↴](#shipyard-info)
 
 ## `shipyard`
 
@@ -70,8 +109,13 @@ A lightweight container engine
 * `attach` — Attach to a running container: its output, and your input (unless --no-stdin), until it ends (its exit code) or the detach keys
 * `stop` — Stop running containers: their stop signal, then SIGKILL once their stop timeout is up. Returns once each has ended
 * `restart` — Stop containers (as `stop`), then start them again
-* `update` — Change containers' settings without making them again: their restart policy
+* `update` — Change containers' settings without making them again: their restart policy, and their resource limits (in their cgroup at once while they run, and for their next starts)
 * `kill` — Send a signal to running containers' main process (SIGKILL unless told), without waiting
+* `pause` — Freeze running containers' processes where they are (their cgroup's freezer), until `unpause`
+* `unpause` — Let paused containers' processes run on
+* `top` — Show a running container's processes, in `ps -ef`'s columns
+* `stats` — Show what containers use (CPU, memory, network, block I/O, processes), every second until Ctrl-C, or once with --no-stream
+* `compose` — Run Docker's `docker compose` against Shipyard (its API's service started if nothing serves it yet): `shipyard compose up -d`. Needs Docker's CLI and its compose plugin
 * `rename` — Rename a container (a running one's name on its networks too, at once)
 * `exec` — Run a command in a running container. Exits with its exit code (127 if it isn't found, 126 if it can't be run)
 * `cp` — Copy files between a container (running or not) and the host: CONTAINER:PATH to a host path (or - for a tar stream on stdout), or back
@@ -80,19 +124,27 @@ A lightweight container engine
 * `wait` — Wait for containers to end, and print each one's exit code
 * `ps` — List containers: the running ones, or all of them with -a
 * `port` — Show the host ports a container publishes (all of them, or those to one of its ports)
-* `inspect` — Show containers in full, as JSON
+* `inspect` — Show objects in full, as JSON: a container, an image, a network or a volume, by name, in Docker's shape (`docker inspect`'s)
 * `rm` — Remove containers (their writable layers too). A running one needs -f
 * `pull` — Pull an image into the local store (and extract it, on Linux), so a run starts at once and needs no registry
 * `images` — List images in the local store
 * `rmi` — Remove one or more images from the local store (reference-counted; shared layers survive)
+* `tag` — Give an image another name (TARGET, a reference) beside its own
+* `container` — Manage containers (the same commands as at the top: `container ls` is `ps`, `container rm` is `rm`…)
 * `image` — Manage images
 * `volume` — Manage named volumes
 * `network` — Manage networks (bridges containers share; Linux, root)
 * `system` — System-wide information and maintenance
 * `vm` — The Linux VM containers run in on a Mac: its status, start and stop
 * `doctor` — Check whether this host can run containers, and what to fix
+* `version` — Show Shipyard's version and its host's (`--format` a Go template over `{Client, Server}`, as Docker's)
+* `info` — Show what Shipyard has and what its host is (`--format` a Go template over Docker's `SystemInfo`)
 
 ###### **Options:**
+
+* `-v`, `--version` — Print version (`-v` as Docker's, `-V` too)
+
+  Possible values: `true`, `false`
 
 * `-D`, `--debug` — Show debug logs (same as --log-level debug)
 * `--log-level <LEVEL>` — How much to log
@@ -129,9 +181,21 @@ shipyard run [OPTIONS] --bundle DIR
   Possible values: `true`, `false`
 
 * `--detach-keys <KEYS>` — In the foreground with -it: the keys that detach (the container goes on): ctrl-p,ctrl-q, or others separated by commas (empty: none)
+* `-a`, `--attach <STREAM>` — In the foreground: attach only these streams (stdin, stdout, stderr; repeatable). stdin takes your input, as -i. Without it, all of them
+* `--help` — Print help (`-h` is the hostname's, as Docker's)
+
+  Possible values: `true`, `false`
+
 * `-i`, `--interactive` — Pass your input on to the command. Without it, an isolated command's stdin is empty (/dev/null), so it can't take keys meant for your shell
 * `-t`, `--tty` — Give the command a terminal of the container's own (a pseudo-terminal): full-screen programs, password prompts and job control work. With -i, what you type goes to it
 * `-e`, `--env <KEY[=VALUE]>` — Set an environment variable, or copy KEY from your shell if no value is given
+* `--env-file <FILE>` — Read variables from a file, as Docker's: a KEY=VALUE per line (a bare KEY copies yours), # lines and blank ones skipped, values as they are. Before --env, which wins. Repeatable
+* `-l`, `--label <KEY[=VALUE]>` — Set a label on the container: KEY=VALUE, or KEY (an empty value). Repeatable
+* `--label-file <FILE>` — Read labels from a file: a KEY=VALUE (or KEY) per line, # lines and blank ones skipped. Before --label, which wins. Repeatable
+* `--cidfile <FILE>` — Write the container's ID to FILE once it's made (refused if FILE is there already)
+* `-q`, `--quiet` — Print no pull progress
+* `--privileged` — Not supported: give the container the capabilities (--cap-add) and devices (--device) it needs instead
+* `--init` — Not supported yet: run the command without it (an image's own init, if it has one)
 * `-w`, `--workdir <DIR>` — Working directory inside the container (absolute path): the image's, or `/`, if not given
 * `-u`, `--user <USER[:GROUP]>` — Run as this user and group: names (from the container's /etc/passwd and /etc/group) or numbers
 * `--group-add <GROUP>` — Add a supplementary group: a name or a number
@@ -159,10 +223,11 @@ shipyard run [OPTIONS] --bundle DIR
 * `--preserve-fds <N>` — Pass N more descriptors on to the command, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as Podman does
 
   Default value: `0`
-* `--hostname <NAME>` — Hostname inside the container (Linux)
+* `-h`, `--hostname <NAME>` — Hostname inside the container (Linux)
 * `--domainname <NAME>` — NIS domain name inside the container (Linux)
-* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host)
-* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host and container:)
+* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), container:NAME (another running container's, as it is), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--ipc <MODE>` — The container's IPC namespace (Linux): private or shareable (its own: any running container's can be joined), or container:NAME (another running container's, with its /dev/shm)
 * `--name <NAME>` — The container's name: on each network made with `shipyard network create` that it joins, other containers find it by this name (Linux). Letters, digits, _ and -
 * `--network-alias <NAME>` — Another name the container answers to on each network made with `shipyard network create` that it joins. Repeatable (Linux)
 * `--ip <IP>` — The container's address on its network (a bridge network's; with one network only: on several, name=NETWORK,ip=IP gives each its own)
@@ -173,6 +238,7 @@ shipyard run [OPTIONS] --bundle DIR
 * `--dns-search <DOMAIN>` — A DNS search domain, instead of the host's. Repeatable (Linux; with an image or --rootfs)
 * `--dns-option <OPTION>` — A resolver option (like ndots:2), instead of the host's. Repeatable (Linux; with an image or --rootfs)
 * `-p`, `--publish <SPEC>` — Publish a container's port on the host, like 8080:80 (the host's port 8080, on every IPv4 address, to the container's 80), 127.0.0.1:8080:80 (on that address only), 80 (a free host port) or 53:53/udp. Ranges work (8000-8010:80-90). Repeatable (Linux; a bridge network, or pasta)
+* `--expose <PORT[/PROTO]>` — Expose a port, or a range (8000-8010), TCP unless /udp: published with -P beside the image's own, and shown by inspect. Repeatable
 * `-P`, `--publish-all` — Publish every port the image says it uses (its exposed ports) on free host ports (Linux; a bridge network, or pasta)
 * `--rootfs <DIR>` — Use DIR as the container's root filesystem: it becomes `/` inside, with its own /proc, /sys and /dev (Linux)
 * `--no-image` — Run without an image: the command sees the host's files, isolated in its own namespaces otherwise (Linux), and COMMAND comes first
@@ -209,7 +275,9 @@ shipyard run [OPTIONS] --bundle DIR
 * `--device-write-bps <DEVICE:RATE>` — Limits writes to a block device, in bytes per second. Repeatable
 * `--device-read-iops <DEVICE:RATE>` — Limits reads from a block device, in operations per second (/dev/sda:1000). Repeatable
 * `--device-write-iops <DEVICE:RATE>` — Limits writes to a block device, in operations per second. Repeatable
-* `--volume <SOURCE:DEST[:ro]>` — Mount a named volume or host path into the container: `SOURCE:DEST[:ro]`. A bare SOURCE (no slash) is a named volume, created on first use; a path is bind-mounted. Repeatable (Linux, with a root filesystem)
+* `-v`, `--volume <[SOURCE:]DEST[:OPTIONS]>` — Mount a named volume or host path into the container: `[SOURCE:]DEST[:MODES]`, MODES `ro` and `nocopy`, comma-joined. A bare SOURCE (no slash) is a named volume, created on first use; DEST alone, a new anonymous one; either, if empty, is filled with the image's files at DEST when the container is made (unless `nocopy`). A path is bind-mounted (it must exist); DEST alone is a new anonymous volume. Repeatable (Linux, with a root filesystem)
+* `--tmpfs <PATH[:OPTIONS]>` — Mount a tmpfs (in memory, empty at each start) at PATH, with `mount(8)`'s OPTIONS: `size=64m`, `mode=1777`, `uid`, `gid`, `nr_inodes`, `ro`, and `exec`, `suid`, `dev` (it's `noexec`, `nosuid`, `nodev` without them, as Docker's). Repeatable
+* `--mount <KEY=VALUE,...>` — Mount as Docker's `--mount` does: `type=bind,source=/path,target=/d`, `type=volume,source=NAME,target=/d` (the default type), or `type=tmpfs,target=/d,tmpfs-size=64m,tmpfs-mode=1777`; `readonly` for any, `volume-nocopy` for a volume (not filled from the image). Repeatable
 
 
 
@@ -231,9 +299,20 @@ shipyard create [OPTIONS] --rootfs DIR COMMAND...
 ###### **Options:**
 
 * `--rm` — Remove the container once it ends, after its first start
+* `--help` — Print help (`-h` is the hostname's, as Docker's)
+
+  Possible values: `true`, `false`
+
 * `-i`, `--interactive` — Pass your input on to the command. Without it, an isolated command's stdin is empty (/dev/null), so it can't take keys meant for your shell
 * `-t`, `--tty` — Give the command a terminal of the container's own (a pseudo-terminal): full-screen programs, password prompts and job control work. With -i, what you type goes to it
 * `-e`, `--env <KEY[=VALUE]>` — Set an environment variable, or copy KEY from your shell if no value is given
+* `--env-file <FILE>` — Read variables from a file, as Docker's: a KEY=VALUE per line (a bare KEY copies yours), # lines and blank ones skipped, values as they are. Before --env, which wins. Repeatable
+* `-l`, `--label <KEY[=VALUE]>` — Set a label on the container: KEY=VALUE, or KEY (an empty value). Repeatable
+* `--label-file <FILE>` — Read labels from a file: a KEY=VALUE (or KEY) per line, # lines and blank ones skipped. Before --label, which wins. Repeatable
+* `--cidfile <FILE>` — Write the container's ID to FILE once it's made (refused if FILE is there already)
+* `-q`, `--quiet` — Print no pull progress
+* `--privileged` — Not supported: give the container the capabilities (--cap-add) and devices (--device) it needs instead
+* `--init` — Not supported yet: run the command without it (an image's own init, if it has one)
 * `-w`, `--workdir <DIR>` — Working directory inside the container (absolute path): the image's, or `/`, if not given
 * `-u`, `--user <USER[:GROUP]>` — Run as this user and group: names (from the container's /etc/passwd and /etc/group) or numbers
 * `--group-add <GROUP>` — Add a supplementary group: a name or a number
@@ -261,10 +340,11 @@ shipyard create [OPTIONS] --rootfs DIR COMMAND...
 * `--preserve-fds <N>` — Pass N more descriptors on to the command, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as Podman does
 
   Default value: `0`
-* `--hostname <NAME>` — Hostname inside the container (Linux)
+* `-h`, `--hostname <NAME>` — Hostname inside the container (Linux)
 * `--domainname <NAME>` — NIS domain name inside the container (Linux)
-* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host)
-* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host and container:)
+* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), container:NAME (another running container's, as it is), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--ipc <MODE>` — The container's IPC namespace (Linux): private or shareable (its own: any running container's can be joined), or container:NAME (another running container's, with its /dev/shm)
 * `--name <NAME>` — The container's name: on each network made with `shipyard network create` that it joins, other containers find it by this name (Linux). Letters, digits, _ and -
 * `--network-alias <NAME>` — Another name the container answers to on each network made with `shipyard network create` that it joins. Repeatable (Linux)
 * `--ip <IP>` — The container's address on its network (a bridge network's; with one network only: on several, name=NETWORK,ip=IP gives each its own)
@@ -275,6 +355,7 @@ shipyard create [OPTIONS] --rootfs DIR COMMAND...
 * `--dns-search <DOMAIN>` — A DNS search domain, instead of the host's. Repeatable (Linux; with an image or --rootfs)
 * `--dns-option <OPTION>` — A resolver option (like ndots:2), instead of the host's. Repeatable (Linux; with an image or --rootfs)
 * `-p`, `--publish <SPEC>` — Publish a container's port on the host, like 8080:80 (the host's port 8080, on every IPv4 address, to the container's 80), 127.0.0.1:8080:80 (on that address only), 80 (a free host port) or 53:53/udp. Ranges work (8000-8010:80-90). Repeatable (Linux; a bridge network, or pasta)
+* `--expose <PORT[/PROTO]>` — Expose a port, or a range (8000-8010), TCP unless /udp: published with -P beside the image's own, and shown by inspect. Repeatable
 * `-P`, `--publish-all` — Publish every port the image says it uses (its exposed ports) on free host ports (Linux; a bridge network, or pasta)
 * `--rootfs <DIR>` — Use DIR as the container's root filesystem: it becomes `/` inside, with its own /proc, /sys and /dev (Linux)
 * `--no-image` — Run without an image: the command sees the host's files, isolated in its own namespaces otherwise (Linux), and COMMAND comes first
@@ -311,7 +392,9 @@ shipyard create [OPTIONS] --rootfs DIR COMMAND...
 * `--device-write-bps <DEVICE:RATE>` — Limits writes to a block device, in bytes per second. Repeatable
 * `--device-read-iops <DEVICE:RATE>` — Limits reads from a block device, in operations per second (/dev/sda:1000). Repeatable
 * `--device-write-iops <DEVICE:RATE>` — Limits writes to a block device, in operations per second. Repeatable
-* `--volume <SOURCE:DEST[:ro]>` — Mount a named volume or host path into the container: `SOURCE:DEST[:ro]`. A bare SOURCE (no slash) is a named volume, created on first use; a path is bind-mounted. Repeatable (Linux, with a root filesystem)
+* `-v`, `--volume <[SOURCE:]DEST[:OPTIONS]>` — Mount a named volume or host path into the container: `[SOURCE:]DEST[:MODES]`, MODES `ro` and `nocopy`, comma-joined. A bare SOURCE (no slash) is a named volume, created on first use; DEST alone, a new anonymous one; either, if empty, is filled with the image's files at DEST when the container is made (unless `nocopy`). A path is bind-mounted (it must exist); DEST alone is a new anonymous volume. Repeatable (Linux, with a root filesystem)
+* `--tmpfs <PATH[:OPTIONS]>` — Mount a tmpfs (in memory, empty at each start) at PATH, with `mount(8)`'s OPTIONS: `size=64m`, `mode=1777`, `uid`, `gid`, `nr_inodes`, `ro`, and `exec`, `suid`, `dev` (it's `noexec`, `nosuid`, `nodev` without them, as Docker's). Repeatable
+* `--mount <KEY=VALUE,...>` — Mount as Docker's `--mount` does: `type=bind,source=/path,target=/d`, `type=volume,source=NAME,target=/d` (the default type), or `type=tmpfs,target=/d,tmpfs-size=64m,tmpfs-mode=1777`; `readonly` for any, `volume-nocopy` for a volume (not filled from the image). Repeatable
 
 
 
@@ -366,7 +449,7 @@ Stop running containers: their stop signal, then SIGKILL once their stop timeout
 
 ###### **Options:**
 
-* `-t`, `--time <SECONDS>` — Seconds to wait after the stop signal before SIGKILL (the container's own, its --stop-timeout, unless given)
+* `-t`, `--timeout <SECONDS>` [alias: `time`] — Seconds to wait after the stop signal before SIGKILL (the container's own, its --stop-timeout, unless given); -1 waits for as long as it takes, as Docker's
 * `-s`, `--signal <SIGNAL>` — The signal sent first (the container's own, its --stop-signal, unless given)
 
 
@@ -383,16 +466,16 @@ Stop containers (as `stop`), then start them again
 
 ###### **Options:**
 
-* `-t`, `--time <SECONDS>` — Seconds to wait after the stop signal before SIGKILL (the container's own, its --stop-timeout, unless given)
+* `-t`, `--timeout <SECONDS>` [alias: `time`] — Seconds to wait after the stop signal before SIGKILL (the container's own, its --stop-timeout, unless given); -1 waits for as long as it takes, as Docker's
 * `-s`, `--signal <SIGNAL>` — The signal sent first (the container's own, its --stop-signal, unless given)
 
 
 
 ## `shipyard update`
 
-Change containers' settings without making them again: their restart policy
+Change containers' settings without making them again: their restart policy, and their resource limits (in their cgroup at once while they run, and for their next starts)
 
-**Usage:** `shipyard update --restart <POLICY> <CONTAINER>...`
+**Usage:** `shipyard update [OPTIONS] <CONTAINER>...`
 
 ###### **Arguments:**
 
@@ -401,6 +484,17 @@ Change containers' settings without making them again: their restart policy
 ###### **Options:**
 
 * `--restart <POLICY>` — The restart policy: no, on-failure (or on-failure:N), always or unless-stopped
+* `-m`, `--memory <SIZE>` — The most memory the container may use (such as 512m or 2g). Its swap, if it's the default (as much as its memory), follows
+* `--memory-reservation <SIZE>` — Memory kept for the container when the host runs short
+* `--memory-swap <SIZE>` — Memory plus swap: counted from --memory, or the container's own memory limit without it; -1 for unlimited swap
+* `--cpus <NUMBER>` — How many CPUs' worth of time the container may use (such as 1.5)
+* `--cpu-period <MICROSECONDS>` — The CPU period, in microseconds (1000 to 1000000); its quota stays
+* `--cpu-quota <MICROSECONDS>` — CPU time per period, in microseconds; its period stays
+* `-c`, `--cpu-shares <SHARES>` — The container's CPU share against others, in Docker's units (1024 is the default share)
+* `--cpuset-cpus <LIST>` — The CPUs the container may run on (such as 0-3 or 0,2)
+* `--cpuset-mems <LIST>` — The memory nodes the container may use (such as 0 or 0-1)
+* `--pids-limit <NUMBER>` — The most processes (and threads) in the container, its init included (a number: a limit isn't lifted yet)
+* `--blkio-weight <WEIGHT>` — The container's disk-time share, in Docker's units (10 to 1000)
 
 
 
@@ -419,6 +513,74 @@ Send a signal to running containers' main process (SIGKILL unless told), without
 * `-s`, `--signal <SIGNAL>` — The signal: a name (KILL, SIGTERM) or a number
 
   Default value: `SIGKILL`
+
+
+
+## `shipyard pause`
+
+Freeze running containers' processes where they are (their cgroup's freezer), until `unpause`
+
+**Usage:** `shipyard pause <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+
+
+## `shipyard unpause`
+
+Let paused containers' processes run on
+
+**Usage:** `shipyard unpause <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+
+
+## `shipyard top`
+
+Show a running container's processes, in `ps -ef`'s columns
+
+**Usage:** `shipyard top <CONTAINER> [PS OPTIONS]...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+* `<PS OPTIONS>` — Not supported: `ps`'s options (Shipyard reads /proc itself, in `ps -ef`'s columns; any but `-ef` refused)
+
+
+
+## `shipyard stats`
+
+Show what containers use (CPU, memory, network, block I/O, processes), every second until Ctrl-C, or once with --no-stream
+
+**Usage:** `shipyard stats [OPTIONS] [CONTAINER]...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers (without: those running, listed again each time)
+
+###### **Options:**
+
+* `-a`, `--all` — All containers, not only the ones up (without CONTAINER)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE`, or a Go TEMPLATE (`{{.Name}} {{.CPUPerc}}`)
+* `--no-stream` — Print once and end (without: every second, until Ctrl-C)
+* `--no-trunc` — Don't cut IDs short
+
+
+
+## `shipyard compose`
+
+Run Docker's `docker compose` against Shipyard (its API's service started if nothing serves it yet): `shipyard compose up -d`. Needs Docker's CLI and its compose plugin
+
+**Usage:** `shipyard compose [COMPOSE ARGS]...`
+
+###### **Arguments:**
+
+* `<COMPOSE ARGS>` — `docker compose`'s arguments: its command and flags (`up -d`, `ps`, `down -v`…), as Docker's compose takes them
 
 
 
@@ -452,7 +614,10 @@ Run a command in a running container. Exits with its exit code (127 if it isn't 
 * `-t`, `--tty` — Give it a terminal
 * `-d`, `--detach` — Return once it runs (it goes on)
 * `-u`, `--user <USER[:GROUP]>` — Run it as this user, and group if given: names (from the container's own /etc/passwd and /etc/group) or numbers
-* `-e`, `--env <KEY=VALUE>` — Set an environment variable for it (KEY=VALUE; repeatable)
+* `-e`, `--env <KEY[=VALUE]>` — Set an environment variable for it (KEY=VALUE, or a bare KEY to copy your shell's value; repeatable)
+* `--env-file <FILE>` — Read variables from a file, as `run --env-file` does (before --env, which wins). Repeatable
+* `--detach-keys <KEYS>` — Not supported yet: an exec's command ends with this session, so there's nothing to detach from (refused)
+* `--privileged` — Not supported: give the container the capabilities it needs (refused)
 * `-w`, `--workdir <DIR>` — Its working directory, in the container
 
 
@@ -472,6 +637,7 @@ Copy files between a container (running or not) and the host: CONTAINER:PATH to 
 
 * `-a`, `--archive` — Keep the files' owners (where the container has those IDs)
 * `-L`, `--follow-link` — Follow a source that's a symbolic link
+* `-q`, `--quiet` — Taken, as Docker's (no progress): Shipyard prints none
 
 
 
@@ -488,8 +654,9 @@ Print a container's logs: every start's, oldest first
 ###### **Options:**
 
 * `-f`, `--follow` — Then print more as it comes, until the container stops (or is started again)
-* `--tail <N>` — Only the last N lines (across its starts)
+* `-n`, `--tail <N>` — Only the last N lines (across its starts); `all` is every one, as Docker's
 * `--since <TIME>` — Only lines from TIME on: RFC 3339 (2026-10-10T06:16:19Z), Unix seconds, or a duration ago (10m, 2h, 30s, 3d)
+* `--until <TIME>` — Only lines up to TIME (as --since takes it); a follow ends there
 * `-t`, `--timestamps` — Start each line with the time it was written (RFC 3339)
 
 
@@ -505,16 +672,7 @@ Print what happens (containers made, started, ended; images pulled; volumes and 
 * `--since <TIME>` — Past events too, from TIME on: RFC 3339 (2026-10-10T06:16:19Z), Unix seconds, or a duration ago (10m, 2h, 3d). Without it, only new ones
 * `--until <TIME>` — Stop at TIME (as --since): with a past TIME, print and exit. Without it, wait for more until interrupted
 * `-f`, `--filter <KEY=VALUE>` — Only the events that match: type=container|image|volume|network, event=ACTION, container=NAME|ID, image=REF, volume=NAME, network=NAME. Repeat a key for any of its values
-* `--format <FORMAT>` — How to print them: Docker's line, or JSON (one object per line, as the journal keeps it)
-
-  Default value: `text`
-
-  Possible values:
-  - `text`:
-    `TIME TYPE ACTION ID (KEY=VALUE, …)`
-  - `json`:
-    The journal's line
-
+* `--format <FORMAT>` — How to print them: Docker's line without it; `json` (Docker's event message, an object per line), or a Go TEMPLATE over it (`{{.Type}} {{.Action}} {{.Actor.Attributes.name}}`)
 
 
 
@@ -539,15 +697,13 @@ List containers: the running ones, or all of them with -a
 ###### **Options:**
 
 * `-a`, `--all` — All containers, not only the ones up
-* `-q`, `--quiet` — Only their IDs (short)
-* `--format <FORMAT>` — How to print them: a table, or JSON (one object per container)
-
-  Possible values:
-  - `table`:
-    A table, as Docker's
-  - `json`:
-    A JSON array, one object per container (or socket)
-
+* `-q`, `--quiet` — Only their IDs (the format is then ignored, as Docker's)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE` (aligned, with a header), or a Go TEMPLATE (a line per object; `{{.Names}}`, `{{json .}}`, Docker's fields and functions)
+* `-f`, `--filter <KEY=VALUE>` — Only those that match: KEY=VALUE, as Docker's (repeat a key for any of its values; `label` for all of them)
+* `--no-trunc` — Don't cut IDs and commands short
+* `-n`, `--last <N>` — Only the N made last (of all of them, up or not)
+* `-l`, `--latest` — Only the one made last (of all of them, up or not)
+* `-s`, `--size` — Taken, as Docker's: Shipyard doesn't measure a container's size (`Size` is `0B`)
 
 
 
@@ -578,13 +734,31 @@ Show the host ports a container publishes (all of them, or those to one of its p
 
 ## `shipyard inspect`
 
-Show containers in full, as JSON
+Show objects in full, as JSON: a container, an image, a network or a volume, by name, in Docker's shape (`docker inspect`'s)
 
-**Usage:** `shipyard inspect <CONTAINER>...`
+**Usage:** `shipyard inspect [OPTIONS] <NAME>...`
 
 ###### **Arguments:**
 
-* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+* `<NAME>` — The objects: names, IDs or ID prefixes
+
+###### **Options:**
+
+* `--shipyard` — Shipyard's own view of containers instead (its serial, its health history, its network's loss, the config as its record keeps it)
+* `--type <TYPE>` — Only this kind of object (without it: the first of a container, an image, a network, a volume that has the name, as Docker's)
+
+  Possible values:
+  - `container`:
+    A container
+  - `image`:
+    An image
+  - `network`:
+    A network
+  - `volume`:
+    A volume
+
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-s`, `--size` — Taken, as Docker's: Shipyard doesn't measure a container's size
 
 
 
@@ -601,6 +775,7 @@ Remove containers (their writable layers too). A running one needs -f
 ###### **Options:**
 
 * `-f`, `--force` — Remove a running container too (it's killed first)
+* `-v`, `--volumes` — Remove its anonymous volumes too (`-v /path`, the image's own), each that no other container names; a named volume is kept
 
 
 
@@ -624,7 +799,20 @@ Pull an image into the local store (and extract it, on Linux), so a run starts a
 
 List images in the local store
 
-**Usage:** `shipyard images`
+**Usage:** `shipyard images [OPTIONS] [REPOSITORY[:TAG]]`
+
+###### **Arguments:**
+
+* `<REPOSITORY[:TAG]>` — Only images of this name (`alpine`, `alpine:3.*`, as the `reference` filter)
+
+###### **Options:**
+
+* `-a`, `--all` — Taken, as Docker's: Shipyard keeps no intermediate images
+* `-q`, `--quiet` — Only their IDs (the format is then ignored, as Docker's)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE` (aligned, with a header), or a Go TEMPLATE (a line per object; `{{.Names}}`, `{{json .}}`, Docker's fields and functions)
+* `-f`, `--filter <KEY=VALUE>` — Only those that match: KEY=VALUE, as Docker's (repeat a key for any of its values; `label` for all of them)
+* `--no-trunc` — Don't cut IDs short
+* `--digests` — Show each image's digest too
 
 
 
@@ -636,11 +824,647 @@ Remove one or more images from the local store (reference-counted; shared layers
 
 ###### **Arguments:**
 
-* `<IMAGE>` — The image references to remove
+* `<IMAGE>` — The images to remove: references or IDs
 
 ###### **Options:**
 
 * `-f`, `--force` — Untag an image even while a container uses it (a container keeps what it needs until it's removed; a foreground run's layers stay until it ends and a prune collects them)
+
+
+
+## `shipyard tag`
+
+Give an image another name (TARGET, a reference) beside its own
+
+**Usage:** `shipyard tag <SOURCE_IMAGE> <TARGET_IMAGE>`
+
+###### **Arguments:**
+
+* `<SOURCE_IMAGE>` — The image: a reference or an ID
+* `<TARGET_IMAGE>` — Its new name, like `registry.example/app:1.0`
+
+
+
+## `shipyard container`
+
+Manage containers (the same commands as at the top: `container ls` is `ps`, `container rm` is `rm`…)
+
+**Usage:** `shipyard container <COMMAND>`
+
+###### **Subcommands:**
+
+* `ls` — List containers (`ps`)
+* `run` — Run an image in a container (`run`)
+* `create` — Make a container, to start later (`create`)
+* `start` — Start containers (`start`)
+* `stop` — Stop running containers (`stop`)
+* `restart` — Stop containers, then start them again (`restart`)
+* `kill` — Send a signal to running containers (`kill`)
+* `pause` — Freeze running containers (`pause`)
+* `unpause` — Let paused containers run on (`unpause`)
+* `top` — Show a container's processes (`top`)
+* `stats` — Show what containers use (`stats`)
+* `rm` — Remove containers (`rm`)
+* `logs` — Print a container's logs (`logs`)
+* `exec` — Run a command in a running container (`exec`)
+* `inspect` — Show containers in full, as JSON: Docker's shape (`inspect --type container`)
+* `cp` — Copy files between a container and the host (`cp`)
+* `port` — Show the host ports a container publishes (`port`)
+* `rename` — Rename a container (`rename`)
+* `wait` — Wait for containers to end (`wait`)
+* `attach` — Attach to a running container (`attach`)
+* `update` — Change containers' settings (`update`)
+* `prune` — Remove every stopped container
+
+
+
+## `shipyard container ls`
+
+List containers (`ps`)
+
+**Usage:** `shipyard container ls [OPTIONS]`
+
+**Command Aliases:** `ps`, `list`
+
+###### **Options:**
+
+* `-a`, `--all` — All containers, not only the ones up
+* `-q`, `--quiet` — Only their IDs (the format is then ignored, as Docker's)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE` (aligned, with a header), or a Go TEMPLATE (a line per object; `{{.Names}}`, `{{json .}}`, Docker's fields and functions)
+* `-f`, `--filter <KEY=VALUE>` — Only those that match: KEY=VALUE, as Docker's (repeat a key for any of its values; `label` for all of them)
+* `--no-trunc` — Don't cut IDs and commands short
+* `-n`, `--last <N>` — Only the N made last (of all of them, up or not)
+* `-l`, `--latest` — Only the one made last (of all of them, up or not)
+* `-s`, `--size` — Taken, as Docker's: Shipyard doesn't measure a container's size (`Size` is `0B`)
+
+
+
+## `shipyard container run`
+
+Run an image in a container (`run`)
+
+**Usage:** `shipyard container run [OPTIONS] [IMAGE] [COMMAND]...`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The image to run (a reference like `alpine:3.20` or `ghcr.io/owner/app@sha256:...`), then the command to run instead of its own, with its arguments. With --no-image, --rootfs or --no-isolation there's no image: the command comes first (--bundle takes none). Everything after the image is the command's, options too
+
+###### **Options:**
+
+* `-d`, `--detach` — Run in the background: the container is made and started, its ID printed, and it runs on once this command has ended (Linux)
+* `--rm` — Remove the container once it ends (a foreground run returns once it's gone)
+* `--sig-proxy <BOOL>` — In the foreground: pass on the signals this command gets (Ctrl-C, a kill) to the container. With false, Ctrl-C ends this command and the container runs on
+
+  Default value: `true`
+
+  Possible values: `true`, `false`
+
+* `--detach-keys <KEYS>` — In the foreground with -it: the keys that detach (the container goes on): ctrl-p,ctrl-q, or others separated by commas (empty: none)
+* `-a`, `--attach <STREAM>` — In the foreground: attach only these streams (stdin, stdout, stderr; repeatable). stdin takes your input, as -i. Without it, all of them
+* `--help` — Print help (`-h` is the hostname's, as Docker's)
+
+  Possible values: `true`, `false`
+
+* `-i`, `--interactive` — Pass your input on to the command. Without it, an isolated command's stdin is empty (/dev/null), so it can't take keys meant for your shell
+* `-t`, `--tty` — Give the command a terminal of the container's own (a pseudo-terminal): full-screen programs, password prompts and job control work. With -i, what you type goes to it
+* `-e`, `--env <KEY[=VALUE]>` — Set an environment variable, or copy KEY from your shell if no value is given
+* `--env-file <FILE>` — Read variables from a file, as Docker's: a KEY=VALUE per line (a bare KEY copies yours), # lines and blank ones skipped, values as they are. Before --env, which wins. Repeatable
+* `-l`, `--label <KEY[=VALUE]>` — Set a label on the container: KEY=VALUE, or KEY (an empty value). Repeatable
+* `--label-file <FILE>` — Read labels from a file: a KEY=VALUE (or KEY) per line, # lines and blank ones skipped. Before --label, which wins. Repeatable
+* `--cidfile <FILE>` — Write the container's ID to FILE once it's made (refused if FILE is there already)
+* `-q`, `--quiet` — Print no pull progress
+* `--privileged` — Not supported: give the container the capabilities (--cap-add) and devices (--device) it needs instead
+* `--init` — Not supported yet: run the command without it (an image's own init, if it has one)
+* `-w`, `--workdir <DIR>` — Working directory inside the container (absolute path): the image's, or `/`, if not given
+* `-u`, `--user <USER[:GROUP]>` — Run as this user and group: names (from the container's /etc/passwd and /etc/group) or numbers
+* `--group-add <GROUP>` — Add a supplementary group: a name or a number
+* `--ulimit <NAME=SOFT[:HARD]>` — Set a resource limit, e.g. nofile=1024:2048 or core=0
+* `--oom-score-adj <N>` — The command's OOM score adjustment, -1000 to 1000: how willing the kernel's OOM killer is to pick it (lowering it needs root)
+* `--device <HOST[:CONTAINER][:PERMS]>` — Give the container the host's device HOST (a directory: every device below it), at CONTAINER inside (HOST's own path if not given), for PERMS, from rwm (all three if not given). Repeatable (Linux)
+* `--device-cgroup-rule <RULE>` — Let the container use a kind of device: "TYPE MAJOR:MINOR ACCESS", such as "c 1:3 rwm" or "b *:* r" (a for any type, * for any number). Repeatable (Linux)
+* `--stop-signal <SIGNAL>` — Signal sent to stop the command
+
+  Default value: `SIGTERM`
+* `--stop-timeout <SECONDS>` — Seconds to wait after the stop signal before killing the command
+
+  Default value: `10`
+* `--restart <POLICY>` — A container's restart policy, when it ends: no, on-failure (an exit code other than 0; on-failure:N at most N times), always, or unless-stopped. Never after you stop it. Not with --rm
+
+  Default value: `no`
+* `--health-cmd <CMD>` — A container's health check: CMD, run in the container by the image's shell (its SHELL, else /bin/sh -c) every --health-interval while it runs; its exit code says whether the container is well (0) or not. `ps` and `inspect` show what it says: starting, healthy or unhealthy. Without it, the image's own check (its HEALTHCHECK), which the other --health-* flags tune
+* `--no-healthcheck` — No health check, not even the image's own
+* `--health-interval <DURATION>` — Between two health checks (the image's check's, else 30s): a duration, such as 500ms, 30s, 1m or 2h
+* `--health-timeout <DURATION>` — The longest a health check may take (the image's check's, else 30s): then it's a failure
+* `--health-start-period <DURATION>` — After a start, how long failed health checks don't count (the image's check's, else none)
+* `--health-start-interval <DURATION>` — Between two health checks during the start period (the image's check's, else 5s)
+* `--health-retries <N>` — How many failed health checks in a row make the container unhealthy (the image's check's, else 3)
+* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname, IPC and network, as you. On Linux, commands are isolated by default (rootless, in a user namespace, without root); on macOS they always run like this for now
+* `--preserve-fds <N>` — Pass N more descriptors on to the command, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as Podman does
+
+  Default value: `0`
+* `-h`, `--hostname <NAME>` — Hostname inside the container (Linux)
+* `--domainname <NAME>` — NIS domain name inside the container (Linux)
+* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host and container:)
+* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), container:NAME (another running container's, as it is), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--ipc <MODE>` — The container's IPC namespace (Linux): private or shareable (its own: any running container's can be joined), or container:NAME (another running container's, with its /dev/shm)
+* `--name <NAME>` — The container's name: on each network made with `shipyard network create` that it joins, other containers find it by this name (Linux). Letters, digits, _ and -
+* `--network-alias <NAME>` — Another name the container answers to on each network made with `shipyard network create` that it joins. Repeatable (Linux)
+* `--ip <IP>` — The container's address on its network (a bridge network's; with one network only: on several, name=NETWORK,ip=IP gives each its own)
+* `--ip6 <IP>` — The container's IPv6 address on its network (one made with --ipv6; with one network only: on several, name=NETWORK,ip6=IP gives each its own)
+* `--mac-address <MAC>` — The container's hardware address on its network (a bridge network's; with one network only), locally administered, like 02:42:0a:58:00:02
+* `--add-host <NAME:IP>` — Add NAME with address IP to the container's /etc/hosts. Repeatable (Linux; with an image or --rootfs)
+* `--dns <IP>` — A DNS server for the container's /etc/resolv.conf, instead of the host's. Repeatable (Linux; with an image or --rootfs)
+* `--dns-search <DOMAIN>` — A DNS search domain, instead of the host's. Repeatable (Linux; with an image or --rootfs)
+* `--dns-option <OPTION>` — A resolver option (like ndots:2), instead of the host's. Repeatable (Linux; with an image or --rootfs)
+* `-p`, `--publish <SPEC>` — Publish a container's port on the host, like 8080:80 (the host's port 8080, on every IPv4 address, to the container's 80), 127.0.0.1:8080:80 (on that address only), 80 (a free host port) or 53:53/udp. Ranges work (8000-8010:80-90). Repeatable (Linux; a bridge network, or pasta)
+* `--expose <PORT[/PROTO]>` — Expose a port, or a range (8000-8010), TCP unless /udp: published with -P beside the image's own, and shown by inspect. Repeatable
+* `-P`, `--publish-all` — Publish every port the image says it uses (its exposed ports) on free host ports (Linux; a bridge network, or pasta)
+* `--rootfs <DIR>` — Use DIR as the container's root filesystem: it becomes `/` inside, with its own /proc, /sys and /dev (Linux)
+* `--no-image` — Run without an image: the command sees the host's files, isolated in its own namespaces otherwise (Linux), and COMMAND comes first
+* `--entrypoint <COMMAND>` — Run COMMAND instead of the image's entrypoint (and without its default arguments); `""` runs the command alone
+* `--pull <WHEN>` — When to pull the image: `missing` (if the store doesn't have it: the default), `always`, or `never` (the store's, or an error)
+
+  Possible values:
+  - `missing`:
+    Only if the store doesn't have it whole
+  - `always`:
+    Every time (a tag may have moved)
+  - `never`:
+    Never: the store's, or nothing
+
+* `--read-only` — Make the container's root filesystem read-only (with an image or --rootfs)
+* `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
+* `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
+* `--security-opt <OPTION>` — A security option: `no-new-privileges=false` lets setuid programs inside gain privileges (they can't by default); `seccomp=FILE` filters system calls with a profile of your own, `seccomp=unconfined` not at all (Docker's profile by default). Repeatable (Linux)
+* `--uidmap <CONTAINER:HOST:SIZE>` — Run in a user namespace: container IDs CONTAINER.. are host IDs HOST.., SIZE of them, e.g. 0:100000:65536 (root inside is host user 100000). Repeatable (Linux, root only: without root, the maps are chosen for you)
+* `--gidmap <CONTAINER:HOST:SIZE>` — The same for group IDs; the --uidmap ranges if not given (Linux)
+* `--bundle <DIR>` — Run the OCI bundle in DIR: its config.json says what to run and how, so no COMMAND or container options are given (Linux)
+* `-m`, `--memory <SIZE>` — The most memory the container may use (such as 512m or 2g); past it, the kernel's OOM killer stops a process (Linux; rootless where a cgroup subtree is delegated)
+* `--memory-reservation <SIZE>` — Memory kept for the container when the host runs short (cgroup v2's memory.low)
+* `--memory-swap <SIZE>` — Memory plus swap (needs --memory, except -1): -1 for unlimited swap. Without it, the container may swap as much as --memory, as with Docker
+* `--cpus <NUMBER>` — How many CPUs' worth of time the container may use (such as 1.5)
+* `--cpu-period <MICROSECONDS>` — The CPU period, in microseconds (1000 to 1000000; default 100000)
+* `--cpu-quota <MICROSECONDS>` — CPU time per period, in microseconds (-1 or 0 for no limit)
+* `-c`, `--cpu-shares <SHARES>` — The container's CPU share against others, in Docker's units (1024 is the default share)
+* `--cpuset-cpus <LIST>` — The CPUs the container may run on (such as 0-3 or 0,2)
+* `--cpuset-mems <LIST>` — The memory nodes the container may use (such as 0 or 0-1)
+* `--pids-limit <NUMBER>` — The most processes (and threads) in the container, its init included (-1 or 0 for no limit)
+* `--blkio-weight <WEIGHT>` — The container's disk-time share, in Docker's units (10 to 1000)
+* `--device-read-bps <DEVICE:RATE>` — Limits reads from a block device, in bytes per second (/dev/sda:10mb). Repeatable
+* `--device-write-bps <DEVICE:RATE>` — Limits writes to a block device, in bytes per second. Repeatable
+* `--device-read-iops <DEVICE:RATE>` — Limits reads from a block device, in operations per second (/dev/sda:1000). Repeatable
+* `--device-write-iops <DEVICE:RATE>` — Limits writes to a block device, in operations per second. Repeatable
+* `-v`, `--volume <[SOURCE:]DEST[:OPTIONS]>` — Mount a named volume or host path into the container: `[SOURCE:]DEST[:MODES]`, MODES `ro` and `nocopy`, comma-joined. A bare SOURCE (no slash) is a named volume, created on first use; DEST alone, a new anonymous one; either, if empty, is filled with the image's files at DEST when the container is made (unless `nocopy`). A path is bind-mounted (it must exist); DEST alone is a new anonymous volume. Repeatable (Linux, with a root filesystem)
+* `--tmpfs <PATH[:OPTIONS]>` — Mount a tmpfs (in memory, empty at each start) at PATH, with `mount(8)`'s OPTIONS: `size=64m`, `mode=1777`, `uid`, `gid`, `nr_inodes`, `ro`, and `exec`, `suid`, `dev` (it's `noexec`, `nosuid`, `nodev` without them, as Docker's). Repeatable
+* `--mount <KEY=VALUE,...>` — Mount as Docker's `--mount` does: `type=bind,source=/path,target=/d`, `type=volume,source=NAME,target=/d` (the default type), or `type=tmpfs,target=/d,tmpfs-size=64m,tmpfs-mode=1777`; `readonly` for any, `volume-nocopy` for a volume (not filled from the image). Repeatable
+
+
+
+## `shipyard container create`
+
+Make a container, to start later (`create`)
+
+**Usage:** `shipyard container create [OPTIONS] [IMAGE] [COMMAND]...`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The image to run (a reference like `alpine:3.20` or `ghcr.io/owner/app@sha256:...`), then the command to run instead of its own, with its arguments. With --no-image, --rootfs or --no-isolation there's no image: the command comes first (--bundle takes none). Everything after the image is the command's, options too
+
+###### **Options:**
+
+* `--rm` — Remove the container once it ends, after its first start
+* `--help` — Print help (`-h` is the hostname's, as Docker's)
+
+  Possible values: `true`, `false`
+
+* `-i`, `--interactive` — Pass your input on to the command. Without it, an isolated command's stdin is empty (/dev/null), so it can't take keys meant for your shell
+* `-t`, `--tty` — Give the command a terminal of the container's own (a pseudo-terminal): full-screen programs, password prompts and job control work. With -i, what you type goes to it
+* `-e`, `--env <KEY[=VALUE]>` — Set an environment variable, or copy KEY from your shell if no value is given
+* `--env-file <FILE>` — Read variables from a file, as Docker's: a KEY=VALUE per line (a bare KEY copies yours), # lines and blank ones skipped, values as they are. Before --env, which wins. Repeatable
+* `-l`, `--label <KEY[=VALUE]>` — Set a label on the container: KEY=VALUE, or KEY (an empty value). Repeatable
+* `--label-file <FILE>` — Read labels from a file: a KEY=VALUE (or KEY) per line, # lines and blank ones skipped. Before --label, which wins. Repeatable
+* `--cidfile <FILE>` — Write the container's ID to FILE once it's made (refused if FILE is there already)
+* `-q`, `--quiet` — Print no pull progress
+* `--privileged` — Not supported: give the container the capabilities (--cap-add) and devices (--device) it needs instead
+* `--init` — Not supported yet: run the command without it (an image's own init, if it has one)
+* `-w`, `--workdir <DIR>` — Working directory inside the container (absolute path): the image's, or `/`, if not given
+* `-u`, `--user <USER[:GROUP]>` — Run as this user and group: names (from the container's /etc/passwd and /etc/group) or numbers
+* `--group-add <GROUP>` — Add a supplementary group: a name or a number
+* `--ulimit <NAME=SOFT[:HARD]>` — Set a resource limit, e.g. nofile=1024:2048 or core=0
+* `--oom-score-adj <N>` — The command's OOM score adjustment, -1000 to 1000: how willing the kernel's OOM killer is to pick it (lowering it needs root)
+* `--device <HOST[:CONTAINER][:PERMS]>` — Give the container the host's device HOST (a directory: every device below it), at CONTAINER inside (HOST's own path if not given), for PERMS, from rwm (all three if not given). Repeatable (Linux)
+* `--device-cgroup-rule <RULE>` — Let the container use a kind of device: "TYPE MAJOR:MINOR ACCESS", such as "c 1:3 rwm" or "b *:* r" (a for any type, * for any number). Repeatable (Linux)
+* `--stop-signal <SIGNAL>` — Signal sent to stop the command
+
+  Default value: `SIGTERM`
+* `--stop-timeout <SECONDS>` — Seconds to wait after the stop signal before killing the command
+
+  Default value: `10`
+* `--restart <POLICY>` — A container's restart policy, when it ends: no, on-failure (an exit code other than 0; on-failure:N at most N times), always, or unless-stopped. Never after you stop it. Not with --rm
+
+  Default value: `no`
+* `--health-cmd <CMD>` — A container's health check: CMD, run in the container by the image's shell (its SHELL, else /bin/sh -c) every --health-interval while it runs; its exit code says whether the container is well (0) or not. `ps` and `inspect` show what it says: starting, healthy or unhealthy. Without it, the image's own check (its HEALTHCHECK), which the other --health-* flags tune
+* `--no-healthcheck` — No health check, not even the image's own
+* `--health-interval <DURATION>` — Between two health checks (the image's check's, else 30s): a duration, such as 500ms, 30s, 1m or 2h
+* `--health-timeout <DURATION>` — The longest a health check may take (the image's check's, else 30s): then it's a failure
+* `--health-start-period <DURATION>` — After a start, how long failed health checks don't count (the image's check's, else none)
+* `--health-start-interval <DURATION>` — Between two health checks during the start period (the image's check's, else 5s)
+* `--health-retries <N>` — How many failed health checks in a row make the container unhealthy (the image's check's, else 3)
+* `--no-isolation` — Run without isolation: the command sees the host's processes, mounts, hostname, IPC and network, as you. On Linux, commands are isolated by default (rootless, in a user namespace, without root); on macOS they always run like this for now
+* `--preserve-fds <N>` — Pass N more descriptors on to the command, from 3 up (after socket activation's, if `LISTEN_FDS` and `LISTEN_PID` give it any), as Podman does
+
+  Default value: `0`
+* `-h`, `--hostname <NAME>` — Hostname inside the container (Linux)
+* `--domainname <NAME>` — NIS domain name inside the container (Linux)
+* `--sysctl <KEY=VALUE>` — Set a kernel setting the container owns, e.g. kernel.shmmax=1073741824 (Linux): IPC settings, or net.* with a network of its own (any --network but host and container:)
+* `--network <MODE>` — The container's network: bridge (the default network: root's default), pasta (a network of its own through pasta: the default without root), host (the host's), none (one of its own with only a loopback interface), container:NAME (another running container's, as it is), or a network's name (Linux; bridge and names need root). Repeatable for bridge networks: the container joins each, in order. name=NAME,ip=IP,ip6=IP,mac-address=MAC,alias=ALIAS gives one its own settings
+* `--ipc <MODE>` — The container's IPC namespace (Linux): private or shareable (its own: any running container's can be joined), or container:NAME (another running container's, with its /dev/shm)
+* `--name <NAME>` — The container's name: on each network made with `shipyard network create` that it joins, other containers find it by this name (Linux). Letters, digits, _ and -
+* `--network-alias <NAME>` — Another name the container answers to on each network made with `shipyard network create` that it joins. Repeatable (Linux)
+* `--ip <IP>` — The container's address on its network (a bridge network's; with one network only: on several, name=NETWORK,ip=IP gives each its own)
+* `--ip6 <IP>` — The container's IPv6 address on its network (one made with --ipv6; with one network only: on several, name=NETWORK,ip6=IP gives each its own)
+* `--mac-address <MAC>` — The container's hardware address on its network (a bridge network's; with one network only), locally administered, like 02:42:0a:58:00:02
+* `--add-host <NAME:IP>` — Add NAME with address IP to the container's /etc/hosts. Repeatable (Linux; with an image or --rootfs)
+* `--dns <IP>` — A DNS server for the container's /etc/resolv.conf, instead of the host's. Repeatable (Linux; with an image or --rootfs)
+* `--dns-search <DOMAIN>` — A DNS search domain, instead of the host's. Repeatable (Linux; with an image or --rootfs)
+* `--dns-option <OPTION>` — A resolver option (like ndots:2), instead of the host's. Repeatable (Linux; with an image or --rootfs)
+* `-p`, `--publish <SPEC>` — Publish a container's port on the host, like 8080:80 (the host's port 8080, on every IPv4 address, to the container's 80), 127.0.0.1:8080:80 (on that address only), 80 (a free host port) or 53:53/udp. Ranges work (8000-8010:80-90). Repeatable (Linux; a bridge network, or pasta)
+* `--expose <PORT[/PROTO]>` — Expose a port, or a range (8000-8010), TCP unless /udp: published with -P beside the image's own, and shown by inspect. Repeatable
+* `-P`, `--publish-all` — Publish every port the image says it uses (its exposed ports) on free host ports (Linux; a bridge network, or pasta)
+* `--rootfs <DIR>` — Use DIR as the container's root filesystem: it becomes `/` inside, with its own /proc, /sys and /dev (Linux)
+* `--no-image` — Run without an image: the command sees the host's files, isolated in its own namespaces otherwise (Linux), and COMMAND comes first
+* `--entrypoint <COMMAND>` — Run COMMAND instead of the image's entrypoint (and without its default arguments); `""` runs the command alone
+* `--pull <WHEN>` — When to pull the image: `missing` (if the store doesn't have it: the default), `always`, or `never` (the store's, or an error)
+
+  Possible values:
+  - `missing`:
+    Only if the store doesn't have it whole
+  - `always`:
+    Every time (a tag may have moved)
+  - `never`:
+    Never: the store's, or nothing
+
+* `--read-only` — Make the container's root filesystem read-only (with an image or --rootfs)
+* `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
+* `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
+* `--security-opt <OPTION>` — A security option: `no-new-privileges=false` lets setuid programs inside gain privileges (they can't by default); `seccomp=FILE` filters system calls with a profile of your own, `seccomp=unconfined` not at all (Docker's profile by default). Repeatable (Linux)
+* `--uidmap <CONTAINER:HOST:SIZE>` — Run in a user namespace: container IDs CONTAINER.. are host IDs HOST.., SIZE of them, e.g. 0:100000:65536 (root inside is host user 100000). Repeatable (Linux, root only: without root, the maps are chosen for you)
+* `--gidmap <CONTAINER:HOST:SIZE>` — The same for group IDs; the --uidmap ranges if not given (Linux)
+* `--bundle <DIR>` — Run the OCI bundle in DIR: its config.json says what to run and how, so no COMMAND or container options are given (Linux)
+* `-m`, `--memory <SIZE>` — The most memory the container may use (such as 512m or 2g); past it, the kernel's OOM killer stops a process (Linux; rootless where a cgroup subtree is delegated)
+* `--memory-reservation <SIZE>` — Memory kept for the container when the host runs short (cgroup v2's memory.low)
+* `--memory-swap <SIZE>` — Memory plus swap (needs --memory, except -1): -1 for unlimited swap. Without it, the container may swap as much as --memory, as with Docker
+* `--cpus <NUMBER>` — How many CPUs' worth of time the container may use (such as 1.5)
+* `--cpu-period <MICROSECONDS>` — The CPU period, in microseconds (1000 to 1000000; default 100000)
+* `--cpu-quota <MICROSECONDS>` — CPU time per period, in microseconds (-1 or 0 for no limit)
+* `-c`, `--cpu-shares <SHARES>` — The container's CPU share against others, in Docker's units (1024 is the default share)
+* `--cpuset-cpus <LIST>` — The CPUs the container may run on (such as 0-3 or 0,2)
+* `--cpuset-mems <LIST>` — The memory nodes the container may use (such as 0 or 0-1)
+* `--pids-limit <NUMBER>` — The most processes (and threads) in the container, its init included (-1 or 0 for no limit)
+* `--blkio-weight <WEIGHT>` — The container's disk-time share, in Docker's units (10 to 1000)
+* `--device-read-bps <DEVICE:RATE>` — Limits reads from a block device, in bytes per second (/dev/sda:10mb). Repeatable
+* `--device-write-bps <DEVICE:RATE>` — Limits writes to a block device, in bytes per second. Repeatable
+* `--device-read-iops <DEVICE:RATE>` — Limits reads from a block device, in operations per second (/dev/sda:1000). Repeatable
+* `--device-write-iops <DEVICE:RATE>` — Limits writes to a block device, in operations per second. Repeatable
+* `-v`, `--volume <[SOURCE:]DEST[:OPTIONS]>` — Mount a named volume or host path into the container: `[SOURCE:]DEST[:MODES]`, MODES `ro` and `nocopy`, comma-joined. A bare SOURCE (no slash) is a named volume, created on first use; DEST alone, a new anonymous one; either, if empty, is filled with the image's files at DEST when the container is made (unless `nocopy`). A path is bind-mounted (it must exist); DEST alone is a new anonymous volume. Repeatable (Linux, with a root filesystem)
+* `--tmpfs <PATH[:OPTIONS]>` — Mount a tmpfs (in memory, empty at each start) at PATH, with `mount(8)`'s OPTIONS: `size=64m`, `mode=1777`, `uid`, `gid`, `nr_inodes`, `ro`, and `exec`, `suid`, `dev` (it's `noexec`, `nosuid`, `nodev` without them, as Docker's). Repeatable
+* `--mount <KEY=VALUE,...>` — Mount as Docker's `--mount` does: `type=bind,source=/path,target=/d`, `type=volume,source=NAME,target=/d` (the default type), or `type=tmpfs,target=/d,tmpfs-size=64m,tmpfs-mode=1777`; `readonly` for any, `volume-nocopy` for a volume (not filled from the image). Repeatable
+
+
+
+## `shipyard container start`
+
+Start containers (`start`)
+
+**Usage:** `shipyard container start [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `-a`, `--attach` — Attach to it as it starts (one container): its output from its first byte, until it ends (its exit code) or Ctrl-P Ctrl-Q
+* `-i`, `--interactive` — With -a: pass your input on to it
+* `--detach-keys <KEYS>` — With -a: the keys that detach (the container goes on), as attach's
+
+  Default value: `ctrl-p,ctrl-q`
+
+
+
+## `shipyard container stop`
+
+Stop running containers (`stop`)
+
+**Usage:** `shipyard container stop [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `-t`, `--timeout <SECONDS>` [alias: `time`] — Seconds to wait after the stop signal before SIGKILL (the container's own, its --stop-timeout, unless given); -1 waits for as long as it takes, as Docker's
+* `-s`, `--signal <SIGNAL>` — The signal sent first (the container's own, its --stop-signal, unless given)
+
+
+
+## `shipyard container restart`
+
+Stop containers, then start them again (`restart`)
+
+**Usage:** `shipyard container restart [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `-t`, `--timeout <SECONDS>` [alias: `time`] — Seconds to wait after the stop signal before SIGKILL (the container's own, its --stop-timeout, unless given); -1 waits for as long as it takes, as Docker's
+* `-s`, `--signal <SIGNAL>` — The signal sent first (the container's own, its --stop-signal, unless given)
+
+
+
+## `shipyard container kill`
+
+Send a signal to running containers (`kill`)
+
+**Usage:** `shipyard container kill [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `-s`, `--signal <SIGNAL>` — The signal: a name (KILL, SIGTERM) or a number
+
+  Default value: `SIGKILL`
+
+
+
+## `shipyard container pause`
+
+Freeze running containers (`pause`)
+
+**Usage:** `shipyard container pause <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+
+
+## `shipyard container unpause`
+
+Let paused containers run on (`unpause`)
+
+**Usage:** `shipyard container unpause <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+
+
+## `shipyard container top`
+
+Show a container's processes (`top`)
+
+**Usage:** `shipyard container top <CONTAINER> [PS OPTIONS]...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+* `<PS OPTIONS>` — Not supported: `ps`'s options (Shipyard reads /proc itself, in `ps -ef`'s columns; any but `-ef` refused)
+
+
+
+## `shipyard container stats`
+
+Show what containers use (`stats`)
+
+**Usage:** `shipyard container stats [OPTIONS] [CONTAINER]...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers (without: those running, listed again each time)
+
+###### **Options:**
+
+* `-a`, `--all` — All containers, not only the ones up (without CONTAINER)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE`, or a Go TEMPLATE (`{{.Name}} {{.CPUPerc}}`)
+* `--no-stream` — Print once and end (without: every second, until Ctrl-C)
+* `--no-trunc` — Don't cut IDs short
+
+
+
+## `shipyard container rm`
+
+Remove containers (`rm`)
+
+**Usage:** `shipyard container rm [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `-f`, `--force` — Remove a running container too (it's killed first)
+* `-v`, `--volumes` — Remove its anonymous volumes too (`-v /path`, the image's own), each that no other container names; a named volume is kept
+
+
+
+## `shipyard container logs`
+
+Print a container's logs (`logs`)
+
+**Usage:** `shipyard container logs [OPTIONS] <CONTAINER>`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+
+###### **Options:**
+
+* `-f`, `--follow` — Then print more as it comes, until the container stops (or is started again)
+* `-n`, `--tail <N>` — Only the last N lines (across its starts); `all` is every one, as Docker's
+* `--since <TIME>` — Only lines from TIME on: RFC 3339 (2026-10-10T06:16:19Z), Unix seconds, or a duration ago (10m, 2h, 30s, 3d)
+* `--until <TIME>` — Only lines up to TIME (as --since takes it); a follow ends there
+* `-t`, `--timestamps` — Start each line with the time it was written (RFC 3339)
+
+
+
+## `shipyard container exec`
+
+Run a command in a running container (`exec`)
+
+**Usage:** `shipyard container exec [OPTIONS] <CONTAINER> <COMMAND>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+* `<COMMAND>` — The command and its arguments
+
+###### **Options:**
+
+* `-i`, `--interactive` — Pass your input on to it (without: it reads end-of-file)
+* `-t`, `--tty` — Give it a terminal
+* `-d`, `--detach` — Return once it runs (it goes on)
+* `-u`, `--user <USER[:GROUP]>` — Run it as this user, and group if given: names (from the container's own /etc/passwd and /etc/group) or numbers
+* `-e`, `--env <KEY[=VALUE]>` — Set an environment variable for it (KEY=VALUE, or a bare KEY to copy your shell's value; repeatable)
+* `--env-file <FILE>` — Read variables from a file, as `run --env-file` does (before --env, which wins). Repeatable
+* `--detach-keys <KEYS>` — Not supported yet: an exec's command ends with this session, so there's nothing to detach from (refused)
+* `--privileged` — Not supported: give the container the capabilities it needs (refused)
+* `-w`, `--workdir <DIR>` — Its working directory, in the container
+
+
+
+## `shipyard container inspect`
+
+Show containers in full, as JSON: Docker's shape (`inspect --type container`)
+
+**Usage:** `shipyard container inspect [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `--shipyard` — Shipyard's own view instead (its serial, its health history, its network's loss, the config as its record keeps it)
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-s`, `--size` — Taken, as Docker's: Shipyard doesn't measure a container's size
+
+
+
+## `shipyard container cp`
+
+Copy files between a container and the host (`cp`)
+
+**Usage:** `shipyard container cp [OPTIONS] <SOURCE> <DESTINATION>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — From: CONTAINER:PATH, a host path, or - (a tar stream on stdin)
+* `<DESTINATION>` — To: CONTAINER:PATH, a host path, or - (a tar stream on stdout)
+
+###### **Options:**
+
+* `-a`, `--archive` — Keep the files' owners (where the container has those IDs)
+* `-L`, `--follow-link` — Follow a source that's a symbolic link
+* `-q`, `--quiet` — Taken, as Docker's (no progress): Shipyard prints none
+
+
+
+## `shipyard container port`
+
+Show the host ports a container publishes (`port`)
+
+**Usage:** `shipyard container port [OPTIONS] <CONTAINER> [PORT[/PROTO]]`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+* `<PORT[/PROTO]>` — One of its ports: 80, 80/tcp or 53/udp (tcp if not said)
+
+###### **Options:**
+
+* `--sockets` — Show its sockets instead: what it listens on, and its connections, each peer by its container's name where it's one (Linux)
+* `--format <FORMAT>` — How to show its sockets: a table, or JSON
+
+  Possible values:
+  - `table`:
+    A table, as Docker's
+  - `json`:
+    A JSON array, one object per container (or socket)
+
+
+
+
+## `shipyard container rename`
+
+Rename a container (`rename`)
+
+**Usage:** `shipyard container rename <CONTAINER> <NEW_NAME>`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+* `<NEW_NAME>` — Its new name
+
+
+
+## `shipyard container wait`
+
+Wait for containers to end (`wait`)
+
+**Usage:** `shipyard container wait <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+
+
+## `shipyard container attach`
+
+Attach to a running container (`attach`)
+
+**Usage:** `shipyard container attach [OPTIONS] <CONTAINER>`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+
+###### **Options:**
+
+* `--detach-keys <KEYS>` — The keys that detach (the container goes on): ctrl-p,ctrl-q, or others separated by commas (empty: none)
+
+  Default value: `ctrl-p,ctrl-q`
+* `--no-stdin` — Don't pass your input on
+
+
+
+## `shipyard container update`
+
+Change containers' settings (`update`)
+
+**Usage:** `shipyard container update [OPTIONS] <CONTAINER>...`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The containers: names, IDs, serials or ID prefixes
+
+###### **Options:**
+
+* `--restart <POLICY>` — The restart policy: no, on-failure (or on-failure:N), always or unless-stopped
+* `-m`, `--memory <SIZE>` — The most memory the container may use (such as 512m or 2g). Its swap, if it's the default (as much as its memory), follows
+* `--memory-reservation <SIZE>` — Memory kept for the container when the host runs short
+* `--memory-swap <SIZE>` — Memory plus swap: counted from --memory, or the container's own memory limit without it; -1 for unlimited swap
+* `--cpus <NUMBER>` — How many CPUs' worth of time the container may use (such as 1.5)
+* `--cpu-period <MICROSECONDS>` — The CPU period, in microseconds (1000 to 1000000); its quota stays
+* `--cpu-quota <MICROSECONDS>` — CPU time per period, in microseconds; its period stays
+* `-c`, `--cpu-shares <SHARES>` — The container's CPU share against others, in Docker's units (1024 is the default share)
+* `--cpuset-cpus <LIST>` — The CPUs the container may run on (such as 0-3 or 0,2)
+* `--cpuset-mems <LIST>` — The memory nodes the container may use (such as 0 or 0-1)
+* `--pids-limit <NUMBER>` — The most processes (and threads) in the container, its init included (a number: a limit isn't lifted yet)
+* `--blkio-weight <WEIGHT>` — The container's disk-time share, in Docker's units (10 to 1000)
+
+
+
+## `shipyard container prune`
+
+Remove every stopped container
+
+**Usage:** `shipyard container prune [OPTIONS]`
+
+###### **Options:**
+
+* `-f`, `--force` — Don't ask (needed where there's no terminal to ask on)
+* `--filter <KEY=VALUE>` — Only what matches: `until=TIME` (a time, or a duration such as `24h`: made before), `label=KEY[=VALUE]`, `label!=KEY[=VALUE]`; `image prune` takes `dangling=false` too (as -a)
 
 
 
@@ -652,24 +1476,110 @@ Manage images
 
 ###### **Subcommands:**
 
-* `ls` — List images in the local store
-* `prune` — Remove unreferenced images, layers and blobs from the store
+* `ls` — List images in the local store (`images`)
+* `prune` — Remove dangling images (every image no container was made from, with -a), and what nothing in the store needs
+* `rm` — Remove images (`rmi`)
+* `pull` — Pull an image (`pull`)
+* `tag` — Give an image another name (`tag`)
+* `inspect` — Show images in full, as JSON: Docker's shape (`docker image inspect`'s)
 
 
 
 ## `shipyard image ls`
 
-List images in the local store
+List images in the local store (`images`)
 
-**Usage:** `shipyard image ls`
+**Usage:** `shipyard image ls [OPTIONS] [REPOSITORY[:TAG]]`
+
+**Command Alias:** `list`
+
+###### **Arguments:**
+
+* `<REPOSITORY[:TAG]>` — Only images of this name (`alpine`, `alpine:3.*`, as the `reference` filter)
+
+###### **Options:**
+
+* `-a`, `--all` — Taken, as Docker's: Shipyard keeps no intermediate images
+* `-q`, `--quiet` — Only their IDs (the format is then ignored, as Docker's)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE` (aligned, with a header), or a Go TEMPLATE (a line per object; `{{.Names}}`, `{{json .}}`, Docker's fields and functions)
+* `-f`, `--filter <KEY=VALUE>` — Only those that match: KEY=VALUE, as Docker's (repeat a key for any of its values; `label` for all of them)
+* `--no-trunc` — Don't cut IDs short
+* `--digests` — Show each image's digest too
 
 
 
 ## `shipyard image prune`
 
-Remove unreferenced images, layers and blobs from the store
+Remove dangling images (every image no container was made from, with -a), and what nothing in the store needs
 
-**Usage:** `shipyard image prune`
+**Usage:** `shipyard image prune [OPTIONS]`
+
+###### **Options:**
+
+* `-a`, `--all` — Every image no container was made from, not only dangling ones
+* `-f`, `--force` — Don't ask (needed where there's no terminal to ask on)
+* `--filter <KEY=VALUE>` — Only what matches: `until=TIME` (a time, or a duration such as `24h`: made before), `label=KEY[=VALUE]`, `label!=KEY[=VALUE]`; `image prune` takes `dangling=false` too (as -a)
+
+
+
+## `shipyard image rm`
+
+Remove images (`rmi`)
+
+**Usage:** `shipyard image rm [OPTIONS] <IMAGE>...`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The images to remove: references or IDs
+
+###### **Options:**
+
+* `-f`, `--force` — Untag an image even while a container uses it (a container keeps what it needs until it's removed; a foreground run's layers stay until it ends and a prune collects them)
+
+
+
+## `shipyard image pull`
+
+Pull an image (`pull`)
+
+**Usage:** `shipyard image pull [OPTIONS] <IMAGE>`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The image, like `alpine:3.20` or `ghcr.io/owner/app@sha256:...`
+
+###### **Options:**
+
+* `-q`, `--quiet` — Print nothing but the image's digest
+
+
+
+## `shipyard image tag`
+
+Give an image another name (`tag`)
+
+**Usage:** `shipyard image tag <SOURCE_IMAGE> <TARGET_IMAGE>`
+
+###### **Arguments:**
+
+* `<SOURCE_IMAGE>` — The image: a reference or an ID
+* `<TARGET_IMAGE>` — Its new name, like `registry.example/app:1.0`
+
+
+
+## `shipyard image inspect`
+
+Show images in full, as JSON: Docker's shape (`docker image inspect`'s)
+
+**Usage:** `shipyard image inspect [OPTIONS] <IMAGE>...`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The images: references or IDs
+
+###### **Options:**
+
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
 
 
 
@@ -681,7 +1591,7 @@ Manage named volumes
 
 ###### **Subcommands:**
 
-* `create` — Create a named volume
+* `create` — Create a named volume (one with a new name of its own without NAME; one that's there already is left as it is)
 * `ls` — List named volumes
 * `inspect` — Show a volume's details
 * `rm` — Remove one or more named volumes (never one a running container uses)
@@ -691,13 +1601,21 @@ Manage named volumes
 
 ## `shipyard volume create`
 
-Create a named volume
+Create a named volume (one with a new name of its own without NAME; one that's there already is left as it is)
 
-**Usage:** `shipyard volume create <NAME>`
+**Usage:** `shipyard volume create [OPTIONS] [NAME]`
 
 ###### **Arguments:**
 
 * `<NAME>` — The volume's name
+
+###### **Options:**
+
+* `-l`, `--label <KEY[=VALUE]>` — Set a label on it: KEY=VALUE, or KEY (an empty value). Repeatable
+* `-d`, `--driver <DRIVER>` — Its driver: local, the only one (a directory of the store's)
+
+  Default value: `local`
+* `-o`, `--opt <KEY=VALUE>` — A driver option: refused (a local volume is a directory, with no options; `type=nfs` and the like aren't mounted)
 
 
 
@@ -705,7 +1623,15 @@ Create a named volume
 
 List named volumes
 
-**Usage:** `shipyard volume ls`
+**Usage:** `shipyard volume ls [OPTIONS]`
+
+**Command Alias:** `list`
+
+###### **Options:**
+
+* `-q`, `--quiet` — Only their IDs (the format is then ignored, as Docker's)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE` (aligned, with a header), or a Go TEMPLATE (a line per object; `{{.Names}}`, `{{json .}}`, Docker's fields and functions)
+* `-f`, `--filter <KEY=VALUE>` — Only those that match: KEY=VALUE, as Docker's (repeat a key for any of its values; `label` for all of them)
 
 
 
@@ -713,11 +1639,15 @@ List named volumes
 
 Show a volume's details
 
-**Usage:** `shipyard volume inspect <NAME>`
+**Usage:** `shipyard volume inspect [OPTIONS] <VOLUME>...`
 
 ###### **Arguments:**
 
-* `<NAME>` — The volume's name
+* `<VOLUME>` — The volumes
+
+###### **Options:**
+
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
 
 
 
@@ -756,8 +1686,8 @@ Manage networks (bridges containers share; Linux, root)
 * `create` — Create a network: a bridge with a subnet of its own
 * `ls` — List networks
 * `inspect` — Show networks' details, and the containers on them, as JSON
-* `rm` — Remove one or more networks (never one a container uses, nor the default one)
-* `prune` — Remove every network no container uses but the default one (asks first)
+* `rm` — Remove one or more networks (never one a container that's up is on, nor the default one; a stopped container doesn't keep its networks, as Docker's don't)
+* `prune` — Remove every network no container that's up is on, but the default one (asks first)
 * `connect` — Connect a container to a network: at once if it's running, at its next start otherwise
 * `disconnect` — Disconnect a container from a network: at once if it's running, at its next start otherwise
 
@@ -781,6 +1711,11 @@ Create a network: a bridge with a subnet of its own
 * `--internal` — No way out of it: containers on it reach each other and the host only (each other only, with --isolate-host)
 * `--isolate-host` — Keep its containers from the host itself (its services, on any of its addresses) and from the cloud's metadata addresses, but for the network's DNS server. Not for the default network
 * `--conntrack-limit` — Limit each container address on it to 8192 open connections (of those it opens: to the world, the host and other networks); more are refused
+* `-l`, `--label <KEY[=VALUE]>` — Set a label on it: KEY=VALUE, or KEY (an empty value). Repeatable
+* `-d`, `--driver <DRIVER>` — Its driver: bridge, the only one
+
+  Default value: `bridge`
+* `-o`, `--opt <KEY=VALUE>` — A driver option, KEY=VALUE: Docker's bridge options at their defaults, and Shipyard's own (`com.shipyard.network.isolate-host`, `com.shipyard.network.conntrack-limit`); others are refused. Repeatable
 
 
 
@@ -788,7 +1723,16 @@ Create a network: a bridge with a subnet of its own
 
 List networks
 
-**Usage:** `shipyard network ls`
+**Usage:** `shipyard network ls [OPTIONS]`
+
+**Command Alias:** `list`
+
+###### **Options:**
+
+* `-q`, `--quiet` — Only their IDs (the format is then ignored, as Docker's)
+* `--format <FORMAT>` — How to print them: `table` (the default), `json` (an object per line), `table TEMPLATE` (aligned, with a header), or a Go TEMPLATE (a line per object; `{{.Names}}`, `{{json .}}`, Docker's fields and functions)
+* `-f`, `--filter <KEY=VALUE>` — Only those that match: KEY=VALUE, as Docker's (repeat a key for any of its values; `label` for all of them)
+* `--no-trunc` — Don't cut IDs short
 
 
 
@@ -796,17 +1740,22 @@ List networks
 
 Show networks' details, and the containers on them, as JSON
 
-**Usage:** `shipyard network inspect <NETWORK>...`
+**Usage:** `shipyard network inspect [OPTIONS] <NETWORK>...`
 
 ###### **Arguments:**
 
 * `<NETWORK>` — The networks
 
+###### **Options:**
+
+* `--shipyard` — Shipyard's own view instead (the containers on it by their leases, its bridge, its DNS server)
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+
 
 
 ## `shipyard network rm`
 
-Remove one or more networks (never one a container uses, nor the default one)
+Remove one or more networks (never one a container that's up is on, nor the default one; a stopped container doesn't keep its networks, as Docker's don't)
 
 **Usage:** `shipyard network rm <NETWORK>...`
 
@@ -818,7 +1767,7 @@ Remove one or more networks (never one a container uses, nor the default one)
 
 ## `shipyard network prune`
 
-Remove every network no container uses but the default one (asks first)
+Remove every network no container that's up is on, but the default one (asks first)
 
 **Usage:** `shipyard network prune [OPTIONS]`
 
@@ -872,9 +1821,26 @@ System-wide information and maintenance
 
 ###### **Subcommands:**
 
+* `prune` — Remove what nothing uses: stopped containers, unused networks, dangling images (every unused one with -a), unused anonymous volumes with --volumes
 * `df` — Show the store's disk usage
 * `recover` — Settle containers that ended unwatched, then start those whose restart policy brings them back when the host starts (what the boot unit runs: see contrib/systemd)
 * `stop` — Stop every container that's up, for the host's shutdown, each with its own stop signal and timeout: not as your stop (their restart policy brings them back at boot), and none restarted until `system recover` (what shipyard-stop.service runs at a shutdown)
+* `service` — Serve Docker's Engine API (a subset, version 1.43) on a UNIX socket, for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`); systemd's shipyard.socket starts it at the first connection (see contrib/systemd). It exits once nothing has been asked for 60 s (`SHIPYARD_API_IDLE`: other whole seconds)
+
+
+
+## `shipyard system prune`
+
+Remove what nothing uses: stopped containers, unused networks, dangling images (every unused one with -a), unused anonymous volumes with --volumes
+
+**Usage:** `shipyard system prune [OPTIONS]`
+
+###### **Options:**
+
+* `-a`, `--all` — Every image no container was made from, not only dangling ones
+* `--volumes` — The anonymous volumes no container uses too
+* `-f`, `--force` — Don't ask (needed where there's no terminal to ask on)
+* `--filter <KEY=VALUE>` — Only what matches: `until=TIME` (a time, or a duration such as `24h`: made before), `label=KEY[=VALUE]`, `label!=KEY[=VALUE]`; `image prune` takes `dangling=false` too (as -a)
 
 
 
@@ -882,7 +1848,11 @@ System-wide information and maintenance
 
 Show the store's disk usage
 
-**Usage:** `shipyard system df`
+**Usage:** `shipyard system df [OPTIONS]`
+
+###### **Options:**
+
+* `--format <FORMAT>` — How to show it: Docker's table without it; `json`, an object per kind; or a Go TEMPLATE (`{{.Type}} {{.Size}}`)
 
 
 
@@ -902,6 +1872,18 @@ Stop every container that's up, for the host's shutdown, each with its own stop 
 
 
 
+## `shipyard system service`
+
+Serve Docker's Engine API (a subset, version 1.43) on a UNIX socket, for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`); systemd's shipyard.socket starts it at the first connection (see contrib/systemd). It exits once nothing has been asked for 60 s (`SHIPYARD_API_IDLE`: other whole seconds)
+
+**Usage:** `shipyard system service [OPTIONS]`
+
+###### **Options:**
+
+* `--socket <PATH>` — The socket to listen on, when systemd passes none (by default api.sock in the containers' state directory: /run/shipyard for root, shipyard in the user's runtime directory for anyone else)
+
+
+
 ## `shipyard vm`
 
 The Linux VM containers run in on a Mac: its status, start and stop
@@ -913,6 +1895,8 @@ The Linux VM containers run in on a Mac: its status, start and stop
 * `start` — Start the VM, if it isn't running, and wait for its guest to boot
 * `status` — Say whether the VM runs, which guest it boots, and the ports it forwards to this Mac
 * `stop` — Stop the VM: its containers stopped in order, then the guest powered off
+* `install` — Let launchd hold Docker's socket while the VM is stopped and start the VM at its first connection (`docker` works any time; nothing runs until then). Run again after moving shipyard
+* `uninstall` — Undo `vm install`: launchd lets go of Docker's socket (a VM it started is stopped first)
 
 
 
@@ -940,11 +1924,51 @@ Stop the VM: its containers stopped in order, then the guest powered off
 
 
 
+## `shipyard vm install`
+
+Let launchd hold Docker's socket while the VM is stopped and start the VM at its first connection (`docker` works any time; nothing runs until then). Run again after moving shipyard
+
+**Usage:** `shipyard vm install`
+
+
+
+## `shipyard vm uninstall`
+
+Undo `vm install`: launchd lets go of Docker's socket (a VM it started is stopped first)
+
+**Usage:** `shipyard vm uninstall`
+
+
+
 ## `shipyard doctor`
 
 Check whether this host can run containers, and what to fix
 
 **Usage:** `shipyard doctor`
+
+
+
+## `shipyard version`
+
+Show Shipyard's version and its host's (`--format` a Go template over `{Client, Server}`, as Docker's)
+
+**Usage:** `shipyard version [OPTIONS]`
+
+###### **Options:**
+
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+
+
+
+## `shipyard info`
+
+Show what Shipyard has and what its host is (`--format` a Go template over Docker's `SystemInfo`)
+
+**Usage:** `shipyard info [OPTIONS]`
+
+###### **Options:**
+
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
 
 
 

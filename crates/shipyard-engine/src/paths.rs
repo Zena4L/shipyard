@@ -40,6 +40,25 @@ pub struct Paths {
     /// The variables that moved a store from its default place (F44): the
     /// boot unit, which runs with systemd's environment, won't see them.
     store_overrides: Vec<&'static str>,
+    /// The Docker API's socket, if `SHIPYARD_API_SOCKET` moves it (for
+    /// tests: each its own service); else the runtime root's.
+    api_socket: Option<std::result::Result<PathBuf, String>>,
+    /// A test build's pause in a create's fill (`SHIPYARD_TEST_FILL_PAUSE`:
+    /// where to say it's there), for a test to kill it mid-fill. A release
+    /// takes none.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "a fill is Linux's")
+    )]
+    fill_pause: Option<PathBuf>,
+    /// A test build's pause in a start, its container made and not yet
+    /// started (`SHIPYARD_TEST_START_PAUSE`: where to say it's there), for a
+    /// test to end its init in F119's window. A release takes none.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "a start is Linux's")
+    )]
+    start_pause: Option<PathBuf>,
 }
 
 /// The variables that move a store (for [`Paths::store_overrides`]).
@@ -123,7 +142,9 @@ impl Paths {
     ///
     /// The events journal: `SHIPYARD_EVENTS_DIR` if set, else beside the
     /// containers' records (`/var/lib/shipyard/events` for root: see
-    /// [`events`](Self::events)).
+    /// [`events`](Self::events)). The API's socket: `SHIPYARD_API_SOCKET`
+    /// if set (for tests: each its own service), else the runtime root's
+    /// (see [`api_socket`](Self::api_socket)).
     ///
     /// Which of these moved a store is kept for
     /// [`store_overrides`](Self::store_overrides) (F44).
@@ -151,7 +172,38 @@ impl Paths {
             program_path: std::env::var_os("PATH"),
             started_by_sudo: std::env::var_os("SUDO_USER").is_some(),
             store_overrides: store_overrides_from_env(),
+            api_socket: std::env::var_os("SHIPYARD_API_SOCKET")
+                .filter(|path| !path.is_empty())
+                .map(|path| absolute("API socket", "SHIPYARD_API_SOCKET", PathBuf::from(path))),
+            fill_pause: std::env::var_os("SHIPYARD_TEST_FILL_PAUSE")
+                .filter(|path| cfg!(debug_assertions) && !path.is_empty())
+                .map(PathBuf::from),
+            start_pause: std::env::var_os("SHIPYARD_TEST_START_PAUSE")
+                .filter(|path| cfg!(debug_assertions) && !path.is_empty())
+                .map(PathBuf::from),
         }
+    }
+
+    /// A test build's pause in a create's fill, if one was asked for
+    /// (`SHIPYARD_TEST_FILL_PAUSE`): where the fill says it's there.
+    #[must_use]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "a fill is Linux's")
+    )]
+    pub(crate) fn fill_pause(&self) -> Option<&Path> {
+        self.fill_pause.as_deref()
+    }
+
+    /// A test build's pause in a start (`SHIPYARD_TEST_START_PAUSE`): where
+    /// the start says its container's ID, then waits for it to be removed.
+    #[must_use]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "a start is Linux's")
+    )]
+    pub(crate) fn start_pause(&self) -> Option<&Path> {
+        self.start_pause.as_deref()
     }
 
     /// These places, with networks kept in `dir`.
@@ -291,6 +343,36 @@ impl Paths {
         self.runtime_root
             .as_deref()
             .map_err(|why| Error::new(ErrorKind::Environment, why.clone()))
+    }
+
+    /// The Docker API's socket, `api.sock` in the [runtime's state
+    /// root](Self::runtime_root): `/run/shipyard/api.sock` for root, else
+    /// `$XDG_RUNTIME_DIR/shipyard/api.sock` (step 11.2a, D11.2-1);
+    /// `SHIPYARD_API_SOCKET` (tests) wins.
+    ///
+    /// # Errors
+    ///
+    /// As [`runtime_root`](Self::runtime_root);
+    /// [`ErrorKind::Environment`] for a `SHIPYARD_API_SOCKET` that isn't an
+    /// absolute path.
+    pub fn api_socket(&self) -> Result<PathBuf> {
+        match &self.api_socket {
+            Some(socket) => socket
+                .clone()
+                .map_err(|why| Error::new(ErrorKind::Environment, why)),
+            None => Ok(self.runtime_root()?.join("api.sock")),
+        }
+    }
+
+    /// Where the API's exec `exec_id` has its command's PID written once it
+    /// runs (F117): `.exec-<id>.pid` in the runtime's state root, the
+    /// caller's alone (no container's ID starts with a dot).
+    ///
+    /// # Errors
+    ///
+    /// As [`runtime_root`](Self::runtime_root).
+    pub fn exec_pid_file(&self, exec_id: &str) -> Result<PathBuf> {
+        Ok(self.runtime_root()?.join(format!(".exec-{exec_id}.pid")))
     }
 
     /// These places, with the image store at `dir`.

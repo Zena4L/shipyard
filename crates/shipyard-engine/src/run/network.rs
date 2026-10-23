@@ -31,6 +31,26 @@ impl RunRequest {
                 crate::network::NETWORKS_NEED_ROOT
             );
         }
+        if let NetworkMode::Container(container) = mode {
+            // Another container's, as it is: nothing of this one's goes in
+            // it (checked before the runtime's checks, so no refusal names
+            // another flag), its maps too.
+            refuse_with_a_joined_network(self, container)?;
+            isolation.namespaces.push(Namespace::Network);
+            isolation.sysctls.clone_from(&self.sysctl);
+            match &self.joined.network {
+                Some(joined) => join_namespace(isolation, Namespace::Network, &joined.init),
+                // A start (it has a container) always finds it first: one
+                // without would get an empty network of its own.
+                None if self.container.is_some() => bail!(
+                    Runtime,
+                    "the container whose network it joins wasn't found for this start"
+                ),
+                // A create's check: nothing is started.
+                None => {}
+            }
+            return Ok(());
+        }
         if mode.own_namespace() {
             isolation.namespaces.push(Namespace::Network);
             // The groups the container has: its own user namespace's, or
@@ -69,6 +89,9 @@ impl RunRequest {
                     (NetworkMode::Host, true) => {
                         "the host's network (the default here), the container's ports are the \
                          host's already"
+                    }
+                    (NetworkMode::Container(_), _) => {
+                        "--network container:, the ports are the other container's"
                     }
                     _ => "--network none, there's nothing to publish to",
                 }
@@ -114,7 +137,39 @@ impl RunRequest {
         } else {
             None
         };
-        let hostname = match self.hostname_for(&run, &mode) {
+        let (hostname, hosts, dns) = self.etc_settings(&run, &mode)?;
+        Ok(NetworkPlan {
+            hostname,
+            mode,
+            run,
+            etc_files: has_root,
+            hosts,
+            dns,
+            ports: self.publish.clone(),
+            publish_all: self.publish_all,
+            pasta,
+            defaulted: self.network.is_empty(),
+            name: self.name.clone(),
+            container: self.container.clone(),
+            joined: self.joined.network.clone(),
+        })
+    }
+
+    /// What its `/etc` files are made of: its hostname, `--add-host` and
+    /// `--dns*`; another container's network's, if it joins one.
+    fn etc_settings(
+        &self,
+        run: &RunId,
+        mode: &NetworkMode,
+    ) -> Result<(String, Vec<shipyard_network::files::HostEntry>, DnsSettings)> {
+        if let Some(joined) = &self.joined.network {
+            return Ok((
+                joined.hostname.clone(),
+                joined.hosts.clone(),
+                joined.dns.clone(),
+            ));
+        }
+        let hostname = match self.hostname_for(run, mode) {
             Some(hostname) => hostname,
             // The host's network, and its name with it.
             None => nix::unistd::gethostname()
@@ -122,24 +177,12 @@ impl RunRequest {
                 .to_string_lossy()
                 .into_owned(),
         };
-        Ok(NetworkPlan {
-            hostname,
-            mode,
-            run,
-            etc_files: has_root,
-            hosts: self.add_host.clone(),
-            dns: DnsSettings {
-                servers: self.dns.clone(),
-                search: self.dns_search.clone(),
-                options: self.dns_option.clone(),
-            },
-            ports: self.publish.clone(),
-            publish_all: self.publish_all,
-            pasta,
-            defaulted: self.network.is_empty(),
-            name: self.name.clone(),
-            container: self.container.clone(),
-        })
+        let dns = DnsSettings {
+            servers: self.dns.clone(),
+            search: self.dns_search.clone(),
+            options: self.dns_option.clone(),
+        };
+        Ok((hostname, self.add_host.clone(), dns))
     }
 
     /// The run's network: what `network` asks for, with
@@ -170,31 +213,34 @@ impl RunRequest {
     /// The network a run gets without `--network` (see
     /// [`network_mode`](Self::network_mode)): worked out once a run, as it
     /// reads `/proc`.
+    fn default_network(engine: &Engine) -> NetworkMode {
+        use crate::network::Defaulted;
+        match crate::network::defaulted() {
+            Defaulted::Bridge => NetworkMode::bridge(shipyard_network::store::DEFAULT_NETWORK),
+            Defaulted::Pasta => NetworkMode::Pasta,
+            Defaulted::Host => Self::host_by_default(engine),
+        }
+    }
+
+    /// The host's network for a run that asked for none: said, where it's
+    /// a root that can't make a bridge (off Linux, it's all there is).
     #[cfg_attr(
         not(target_os = "linux"),
         allow(unused_variables, reason = "the warning is Linux's")
     )]
-    fn default_network(engine: &Engine) -> NetworkMode {
-        if !cfg!(target_os = "linux") {
-            NetworkMode::Host
-        } else if crate::network::can_network() {
-            NetworkMode::bridge(shipyard_network::store::DEFAULT_NETWORK)
-        } else if crate::network::host_root() {
-            #[cfg(target_os = "linux")]
-            if let Some(why) = crate::network::why_no_network() {
-                engine.warn(
-                    WarningKind::HostNetworkFallback,
-                    format!(
-                        "the container gets the host's network: the bridge network needs \
-                         CAP_NET_ADMIN and a writable /proc/sys, and {why}. Pass --network host \
-                         to choose it (without this warning), or --network none for no network"
-                    ),
-                );
-            }
-            NetworkMode::Host
-        } else {
-            NetworkMode::Pasta
+    fn host_by_default(engine: &Engine) -> NetworkMode {
+        #[cfg(target_os = "linux")]
+        if let Some(why) = crate::network::why_no_network() {
+            engine.warn(
+                WarningKind::HostNetworkFallback,
+                format!(
+                    "the container gets the host's network: the bridge network needs \
+                     CAP_NET_ADMIN and a writable /proc/sys, and {why}. Pass --network host to \
+                     choose it (without this warning), or --network none for no network"
+                ),
+            );
         }
+        NetworkMode::Host
     }
 
     /// An isolated container's hostname: `--hostname`; else, with a network
@@ -202,10 +248,68 @@ impl RunRequest {
     /// set: with the host's network, it keeps the host's name (as Docker
     /// does), the one the host's `/etc/hosts` and DNS know.
     pub(super) fn hostname_for(&self, run: &RunId, mode: &NetworkMode) -> Option<String> {
-        self.hostname
-            .clone()
-            .or_else(|| mode.own_namespace().then(|| run.as_str().to_owned()))
+        self.hostname.clone().or_else(|| {
+            (mode.own_namespace() || mode.joined_container().is_some())
+                .then(|| run.as_str().to_owned())
+        })
     }
+}
+
+/// Gives `isolation` `process`'s namespace of `kind`, and its user
+/// namespace (once) where that's joined too, with its maps.
+pub(super) fn join_namespace(
+    isolation: &mut Isolation,
+    kind: Namespace,
+    process: &crate::network::JoinedProcess,
+) {
+    use shipyard_runtime::isolation::{JoinSource, NamespaceJoin};
+    let from = JoinSource::Process {
+        pid: process.pid,
+        start_time: process.start_time,
+    };
+    isolation.joins.push(NamespaceJoin::new(kind, from.clone()));
+    if let Some(maps) = &process.maps
+        && !isolation.is_joined(Namespace::User)
+    {
+        if !isolation.has(Namespace::User) {
+            isolation.namespaces.push(Namespace::User);
+        }
+        isolation.id_maps = Some(maps.clone());
+        isolation
+            .joins
+            .push(NamespaceJoin::new(Namespace::User, from));
+    }
+}
+
+/// What a container that joins another's network can't be given: the
+/// other's names, addresses and files are its own (Docker's "conflicting
+/// options").
+fn refuse_with_a_joined_network(request: &RunRequest, container: &str) -> Result<()> {
+    let given = [
+        ("--hostname", request.hostname.is_some()),
+        ("--add-host", !request.add_host.is_empty()),
+        (
+            "--dns, --dns-search and --dns-option",
+            !request.dns.is_empty()
+                || !request.dns_search.is_empty()
+                || !request.dns_option.is_empty(),
+        ),
+        (
+            "net.* --sysctl settings",
+            request
+                .sysctl
+                .iter()
+                .any(|(key, _)| key.starts_with("net.")),
+        ),
+    ];
+    if let Some((flag, _)) = given.iter().find(|(_, given)| *given) {
+        bail!(
+            InvalidRequest,
+            "{flag} can't be given with --network container:{container}: the network, its names \
+             and its files are that container's"
+        );
+    }
+    Ok(())
 }
 
 /// `--ip`, `--ip6` and `--mac-address`: a container's addresses on its one
@@ -260,8 +364,8 @@ pub(super) fn combine_networks(
             }
             _ => bail!(
                 InvalidRequest,
-                "--network host, none and pasta can't be combined with other networks: a \
-                 container on several is on bridge networks"
+                "--network host, none, pasta and container: can't be combined with other \
+                 networks: a container on several is on bridge networks"
             ),
         }
     }

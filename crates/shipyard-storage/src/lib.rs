@@ -12,4 +12,6 @@ compile_error!("shipyard-storage only supports UNIX platforms (Linux, macOS)");
 
 pub mod volume;
 
-pub use volume::{Pruned, Volume, VolumeError, VolumeHold, VolumeMount, Volumes, is_trash};
+pub use volume::{
+    Filling, Pruned, Volume, VolumeError, VolumeHold, VolumeMount, Volumes, is_trash,
+};

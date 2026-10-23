@@ -101,6 +101,7 @@ pub(super) fn checks(engine: &Engine) -> (User, Vec<Check>) {
             engine.paths().store_overrides(),
             rootless,
         ));
+        checks.extend(api_socket(engine, rootless));
     }
     (user, checks)
 }
@@ -234,10 +235,16 @@ pub(super) fn controllers_check(base: &Path, delegated: &[Controller], rootless:
             Level::Warn,
             NAME,
             format!(
-                "{place}, without the {} controller{}: limits that need {} are refused",
+                "{place}, without the {} controller{}: limits that need {} are refused{}",
                 missing.join(", "),
                 if missing.len() == 1 { "" } else { "s" },
-                if missing.len() == 1 { "it" } else { "them" }
+                if missing.len() == 1 { "it" } else { "them" },
+                // F62: the default is set only where it can be.
+                if delegated.contains(&Controller::Pids) {
+                    ""
+                } else {
+                    ", and containers get no default process limit"
+                }
             ),
         )
     }
@@ -655,19 +662,7 @@ pub(super) fn sudo_logout_check(kill_user_processes: bool, sudo: bool) -> Option
 /// longest of the containers' (`longest`): root's, or (rootless) the
 /// user's, as `systemctl` says (an install with `--global` included).
 fn boot_unit(rootless: bool, with_policy: usize, longest: Option<u64>) -> Vec<Check> {
-    let ask = |args: &[&str]| {
-        let mut command = Command::new("systemctl");
-        if rootless {
-            command.arg("--user");
-        }
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .unwrap_or_default()
-    };
+    let ask = |args: &[&str]| systemctl(rootless, args);
     let enabled = |unit: &str| {
         matches!(
             ask(&["is-enabled", unit]).as_str(),
@@ -741,6 +736,79 @@ pub(super) struct StopLimit {
     /// A user's manager's own stop timeout (`user@UID.service`, the
     /// system's), not the stop unit's: on Ubuntu 24.04, 5 s.
     pub(super) by_user_manager: bool,
+}
+
+/// What `systemctl` (`--user` for a rootless caller) prints for `args`,
+/// trimmed: empty if it can't be run.
+fn systemctl(rootless: bool, args: &[&str]) -> String {
+    let mut command = Command::new("systemctl");
+    if rootless {
+        command.arg("--user");
+    }
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// The Docker API's line (step 11.2a): whether systemd's socket starts
+/// the service, and where clients find it.
+fn api_socket(engine: &Engine, rootless: bool) -> Option<Check> {
+    let path = engine.paths().api_socket().ok()?;
+    let enabled = matches!(
+        systemctl(rootless, &["is-enabled", API_SOCKET_UNIT]).as_str(),
+        "enabled" | "enabled-runtime"
+    );
+    let socket = ApiSocket {
+        enabled,
+        failed: systemctl(rootless, &["is-active", API_SOCKET_UNIT]) == "failed",
+        // Never connected to while systemd's socket has it: a connection
+        // would start the service, for a check that only looks.
+        served: !enabled && std::os::unix::net::UnixStream::connect(&path).is_ok(),
+    };
+    Some(api_socket_check(socket, &path, rootless))
+}
+
+/// The API's socket unit (contrib/systemd).
+const API_SOCKET_UNIT: &str = "shipyard.socket";
+
+/// What's known of the Docker API's socket.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ApiSocket {
+    /// systemd's socket unit is enabled.
+    pub(super) enabled: bool,
+    /// It failed.
+    pub(super) failed: bool,
+    /// Something answers on the socket (systemd, or a service run by hand).
+    pub(super) served: bool,
+}
+
+/// The Docker API's line: never a limit (it's for Docker's clients, not
+/// Shipyard's), but a failed socket unit is said.
+pub(super) fn api_socket_check(socket: ApiSocket, path: &Path, rootless: bool) -> Check {
+    const NAME: &str = "docker api";
+    let user = if rootless { "--user " } else { "" };
+    if socket.failed {
+        return Check::new(
+            Level::Warn,
+            NAME,
+            format!("shipyard.socket failed: see `journalctl {user}-u shipyard.socket`"),
+        );
+    }
+    let host = format!("DOCKER_HOST=unix://{}", path.display());
+    let text = match (socket.enabled, socket.served) {
+        (true, _) => format!("shipyard.socket is enabled: {host}"),
+        (false, true) => format!("served (not by shipyard.socket): {host}"),
+        (false, false) => format!(
+            "not served at {}: for Docker's clients, enable shipyard.socket (see \
+             contrib/systemd), or run `shipyard system service`",
+            path.display()
+        ),
+    };
+    Check::new(Level::Ok, NAME, text)
 }
 
 /// The unit that starts the containers at boot (contrib/systemd).

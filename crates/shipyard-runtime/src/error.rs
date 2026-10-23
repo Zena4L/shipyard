@@ -318,6 +318,20 @@ pub enum Error {
     #[error("{0}")]
     Network(String),
 
+    /// Joining a namespace that isn't a network one failed (an IPC or UTS
+    /// namespace a container joins, or the process that joins another
+    /// container's user namespace): what was being done and why.
+    #[error("{0}")]
+    Namespace(String),
+
+    /// Another container's user namespace, to be joined, has other ID maps
+    /// than the container was given (its setup goes by them).
+    #[error("process {pid}'s user namespace has other ID maps than the container was given")]
+    JoinedMapsDiffer {
+        /// The other container's init.
+        pid: u32,
+    },
+
     /// A system call failed in shipyard itself. `op` says what we were doing;
     /// the errno is the error's source, so full-chain printing shows both once.
     #[error("{op}")]

@@ -51,8 +51,8 @@ pub enum ContainerState {
 }
 
 impl ContainerState {
-    /// Its name, as `ps` and `inspect` say it: `created`, `running`,
-    /// `paused`, `stopping`, `restarting` or `exited`.
+    /// Its name, as `ps` and `inspect --shipyard` say it: `created`,
+    /// `running`, `paused`, `stopping`, `restarting` or `exited`.
     #[must_use]
     pub fn word(&self) -> &'static str {
         match self {
@@ -65,9 +65,21 @@ impl ContainerState {
         }
     }
 
+    /// Its name as Docker says it (`docker inspect`'s `State.Status`):
+    /// Docker has no stopping, so a container still stopping is
+    /// `running`, as Docker's is until its end.
+    #[must_use]
+    pub fn docker_word(&self) -> &'static str {
+        match self {
+            Self::Stopping => "running",
+            other => other.word(),
+        }
+    }
+
     /// Whether it's active: running, paused, still stopping, or about to
-    /// restart. What `ps` lists without `-a`, and (until stage 11) what
-    /// `inspect` says is `running`.
+    /// restart. What `ps` lists without `-a`, and what both views of
+    /// `inspect` say is running (as Docker says a restarting container is:
+    /// moby's `SetRestarting`).
     #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(

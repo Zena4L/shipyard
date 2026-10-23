@@ -369,15 +369,20 @@ fn a_killed_servers_worker_is_started_again() {
         assert_eq!(networks.inspect("app")["DNSRunning"], true);
         // SAFETY: `kill` takes plain values.
         assert_eq!(unsafe { libc::kill(server[0], libc::SIGTERM) }, 0);
+        // Gone is its lock let go too: a process's command line empties
+        // (the kernel's `exit_mm`) before its files close (`exit_files`),
+        // so the processes can look gone while the lock is still held.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !networks.dns_workers().is_empty() || !networks.dns_servers().is_empty() {
+        while !networks.dns_workers().is_empty()
+            || !networks.dns_servers().is_empty()
+            || networks.inspect("app")["DNSRunning"] != false
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "its worker outlived it"
+                "its worker outlived it, or its lock is still held"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(networks.inspect("app")["DNSRunning"], false);
         db.stop();
     });
 }
@@ -655,11 +660,11 @@ fn a_renamed_container_answers_to_its_new_name() {
         assert_eq!(addresses(&answer(short)), [web]);
         assert_eq!(addresses(&answer(&short.to_uppercase())), [web]);
         let refused = shipyard(&["rename", "web", "DB"]);
-        assert_eq!(refused.code, Some(125), "{}", refused.stderr);
+        assert_eq!(refused.code, Some(1), "{}", refused.stderr);
         assert!(refused.stderr.contains("taken"), "{}", refused.stderr);
         assert_eq!(addresses(&answer("web")), [web], "unchanged");
         let named = |reference: &str| {
-            let shown = shipyard(&["inspect", reference]);
+            let shown = shipyard(&["inspect", "--shipyard", reference]);
             serde_json::from_str::<serde_json::Value>(&shown.stdout).unwrap()[0]["name"].clone()
         };
         assert_eq!(named("web"), "web", "its record unchanged");

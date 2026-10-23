@@ -1,23 +1,15 @@
 //! The kernel's random numbers, for what must be unguessable or unlikely to
 //! repeat: run and container IDs, a container's serial.
 
-use std::fs::File;
-use std::io::Read as _;
-
 use crate::error::{Context as _, Result};
 
-/// `N` random bytes, read from `/dev/urandom` (`random(7)`): the kernel's
-/// generator, which never blocks once it has been seeded at boot.
+/// `N` random bytes, the kernel's (`shipyard_sys::random`).
 ///
 /// # Errors
 ///
 /// `/dev/urandom` couldn't be read.
 pub(crate) fn bytes<const N: usize>() -> Result<[u8; N]> {
-    let mut bytes = [0u8; N];
-    File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut bytes))
-        .context("reading /dev/urandom")?;
-    Ok(bytes)
+    shipyard_sys::random::bytes().context("reading /dev/urandom")
 }
 
 /// `bytes` as lowercase hex, two characters a byte.

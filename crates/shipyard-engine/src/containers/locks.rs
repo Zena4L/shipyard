@@ -30,6 +30,19 @@ pub(crate) fn restarting_lock(
     )
 }
 
+/// Whether container `id`'s restart is held: by its clean-up, from before it
+/// lets the container go until its policy has decided, and by the waiter
+/// through its backoff (step 11.3e1). A container whose restart is held is
+/// as good as up: it's about to start again. Tried, never waited for (a
+/// look holds it for a moment: a caller beside it may see it held).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "asked by the removals, which are Linux's")
+)]
+pub(crate) fn restart_pending(engine: &Engine, id: &ContainerId) -> bool {
+    restarting_lock(engine, id, std::time::Duration::ZERO).is_err()
+}
+
 /// Container `id`'s operation lock ([`OP_LOCK`]), waited for up to `wait`
 /// (another `start` or `rm` of it may take that long): held until dropped.
 ///

@@ -1,6 +1,7 @@
 //! `shipyard events`: the engine's journal of what happened (containers
 //! made, started, ended; images pulled; volumes and networks made and
-//! removed), printed as Docker prints it, or as JSON lines.
+//! removed), printed as Docker prints it: its line, or a Go template over
+//! Docker's event message (`json`: one object per line).
 
 use std::process::ExitCode;
 
@@ -26,20 +27,72 @@ pub(crate) struct EventsArgs {
     /// network=NAME. Repeat a key for any of its values.
     #[arg(short, long, value_name = "KEY=VALUE")]
     filter: Vec<String>,
-    /// How to print them: Docker's line, or JSON (one object per line, as
-    /// the journal keeps it).
-    #[arg(long, value_enum, default_value_t)]
-    format: Format,
+    /// How to print them: Docker's line without it; `json` (Docker's event
+    /// message, an object per line), or a Go TEMPLATE over it
+    /// (`{{.Type}} {{.Action}} {{.Actor.Attributes.name}}`).
+    #[arg(long, value_name = "FORMAT")]
+    format: Option<String>,
 }
 
-/// `events`' output.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Format {
-    /// `TIME TYPE ACTION ID (KEY=VALUE, …)`.
-    #[default]
-    Text,
-    /// The journal's line.
-    Json,
+/// An event as `--format` reads it: Docker's message, its JSON for
+/// `json`, its Go field names for a template.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct EventRow(shipyard_engine::docker::EventMessage);
+
+/// An event's Go field names (Docker's `events.Message`), each there with
+/// its zero value where the message has none, as Go's are.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct GoMessage<'a> {
+    status: &'a str,
+    #[serde(rename = "ID")]
+    id: &'a str,
+    from: &'a str,
+    #[serde(rename = "Type")]
+    kind: &'a str,
+    action: &'a str,
+    actor: GoActor<'a>,
+    scope: &'a str,
+    time: i64,
+    time_nano: i64,
+}
+
+/// An event's actor by its Go field names.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct GoActor<'a> {
+    #[serde(rename = "ID")]
+    id: &'a str,
+    attributes: &'a std::collections::BTreeMap<String, String>,
+}
+
+impl crate::format::Row for EventRow {
+    fn headers() -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    fn id(&self) -> &str {
+        &self.0.actor.id
+    }
+
+    fn fields(&self) -> gotmpl::Result<gotmpl::Value> {
+        let message = &self.0;
+        gotmpl::to_value(&GoMessage {
+            status: message.status.as_deref().unwrap_or_default(),
+            id: message.id.as_deref().unwrap_or_default(),
+            from: message.from.as_deref().unwrap_or_default(),
+            kind: &message.kind,
+            action: &message.action,
+            actor: GoActor {
+                id: &message.actor.id,
+                attributes: &message.actor.attributes,
+            },
+            scope: message.scope,
+            time: message.time,
+            time_nano: message.time_nano,
+        })
+    }
 }
 
 /// `shipyard events`: the journal's events, as `args` say, until `--until`
@@ -50,12 +103,32 @@ pub(crate) fn events(args: &EventsArgs) -> Result<ExitCode> {
         since: args.since.and_then(events::system_time),
         until: args.until.and_then(events::system_time),
         filters: Filters::parse(&args.filter)?,
-        gone: Some(shipyard_cli::pipe::stdout_gone),
+        gone: Some(shipyard_engine::logs::Gone::new(
+            shipyard_cli::pipe::stdout_gone,
+        )),
     };
+    // Docker's: a template, never a table.
+    let output = args
+        .format
+        .as_deref()
+        .map(crate::format::Output::lines)
+        .transpose()?;
     let mut out = std::io::stdout().lock();
     let read = events::read(&engine, &options, |event| {
         use std::io::Write as _;
-        writeln!(out, "{}", line(&event, args.format))?;
+        match &output {
+            None => writeln!(out, "{}", line(&event))?,
+            // A failed write is the `io::Error` it was (a reader gone
+            // stays quiet: `main`'s `broken_pipe`), a template's failure
+            // one of its own.
+            Some(output) => output
+                .write(&mut out, &[EventRow((&event).into())])
+                .map_err(|error| {
+                    error
+                        .downcast::<std::io::Error>()
+                        .unwrap_or_else(std::io::Error::other)
+                })?,
+        }
         out.flush()
     });
     // A reader gone (`events | head`) ends it quietly: `main`'s `fail`.
@@ -63,12 +136,11 @@ pub(crate) fn events(args: &EventsArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `event` as `format` prints it. Text is meant for a terminal: a control
-/// character in it is escaped (`\u{1b}`), never sent.
-fn line(event: &Event, format: Format) -> String {
-    match format {
-        Format::Json => event.to_line(),
-        Format::Text => {
+/// `event` as Docker's line prints it. It's meant for a terminal: a
+/// control character in it is escaped (`\u{1b}`), never sent.
+fn line(event: &Event) -> String {
+    {
+        {
             let mut text = format!(
                 "{} {} {}",
                 events::rfc3339(event.time),
@@ -108,22 +180,18 @@ mod tests {
             .with("exitCode", 3)
             .at(SystemTime::UNIX_EPOCH + Duration::new(1_760_000_000, 5));
         assert_eq!(
-            line(&event, Format::Text),
+            line(&event),
             "2025-10-09T08:53:20.000000005Z container die 0123abcd (exitCode=3, name=web)"
         );
-        assert_eq!(line(&event, Format::Json), event.to_line());
         let prune = Event::new(Kind::Image, "prune", "")
             .at(SystemTime::UNIX_EPOCH + Duration::new(1_760_000_000, 0));
-        assert_eq!(
-            line(&prune, Format::Text),
-            "2025-10-09T08:53:20.000000000Z image prune"
-        );
+        assert_eq!(line(&prune), "2025-10-09T08:53:20.000000000Z image prune");
         // A terminal's escapes are printed, never sent.
         let named = Event::new(Kind::Volume, "create", "v\x1b[2Jx")
             .with("note", "a\nb")
             .at(SystemTime::UNIX_EPOCH);
         assert_eq!(
-            line(&named, Format::Text),
+            line(&named),
             "1970-01-01T00:00:00.000000000Z volume create v\\u{1b}[2Jx (note=a\\u{a}b)"
         );
     }

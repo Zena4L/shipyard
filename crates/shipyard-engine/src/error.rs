@@ -272,13 +272,18 @@ impl From<shipyard_runtime::container::ContainerError> for Error {
             ContainerError::InvalidId(_)
             | ContainerError::CantStop { .. }
             | ContainerError::BadHoldLabel(_) => ErrorKind::InvalidRequest,
-            // Ended: what needed it running raced its end. (Running when it
-            // had to be stopped, or created, is the runtime's to say.)
+            // Ended, or paused: what needed it running raced its end or a
+            // `pause` (Docker's 409). (Running when it had to be stopped, or
+            // created, is the runtime's to say.)
             ContainerError::WrongStatus {
-                status: Status::Stopped | Status::Stopping,
+                status: Status::Stopped | Status::Stopping | Status::Paused,
                 ..
             } => ErrorKind::NotRunning,
-            ContainerError::NoStateRoot(_) => ErrorKind::Environment,
+            // No state root, or no cgroup of its own (rootless without
+            // delegation): the host's lack, not a fault.
+            ContainerError::NoStateRoot(_) | ContainerError::NeedsCgroup(_) => {
+                ErrorKind::Environment
+            }
             _ => ErrorKind::Runtime,
         };
         Self::wrap(kind, error)
@@ -300,6 +305,7 @@ impl From<shipyard_image::IndexError> for Error {
         let kind = match &error {
             shipyard_image::IndexError::Busy => ErrorKind::Busy,
             shipyard_image::IndexError::NoSuchImage(_) => ErrorKind::NotFound,
+            shipyard_image::IndexError::Ambiguous(_) => ErrorKind::InvalidRequest,
             _ => ErrorKind::Storage,
         };
         Self::wrap(kind, error)
@@ -342,11 +348,14 @@ impl From<shipyard_image::ReferenceError> for Error {
 impl From<shipyard_storage::VolumeError> for Error {
     fn from(error: shipyard_storage::VolumeError) -> Self {
         let kind = match &error {
-            shipyard_storage::VolumeError::InvalidName(_) => ErrorKind::InvalidRequest,
+            shipyard_storage::VolumeError::InvalidName(_)
+            | shipyard_storage::VolumeError::TooManyLabels(_) => ErrorKind::InvalidRequest,
             shipyard_storage::VolumeError::NotFound(_) => ErrorKind::NotFound,
             shipyard_storage::VolumeError::Exists(_) => ErrorKind::Exists,
             shipyard_storage::VolumeError::InUse(_) => ErrorKind::InUse,
-            shipyard_storage::VolumeError::Io { .. } => ErrorKind::Storage,
+            shipyard_storage::VolumeError::Busy(_) => ErrorKind::Busy,
+            shipyard_storage::VolumeError::Io { .. }
+            | shipyard_storage::VolumeError::Labels { .. } => ErrorKind::Storage,
         };
         Self::wrap(kind, error)
     }
@@ -358,12 +367,14 @@ impl From<shipyard_network::store::StoreError> for Error {
         // `Address` is coarse: an address outside the subnet, one taken, or
         // none left all say so in its message; it's the network's answer.
         let kind = match &error {
-            StoreError::InvalidName(_) => ErrorKind::InvalidRequest,
+            StoreError::InvalidName(_) | StoreError::TooManyLabels(_) => ErrorKind::InvalidRequest,
             StoreError::NotFound(_) => ErrorKind::NotFound,
             StoreError::Exists(_) | StoreError::NameTaken { .. } => ErrorKind::Exists,
             StoreError::InUse { .. } => ErrorKind::InUse,
             StoreError::Busy(_) => ErrorKind::Busy,
-            StoreError::Io { .. } | StoreError::Corrupt { .. } => ErrorKind::Storage,
+            StoreError::Io { .. } | StoreError::Corrupt { .. } | StoreError::Labels { .. } => {
+                ErrorKind::Storage
+            }
             _ => ErrorKind::Network,
         };
         Self::wrap(kind, error)

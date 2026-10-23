@@ -20,7 +20,7 @@ pub struct EventsOptions {
     pub filters: Filters,
     /// Asked between a follower's looks: `true` ends it (its reader has
     /// gone, which a write would only find at the next event).
-    pub gone: Option<fn() -> bool>,
+    pub gone: Option<crate::logs::Gone>,
 }
 
 /// Gives `sink` the journal's events, as `options` say: the past ones from
@@ -86,7 +86,7 @@ pub fn read(
             continue;
         }
         if options.until.is_some_and(|until| SystemTime::now() > until)
-            || options.gone.is_some_and(|gone| gone())
+            || options.gone.as_ref().is_some_and(crate::logs::Gone::ask)
         {
             return Ok(());
         }

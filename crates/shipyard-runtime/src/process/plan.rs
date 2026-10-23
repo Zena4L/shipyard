@@ -214,6 +214,8 @@ pub(crate) struct ReexecFds {
     pub(crate) hooks: Option<RawFd>,
     /// An overlay real root made: passed on too.
     pub(crate) overlay: Option<RawFd>,
+    /// The mount namespace whose `/dev/shm` is shared: passed on too.
+    pub(crate) shm_mount_ns: Option<RawFd>,
     /// The socket the init sends the container's terminal back on: passed
     /// on too.
     pub(crate) terminal: Option<RawFd>,
@@ -778,6 +780,7 @@ fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
             fds.gate,
             fds.hooks,
             fds.overlay,
+            fds.shm_mount_ns,
             fds.terminal,
             &fds.passing,
         ))

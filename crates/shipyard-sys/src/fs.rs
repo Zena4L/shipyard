@@ -541,6 +541,111 @@ pub fn set_mode(file: &File, mode: u32) -> io::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
+/// Why a directory isn't the caller's alone, if it isn't: not a directory
+/// (or a symbolic link), another user's, or one others can write to (they
+/// could plant files, or a symbolic link, where the caller reads, writes and
+/// deletes). `None`: it's the caller's alone.
+///
+/// # Errors
+///
+/// It can't be looked at (it's missing, say).
+pub fn unsafe_dir(dir: &Path) -> io::Result<Option<&'static str>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::symlink_metadata(dir)?;
+    Ok(if !metadata.is_dir() {
+        Some("it isn't a directory (or it's a symbolic link)")
+    } else if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        Some("it belongs to another user")
+    } else if metadata.mode() & 0o022 != 0 {
+        Some("others can write to it")
+    } else {
+        None
+    })
+}
+
+/// Makes `dir` (and what's missing above it) if it's missing, the caller's
+/// alone (0700), then [checks](unsafe_dir) it is: why it isn't, if it isn't.
+/// The runtime's state root and the Docker API's socket directory are made
+/// so.
+///
+/// # Errors
+///
+/// It couldn't be made or looked at.
+pub fn private_dir(dir: &Path) -> io::Result<Option<&'static str>> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    unsafe_dir(dir)
+}
+
+/// The directory `below` names inside `dir`, each of its components a
+/// directory opened without following a symlink (`O_NOFOLLOW`): a
+/// component that is a symlink, or isn't a directory, is an error
+/// (`ELOOP`, `ENOTDIR`), never a way out of `dir`. `below` is relative and
+/// plain (no `..`, no `/` at its start). Open for reference only (`O_PATH`
+/// on Linux): what a bind's source or a walk needs.
+///
+/// # Errors
+///
+/// `below` isn't plain ([`io::ErrorKind::InvalidInput`]); a component
+/// that's missing, a symlink or not a directory.
+pub fn open_below(dir: BorrowedFd<'_>, below: &Path) -> io::Result<OwnedFd> {
+    walk_below(dir, below, None)
+}
+
+/// [`open_below`], making each missing component (`mkdirat`, `mode`) on
+/// the way: what a bind's missing source is made with, so no symlink
+/// another put on its path is ever followed (11.7). One made meanwhile by
+/// another is taken as it is, if it's a directory.
+///
+/// # Errors
+///
+/// As [`open_below`]'s; a component that can't be made.
+pub fn make_below(dir: BorrowedFd<'_>, below: &Path, mode: u32) -> io::Result<OwnedFd> {
+    walk_below(dir, below, Some(mode))
+}
+
+/// [`open_below`] and [`make_below`]'s walk: each component made first if
+/// `make` gives its mode.
+fn walk_below(dir: BorrowedFd<'_>, below: &Path, make: Option<u32>) -> io::Result<OwnedFd> {
+    use std::path::Component;
+    #[cfg(target_os = "linux")]
+    let reference = OFlag::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let reference = OFlag::O_RDONLY;
+    let flags = reference | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut names = Vec::new();
+    for component in below.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: not a plain relative path", below.display()),
+                ));
+            }
+        }
+    }
+    // The permission bits alone, as `mode_t` is wherever this runs (16 bits
+    // on macOS).
+    let mode = make.map(|mode| {
+        Mode::from_bits_truncate(libc::mode_t::try_from(mode & 0o7777).unwrap_or_default())
+    });
+    let mut at = nix::unistd::dup(dir)?;
+    for name in names {
+        if let Some(mode) = mode {
+            match nix::sys::stat::mkdirat(&at, name, mode) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+        at = openat(&at, name, flags, Mode::empty())?;
+    }
+    Ok(at)
+}
+
 #[cfg(test)]
 mod hooks {
     use std::cell::Cell;

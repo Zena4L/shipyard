@@ -409,6 +409,20 @@ impl Cgroup {
         self.apply(resources)
     }
 
+    /// [`Cgroup::limit`] for a running container's `update`: a refusal
+    /// puts back what was written before it, as each file read before its
+    /// write, so the container is left as it was (11.7: a limit newly set,
+    /// then another refused, stayed in force while its record said none).
+    ///
+    /// # Errors
+    ///
+    /// As [`Cgroup::limit`]'s; [`CgroupError::PartlyApplied`] only for the
+    /// files that couldn't be put back.
+    pub fn limit_or_put_back(&self, resources: &Resources) -> Result<Vec<String>, CgroupError> {
+        self.enable(&resources.controllers())?;
+        self.apply_with(resources, PutBack::Yes)
+    }
+
     /// Makes sure the controllers `wanted` reach it: each ancestor, from the
     /// base down, hands down what's missing (one write each: G2), as runc's
     /// cgroupfs driver does. What's handed down already is no write at all.
@@ -473,11 +487,26 @@ impl Cgroup {
     /// A value the kernel refused, naming the file; a file this kernel
     /// doesn't have; a swap limit asked for where there's no swap accounting.
     pub fn apply(&self, resources: &Resources) -> Result<Vec<String>, CgroupError> {
+        self.apply_with(resources, PutBack::No)
+    }
+
+    /// [`Cgroup::apply`], putting back on a refusal or not.
+    fn apply_with(
+        &self,
+        resources: &Resources,
+        put_back: PutBack,
+    ) -> Result<Vec<String>, CgroupError> {
         let mut skipped = Vec::new();
-        let mut written: Vec<String> = Vec::new();
+        // Each file written, with what it held before (if it could be read).
+        let mut written: Vec<(String, String, Option<String>)> = Vec::new();
         for (file, value) in resources.files() {
-            let Err(err) = write_file(&self.path.join(&file), &value) else {
-                written.push(file);
+            let path = self.path.join(&file);
+            let before = match put_back {
+                PutBack::Yes => std::fs::read_to_string(&path).ok(),
+                PutBack::No => None,
+            };
+            let Err(err) = write_file(&path, &value) else {
+                written.push((file, value, before));
                 continue;
             };
             let refused = match (file.as_str(), io_errno(&err)) {
@@ -498,20 +527,34 @@ impl Cgroup {
                     errno,
                 },
             };
-            // Nothing is undone: say what changed already (an `update`'s
-            // container keeps running with it).
-            return Err(if written.is_empty() {
+            // Put back if asked, last first; what stays changed is said (an
+            // `update`'s container keeps running with it).
+            let kept: Vec<String> = match put_back {
+                PutBack::Yes => written
+                    .into_iter()
+                    .rev()
+                    .filter(|(file, value, before)| {
+                        before.as_deref().is_none_or(|before| {
+                            write_file(&self.path.join(file), &put_back_value(file, value, before))
+                                .is_err()
+                        })
+                    })
+                    .map(|(file, _, _)| file)
+                    .collect(),
+                PutBack::No => written.into_iter().map(|(file, _, _)| file).collect(),
+            };
+            return Err(if kept.is_empty() {
                 refused
             } else {
                 CgroupError::PartlyApplied {
-                    written,
+                    written: kept,
                     refused: Box::new(refused),
                 }
             });
         }
         // Not where the root's file can't be read (inside a cgroup
         // namespace, it isn't there): no telling, so no warning.
-        if written.iter().any(|file| file == "io.weight")
+        if written.iter().any(|(file, _, _)| file == "io.weight")
             && let Ok(qos) = std::fs::read_to_string(Path::new(ROOT).join("io.cost.qos"))
             && !io_weight_has_effect(&qos)
         {
@@ -915,14 +958,55 @@ pub(super) fn absolute(cgroup: &Path) -> PathBuf {
     }
 }
 
+/// Whether a refused [`Cgroup::apply_with`] puts back what it wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutBack {
+    /// It does (an update of a running container).
+    Yes,
+    /// It doesn't (a start, which fails as a whole).
+    No,
+}
+
+/// What puts `file` back as it was, `before` (its contents read before
+/// `written` was written): its line for the device or key `written` set
+/// in a keyed file (`io.max`, `io.weight`; a device it had no line for
+/// back to no limit), else its value, and an empty one as a newline
+/// (`cpuset.cpus`' "inherit": an empty write is no write at all).
+fn put_back_value(file: &str, written: &str, before: &str) -> String {
+    if matches!(file, "io.max" | "io.weight")
+        && let Some(key) = written.split_whitespace().next()
+    {
+        if let Some(line) = before
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(key))
+        {
+            return line.to_owned();
+        }
+        if file == "io.max" {
+            return format!("{key} rbps=max wbps=max riops=max wiops=max");
+        }
+        return format!("{key} default");
+    }
+    let value = before.trim_end_matches('\n');
+    if value.is_empty() {
+        "\n".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
 /// Writes `value` to the cgroup file at `path`, in one write. Opened for
 /// writing only, never created: the kernel makes a cgroup's files, and with
 /// `O_CREAT` (as `std::fs::write` opens) a missing one fails with EACCES,
 /// which would hide that it's missing (ENOENT).
 fn write_file(path: &Path, value: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+    // Truncated as a shell's `echo 1 > memory.max` opens it: nothing to a
+    // cgroup's file, but a plain file standing in for one (a test's) holds
+    // what was written last, not its tail too.
     std::fs::OpenOptions::new()
         .write(true)
+        .truncate(true)
         .open(path)?
         .write_all(value.as_bytes())
 }
@@ -963,6 +1047,77 @@ fn io_errno(err: &std::io::Error) -> Errno {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused update's put-back: each file as it was, a keyed file's
+    /// device line (one it had none for back to no limit), an empty one
+    /// as a newline (an empty write writes nothing).
+    #[test]
+    fn put_back_values_are_what_was_there() {
+        assert_eq!(put_back_value("memory.max", "536870912", "max\n"), "max");
+        assert_eq!(put_back_value("cpuset.cpus", "0", "\n"), "\n");
+        assert_eq!(
+            put_back_value("cpu.max", "50000 100000", "max 100000\n"),
+            "max 100000"
+        );
+        let io =
+            "8:0 rbps=100 wbps=max riops=max wiops=max\n9:0 rbps=max wbps=5 riops=max wiops=max\n";
+        assert_eq!(
+            put_back_value("io.max", "9:0 wbps=7", io),
+            "9:0 rbps=max wbps=5 riops=max wiops=max"
+        );
+        assert_eq!(
+            put_back_value("io.max", "7:0 rbps=1", io),
+            "7:0 rbps=max wbps=max riops=max wiops=max"
+        );
+        assert_eq!(
+            put_back_value("io.weight", "default 300", "default 100\n8:0 50\n"),
+            "default 100"
+        );
+    }
+
+    /// An update refused part way (no swap accounting: `memory.swap.max`
+    /// missing) leaves the cgroup as it was: the CPUs and memory limit it
+    /// wrote first put back. Without the put-back (a start's), they stay
+    /// and are said. Plain files stand in for the cgroup's.
+    #[test]
+    fn a_refused_update_puts_the_cgroup_back() {
+        let dir = std::env::temp_dir().join(format!("shipyard-put-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cgroup = Cgroup::at(dir.clone(), dir.clone());
+        let limits = Resources {
+            cpuset_cpus: Some("0".to_owned()),
+            memory_max: Some(512 << 20),
+            swap_max: Some(crate::resources::Limit::Value(1 << 30)),
+            ..Resources::default()
+        };
+        let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
+        for put_back in [PutBack::Yes, PutBack::No] {
+            std::fs::write(dir.join("cpuset.cpus"), "\n").unwrap();
+            std::fs::write(dir.join("memory.max"), "max\n").unwrap();
+            let refused = cgroup.apply_with(&limits, put_back).unwrap_err();
+            match put_back {
+                PutBack::Yes => {
+                    assert!(
+                        matches!(refused, CgroupError::NoSwapAccounting),
+                        "{refused:?}"
+                    );
+                    assert_eq!(
+                        (read("cpuset.cpus"), read("memory.max")),
+                        ("\n".into(), "max".into())
+                    );
+                }
+                PutBack::No => {
+                    let CgroupError::PartlyApplied { written, .. } = refused else {
+                        panic!("{refused:?}");
+                    };
+                    assert_eq!(written, ["cpuset.cpus", "memory.max"]);
+                    assert_eq!(read("memory.max"), "536870912");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Plain directories stand in for cgroups (`rmdir` refuses a non-empty
     /// one, as it refuses a cgroup with processes): an old empty one goes;

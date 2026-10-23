@@ -32,10 +32,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 pub fn layer_tar(root: &std::path::Path) -> (Vec<u8>, String) {
     let mut builder = tar::Builder::new(Vec::new());
     builder.append_dir_all(".", root).unwrap();
-    let tar = builder.into_inner().unwrap();
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(&tar).unwrap();
-    (encoder.finish().unwrap(), sha256(&tar))
+    gzipped(&builder.into_inner().unwrap())
 }
 
 /// A minimal in-process registry serving a fixed set of GET routes; stopped
@@ -65,6 +62,17 @@ impl Drop for Serving {
 /// Serves `routes` (path, content type, body) on a free loopback port.
 #[must_use]
 pub fn serve(routes: Vec<(String, &'static str, Vec<u8>)>) -> Serving {
+    serve_guarded(routes, None)
+}
+
+/// [`serve`], answering only a request whose `Authorization` header is
+/// `authorization` (`Basic …`): any other gets a 401 asking for Basic
+/// auth, as a private registry does.
+#[must_use]
+pub fn serve_guarded(
+    routes: Vec<(String, &'static str, Vec<u8>)>,
+    authorization: Option<String>,
+) -> Serving {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     listener.set_nonblocking(true).unwrap();
@@ -75,6 +83,7 @@ pub fn serve(routes: Vec<(String, &'static str, Vec<u8>)>) -> Serving {
     let held = Arc::new(AtomicU32::new(0));
     let held_thread = held.clone();
     let routes = Arc::new(routes);
+    let authorization = Arc::new(authorization);
     let handle = thread::spawn(move || {
         while !stop_thread.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -82,7 +91,11 @@ pub fn serve(routes: Vec<(String, &'static str, Vec<u8>)>) -> Serving {
                     let _ = stream.set_nonblocking(false);
                     let routes = routes.clone();
                     let hold = (hold_thread.clone(), held_thread.clone());
-                    thread::spawn(move || handle_conn(stream, &routes, &hold.0, &hold.1));
+                    let authorization = authorization.clone();
+                    thread::spawn(move || {
+                        let authorization = authorization.as_ref().as_ref();
+                        handle_conn(stream, &routes, &hold.0, &hold.1, authorization);
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(std::time::Duration::from_millis(5));
@@ -105,6 +118,7 @@ fn handle_conn(
     routes: &[(String, &'static str, Vec<u8>)],
     hold: &AtomicBool,
     held: &AtomicU32,
+    authorization: Option<&String>,
 ) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -112,12 +126,29 @@ fn handle_conn(
         return;
     }
     let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
-    // Drain headers.
+    // Drain headers, keeping its credentials.
+    let mut given = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).is_err() || h == "\r\n" || h.is_empty() {
             break;
         }
+        if let Some((name, value)) = h.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            given = Some(value.trim().to_owned());
+        }
+    }
+    if let Some(wanted) = authorization
+        && given.as_ref() != Some(wanted)
+    {
+        let mut stream = stream;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"fixture\"\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return;
     }
     if path.contains("/blobs/") && hold.load(Ordering::Relaxed) {
         held.fetch_add(1, Ordering::Relaxed);
@@ -125,7 +156,12 @@ fn handle_conn(
     while path.contains("/blobs/") && hold.load(Ordering::Relaxed) {
         thread::sleep(std::time::Duration::from_millis(10));
     }
-    let response = routes.iter().find(|(p, _, _)| *p == path);
+    // Its API root answers, as a registry's does (`docker login` asks it).
+    let root = (String::from("/v2/"), "application/json", b"{}".to_vec());
+    let response = routes
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .or_else(|| (path == root.0).then_some(&root));
     let mut stream = stream;
     match response {
         Some((_, content_type, body)) => {
@@ -222,16 +258,105 @@ pub fn implying_layer(path: &str, content: &[u8]) -> (Vec<u8>, String) {
     header.set_size(content.len() as u64);
     header.set_mode(0o644);
     builder.append_data(&mut header, path, content).unwrap();
-    let tar = builder.into_inner().unwrap();
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(&tar).unwrap();
-    (encoder.finish().unwrap(), sha256(&tar))
+    gzipped(&builder.into_inner().unwrap())
 }
+
+/// A layer of the tar `tar`: gzipped, and its diff ID (the tar's digest).
+fn gzipped(tar: &[u8]) -> (Vec<u8>, String) {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(tar).unwrap();
+    (encoder.finish().unwrap(), sha256(tar))
+}
+
+/// One entry of a [`built_layer`]: a directory, a file or a symlink, with
+/// its owner and mode (a link's are the tar's defaults).
+#[derive(Debug, Clone, Copy)]
+pub enum LayerEntry<'a> {
+    /// A directory.
+    Dir {
+        /// Its path in the image (no leading `/`).
+        path: &'a str,
+        /// Its owner, `(uid, gid)`.
+        owner: (u64, u64),
+        /// Its permission bits.
+        mode: u32,
+    },
+    /// A regular file.
+    File {
+        /// Its path in the image (no leading `/`).
+        path: &'a str,
+        /// Its owner, `(uid, gid)`.
+        owner: (u64, u64),
+        /// Its permission bits.
+        mode: u32,
+        /// What it holds.
+        content: &'a [u8],
+    },
+    /// A symbolic link.
+    Link {
+        /// Its path in the image (no leading `/`).
+        path: &'a str,
+        /// What it points at.
+        target: &'a str,
+    },
+}
+
+/// A layer of `entries`, in order, with the owners and modes they name
+/// (which a test's own files couldn't have without root).
+#[must_use]
+pub fn built_layer(entries: &[LayerEntry<'_>]) -> (Vec<u8>, String) {
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in entries {
+        let mut header = tar::Header::new_gnu();
+        match *entry {
+            LayerEntry::Dir { path, owner, mode } => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_uid(owner.0);
+                header.set_gid(owner.1);
+                header.set_mode(mode);
+                header.set_size(0);
+                builder
+                    .append_data(&mut header, path, std::io::empty())
+                    .unwrap();
+            }
+            LayerEntry::File {
+                path,
+                owner,
+                mode,
+                content,
+            } => {
+                header.set_uid(owner.0);
+                header.set_gid(owner.1);
+                header.set_mode(mode);
+                header.set_size(content.len() as u64);
+                builder.append_data(&mut header, path, content).unwrap();
+            }
+            LayerEntry::Link { path, target } => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777);
+                header.set_size(0);
+                builder.append_link(&mut header, path, target).unwrap();
+            }
+        }
+    }
+    gzipped(&builder.into_inner().unwrap())
+}
+
+/// The fixture image (the host's programs) with `extra` on top, and
+/// `runtime` as its config's `config` object.
+#[must_use]
+pub fn fixture_with_layer(extra: (Vec<u8>, String), runtime: &str) -> (Serving, String) {
+    fixture_configured(vec![layer_tar(RootFs::minimal().path()), extra], runtime)
+}
+
+/// The fixture image's config's `config` object, unless a test asks for
+/// another: it prints its marker.
+const DEFAULT_RUNTIME: &str = r#"{"Cmd":["/bin/cat","/marker"]}"#;
 
 /// A fixture registry serving an image of `layers` (base first).
 #[must_use]
 pub fn fixture_layers(layers: Vec<(Vec<u8>, String)>) -> (Serving, String) {
-    fixture_configured(layers, r#"{"Cmd":["/bin/cat","/marker"]}"#)
+    fixture_configured(layers, DEFAULT_RUNTIME)
 }
 
 /// The fixture image (one layer, the host's programs) with `runtime` as
@@ -244,6 +369,26 @@ pub fn fixture_with_config(runtime: &str) -> (Serving, String) {
 /// A fixture registry serving an image of `layers` (base first), its
 /// config's `config` object `runtime` (JSON).
 fn fixture_configured(layers: Vec<(Vec<u8>, String)>, runtime: &str) -> (Serving, String) {
+    fixture_guarded(layers, runtime, None)
+}
+
+/// The fixture image, served only with `authorization` (`Basic …`): a
+/// private registry's.
+#[must_use]
+pub fn fixture_requiring(authorization: &str) -> (Serving, String) {
+    fixture_guarded(
+        vec![layer_tar(RootFs::minimal().path())],
+        DEFAULT_RUNTIME,
+        Some(authorization.to_owned()),
+    )
+}
+
+/// [`fixture_configured`], answering only `authorization`, if given.
+fn fixture_guarded(
+    layers: Vec<(Vec<u8>, String)>,
+    runtime: &str,
+    authorization: Option<String>,
+) -> (Serving, String) {
     let diff_ids: Vec<String> = layers.iter().map(|(_, id)| format!("\"{id}\"")).collect();
     let config = format!(
         r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}},"config":{runtime}}}"#,
@@ -289,7 +434,7 @@ fn fixture_configured(layers: Vec<(Vec<u8>, String)>, runtime: &str) -> (Serving
             layer,
         ));
     }
-    let serving = serve(routes);
+    let serving = serve_guarded(routes, authorization);
     let image = format!("{}/{repo}", serving.base);
     (serving, image)
 }

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use shipyard_runtime::attach::Frame;
 use shipyard_runtime::attach::forward::{
     self, AGENT_PORT, Connection, FORWARD_REQUEST, MAX_PORTS_ANSWER, PORTS_REQUEST, PortsAnswer,
-    PublishedPort, Request,
+    PublishedPort, Refusal, Request,
 };
 
 use crate::host::{ACCEPT_REST, log};
@@ -30,6 +30,10 @@ use crate::ports::{PortsFile, Unbound, wanted};
 
 /// How often the guest is asked for its ports.
 const POLL: Duration = Duration::from_secs(2);
+
+/// The least time between two asks for the guest's ports, however often
+/// a connection's end wakes the poller.
+const MIN_POLL: Duration = Duration::from_millis(250);
 
 /// How often while it doesn't answer (an older guest, one restarting its
 /// agent): its last answer kept meanwhile. And how often a port another
@@ -151,6 +155,7 @@ impl Forwarding {
     fn poll(self: &Arc<Self>, wake: &Receiver<()>, (clients, mut idle): (Arc<Clients>, Idle)) {
         let mut failing: Option<String> = None;
         loop {
+            let asked_at = Instant::now();
             let asked = ask(&self.machine);
             let active = asked.as_ref().ok().map(|answer| answer.active);
             match asked {
@@ -195,6 +200,11 @@ impl Forwarding {
             match wake.recv_timeout(wait) {
                 Ok(()) | Err(RecvTimeoutError::Timeout) => while wake.try_recv().is_ok() {},
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+            // Woken by a burst of short connections (a script's `docker`
+            // calls), it still asks the guest no more than so often.
+            if let Some(rest) = MIN_POLL.checked_sub(asked_at.elapsed()) {
+                std::thread::sleep(rest);
             }
             if self.state.lock().map_or(true, |state| state.stopped) {
                 return;
@@ -537,57 +547,88 @@ fn bind(address: SocketAddr, reuse: bool) -> std::io::Result<TcpListener> {
 /// vsock (tried twice: its backlog may be full in a burst), its answer to
 /// be read within [`ANSWER_WAIT`].
 pub(crate) fn request(machine: &Machine, args: &[&str]) -> Result<Connection<UnixStream>, String> {
+    request_from(machine, args).map(|(connection, _)| connection)
+}
+
+/// [`request`], with the connection's port on this side (what the guest
+/// sees as its peer's: [`Machine::connect_from`]).
+fn request_from(machine: &Machine, args: &[&str]) -> Result<(Connection<UnixStream>, u32), String> {
     let limit = Duration::from_secs(10);
-    let mut stream = machine
-        .connect(AGENT_PORT, limit)
+    let (stream, port) = machine
+        .connect_from(AGENT_PORT, limit)
         .or_else(|_| {
             std::thread::sleep(Duration::from_millis(100));
-            machine.connect(AGENT_PORT, limit)
+            machine.connect_from(AGENT_PORT, limit)
         })
-        .map(UnixStream::from)
         .map_err(|e| e.to_string())?;
+    let mut stream = UnixStream::from(stream);
     stream
         .set_read_timeout(Some(ANSWER_WAIT))
         .map_err(|e| e.to_string())?;
     let hello = forward::hello(&Request::internal(args)).map_err(|e| e.to_string())?;
     forward::send(&mut stream, &hello).map_err(|e| e.to_string())?;
-    Ok(Connection::new(stream))
+    Ok((Connection::new(stream), port))
 }
 
 /// Asks the guest's agent what its containers publish.
 fn ask(machine: &Machine) -> Result<PortsAnswer, String> {
     let mut connection = request(machine, &[PORTS_REQUEST])?;
-    let answer = output(&mut connection, MAX_PORTS_ANSWER)?;
+    let answer =
+        output(&mut connection, MAX_PORTS_ANSWER).map_err(|refusal| refusal.to_string())?;
     PortsAnswer::decode(&answer).map_err(|e| e.to_string())
 }
 
 /// What an internal request (`__guest-ports`, `__guest-doctor`) answers on
 /// `connection`, as the agent runs it: its stdout, up to `cap`, once it has
-/// ended well. A refusal is its reason (`forward::STOPPING` from a host
-/// that's stopping); another end, an older guest's (which runs the request
-/// as an unknown command), said as such.
+/// ended well. A refusal is its reason (`Refusal::Stopping` from a host
+/// that's stopping); any other failure is [`Unanswered::Broken`] (an
+/// older guest's end, which runs the request as an unknown command, said as
+/// such).
 pub(crate) fn output<S: std::io::Read + std::io::Write>(
     connection: &mut Connection<S>,
     cap: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, Unanswered> {
+    let other = Unanswered::Broken;
     let mut answer = Vec::new();
     loop {
-        match connection.next_frame().map_err(|e| e.to_string())? {
+        match connection.next_frame().map_err(|e| other(e.to_string()))? {
             Some(Frame::Welcome { .. } | Frame::Stderr(_)) => {}
             Some(Frame::Stdout(bytes)) if answer.len() + bytes.len() <= cap => {
                 answer.extend_from_slice(&bytes);
             }
-            Some(Frame::Stdout(_)) => return Err("an answer too long".to_owned()),
+            Some(Frame::Stdout(_)) => return Err(other("an answer too long".to_owned())),
             Some(Frame::Exited(0)) => return Ok(answer),
             Some(Frame::Exited(code)) => {
-                return Err(format!(
+                return Err(other(format!(
                     "its answer ended with {code}: a guest older than this shipyard? \
                      scripts/guest/build.sh makes it this build's"
-                ));
+                )));
             }
-            Some(Frame::Refused(why)) => return Err(why),
-            Some(_) => return Err("not an answer to the request".to_owned()),
-            None => return Err("the guest closed the connection".to_owned()),
+            Some(frame) if let Some(refusal) = Refusal::of(&frame) => {
+                return Err(Unanswered::Refused(refusal));
+            }
+            Some(_) => return Err(other("not an answer to the request".to_owned())),
+            None => return Err(other("the guest closed the connection".to_owned())),
+        }
+    }
+}
+
+/// Why a request to the agent got no answer: refused (the peer said no,
+/// and why), or broken (the wire: a closed connection, an answer too long,
+/// an older guest's command end).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unanswered {
+    /// The host or the guest said no.
+    Refused(Refusal),
+    /// No answer came, or none it could be.
+    Broken(String),
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => refusal.fmt(f),
+            Self::Broken(why) => f.write_str(why),
         }
     }
 }
@@ -598,16 +639,60 @@ pub(crate) fn output<S: std::io::Read + std::io::Write>(
 /// answer for its ports and nothing is listened on.)
 fn forward_one(machine: &Machine, guest: PublishedPort, mut tcp: TcpStream) -> Result<(), String> {
     let (ip, port) = (guest.ip.to_string(), guest.port.to_string());
-    let mut connection = request(machine, &[FORWARD_REQUEST, &ip, &port])?;
-    match connection.next_frame().map_err(|e| e.to_string())? {
-        Some(Frame::Welcome { .. }) => {}
-        Some(Frame::Refused(why)) => return Err(why),
-        _ => return Err("the guest didn't take it".to_owned()),
-    }
-    let (agent, unread) = connection.into_parts();
-    agent.set_read_timeout(None).map_err(|e| e.to_string())?;
+    let (agent, unread) =
+        joined(machine, &[FORWARD_REQUEST, &ip, &port]).map_err(|refusal| refusal.to_string())?;
     tcp.write_all(&unread).map_err(|e| e.to_string())?;
     shipyard_sys::relay::both_ways(tcp.into(), agent.into(), LINGER).map_err(|e| e.to_string())
+}
+
+/// A connection the agent is asked for (`args`: a port's, the API's), its
+/// welcome waited for: the stream to relay, and the bytes already read past
+/// the welcome. A refusal is its reason. A command's welcome (no input
+/// taken: an older guest, which runs the request as an unknown command)
+/// is refused, never relayed as the connection's bytes.
+pub(crate) fn joined(
+    machine: &Machine,
+    args: &[&str],
+) -> Result<(UnixStream, Vec<u8>), Unanswered> {
+    joined_from(machine, args).map(|(agent, unread, _)| (agent, unread))
+}
+
+/// [`joined`], with the connection's port on this side, which names it to
+/// the guest ([`hang_up`]).
+pub(crate) fn joined_from(
+    machine: &Machine,
+    args: &[&str],
+) -> Result<(UnixStream, Vec<u8>, u32), Unanswered> {
+    let other = Unanswered::Broken;
+    let (mut connection, port) = request_from(machine, args).map_err(other)?;
+    match connection.next_frame().map_err(|e| other(e.to_string()))? {
+        Some(Frame::Welcome { stdin: true, .. }) => {}
+        Some(Frame::Welcome { .. }) => {
+            return Err(other(
+                "the guest is older than this shipyard: scripts/guest/build.sh makes it this \
+                 build's"
+                    .to_owned(),
+            ));
+        }
+        Some(frame) if let Some(refusal) = Refusal::of(&frame) => {
+            return Err(Unanswered::Refused(refusal));
+        }
+        _ => return Err(other("the guest didn't take it".to_owned())),
+    }
+    let (agent, unread) = connection.into_parts();
+    agent
+        .set_read_timeout(None)
+        .map_err(|e| other(e.to_string()))?;
+    Ok((agent, unread, port))
+}
+
+/// Tells the guest's agent that the client of its API connection from
+/// `port` ([`joined_from`]) has gone (11.7): Virtualization.framework
+/// passes this side's close on as a half-close only, which a client that
+/// has merely finished sending also is, so the guest can't tell. Not
+/// waited for (an older guest runs it as an unknown command, and fails).
+pub(crate) fn hang_up(machine: &Machine, port: u32) {
+    let _ = request(machine, &[forward::API_HANG_UP, &port.to_string()]);
 }
 
 #[cfg(test)]

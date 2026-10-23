@@ -111,7 +111,7 @@ impl RunDir {
             HeldFile::new(lock_dir(&dir.path)?),
         ]);
         drop(sweeping);
-        let own = plan.mode.own_namespace();
+        let own = plan.in_a_network_namespace();
         // With the host's network, its files as they are (its resolvers work
         // from there); with one of its own, the real upstreams behind a
         // local stub.

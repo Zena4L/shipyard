@@ -47,9 +47,11 @@
 #[cfg(not(unix))]
 compile_error!("shipyard-engine only supports UNIX platforms (Linux, macOS)");
 
+pub mod api_service;
 pub mod attach;
 pub mod containers;
 pub mod cp;
+pub mod docker;
 pub mod doctor;
 mod entry;
 mod error;
@@ -62,10 +64,12 @@ pub mod image;
 pub mod logs;
 pub mod network;
 mod paths;
+pub mod prune;
 mod random;
 pub mod report;
 pub mod run;
 pub(crate) mod streams;
+mod test_pause;
 pub mod volumes;
 
 use std::sync::Arc;

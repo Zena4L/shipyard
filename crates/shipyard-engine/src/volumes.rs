@@ -5,6 +5,7 @@
 //! `volumes/` subtree. These back `shipyard volume create/ls/inspect/
 //! rm/prune` and `system df`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use shipyard_storage::{Volume, Volumes};
@@ -32,6 +33,132 @@ pub fn create(engine: &Engine, name: &str) -> Result<Volume> {
     let volume = open(engine)?.create(name)?;
     crate::events::emit_about(engine, crate::events::Kind::Volume, "create", name);
     Ok(volume)
+}
+
+/// Refuses what a volume of Shipyard's can't be (the CLI's and the API's
+/// create alike): a driver other than `local` (none, or empty, is it), or
+/// driver options (`type=nfs` and the like would mount something else).
+///
+/// # Errors
+///
+/// [`ErrorKind::InvalidRequest`], saying which.
+pub fn check_driver(driver: Option<&str>, has_options: bool) -> Result<()> {
+    if let Some(driver) = driver.filter(|driver| !driver.is_empty() && *driver != "local") {
+        return Err(Error::new(
+            ErrorKind::InvalidRequest,
+            format!("the volume driver {driver} isn't supported: only local"),
+        ));
+    }
+    if has_options {
+        return Err(Error::new(
+            ErrorKind::InvalidRequest,
+            "volume driver options aren't supported: a volume is a directory of the store's",
+        ));
+    }
+    Ok(())
+}
+
+/// Marks `labels` anonymous, as Docker marks a volume it made unnamed
+/// (`com.docker.volume.anonymous`, empty): its prune takes those.
+pub(crate) fn mark_anonymous(labels: &mut BTreeMap<String, String>) {
+    labels.insert(crate::docker::ANONYMOUS_VOLUME.to_owned(), String::new());
+}
+
+/// `POST /volumes/create` (Docker's): the volume `name` (none: a new
+/// 64-hex one, as Docker names it) with `labels`. One that exists is
+/// returned as it is, its labels unchanged, as Docker's `local` driver
+/// does.
+///
+/// # Errors
+///
+/// Returns an error if the name is invalid ([`ErrorKind::InvalidRequest`]),
+/// or the store can't be written.
+pub fn create_with(
+    engine: &Engine,
+    name: Option<&str>,
+    labels: &BTreeMap<String, String>,
+) -> Result<Volume> {
+    // Without a name: a new one, and anonymous, as Docker marks it (its
+    // prune takes those without `all`).
+    let mut labels = labels.clone();
+    let name = if let Some(name) = name.filter(|name| !name.is_empty()) {
+        name.to_owned()
+    } else {
+        mark_anonymous(&mut labels);
+        crate::docker::new_id()?
+    };
+    let volumes = open(engine)?;
+    match volumes.create_with(&name, &labels) {
+        Ok(volume) => {
+            crate::events::emit_about(engine, crate::events::Kind::Volume, "create", &name);
+            Ok(volume)
+        }
+        Err(shipyard_storage::VolumeError::Exists(_)) => Ok(volumes.inspect(&name)?),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Makes the new anonymous volume `name` for a create (never one that's
+/// there: [`ErrorKind::Exists`]), and
+/// holds it (shared) until the container's record names it: a prune
+/// meanwhile only tries its lock, so never takes it.
+///
+/// # Errors
+///
+/// It's there already, or it couldn't be made or held.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "a create is Linux's")
+)]
+pub(crate) fn create_anonymous(
+    engine: &Engine,
+    name: &str,
+) -> Result<shipyard_storage::VolumeHold> {
+    let mut labels = BTreeMap::new();
+    mark_anonymous(&mut labels);
+    let volumes = open(engine)?;
+    volumes.create_with(name, &labels)?;
+    crate::events::emit_about(engine, crate::events::Kind::Volume, "create", name);
+    Ok(volumes.hold_existing(name)?)
+}
+
+/// The labels of the volume `name` (none for one made without).
+///
+/// # Errors
+///
+/// Its labels can't be read (a newer version: [`ErrorKind::Storage`]).
+pub fn labels(engine: &Engine, name: &str) -> Result<BTreeMap<String, String>> {
+    Ok(open(engine)?.labels(name)?)
+}
+
+/// The volumes some container's record mounts (running or not, as `rm`
+/// refuses them): what isn't dangling. Read without the store's lock: a
+/// listing's answer, stale once given (`rm` and `prune` decide under it).
+///
+/// # Errors
+///
+/// The records can't be listed.
+pub fn in_use(engine: &Engine) -> Result<BTreeSet<String>> {
+    let records = crate::containers::list(engine)?;
+    Ok(records
+        .iter()
+        .flat_map(|record| {
+            record
+                .config
+                .volume
+                .iter()
+                .filter_map(|spec| mounted_volume(spec))
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The named volume a `--volume` spec mounts (`NAME:/path[:ro]`), if it
+/// mounts one (not a host path).
+fn mounted_volume(spec: &str) -> Option<&str> {
+    spec.split(':')
+        .next()
+        .filter(|source| shipyard_storage::volume::is_named_volume(source))
 }
 
 /// `shipyard volume ls`.
@@ -71,7 +198,7 @@ pub fn usage(engine: &Engine) -> Result<Usage> {
     };
     for volume in volumes.list()? {
         let taken = shipyard_image::fsat::tree_usage(&dir, std::ffi::OsStr::new(&volume.name));
-        usage.count += 1;
+        usage.total += 1;
         usage.bytes += taken.bytes;
         usage.complete &= taken.complete;
         let named = records
@@ -79,6 +206,8 @@ pub fn usage(engine: &Engine) -> Result<Usage> {
             .is_none_or(|records| !users_of(records, &volume.name).is_empty());
         if !named && !volumes.in_use(&volume.name)? {
             usage.reclaimable += taken.bytes;
+        } else {
+            usage.active += 1;
         }
     }
     Ok(usage)
@@ -87,7 +216,7 @@ pub fn usage(engine: &Engine) -> Result<Usage> {
 /// The containers of `records` that mount the volume `name`, whatever
 /// their state (Docker's: a stopped container keeps its volumes), by name,
 /// sorted.
-fn users_of(records: &[crate::containers::Record], name: &str) -> Vec<String> {
+pub(crate) fn users_of(records: &[crate::containers::Record], name: &str) -> Vec<String> {
     let mut users: Vec<String> = records
         .iter()
         .filter(|record| {
@@ -95,7 +224,7 @@ fn users_of(records: &[crate::containers::Record], name: &str) -> Vec<String> {
                 .config
                 .volume
                 .iter()
-                .any(|spec| spec.split(':').next() == Some(name))
+                .any(|spec| mounted_volume(spec) == Some(name))
         })
         .map(|record| record.name.to_string())
         .collect();
@@ -149,6 +278,8 @@ pub fn remove(engine: &Engine, name: &str) -> Result<()> {
 pub struct PruneReport {
     /// The volumes removed.
     pub removed: Vec<String>,
+    /// The bytes they held (what could be read of them).
+    pub bytes: u64,
     /// The volumes left, in use.
     pub in_use: Vec<String>,
     /// What couldn't be removed, and why.
@@ -164,6 +295,20 @@ pub struct PruneReport {
 /// Returns an error if the volume store can't be read, or the containers'
 /// records listed.
 pub fn prune(engine: &Engine) -> Result<PruneReport> {
+    prune_where(engine, &|_, _| true)
+}
+
+/// [`prune`], of the volumes `wanted` takes (by name and labels: Docker's
+/// prune takes only anonymous ones unless asked for all). A volume whose
+/// labels can't be read is never taken.
+///
+/// # Errors
+///
+/// As [`prune`].
+pub fn prune_where(
+    engine: &Engine,
+    wanted: &dyn Fn(&str, &BTreeMap<String, String>) -> bool,
+) -> Result<PruneReport> {
     let volumes = open(engine)?;
     let mut in_use = Vec::new();
     let mut trashed = Vec::new();
@@ -171,6 +316,15 @@ pub fn prune(engine: &Engine) -> Result<PruneReport> {
     // Each check and move aside under the container store's lock (F56).
     crate::containers::with_records_locked(engine, "every volume", |records| {
         for volume in volumes.list()? {
+            // Labels that can't be read: never taken, and said.
+            match volumes.labels(&volume.name) {
+                Ok(labels) if wanted(&volume.name, &labels) => {}
+                Ok(_) => continue,
+                Err(err) => {
+                    failed.push(Error::from(err).context(format!("the volume {}", volume.name)));
+                    continue;
+                }
+            }
             if !users_of(records, &volume.name).is_empty() {
                 in_use.push(volume.name);
                 continue;
@@ -187,8 +341,17 @@ pub fn prune(engine: &Engine) -> Result<PruneReport> {
         }
         Ok(())
     })?;
-    // What removals cut short left, deleted too.
+    // What they held, measured where they were moved: after the lock, so
+    // no walk of a big volume holds the container store up.
     let trash_dir = volumes.trash_dir();
+    let bytes = match shipyard_image::fsat::open_dir(&trash_dir) {
+        Ok(dir) => trashed.iter().fold(0_u64, |bytes, (_, trash)| {
+            let taken = shipyard_image::fsat::tree_usage(&dir, std::ffi::OsStr::new(trash));
+            bytes.saturating_add(taken.bytes)
+        }),
+        Err(_) => 0,
+    };
+    // What removals cut short left, deleted too.
     let leftovers: Vec<String> = std::fs::read_dir(&trash_dir)
         .with_context(|| format!("reading {}", trash_dir.display()))?
         .filter_map(|entry| entry.ok()?.file_name().to_str().map(str::to_owned))
@@ -208,6 +371,7 @@ pub fn prune(engine: &Engine) -> Result<PruneReport> {
     crate::events::emit_pruned(engine, crate::events::Kind::Volume, trashed.len());
     Ok(PruneReport {
         removed: trashed.into_iter().map(|(name, _)| name).collect(),
+        bytes,
         in_use,
         failed,
     })
@@ -313,6 +477,7 @@ mod tests {
                 labels: crate::containers::Labels::default(),
                 image_id: None,
                 auto_remove: false,
+                created: crate::containers::Created::default(),
             },
         )
         .unwrap();
@@ -397,6 +562,7 @@ mod tests {
                 labels: crate::containers::Labels::default(),
                 image_id: None,
                 auto_remove: false,
+                created: crate::containers::Created::default(),
             },
         )
         .unwrap();

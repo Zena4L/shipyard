@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use super::config::Config;
+use super::config::StoredConfig;
 use super::record::{BoundPort, Record};
 use super::state::ContainerState;
 use crate::Engine;
@@ -27,6 +27,51 @@ pub struct Summary {
     /// When and how this start lost its network, if it did (its pasta
     /// died), while it's up.
     pub network_lost: Option<crate::network::lost::NetworkLost>,
+    /// The command it runs: its entrypoint, then its arguments, its
+    /// image's where it gave none (F101: [`shown_command`]).
+    pub(crate) command: Vec<String>,
+}
+
+/// The entrypoint and the command `record` runs, apart, as a start
+/// resolves them (the start's own rule, `RunRequest::entrypoint_and_cmd`)
+/// with its image's `image` config: its own settings, its image's where it
+/// gave none. A record whose request can't be made back shows what it was
+/// given (an empty entrypoint, `--entrypoint ""`, is none).
+pub(crate) fn shown_entrypoint_and_cmd(
+    record: &Record,
+    image: Option<&shipyard_image::RuntimeConfig>,
+) -> (Vec<String>, Vec<String>) {
+    let words = |list: Vec<std::ffi::OsString>| -> Vec<String> {
+        list.iter()
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect()
+    };
+    record.to_request().map_or_else(
+        |_| {
+            let config = &record.config;
+            let entrypoint = config
+                .entrypoint
+                .iter()
+                .filter(|entrypoint| !entrypoint.is_empty())
+                .cloned()
+                .collect();
+            (entrypoint, config.command.clone())
+        },
+        |request| {
+            let (entrypoint, cmd) = request.entrypoint_and_cmd(image);
+            (words(entrypoint), words(cmd))
+        },
+    )
+}
+
+/// The command `record` runs, as one list: its entrypoint, then its
+/// arguments ([`shown_entrypoint_and_cmd`]).
+pub(crate) fn shown_command(
+    record: &Record,
+    image: Option<&shipyard_image::RuntimeConfig>,
+) -> Vec<String> {
+    let (entrypoint, cmd) = shown_entrypoint_and_cmd(record, image);
+    entrypoint.into_iter().chain(cmd).collect()
 }
 
 /// The containers, oldest first, each with its state; only the ones up
@@ -38,6 +83,8 @@ pub struct Summary {
 /// As [`super::list`].
 pub fn summaries(engine: &Engine, all: bool) -> Result<Vec<Summary>> {
     let mut found = Vec::new();
+    // Each image read once, however many containers share it.
+    let mut images = crate::image::ImageConfigs::new(engine);
     for record in super::list(engine)? {
         let state = match super::state(engine, &record) {
             Ok(state) => state,
@@ -52,82 +99,32 @@ pub fn summaries(engine: &Engine, all: bool) -> Result<Vec<Summary>> {
         if all || state.is_active() {
             let health = super::health(engine, &record, &state);
             let network_lost = super::network_lost(engine, &record, &state);
+            let command = shown_command(
+                &record,
+                images.get(record.config.image.as_deref(), record.image_id.as_deref()),
+            );
             found.push(Summary {
                 record,
                 state,
                 health,
                 network_lost,
+                command,
             });
         }
     }
     Ok(found)
 }
 
-/// A container as `ps --format json` lists it.
-#[derive(Debug, Clone, Serialize)]
-#[non_exhaustive]
-pub struct Listed {
-    /// Its full ID.
-    pub id: String,
-    /// Its name.
-    pub name: String,
-    /// Its serial.
-    pub serial: String,
-    /// The image it was made from, as given.
-    pub image: Option<String>,
-    /// The command it was given (its entrypoint, then its command; empty:
-    /// the image's own).
-    pub command: Vec<String>,
-    /// When it was made (RFC 3339, UTC).
-    pub created: String,
-    /// `created`, `running`, `paused`, `stopping`, `restarting` or
-    /// `exited`.
-    pub state: &'static str,
-    /// What its health checks say (`starting`, `healthy`, `unhealthy`), if
-    /// it has them and is up.
-    pub health: Option<crate::health::Status>,
-    /// Whether this start lost its network (its pasta died).
-    pub network_lost: bool,
-    /// The host ports its last start published.
-    pub ports: Vec<BoundPort>,
-}
-
-impl From<&Summary> for Listed {
-    fn from(summary: &Summary) -> Self {
-        let record = &summary.record;
-        Self {
-            id: record.id.as_str().to_owned(),
-            name: record.name.as_str().to_owned(),
-            serial: record.serial.to_string(),
-            image: record.config.image.clone(),
-            command: summary.command(),
-            created: rfc3339(record.created),
-            state: summary.state.word(),
-            health: summary.health.as_ref().map(|health| health.status),
-            network_lost: summary.network_lost.is_some(),
-            ports: record.ports.clone(),
-        }
-    }
-}
-
 impl Summary {
-    /// The command it was given: its entrypoint (unless `""`), then its
-    /// command; empty when it's the image's own.
+    /// The command it runs ([`Summary::command`]'s field, F101).
     #[must_use]
     pub fn command(&self) -> Vec<String> {
-        let config = &self.record.config;
-        config
-            .entrypoint
-            .iter()
-            .filter(|entrypoint| !entrypoint.is_empty())
-            .chain(&config.command)
-            .cloned()
-            .collect()
+        self.command.clone()
     }
 }
 
-/// A container as `inspect` shows it (its JSON is Shipyard's own,
-/// documented in `docs/user/containers.md`).
+/// A container as Shipyard's own view shows it (its JSON is Shipyard's,
+/// documented in `docs/user/containers.md`; `inspect` shows Docker's).
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct Inspected {
@@ -156,8 +153,8 @@ pub struct Inspected {
     pub restart_count: u32,
     /// Its last start's log directory, if it has started.
     pub log_dir: Option<String>,
-    /// How it runs, as it was made.
-    pub config: Config,
+    /// How it runs, as it was made: its record's form.
+    pub config: StoredConfig,
 }
 
 /// `inspect`'s `state`.
@@ -352,15 +349,69 @@ pub fn sockets(engine: &Engine, reference: &str) -> Result<Sockets> {
     }
 }
 
+/// What both views of one container (Shipyard's own, [`inspect`], and
+/// Docker's, [`crate::docker::inspect_container`]) are made from: its
+/// record, its state now, and what its last start left (read once).
+#[derive(Debug)]
+pub(crate) struct Gathered {
+    /// Its record.
+    pub(crate) record: Record,
+    /// Its state now.
+    pub(crate) state: ContainerState,
+    /// Its init's PID, while it's up.
+    pub(crate) pid: Option<i32>,
+    /// Its last start's log directory, if it has started.
+    pub(crate) log_dir: Option<String>,
+    /// What its health checks say, if it has them and is up.
+    pub(crate) health: Option<crate::health::Health>,
+    /// When and how this start lost its network, if it did, while it's up.
+    pub(crate) network_lost: Option<crate::network::lost::NetworkLost>,
+}
+
+/// The container `reference` names, gathered for a view.
+///
+/// # Errors
+///
+/// As [`super::find`] and [`super::state()`].
+pub(crate) fn gathered(engine: &Engine, reference: &str) -> Result<Gathered> {
+    let record = super::find(engine, reference)?;
+    let state = super::state(engine, &record)?;
+    let log_dir = super::logs_dir(engine, &record.id).ok().and_then(|logs| {
+        let last = super::last_logs_name(&logs)?;
+        Some(logs.join(last).display().to_string())
+    });
+    let pid = state
+        .is_active()
+        .then(|| init_pid(engine, &record))
+        .flatten();
+    let health = super::health(engine, &record, &state);
+    let network_lost = super::network_lost(engine, &record, &state);
+    Ok(Gathered {
+        record,
+        state,
+        pid,
+        log_dir,
+        health,
+        network_lost,
+    })
+}
+
 /// The container `reference` names (as [`super::find`] finds it), as
-/// `inspect` shows it.
+/// Shipyard's own view shows it (`docker inspect`'s is
+/// [`crate::docker::inspect_container`]).
 ///
 /// # Errors
 ///
 /// As [`super::find`] and [`super::state()`].
 pub fn inspect(engine: &Engine, reference: &str) -> Result<Inspected> {
-    let record = super::find(engine, reference)?;
-    let state = super::state(engine, &record)?;
+    let Gathered {
+        record,
+        state,
+        pid,
+        log_dir,
+        health,
+        network_lost,
+    } = gathered(engine, reference)?;
     let (exit_code, oom, finished) = match &state {
         ContainerState::Exited {
             code,
@@ -370,23 +421,16 @@ pub fn inspect(engine: &Engine, reference: &str) -> Result<Inspected> {
         ContainerState::Restarting { code, finished, .. } => (*code, None, *finished),
         _ => (None, None, None),
     };
-    let log_dir = super::logs_dir(engine, &record.id).ok().and_then(|logs| {
-        let last = super::last_logs_name(&logs)?;
-        Some(logs.join(last).display().to_string())
-    });
     let state = InspectedState {
         status: state.word(),
         running: state.is_active(),
-        pid: state
-            .is_active()
-            .then(|| init_pid(engine, &record))
-            .flatten(),
+        pid,
         exit_code,
         oom,
         started_at: record.started.map(rfc3339),
         finished_at: finished.or(record.finished).map(rfc3339),
-        health: super::health(engine, &record, &state),
-        network_lost: super::network_lost(engine, &record, &state),
+        health,
+        network_lost,
     };
     Ok(inspected(record, state, log_dir))
 }
@@ -424,7 +468,7 @@ pub(super) fn inspected(
         auto_remove,
         restart_count,
         log_dir,
-        config,
+        config: StoredConfig::from(&config),
     }
 }
 

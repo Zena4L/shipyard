@@ -294,7 +294,7 @@ mod linux {
     fn mount_root(root: &RootSetup) -> Step<(OwnedFd, Vec<Option<ClonedSource>>)> {
         // The bind sources, cloned before anything is mounted over the host's
         // paths (see `staging`), where the root needs it.
-        let mut cloned: Vec<Option<ClonedSource>> = Vec::new();
+        let cloned;
         let root_fd = if let Some(mounted) = root.attach() {
             // Made by real root (`--uidmap`: the container's own root can't
             // reach the image store, nor the directory it's for): attached in
@@ -303,12 +303,15 @@ mod linux {
             // SAFETY: inherited across the exec for this; owned by nothing
             // else here.
             let mounted = unsafe { OwnedFd::from_raw_fd(mounted) };
-            cloned = clone_sources(root)?;
+            cloned = clone_sources(root, Which::Every)?;
             let fail = |errno| Failure::at(ChildStep::AttachOverlay, errno);
             let on = staging().map_err(fail)?;
             overlay::attach(&mounted, on.as_fd()).map_err(fail)?;
             mounted
         } else {
+            // A source Shipyard made: by descriptor, never by its path (step
+            // 11.7), before anything is mounted.
+            cloned = clone_sources(root, Which::Made)?;
             // An image root: mounted here, inside the container's namespaces,
             // so a rootless overlay mount lands in the user namespace where
             // the kernel allows it.
@@ -377,10 +380,21 @@ mod linux {
         is_dir: bool,
     }
 
-    /// Every bind source of `root`'s mounts, cloned while the host's paths
-    /// are as they are (`None` for a tmpfs). The clones are made with this
-    /// process's credentials, as a bind by path would be.
-    fn clone_sources(root: &RootSetup) -> Step<Vec<Option<ClonedSource>>> {
+    /// Which of a root's bind sources [`clone_sources`] clones.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Which {
+        /// Every one (an attached root's: its staging hides the host's paths).
+        Every,
+        /// Those Shipyard made (`made_below`): the rest are bound by path.
+        Made,
+    }
+
+    /// `root`'s bind sources (`which` of them), cloned while the host's
+    /// paths are as they are (`None` for a tmpfs, or one not cloned). The
+    /// clones are made with this process's credentials, as a bind by path
+    /// would be. A made source is reached from its directory without
+    /// following a symlink: one put on its path is refused (`ELOOP`).
+    fn clone_sources(root: &RootSetup, which: Which) -> Step<Vec<Option<ClonedSource>>> {
         root.mounts
             .iter()
             .enumerate()
@@ -388,34 +402,43 @@ mod linux {
                 let Some(source) = entry.source() else {
                     return Ok(None);
                 };
-                clone_tree(source, entry.recursive)
+                let cloned = match (entry.made_below(), which) {
+                    (Some(dir), _) => clone_made(dir, source, entry.recursive),
+                    (None, Which::Every) => clone_tree(source, entry.recursive),
+                    (None, Which::Made) => return Ok(None),
+                };
+                cloned
                     .map(Some)
                     .map_err(|errno| Failure::at(ChildStep::Mount, errno).detail(index))
             })
             .collect()
     }
 
+    /// A made `source`, below `dir`, cloned by descriptor: `dir` opened as
+    /// it is (Docker's resolution), then each component below it without
+    /// following a symlink (`shipyard_sys::fs::open_below`).
+    fn clone_made(dir: &Path, source: &Path, recursive: bool) -> nix::Result<ClonedSource> {
+        let below = source.strip_prefix(dir).map_err(|_| Errno::EINVAL)?;
+        let dir = nix::fcntl::open(
+            dir,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let made = shipyard_sys::fs::open_below(dir.as_fd(), below)
+            .map_err(|error| Errno::from_raw(error.raw_os_error().unwrap_or(libc::EINVAL)))?;
+        let recursive = if recursive { libc::AT_RECURSIVE } else { 0 };
+        let tree = open_tree(made.as_raw_fd(), c"", libc::AT_EMPTY_PATH | recursive)?;
+        Ok(ClonedSource { tree, is_dir: true })
+    }
+
     /// `open_tree(path, OPEN_TREE_CLONE)`, with what's mounted below it if
     /// `recursive`.
     fn clone_tree(path: &Path, recursive: bool) -> nix::Result<ClonedSource> {
         use std::os::unix::ffi::OsStrExt as _;
-        const OPEN_TREE_CLONE: libc::c_uint = 1;
         let path =
             std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
-        let mut flags = OPEN_TREE_CLONE | libc::c_uint::try_from(libc::O_CLOEXEC).unwrap_or(0);
-        if recursive {
-            flags |= libc::c_uint::try_from(libc::AT_RECURSIVE).unwrap_or(0);
-        }
-        // SAFETY: `open_tree` takes a directory descriptor, a NUL-terminated
-        // path and flags, and returns a new descriptor or -1.
-        let fd =
-            unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, path.as_ptr(), flags) };
-        let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
-        if fd < 0 {
-            return Err(Errno::last());
-        }
-        // SAFETY: a new descriptor the kernel just gave this process.
-        let tree = unsafe { OwnedFd::from_raw_fd(fd) };
+        let recursive = if recursive { libc::AT_RECURSIVE } else { 0 };
+        let tree = open_tree(libc::AT_FDCWD, &path, recursive)?;
         let is_dir =
             SFlag::from_bits_truncate(nix::sys::stat::fstat(&tree)?.st_mode & SFlag::S_IFMT.bits())
                 == SFlag::S_IFDIR;
@@ -543,6 +566,19 @@ mod linux {
                     MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
                     Some(&options),
                 )
+            }
+            // Another container's, with its IPC namespace (Docker's
+            // `--ipc container:`): cloned in its mount namespace.
+            StandardMount::Shm if let Some(theirs) = setup.shm_mount_ns => {
+                let fail = dev_failure("shm");
+                let dev = open_directory(root, "dev").map_err(dev_failure("/dev"))?;
+                let tree = clone_their_shm(theirs).map_err(fail)?;
+                // This container's own rules, whatever the other made of its
+                // mount (`suid`, `exec`, shared with its mounts): Docker's.
+                confine_shared(&tree).map_err(fail)?;
+                mkdirat(&dev, "shm", Mode::from_bits_truncate(0o755)).map_err(fail)?;
+                let on = open_directory(&dev, "shm").map_err(fail)?;
+                overlay::attach(&tree, on.as_fd()).map_err(fail)
             }
             StandardMount::Shm => mount_in_dev(
                 root,
@@ -682,6 +718,155 @@ mod linux {
         let fs = open_directory(&sys, "fs")?;
         let on = open_directory(&fs, "cgroup")?;
         mount_on(&on, "cgroup2", "cgroup2", cgroup.mount_flags(), None)
+    }
+
+    /// Another container's `/dev/shm`, as a detached mount: a mount can be
+    /// cloned only by a process in its mount namespace (the kernel's
+    /// `check_mnt`; probe `foreign-shm.c`), so a child enters theirs (`ns`,
+    /// inherited), opens `/dev/shm` there (its root's: never through a
+    /// symlink), checks it's a tmpfs, clones it (`open_tree`) and hands it
+    /// back. A detached mount belongs to no namespace: it's attached here.
+    /// (This process is single-threaded, as `setns` into a mount namespace
+    /// needs: the clean image.)
+    fn clone_their_shm(ns: std::os::fd::RawFd) -> nix::Result<OwnedFd> {
+        /// How long the helper may take, in seconds.
+        const SHM_CLONE_WAIT_SECONDS: i64 = 30;
+        use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, socketpair};
+        use nix::unistd::ForkResult;
+        let (ours, theirs) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )?;
+        // SAFETY: this process is single-threaded (the clean image): the
+        // child may do anything, and only `_exit`s.
+        match unsafe { nix::unistd::fork() }? {
+            ForkResult::Child => {
+                drop(ours);
+                let cloned = (|| -> nix::Result<OwnedFd> {
+                    // SAFETY: `ns` is a descriptor this process inherited and
+                    // holds open.
+                    let ns = unsafe { std::os::fd::BorrowedFd::borrow_raw(ns) };
+                    nix::sched::setns(ns, nix::sched::CloneFlags::CLONE_NEWNS)?;
+                    // Its root and working directory are the namespace's
+                    // root now: the other container's.
+                    let root = nix::fcntl::open(
+                        "/",
+                        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )?;
+                    let dev = open_directory(&root, "dev")?;
+                    let shm = open_directory(&dev, "shm")?;
+                    if nix::sys::statfs::fstatfs(&shm)?.filesystem_type()
+                        != nix::sys::statfs::TMPFS_MAGIC
+                    {
+                        return Err(Errno::EXDEV);
+                    }
+                    clone_of(&shm)
+                })();
+                let code = match cloned {
+                    Ok(tree) => {
+                        let sent = shipyard_sys::fdpass::send(
+                            theirs.as_fd(),
+                            &[tree.as_fd()],
+                            &[0],
+                            MsgFlags::empty(),
+                        );
+                        i32::from(sent.is_err())
+                    }
+                    Err(errno) => {
+                        let _ = nix::unistd::write(&theirs, &(errno as i32).to_ne_bytes());
+                        1
+                    }
+                };
+                // SAFETY: `_exit` ends the child at once.
+                unsafe { libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => {
+                drop(theirs);
+                // A helper stuck in the other's mount namespace (a lookup
+                // that never ends) never holds this start for good.
+                let _ = nix::sys::socket::setsockopt(
+                    &ours,
+                    nix::sys::socket::sockopt::ReceiveTimeout,
+                    &<nix::sys::time::TimeVal as nix::sys::time::TimeValLike>::seconds(
+                        SHM_CLONE_WAIT_SECONDS,
+                    ),
+                );
+                let mut bytes = [0_u8; 4];
+                let mut room = shipyard_sys::fdpass::Room::new(1);
+                let received = shipyard_sys::fdpass::receive(
+                    ours.as_fd(),
+                    &mut bytes,
+                    &mut room,
+                    MsgFlags::MSG_CMSG_CLOEXEC,
+                );
+                if received.is_err() {
+                    let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                }
+                let _ = nix::sys::wait::waitpid(child, None);
+                let received = received?;
+                match received.fds.into_iter().next() {
+                    Some(tree) => Ok(tree),
+                    None if received.bytes == 4 => Err(Errno::from_raw(i32::from_ne_bytes(bytes))),
+                    None => Err(Errno::EIO),
+                }
+            }
+        }
+    }
+
+    /// Makes the detached mount `tree` (another container's `/dev/shm`)
+    /// `nosuid`, `nodev`, `noexec` and private: nothing the other container
+    /// set on its own mount (a remount with `suid,exec`, a shared peer
+    /// group) comes along. `mount_setattr(2)` (Linux 5.12).
+    fn confine_shared(tree: &OwnedFd) -> nix::Result<()> {
+        let attr = libc::mount_attr {
+            attr_set: libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | libc::MOUNT_ATTR_NOEXEC,
+            attr_clr: 0,
+            propagation: libc::MS_PRIVATE,
+            userns_fd: 0,
+        };
+        // SAFETY: the path is an empty NUL-terminated string and `attr` a
+        // valid `mount_attr` of the size given; the kernel only reads both.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                tree.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                &raw const attr,
+                std::mem::size_of::<libc::mount_attr>(),
+            )
+        };
+        Errno::result(result).map(drop)
+    }
+
+    /// `open_tree(OPEN_TREE_CLONE)` of the mount at `place` (an `O_PATH`
+    /// descriptor): a detached copy of it.
+    fn clone_of(place: &OwnedFd) -> nix::Result<OwnedFd> {
+        open_tree(place.as_raw_fd(), c"", libc::AT_EMPTY_PATH)
+    }
+
+    /// `open_tree(at, path, OPEN_TREE_CLONE | flags)`, close-on-exec: a
+    /// detached copy of the mount there.
+    fn open_tree(
+        at: std::os::fd::RawFd,
+        path: &std::ffi::CStr,
+        flags: libc::c_int,
+    ) -> nix::Result<OwnedFd> {
+        const OPEN_TREE_CLONE: libc::c_uint = 1;
+        let flags = OPEN_TREE_CLONE | (libc::O_CLOEXEC | flags).cast_unsigned();
+        // SAFETY: `open_tree` takes a directory descriptor (or `AT_FDCWD`),
+        // a NUL-terminated path and flags, and returns a new descriptor or
+        // -1.
+        let fd = unsafe { libc::syscall(libc::SYS_open_tree, at, path.as_ptr(), flags) };
+        let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+        if fd < 0 {
+            return Err(Errno::last());
+        }
+        // SAFETY: a new descriptor the kernel just gave this process.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Opens the directory `name` in `dir` as a place to mount on: the

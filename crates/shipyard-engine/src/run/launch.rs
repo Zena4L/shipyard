@@ -59,9 +59,10 @@ pub enum Outcome {
 /// image, the network, the volumes), before the command ran.
 pub fn run(
     engine: &Engine,
-    request: RunRequest,
+    mut request: RunRequest,
     passed: process::passed::PassedFds,
 ) -> Result<Outcome> {
+    super::resolve_joins(engine, &mut request)?;
     let planned = match check(engine, request)? {
         Checked::Bundle(invocation) => return launch(engine, *invocation, None, passed),
         Checked::Command(planned) => planned,
@@ -77,12 +78,8 @@ pub fn run(
     let (defaults, area) = (None, None);
     // A bridge network's address and the /etc files, made now: the
     // container is connected once its namespace exists.
-    let exposed = defaults
-        .as_ref()
-        .map_or(&[][..], |defaults: &super::ImageDefaults| {
-            &defaults.config.exposed_ports
-        });
-    let network = match RunNetwork::set_up(engine, planned.network(), exposed) {
+    let exposed = planned.exposed(defaults.as_ref());
+    let network = match RunNetwork::set_up(engine, planned.network(), &exposed) {
         Ok(network) => network,
         Err(error) => {
             // The default bridge network couldn't be made (the kernel

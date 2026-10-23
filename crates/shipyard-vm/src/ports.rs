@@ -152,11 +152,8 @@ impl PortsFile {
     ///
     /// [`VmError::Io`].
     pub fn write(&self, path: &Path) -> Result<(), VmError> {
-        let bytes = serde_json::to_vec(self).map_err(|e| VmError::io(path, e.into()))?;
-        let how =
-            shipyard_sys::fs::Write::new(0o600).durability(shipyard_sys::fs::Durability::Atomic);
-        shipyard_sys::fs::write_atomically(path, &bytes, &how)
-            .map_err(|e| VmError::io(path, std::io::Error::other(e.to_string())))
+        // Not synced: the host writes it again at each change while it runs.
+        crate::state_file::write(path, self, shipyard_sys::fs::Durability::Atomic)
     }
 
     /// Reads it from `path`: `None` if there's none.
@@ -165,27 +162,7 @@ impl PortsFile {
     ///
     /// [`VmError::Io`]: unreadable, not this format, or a newer version.
     pub fn read(path: &Path) -> Result<Option<Self>, VmError> {
-        #[derive(Deserialize)]
-        struct Versioned {
-            version: u32,
-        }
-        let bytes = match shipyard_sys::fs::read_bounded(path, PORTS_FILE_CAP) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(VmError::io(path, error)),
-        };
-        let unreadable = |e: serde_json::Error| VmError::io(path, e.into());
-        let versioned: Versioned = serde_json::from_slice(&bytes).map_err(unreadable)?;
-        if versioned.version > PORTS_FILE_VERSION {
-            return Err(VmError::io(
-                path,
-                std::io::Error::other(format!(
-                    "version {}, newer than this shipyard's {PORTS_FILE_VERSION}",
-                    versioned.version
-                )),
-            ));
-        }
-        serde_json::from_slice(&bytes).map(Some).map_err(unreadable)
+        crate::state_file::read(path, PORTS_FILE_CAP, PORTS_FILE_VERSION, "")
     }
 }
 

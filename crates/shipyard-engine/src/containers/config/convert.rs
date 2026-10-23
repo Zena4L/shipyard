@@ -51,7 +51,13 @@ impl Config {
         // Every field named, none `..`: a field added to the request must
         // be kept here too (or said not to be).
         let RunRequest {
-            streams: RunStreams { interactive, tty },
+            // (`once` is kept in `created.json`, not the record's config.)
+            streams:
+                RunStreams {
+                    interactive,
+                    tty,
+                    once: _,
+                },
             env,
             caller_env,
             workdir,
@@ -72,6 +78,8 @@ impl Config {
             network,
             // The record's own name (and its name on its networks).
             name: _,
+            // The record keeps them, beside its config.
+            labels: _,
             network_alias,
             ip,
             ip6,
@@ -82,6 +90,14 @@ impl Config {
             dns_option,
             publish,
             publish_all,
+            // Kept beside the record (`created.json`), not in its config.
+            expose: _,
+            tmpfs: _,
+            // Made at its create, if they were missing.
+            make_sources: _,
+            made_sources: _,
+            // Written once, at its create.
+            cidfile: _,
             rootfs,
             image,
             entrypoint,
@@ -101,6 +117,10 @@ impl Config {
             default_mode: _,
             detached: _,
             container: _,
+            // Found at each start; the other's ID is `created.json`'s.
+            joined: _,
+            // Another's IPC namespace is `created.json`'s (`ipc_from`).
+            ipc: _,
         } = request;
         // A check with nothing to run is refused at once, not at each start.
         if let Some(check) = health {
@@ -187,20 +207,18 @@ impl Config {
     /// record this Shipyard can't take (a signal, a capability, a pull
     /// policy or an rlimit it doesn't know, or a mangled address).
     pub(crate) fn to_request(&self, name: &Name) -> Result<RunRequest> {
-        let capabilities = |names: &[String]| {
-            names
-                .iter()
-                .map(|name| parse_capability(name))
-                .collect::<Result<_>>()
-        };
         // Every field named, none `..`, as `from_request`.
         Ok(RunRequest {
             default_mode: std::cell::OnceCell::new(),
             detached: false,
             container: None,
+            joined: crate::run::Joined::default(),
+            ipc: crate::run::IpcMode::Private,
             streams: RunStreams {
                 interactive: self.interactive,
                 tty: self.tty,
+                // (Kept in `created.json`: each start reads it there.)
+                once: false,
             },
             env: self.env.iter().map(Into::into).collect(),
             caller_env: Vec::new(),
@@ -244,18 +262,14 @@ impl Config {
                 .map(Network::to_mode)
                 .collect::<Result<_>>()?,
             name: Some(name.to_string()),
+            // A start's request runs it; its labels are the record's, its
+            // exposed ports beside it (`containers::created`).
+            labels: std::collections::BTreeMap::new(),
             network_alias: self.network_alias.clone(),
             ip: self.ip,
             ip6: self.ip6,
             mac_address: self.mac_address.as_deref().map(parse_mac).transpose()?,
-            add_host: self
-                .add_host
-                .iter()
-                .map(|host| HostEntry {
-                    name: host.name.clone(),
-                    ip: host.ip,
-                })
-                .collect(),
+            add_host: self.add_host.iter().map(Host::to_entry).collect(),
             dns: self.dns.clone(),
             dns_search: self.dns_search.clone(),
             dns_option: self.dns_option.clone(),
@@ -265,6 +279,11 @@ impl Config {
                 .map(Port::to_request)
                 .collect::<Result<_>>()?,
             publish_all: self.publish_all,
+            expose: Vec::new(),
+            tmpfs: Vec::new(),
+            make_sources: Vec::new(),
+            made_sources: Vec::new(),
+            cidfile: None,
             rootfs: self.rootfs.as_ref().map(PathBuf::from),
             image: self.image.clone(),
             entrypoint: self.entrypoint.as_ref().map(Into::into),
@@ -275,8 +294,8 @@ impl Config {
                 None
             },
             read_only: self.read_only,
-            cap_add: capabilities(&self.cap_add)?,
-            cap_drop: capabilities(&self.cap_drop)?,
+            cap_add: capabilities_of(&self.cap_add)?,
+            cap_drop: capabilities_of(&self.cap_drop)?,
             security_opt: self.security_opt.iter().map(Security::to_opt).collect(),
             uidmap: self.uidmap.iter().map(IdRange::to_map).collect(),
             gidmap: self.gidmap.iter().map(IdRange::to_map).collect(),
@@ -284,8 +303,8 @@ impl Config {
             // What's refused off Linux names the first limit flag; a record
             // is made where the limits work, and needs no name for them.
             limits: Limits {
-                first_given: None,
                 resources: Ok(self.resources.to_resources()),
+                ..Limits::default()
             },
             volume: self.volume.clone(),
             command: self.command.iter().map(Into::into).collect(),
@@ -402,6 +421,11 @@ fn capability_text(capability: CapabilityArg) -> String {
         CapabilityArg::All => "ALL".to_owned(),
         CapabilityArg::One(capability) => capability.to_string(),
     }
+}
+
+/// A record's capability names, as a request's.
+fn capabilities_of(names: &[String]) -> Result<Vec<CapabilityArg>> {
+    names.iter().map(|name| parse_capability(name)).collect()
 }
 
 fn parse_capability(text: &str) -> Result<CapabilityArg> {
@@ -539,7 +563,7 @@ impl From<&Resources> for CgroupLimits {
 }
 
 impl CgroupLimits {
-    fn to_resources(&self) -> Resources {
+    pub(crate) fn to_resources(&self) -> Resources {
         let mut resources = Resources::default();
         resources.memory_max = self.memory_max;
         resources.memory_low = self.memory_low;
@@ -578,7 +602,10 @@ impl From<&NetworkMode> for Network {
     fn from(mode: &NetworkMode) -> Self {
         match mode {
             NetworkMode::Host => Self::Host,
-            NetworkMode::None => Self::None,
+            // Another container's network is kept beside the record
+            // (`created.json`'s `network_from`): the record's own types are
+            // frozen, and a start without it gets no network of its own.
+            NetworkMode::None | NetworkMode::Container(_) => Self::None,
             NetworkMode::Pasta => Self::Pasta,
             NetworkMode::Bridges(joined) => Self::Bridges(
                 joined
@@ -627,6 +654,16 @@ impl From<&PortRequest> for Port {
             host_port: port.host_port,
             container_port: port.container_port,
             protocol: port.protocol.name().to_owned(),
+        }
+    }
+}
+
+impl Host {
+    /// As a request's `--add-host`.
+    fn to_entry(&self) -> HostEntry {
+        HostEntry {
+            name: self.name.clone(),
+            ip: self.ip,
         }
     }
 }

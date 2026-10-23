@@ -32,7 +32,7 @@ use crate::Engine;
 use crate::containers::{self, ContainerId, Record, RestartPolicy};
 use crate::report::WarningKind;
 use crate::run::start::Input;
-use crate::run::start::start_taken;
+use crate::run::start::{drop_failed_start, last_start, start_taken};
 use crate::run::take::Taken;
 
 /// The first restart's delay.
@@ -126,7 +126,11 @@ pub(in crate::run) fn prune_before_a_start(engine: &Engine, id: &ContainerId) {
 /// if its policy says so, once the backoff is over (see the module's
 /// documentation). What goes wrong is said to the clean-up's log; the
 /// container is then left ended.
-pub(in crate::run) fn after_end(engine: &Engine, id: &ContainerId) {
+pub(in crate::run) fn after_end(
+    engine: &Engine,
+    id: &ContainerId,
+    held: Option<nix::fcntl::Flock<std::fs::File>>,
+) {
     let Ok(record) = containers::read_one(engine, id) else {
         return;
     };
@@ -143,7 +147,11 @@ pub(in crate::run) fn after_end(engine: &Engine, id: &ContainerId) {
     // The one restart that waits: another clean-up's may hold it a moment
     // (its start just ended), or for its whole backoff (its start failed,
     // and it goes on: then this one has nothing to do).
-    let Ok(_restarting) = containers::restarting_lock(engine, id, RESTARTING_WAIT) else {
+    // Held already (the clean-up took it before it let the container go),
+    // or waited for.
+    let Some(_restarting) =
+        held.or_else(|| containers::restarting_lock(engine, id, RESTARTING_WAIT).ok())
+    else {
         return;
     };
     // Again, under it: started again meanwhile, or gone.
@@ -257,24 +265,6 @@ fn schedule(engine: &Engine, id: &ContainerId, delay: Duration) -> Option<Turn> 
         deadline,
         delay,
     })
-}
-
-/// Container `id`'s newest start's logs directory, by its name.
-fn last_start(engine: &Engine, id: &ContainerId) -> Option<String> {
-    containers::last_logs_name(&containers::logs_dir(engine, id).ok()?)
-}
-
-/// After a restart that failed: the start directory it made (newer than
-/// `before`) removed, so failures don't push the last run's logs out.
-fn drop_failed_start(engine: &Engine, id: &ContainerId, before: Option<&str>) {
-    let Ok(logs) = containers::logs_dir(engine, id) else {
-        return;
-    };
-    if let Some(newest) = containers::last_logs_name(&logs)
-        && Some(newest.as_str()) != before
-    {
-        let _ = std::fs::remove_dir_all(logs.join(newest));
-    }
 }
 
 /// Waits until `deadline`, then for container `id`'s locks (tried, never

@@ -432,6 +432,10 @@ mod linux {
             a_failed_start_keeps_what_its_user_stopped,
         ),
         (
+            "a_failed_start_sets_off_no_restart",
+            a_failed_start_sets_off_no_restart,
+        ),
+        (
             "a_stop_of_a_dead_start_stays_stopped",
             a_stop_of_a_dead_start_stays_stopped,
         ),
@@ -514,6 +518,30 @@ mod linux {
         (
             "an_end_its_clean_up_missed_is_said_once",
             an_end_its_clean_up_missed_is_said_once,
+        ),
+        (
+            "an_end_recorded_but_unsaid_is_said_once",
+            an_end_recorded_but_unsaid_is_said_once,
+        ),
+        (
+            "one_its_policy_restarts_is_never_removed_unasked",
+            one_its_policy_restarts_is_never_removed_unasked,
+        ),
+        (
+            "an_image_a_record_names_is_kept_without_its_pin",
+            an_image_a_record_names_is_kept_without_its_pin,
+        ),
+        (
+            "an_end_unsaid_across_a_reboot_is_said_once",
+            an_end_unsaid_across_a_reboot_is_said_once,
+        ),
+        (
+            "a_mark_of_another_start_says_nothing",
+            a_mark_of_another_start_says_nothing,
+        ),
+        (
+            "docker_inspect_reads_the_image_and_the_area",
+            docker_inspect_reads_the_image_and_the_area,
         ),
         ("rm_f_says_kill_die_destroy", rm_f_says_kill_die_destroy),
         ("a_passing_check_is_healthy", a_passing_check_is_healthy),
@@ -626,6 +654,7 @@ mod linux {
         let mut options = shipyard_engine::run::Foreground {
             sig_proxy: true,
             detach_keys: None,
+            output: shipyard_engine::attach::Output::BOTH,
         };
         let mut auto_remove = false;
         let mut rest = args.iter();
@@ -757,6 +786,7 @@ mod linux {
             detach_keys: shipyard_runtime::attach::DetachKeys::default_keys(),
             stdin: false,
             held: false,
+            output: shipyard_engine::attach::Output::BOTH,
         }
     }
 
@@ -5029,6 +5059,68 @@ mod linux {
         shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
 
+    /// F81: a user's `start` that fails (its gate never opened) of an
+    /// `always` container that ended by itself sets off no restart (Docker's
+    /// policy follows a run, not a failed start); the control: a start
+    /// that runs and ends is restarted by the same policy.
+    fn a_failed_start_sets_off_no_restart() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let request = stores.request(&["sh", "-c", "exit 3"]);
+        let id = shipyard_engine::run::create(&engine, request, false)
+            .unwrap()
+            .id;
+        shipyard_engine::run::start(&engine, id.as_str()).unwrap();
+        eventually("its end settled", || {
+            stores.running_file(&id).try_lock().is_ok() && stores.record(&id).finished.is_some()
+        });
+        containers::testing::update(&engine, &id, |record| {
+            record.config.restart = containers::RestartPolicy::Always;
+        })
+        .unwrap();
+        let before = stores.record(&id);
+        let starts = stores.starts(&id);
+        let root = stores.runtime_root();
+        let failed = shipyard_engine::run::start_with(&engine, id.as_str(), |id| {
+            std::fs::remove_file(root.join(id.as_str()).join("exec.fifo")).unwrap();
+        });
+        assert!(failed.is_err(), "{failed:?}");
+        eventually("its clean-up done", || {
+            stores.running_file(&id).try_lock().is_ok()
+                && runtime::status(&stores.runtime_root(), id.as_str())
+                    .unwrap()
+                    .is_none()
+        });
+        // Its `__cleanup` gone: the policy decided (a restart is made
+        // before it exits, as the control below shows for a start that ran).
+        eventually("its __cleanup gone", || {
+            processes_with("__cleanup")
+                .iter()
+                .all(|process| !process.contains(id.as_str()))
+        });
+        let after = stores.record(&id);
+        assert_eq!(
+            (after.started, after.restart_count),
+            (before.started, before.restart_count),
+            "restarted after a failed start"
+        );
+        assert!(
+            runtime::status(&stores.runtime_root(), id.as_str())
+                .unwrap()
+                .is_none(),
+            "running again after a failed start"
+        );
+        // Nor does it leave a start directory of its own, which would hide
+        // the last run's logs and health (F133's Murphy review).
+        assert_eq!(stores.starts(&id), starts, "the failed start's directory");
+        // The control: a start that runs and ends is the policy's.
+        shipyard_engine::run::start(&engine, id.as_str()).unwrap();
+        eventually("restarted by its policy", || {
+            stores.record(&id).restart_count >= 1
+        });
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
+    }
+
     /// A `stop` of a container whose start died after it recorded itself
     /// (its CLI killed: faked as `a_start_killed_after_recording_itself_keeps_its_history`
     /// does, with a v2 `previous-start.json`) stays a stop: the dead start's
@@ -6182,6 +6274,221 @@ mod linux {
         panic!("the clean-up recorded the end first, every time");
     }
 
+    /// F88: a clean-up killed after it recorded the end but before it said
+    /// it (paused there by its test hook): the next command that takes the
+    /// container says its end, once.
+    fn an_end_recorded_but_unsaid_is_said_once() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = killed_between_the_end_and_its_die(&stores);
+        shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
+        assert_eq!(
+            stores.actions(id.as_str()),
+            ["create", "start", "die", "destroy"]
+        );
+    }
+
+    /// A container whose policy starts it again, in the moment its
+    /// clean-up has let it go but not yet decided its restart (paused there
+    /// by its test hook: what a prune or an `rm` waiting on it wakes in):
+    /// refused as restarting by a removal without force, kept by a prune.
+    /// Its clean-up killed there (nothing will restart it), it's removed.
+    fn one_its_policy_restarts_is_never_removed_unasked() {
+        use shipyard_engine::docker::filters::ContainerPruneFilters;
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let hook = stores.scratch.0.join("restart-paused");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("launch").args([
+            "--restart",
+            "always",
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sh",
+            "-c",
+            "exit 3",
+        ]);
+        for (key, value) in stores.env() {
+            command.env(key, value);
+        }
+        command.env("SHIPYARD_TEST_CLEANUP_RESTART_PAUSE", &hook);
+        let id = Stores::id(&command.output().unwrap());
+        eventually("its clean-up paused, the container let go", || {
+            hook.exists()
+        });
+        assert!(stores.running_file(&id).try_lock().is_ok(), "let go");
+        assert!(stores.record(&id).next_start.is_none(), "not scheduled");
+        let refused = shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            shipyard_engine::ErrorKind::InUse,
+            "{refused:#}"
+        );
+        let pruned =
+            shipyard_engine::prune::containers(&engine, &ContainerPruneFilters::default()).unwrap();
+        assert!(pruned.removed.is_empty(), "{:?}", pruned.removed);
+        assert!(pruned.failed.is_empty(), "{:?}", pruned.failed);
+        // Nothing to restart it now: removed without force.
+        let pid: i32 = std::fs::read_to_string(&hook).unwrap().parse().unwrap();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        eventually("the clean-up gone, the restart free", || {
+            shipyard_engine::run::remove(&engine, id.as_str(), false).is_ok()
+        });
+    }
+
+    /// `image prune -a` keeps an image a container's record names even
+    /// without the container's pin (a create killed between its record and
+    /// its pin, a record from before pins): its next start needs it. Once
+    /// the container is removed, the image goes.
+    fn an_image_a_record_names_is_kept_without_its_pin() {
+        use shipyard_engine::docker::filters::{Given, ImagePruneFilters};
+        use shipyard_image::index::Index;
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let made = shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
+        let root = stores.scratch.store();
+        let pins: Vec<(String, String)> = Index::open(&root).unwrap().pins();
+        let mine: Vec<&(String, String)> = pins
+            .iter()
+            .filter(|(_, id)| id == made.id.as_str())
+            .collect();
+        assert_eq!(mine.len(), 1, "{pins:?}");
+        Index::unpin(&root, &mine[0].0, &mine[0].1).unwrap();
+        let all = ImagePruneFilters::parse(
+            Given::from_pairs([("dangling".to_owned(), "false".to_owned())]),
+            0,
+        )
+        .unwrap();
+        let kept = shipyard_engine::prune::images(&engine, &all).unwrap();
+        assert!(kept.untagged.is_empty(), "{:?}", kept.untagged);
+        shipyard_engine::run::remove(&engine, made.id.as_str(), false).unwrap();
+        let pruned = shipyard_engine::prune::images(&engine, &all).unwrap();
+        assert!(!pruned.untagged.is_empty(), "its control: unused now");
+    }
+
+    /// F88 across a reboot: the clean-up killed in the same window, then
+    /// the runtime's state gone (the host restarted): the recovery pass
+    /// says the end, once, and no later pass says it again.
+    fn an_end_unsaid_across_a_reboot_is_said_once() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = killed_between_the_end_and_its_die(&stores);
+        runtime::delete(&stores.runtime_root(), id.as_str(), true).unwrap();
+        for _ in 0..2 {
+            let other =
+                shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
+            shipyard_engine::run::remove(&engine, other.id.as_str(), false).unwrap();
+            assert_eq!(stores.actions(id.as_str()), ["create", "start", "die"]);
+        }
+        shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
+    }
+
+    /// F88's mark goes with an end said, and one another start left (a
+    /// start killed before it recorded itself) says nothing: one `die`.
+    fn a_mark_of_another_start_says_nothing() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = Stores::id(&stores.launch(&[
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sh",
+            "-c",
+            "exit 3",
+        ]));
+        eventually("its end, recorded and said", || {
+            stores.running_file(&id).try_lock().is_ok()
+                && stores.actions(id.as_str()) == ["create", "start", "die"]
+        });
+        let mark = containers::testing::record_dir(&engine, &id)
+            .unwrap()
+            .join("end-unsaid");
+        assert!(!mark.exists(), "said, its mark gone");
+        std::fs::write(&mark, "1").unwrap();
+        let other =
+            shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
+        shipyard_engine::run::remove(&engine, other.id.as_str(), false).unwrap();
+        shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
+        assert_eq!(
+            stores.actions(id.as_str()),
+            ["create", "start", "die", "destroy"]
+        );
+    }
+
+    /// Docker's inspect reads past the record: its image's own ports
+    /// beside those published, and its writable area's places once it has
+    /// started (none before: `null`).
+    fn docker_inspect_reads_the_image_and_the_area() {
+        let stores = Stores::with_image_config(r#"{"ExposedPorts":{"8080/tcp":{}}}"#);
+        let engine = stores.engine();
+        let made = shipyard_engine::run::create(&engine, stores.request(&["true"]), false).unwrap();
+        let inspected =
+            shipyard_engine::docker::inspect_container(&engine, made.id.as_str()).unwrap();
+        assert!(inspected.graph_driver.data.is_none(), "not started");
+        assert!(
+            inspected.config.exposed_ports.contains_key("8080/tcp"),
+            "{:?}",
+            inspected.config.exposed_ports
+        );
+        let id = launch_plain(&stores, &[]);
+        let inspected = shipyard_engine::docker::inspect_container(&engine, id.as_str()).unwrap();
+        let data = inspected.graph_driver.data.unwrap();
+        assert_eq!(std::path::Path::new(&data["UpperDir"]), stores.upper(&id));
+        for key in ["LowerDir", "WorkDir", "MergedDir"] {
+            assert!(
+                data[key]
+                    .split(':')
+                    .all(|dir| std::path::Path::new(dir).is_dir()),
+                "{key}: {}",
+                data[key]
+            );
+        }
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
+        shipyard_engine::run::remove(&engine, made.id.as_str(), false).unwrap();
+    }
+
+    /// A container whose `__cleanup` was killed after it recorded the end
+    /// and before it said it (F88's window, by its test hook): its end in
+    /// the record, its mark beside it, no `die`.
+    fn killed_between_the_end_and_its_die(stores: &Stores) -> ContainerId {
+        killed_between_the_end_and_its_die_with(stores, &[])
+    }
+
+    /// [`killed_between_the_end_and_its_die`], launched with `flags` too.
+    fn killed_between_the_end_and_its_die_with(stores: &Stores, flags: &[&str]) -> ContainerId {
+        let hook = stores.scratch.0.join("clean-up-paused");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("launch").args(flags).args([
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sh",
+            "-c",
+            "exit 3",
+        ]);
+        for (key, value) in stores.env() {
+            command.env(key, value);
+        }
+        command.env("SHIPYARD_TEST_CLEANUP_PAUSE", &hook);
+        let id = Stores::id(&command.output().unwrap());
+        eventually("its clean-up paused, the end recorded", || hook.exists());
+        assert!(stores.record(&id).exit.is_some(), "the end recorded first");
+        let pid: i32 = std::fs::read_to_string(&hook).unwrap().parse().unwrap();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        // Unsaid: no `die` yet.
+        assert_eq!(stores.actions(id.as_str()), ["create", "start"]);
+        id
+    }
+
     /// `rm -f` of a running container, as Docker says it: `kill`, its end
     /// (`die`, 137: killed by its monitor, its exit recorded), `destroy`.
     fn rm_f_says_kill_die_destroy() {
@@ -6293,8 +6600,22 @@ mod linux {
             .and_then(|kb| kb.trim().trim_end_matches("kB").trim().parse().ok())
             .unwrap();
         assert!(anonymous < 2048, "the companion: {anonymous} kB");
-        shipyard_engine::run::remove(&stores.engine(), id.as_str(), true).unwrap();
+        // Ended, it's unhealthy, its streak and results kept: as Docker's
+        // says once its checks stop (F133; 29.8's capture).
+        let fast = shipyard_engine::run::StopOptions {
+            timeout: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        shipyard_engine::run::stop(&stores.engine(), id.as_str(), fast).unwrap();
+        eventually("its end settled", || {
+            stores.running_file(&id).try_lock().is_ok() && stores.record(&id).finished.is_some()
+        });
+        let ended = health_of(&stores, &id).expect("its health kept after its end");
+        assert_eq!(ended.status, Status::Unhealthy, "{ended:?}");
+        assert_eq!(ended.failing_streak, 0);
+        assert_eq!(ended.log.last().unwrap().exit_code, 0);
         eventually("its companion gone", || companions(&id).is_empty());
+        shipyard_engine::run::remove(&stores.engine(), id.as_str(), true).unwrap();
     }
 
     /// A check reads its own container's record, by its ID, and no other
@@ -6355,6 +6676,19 @@ mod linux {
         assert_eq!(health.log[0].output, "sick");
         assert_eq!(health.log[0].exit_code, 1);
         assert_eq!(health_events(&stores, &id), ["unhealthy"]);
+        // Its results kept once it has ended (F133: Docker's
+        // `State.Health` after the end).
+        let fast = shipyard_engine::run::StopOptions {
+            timeout: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        shipyard_engine::run::stop(&stores.engine(), id.as_str(), fast).unwrap();
+        eventually("its end settled", || {
+            stores.running_file(&id).try_lock().is_ok() && stores.record(&id).finished.is_some()
+        });
+        let kept = health_of(&stores, &id).expect("its health kept after its end");
+        assert_eq!(kept.status, Status::Unhealthy);
+        assert_eq!(kept.log[0].output, "sick");
         shipyard_engine::run::remove(&stores.engine(), id.as_str(), true).unwrap();
         let missing = launch_checked(&stores, "exec /no/such/check", &["--health-retries", "1"]);
         eventually("unhealthy", || {
@@ -6433,7 +6767,9 @@ mod linux {
         };
         shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
         assert!(companions(&id).is_empty(), "{:?}", companions(&id));
-        assert_eq!(health_of(&stores, &id), None, "none while it's down");
+        // Down: unhealthy, its last start's results kept (F133, Docker's).
+        let down = health_of(&stores, &id).expect("its health while it's down");
+        assert_eq!(down.status, Status::Unhealthy, "{down:?}");
         shipyard_engine::run::start(&engine, id.as_str()).unwrap();
         eventually("healthy again", || {
             health_of(&stores, &id)

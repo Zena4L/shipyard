@@ -47,6 +47,9 @@ pub struct Pulled {
     pub config: ImageConfig,
     /// The manifest's digest.
     pub manifest_digest: Digest,
+    /// The multi-platform index's digest, if the reference named one
+    /// (F118: Docker's `RepoDigests`).
+    pub index_digest: Option<Digest>,
 }
 
 /// Why a pull failed.
@@ -180,7 +183,9 @@ pub fn pull_with(
         });
     }
 
-    let (manifest_bytes, manifest_digest) = if is_index(&top.bytes, top.media_type.as_deref()) {
+    let through_index = is_index(&top.bytes, top.media_type.as_deref());
+    let index_digest = through_index.then(|| top_digest.clone());
+    let (manifest_bytes, manifest_digest) = if through_index {
         store.write_blob(&top_digest, &mut &top.bytes[..])?;
         let index = Index::parse(&top.bytes)?;
         let entry = index.select(platform)?;
@@ -224,6 +229,7 @@ pub fn pull_with(
         manifest,
         config,
         manifest_digest,
+        index_digest,
     })
 }
 
@@ -243,9 +249,12 @@ pub fn from_store(
 ) -> Result<Option<Pulled>, PullError> {
     let limit = crate::MANIFEST_SIZE_LIMIT;
     let index = StoreIndex::open(store.root())?;
-    let recorded = index
-        .get(&reference.to_string())
-        .and_then(|record| Digest::parse(&record.manifest).ok());
+    let record = index.get(&reference.to_string());
+    let recorded = record.and_then(|record| Digest::parse(&record.manifest).ok());
+    // The index its pull went through, as the store's index recorded it.
+    let recorded_index = record
+        .and_then(|record| record.index_digest.as_deref())
+        .and_then(|digest| Digest::parse(digest).ok());
     let Some(top_digest) = recorded.or_else(|| reference.digest.clone()) else {
         return Ok(None);
     };
@@ -254,14 +263,14 @@ pub fn from_store(
     }
     let top = store.read_blob(&top_digest, limit)?;
     // A pinned index: the platform's manifest, if that's stored too.
-    let (manifest_bytes, manifest_digest) = if is_index(&top, None) {
+    let (manifest_bytes, manifest_digest, index_digest) = if is_index(&top, None) {
         let digest = Index::parse(&top)?.select(platform)?.digest.clone();
         if !store.contains(&digest) {
             return Ok(None);
         }
-        (store.read_blob(&digest, limit)?, digest)
+        (store.read_blob(&digest, limit)?, digest, Some(top_digest))
     } else {
-        (top, top_digest)
+        (top, top_digest, recorded_index)
     };
     let manifest = ImageManifest::parse(&manifest_bytes)?;
     check_manifest(&manifest)?;
@@ -277,6 +286,7 @@ pub fn from_store(
         manifest,
         config,
         manifest_digest,
+        index_digest,
     }))
 }
 

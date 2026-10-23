@@ -11,14 +11,13 @@
 //! none of another crate's: a change there can't change a record. The
 //! format is pinned by a test that reads a literal record.
 //!
-//! This serde form is the record's (inside version 3) and, until stage 11
-//! gives `inspect` Docker's form, `inspect`'s JSON too: a change to it is a
-//! new record version (`record.rs`'s upgrade rule).
+//! The engine's own form, with no serde of its own: a record keeps it as
+//! [`StoredConfig`], frozen types of the record's,
+//! converted at its edge (step 11.1, D10.1d-1). A field added here fails to
+//! build until `stored.rs` says how a record keeps it.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr};
-
-use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, bail};
 
@@ -27,8 +26,7 @@ use crate::error::{Result, bail};
 /// (a bare `--env KEY` is stored with the value it had then), and the
 /// name, which is the record's ([`Record::name`](super::Record::name)).
 /// Made by [`from_request`](Self::from_request) only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[allow(
     clippy::struct_excessive_bools,
@@ -59,14 +57,9 @@ pub struct Config {
     pub stop_signal: String,
     /// `--stop-timeout`, in seconds.
     pub stop_timeout: u64,
-    /// `--restart`. Records before version 3 have none (`no`): the one
-    /// field a version may lack, as the config is the same type in every
-    /// version.
-    #[serde(default)]
+    /// `--restart`.
     pub restart: RestartPolicy,
-    /// `--health-cmd` and the rest: none, no checks. Added before version 3
-    /// was released (9.6b), as `restart`.
-    #[serde(default)]
+    /// `--health-cmd` and the rest: none, no checks.
     pub health: Option<crate::health::HealthCheck>,
     /// `--no-isolation`.
     pub no_isolation: bool,
@@ -131,8 +124,7 @@ pub struct Config {
 /// What happens when a container ends (`--restart`), Docker's policies:
 /// written and read in their words (`no`, `on-failure`, `on-failure:3`,
 /// `always`, `unless-stopped`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RestartPolicy {
     /// Never started again by its policy.
@@ -200,8 +192,7 @@ impl From<RestartPolicy> for String {
 
 /// An rlimit: its kind's name (`nofile`), and the soft and hard values
 /// (`None`: unlimited).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Ulimit {
     /// The resource (`nofile`, `nproc`, …).
@@ -213,8 +204,7 @@ pub struct Ulimit {
 }
 
 /// A host device given to the container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Device {
     /// The host's device (or a directory of them).
@@ -226,8 +216,7 @@ pub struct Device {
 }
 
 /// `--user`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct User {
     /// The user: a name or a number.
@@ -237,8 +226,7 @@ pub struct User {
 }
 
 /// A kernel setting the container owns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Sysctl {
     /// Its name (`net.ipv4.ip_forward`).
@@ -248,8 +236,7 @@ pub struct Sysctl {
 }
 
 /// A kind of device the container may use (`--device-cgroup-rule`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeviceCgroupRule {
     /// Allowed, or denied.
@@ -266,8 +253,7 @@ pub struct DeviceCgroupRule {
 
 /// A range of a user namespace's map: `size` IDs from `container` inside
 /// are `host` onwards outside.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IdRange {
     /// The first ID inside.
@@ -280,8 +266,7 @@ pub struct IdRange {
 
 /// The cgroup limits, as the cgroup files take them (`None`: the kernel's
 /// default, no limit).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CgroupLimits {
     /// `memory.max`, in bytes.
@@ -315,8 +300,7 @@ pub struct CgroupLimits {
 }
 
 /// An amount that can also be no limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Amount {
     /// No limit.
@@ -326,8 +310,7 @@ pub enum Amount {
 }
 
 /// One device's `io.max`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoLimit {
     /// The block device's major number.
@@ -345,8 +328,7 @@ pub struct IoLimit {
 }
 
 /// A network asked for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Network {
     /// The host's.
@@ -360,8 +342,7 @@ pub enum Network {
 }
 
 /// A bridge network joined, and the container's settings there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Bridge {
     /// The network.
@@ -391,8 +372,7 @@ impl Bridge {
 }
 
 /// An `/etc/hosts` entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Host {
     /// The name.
@@ -402,8 +382,7 @@ pub struct Host {
 }
 
 /// A port published.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Port {
     /// The host address (`None`: every one).
@@ -417,8 +396,7 @@ pub struct Port {
 }
 
 /// A security option.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Security {
     /// `no-new-privileges`, on or off.
@@ -431,3 +409,6 @@ pub enum Security {
 
 mod bridges;
 mod convert;
+mod stored;
+
+pub use stored::StoredConfig;

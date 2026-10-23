@@ -30,14 +30,22 @@ pub struct ExecRequest {
     pub detach: bool,
     /// Its user (`-u USER[:GROUP]`, names or numbers); else the container's.
     pub user: Option<String>,
-    /// `KEY=VALUE` entries added to the container's environment (`-e`).
+    /// `KEY=VALUE` entries added to the container's environment (`-e`); a
+    /// bare `KEY` takes the caller's value from
+    /// [`caller_env`](Self::caller_env), as `run`'s does.
     pub env: Vec<OsString>,
+    /// The caller's values for the bare `KEY`s in [`env`](Self::env): the
+    /// engine never reads its own process's environment for them.
+    pub caller_env: Vec<(OsString, OsString)>,
     /// Its working directory (`-w`), inside the container.
     pub workdir: Option<PathBuf>,
     /// How a stop request (SIGTERM or SIGINT to this process) ends it: its
     /// signal, then SIGKILL to all it started after its timeout (by default
     /// SIGTERM, then 10 s).
     pub stop: shipyard_runtime::process::StopPolicy,
+    /// Where to write its PID (as the host sees it) once it runs (the API's
+    /// exec inspect, F117).
+    pub pid_file: Option<PathBuf>,
 }
 
 /// How an exec went.
@@ -133,12 +141,19 @@ mod linux {
         )?;
         let mut options = ExecOptions::new(request.args.clone());
         options.cwd.clone_from(&request.workdir);
-        options.env.clone_from(&request.env);
+        options.env = request
+            .env
+            .iter()
+            .filter_map(|entry| {
+                crate::run::command::resolved_env(entry, &request.caller_env).transpose()
+            })
+            .collect::<Result<_>>()?;
         options.user_spec.clone_from(&request.user);
         options.no_input = !request.interactive;
         options.detach = request.detach;
         options.terminal = request.tty;
         options.stop = request.stop;
+        options.pid_file.clone_from(&request.pid_file);
         match runtime::exec(root, record.id.as_str(), &options, None)? {
             ExecOutcome::Exited(status) => Ok(Ran::Exited(status.code())),
             ExecOutcome::Detached { pid } => Ok(Ran::Detached { pid }),

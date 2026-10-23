@@ -50,11 +50,6 @@ const INIT_ARG: &str = "__guest-init";
 #[cfg(target_os = "linux")]
 const READY: &str = "/run/shipyard-guest-ready";
 
-/// What a request is told while the guest isn't ready.
-#[cfg(target_os = "linux")]
-const NOT_READY: &str = "the VM is still starting: it's checking its data disk, or repairing it \
-                         after an unclean stop (its console log says how far); try again shortly";
-
 /// The argument that makes this binary the guest's agent.
 #[cfg(target_os = "linux")]
 const AGENT_ARG: &str = "__shipyard-agent";

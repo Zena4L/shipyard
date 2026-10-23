@@ -117,6 +117,21 @@ fn two_first_commands_start_one_vm() {
 }
 
 /// 10.3b1: commands run in the guest through the plain CLI, as on Linux.
+/// `command` started with SIGINT as a terminal's Ctrl-C gives it: a test
+/// run from a shell's background job (`… &`) inherits it ignored, and a
+/// program started so rightly keeps ignoring it (11.5b2b's verify: the CLI
+/// never saw the test's SIGINT, and the command ran its `sleep 60` out).
+fn with_sigint(command: &mut Command) {
+    // SAFETY: between fork and exec, `signal` only: async-signal-safe, no
+    // allocation, no lock.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(command, || {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+}
+
 /// A directory under the home binds at its own path; a link in it out of
 /// the home is refused before anything is sent; `-e KEY` takes the Mac's
 /// value; a Ctrl-C (SIGINT to the CLI) reaches the container; a reader
@@ -172,21 +187,22 @@ fn commands_are_forwarded_as_on_linux() {
 
     // Ctrl-C: the CLI's SIGINT, passed on to the container (its trap says
     // it came).
-    let mut interrupted = vm
-        .command(&[
-            "run",
-            "--rm",
-            "--name",
-            "trapped",
-            IMAGE,
-            "sh",
-            "-c",
-            "trap 'exit 42' INT; echo ready; sleep 60 & wait",
-        ])
+    let mut trapped = vm.command(&[
+        "run",
+        "--rm",
+        "--name",
+        "trapped",
+        IMAGE,
+        "sh",
+        "-c",
+        "trap 'exit 42' INT; echo ready; sleep 60 & wait",
+    ]);
+    trapped
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    with_sigint(&mut trapped);
+    let mut interrupted = trapped.spawn().unwrap();
     let mut out = std::io::BufReader::new(interrupted.stdout.take().unwrap());
     let mut line = String::new();
     out.read_line(&mut line).unwrap();
@@ -196,7 +212,14 @@ fn commands_are_forwarded_as_on_linux() {
         nix::sys::signal::Signal::SIGINT,
     )
     .unwrap();
-    assert_eq!(interrupted.wait().unwrap().code(), Some(42));
+    let ended = interrupted.wait_with_output().unwrap();
+    assert_eq!(
+        ended.status.code(),
+        Some(42),
+        "{}; the host's log:\n{}",
+        text(&ended.stderr),
+        std::fs::read_to_string(vm.dir.join("host.log")).unwrap_or_default()
+    );
 
     // A reader that goes: quiet, and a success.
     let mut many = vm

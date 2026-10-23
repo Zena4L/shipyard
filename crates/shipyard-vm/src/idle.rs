@@ -89,6 +89,11 @@ impl Clients {
         self.lock().stopping = true;
     }
 
+    /// Whether the host is stopping.
+    pub(crate) fn stopping(&self) -> bool {
+        self.lock().stopping
+    }
+
     /// The state, even past a thread that panicked holding it (nothing
     /// under it can be left half done: plain counts): a poisoned lock read
     /// as "stopping" would refuse every client for good.

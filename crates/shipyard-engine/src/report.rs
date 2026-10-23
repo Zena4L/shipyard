@@ -122,6 +122,9 @@ pub enum WarningKind {
     /// A container lost its network while it ran (its pasta died): it ran
     /// on with only its loopback.
     NetworkLost,
+    /// A container others share the network or IPC namespace of stopped or
+    /// went: they lose them until they're started again (D11.4b2-4).
+    SharedNamespacesLost,
 }
 
 /// A step of a pull.

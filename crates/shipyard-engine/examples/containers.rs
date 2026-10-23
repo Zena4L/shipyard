@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 labels: Labels::default(),
                 image_id: None,
                 auto_remove: false,
+                created: shipyard_engine::containers::Created::default(),
             },
         )?;
         writeln!(

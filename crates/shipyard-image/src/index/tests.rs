@@ -68,6 +68,8 @@ fn record(manifest: &str, config: &str, layers: &[&str]) -> ImageRecord {
         manifest: d(manifest),
         config: d(config),
         layers: layers.iter().map(|h| d(h)).collect(),
+        index_digest: None,
+        tagged_at: None,
     }
 }
 
@@ -154,6 +156,114 @@ fn a_pin_keeps_an_image_unlisted_until_forgotten() {
         .unwrap();
     assert_eq!(removed.len(), 3, "{removed:?}");
     assert!(!scratch.0.join("layers").join(hex("c")).exists());
+}
+
+/// An ID names one image: its manifest digest, whole or its start (4 hex
+/// digits or more), with `sha256:` or not; or its config digest, whole.
+/// Every reference of it; a start of two images' refused, as is anything
+/// not hex, too short, or a config digest's start.
+#[test]
+fn an_image_is_found_by_its_id() {
+    let scratch = Scratch::new();
+    Index::record(&scratch.0, "web:1", record("a1", "c1", &["e"])).unwrap();
+    Index::record(&scratch.0, "web:latest", record("a1", "c1", &["e"])).unwrap();
+    Index::record(&scratch.0, "db:1", record("a2", "c2", &["f"])).unwrap();
+    let index = Index::open(&scratch.0).unwrap();
+    let references = |id: &str| -> Vec<String> {
+        index
+            .by_id(id)
+            .unwrap()
+            .into_iter()
+            .map(|image| image.reference)
+            .collect()
+    };
+    assert_eq!(
+        references(&format!("sha256:{}", hex("a1"))),
+        ["web:1", "web:latest"]
+    );
+    assert_eq!(references("a1a1"), ["web:1", "web:latest"]);
+    assert_eq!(references("A2A2"), ["db:1"], "in capitals");
+    assert_eq!(
+        references(&format!("sha256:{}", hex("c2"))),
+        ["db:1"],
+        "the config's, whole"
+    );
+    assert!(
+        matches!(index.by_id("a1a"), Err(IndexError::NoSuchImage(_))),
+        "too short"
+    );
+    assert!(matches!(
+        index.by_id("aaaa").map(|_| ()),
+        Err(IndexError::NoSuchImage(_))
+    ));
+    for none in ["c1c1", "d", "", "sha256:", "webs", "c1:x0"] {
+        assert!(
+            matches!(index.by_id(none), Err(IndexError::NoSuchImage(_))),
+            "{none:?}"
+        );
+    }
+}
+
+/// Two images whose manifests start alike: their common start is
+/// ambiguous, more of it isn't.
+#[test]
+fn an_id_s_start_of_two_images_is_ambiguous() {
+    let scratch = Scratch::new();
+    Index::record(&scratch.0, "one:1", record("ab12", "c1", &["e"])).unwrap();
+    Index::record(&scratch.0, "two:1", record("ab34", "c2", &["f"])).unwrap();
+    let index = Index::open(&scratch.0).unwrap();
+    assert!(matches!(
+        index.by_id("abab"),
+        Err(IndexError::NoSuchImage(_))
+    ));
+    assert!(matches!(index.by_id("ab12"), Ok(found) if found.len() == 1));
+    Index::record(&scratch.0, "three:1", record("ab12ab34", "c3", &["g"])).unwrap();
+    let index = Index::open(&scratch.0).unwrap();
+    assert!(matches!(index.by_id("ab12"), Err(IndexError::Ambiguous(_))));
+}
+
+/// Two manifests of one config (a rebuild compressed otherwise) are two
+/// images, as their IDs are: a start of both is ambiguous.
+#[test]
+fn two_manifests_of_one_config_are_two_images() {
+    let scratch = Scratch::new();
+    Index::record(&scratch.0, "one:1", record("cd56", "c1", &["e"])).unwrap();
+    Index::record(&scratch.0, "two:1", record("cd56cd57", "c1", &["e"])).unwrap();
+    let index = Index::open(&scratch.0).unwrap();
+    assert!(matches!(index.by_id("cd56"), Err(IndexError::Ambiguous(_))));
+    assert!(matches!(index.by_id("cd56cd57"), Ok(found) if found.len() == 1));
+}
+
+/// Several references removed at once: all or none.
+#[test]
+fn references_are_removed_together_or_not_at_all() {
+    let scratch = Scratch::new();
+    Index::record(&scratch.0, "web:1", record("a1", "c1", &["e"])).unwrap();
+    Index::record(&scratch.0, "web:2", record("a1", "c1", &["e"])).unwrap();
+    let held = scratch.exclusive();
+    let mut index = Index::open(&scratch.0).unwrap();
+    let mut remover = scratch.remover();
+    let refused = index.remove_all(
+        &["web:1".to_owned(), "web:3".to_owned()],
+        &held,
+        &BTreeSet::new(),
+        &mut remover,
+    );
+    assert!(matches!(refused, Err(IndexError::NoSuchImage(name)) if name == "web:3"));
+    assert_eq!(
+        Index::open(&scratch.0).unwrap().images().len(),
+        2,
+        "none removed"
+    );
+    index
+        .remove_all(
+            &["web:1".to_owned(), "web:2".to_owned()],
+            &held,
+            &BTreeSet::new(),
+            &mut remover,
+        )
+        .unwrap();
+    assert!(Index::open(&scratch.0).unwrap().images().is_empty());
 }
 
 #[test]
@@ -411,4 +521,64 @@ fn temporaries_go_and_are_not_reported() {
     assert!(removed.is_empty(), "{removed:?}");
     assert!(!scratch.0.join("blobs/sha256").join(temporary).exists());
     assert!(!scratch.0.join("blobs/sha256").join(partial).exists());
+}
+
+/// F118's fields: an entry an older Shipyard wrote (without them) reads as
+/// none of them; one with them is kept as written (H2).
+#[test]
+fn an_older_entry_reads_without_the_index_and_tag_time() {
+    let scratch = Scratch::new();
+    let a = format!("sha256:{}", hex("a"));
+    std::fs::write(
+        scratch.0.join(INDEX_FILE),
+        format!(r#"{{"img":{{"manifest":"{a}","config":"{a}","layers":[]}}}}"#),
+    )
+    .unwrap();
+    let older = Index::open(&scratch.0)
+        .unwrap()
+        .get("img")
+        .cloned()
+        .unwrap();
+    assert_eq!((older.index_digest, older.tagged_at), (None, None));
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000);
+    let newer = ImageRecord {
+        index_digest: Some(format!("sha256:{}", hex("d"))),
+        tagged_at: Some(at),
+        ..record("a", "a", &[])
+    };
+    Index::record(&scratch.0, "img", newer.clone()).unwrap();
+    assert_eq!(Index::open(&scratch.0).unwrap().get("img"), Some(&newer));
+}
+
+/// The index an image was pulled through is one of its blobs: kept while
+/// it's listed, collected with it.
+#[test]
+fn an_image_s_index_blob_is_kept_while_it_is_listed() {
+    let scratch = Scratch::new();
+    scratch.blob(&hex("a"), 10);
+    scratch.blob(&hex("d"), 20);
+    let pulled = ImageRecord {
+        index_digest: Some(format!("sha256:{}", hex("d"))),
+        ..record("a", "a", &[])
+    };
+    Index::record(&scratch.0, "img", pulled).unwrap();
+    let mut index = Index::open(&scratch.0).unwrap();
+    index
+        .prune(
+            &scratch.exclusive(),
+            &BTreeSet::new(),
+            &mut scratch.remover(),
+        )
+        .unwrap();
+    let index_blob = scratch.0.join("blobs/sha256").join(hex("d"));
+    assert!(index_blob.exists(), "kept while listed");
+    index
+        .remove(
+            "img",
+            &scratch.exclusive(),
+            &BTreeSet::new(),
+            &mut scratch.remover(),
+        )
+        .unwrap();
+    assert!(!index_blob.exists(), "collected with it");
 }

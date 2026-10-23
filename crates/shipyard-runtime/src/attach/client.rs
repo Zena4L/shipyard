@@ -42,6 +42,33 @@ pub struct AttachOptions {
     /// step 9.4c3a), so a slow reader loses no output and a fast writer no
     /// input.
     pub held: bool,
+    /// Which of the container's output streams are written here (Docker's
+    /// `run -a`): a frame of one that isn't is read, and dropped.
+    pub output: Output,
+}
+
+/// Which of a container's output streams an attachment writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    /// Its standard output, to this process's.
+    pub stdout: bool,
+    /// Its standard error, to this process's.
+    pub stderr: bool,
+}
+
+impl Default for Output {
+    /// [`BOTH`](Self::BOTH).
+    fn default() -> Self {
+        Self::BOTH
+    }
+}
+
+impl Output {
+    /// Both: every attachment's but a run's with `-a`.
+    pub const BOTH: Self = Self {
+        stdout: true,
+        stderr: true,
+    };
 }
 
 /// How an attachment ended.
@@ -85,6 +112,10 @@ pub enum AttachError {
     /// The monitor didn't let this client in (the reason: too many clients).
     #[error("the container's monitor refused: {0}")]
     Refused(String),
+    /// The macOS VM's host or guest refused this client, saying why by its
+    /// code (`Frame::Declined`, version 5).
+    #[error("{0}")]
+    Declined(super::forward::Refusal),
     /// The monitor speaks another version of the protocol.
     #[error(
         "the container's monitor speaks attach protocol version {0}, this Shipyard {VERSION}: \
@@ -201,7 +232,56 @@ pub fn welcomed_with(
     })
 }
 
+/// Resizes the terminal of the container whose monitor `stream` is
+/// connected to (`docker resize`'s, the Docker API's): welcomed first, as
+/// any client, then the size (`rows`, `cols`), then let go. A container
+/// without a terminal takes none (nothing done).
+///
+/// # Errors
+///
+/// [`AttachError`]: not let in (refused: too many clients, ended), or the
+/// size couldn't be sent.
+pub fn resize(stream: UnixStream, rows: u16, cols: u16) -> Result<(), AttachError> {
+    let options = AttachOptions {
+        detach_keys: DetachKeys::none(),
+        stdin: false,
+        held: false,
+        output: Output::BOTH,
+    };
+    let mut welcomed = welcomed(stream, &options)?;
+    let mut bytes = Vec::new();
+    Frame::Resize { rows, cols }.encode(&mut bytes);
+    welcomed.stream.write_all(&bytes)?;
+    Ok(())
+}
+
+/// A welcomed session's parts, for a caller that runs its own session
+/// over another stream (the Docker API's attach, step 11.2b2a).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct WelcomedParts {
+    /// The connection to the monitor.
+    pub stream: UnixStream,
+    /// What was read past the welcome (the first output frames, maybe).
+    pub unread: Vec<u8>,
+    /// The container has a terminal: its output is one stream.
+    pub terminal: bool,
+    /// The container takes input.
+    pub stdin: bool,
+}
+
 impl Welcomed {
+    /// Its parts: the caller runs the session itself.
+    #[must_use]
+    pub fn into_parts(self) -> WelcomedParts {
+        WelcomedParts {
+            unread: self.decoder.unread().to_vec(),
+            stream: self.stream,
+            terminal: self.terminal,
+            stdin: self.stdin,
+        }
+    }
+
     /// The session, with the options it said hello with, until the
     /// container ends, the detach keys are typed, or the monitor lets go.
     /// A terminal's session watches SIGWINCH and SIGCONT itself: a caller
@@ -304,6 +384,7 @@ impl Welcomed {
             } else {
                 Window::NotATerminal
             },
+            output: options.output,
         };
         session.resize_if_changed();
         // A signalled session's watch is woken for every signal, terminal
@@ -330,6 +411,9 @@ fn welcome(
         if let Some(frame) = decoder.next_frame()? {
             return match frame {
                 Frame::Refused(reason) => Err(AttachError::Refused(reason)),
+                Frame::Declined { reason, why } => Err(AttachError::Declined(
+                    super::forward::Refusal::from_decline(reason, &why),
+                )),
                 _ if !said => Err(AttachError::NotLetIn),
                 Frame::Welcome {
                     version,
@@ -384,6 +468,8 @@ struct Session {
     wants_raw: bool,
     /// The window's size, as last sent.
     window: Window,
+    /// Which output streams are written.
+    output: Output,
 }
 
 impl Session {
@@ -597,8 +683,15 @@ impl Session {
                 Err(err) => return Err(err.into()),
             };
             match frame {
-                Frame::Stdout(bytes) => write_all(libc::STDOUT_FILENO, &bytes)?,
-                Frame::Stderr(bytes) => write_all(libc::STDERR_FILENO, &bytes)?,
+                Frame::Stdout(bytes) if self.output.stdout => {
+                    write_all(libc::STDOUT_FILENO, &bytes)?;
+                }
+                Frame::Stderr(bytes) if self.output.stderr => {
+                    write_all(libc::STDERR_FILENO, &bytes)?;
+                }
+                // Not asked for (`-a`): read, so the container isn't held
+                // up, and dropped.
+                Frame::Stdout(_) | Frame::Stderr(_) => {}
                 Frame::Detached => return Ok(Some(Ended::Detached)),
                 Frame::Exited(code) => return Ok(Some(Ended::Exited(code))),
                 Frame::Dropped(reason) => return Ok(Some(Ended::Dropped(reason))),
@@ -617,6 +710,7 @@ fn name(frame: &Frame) -> &'static str {
         Frame::Resize { .. } => "resize",
         Frame::Welcome { .. } => "welcome",
         Frame::Refused(_) => "refused",
+        Frame::Declined { .. } => "declined",
         Frame::Stdout(_) => "stdout",
         Frame::Stderr(_) => "stderr",
         Frame::Detached => "detached",
@@ -757,6 +851,7 @@ mod tests {
             raw: None,
             wants_raw: false,
             window: Window::Unsent,
+            output: Output::BOTH,
         };
         let sent = |session: &mut Session, size| {
             session.out.clear();

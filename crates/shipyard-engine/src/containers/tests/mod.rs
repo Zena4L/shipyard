@@ -24,7 +24,7 @@ mod naming;
 mod networks;
 mod requests;
 mod states;
-mod versions;
+pub(crate) mod versions;
 
 /// An engine on a container store of its own, in a fresh directory.
 fn engine(name: &str) -> (Engine, Arc<Collect>, PathBuf) {
@@ -71,5 +71,6 @@ fn new(name: Option<&str>) -> NewContainer {
         labels: Labels::default(),
         image_id: None,
         auto_remove: false,
+        created: crate::containers::Created::default(),
     }
 }

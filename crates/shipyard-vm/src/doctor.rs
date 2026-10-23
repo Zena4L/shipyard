@@ -63,6 +63,12 @@ pub fn checks(paths: Result<&VmPaths, &VmError>, revision: &str) -> Vec<Finding>
             guest(&paths.guest, revision),
             vm(paths),
             ports(paths),
+            docker(
+                &paths.docker_socket(),
+                crate::launchd::socket_there(&paths.docker_socket()),
+                crate::launchd::program(paths).as_deref(),
+                crate::launchd::this_binary().ok().as_deref(),
+            ),
             home(),
             files(paths),
         ]),
@@ -72,6 +78,61 @@ pub fn checks(paths: Result<&VmPaths, &VmError>, revision: &str) -> Vec<Finding>
         ]),
     }
     found
+}
+
+/// Docker's socket (`socket`): launchd's any time, once `shipyard vm
+/// install` has loaded its agent (`agent`: the program it runs), else only
+/// while the VM runs. An agent whose socket isn't `there` (another host
+/// took it, or the directory was emptied) is said, with the fix. An agent that runs another binary than this one
+/// (`ours`: moved, or rebuilt elsewhere) is said, with the fix.
+fn docker(socket: &Path, there: bool, agent: Option<&Path>, ours: Option<&Path>) -> Finding {
+    let socket = socket.display();
+    match agent {
+        None => Finding::new(
+            Level::Ok,
+            "docker",
+            format!("{socket} while the VM runs (`shipyard vm install`: any time, by launchd)"),
+        ),
+        Some(_) if !there => Finding::new(
+            Level::Warn,
+            "docker",
+            format!(
+                "launchd's agent is loaded but {socket} isn't there: run `shipyard vm install` \
+                 again"
+            ),
+        ),
+        Some(agent)
+            if let Some(folder) = crate::launchd::protected(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+                agent,
+            ) =>
+        {
+            Finding::new(
+                Level::Warn,
+                "docker",
+                format!(
+                    "launchd starts {}, in your {folder} folder: macOS lets it run only with \
+                     your permission. Put shipyard elsewhere, then `shipyard vm install` again",
+                    agent.display()
+                ),
+            )
+        }
+        Some(agent) if ours.is_some_and(|ours| ours != agent) => Finding::new(
+            Level::Warn,
+            "docker",
+            format!(
+                "launchd starts {}, not this shipyard: run `shipyard vm install` again",
+                agent.display()
+            ),
+        ),
+        Some(_) => Finding::new(
+            Level::Ok,
+            "docker",
+            format!("{socket} (launchd's: any time)"),
+        ),
+    }
 }
 
 /// This Mac's version, as `sw_vers` says it (`kern.osproductversion`).
@@ -338,6 +399,27 @@ fn files(paths: &VmPaths) -> Finding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Docker's socket: while the VM runs without an agent; launchd's with
+    /// one that runs this binary; a warning, with the fix, for one that
+    /// runs another.
+    #[test]
+    fn dockers_socket_says_who_holds_it() {
+        let socket = Path::new("/vm/docker.sock");
+        let ours = Path::new("/bin/shipyard");
+        let none = docker(socket, false, None, Some(ours));
+        assert_eq!(none.level, Level::Ok);
+        assert!(none.text.contains("while the VM runs"), "{}", none.text);
+        let installed = docker(socket, true, Some(ours), Some(ours));
+        assert_eq!(installed.level, Level::Ok);
+        assert!(installed.text.contains("launchd's"), "{}", installed.text);
+        let moved = docker(socket, true, Some(Path::new("/old/shipyard")), Some(ours));
+        assert_eq!(moved.level, Level::Warn);
+        assert!(moved.text.contains("shipyard vm install"), "{}", moved.text);
+        let lost = docker(socket, false, Some(ours), Some(ours));
+        assert_eq!(lost.level, Level::Warn);
+        assert!(lost.text.contains("isn't there"), "{}", lost.text);
+    }
 
     /// macOS 13 or later on Apple Silicon; an older one, or Intel, fails;
     /// an unread version warns.

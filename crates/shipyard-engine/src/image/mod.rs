@@ -41,8 +41,7 @@ use std::sync::Arc;
 
 use shipyard_image::index::Index;
 use shipyard_image::{
-    Descriptor, GC_WAIT, ImageReference, LiveArea, LockMode, Platform, Pulled, Store, StoreLock,
-    USE_WAIT,
+    Descriptor, GC_WAIT, LiveArea, LockMode, Platform, Pulled, Store, StoreLock, USE_WAIT,
 };
 #[cfg(target_os = "linux")]
 use shipyard_image::{LayerOwners, LayerSpec, RuntimeConfig};
@@ -54,6 +53,10 @@ pub(crate) use helper::Request;
 pub use helper::entry_point as storage_helper_entry_point;
 #[cfg(target_os = "linux")]
 use helper::{Outcome, ranges};
+/// A registry credential, as a client hands one in ([`GivenCredential`]).
+pub use shipyard_image::Credential;
+/// An image reference (`alpine:3.20`), as the API parses and shows one.
+pub use shipyard_image::{ImageReference, ReferenceError};
 
 use crate::Engine;
 #[cfg(target_os = "linux")]
@@ -210,6 +213,118 @@ pub(crate) fn open_store(engine: &Engine) -> Result<Store> {
     Store::open(engine.paths().image_store()?).context("opening the image store")
 }
 
+/// The runtime config (its command, variables, ports…) of the image a
+/// container was made from: `reference` as it was given, pinned to its
+/// manifest digest `image_id`, read from `store` as a start reads it (no
+/// tag looked up: one moved or removed since doesn't change it). `None` if
+/// it's gone or can't be read: a view shows what it can without it.
+pub(crate) fn runtime_config(
+    store: &Store,
+    reference: &str,
+    image_id: &str,
+) -> Option<shipyard_image::RuntimeConfig> {
+    let mut image = ImageReference::parse(reference).ok()?;
+    image.digest = Some(shipyard_image::Digest::parse(image_id).ok()?);
+    let pulled = shipyard_image::from_store(&image, &Platform::host(), store).ok()??;
+    Some(pulled.config.config)
+}
+
+/// Images' runtime configs, each read once ([`runtime_config`]): for a
+/// listing whose containers share images. The store is opened at the
+/// first container with an image (a listing never makes it).
+pub(crate) struct ImageConfigs<'a> {
+    engine: &'a Engine,
+    /// Opened (or found missing) at the first container with an image.
+    store: std::cell::OnceCell<Option<Store>>,
+    read: std::collections::HashMap<String, Option<shipyard_image::RuntimeConfig>>,
+}
+
+impl<'a> ImageConfigs<'a> {
+    /// None read yet, from `engine`'s store.
+    pub(crate) fn new(engine: &'a Engine) -> Self {
+        Self {
+            engine,
+            store: std::cell::OnceCell::new(),
+            read: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The runtime config of the image `reference` (as given) pinned to
+    /// `image_id`, if any.
+    pub(crate) fn get(
+        &mut self,
+        reference: Option<&str>,
+        image_id: Option<&str>,
+    ) -> Option<&shipyard_image::RuntimeConfig> {
+        let (reference, image_id) = (reference?, image_id?);
+        let engine = self.engine;
+        let store = self
+            .store
+            .get_or_init(|| {
+                // Only one that's there: a view never makes the store.
+                let root = engine.paths().image_store().ok()?;
+                root.exists().then(|| open_store(engine).ok()).flatten()
+            })
+            .as_ref()?;
+        self.read
+            .entry(image_id.to_owned())
+            .or_insert_with(|| runtime_config(store, reference, image_id))
+            .as_ref()
+    }
+}
+
+/// How many images (manifests, however many names each has) the store
+/// has: none if there's no store (a look never makes one).
+///
+/// # Errors
+///
+/// The store or its index can't be read.
+pub fn count_images(engine: &Engine) -> Result<usize> {
+    if !engine
+        .paths()
+        .image_store()
+        .is_ok_and(std::path::Path::exists)
+    {
+        return Ok(0);
+    }
+    let store = open_store(engine)?;
+    let _shared = store.lock(LockMode::Shared, USE_WAIT)?;
+    let index = Index::open(store.root())?;
+    let manifests: BTreeSet<String> = index
+        .images()
+        .into_iter()
+        .map(|image| image.record.manifest)
+        .collect();
+    Ok(manifests.len())
+}
+
+/// The manifest digests `name` (a reference or an ID) names in the store,
+/// for `ps -f ancestor=`: none if it names none, if it can't be read, or if
+/// there's no store (a listing never makes one).
+pub(crate) fn manifests_named(engine: &Engine, name: &str) -> Vec<String> {
+    let found = || -> Result<Vec<String>> {
+        let store = open_store(engine)?;
+        let _shared = store.lock(LockMode::Shared, USE_WAIT)?;
+        let index = Index::open(store.root())?;
+        let (images, _) = named(&index, name)?;
+        Ok(images
+            .into_iter()
+            .map(|image| image.record.manifest)
+            .collect())
+    };
+    let there = engine
+        .paths()
+        .image_store()
+        .is_ok_and(std::path::Path::exists);
+    if !there {
+        return Vec::new();
+    }
+    found().unwrap_or_else(|error| {
+        tracing::debug!("ancestor {name}: {error:#}");
+        Vec::new()
+    })
+}
+
 /// Prepares `reference` to run: find it in the store, or pull it (as
 /// `policy` says), extract its layers, and make the run's own writable area,
 /// all under the store's shared lock.
@@ -235,7 +350,7 @@ pub(crate) fn prepare(
     let Ready {
         pulled,
         extracted: (directories, names),
-    } = ready(engine, &store, &shared, &image, policy, maps)?;
+    } = ready(engine, &store, &shared, &image, Fetch::docker(policy), maps)?;
 
     // The run's own writable area, listing the layers it stacks, so garbage
     // collection keeps them while it runs.
@@ -286,7 +401,7 @@ pub(crate) fn make_ready(
     let store = open_store(engine)?;
     let shared = store.lock(LockMode::Shared, USE_WAIT)?;
     let image = ImageReference::parse(reference)?;
-    let ready = ready(engine, &store, &shared, &image, policy, maps)?;
+    let ready = ready(engine, &store, &shared, &image, Fetch::docker(policy), maps)?;
     Ok((
         ready.pulled.manifest_digest.to_string(),
         ready.pulled.config.config,
@@ -421,16 +536,8 @@ pub(crate) fn pin(
     else {
         bail!(NotFound, "{reference} isn't in the image store");
     };
-    let record = shipyard_image::ImageRecord {
-        manifest: pulled.manifest_digest.to_string(),
-        config: pulled.manifest.config.digest.to_string(),
-        layers: pulled
-            .manifest
-            .layers
-            .iter()
-            .map(|layer| layer.digest.to_string())
-            .collect(),
-    };
+    // A pin keeps the image's blobs: its index too, if it has one.
+    let record = shipyard_image::ImageRecord::of(&pulled, None);
     let digest = record.manifest.clone();
     Index::pin(store.root(), &owner, id, record)?;
     drop(shared);
@@ -496,8 +603,24 @@ struct Ready {
     extracted: (Vec<std::path::PathBuf>, Vec<String>),
 }
 
+/// How an image is fetched: when it's pulled, and with whose credentials.
+struct Fetch {
+    policy: PullPolicy,
+    credentials: shipyard_image::Credentials,
+}
+
+impl Fetch {
+    /// As `policy` says, with Docker's credentials (its config file).
+    fn docker(policy: PullPolicy) -> Self {
+        Self {
+            policy,
+            credentials: shipyard_image::Credentials::docker(),
+        }
+    }
+}
+
 /// Makes `image` ready, under the store's shared lock `held`: found in the
-/// store or pulled (as `policy` says), its layers extracted (Linux: macOS
+/// store or pulled (as `fetch` says), its layers extracted (Linux: macOS
 /// keeps the blobs for the VM), and recorded in the store's index, so
 /// `images`, `rmi` and `prune` know it's present and what it depends on.
 fn ready(
@@ -505,14 +628,14 @@ fn ready(
     store: &Store,
     held: &StoreLock,
     image: &ImageReference,
-    policy: PullPolicy,
+    fetch: Fetch,
     #[cfg_attr(
         not(target_os = "linux"),
         allow(unused_variables, reason = "macOS keeps the blobs: nothing to extract")
     )]
     maps: Option<&shipyard_runtime::isolation::IdMaps>,
 ) -> Result<Ready> {
-    let pulled = obtain(engine, store, image, policy)?;
+    let pulled = obtain(engine, store, image, fetch)?;
     #[cfg(target_os = "linux")]
     let extracted = {
         let layers = shipyard_image::layer_specs(&pulled.manifest, &pulled.config)
@@ -531,15 +654,14 @@ fn ready(
     })
 }
 
-/// The image `image` names: the store's if `policy` lets it be and the
-/// store has it whole (no request at all), else pulled. A stored copy that
-/// can't be read is pulled again, unless `policy` forbids it.
-fn obtain(
-    engine: &Engine,
-    store: &Store,
-    image: &ImageReference,
-    policy: PullPolicy,
-) -> Result<Pulled> {
+/// The image `image` names: the store's if `fetch`'s policy lets it be
+/// and the store has it whole (no request at all), else pulled. A stored
+/// copy that can't be read is pulled again, unless the policy forbids it.
+fn obtain(engine: &Engine, store: &Store, image: &ImageReference, fetch: Fetch) -> Result<Pulled> {
+    let Fetch {
+        policy,
+        credentials,
+    } = fetch;
     let platform = Platform::host();
     if policy != PullPolicy::Always {
         match shipyard_image::from_store(image, &platform, store) {
@@ -564,17 +686,18 @@ fn obtain(
     let options = shipyard_image::PullOptions {
         recheck: policy == PullPolicy::Always,
     };
-    download(engine, store, image, &platform, options)
+    download(engine, store, image, &platform, options, credentials)
 }
 
-/// Pulls `image` into the store, signing in with Docker's credentials if
-/// the registry asks, reporting each layer's progress.
+/// Pulls `image` into the store, signing in with `credentials` if the
+/// registry asks, reporting each layer's progress.
 fn download(
     engine: &Engine,
     store: &Store,
     image: &ImageReference,
     platform: &Platform,
     options: shipyard_image::PullOptions,
+    credentials: shipyard_image::Credentials,
 ) -> Result<Pulled> {
     engine.report(Message::Progress(Progress::Pulling {
         image: image.to_string(),
@@ -585,7 +708,6 @@ fn download(
             downloaded: fetched.then_some(layer.size),
         }));
     };
-    let credentials = shipyard_image::Credentials::docker();
     let pulled = shipyard_image::pull(image, platform, store, credentials, options, &progress)
         .with_context(|| format!("pulling {image}"))?;
     crate::events::emit_about(
@@ -605,12 +727,111 @@ fn download(
 ///
 /// If the image can't be pulled, extracted or recorded.
 pub fn pull(engine: &Engine, reference: &str) -> Result<String> {
+    Ok(pull_with(engine, reference, None)?.digest)
+}
+
+/// What [`pull_with`] pulled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledImage {
+    /// What Docker's `Digest:` says: the multi-platform index the
+    /// reference named, if it named one, else its manifest's digest (F118).
+    pub digest: String,
+    /// Whether the reference names another image than before (or none
+    /// before): Docker's "Downloaded newer image", else "up to date".
+    pub newer: bool,
+}
+
+/// A credential a client handed in for a pull (Docker's `X-Registry-Auth`),
+/// and the registry it's for, if it names one.
+#[derive(Debug, Clone)]
+pub struct GivenCredential {
+    /// The credential: never logged, kept or shown.
+    pub credential: Credential,
+    /// The registry it's for (`docker.io`, `https://index.docker.io/v1/`,
+    /// `ghcr.io`); `None`: any.
+    pub registry: Option<String>,
+}
+
+/// What a sign-in came to ([`login`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Login {
+    /// The registry took the credential (or asked for none).
+    Succeeded,
+    /// The registry refused it, or took none of its kind: why, in words
+    /// that never hold the secret.
+    Refused(String),
+}
+
+/// Signs in to the registry `given` names (Docker Hub if it names none)
+/// with its credential, as `docker login` asks Docker's daemon to (`POST
+/// /auth`, F118): checked against the registry's `/v2/`, never kept,
+/// logged or shown. The client keeps it, as Docker's CLI does.
+///
+/// # Errors
+///
+/// [`crate::ErrorKind::Image`]: the registry couldn't be
+/// reached, or answered otherwise.
+pub fn login(given: GivenCredential) -> Result<Login> {
+    use shipyard_image::RegistryError;
+    match shipyard_image::login(given.registry.as_deref(), given.credential) {
+        Ok(()) => Ok(Login::Succeeded),
+        // Docker's words for it (`unauthorized: …`): never "sign in again".
+        Err(RegistryError::Refused { registry, .. }) => Ok(Login::Refused(format!(
+            "unauthorized: {registry} refused the username and password or token"
+        ))),
+        Err(error @ RegistryError::Auth { .. }) => {
+            Ok(Login::Refused(format!("unauthorized: {error}")))
+        }
+        Err(error) => Err(crate::Error::new(
+            crate::ErrorKind::Image,
+            format!("signing in: {error}"),
+        )),
+    }
+}
+
+/// [`pull`], signing in with `given` instead of Docker's config file when
+/// a client handed one in (an anonymous pull for any other registry).
+///
+/// # Errors
+///
+/// As [`pull`].
+pub fn pull_with(
+    engine: &Engine,
+    reference: &str,
+    given: Option<GivenCredential>,
+) -> Result<PulledImage> {
     let store = open_store(engine)?;
     let shared = store.lock(LockMode::Shared, USE_WAIT)?;
     let image = ImageReference::parse(reference)?;
-    let ready = ready(engine, &store, &shared, &image, PullPolicy::Always, None)?;
+    // What the reference named before (an index that can't be read: none).
+    let before = Index::open(store.root()).ok().and_then(|index| {
+        index
+            .get(&image.to_string())
+            .map(|record| record.manifest.clone())
+    });
+    let fetch = match given {
+        Some(given) => Fetch {
+            policy: PullPolicy::Always,
+            credentials: shipyard_image::Credentials::given(
+                given.credential,
+                given.registry.as_deref(),
+            ),
+        },
+        None => Fetch::docker(PullPolicy::Always),
+    };
+    let ready = ready(engine, &store, &shared, &image, fetch, None)?;
     drop(shared);
-    Ok(ready.pulled.manifest_digest.to_string())
+    let manifest = ready.pulled.manifest_digest.to_string();
+    // Docker's `Digest:`: the index the reference named, else its manifest.
+    let digest = ready
+        .pulled
+        .index_digest
+        .as_ref()
+        .map_or_else(|| manifest.clone(), ToString::to_string);
+    Ok(PulledImage {
+        newer: before.as_ref() != Some(&manifest),
+        digest,
+    })
 }
 
 /// Removes a detached container's writable area `name`, as a foreground
@@ -903,19 +1124,22 @@ pub(crate) fn through_helper(
     }
 }
 
-/// Records a pulled image in the store's reference index.
+/// Records a pulled image in the store's reference index: the index it
+/// came through, and when its reference was pointed at it (now, unless it
+/// already named this image: a run of a stored one leaves its time).
 fn record_image(engine: &Engine, store: &Store, pulled: &Pulled) -> Result<()> {
-    let record = shipyard_image::ImageRecord {
-        manifest: pulled.manifest_digest.to_string(),
-        config: pulled.manifest.config.digest.to_string(),
-        layers: pulled
-            .manifest
-            .layers
-            .iter()
-            .map(|layer| layer.digest.to_string())
-            .collect(),
-    };
-    if let Some(aside) = Index::record(store.root(), &pulled.reference.to_string(), record)? {
+    let key = pulled.reference.to_string();
+    let manifest = pulled.manifest_digest.to_string();
+    let kept = Index::open(store.root())
+        .ok()
+        .and_then(|index| index.get(&key).cloned())
+        .filter(|before| before.manifest == manifest)
+        .and_then(|before| before.tagged_at);
+    let record = shipyard_image::ImageRecord::of(
+        pulled,
+        Some(kept.unwrap_or_else(std::time::SystemTime::now)),
+    );
+    if let Some(aside) = Index::record(store.root(), &key, record)? {
         engine.warn(
             WarningKind::IndexReset,
             format!(
@@ -928,6 +1152,71 @@ fn record_image(engine: &Engine, store: &Store, pulled: &Pulled) -> Result<()> {
     Ok(())
 }
 
+/// Tags the image `source` names (a reference, or an ID: [`remove`]'s
+/// rule) as `target` too (`repo[:tag]`, `latest` if none), as `docker tag`
+/// does: a reference the index records, the same image's. Returns the
+/// target as the index names it.
+///
+/// # Errors
+///
+/// `source` names no image ([`crate::ErrorKind::NotFound`]), or an
+/// ambiguous ID; `target` isn't a reference, or has a digest
+/// ([`crate::ErrorKind::InvalidRequest`]); the store can't be updated.
+pub fn tag(engine: &Engine, source: &str, target: &str) -> Result<String> {
+    let target = ImageReference::parse(target)?;
+    if target.digest.is_some() {
+        bail!(
+            InvalidRequest,
+            "a tag can't have a digest: {target} (name it repository[:tag])"
+        );
+    }
+    let store = open_store(engine)?;
+    // Shared: no collection removes the image's blobs meanwhile.
+    let _shared = store.lock(LockMode::Shared, USE_WAIT)?;
+    let index = Index::open(store.root())?;
+    let (found, _) = named(&index, source)?;
+    let Some(image) = found.into_iter().next() else {
+        bail!(NotFound, "no such image: {source}");
+    };
+    let key = target.to_string();
+    // Its time now; no index of its own (a registry knows this name by
+    // none yet: Docker's adds a repository's digest at a pull or a push).
+    let record = shipyard_image::ImageRecord {
+        index_digest: None,
+        tagged_at: Some(std::time::SystemTime::now()),
+        ..image.record
+    };
+    if let Some(aside) = Index::record(store.root(), &key, record)? {
+        engine.warn(
+            WarningKind::IndexReset,
+            format!(
+                "the store index was corrupt; it was moved to {} and a new one started",
+                aside.display()
+            ),
+        );
+    }
+    crate::events::emit_about(engine, crate::events::Kind::Image, "tag", &key);
+    Ok(key)
+}
+
+/// Whether the store has the image `reference` names whole, for this
+/// host's platform, as a run would take it without pulling (the API's
+/// create answers "No such image" otherwise, and its client pulls).
+///
+/// # Errors
+///
+/// The reference isn't one ([`crate::ErrorKind::InvalidRequest`]), or the
+/// store can't be opened or read: never "not stored" (a client told so
+/// would pull it again).
+pub fn stored(engine: &Engine, reference: &str) -> Result<bool> {
+    let image = ImageReference::parse(reference)
+        .map_err(|error| crate::Error::new(crate::ErrorKind::InvalidRequest, error.to_string()))?;
+    let store = open_store(engine)?;
+    let found = shipyard_image::from_store(&image, &Platform::host(), &store)
+        .with_context(|| format!("reading {reference} from the image store"))?;
+    Ok(found.is_some())
+}
+
 /// Lists the images in the store (for `shipyard images`).
 ///
 /// # Errors
@@ -938,73 +1227,270 @@ pub fn list(engine: &Engine) -> Result<Vec<shipyard_image::ListedImage>> {
     Ok(index.images())
 }
 
-/// Removes an image reference and garbage-collects what nothing needs any
-/// more (for `shipyard rmi`). An image a container was made from (running
-/// or not: its pin), or a foreground run uses, is refused, unless `force`
-/// (or another reference keeps the same image): then it's untagged; a
-/// container's pin keeps what it needs, a run's layers stay until a later
-/// prune.
-/// Returns the blob digests removed.
+/// What [`remove`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removed {
+    /// The references untagged, as the index names them.
+    pub untagged: Vec<String>,
+    /// Whether the name given was an ID (else a reference, the one
+    /// untagged).
+    pub by_id: bool,
+    /// The blob digests deleted (an image's own config and manifest
+    /// among them when no reference keeps it any more), sorted.
+    pub deleted: Vec<String>,
+}
+
+/// Removes an image and garbage-collects what nothing needs any more (for
+/// `shipyard rmi` and Docker's `DELETE /images/{name}`). `name` is a
+/// reference, else an ID ([`Index::by_id`]: its config or manifest digest,
+/// or a unique prefix), which removes every reference of that image; one
+/// with more than one is refused unless `force`, as Docker does. An image
+/// a container was made from (running or not: its pin), or a foreground
+/// run uses, is refused, unless `force` (or another reference keeps the
+/// same image): then it's untagged; a container's pin keeps what it needs,
+/// a run's layers stay until a later prune.
 ///
 /// # Errors
 ///
 /// Returns an error if no image matches ([`crate::ErrorKind::NotFound`]),
-/// it's in use ([`crate::ErrorKind::InUse`]), the store is busy
+/// an ID's prefix matches more than one ([`crate::ErrorKind::InvalidRequest`]),
+/// it's in use or has several references without `force`
+/// ([`crate::ErrorKind::InUse`]), the store is busy
 /// ([`crate::ErrorKind::Busy`]), or it can't be updated.
-pub fn remove(engine: &Engine, reference: &str, force: bool) -> Result<Vec<String>> {
-    // The reference untagged, and its image (its manifest's digest).
-    let mut untagged = (String::new(), None);
-    let removed = collect(engine, |index, held, live, in_use, remove_layers| {
-        let key = index_key(index, reference);
-        let reference = key.as_str();
-        let only_reference = |manifest: &str| {
-            !index
-                .images()
-                .iter()
-                .any(|other| other.reference != reference && other.record.manifest == manifest)
-        };
-        if !force && let Some(record) = index.get(reference) {
-            // A container made from it (running or not) pins it.
-            let pinned = index.pinned_by(&record.manifest);
-            if !pinned.is_empty() && only_reference(&record.manifest) {
-                let named: Vec<String> = pinned
-                    .iter()
-                    .map(|id| {
-                        id.chars()
-                            .take(crate::containers::ContainerId::SHORT)
-                            .collect()
-                    })
-                    .collect();
-                bail!(
-                    InUse,
-                    "the image {reference} is used by container {} (--force untags it anyway: \
-                     the containers keep what they need)",
-                    named.join(", ")
-                );
-            }
-            if live.iter().any(|area| area.image == record.manifest)
-                && only_reference(&record.manifest)
-            {
-                bail!(
-                    InUse,
-                    "the image {reference} is in use by a running container (--force untags it \
-                     anyway)"
-                );
-            }
+pub fn remove(engine: &Engine, name: &str, force: bool) -> Result<Removed> {
+    // The references untagged, and the image's manifest's digest.
+    let mut untagged = (Vec::new(), None);
+    let mut by_id = false;
+    let deleted = collect(engine, |index, held, live, in_use, remove_layers| {
+        let (found, id) = named(index, name)?;
+        let targets: Vec<String> = found.into_iter().map(|image| image.reference).collect();
+        by_id = id;
+        let manifest = targets
+            .first()
+            .and_then(|reference| index.get(reference))
+            .map(|record| record.manifest.clone());
+        if !force && let Some(manifest) = &manifest {
+            refuse_in_use(index, name, &targets, manifest, live)?;
         }
-        let manifest = index.get(reference).map(|record| record.manifest.clone());
-        let removed = index.remove(reference, held, in_use, remove_layers)?;
-        untagged = (reference.to_owned(), manifest);
-        Ok(removed)
+        // All of them, or none: one save, one collection.
+        let deleted = index.remove_all(&targets, held, in_use, remove_layers)?;
+        untagged = (targets, manifest);
+        Ok(deleted)
     })?;
-    let (reference, manifest) = untagged;
-    crate::events::emit_about(engine, crate::events::Kind::Image, "untag", &reference);
+    let (untagged, manifest) = untagged;
+    for reference in &untagged {
+        crate::events::emit_about(engine, crate::events::Kind::Image, "untag", reference);
+    }
     // Deleted: the image itself, not only its name (no other reference
     // keeps it). Its layers and config aren't images.
-    if let Some(manifest) = manifest.filter(|manifest| removed.contains(manifest)) {
+    if let Some(manifest) = manifest.filter(|manifest| deleted.contains(manifest)) {
         crate::events::emit_about(engine, crate::events::Kind::Image, "delete", &manifest);
     }
-    Ok(removed)
+    let mut deleted = deleted;
+    deleted.sort();
+    deleted.dedup();
+    Ok(Removed {
+        untagged,
+        by_id,
+        deleted,
+    })
+}
+
+/// Removes every reference of the images `manifests` names that nothing
+/// uses, decided again under the store's lock: no container made from it
+/// (its record, read under the lock, so one placed before is seen and one
+/// placed after fails at its pin; or its pin, which an unreadable record
+/// still has) and no run (its area). What it removed: the references
+/// untagged, the blobs deleted.
+///
+/// # Errors
+///
+/// The store is busy ([`crate::ErrorKind::Busy`]), or can't be read or
+/// updated; the containers' records can't be listed.
+pub(crate) fn remove_unused(
+    engine: &Engine,
+    manifests: &BTreeSet<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut untagged = Vec::new();
+    let mut images = BTreeSet::new();
+    let deleted = collect(engine, |index, held, live, in_use, remove_layers| {
+        // What a container's record names: its image's manifest, or (a
+        // record older than `image_id`) the one its reference names now.
+        let named: BTreeSet<String> = crate::containers::list(engine)?
+            .iter()
+            .filter_map(|record| {
+                record.image_id.clone().or_else(|| {
+                    let reference = record.config.image.as_deref()?;
+                    let canonical = ImageReference::parse(reference).ok()?.to_string();
+                    Some(index.get(&canonical)?.manifest.clone())
+                })
+            })
+            .collect();
+        let unused = |manifest: &String| {
+            manifests.contains(manifest)
+                && !named.contains(manifest)
+                && index.pinned_by(manifest).is_empty()
+                && !live.iter().any(|area| &area.image == manifest)
+        };
+        let targets: Vec<String> = index
+            .images()
+            .into_iter()
+            .filter(|image| unused(&image.record.manifest))
+            .map(|image| {
+                images.insert(image.record.manifest);
+                image.reference
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deleted = index.remove_all(&targets, held, in_use, remove_layers)?;
+        untagged = targets;
+        Ok(deleted)
+    })?;
+    for reference in &untagged {
+        crate::events::emit_about(engine, crate::events::Kind::Image, "untag", reference);
+    }
+    for manifest in images.iter().filter(|manifest| deleted.contains(*manifest)) {
+        crate::events::emit_about(engine, crate::events::Kind::Image, "delete", manifest);
+    }
+    let mut deleted = deleted;
+    deleted.sort();
+    deleted.dedup();
+    Ok((untagged, deleted))
+}
+
+/// The bytes container `id`'s own writable layer holds (what could be
+/// read of it; 0 without one), for a prune's reclaimed space.
+pub(crate) fn owned_area_bytes(engine: &Engine, id: &str) -> u64 {
+    // No store: no layer (and a measure never makes one).
+    if !engine
+        .paths()
+        .image_store()
+        .is_ok_and(std::path::Path::exists)
+    {
+        return 0;
+    }
+    let Ok(store) = open_store(engine) else {
+        return 0;
+    };
+    let name = shipyard_image::owned_area_name(id);
+    let upper = shipyard_image::AreaPlaces::of(&store, &name).upper;
+    let (Some(parent), Some(leaf)) = (upper.parent(), upper.file_name()) else {
+        return 0;
+    };
+    shipyard_image::fsat::open_dir(parent)
+        .map_or(0, |dir| shipyard_image::fsat::tree_usage(&dir, leaf).bytes)
+}
+
+/// What `name` names in `index`: the reference it is (canonical, if the
+/// index has that), else every reference of the image it's the ID of
+/// ([`Index::by_id`]); and whether it was an ID.
+///
+/// # Errors
+///
+/// Neither ([`crate::ErrorKind::NotFound`]); an ID's prefix of more than
+/// one image ([`crate::ErrorKind::InvalidRequest`]); an index that can't be
+/// read.
+pub(crate) fn named(index: &Index, name: &str) -> Result<(Vec<shipyard_image::ListedImage>, bool)> {
+    let key = index_key(index, name);
+    if let Some(record) = index.get(&key) {
+        let found = shipyard_image::ListedImage {
+            reference: key,
+            record: record.clone(),
+        };
+        return Ok((vec![found], false));
+    }
+    // `repo@sha256:…` (an image's `RepoDigests`): that repository's
+    // references to that manifest.
+    if let Ok(reference) = ImageReference::parse(name)
+        && let Some(digest) = &reference.digest
+    {
+        let digest = digest.to_string();
+        let found: Vec<_> = index
+            .images()
+            .into_iter()
+            .filter(|image| {
+                image.record.manifest == digest
+                    && ImageReference::parse(&image.reference).is_ok_and(|listed| {
+                        listed.registry == reference.registry
+                            && listed.repository == reference.repository
+                    })
+            })
+            .collect();
+        if found.is_empty() {
+            bail!(NotFound, "no such image: {name}");
+        }
+        return Ok((found, true));
+    }
+    match index.by_id(name) {
+        Ok(images) => Ok((images, true)),
+        // Neither: named as typed, as the index's own refusal has it.
+        Err(shipyard_image::IndexError::NoSuchImage(_)) => bail!(NotFound, "no such image: {name}"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Refuses to remove `targets` (what `name` names) of the image whose
+/// manifest is `manifest`, without `--force`: references in more than one
+/// repository at once (an ID's: Docker's rule), or the image in use while
+/// no other reference keeps it.
+fn refuse_in_use(
+    index: &Index,
+    name: &str,
+    targets: &[String],
+    manifest: &str,
+    live: &[LiveArea],
+) -> Result<()> {
+    let repositories: BTreeSet<String> = targets
+        .iter()
+        .map(|target| {
+            ImageReference::parse(target).map_or_else(
+                |_| target.clone(),
+                |parsed| format!("{}/{}", parsed.registry, parsed.repository),
+            )
+        })
+        .collect();
+    if repositories.len() > 1 {
+        bail!(
+            InUse,
+            "the image {name} is referenced in several repositories ({}): --force removes them \
+             all",
+            targets.join(", ")
+        );
+    }
+    let kept_elsewhere = index
+        .images()
+        .iter()
+        .any(|other| !targets.contains(&other.reference) && other.record.manifest == manifest);
+    if kept_elsewhere {
+        return Ok(());
+    }
+    // A container made from it (running or not) pins it.
+    let pinned = index.pinned_by(manifest);
+    if !pinned.is_empty() {
+        let named: Vec<String> = pinned
+            .iter()
+            .map(|id| {
+                id.chars()
+                    .take(crate::containers::ContainerId::SHORT)
+                    .collect()
+            })
+            .collect();
+        bail!(
+            InUse,
+            "the image {name} is used by container {} (--force untags it anyway: the containers \
+             keep what they need)",
+            named.join(", ")
+        );
+    }
+    if live.iter().any(|area| area.image == manifest) {
+        bail!(
+            InUse,
+            "the image {name} is in use by a running container (--force untags it anyway)"
+        );
+    }
+    Ok(())
 }
 
 /// Removes every blob and layer nothing needs, and what interrupted work
@@ -1014,11 +1500,17 @@ pub fn remove(engine: &Engine, reference: &str, force: bool) -> Result<Vec<Strin
 ///
 /// Returns an error if the store is busy or can't be updated.
 pub fn prune(engine: &Engine) -> Result<Vec<String>> {
-    let removed = collect(engine, |index, held, _, in_use, remove_layers| {
-        Ok(index.prune(held, in_use, remove_layers)?)
-    })?;
+    let removed = collect_unreferenced(engine)?;
     crate::events::emit_pruned(engine, crate::events::Kind::Image, removed.len());
     Ok(removed)
+}
+
+/// [`prune`]'s collection, unsaid: for a prune that says the whole of
+/// what it did once.
+pub(crate) fn collect_unreferenced(engine: &Engine) -> Result<Vec<String>> {
+    collect(engine, |index, held, _, in_use, remove_layers| {
+        Ok(index.prune(held, in_use, remove_layers)?)
+    })
 }
 
 /// A garbage collection: under the store's lock, exclusive, it sweeps the
@@ -1129,12 +1621,11 @@ fn in_use(live: &[LiveArea], owned: &[shipyard_image::OwnedArea]) -> BTreeSet<St
 /// df`).
 #[derive(Debug)]
 pub struct StoreUsage {
-    /// How many images the store has.
-    pub images: u64,
-    /// Their blobs and extracted layers.
-    pub disk: shipyard_image::DiskUsage,
-    /// The containers' writable layers: running ones (`count`), and kept
-    /// ones of stopped containers (in `bytes`, not reclaimable: `rm`
+    /// The images (their manifests): those a container's layers use are
+    /// active; their blobs and extracted layers.
+    pub images: Usage,
+    /// The containers: those running are active; their writable layers,
+    /// kept ones of stopped containers in `bytes`, not reclaimable (`rm`
     /// reclaims them, not a prune).
     pub containers: Usage,
 }
@@ -1142,14 +1633,21 @@ pub struct StoreUsage {
 /// What a kind of thing in the store takes.
 #[derive(Debug, Default)]
 pub struct Usage {
-    /// How many there are (in use, for containers).
-    pub count: u64,
+    /// How many there are.
+    pub total: u64,
+    /// How many are in use (Docker's `ACTIVE`).
+    pub active: u64,
     /// Their bytes.
     pub bytes: u64,
     /// The bytes nothing uses now.
     pub reclaimable: u64,
     /// Whether all of it could be read: `false`, it takes more.
     pub complete: bool,
+}
+
+/// `n` as a count of things.
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// The store's disk usage (for `shipyard system df`).
@@ -1192,17 +1690,47 @@ pub fn disk_usage(engine: &Engine) -> Result<StoreUsage> {
         containers.complete &= taken.complete;
         containers.bytes += taken.bytes;
         if running {
-            containers.count += 1;
+            containers.active += 1;
         }
         if !kept {
             containers.reclaimable += taken.bytes;
         }
     }
-    Ok(StoreUsage {
-        images: u64::try_from(index.images().len()).unwrap_or(u64::MAX),
-        disk,
-        containers,
-    })
+    // Every container's record, not only those with a layer (one never
+    // started has none). Unreadable: at least those running, said to be
+    // more (`complete` false).
+    let records = crate::containers::list(engine).ok();
+    if let Some(records) = &records {
+        containers.total = count(records.len()).max(containers.active);
+    } else {
+        containers.total = containers.active;
+        containers.complete = false;
+    }
+    // An image is active when a container's record runs it (its manifest
+    // digest, what every start runs): never by layers a base shares.
+    let used: BTreeSet<&str> = records
+        .iter()
+        .flatten()
+        .filter_map(|record| record.image_id.as_deref())
+        .collect();
+    let manifests: BTreeSet<String> = index
+        .images()
+        .into_iter()
+        .map(|image| image.record.manifest)
+        .collect();
+    let images = Usage {
+        total: count(manifests.len()),
+        active: count(
+            manifests
+                .iter()
+                .filter(|manifest| used.contains(manifest.as_str()))
+                .count(),
+        ),
+        bytes: disk.blob_bytes + disk.layer_bytes,
+        reclaimable: disk.blob_reclaimable + disk.layer_reclaimable,
+        complete: disk.complete,
+    };
+    Ok(StoreUsage { images, containers })
 }
 
 #[cfg(test)]
@@ -1220,6 +1748,8 @@ mod tests {
             manifest: "sha256:aa".to_owned(),
             config: "sha256:bb".to_owned(),
             layers: Vec::new(),
+            index_digest: None,
+            tagged_at: None,
         };
         let canonical = "docker.io/library/alpine:latest";
         Index::record(&root, canonical, record()).unwrap();

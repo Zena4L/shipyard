@@ -537,7 +537,7 @@ fn route_network6(internal: &[bool], ipv6: &[bool]) -> Option<usize> {
     not(target_os = "linux"),
     allow(dead_code, reason = "networks are Linux's")
 )]
-pub(super) fn resolver(
+pub(crate) fn resolver(
     networks: &[&shipyard_network::store::NetworkConfig],
 ) -> Option<std::net::IpAddr> {
     let with_dns = || networks.iter().filter(|config| config.has_dns());

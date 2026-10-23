@@ -159,8 +159,9 @@ fn version_2_reads_as_written() {
     assert_eq!(Record::parse(&written).unwrap(), v3);
 }
 
-/// A version 3 record, as one is written: every field set.
-const V3_RECORD: &str = r#"{
+/// A version 3 record, as one is written: every field set (the views'
+/// tests start from it too).
+pub(crate) const V3_RECORD: &str = r#"{
         "version": 3,
         "id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "serial": 304812,
@@ -292,6 +293,157 @@ fn version_3_reads_as_written() {
         Record::parse(extra.as_bytes()).unwrap_err().kind(),
         ErrorKind::Storage
     );
+}
+
+/// A version 3 config with every nested form set (each enum's every
+/// variant, each list with an entry), written in 0.2.0's order: what
+/// `StoredConfig` must read and write as released.
+pub(crate) const V3_FULL_CONFIG: &str = r#"{
+        "interactive": true, "tty": true, "env": ["A=1"], "workdir": "/w",
+        "user": {"name": "app", "group": "staff"}, "group_add": ["audio"],
+        "ulimit": [{"kind": "nofile", "soft": 1024, "hard": null}],
+        "oom_score_adj": -100,
+        "device": [{"host": "/dev/fuse", "container": "/dev/f", "access": "rwm"}],
+        "device_cgroup_rule": [{"allow": true, "kind": "c", "major": 10, "minor": null,
+                                "access": "rw"}],
+        "stop_signal": "SIGINT", "stop_timeout": 3, "restart": "unless-stopped",
+        "health": {"test": ["CMD", "true"], "interval_ms": 1, "timeout_ms": 2,
+                   "start_period_ms": 3, "start_interval_ms": 4, "retries": 5},
+        "no_isolation": false, "hostname": "h", "domainname": "d",
+        "sysctl": [{"key": "net.ipv4.ip_forward", "value": "1"}],
+        "network": [{"bridges": [{"name": "app", "ip": "10.89.0.9", "ip6": "fd00::9",
+                                  "mac": "02:42:0a:59:00:09", "aliases": ["web"]}]},
+                    "host", "none", "pasta"],
+        "network_alias": ["w"], "ip": "10.89.0.9", "ip6": "fd00::9",
+        "mac_address": "02:42:0a:59:00:09",
+        "add_host": [{"name": "db", "ip": "10.0.0.5"}], "dns": ["1.1.1.1"],
+        "dns_search": ["example.com"], "dns_option": ["ndots:2"],
+        "publish": [{"host_ip": "127.0.0.1", "host_port": null, "container_port": 53,
+                     "protocol": "udp"}],
+        "publish_all": true, "rootfs": null, "image": "alpine", "entrypoint": "/init",
+        "pull": "always", "read_only": true, "cap_add": ["NET_ADMIN"],
+        "cap_drop": ["ALL"],
+        "security_opt": [{"no_new_privileges": true}, "seccomp_unconfined",
+                         {"seccomp_profile": "/p.json"}],
+        "uidmap": [{"container": 0, "host": 100000, "size": 65536}],
+        "gidmap": [{"container": 0, "host": 100000, "size": 65536}],
+        "bundle": null,
+        "resources": {"memory_max": 1048576, "memory_low": 524288,
+                      "swap_max": "max", "swap_is_default": true, "cpu_quota": 50000,
+                      "cpu_period": 100000, "cpu_max": true, "cpu_weight": 100,
+                      "cpuset_cpus": "0-1", "cpuset_mems": "0", "pids_max": 64,
+                      "io_weight": 200,
+                      "io_max": [{"major": 8, "minor": 0, "rbps": 1, "wbps": null,
+                                  "riops": null, "wiops": 4}],
+                      "unified": {"memory.oom.group": "1"}},
+        "volume": ["data:/data:ro"], "command": ["sh", "-c", "true"]
+    }"#;
+
+/// [`V3_RECORD`] with [`V3_FULL_CONFIG`] for its config.
+pub(crate) fn v3_full_record() -> String {
+    let config =
+        &V3_RECORD[V3_RECORD.find("\"config\": {").unwrap()..V3_RECORD.find("\"labels\"").unwrap()];
+    V3_RECORD.replacen(
+        config,
+        &format!("\"config\": {V3_FULL_CONFIG},\n        "),
+        1,
+    )
+}
+
+/// Every key of `json`, by its path, in the order written (`serde_json`'s
+/// own `Value` sorts them: an order kept is only seen by reading the keys
+/// as they come).
+fn keys_in_order(json: &[u8]) -> Vec<String> {
+    use serde::de::{DeserializeSeed, Deserializer as _, MapAccess, SeqAccess, Visitor};
+    struct Keys<'a>(&'a mut Vec<String>, String);
+    impl<'de> DeserializeSeed<'de> for Keys<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Keys<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                let path = format!("{}.{key}", self.1);
+                self.0.push(path.clone());
+                map.next_value_seed(Keys(self.0, path))?;
+            }
+            Ok(())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let mut at = 0;
+            while seq
+                .next_element_seed(Keys(self.0, format!("{}[{at}]", self.1)))?
+                .is_some()
+            {
+                at += 1;
+            }
+            Ok(())
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+    }
+    let mut keys = Vec::new();
+    serde_json::Deserializer::from_slice(json)
+        .deserialize_any(Keys(&mut keys, String::new()))
+        .unwrap();
+    keys
+}
+
+/// Every nested form of a version 3 config (each enum's every variant,
+/// each list's entries, a health check without a shell, which isn't
+/// written) reads, and is written again with the same keys in the same
+/// order and the same values: the released format, kept by the record's
+/// own types (`StoredConfig`), whatever the engine's `Config` does.
+#[test]
+fn every_nested_form_is_written_as_released() {
+    let literal = v3_full_record();
+    let record = Record::parse(literal.as_bytes()).unwrap();
+    assert_eq!(
+        record.config.restart,
+        crate::containers::RestartPolicy::UnlessStopped
+    );
+    assert_eq!(
+        record.config.resources.swap_max,
+        Some(crate::containers::Amount::Max)
+    );
+    let written = record.to_json_new().unwrap();
+    assert_eq!(keys_in_order(&written), keys_in_order(literal.as_bytes()));
+    let given: serde_json::Value = serde_json::from_str(&literal).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&written).unwrap(),
+        given
+    );
+    // `swap_max`'s other form, a value.
+    let valued = literal.replacen("\"swap_max\": \"max\"", "\"swap_max\": {\"value\": 7}", 1);
+    let record = Record::parse(valued.as_bytes()).unwrap();
+    assert_eq!(
+        record.config.resources.swap_max,
+        Some(crate::containers::Amount::Value(7))
+    );
+    let written = record.to_json_new().unwrap();
+    assert_eq!(keys_in_order(&written), keys_in_order(valued.as_bytes()));
 }
 
 /// The upgrade rule (F43): written again at the version read, unless what's

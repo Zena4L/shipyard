@@ -11,9 +11,12 @@ publish.workspace = true
 
 [dependencies]
 libc.workspace = true
-nix.workspace = true
+# `sysconf(_SC_CLK_TCK)` for `top`'s and `stats`' clock ticks (`feature`).
+nix = { workspace = true, features = ["feature"] }
 serde.workspace = true
 serde_json.workspace = true
+# Networks' IDs, derived from what makes each one (step 11.2c2b).
+sha2.workspace = true
 shipyard-image.workspace = true
 shipyard-network.workspace = true
 shipyard-runtime.workspace = true

@@ -347,7 +347,10 @@ Decided 2026-10-15 (ROADMAP D23, D24).
 
 ## 11. Docker compatibility — stage 11
 
-Decided 2026-10-15 (ROADMAP D25–D27).
+Decided 2026-10-15 (ROADMAP D25–D27). **Done** 2026-10-23, steps 11.1–11.6
+([notes](stages/11-docker-compat.md)): the API, the drop-in CLI, compose and
+Testcontainers, and Docker's clients on the Mac; what's left moved to stages 12, 13 and
+15 (the notes' "moved out" table).
 
 - **The container record split from `Config` and from the API's types** (moved from
   stage 10, D10.1d-1), so a record version is a frozen type of its own, before any v4.
@@ -356,7 +359,9 @@ Decided 2026-10-15 (ROADMAP D25–D27).
   on macOS), plus an event stream. Shipyard's own data (serials, health history, observed
   sockets) under `/shipyard/…`. The subset is what `docker compose` and Testcontainers
   use, listed in the stage's plan.
-- **The Mac CLI talks this API** to the guest, replacing stage 10's forwarding.
+- **Docker's clients on the Mac use this API** (step 11.5b): served on a socket in the
+  VM's directory and relayed to the guest's service. The Mac's `shipyard` keeps stage
+  10's forwarding (D11.5b-1): its move to the API is stage 13's.
 - **The CLI, a drop-in for `docker`** on the everyday commands (`run`, `create`, `start`,
   `stop`, `rm`, `ps`, `logs`, `exec`, `inspect`, `images`, `pull`, `compose`…): Docker's
   flags and short forms (`-v`, `-h`, `--env-file`, `-l`, `logs -n`, `inspect -f`,
@@ -388,6 +393,9 @@ Decided 2026-10-15 (ROADMAP D29). Apple Silicon only.
   mounts of macOS paths that just work.
 - **Ports and DNS** from macOS into the VM.
 - **Lifecycle:** the VM starts on first use and stops when idle.
+- **The Mac's `shipyard` over the API** (moved from stage 11, D11.5b-1): its commands
+  as API calls instead of forwarded argument lists, with Shipyard's own endpoints for what
+  Docker's API lacks.
 - **Entitlements and notarization** (`com.apple.security.virtualization`).
 - **The macOS version floor:** macOS 13 Ventura (decided in step 10.3, D10.3-4: what
   Rosetta in Virtualization.framework needs).

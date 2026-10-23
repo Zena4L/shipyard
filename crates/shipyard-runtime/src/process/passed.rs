@@ -173,11 +173,11 @@ fn listen_from(
     names: Option<OsString>,
     own: u32,
 ) -> Option<Listen> {
-    let number = |value: Option<&std::ffi::OsStr>| value?.to_str()?.parse::<u64>().ok();
-    if number(pid)? != u64::from(own) {
-        return None;
-    }
-    let count = usize::try_from(number(fds)?).ok()?;
+    let count = shipyard_sys::listen::passed(
+        own,
+        pid.and_then(std::ffi::OsStr::to_str),
+        fds.and_then(std::ffi::OsStr::to_str),
+    );
     (count > 0).then_some(Listen { count, names })
 }
 

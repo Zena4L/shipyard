@@ -5,15 +5,17 @@
 
 use std::io::Write as _;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use shipyard_engine::attach::Settled;
-use shipyard_engine::containers::{BoundPort, ContainerState, Listed};
+use shipyard_engine::containers::BoundPort;
 
-/// How `ps` and `port --sockets` print.
+use crate::format::rows::{self, ContainerRow};
+
+/// How `port --sockets` prints.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Format {
+pub(crate) enum SocketsFormat {
     /// A table, as Docker's.
     #[default]
     Table,
@@ -22,7 +24,7 @@ pub(crate) enum Format {
 }
 
 /// `shipyard start`: each container started (one running is left as it
-/// is), its reference printed as given; exits 125 if any couldn't be.
+/// is), its reference printed as given; exits 1 if any couldn't be.
 pub(crate) fn start(references: &[String]) -> ExitCode {
     each_said(references, |engine, reference| {
         shipyard_engine::run::start(engine, reference).map(drop)
@@ -55,6 +57,7 @@ pub(crate) fn start_attached(
         detach_keys: shipyard_runtime::attach::DetachKeys::parse(detach_keys)?,
         stdin: interactive,
         held: false,
+        output: shipyard_engine::attach::Output::BOTH,
     };
     let code = shipyard_engine::run::start_attached(&engine, reference, &options)?;
     Ok(attached_exit(code))
@@ -67,13 +70,14 @@ pub(crate) fn attach(reference: &str, detach_keys: &str, stdin: bool) -> Result<
         detach_keys: shipyard_runtime::attach::DetachKeys::parse(detach_keys)?,
         stdin,
         held: false,
+        output: shipyard_engine::attach::Output::BOTH,
     };
     let code = shipyard_engine::attach::to_container(&engine, reference, &options)?;
     Ok(attached_exit(code))
 }
 
 /// Does `act` to each container, saying each reference as given once it's
-/// done; exits 125 if any couldn't be.
+/// done; exits 1 if any couldn't be.
 fn each_said(
     references: &[String],
     mut act: impl FnMut(&shipyard_engine::Engine, &str) -> shipyard_engine::Result<()>,
@@ -100,9 +104,17 @@ pub(crate) struct ContainerRefs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct StopArgs {
     /// Seconds to wait after the stop signal before SIGKILL (the container's
-    /// own, its --stop-timeout, unless given).
-    #[arg(short = 't', long = "time", value_name = "SECONDS")]
-    time: Option<u64>,
+    /// own, its --stop-timeout, unless given); -1 waits for as long as it
+    /// takes, as Docker's.
+    #[arg(
+        short = 't',
+        long = "timeout",
+        visible_alias = "time",
+        value_name = "SECONDS",
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i64).range(-1..)
+    )]
+    time: Option<i64>,
     /// The signal sent first (the container's own, its --stop-signal, unless
     /// given).
     #[arg(short, long, value_name = "SIGNAL")]
@@ -114,13 +126,14 @@ impl StopArgs {
     pub(crate) fn options(&self) -> shipyard_engine::run::StopOptions {
         shipyard_engine::run::StopOptions {
             signal: self.signal,
-            timeout: self.time.map(Duration::from_secs),
+            // -1: for as long as it takes (the engine's rule, as the API's).
+            timeout: self.time.map(shipyard_engine::run::StopOptions::timeout_of),
         }
     }
 }
 
 /// `shipyard stop`: each container stopped (one not up is left as it is),
-/// its reference printed as given once it has ended; exits 125 if any
+/// its reference printed as given once it has ended; exits 1 if any
 /// couldn't be.
 pub(crate) fn stop(references: &[String], options: shipyard_engine::run::StopOptions) -> ExitCode {
     each_said(references, |engine, reference| {
@@ -129,7 +142,7 @@ pub(crate) fn stop(references: &[String], options: shipyard_engine::run::StopOpt
 }
 
 /// `shipyard restart`: each container stopped, then started, its reference
-/// printed as given; exits 125 if any couldn't be.
+/// printed as given; exits 1 if any couldn't be.
 pub(crate) fn restart(
     references: &[String],
     options: shipyard_engine::run::StopOptions,
@@ -140,22 +153,33 @@ pub(crate) fn restart(
 }
 
 /// `shipyard kill`: `signal` sent to each container's main process, its
-/// reference printed as given; exits 125 if any isn't running.
+/// reference printed as given; exits 1 if any isn't running.
 pub(crate) fn kill(references: &[String], signal: shipyard_runtime::process::Signal) -> ExitCode {
     each_said(references, |engine, reference| {
         shipyard_engine::run::kill(engine, reference, signal).map(drop)
     })
 }
 
-/// `shipyard update`: each container's restart policy set to `restart`,
-/// its reference printed as given; exits 125 if any couldn't be.
-pub(crate) fn update(
-    references: &[String],
-    restart: shipyard_engine::containers::RestartPolicy,
-) -> ExitCode {
-    let request = shipyard_engine::run::UpdateRequest::restart(restart);
-    each_said(references, |engine, reference| {
+/// `shipyard update`: each container's restart policy and limits changed
+/// as asked, its reference printed as given; exits 1 if any couldn't be.
+pub(crate) fn update(args: &crate::cli::UpdateArgs) -> ExitCode {
+    let mut request = shipyard_engine::run::UpdateRequest::default();
+    request.restart = args.restart;
+    let request = request.with_limits(args.limits.docker());
+    each_said(&args.refs.containers, |engine, reference| {
         shipyard_engine::run::update(engine, reference, &request).map(drop)
+    })
+}
+
+/// `shipyard pause` (`freeze`) and `unpause`: each container frozen or
+/// thawed, its reference printed as given; exits 1 if any couldn't be.
+pub(crate) fn pause(references: &[String], freeze: bool) -> ExitCode {
+    each_said(references, |engine, reference| {
+        if freeze {
+            shipyard_engine::run::pause(engine, reference).map(drop)
+        } else {
+            shipyard_engine::run::unpause(engine, reference).map(drop)
+        }
     })
 }
 
@@ -168,6 +192,10 @@ pub(crate) fn rename(reference: &str, new_name: &str) -> Result<ExitCode> {
 
 /// `shipyard exec`'s flags.
 #[derive(Debug, clap::Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "clap's switches: each bool is one command-line flag"
+)]
 pub(crate) struct ExecArgs {
     /// Pass your input on to it (without: it reads end-of-file).
     #[arg(short, long)]
@@ -182,12 +210,29 @@ pub(crate) struct ExecArgs {
     /// container's own /etc/passwd and /etc/group) or numbers.
     #[arg(short, long, value_name = "USER[:GROUP]")]
     user: Option<String>,
-    /// Set an environment variable for it (KEY=VALUE; repeatable).
-    #[arg(short, long, value_name = "KEY=VALUE")]
+    /// Set an environment variable for it (KEY=VALUE, or a bare KEY to
+    /// copy your shell's value; repeatable).
+    #[arg(short, long, value_name = "KEY[=VALUE]")]
     env: Vec<std::ffi::OsString>,
+    /// Read variables from a file, as `run --env-file` does (before --env,
+    /// which wins). Repeatable.
+    #[arg(long, value_name = "FILE")]
+    env_file: Vec<std::path::PathBuf>,
+    /// Not supported yet: an exec's command ends with this session, so
+    /// there's nothing to detach from (refused).
+    #[arg(long, value_name = "KEYS")]
+    detach_keys: Option<String>,
+    /// Not supported: give the container the capabilities it needs
+    /// (refused).
+    #[arg(long)]
+    privileged: bool,
     /// Its working directory, in the container.
     #[arg(short, long, value_name = "DIR")]
     workdir: Option<std::path::PathBuf>,
+    /// Where to write its PID (as the host sees it) once it runs: the API
+    /// service's, for an exec's inspect (F117). Not Docker's: hidden.
+    #[arg(long, value_name = "FILE", hide = true)]
+    pid_file: Option<std::path::PathBuf>,
     /// The container: its name, ID, serial or ID prefix.
     container: String,
     /// The command and its arguments.
@@ -196,24 +241,64 @@ pub(crate) struct ExecArgs {
 }
 
 /// `shipyard exec`: exits with the command's code (126 or 127 if it
-/// couldn't be run), 0 once it runs detached, 125 for Shipyard's own
-/// failures.
+/// couldn't be run), 0 once it runs detached, 1 for Shipyard's own
+/// failures (Docker's), 125 for what it can't take as asked (a refused
+/// flag, an env file that can't be read: usage errors, as clap's).
 pub(crate) fn exec(args: ExecArgs) -> ExitCode {
+    let usage = |message: &str| {
+        let error = clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!("{message}\n"),
+        );
+        let _ = error.print();
+        ExitCode::from(shipyard_runtime::process::EXIT_ENGINE_ERROR)
+    };
+    if args.detach_keys.is_some() {
+        return usage(
+            "--detach-keys isn't supported for exec yet: its command ends with this session, \
+             so there's nothing to detach from (use -d to run it in the background)",
+        );
+    }
+    if args.privileged {
+        return usage(
+            "--privileged isn't supported: give the container the capabilities (--cap-add) it \
+             needs",
+        );
+    }
+    // The files' variables first: `--env` wins (Docker's order).
+    let mut env = Vec::new();
+    for path in &args.env_file {
+        match crate::run::files::env_file(path) {
+            Ok(entries) => env.extend(entries),
+            Err(error) => return usage(&error.to_string()),
+        }
+    }
+    env.extend(args.env);
     let engine = crate::reporter::engine();
+    let caller_env = crate::run::caller_env_of(&env);
     let request = shipyard_engine::exec::ExecRequest {
         args: args.command,
         interactive: args.interactive,
         tty: args.tty,
         detach: args.detach,
         user: args.user,
-        env: args.env,
+        env,
+        caller_env,
         workdir: args.workdir,
         stop: shipyard_runtime::process::StopPolicy::default(),
+        pid_file: args.pid_file,
     };
     match shipyard_engine::exec::in_container(&engine, &args.container, &request) {
         Ok(shipyard_engine::exec::Ran::Exited(code)) => ExitCode::from(code),
         Ok(_) => ExitCode::SUCCESS,
-        Err(error) => crate::reporter::report(&error, shipyard_engine::exec::exit_code(&error)),
+        Err(error) => {
+            // The command's own 126 or 127, or Shipyard's failure.
+            let code = match shipyard_engine::exec::exit_code(&error) {
+                shipyard_runtime::process::EXIT_ENGINE_ERROR => crate::reporter::EXIT_FAILURE,
+                code => code,
+            };
+            crate::reporter::report(&error, code)
+        }
     }
 }
 
@@ -226,6 +311,9 @@ pub(crate) struct CpArgs {
     /// Follow a source that's a symbolic link.
     #[arg(short = 'L', long)]
     follow_link: bool,
+    /// Taken, as Docker's (no progress): Shipyard prints none.
+    #[arg(short, long)]
+    quiet: bool,
     /// From: CONTAINER:PATH, a host path, or - (a tar stream on stdin).
     source: std::ffi::OsString,
     /// To: CONTAINER:PATH, a host path, or - (a tar stream on stdout).
@@ -241,10 +329,25 @@ pub(crate) struct CpArgs {
 )]
 impl ExecArgs {
     /// What a forwarded `exec` needs of a Mac (step 10.3b): its input with
-    /// `-i`.
+    /// `-i`, its env files (host paths), and the variables a bare `-e KEY`
+    /// (or an env file's bare `KEY`) copies.
     pub(crate) fn needs(&self) -> crate::forward::Needs {
+        let from_files: Vec<std::ffi::OsString> = self
+            .env_file
+            .iter()
+            .filter_map(|path| crate::run::files::env_file(path).ok())
+            .flatten()
+            .collect();
+        let mut copied_env = crate::run::copied_env(&from_files);
+        copied_env.extend(crate::run::copied_env(&self.env));
         crate::forward::Needs {
             input: self.interactive,
+            paths: self
+                .env_file
+                .iter()
+                .map(crate::forward::HostPath::existing)
+                .collect(),
+            copied_env,
             ..crate::forward::Needs::default()
         }
     }
@@ -324,13 +427,17 @@ pub(crate) struct LogsArgs {
     /// started again).
     #[arg(short, long)]
     follow: bool,
-    /// Only the last N lines (across its starts).
-    #[arg(long, value_name = "N")]
-    tail: Option<usize>,
+    /// Only the last N lines (across its starts); `all` is every one, as
+    /// Docker's.
+    #[arg(short = 'n', long, value_name = "N", value_parser = parse_tail)]
+    pub(crate) tail: Option<Tail>,
     /// Only lines from TIME on: RFC 3339 (2026-10-10T06:16:19Z), Unix
     /// seconds, or a duration ago (10m, 2h, 30s, 3d).
     #[arg(long, value_name = "TIME", value_parser = shipyard_cli::logs_output::parse_since)]
     since: Option<shipyard_runtime::logs::time::Timestamp>,
+    /// Only lines up to TIME (as --since takes it); a follow ends there.
+    #[arg(long, value_name = "TIME", value_parser = shipyard_cli::logs_output::parse_since)]
+    until: Option<shipyard_runtime::logs::time::Timestamp>,
     /// Start each line with the time it was written (RFC 3339).
     #[arg(short, long)]
     timestamps: bool,
@@ -338,15 +445,40 @@ pub(crate) struct LogsArgs {
     container: String,
 }
 
+/// `logs -n`'s count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tail {
+    /// Every line (`all`).
+    All,
+    /// The last this many.
+    Last(usize),
+}
+
+/// `logs -n`'s `N`: a number, or `all`.
+fn parse_tail(s: &str) -> Result<Tail, String> {
+    if s == "all" {
+        return Ok(Tail::All);
+    }
+    s.parse()
+        .map(Tail::Last)
+        .map_err(|_| format!("{s}: give a number of lines, or all"))
+}
+
 /// `shipyard logs`: the container's logs, every start's, as `args` say.
 pub(crate) fn logs(args: &LogsArgs) -> Result<ExitCode> {
     let engine = crate::reporter::engine();
     let options = shipyard_engine::logs::LogsOptions {
-        tail: args.tail,
+        tail: match args.tail {
+            Some(Tail::Last(lines)) => Some(lines),
+            Some(Tail::All) | None => None,
+        },
         since: args.since,
+        until: args.until,
         follow: args.follow,
         identity: None,
-        gone: Some(shipyard_cli::pipe::stdout_gone),
+        gone: Some(shipyard_engine::logs::Gone::new(
+            shipyard_cli::pipe::stdout_gone,
+        )),
     };
     let skipped = shipyard_cli::logs_output::printed(args.timestamps, |sink| {
         Ok(shipyard_engine::logs::of_container(
@@ -363,7 +495,7 @@ pub(crate) fn logs(args: &LogsArgs) -> Result<ExitCode> {
 }
 
 /// `shipyard wait`: each container's exit code once it has ended, one per
-/// line; exits 125 if any couldn't be waited for.
+/// line; exits 1 if any couldn't be waited for.
 pub(crate) fn wait(references: &[String]) -> ExitCode {
     let engine = crate::reporter::engine();
     crate::output::each(references, |reference| {
@@ -374,26 +506,29 @@ pub(crate) fn wait(references: &[String]) -> ExitCode {
 }
 
 /// `shipyard rm`: each container removed (a running one only with
-/// `force`), its reference printed as given; exits 125 if any couldn't be.
-pub(crate) fn rm(references: &[String], force: bool) -> ExitCode {
+/// `force`; its anonymous volumes too with `volumes`), its reference
+/// printed as given; exits 1 if any couldn't be.
+pub(crate) fn rm(references: &[String], options: shipyard_engine::run::RemoveOptions) -> ExitCode {
     each_said(references, |engine, reference| {
-        shipyard_engine::run::remove(engine, reference, force).map(drop)
+        shipyard_engine::run::remove_with(engine, reference, options).map(drop)
     })
 }
 
-/// `shipyard inspect`: the containers as a JSON array (the ones found);
-/// exits 125 if any wasn't.
-pub(crate) fn inspect(references: &[String]) -> Result<ExitCode> {
+/// `shipyard inspect`: each object named, as Docker shows it: the first
+/// of a container, an image, a network and a volume that has the name (or
+/// the `--type` asked), as `--format` asks (one JSON array without it);
+/// containers in Shipyard's own view with `--shipyard`. One found nowhere
+/// is said, the rest still shown, and the command exits 1.
+pub(crate) fn inspect(args: &crate::cli::InspectArgs) -> Result<ExitCode> {
     let engine = crate::reporter::engine();
-    let mut found = Vec::new();
-    let code = crate::output::each(references, |reference| {
-        found.push(shipyard_engine::containers::inspect(&engine, reference)?);
-        Ok(())
-    });
-    let mut out = std::io::stdout().lock();
-    serde_json::to_writer_pretty(&mut out, &found)?;
-    writeln!(out)?;
-    Ok(code)
+    let kind = args.kind.map(Into::into);
+    crate::output::shown(&args.names, args.shown.format.as_deref(), |name| {
+        Ok(if args.shipyard {
+            serde_json::to_value(shipyard_engine::containers::inspect(&engine, name)?)?
+        } else {
+            serde_json::to_value(shipyard_engine::docker::inspect_any(&engine, name, kind)?)?
+        })
+    })
 }
 
 /// A container's port as `port` takes it: `80`, `80/tcp` or `53/udp` (tcp
@@ -470,15 +605,17 @@ pub(crate) fn port(reference: &str, wanted: Option<&(u16, String)>) -> Result<Ex
 
 /// `shipyard port --sockets`: the container's sockets, as a table (`PROTO
 /// LOCAL REMOTE STATE PEER`) or JSON.
-pub(crate) fn sockets(reference: &str, format: Format) -> Result<ExitCode> {
+pub(crate) fn sockets(reference: &str, format: SocketsFormat) -> Result<ExitCode> {
     let found = shipyard_engine::containers::sockets(&crate::reporter::engine(), reference)?;
     let mut out = std::io::stdout().lock();
     match format {
-        Format::Json => {
-            serde_json::to_writer_pretty(&mut out, &found.sockets)?;
-            writeln!(out)?;
+        SocketsFormat::Json => {
+            // What a terminal would act on escaped (C1, bidi: serde leaves
+            // them), as `--format json` does (11.6b's review).
+            let text = serde_json::to_string_pretty(&found.sockets)?;
+            writeln!(out, "{}", crate::format::terminal_safe(text))?;
         }
-        Format::Table => {
+        SocketsFormat::Table => {
             let rows: Vec<Vec<String>> = found
                 .sockets
                 .iter()
@@ -503,170 +640,35 @@ pub(crate) fn sockets(reference: &str, format: Format) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `shipyard ps`: the containers up (all of them with `all`), as a table,
-/// their IDs alone (`quiet`), or JSON.
-pub(crate) fn ps(all: bool, quiet: bool, format: Format) -> Result<ExitCode> {
-    let summaries = shipyard_engine::containers::summaries(&crate::reporter::engine(), all)?;
-    let now = SystemTime::now();
-    let mut out = std::io::stdout().lock();
-    if quiet {
-        for summary in &summaries {
-            writeln!(out, "{}", summary.record.id.short())?;
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    match format {
-        Format::Json => {
-            let rows: Vec<Listed> = summaries.iter().map(Listed::from).collect();
-            serde_json::to_writer_pretty(&mut out, &rows)?;
-            writeln!(out)?;
-        }
-        Format::Table => {
-            let rows: Vec<Vec<String>> = summaries
-                .iter()
-                .map(|summary| {
-                    let record = &summary.record;
-                    vec![
-                        record.id.short().to_owned(),
-                        record
-                            .config
-                            .image
-                            .clone()
-                            .unwrap_or_else(|| "-".to_owned()),
-                        truncated(&format!("\"{}\"", summary.command().join(" ")), 22),
-                        format!("{} ago", ago(record.created, now)),
-                        with_network(
-                            with_health(
-                                status(&summary.state, now),
-                                summary.health.as_ref().map(|health| health.status),
-                            ),
-                            summary.network_lost.is_some(),
-                        ),
-                        // Only while it runs (or is paused), as `port`: an
-                        // ended one, or one waiting to restart, holds none.
-                        if matches!(
-                            summary.state,
-                            ContainerState::Running { .. } | ContainerState::Paused
-                        ) {
-                            ports(&record.ports)
-                        } else {
-                            String::new()
-                        },
-                        record.name.as_str().to_owned(),
-                    ]
-                })
-                .collect();
-            crate::output::table(
-                &mut out,
-                &[
-                    "CONTAINER ID",
-                    "IMAGE",
-                    "COMMAND",
-                    "CREATED",
-                    "STATUS",
-                    "PORTS",
-                    "NAMES",
-                ],
-                &rows,
-            )?;
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `text`, cut to `width` characters with an ellipsis if it's longer.
-fn truncated(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_owned();
-    }
-    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
-}
-
-/// A state as `ps` says it: `Up 3 minutes`, `Exited (0) 2 hours ago`.
-fn status(state: &ContainerState, now: SystemTime) -> String {
-    match state {
-        ContainerState::Running { since: Some(since) } => format!("Up {}", ago(*since, now)),
-        ContainerState::Running { since: None } => "Up".to_owned(),
-        ContainerState::Paused => "Paused".to_owned(),
-        ContainerState::Stopping => "Stopping".to_owned(),
-        // Docker's: how it last ended, and when.
-        ContainerState::Exited { code, finished, .. } => ended("Exited", *code, *finished, now),
-        ContainerState::Restarting { code, finished, .. } => {
-            ended("Restarting", *code, *finished, now)
-        }
-        _ => "Created".to_owned(),
-    }
-}
-
-/// `status` with what the health checks say, as Docker: `Up 3 minutes
-/// (healthy)`, `(unhealthy)`, `(health: starting)`.
-fn with_health(status: String, health: Option<shipyard_engine::health::Status>) -> String {
-    use shipyard_engine::health::Status;
-    match health {
-        None => status,
-        Some(Status::Starting) => format!("{status} (health: starting)"),
-        Some(said) => format!("{status} ({said})"),
-    }
-}
-
-/// `status` with ` (no network)` if this start lost its network (its pasta
-/// died while it ran).
-fn with_network(status: String, lost: bool) -> String {
-    if lost {
-        format!("{status} (no network)")
+/// `shipyard ps`: the containers up (all of them with `-a`), as Docker
+/// lists them: newest first, filtered (`-f`), the last made only (`-n`,
+/// `-l`), printed as `--format` asks (Docker's table without it), or
+/// their IDs alone (`-q`).
+pub(crate) fn ps(args: &crate::cli::PsArgs) -> Result<ExitCode> {
+    use shipyard_engine::docker::filters::{ContainerFilters, Given};
+    let filters = ContainerFilters::parse(Given::from_pairs(args.list.filter.iter().cloned()))?;
+    let last = if args.latest {
+        Some(1)
     } else {
-        status
+        args.last
+            .and_then(|last| usize::try_from(last).ok())
+            .filter(|&last| last > 0)
+    };
+    let mut summaries = shipyard_engine::docker::list_containers_where(
+        &crate::reporter::engine(),
+        args.all || last.is_some(),
+        &filters,
+    )?;
+    if let Some(last) = last {
+        summaries.truncate(last);
     }
-}
-
-/// `WORD (CODE) N ago`: `?` for a code not known, no time for none.
-fn ended(word: &str, code: Option<i32>, finished: Option<SystemTime>, now: SystemTime) -> String {
-    let code = code.map_or_else(|| "?".to_owned(), |code| code.to_string());
-    match finished {
-        Some(finished) => format!("{word} ({code}) {} ago", ago(finished, now)),
-        None => format!("{word} ({code})"),
-    }
-}
-
-/// How long ago `then` was, as Docker says it: `Less than a second`,
-/// `5 seconds`, `About a minute`, `3 minutes`, `About an hour`, `2 hours`,
-/// `4 days`, `2 weeks`, `3 months`, `2 years`.
-fn ago(then: SystemTime, now: SystemTime) -> String {
-    let seconds = now.duration_since(then).unwrap_or(Duration::ZERO).as_secs();
-    let plural =
-        |count: u64, unit: &str| format!("{count} {unit}{}", if count == 1 { "" } else { "s" });
-    match seconds {
-        0 => "Less than a second".to_owned(),
-        1..60 => plural(seconds, "second"),
-        60..120 => "About a minute".to_owned(),
-        120..3600 => plural(seconds / 60, "minute"),
-        3600..7200 => "About an hour".to_owned(),
-        7200..172_800 => plural(seconds / 3600, "hour"),
-        172_800..1_209_600 => plural(seconds / 86_400, "day"),
-        1_209_600..5_184_000 => plural(seconds / 604_800, "week"),
-        5_184_000..63_072_000 => plural(seconds / 2_592_000, "month"),
-        _ => plural(seconds / 31_536_000, "year"),
-    }
-}
-
-/// The ports, as `ps` shows them: `0.0.0.0:8080->80/tcp, …`.
-fn ports(ports: &[BoundPort]) -> String {
-    ports
+    let now = SystemTime::now();
+    let rows: Vec<ContainerRow> = summaries
         .iter()
-        .map(|port| {
-            let host = match port.host_ip {
-                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-                std::net::IpAddr::V4(ip) => ip.to_string(),
-            };
-            format!(
-                "{host}:{}->{}/{}",
-                port.host_port, port.container_port, port.protocol
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .map(|summary| ContainerRow::new(summary, now, args.no_trunc))
+        .collect();
+    crate::format::print(&args.list, rows::CONTAINERS_TABLE, &rows)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -691,101 +693,26 @@ mod tests {
         let v6 = BoundPort::new("::".parse().unwrap(), 8080, 80, "tcp");
         assert_eq!(host_side(&v4), "0.0.0.0:8080");
         assert_eq!(host_side(&v6), "[::]:8080");
-        assert_eq!(ports(&[v4, v6]), "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp");
     }
+}
 
-    #[test]
-    fn ago_reads_as_dockers() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-        let before = |seconds| now - Duration::from_secs(seconds);
-        for (seconds, said) in [
-            (0, "Less than a second"),
-            (1, "1 second"),
-            (59, "59 seconds"),
-            (60, "About a minute"),
-            (180, "3 minutes"),
-            (3600, "About an hour"),
-            (7200, "2 hours"),
-            (2 * 86_400, "2 days"),
-            (14 * 86_400, "2 weeks"),
-            (90 * 86_400, "3 months"),
-            (800 * 86_400, "2 years"),
-        ] {
-            assert_eq!(ago(before(seconds), now), said, "{seconds}");
-        }
-        assert_eq!(ago(now + Duration::from_secs(5), now), "Less than a second");
-    }
+#[cfg(test)]
+mod exec_tests {
+    use clap::Parser as _;
 
+    use crate::cli::{Cli, Command};
+
+    /// A bare `-e KEY` is named to the Mac (it sends its value), as `run`'s
+    /// is; the engine resolves it, as `run`'s.
     #[test]
-    fn states_read_as_dockers() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let since = Some(now - Duration::from_secs(180));
-        assert_eq!(
-            status(&ContainerState::Running { since }, now),
-            "Up 3 minutes"
-        );
-        assert_eq!(status(&ContainerState::Created, now), "Created");
-        let exited = ContainerState::Exited {
-            code: Some(137),
-            oom: None,
-            finished: Some(now - Duration::from_secs(7200)),
+    fn a_bare_env_key_is_copied_from_the_caller() {
+        let cli = Cli::try_parse_from([
+            "shipyard", "exec", "-e", "GIVEN=1", "-e", "COPIED", "web", "sh",
+        ])
+        .unwrap();
+        let Command::Exec(args) = cli.command else {
+            panic!("an exec");
         };
-        assert_eq!(status(&exited, now), "Exited (137) 2 hours ago");
-        let unknown = ContainerState::Exited {
-            code: None,
-            oom: None,
-            finished: None,
-        };
-        assert_eq!(status(&unknown, now), "Exited (?)");
-        let restarting = ContainerState::Restarting {
-            code: Some(1),
-            finished: Some(now - Duration::from_secs(3)),
-            attempt: 2,
-            at: Some(now),
-        };
-        assert_eq!(status(&restarting, now), "Restarting (1) 3 seconds ago");
-    }
-
-    /// Health as Docker adds it to the status.
-    #[test]
-    fn health_reads_as_dockers() {
-        use shipyard_engine::health::Status;
-        let up = || "Up 3 minutes".to_owned();
-        assert_eq!(with_health(up(), None), "Up 3 minutes");
-        assert_eq!(
-            with_health(up(), Some(Status::Starting)),
-            "Up 3 minutes (health: starting)"
-        );
-        assert_eq!(
-            with_health(up(), Some(Status::Healthy)),
-            "Up 3 minutes (healthy)"
-        );
-        assert_eq!(
-            with_health(up(), Some(Status::Unhealthy)),
-            "Up 3 minutes (unhealthy)"
-        );
-        // A lost network after any health.
-        assert_eq!(
-            with_network(with_health(up(), Some(Status::Healthy)), true),
-            "Up 3 minutes (healthy) (no network)"
-        );
-        assert_eq!(with_network(up(), false), "Up 3 minutes");
-    }
-
-    #[test]
-    fn long_commands_are_cut() {
-        assert_eq!(truncated("short", 22), "short");
-        let cut = truncated("\"sh -c 'while true; do sleep 1; done'\"", 22);
-        assert_eq!(cut.chars().count(), 22);
-        assert!(cut.ends_with('…'));
-    }
-
-    #[test]
-    fn ports_read_as_dockers() {
-        let bound = [
-            BoundPort::new("0.0.0.0".parse().unwrap(), 8080, 80, "tcp"),
-            BoundPort::new("::".parse().unwrap(), 53, 53, "udp"),
-        ];
-        assert_eq!(ports(&bound), "0.0.0.0:8080->80/tcp, [::]:53->53/udp");
+        assert_eq!(args.needs().copied_env, ["COPIED"]);
     }
 }

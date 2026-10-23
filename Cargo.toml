@@ -54,10 +54,12 @@ objc2-virtualization = { version = "0.3", default-features = false, features = [
   "VZDirectorySharingDeviceConfiguration", "VZVirtioFileSystemDeviceConfiguration",
   "VZDirectoryShare", "VZSingleDirectoryShare", "VZSharedDirectory",
   "VZNetworkDeviceConfiguration", "VZVirtioNetworkDeviceConfiguration",
-  "VZNetworkDeviceAttachment", "VZNATNetworkDeviceAttachment",
+  "VZNetworkDeviceAttachment", "VZNATNetworkDeviceAttachment", "VZMACAddress",
 ] }
 block2 = "0.6"
 dispatch2 = "0.3"
+# The VM's LaunchAgent (step 11.5b2a): a property list written, never by hand.
+plist = { version = "1.10", default-features = false }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # Features are added as each stage needs them.
@@ -93,6 +95,12 @@ serde = { version = "1", features = ["derive"] }
 # `xattr`.
 rustix = { version = "1.1", default-features = false, features = ["std", "process", "net"] }
 serde_json = "1"
+# Go templates for `--format` (step 11.3c, D11.3c-1): MIT, no `unsafe`,
+# bounded execution, sorted maps, values from serde. Pinned exactly: one
+# author and pre-1.0, so an update is read before it's taken.
+gotmpl = { version = "=0.6.1", default-features = false, features = ["std", "serde"] }
+# Docker's table columns (Go's `text/tabwriter`, ported).
+tabwriter = "1.4"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -119,6 +127,24 @@ flate2 = "1"
 # Reading layer tar streams. Used for parsing only — never its `unpack`:
 # extraction is done by Shipyard under the stage-6 safety invariants.
 tar = "0.4"
+
+# Stage 11: the Docker Engine API (step 11.2, D11-1). hyper's HTTP/1.1 server
+# on a current-thread tokio runtime over a UNIX socket; the engine stays
+# blocking, its calls on tokio's blocking pool. Only what the server uses.
+tokio = { version = "1", default-features = false, features = [
+  "rt", "net", "time", "sync", "io-util",
+] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# `%XX` in the API's paths and queries (step 11.2a).
+percent-encoding = "2"
+# Acceptance tests only (step 11.4b1): Testcontainers for Rust against the
+# API's UNIX socket; no crypto provider (its default `ring` feature off),
+# though bollard's buildkit client (tonic, prost) and rustls come with it.
+testcontainers = { version = "=0.28.0", default-features = false }
+shipyard-api = { path = "crates/shipyard-api" }
 
 # Test-only crates.
 clap-markdown = "0.1"

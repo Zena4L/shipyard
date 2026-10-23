@@ -15,6 +15,9 @@ nix.workspace = true
 # Lock files opened safely, a volume's hold handed over (stage 10).
 shipyard-sys.workspace = true
 thiserror.workspace = true
+# A volume's labels (`labels.json`, step 11.2c2a).
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

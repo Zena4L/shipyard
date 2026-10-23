@@ -22,7 +22,7 @@ use super::{CpError, CpOptions, CpReport, Source, limits, names_directory, warni
 use crate::run::Files;
 
 /// The helpers `cp` registers.
-pub(super) const HELPERS: [Helper; 2] = [
+pub(super) const HELPERS: [Helper; 4] = [
     Helper {
         name: "cp-out",
         run: cp_out,
@@ -31,18 +31,26 @@ pub(super) const HELPERS: [Helper; 2] = [
         name: "cp-in",
         run: cp_in,
     },
+    Helper {
+        name: "cp-stat",
+        run: cp_stat,
+    },
+    Helper {
+        name: "volume-fill",
+        run: super::fill::volume_fill,
+    },
 ];
 
 /// What a helper's failure means, in `cp`'s terms ([`HelperFailure::kind`]).
-mod kind {
-    pub(super) const NOT_FOUND: u16 = 1;
-    pub(super) const DIRECTORY_ONTO_FILE: u16 = 2;
-    pub(super) const NOT_A_DIRECTORY: u16 = 3;
-    pub(super) const PARENT_MISSING: u16 = 4;
-    pub(super) const NO_SUCH_DIRECTORY: u16 = 5;
-    pub(super) const KIND_CLASH: u16 = 6;
-    pub(super) const SPECIAL: u16 = 8;
-    pub(super) const OTHER: u16 = 7;
+pub(super) mod kind {
+    pub(in crate::cp) const NOT_FOUND: u16 = 1;
+    pub(in crate::cp) const DIRECTORY_ONTO_FILE: u16 = 2;
+    pub(in crate::cp) const NOT_A_DIRECTORY: u16 = 3;
+    pub(in crate::cp) const PARENT_MISSING: u16 = 4;
+    pub(in crate::cp) const NO_SUCH_DIRECTORY: u16 = 5;
+    pub(in crate::cp) const KIND_CLASH: u16 = 6;
+    pub(in crate::cp) const SPECIAL: u16 = 8;
+    pub(in crate::cp) const OTHER: u16 = 7;
 }
 
 /// `cp-out`'s arguments.
@@ -67,6 +75,17 @@ struct InArgs {
     /// `-a`: the stream's owners, not root.
     archive: bool,
 }
+
+/// `cp-stat`'s arguments.
+#[derive(Debug, Serialize, Deserialize)]
+struct StatArgs {
+    /// The path, in the container.
+    path: Vec<u8>,
+}
+
+/// The most of `cp-stat`'s answer read: a JSON line of a few hundred bytes
+/// (a link's target is at most `PATH_MAX`).
+const MAX_STAT: u64 = 64 * 1024;
 
 /// A host source, as the helper needs to know it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -346,6 +365,34 @@ fn send_hit_closed_pipe(err: &CpError) -> bool {
     }
 }
 
+/// See [`super::stat`].
+pub(super) fn stat(files: Files<'_>, path: &Path) -> Result<super::PathStat, CpError> {
+    let args = StatArgs {
+        path: path.as_os_str().as_bytes().to_vec(),
+    };
+    let (read, helper) = start(files, "cp-stat", &args, None)?;
+    answer(read, helper, MAX_STAT, "reading the path's stat")
+}
+
+/// A helper's answer: the JSON it writes on `read` (at most `max`
+/// bytes), once it has ended well.
+pub(super) fn answer<T: serde::de::DeserializeOwned>(
+    read: OwnedFd,
+    helper: RunningHelper,
+    max: u64,
+    doing: &str,
+) -> Result<T, CpError> {
+    let mut said = Vec::new();
+    let read_said = std::fs::File::from(read).take(max).read_to_end(&mut said);
+    helper.wait().map_err(failure)?;
+    let unreadable = |error| CpError::Io {
+        doing: doing.to_owned(),
+        error,
+    };
+    read_said.map_err(unreadable)?;
+    serde_json::from_slice(&said).map_err(|error| unreadable(std::io::Error::other(error)))
+}
+
 /// Starts helper `name` in the container's `files`, with `args`, its standard input
 /// `stdin` (`/dev/null` if `None`) and its output on a pipe: the pipe's
 /// read end, and the helper.
@@ -381,7 +428,7 @@ fn start(
     Ok((read, helper))
 }
 
-fn pipe() -> Result<(OwnedFd, OwnedFd), CpError> {
+pub(super) fn pipe() -> Result<(OwnedFd, OwnedFd), CpError> {
     nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(|errno| CpError::Io {
         doing: "making a pipe".to_owned(),
         error: std::io::Error::from(errno),
@@ -397,7 +444,7 @@ pub(super) fn host_reopen(fd: &OwnedFd, flags: OFlag) -> nix::Result<OwnedFd> {
     )
 }
 
-fn is_directory(fd: &OwnedFd) -> bool {
+pub(super) fn is_directory(fd: &OwnedFd) -> bool {
     fstat(fd).is_ok_and(|stat| stat.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFDIR.bits())
 }
 
@@ -442,11 +489,74 @@ fn unpack_error(err: UnpackError, to: &Path) -> CpError {
 }
 
 /// The errno of an I/O error (none if it has none).
-fn errno_of(err: &std::io::Error) -> Errno {
+pub(super) fn errno_of(err: &std::io::Error) -> Errno {
     Errno::from_raw(err.raw_os_error().unwrap_or(0))
 }
 
 // --- Inside the container (the helper's functions)
+
+/// The container's `path`, as a helper opens what it's asked for (its
+/// last link followed if `follow_last`): not there is `NOT_FOUND`.
+pub(super) fn open_asked(
+    io: &HelperIo,
+    path: &Path,
+    follow_last: bool,
+) -> Result<OwnedFd, HelperFailure> {
+    io.open(path, follow_last).map_err(|errno| {
+        let shown = path.display().to_string();
+        match errno {
+            Errno::ENOENT => HelperFailure::plain(kind::NOT_FOUND, shown),
+            errno => HelperFailure::new(kind::OTHER, errno, format!("opening {shown}")),
+        }
+    })
+}
+
+/// What the container's `path` is, for
+/// [`in_scope`](super::scope::in_scope): a link's target, or `None`.
+fn link_at(io: &HelperIo, path: &Path) -> Result<Option<PathBuf>, Errno> {
+    let fd = io.open(path, false)?;
+    let stat = fstat(&fd)?;
+    if stat.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFLNK.bits() {
+        return Ok(None);
+    }
+    nix::fcntl::readlinkat(&fd, "").map(|target| Some(PathBuf::from(target)))
+}
+
+/// Writes what the container's path is (never what a link at it leads to)
+/// as JSON on standard output: a [`super::PathStat`].
+fn cp_stat(io: &HelperIo) -> Result<(), HelperFailure> {
+    let args: StatArgs = serde_json::from_slice(&io.args)
+        .map_err(|_| HelperFailure::new(kind::OTHER, Errno::EINVAL, "reading cp's arguments"))?;
+    let path = PathBuf::from(OsString::from_vec(args.path));
+    let shown = path.display().to_string();
+    let fd = open_asked(io, &path, false)?;
+    let stat = fstat(&fd).map_err(|errno| HelperFailure::new(kind::OTHER, errno, shown.clone()))?;
+    let symlink = stat.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFLNK.bits();
+    let link_target = if symlink {
+        super::scope::in_scope(&path, |path| link_at(io, path))
+            .map_err(|errno| HelperFailure::new(kind::OTHER, errno, shown.clone()))?
+            .display()
+            .to_string()
+    } else {
+        String::new()
+    };
+    let said = super::PathStat {
+        name: path.file_name().map_or_else(
+            || "/".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        size: u64::try_from(stat.st_size).unwrap_or(0),
+        mode: stat.st_mode,
+        mtime_secs: stat.st_mtime,
+        mtime_nanos: u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
+        link_target,
+    };
+    let json = serde_json::to_vec(&said)
+        .map_err(|_| HelperFailure::new(kind::OTHER, Errno::EINVAL, "writing the stat"))?;
+    (&io.stdout)
+        .write_all(&json)
+        .map_err(|error| HelperFailure::new(kind::OTHER, errno_of(&error), "writing the stat"))
+}
 
 /// Writes the container's source as a tar stream on standard output.
 fn cp_out(io: &HelperIo) -> Result<(), HelperFailure> {
@@ -454,12 +564,7 @@ fn cp_out(io: &HelperIo) -> Result<(), HelperFailure> {
         .map_err(|_| HelperFailure::new(kind::OTHER, Errno::EINVAL, "reading cp's arguments"))?;
     let path = PathBuf::from(OsString::from_vec(args.path));
     let shown = path.display().to_string();
-    let fd = io
-        .open(&path, args.follow_last)
-        .map_err(|errno| match errno {
-            Errno::ENOENT => HelperFailure::plain(kind::NOT_FOUND, shown.clone()),
-            errno => HelperFailure::new(kind::OTHER, errno, format!("opening {shown}")),
-        })?;
+    let fd = open_asked(io, &path, args.follow_last)?;
     let reopen = |fd: &OwnedFd, flags: OFlag| io.reopen(fd, flags);
     let mut out = BufWriter::new(&io.stdout);
     let mut packer = Packer::new(&mut out, &reopen);
@@ -477,7 +582,7 @@ fn cp_out(io: &HelperIo) -> Result<(), HelperFailure> {
 
 /// A writer's failure, from the helper: a broken pipe as one (its reader
 /// went away), anything else said in full.
-fn pack_failure(err: &PackError) -> HelperFailure {
+pub(super) fn pack_failure(err: &PackError) -> HelperFailure {
     match &err {
         PackError::Write(source) if source.kind() == std::io::ErrorKind::BrokenPipe => {
             HelperFailure::new(kind::OTHER, Errno::EPIPE, "writing the archive")

@@ -18,6 +18,7 @@ shipyard-image = { path = "../crates/shipyard-image" }
 shipyard-network = { path = "../crates/shipyard-network" }
 shipyard-runtime = { path = "../crates/shipyard-runtime" }
 shipyard-engine = { path = "../crates/shipyard-engine" }
+shipyard-api = { path = "../crates/shipyard-api" }
 
 # Its own workspace: not one of Shipyard's crates.
 [workspace]
@@ -116,6 +117,13 @@ bench = false
 [[bin]]
 name = "cp_unpack"
 path = "fuzz_targets/cp_unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_request"
+path = "fuzz_targets/api_request.rs"
 test = false
 doc = false
 bench = false

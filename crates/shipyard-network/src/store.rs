@@ -17,8 +17,9 @@
 //! take the network's lock finds the lease stale and sweeps it (with what it
 //! left behind: the host's end of its veth pair). No daemon keeps count.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -161,6 +162,20 @@ pub enum StoreError {
     /// Every address of the network is taken.
     #[error("the network {0} has no free address left")]
     Full(String),
+    /// Labels and options too many to keep (their file would be over
+    /// 64 KiB).
+    #[error("the labels and options of the network {0} are too many: 64 KiB at most")]
+    TooManyLabels(String),
+    /// Its `labels.json` isn't one this Shipyard reads: a newer version,
+    /// or not one at all.
+    #[error("the labels of the network {name}: {source}")]
+    Labels {
+        /// The network.
+        name: String,
+        /// Why.
+        #[source]
+        source: shipyard_sys::versioned::Error,
+    },
     /// A container on the network answers to the name already.
     #[error("the name {name} is taken on the network {network}, by a running container")]
     NameTaken {
@@ -501,6 +516,74 @@ impl Networks {
         })
     }
 
+    /// The networks in `dir`, if it's there: never made nor changed, for a
+    /// reader that only looks (a container's view).
+    #[must_use]
+    pub fn existing(dir: &Path) -> Option<Networks> {
+        dir.is_dir().then(|| Networks {
+            dir: dir.to_owned(),
+        })
+    }
+
+    /// The networks container `container` (its full ID) has a live lease
+    /// on, each with that lease: read without any lock (a listing), and a
+    /// network that can't be read left out, never failing the others.
+    #[must_use]
+    pub fn leases_of(&self, container: &str) -> Vec<(NetworkConfig, Lease)> {
+        let mut found: Vec<(NetworkConfig, Lease)> = self
+            .readable_with_leases()
+            .filter_map(|(config, leases)| {
+                let lease = leases
+                    .into_iter()
+                    .find(|lease| lease.container.as_deref() == Some(container))?;
+                Some((config, lease))
+            })
+            .collect();
+        found.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+        found
+    }
+
+    /// [`leases_of`](Self::leases_of) for every container at once, by its
+    /// ID: each network read once, so a listing costs its networks' leases,
+    /// not those times its containers (11.7: `docker ps` grew with their
+    /// square).
+    #[must_use]
+    pub fn live_leases_by_container(&self) -> BTreeMap<String, Vec<(NetworkConfig, Lease)>> {
+        let mut found: BTreeMap<String, Vec<(NetworkConfig, Lease)>> = BTreeMap::new();
+        for (config, leases) in self.readable_with_leases() {
+            for lease in leases {
+                let Some(container) = lease.container.clone() else {
+                    continue;
+                };
+                let theirs = found.entry(container).or_default();
+                // Its first live lease on a network, as `leases_of` finds it.
+                if !theirs.iter().any(|(had, _)| had.name == config.name) {
+                    theirs.push((config.clone(), lease));
+                }
+            }
+        }
+        for theirs in found.values_mut() {
+            theirs.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+        }
+        found
+    }
+
+    /// Every network that can be read, with its live leases: one that
+    /// can't (or goes meanwhile) left out, never failing the others.
+    fn readable_with_leases(&self) -> impl Iterator<Item = (NetworkConfig, Vec<Lease>)> + '_ {
+        fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| validate_name(name).is_ok())
+            .filter_map(|name| {
+                let config = self.get(&name).ok().flatten()?;
+                let leases = self.live_leases(&name).ok()?;
+                Some((config, leases))
+            })
+    }
+
     /// The directory.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -546,6 +629,19 @@ impl Networks {
     /// Creates the network `spec` asks for, with its subnet free of
     /// `taken` (the host's routes) and of every other network's.
     pub fn create(&self, spec: &NetworkSpec, taken: &[IpNet]) -> Result<NetworkConfig, StoreError> {
+        self.create_with(spec, taken, &NetworkMeta::default())
+    }
+
+    /// [`create`](Self::create), with `meta` (Docker's API's labels and
+    /// options) in its `labels.json`, written before its `config.json`: a
+    /// network is there once its config is, so one cut short never lists
+    /// with another's labels.
+    pub fn create_with(
+        &self,
+        spec: &NetworkSpec,
+        taken: &[IpNet],
+        meta: &NetworkMeta,
+    ) -> Result<NetworkConfig, StoreError> {
         validate_name(&spec.name)?;
         // One create or remove at a time: two creates choosing a subnet at
         // once would choose the same one.
@@ -620,6 +716,7 @@ impl Networks {
                 isolate_host: spec.isolate_host,
                 conntrack_limit: spec.conntrack_limit,
             };
+            write_meta(&spec.name, &dir, meta)?;
             let json = serde_json::to_vec_pretty(&config).map_err(|error| {
                 StoreError::io("writing the network's config", io::Error::other(error))
             })?;
@@ -632,6 +729,33 @@ impl Networks {
             let _ = fs::remove_dir_all(&dir);
         }
         made
+    }
+
+    /// The labels and options of the network `name` (none if it has no
+    /// `labels.json`: one made by the CLI, or before 11.2c2b).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Labels`] for a newer version or not one at all;
+    /// [`StoreError::Io`] if it can't be read (never through a symlink,
+    /// never past 64 KiB).
+    pub fn meta(&self, name: &str) -> Result<NetworkMeta, StoreError> {
+        validate_name(name)?;
+        let path = self.dir.join(name).join(META_FILE);
+        match shipyard_sys::versioned::read_file::<MetaFile>(&path, META_MAX, META_VERSION) {
+            Ok(file) => Ok(file.map_or_else(NetworkMeta::default, |file| NetworkMeta {
+                id: file.id,
+                labels: file.labels,
+                options: file.options,
+            })),
+            Err(shipyard_sys::versioned::FileError::Io(error)) => {
+                Err(StoreError::io(format!("reading {}", path.display()), error))
+            }
+            Err(shipyard_sys::versioned::FileError::Versioned(source)) => Err(StoreError::Labels {
+                name: name.to_owned(),
+                source,
+            }),
+        }
     }
 
     /// The network named `name`'s live leases, without its lock: for a
@@ -1718,6 +1842,75 @@ fn lock_path(path: &Path, name: &str) -> Result<Flock<File>, StoreError> {
     }
 }
 
+/// A network's ID, labels and options (Docker's API's): kept in its
+/// `labels.json` (step 11.2c2b), never read by the networking itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkMeta {
+    /// Its ID, made at its making (64 hex): none for a network made before.
+    pub id: Option<String>,
+    /// Its labels.
+    pub labels: BTreeMap<String, String>,
+    /// Its driver options, as given (checked by the caller).
+    pub options: BTreeMap<String, String>,
+}
+
+impl NetworkMeta {
+    /// Whether it has nothing to keep.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none() && self.labels.is_empty() && self.options.is_empty()
+    }
+}
+
+/// A network's labels and options, beside its config.
+const META_FILE: &str = "labels.json";
+/// The newest `labels.json` this Shipyard reads and writes.
+const META_VERSION: u32 = 1;
+/// The most a `labels.json` holds: written no bigger, read no further.
+const META_MAX: u64 = 64 * 1024;
+
+/// `labels.json`: its version, the labels, the options.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetaFile {
+    version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    options: BTreeMap<String, String>,
+}
+
+/// Writes `meta` as the network `name`'s `labels.json` in `dir`: none if
+/// it's empty (any a create cut short left removed).
+fn write_meta(name: &str, dir: &Path, meta: &NetworkMeta) -> Result<(), StoreError> {
+    let path = dir.join(META_FILE);
+    if meta.is_empty() {
+        return match fs::remove_file(&path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(StoreError::io(
+                format!("removing {}", path.display()),
+                error,
+            )),
+            _ => Ok(()),
+        };
+    }
+    let file = MetaFile {
+        version: META_VERSION,
+        id: meta.id.clone(),
+        labels: meta.labels.clone(),
+        options: meta.options.clone(),
+    };
+    let json = serde_json::to_vec(&file)
+        .map_err(|error| StoreError::io("writing the network's labels", io::Error::other(error)))?;
+    if u64::try_from(json.len()).is_ok_and(|len| len > META_MAX) {
+        return Err(StoreError::TooManyLabels(name.to_owned()));
+    }
+    // Root's alone: nothing of the networking (its DNS servers) reads it.
+    shipyard_sys::fs::write_atomically(&path, &json, &shipyard_sys::fs::Write::new(0o600))
+        .map_err(|error| StoreError::io(format!("writing {}", path.display()), error.into()))
+}
+
 /// Writes `bytes` to `path` through a temporary file and a rename, synced:
 /// a reader sees the old file or the new one, never half of one.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
@@ -1924,9 +2117,7 @@ fn check_subnet6(subnet: IpNet, taken: &[IpNet]) -> Result<IpNet, StoreError> {
 /// ID) that overlaps nothing in `taken`.
 fn random_ula(taken: &[IpNet]) -> Result<IpNet, StoreError> {
     for _ in 0..16 {
-        let mut random = [0u8; 7];
-        File::open("/dev/urandom")
-            .and_then(|mut urandom| urandom.read_exact(&mut random))
+        let random = shipyard_sys::random::bytes::<7>()
             .map_err(|error| StoreError::io("reading /dev/urandom", error))?;
         let prefix = ula(random);
         if !taken.iter().any(|other| other.overlaps(&prefix)) {
@@ -2250,6 +2441,79 @@ mod tests {
         drop(held);
     }
 
+    /// A network made with labels and options keeps them in its
+    /// `labels.json`, read back as written; one without (made by the CLI,
+    /// or before 11.2c2b) has none, and no file.
+    #[test]
+    fn a_network_keeps_its_labels_and_options() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        let meta = NetworkMeta {
+            id: Some("ab".repeat(32)),
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "app".into())]),
+            options: BTreeMap::from([("com.docker.network.driver.mtu".into(), "1500".into())]),
+        };
+        networks.create_with(&spec("app"), &[], &meta).unwrap();
+        assert_eq!(networks.meta("app").unwrap(), meta);
+        let written = fs::read_to_string(scratch.0.join("app").join(META_FILE)).unwrap();
+        assert!(written.starts_with(r#"{"version":1,"#), "{written}");
+        networks.create(&spec("plain"), &[]).unwrap();
+        assert_eq!(networks.meta("plain").unwrap(), NetworkMeta::default());
+        assert!(!scratch.0.join("plain").join(META_FILE).exists());
+    }
+
+    /// A `labels.json` of a newer version, or not one, is refused; one
+    /// too big is never written, and nothing of the network is left.
+    #[test]
+    fn network_labels_that_cant_be_kept_are_refused() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let path = scratch.0.join("app").join(META_FILE);
+        for bad in [r#"{"version":2,"labels":{}}"#, "nope", r#"{"labels":{}}"#] {
+            fs::write(&path, bad).unwrap();
+            assert!(
+                matches!(networks.meta("app"), Err(StoreError::Labels { .. })),
+                "{bad}"
+            );
+        }
+        let big = NetworkMeta {
+            labels: BTreeMap::from([("big".into(), "x".repeat(70 * 1024))]),
+            ..NetworkMeta::default()
+        };
+        assert!(matches!(
+            networks.create_with(&spec("huge"), &[], &big),
+            Err(StoreError::TooManyLabels(_))
+        ));
+        assert!(networks.get("huge").unwrap().is_none());
+        assert!(!scratch.0.join("huge").exists());
+        // Never through a symlink.
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            scratch.0.join("elsewhere"),
+            r#"{"version":1,"labels":{"a":"b"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(scratch.0.join("elsewhere"), &path).unwrap();
+        assert!(matches!(networks.meta("app"), Err(StoreError::Io { .. })));
+    }
+
+    /// A create cut short (labels written, no config) is taken over: its
+    /// labels go unless the new create gives its own.
+    #[test]
+    fn a_cut_short_create_s_labels_are_not_kept() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        fs::create_dir(scratch.0.join("app")).unwrap();
+        fs::write(
+            scratch.0.join("app").join(META_FILE),
+            r#"{"version":1,"labels":{"stale":"yes"}}"#,
+        )
+        .unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        assert_eq!(networks.meta("app").unwrap(), NetworkMeta::default());
+    }
+
     /// A container's live lease is the one that says its ID, before one of
     /// its name that says no container (a run with no record named so);
     /// that one is found by its name only when the caller gives it (all the
@@ -2548,6 +2812,71 @@ mod tests {
         ));
         third.release();
         networks.remove(networks.lock("app").unwrap()).unwrap();
+    }
+
+    /// A container's leases are read without making the store, and a
+    /// network that can't be read is left out, never hiding the others (a
+    /// view of it). The control: its lease on the good network is found.
+    #[test]
+    fn a_containers_leases_are_read_past_a_broken_network() {
+        let scratch = Scratch::new();
+        let missing = scratch.0.join("none");
+        assert!(Networks::existing(&missing).is_none());
+        assert!(!missing.exists(), "never made");
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        networks.create(&spec("broken"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        let mut asked = request("a");
+        asked.container = Some("c".repeat(64));
+        let held = network.allocate(&asked).unwrap();
+        drop(network);
+        fs::write(scratch.0.join("broken").join("config.json"), b"{not json").unwrap();
+        let existing = Networks::existing(&scratch.0).unwrap();
+        let found = existing.leases_of(&"c".repeat(64));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            (found[0].0.name.as_str(), found[0].1.ip),
+            ("app", held.lease().ip)
+        );
+        assert!(existing.leases_of(&"d".repeat(64)).is_empty());
+        held.release();
+    }
+
+    /// Every container's leases read at once are what each one's own read
+    /// finds: on two networks, past a broken one, in the networks' order;
+    /// a container without a lease isn't there.
+    #[test]
+    fn leases_by_container_are_each_ones_leases() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        let mut held = Vec::new();
+        for name in ["zeta", "alpha", "broken"] {
+            networks.create(&spec(name), &[]).unwrap();
+        }
+        for (network, container) in [("zeta", "c"), ("alpha", "c"), ("alpha", "e")] {
+            let locked = networks.lock(network).unwrap();
+            let mut asked = request(container);
+            asked.container = Some(container.repeat(64));
+            held.push(locked.allocate(&asked).unwrap());
+        }
+        fs::write(scratch.0.join("broken").join("config.json"), b"{not json").unwrap();
+        let existing = Networks::existing(&scratch.0).unwrap();
+        let all = existing.live_leases_by_container();
+        assert_eq!(all.len(), 2, "{all:?}");
+        for container in ["c", "e"] {
+            let id = container.repeat(64);
+            assert_eq!(all[&id], existing.leases_of(&id), "{container}");
+        }
+        let names: Vec<&str> = all[&"c".repeat(64)]
+            .iter()
+            .map(|(config, _)| config.name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+        assert!(!all.contains_key(&"d".repeat(64)));
+        for lease in held {
+            lease.release();
+        }
     }
 
     /// An in-use message names the containers, five at most.

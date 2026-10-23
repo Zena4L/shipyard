@@ -12,7 +12,7 @@ impl Config {
     /// The bridge networks it joins, in order, by name: its default one
     /// (`default`) if it says none. `None` if its network isn't bridges
     /// (the host's, its own loopback only, or pasta's).
-    fn bridges<'a>(&'a self, default: &'a str) -> Option<Vec<&'a str>> {
+    pub(crate) fn bridges<'a>(&'a self, default: &'a str) -> Option<Vec<&'a str>> {
         if self.network.is_empty() {
             return Some(vec![default]);
         }

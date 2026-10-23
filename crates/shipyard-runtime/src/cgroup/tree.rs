@@ -27,8 +27,8 @@ use super::manage::{
     remove_if_stale,
 };
 use super::{
-    Cgroup, CgroupError, ROOT, RUN_PARENT, RunCgroup, delegation_root, is_cgroup2, own_cgroup,
-    run_cgroup,
+    Cgroup, CgroupError, Controller, ROOT, RUN_PARENT, RunCgroup, delegation_root, is_cgroup2,
+    own_cgroup, parse_controllers, run_cgroup,
 };
 
 /// Why this process has no part of the tree to manage.
@@ -67,6 +67,16 @@ impl Tree {
     #[must_use]
     pub fn base(&self) -> &Path {
         &self.base
+    }
+
+    /// Whether `controller` reaches the cgroups made below the base: listed
+    /// in the base's `cgroup.controllers` (what [`Cgroup::enable`] needs: one
+    /// missing there wasn't delegated, or the kernel hasn't it). False if it
+    /// can't be read.
+    #[must_use]
+    pub fn offers(&self, controller: Controller) -> bool {
+        std::fs::read_to_string(self.base.join("cgroup.controllers"))
+            .is_ok_and(|text| parse_controllers(&text).contains(&controller))
     }
 
     /// This process's part of the tree.

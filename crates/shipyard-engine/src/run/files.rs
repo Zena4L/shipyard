@@ -1,5 +1,6 @@
 //! A container's files for `cp`: live through a helper, or a stopped one's
-//! root mounted ([`container_files`]).
+//! root mounted ([`container_files`]); that root view also serves a
+//! create's fill of its volumes (`run::volumes::fill_volumes`).
 
 use shipyard_runtime::container as runtime;
 use shipyard_runtime::container::Status;
@@ -107,12 +108,14 @@ fn never_joined(error: &Error) -> bool {
 
 /// What a stopped container's root view holds: its writable layer, its
 /// volumes.
-struct ViewHeld {
+pub(super) struct ViewHeld {
     _area: Option<crate::image::RunArea>,
-    _volumes: Vec<shipyard_storage::VolumeHold>,
+    /// Its volumes, held.
+    pub(super) volumes: Vec<shipyard_storage::VolumeHold>,
 }
 
-/// Container `record`'s root as its start would mount it, for a copy:
+/// Container `record`'s root as its start would mount it, for a copy (or
+/// a create's fill):
 /// its image's layers under its own writable layer (taken, and made if
 /// it has none yet: a created container's first), or its `--rootfs`
 /// directory; its volumes bound and held (made only for a container
@@ -120,7 +123,10 @@ struct ViewHeld {
 /// its user namespace's maps, chosen as a start chooses them.
 /// Nothing else of a start's: no network, devices or security profile
 /// is looked at, the image isn't pinned again, the record isn't written.
-fn stopped_view(engine: &Engine, record: &Record) -> Result<(runtime::RootView, ViewHeld)> {
+pub(super) fn stopped_view(
+    engine: &Engine,
+    record: &Record,
+) -> Result<(runtime::RootView, ViewHeld)> {
     let request = record.to_request()?;
     let is_root = nix::unistd::geteuid().is_root();
     let (id_maps, _) =
@@ -166,7 +172,12 @@ fn stopped_view(engine: &Engine, record: &Record) -> Result<(runtime::RootView, 
     let mounts = request
         .volume_mounts()
         .with_context(|| format!("container {}'s volumes", record.name))?;
-    let named = crate::run::volumes::bind_volumes(engine, &mut root, mounts)?;
+    // What its create made, made again and bound as its starts do (11.7).
+    let mut made = Vec::new();
+    for source in crate::containers::created(engine, &record.id)?.made_sources {
+        made.extend(source.made_for_this_start()?);
+    }
+    let named = crate::run::volumes::bind_volumes(engine, &mut root, mounts, &made)?;
     // Never started: its volumes made, as its first start would make
     // them (Docker's `create` does). Else one missing was removed since.
     let volumes = if record.started.is_none() {
@@ -178,7 +189,7 @@ fn stopped_view(engine: &Engine, record: &Record) -> Result<(runtime::RootView, 
         runtime::RootView { root, id_maps },
         ViewHeld {
             _area: area,
-            _volumes: volumes,
+            volumes,
         },
     ))
 }

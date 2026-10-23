@@ -32,6 +32,22 @@ pub fn list(engine: &Engine) -> Result<Vec<Record>> {
     }
 }
 
+/// Every container's record, as [`list`] reads them, but a record that
+/// can't be read is an error, never left out: for a decision a container
+/// left out would get wrong (a network it may use, removed: F120's
+/// Murphy review).
+///
+/// # Errors
+///
+/// As [`list`], and [`ErrorKind::Storage`] for a record that can't be read.
+#[cfg(target_os = "linux")]
+pub(crate) fn list_every(engine: &Engine) -> Result<Vec<Record>> {
+    match Store::open(engine, false)? {
+        Some(store) => store.read_all(engine, Strict::Yes),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// The container `reference` names: in order, its full ID, its name, its
 /// serial written with its owner code (`SHPU 304812 2`, the check digit
 /// optional), or a prefix of its ID that no other container's has.

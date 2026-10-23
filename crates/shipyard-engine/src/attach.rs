@@ -2,7 +2,7 @@
 //! client ([`shipyard_runtime::attach::client`]) to the container a
 //! reference names, its end race settled by its record.
 
-pub use shipyard_runtime::attach::client::{AttachError, AttachOptions, Ended, Settled};
+pub use shipyard_runtime::attach::client::{AttachError, AttachOptions, Ended, Output, Settled};
 #[cfg(target_os = "linux")]
 pub(crate) use shipyard_runtime::attach::client::{Welcomed, attach, welcomed};
 

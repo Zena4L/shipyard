@@ -8,7 +8,6 @@
 
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,13 +63,127 @@ pub(crate) fn log(line: &str) {
 }
 
 fn serve() -> Result<(), VmError> {
+    // launchd's socket first, if launchd started this host (step 11.5b2a:
+    // the check-in makes it): every failure after is said to the clients
+    // waiting on it, or launchd would start the host again and again for
+    // them while they hang.
+    let launchd = crate::launchd::activated_socket()?.map(Arc::new);
+    let served = served_from(launchd.clone());
+    if let (Err(error), Some(docker)) = (&served, &launchd) {
+        refuse_waiting(docker, &error.to_string());
+    }
+    served
+}
+
+/// [`serve`], once launchd's socket (if any) is had.
+fn served_from(launchd: Option<Arc<UnixListener>>) -> Result<(), VmError> {
     let paths = VmPaths::from_env()?;
     let uid = nix::unistd::getuid().as_raw();
     paths.prepare(uid)?;
+    if let Some(docker) = &launchd
+        && !asked(&paths, docker, std::time::SystemTime::now())
+    {
+        // launchd's own run at load: the socket now made (its check-in),
+        // nothing to serve until a connection comes.
+        log("launchd's socket made: nothing asked, so nothing started");
+        return Ok(());
+    }
     let Some(_lock) = take_lock(&paths)? else {
         log("another host holds the VM: nothing to do");
-        return Ok(());
+        return match launchd {
+            Some(_) => Err(VmError::Host(
+                "another host runs this VM (one started without launchd)".to_owned(),
+            )),
+            None => Ok(()),
+        };
     };
+    // The CLI's mark taken (again: one written as this host started), so
+    // none outlives this host to boot the VM at the next login.
+    let _ = std::fs::remove_file(paths.start_asked());
+    // Docker's socket: launchd's, left to it at the end, or the host's
+    // own, bound before the boot (a client waits in its backlog) and
+    // removed at the end.
+    // Its own only without launchd's agent: one installed holds it (this
+    // host started without it, `launchctl print` failing for a moment,
+    // would otherwise take the agent's socket away for good: 11.6b's
+    // review). Then it isn't served here: its clients go to launchd's.
+    let own = launchd.is_none() && !crate::launchd::installed(&paths);
+    let docker = match launchd {
+        Some(docker) => {
+            log("Docker's socket is launchd's");
+            Some(docker)
+        }
+        None if !own => {
+            log("Docker's socket is launchd's agent's, which isn't running: left to it");
+            None
+        }
+        None => Some(Arc::new(crate::serving::bind_private(
+            &paths.docker_socket(),
+        )?)),
+    };
+    let served = boot_and_serve(&paths, uid, docker.as_ref(), own);
+    if own && let Some(docker) = &docker {
+        if let Err(error) = &served {
+            refuse_waiting(docker, &error.to_string());
+        }
+        let _ = std::fs::remove_file(paths.docker_socket());
+    }
+    let _ = std::fs::remove_file(paths.start_asked());
+    served
+}
+
+/// How old a CLI's start mark may be and still count: its start's own
+/// bound. An older one (its CLI killed, its kick refused) asks nothing.
+const MARK_FRESH: Duration = Duration::from_secs(150);
+
+/// Whether a host launchd started (at `now`) was asked for: by the CLI (a
+/// fresh mark, taken here) or by a connection waiting on `docker`
+/// (launchd's start for it: queued already, seen within a second).
+/// Neither: launchd ran it as it loaded its agent, to make the socket.
+fn asked(paths: &VmPaths, docker: &UnixListener, now: std::time::SystemTime) -> bool {
+    use std::os::fd::AsFd as _;
+    let mark = paths.start_asked();
+    let fresh = std::fs::metadata(&mark)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|made| now.duration_since(made).unwrap_or_default() <= MARK_FRESH);
+    if std::fs::remove_file(&mark).is_ok() && fresh {
+        return true;
+    }
+    let mut waiting = [nix::poll::PollFd::new(
+        docker.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    nix::poll::poll(&mut waiting, nix::poll::PollTimeout::from(1000_u16)).is_ok_and(|n| n > 0)
+}
+
+/// Answers every client of the user's waiting on `docker` with Docker's
+/// error, `why` (none waited for, none written to for more than a moment):
+/// a host that won't serve them lets them go.
+fn refuse_waiting(docker: &UnixListener, why: &str) {
+    if docker.set_nonblocking(true).is_err() {
+        return;
+    }
+    let uid = nix::unistd::getuid().as_raw();
+    while let Ok((client, _)) = docker.accept() {
+        if !crate::peer::peer_uid(&client).is_some_and(|peer| crate::same_user(peer, uid)) {
+            continue;
+        }
+        let _ = client.set_nonblocking(false);
+        let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+        crate::api::refuse(client, why);
+    }
+}
+
+/// Boots the guest and serves both sockets until the host is asked to
+/// stop, or the guest stops by itself. `own_docker`: the host made
+/// Docker's socket (else it's launchd's, never removed here); `docker`
+/// none: it isn't served here (launchd's agent, not running, holds it).
+fn boot_and_serve(
+    paths: &VmPaths,
+    uid: u32,
+    docker: Option<&Arc<UnixListener>>,
+    own_docker: bool,
+) -> Result<(), VmError> {
     // The signals that stop it, blocked in every thread from here (the
     // main thread waits for them).
     let stops = stop_signals();
@@ -83,13 +196,15 @@ fn serve() -> Result<(), VmError> {
         "booting the guest (Alpine {}, kernel {}, shipyard {})",
         guest.manifest.alpine, guest.manifest.kernel.version, guest.manifest.shipyard.revision
     ));
-    let disk = make_disk(&paths)?;
-    let machine = Arc::new(Machine::new(settings(&paths, &guest, &disk)?)?);
+    let disk = make_disk(paths)?;
+    let machine = Arc::new(Machine::new(settings(paths, &guest, &disk)?)?);
     machine.start(Duration::from_secs(30))?;
-    wait_for_agent(&machine, &paths)?;
+    wait_for_agent(&machine, paths)?;
     // From here the guest runs: a failure stops it in order (its
     // containers, its disk), never by the host's end alone.
-    let listener = match keep_disk(&paths, &disk).and_then(|()| listen(&paths)) {
+    let listener = match keep_disk(paths, &disk)
+        .and_then(|()| crate::serving::bind_private(&paths.socket()))
+    {
         Ok(listener) => listener,
         Err(error) => {
             log(&format!("{error}: stopping the guest"));
@@ -110,9 +225,24 @@ fn serve() -> Result<(), VmError> {
         (Arc::clone(&clients), idle),
     );
     let stopping = Arc::new(AtomicBool::new(false));
-    watch(&machine, &stopping, &paths, &forwarding);
-    let (served, admitted) = (Arc::clone(&machine), Arc::clone(&clients));
-    std::thread::spawn(move || accept(&listener, &served, uid, &admitted, &ended));
+    // (launchd's Docker socket is its own: never removed here.)
+    let sockets: Vec<PathBuf> = std::iter::once(paths.socket())
+        .chain(own_docker.then(|| paths.docker_socket()))
+        .collect();
+    watch(&machine, &stopping, sockets, &forwarding);
+    let serving = Arc::new(crate::serving::Serving {
+        machine: Arc::clone(&machine),
+        uid,
+        clients: Arc::clone(&clients),
+        ended,
+    });
+    if let Some(docker) = docker {
+        let (theirs, api) = (Arc::clone(&serving), Arc::clone(docker));
+        std::thread::spawn(move || {
+            crate::serving::accept(&api, &crate::api::SERVED, &theirs, !own_docker);
+        });
+    }
+    std::thread::spawn(move || crate::serving::accept(&listener, &CLI_SERVED, &serving, false));
     let signal = stops
         .wait()
         .map_err(|e| VmError::Host(format!("waiting: {e}")))?;
@@ -143,13 +273,12 @@ fn serve() -> Result<(), VmError> {
 fn watch(
     machine: &Arc<Machine>,
     stopping: &Arc<AtomicBool>,
-    paths: &VmPaths,
+    sockets: Vec<PathBuf>,
     forwarding: &Arc<Forwarding>,
 ) {
     let machine = Arc::clone(machine);
     let stopping = Arc::clone(stopping);
     let forwarding = Arc::clone(forwarding);
-    let socket = paths.socket();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -160,7 +289,9 @@ fn watch(
                 break;
             }
         }
-        let _ = std::fs::remove_file(&socket);
+        for socket in &sockets {
+            let _ = std::fs::remove_file(socket);
+        }
         forwarding.stop();
         log("the guest stopped by itself (its console log says why)");
         std::process::exit(1);
@@ -298,7 +429,27 @@ fn settings(paths: &VmPaths, guest: &Guest, disk: &std::path::Path) -> Result<Se
     let own: Vec<&std::path::Path> = own.iter().map(PathBuf::as_path).collect();
     let cmdline = cmdline(&home.to_string_lossy(), &own)?;
     let console = console_log(paths)?;
-    let cpus = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
+    let cpus = diagnosis_override("SHIPYARD_VM_CPUS").map_or_else(
+        || std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4)),
+        |cpus| usize::try_from(cpus).unwrap_or(1).clamp(1, 16),
+    );
+    let memory = diagnosis_override("SHIPYARD_VM_MEMORY_MIB")
+        .map_or(MEMORY, |mib| mib.clamp(1024, 64 * 1024) << 20);
+    let mac = crate::network::NetworkFile::kept_or_made(&paths.network())?;
+    // Said, so a diagnosis override left in a shell is seen in the log.
+    let overridden = ["SHIPYARD_VM_CPUS", "SHIPYARD_VM_MEMORY_MIB"]
+        .into_iter()
+        .filter(|name| diagnosis_override(name).is_some())
+        .collect::<Vec<_>>();
+    log(&format!(
+        "{cpus} CPUs, {} MiB, network card {mac}{}",
+        memory >> 20,
+        if overridden.is_empty() {
+            String::new()
+        } else {
+            format!(" (overridden: {})", overridden.join(", "))
+        }
+    ));
     Ok(Settings {
         kernel: guest.kernel.clone(),
         initramfs: guest.initramfs.clone(),
@@ -306,9 +457,18 @@ fn settings(paths: &VmPaths, guest: &Guest, disk: &std::path::Path) -> Result<Se
         disk: disk.to_owned(),
         home,
         console,
+        mac,
         cpus,
-        memory: MEMORY,
+        memory,
     })
+}
+
+/// A number the guest's settings are overridden with, for diagnosing the
+/// guest (`SHIPYARD_VM_CPUS`, `SHIPYARD_VM_MEMORY_MIB`: F132's harness,
+/// `guest-crash-rate.sh`); never needed otherwise. One that isn't a number
+/// is ignored.
+fn diagnosis_override(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse().ok()
 }
 
 /// The kernel's command line: the console, the home's path (where the
@@ -376,67 +536,28 @@ fn wait_for_agent(machine: &Machine, paths: &VmPaths) -> Result<(), VmError> {
     }
 }
 
-/// The host's socket: the stale one of a host that died removed (the lock
-/// is held, so none other is serving), the new one only the user's.
-fn listen(paths: &VmPaths) -> Result<UnixListener, VmError> {
-    let path = paths.socket();
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).map_err(|e| VmError::io(&path, e))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| VmError::io(&path, e))?;
-    Ok(listener)
-}
-
-/// Serves the socket: each client of the same user joined to the agent,
-/// on a thread of its own (a slow guest holds up only that client), its
-/// end told on `ended`.
-fn accept(
-    listener: &UnixListener,
-    machine: &Arc<Machine>,
-    uid: u32,
-    clients: &Arc<Clients>,
-    ended: &std::sync::mpsc::Sender<()>,
-) {
-    for client in listener.incoming() {
-        let client = match client {
-            Ok(client) => client,
-            Err(error) => {
-                log(&format!("accepting: {error}"));
-                std::thread::sleep(ACCEPT_REST);
-                continue;
-            }
+/// The CLI's connections (`vm.sock`): each joined to the guest's agent,
+/// refused as the forwarding wire says.
+const CLI_SERVED: crate::serving::Served = crate::serving::Served {
+    what: "a client",
+    refuse: |client, refusal| {
+        // Said by its code to a client that reads one (F99): its hello read
+        // first, for its version (a moment's wait at most; an older one's
+        // words if it says none).
+        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+        let mut connection = forward::Connection::new(client);
+        let version = match connection.next_frame() {
+            Ok(Some(Frame::HelloRun { version, .. })) => version,
+            _ => 0,
         };
-        let peer = crate::peer::peer_uid(&client);
-        if !peer.is_some_and(|peer| crate::same_user(peer, uid)) {
-            log(&format!(
-                "refused a client of uid {peer:?}: only uid {uid} is served"
-            ));
-            continue;
-        }
-        // Stopping (idle): refused before its command reaches the guest;
-        // its CLI starts the VM again.
-        if !clients.come() {
-            log("a client refused: stopping");
-            let mut client = client;
-            let _ = forward::send(&mut client, &Frame::Refused(forward::STOPPING.to_owned()));
-            continue;
-        }
-        let (machine, ended, counted) = (Arc::clone(machine), ended.clone(), Arc::clone(clients));
-        let served = std::thread::Builder::new().spawn(move || {
-            match machine.connect(AGENT_PORT, Duration::from_secs(10)) {
-                Ok(agent) => join(client, agent),
-                Err(error) => log(&format!("a client not served: {error}")),
-            }
-            counted.gone();
-            let _ = ended.send(());
-        });
-        if let Err(error) = served {
-            // (Its closure, which would have said it gone, never ran.)
-            clients.gone();
-            log(&format!("a client not served: {error}"));
-        }
-    }
-}
+        let (mut client, _) = connection.into_parts();
+        let _ = forward::send(&mut client, &refusal.frame(version));
+    },
+    serve: |machine, client| match machine.connect(AGENT_PORT, Duration::from_secs(10)) {
+        Ok(agent) => join(client, agent),
+        Err(error) => log(&format!("a client not served: {error}")),
+    },
+};
 
 /// Copies bytes both ways between `client` and the agent, each direction's
 /// end passed on as a half-close (the other side's reads end), until both
@@ -475,6 +596,61 @@ fn stop_guest(machine: &Machine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal goes as the client reads it: a version 5 client gets
+    /// its code, a version 4 one the words, one that says no hello (within
+    /// the second) the words too.
+    #[test]
+    fn a_refusal_is_said_as_the_client_reads_it() {
+        use shipyard_runtime::attach::{DECLINE_VERSION, Decline};
+        let request = forward::Request::internal(&["ps"]).encode().unwrap();
+        for version in [Some(DECLINE_VERSION), Some(DECLINE_VERSION - 1), None] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            if let Some(version) = version {
+                let hello = Frame::HelloRun {
+                    version,
+                    request: request.clone(),
+                };
+                forward::send(&mut client, &hello).unwrap();
+            }
+            (CLI_SERVED.refuse)(server, &forward::Refusal::Stopping);
+            let said = forward::Connection::new(client).next_frame().unwrap();
+            let expected = if version == Some(DECLINE_VERSION) {
+                Frame::Declined {
+                    reason: Decline::Stopping,
+                    why: forward::STOPPING.to_owned(),
+                }
+            } else {
+                Frame::Refused(forward::STOPPING.to_owned())
+            };
+            assert_eq!(said, Some(expected), "{version:?}");
+        }
+    }
+
+    /// launchd's start of the host is asked for by a fresh mark of the
+    /// CLI's (taken), or a connection waiting; a stale mark (its CLI
+    /// killed, before a reboot) asks nothing and is taken all the same,
+    /// and no mark with nothing waiting is launchd's run at load.
+    #[test]
+    fn a_launchd_start_is_asked_by_a_fresh_mark_or_a_connection() {
+        let dir = std::env::temp_dir().join(format!("shipyard-asked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = VmPaths::at(dir.clone(), dir.join("guest")).unwrap();
+        let docker = UnixListener::bind(dir.join("d.sock")).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(!asked(&paths, &docker, now), "nothing asked");
+        std::fs::write(paths.start_asked(), b"").unwrap();
+        assert!(asked(&paths, &docker, now), "a fresh mark");
+        assert!(!paths.start_asked().exists(), "the mark taken");
+        std::fs::write(paths.start_asked(), b"").unwrap();
+        let later = now + MARK_FRESH + Duration::from_secs(60);
+        assert!(!asked(&paths, &docker, later), "a stale mark");
+        assert!(!paths.start_asked().exists(), "a stale mark taken too");
+        let _waiting = UnixStream::connect(dir.join("d.sock")).unwrap();
+        assert!(asked(&paths, &docker, now), "a connection waiting");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The kernel's command line carries the home; a home it can't carry
     /// (a space, a control character) is refused.

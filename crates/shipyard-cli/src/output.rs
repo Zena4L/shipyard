@@ -6,10 +6,9 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use anyhow::Result;
-use shipyard_runtime::process::EXIT_ENGINE_ERROR;
 
 use crate::broken_pipe;
-use crate::reporter::report;
+use crate::reporter::{EXIT_FAILURE, report};
 
 /// Writes `rows` under `header`, in columns as wide as their widest cell,
 /// three spaces apart (the last one unpadded).
@@ -62,16 +61,20 @@ pub(crate) fn printable_message(text: &str) -> Cow<'_, str> {
     escaped_but(text, &['\n', '\t'])
 }
 
+/// Whether a terminal would act on `c` rather than show it: a control
+/// character (C0 and C1), or a bidirectional or format one.
+pub(crate) fn acts_on_terminal(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
 /// `text` with what a terminal acts on escaped, except the characters in
 /// `kept`.
 fn escaped_but<'a>(text: &'a str, kept: &[char]) -> Cow<'a, str> {
-    let escaped = |c: char| {
-        (c.is_control() && !kept.contains(&c))
-            || matches!(
-                c,
-                '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            )
-    };
+    let escaped = |c: char| acts_on_terminal(c) && !kept.contains(&c);
     if !text.chars().any(escaped) {
         return Cow::Borrowed(text);
     }
@@ -87,7 +90,7 @@ fn escaped_but<'a>(text: &'a str, kept: &[char]) -> Cow<'a, str> {
 }
 
 /// Does `act` for each of `names`, reporting each failure and going on;
-/// exits 125 if any failed. Its output's reader gone stops it, quietly, as
+/// exits 1 if any failed. Its output's reader gone stops it, quietly, as
 /// `fail` does: the rest are left as they are, and that isn't a failure.
 pub(crate) fn each(names: &[String], mut act: impl FnMut(&str) -> Result<()>) -> ExitCode {
     let mut code = ExitCode::SUCCESS;
@@ -96,7 +99,7 @@ pub(crate) fn each(names: &[String], mut act: impl FnMut(&str) -> Result<()>) ->
             if broken_pipe(&err) {
                 break;
             }
-            code = report(&err, EXIT_ENGINE_ERROR);
+            code = report(&err, EXIT_FAILURE);
         }
     }
     code
@@ -139,6 +142,23 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Each of `references` as `view` shows it, as one JSON array (the ones
+/// found: each that isn't is said); exits 1 if any wasn't. (`inspect`'s
+/// and `image inspect`'s, as Docker's.)
+pub(crate) fn shown(
+    references: &[String],
+    format: Option<&str>,
+    mut view: impl FnMut(&str) -> Result<serde_json::Value>,
+) -> Result<ExitCode> {
+    let mut found = Vec::new();
+    let code = each(references, |reference| {
+        found.push(view(reference)?);
+        Ok(())
+    });
+    crate::format::objects(&mut std::io::stdout().lock(), format, &found)?;
+    Ok(code)
 }
 
 #[cfg(test)]

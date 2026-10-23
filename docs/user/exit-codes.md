@@ -4,7 +4,20 @@ Shipyard's exit codes follow Docker's, so existing scripts keep working.
 
 
 When the command runs and exits, its exit code passes through unchanged,
-whatever it is (0–255). The codes below have a special meaning:
+whatever it is (0–255). The codes below have a special meaning.
+
+For every command but `run`, a failure exits with **`1`**, as Docker's CLI does
+(`shipyard rm nope`, `shipyard inspect nope`, `shipyard create` of an image
+that isn't there, `shipyard exec` into a container that isn't running); a
+command given several containers or images goes on past one that fails, and
+exits `1` at the end. A command line Shipyard can't take (an unknown option, a
+missing argument) exits `125`, whatever the command. Shipyard's own `system recover`
+and `system stop` exit `125` when some containers couldn't be started or stopped
+(what the boot units count as done) and `1` when nothing could be done at all. On a
+Mac, a command whose VM went away (or couldn't start) exits `1`, `125` for `run`;
+a guest built before these codes gives its own until it's rebuilt.
+
+For `run`:
 
 | Code | Meaning |
 |---|---|
@@ -21,8 +34,7 @@ no command at all prints its help and exits with `125`.)
 When whatever reads Shipyard's output stops early (`shipyard ps | head -1`), the
 command ends quietly with `0`: nothing went wrong, the reader had what it wanted.
 That's its standard output's reader: `logs` whose standard error is closed while its
-standard output is still read fails (`125`, or `1` from `shipyard-runtime logs`), as
-that output is lost.
+standard output is still read fails (`1`), as that output is lost.
 
 ## Common signal codes
 
@@ -53,9 +65,13 @@ esac
 
 **`shipyard exec`** exits with the command's own code (128 plus the signal's number
 for one a signal ended), `127` if the command isn't found, `126` if it can't be run,
-and `125` when Shipyard couldn't run it at all. **`shipyard attach`** and
+and `1` when Shipyard couldn't run it at all. **`shipyard attach`** and
 **`shipyard start -a`** exit with the container's code when it ends, `0` when you
-detach, `125` when they can't attach.
+detach, `1` when they can't attach.
+
+These are Docker's codes, checked against Docker 29.8: its `inspect`, `rm`,
+`stop`, `logs`, `wait`, `exec`, `start -a`, `attach` and `create` exit `1` when
+they fail, its `run` `125`, and a command line it can't take `125`.
 
 ## `shipyard-runtime`
 

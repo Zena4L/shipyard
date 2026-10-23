@@ -372,6 +372,30 @@ impl Registry {
         })
     }
 
+    /// Signs in to the registry's API root (`/v2/`) with its credential, as
+    /// `docker login` asks its daemon to (`POST /auth`, F118): a token from
+    /// its realm with no scope, or its password, then `/v2/` again. A
+    /// registry that answers without asking is signed in to, as Docker's.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Refused`] if it refuses the credential;
+    /// [`RegistryError::Auth`] if it can't be signed in to (no credential it
+    /// takes); a transport failure or another status.
+    pub fn check(&self) -> Result<(), RegistryError> {
+        let url = format!("{}/v2/", self.base);
+        let context = format!("signing in to {}", self.host);
+        let get = Get {
+            url: &url,
+            context: &context,
+            accept: None,
+            size: MAX_SMALL_RESPONSE,
+            from: 0,
+            capped: true,
+        };
+        Self::retrying(|| self.authorized(&get, "").map(drop))
+    }
+
     /// Fetches the blob `digest` in `repository`, of `size` bytes exactly,
     /// into `sink`, going on from what the sink has (`Range`): across
     /// attempts here, and from a pull that stopped before. A registry that
@@ -640,16 +664,23 @@ impl Registry {
             .flat_map(|header| parse_challenges(header))
             .collect();
         let found = self.credential()?;
+        // A registry's own bearer token (Docker's `registrytoken`): sent as
+        // it is, whatever the challenge, as Docker sends it.
+        if let Some(Credential::RegistryToken(token)) =
+            found.as_ref().map(|found| &found.credential)
+        {
+            *self.authorization()? = Some(format!("Bearer {token}"));
+            return Ok(found);
+        }
         let Some(bearer) = parsed.iter().find(|challenge| challenge.scheme == "bearer") else {
             if !parsed.iter().any(|challenge| challenge.scheme == "basic") {
                 return Err(self.auth_error("a 401 without a Bearer or Basic challenge"));
             }
             let authorization = match found.as_ref().map(|found| &found.credential) {
                 Some(Credential::Basic { username, password }) => basic(username, password),
-                Some(Credential::IdentityToken(_)) => {
+                Some(Credential::IdentityToken(_) | Credential::RegistryToken(_)) => {
                     return Err(self.auth_error(
-                        "the registry asks for a password, and the credential is an identity \
-                         token",
+                        "the registry asks for a password, and the credential is a token",
                     ));
                 }
                 None => {
@@ -672,20 +703,24 @@ impl Registry {
         if !realm_allowed(realm, self.secure) {
             return Err(self.auth_error("the token realm isn't HTTPS"));
         }
+        // A sign-in (no repository, `check`) asks for none, as Docker's.
         let scope = bearer
             .param("scope")
-            .map_or_else(|| format!("repository:{repository}:pull"), str::to_owned);
+            .map(str::to_owned)
+            .or_else(|| (!repository.is_empty()).then(|| format!("repository:{repository}:pull")));
         let service = bearer.param("service");
         let context = format!("fetching a token from {realm}");
         let token = Self::retrying(|| {
-            let response = self.token_request(realm, service, &scope, found.as_ref(), &context)?;
+            let response =
+                self.token_request(realm, service, scope.as_deref(), found.as_ref(), &context)?;
             let status = response.status().as_u16();
             // An OAuth2 server turns a bad refresh token down with a 400
             // (`invalid_grant`).
             let refused = match found.as_ref().map(|found| &found.credential) {
                 Some(Credential::IdentityToken(_)) => matches!(status, 400 | 401 | 403),
                 Some(Credential::Basic { .. }) => matches!(status, 401 | 403),
-                None => false,
+                // (Sent to the registry itself, never here.)
+                Some(Credential::RegistryToken(_)) | None => false,
             };
             if let (true, Some(found)) = (refused, &found) {
                 return Err(Attempt::Fatal(RegistryError::Refused {
@@ -724,7 +759,7 @@ impl Registry {
         &self,
         realm: &str,
         service: Option<&str>,
-        scope: &str,
+        scope: Option<&str>,
         found: Option<&FoundCredential>,
         context: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, Attempt> {
@@ -735,8 +770,10 @@ impl Registry {
                 ("grant_type", "refresh_token"),
                 ("refresh_token", token.as_str()),
                 ("client_id", "shipyard"),
-                ("scope", scope),
             ];
+            if let Some(scope) = scope {
+                form.push(("scope", scope));
+            }
             if let Some(service) = service {
                 form.push(("service", service));
             }
@@ -750,21 +787,19 @@ impl Registry {
                 .send_form(form)
                 .map_err(failed);
         }
-        let mut url = realm.to_owned();
-        url.push(if realm.contains('?') { '&' } else { '?' });
-        if let Some(service) = service {
-            url.push_str("service=");
-            url.push_str(&encode(service));
-            url.push('&');
-        }
-        url.push_str("scope=");
-        url.push_str(&encode(scope));
+        let mut query = Vec::new();
+        query.extend(service.map(|service| format!("service={}", encode(service))));
+        query.extend(scope.map(|scope| format!("scope={}", encode(scope))));
         let mut authorization = None;
         if let Some(Credential::Basic { username, password }) = found.map(|found| &found.credential)
         {
-            url.push_str("&account=");
-            url.push_str(&encode(username));
+            query.push(format!("account={}", encode(username)));
             authorization = Some(basic(username, password));
+        }
+        let mut url = realm.to_owned();
+        if !query.is_empty() {
+            url.push(if realm.contains('?') { '&' } else { '?' });
+            url.push_str(&query.join("&"));
         }
         let mut request = self
             .agent
@@ -1123,6 +1158,11 @@ fn realm_allowed(realm: &str, secure: bool) -> bool {
 
 /// Whether `host` (with an optional port) is this machine.
 fn is_loopback(host: &str) -> bool {
+    // Only a host's characters: `localhost:80@elsewhere` is elsewhere's
+    // (the part before `@` is a URL's user), never this machine.
+    if !is_host(host) {
+        return false;
+    }
     let without_port = if let Some(rest) = host.strip_prefix('[') {
         // `[::1]` or `[::1]:port` -> `::1`
         rest.split(']').next().unwrap_or(rest)
@@ -1130,6 +1170,16 @@ fn is_loopback(host: &str) -> bool {
         host.rsplit_once(':').map_or(host, |(h, _)| h)
     };
     without_port == "localhost" || without_port == "127.0.0.1" || without_port == "::1"
+}
+
+/// Whether `host` is only what a registry's host (and port) can be made of:
+/// letters, digits, `.`, `-`, `:` and an IPv6 address's brackets. Never a
+/// URL's user (`@`), path, query or fragment.
+pub(crate) fn is_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
 }
 
 /// Percent-encodes a query parameter value (minimal: the characters that
@@ -1271,6 +1321,10 @@ mod tests {
         assert!(is_loopback("[::1]:5000"));
         assert!(!is_loopback("registry-1.docker.io"));
         assert!(!is_loopback("ghcr.io"));
+        // A URL's user is never the host (11.6a2's Murphy review).
+        assert!(!is_loopback("localhost:80@evil.example"));
+        assert!(!is_loopback("localhost@evil.example"));
+        assert!(!is_loopback("127.0.0.1/../evil"));
         assert!(Registry::new("localhost:5000").base.starts_with("http://"));
         let remote = Registry::new("ghcr.io");
         assert!(remote.base.starts_with("https://") && remote.secure);

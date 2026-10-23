@@ -167,6 +167,12 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
     // The container's state, if it stopped for hooks: `startContainer`'s
     // too.
     let state = set_up(&setup, report).unwrap_or_else(|failure| fail(failure));
+    // Another container's mount namespace (its `/dev/shm` is cloned by now):
+    // let go, or it would keep that container's mounts (its root, its
+    // volumes) alive after it ends, for as long as this one runs.
+    if let Some(fd) = setup.root.as_ref().and_then(|root| root.shm_mount_ns) {
+        let _ = nix::unistd::close(fd);
+    }
     // A keyring of the container's own, not its caller's: the init joins
     // it, and the command inherits it.
     join_session_keyring()

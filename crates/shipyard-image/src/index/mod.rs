@@ -70,14 +70,44 @@ pub struct ImageRecord {
     pub config: String,
     /// The layer blob digests, base first.
     pub layers: Vec<String>,
+    /// The multi-platform index the reference named at its pull, if it
+    /// named one: Docker's `RepoDigests` and a pull's `Digest:` (F118).
+    /// Kept beside the bare map's other fields, which an older Shipyard
+    /// reads without it (and drops, if it rewrites the entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_digest: Option<String>,
+    /// When the reference was last pointed at it (a pull, a tag): Docker's
+    /// `LastTagTime` (F118). None from an older Shipyard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tagged_at: Option<std::time::SystemTime>,
 }
 
 impl ImageRecord {
-    /// Every blob digest this image references (manifest, config, layers).
+    /// What `pulled` depends on: its manifest, config and layers, and the
+    /// index it came through; pointed at it at `tagged_at`.
+    #[must_use]
+    pub fn of(pulled: &crate::Pulled, tagged_at: Option<std::time::SystemTime>) -> Self {
+        Self {
+            manifest: pulled.manifest_digest.to_string(),
+            config: pulled.manifest.config.digest.to_string(),
+            layers: pulled
+                .manifest
+                .layers
+                .iter()
+                .map(|layer| layer.digest.to_string())
+                .collect(),
+            index_digest: pulled.index_digest.as_ref().map(ToString::to_string),
+            tagged_at,
+        }
+    }
+
+    /// Every blob digest this image references (manifest, config, layers,
+    /// and its index if it was pulled through one).
     fn blob_digests(&self) -> impl Iterator<Item = &String> {
         std::iter::once(&self.manifest)
             .chain(std::iter::once(&self.config))
             .chain(&self.layers)
+            .chain(&self.index_digest)
     }
 }
 
@@ -143,9 +173,13 @@ pub enum IndexError {
     /// Another process held the index's lock past the wait.
     #[error("the image store is busy; try again")]
     Busy,
-    /// No image matched the reference given to [`Index::remove`].
+    /// No image matched the reference given to [`Index::remove`], or the
+    /// ID given to [`Index::by_id`].
     #[error("no such image: {0}")]
     NoSuchImage(String),
+    /// An ID's prefix that more than one image's starts with.
+    #[error("{0} names more than one image: give more of its ID")]
+    Ambiguous(String),
 }
 
 /// Removes layer directories by name (see [`crate::remove_layers`]): what
@@ -264,6 +298,51 @@ impl Index {
                 record: record.clone(),
             })
             .collect()
+    }
+
+    /// The image an ID names, as each of its references. The ID is the
+    /// image's manifest digest (Docker's image ID, D11.2c-2), with or
+    /// without `sha256:`, whole or its first 4 hex digits or more (Docker's
+    /// shortest); or its config digest, whole. All of one image's
+    /// references share its manifest.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::NoSuchImage`] if it names none (or isn't hex, or is
+    /// too short); [`IndexError::Ambiguous`] if it's the start of more than
+    /// one image's.
+    pub fn by_id(&self, id: &str) -> Result<Vec<ListedImage>, IndexError> {
+        /// The fewest hex digits taken as an ID's start (Docker's).
+        const SHORTEST: usize = 4;
+        /// A whole digest's hex digits.
+        const WHOLE: usize = 64;
+        let hex = id.strip_prefix("sha256:").unwrap_or(id);
+        if hex.len() < SHORTEST || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(IndexError::NoSuchImage(id.to_owned()));
+        }
+        let hex = hex.to_ascii_lowercase();
+        let starts = |digest: &str| {
+            digest
+                .strip_prefix("sha256:")
+                .is_some_and(|digest| digest.starts_with(&hex))
+        };
+        let found: Vec<ListedImage> = self
+            .images()
+            .into_iter()
+            .filter(|image| {
+                starts(&image.record.manifest)
+                    || (hex.len() == WHOLE && starts(&image.record.config))
+            })
+            .collect();
+        let manifests: std::collections::BTreeSet<&str> = found
+            .iter()
+            .map(|image| image.record.manifest.as_str())
+            .collect();
+        match manifests.len() {
+            0 => Err(IndexError::NoSuchImage(id.to_owned())),
+            1 => Ok(found),
+            _ => Err(IndexError::Ambiguous(id.to_owned())),
+        }
     }
 
     /// Removes the entry `reference` from the index under `root`, under its

@@ -30,6 +30,15 @@ pub(super) fn root_on_host_files(isolation: &Isolation) -> Option<Warning> {
 }
 
 impl Planned {
+    /// The ports this run exposes: its image's (`defaults`, if it has
+    /// one), then its own (`--expose`): what `-P` publishes.
+    pub(crate) fn exposed(&self, defaults: Option<&super::ImageDefaults>) -> Vec<String> {
+        crate::containers::exposed_ports(
+            defaults.map_or(&[][..], |defaults| &defaults.config.exposed_ports),
+            &self.request.expose,
+        )
+    }
+
     /// Finishes the run with `image`'s root and defaults, if it has an
     /// image: each applies only where the request didn't say otherwise. Named
     /// volumes are made if new, and held: keep what's returned with them
@@ -101,8 +110,21 @@ impl Planned {
                 bind_etc_files(root, etc);
             }
             let named = match isolation.root.as_mut() {
-                Some(root) => bind_volumes(engine, root, volumes)?,
-                // `check` refused volumes without a root.
+                Some(root) => {
+                    let named = bind_volumes(engine, root, volumes, &request.made_sources)?;
+                    // Fresh at each start (`check` saw no two on one place).
+                    root.mounts
+                        .extend(request.tmpfs.iter().map(super::TmpfsMount::to_runtime));
+                    // A parent before what's in it (Docker's `sortMounts`):
+                    // a tmpfs on `/data` mounted after a volume on
+                    // `/data/db` would hide it, and `/etc`'s after the
+                    // run's own `/etc` files. In the order given among
+                    // equals.
+                    root.mounts
+                        .sort_by_key(|mount| mount.destination.components().count());
+                    named
+                }
+                // `check` refused volumes and tmpfs mounts without a root.
                 None => Vec::new(),
             };
             // All checked before a volume is made. An overlay path that can't

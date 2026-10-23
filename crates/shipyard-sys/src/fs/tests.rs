@@ -420,3 +420,61 @@ fn a_file_longer_than_it_says_is_refused_at_its_bound() {
     let error = read_bounded(path, 16).unwrap_err();
     assert_eq!(refusal(&error), Some(Refusal::TooLarge { cap: 16 }));
 }
+
+/// A directory made private is the caller's alone; one others can write to,
+/// or a symbolic link to one, is said to be unsafe.
+#[test]
+fn private_directories_are_the_caller_s_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let base = std::env::temp_dir().join(format!("shipyard-sys-private-{}", std::process::id()));
+    let dir = base.join("a").join("b");
+    assert_eq!(super::private_dir(&dir).unwrap(), None);
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        super::private_dir(&dir).unwrap(),
+        Some("others can write to it")
+    );
+    let link = base.join("link");
+    std::os::unix::fs::symlink(base.join("a"), &link).unwrap();
+    assert!(super::unsafe_dir(&link).unwrap().is_some());
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// What's missing below a directory is made, each component a directory;
+/// a symlink on the way is refused (`ELOOP` on Linux, `ENOTDIR` on macOS,
+/// for `O_NOFOLLOW | O_DIRECTORY`), never followed out of it,
+/// and its target is left alone; a path that isn't plain is refused. The
+/// control: the same path without the symlink is made and opened.
+#[test]
+fn below_a_directory_no_symlink_is_followed() {
+    let scratch = Scratch::new();
+    let dir = scratch.open();
+    let made = make_below(dir.as_fd(), Path::new("a/b/c"), 0o755).unwrap();
+    assert!(scratch.path("a/b/c").is_dir());
+    drop(made);
+    open_below(dir.as_fd(), Path::new("a/b/c")).unwrap();
+
+    let outside = Scratch::new();
+    std::fs::remove_dir_all(scratch.path("a/b")).unwrap();
+    symlink(&outside.0, scratch.path("a/b")).unwrap();
+    for walked in [
+        make_below(dir.as_fd(), Path::new("a/b/c"), 0o755),
+        open_below(dir.as_fd(), Path::new("a/b")),
+    ] {
+        let refused = walked.unwrap_err();
+        assert!(
+            matches!(refused.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "{refused}"
+        );
+    }
+    assert!(outside.names().is_empty(), "nothing made through the link");
+    std::fs::write(scratch.path("file"), "x").unwrap();
+    let refused = open_below(dir.as_fd(), Path::new("file")).unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::ENOTDIR), "{refused}");
+    for unplain in ["../a", "/a", "a/../b"] {
+        let refused = make_below(dir.as_fd(), Path::new(unplain), 0o755).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{unplain}");
+    }
+}

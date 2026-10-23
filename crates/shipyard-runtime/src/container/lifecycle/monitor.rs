@@ -1083,7 +1083,7 @@ fn raise_descriptor_limit() -> Option<libc::rlimit> {
 
 /// Raises the monitor's soft descriptor limit to `wanted`, as far as the
 /// hard limit lets it: [`raise_descriptor_limit`]'s, for any number.
-fn raise_descriptor_limit_to(wanted: usize) -> Option<libc::rlimit> {
+pub(super) fn raise_descriptor_limit_to(wanted: usize) -> Option<libc::rlimit> {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
     let wanted = libc::rlim_t::try_from(wanted).ok()?.min(hard);
@@ -1101,7 +1101,7 @@ fn raise_descriptor_limit_to(wanted: usize) -> Option<libc::rlimit> {
 /// caller had. Below the descriptors already open is allowed; a refusal
 /// (none is expected) leaves the monitor's. Async-signal-safe: one
 /// `setrlimit`, no allocation or lock.
-fn set_descriptor_limit(limit: Option<libc::rlimit>) {
+pub(super) fn set_descriptor_limit(limit: Option<libc::rlimit>) {
     if let Some(limit) = limit {
         // SAFETY: `limit` is a valid `rlimit`; `setrlimit` is a direct
         // system call wrapper.

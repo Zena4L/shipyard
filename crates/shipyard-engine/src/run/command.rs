@@ -37,27 +37,28 @@ pub(super) fn add_image_env(
     Ok(())
 }
 
-/// `KEY=VALUE` sets a variable; a bare `KEY` copies the caller's value, from
-/// `caller_env` (never this process's environment), and is skipped if the
-/// caller has none (Docker's behavior).
+/// `entry` as a `KEY=VALUE` (an `-e`): as given if it has an `=`; a bare
+/// `KEY` with the caller's value, from `caller_env` (never this process's
+/// environment), or `None` if the caller has none (skipped: Docker's
+/// behavior). Shared by `run` and `exec`.
 ///
 /// Error messages name the variable but never echo the value, which may be a
 /// secret.
-pub(super) fn add_env(
-    env: &mut Env,
+///
+/// # Errors
+///
+/// [`crate::ErrorKind::InvalidRequest`]: a bare
+/// name that's empty or has spaces (checked first: it would otherwise just
+/// be "not found" and silently dropped).
+pub(crate) fn resolved_env(
     entry: &OsStr,
     caller_env: &[(OsString, OsString)],
-) -> Result<()> {
+) -> Result<Option<OsString>> {
     let bytes = entry.as_bytes();
-    let key = OsStr::from_bytes(bytes.split(|&b| b == b'=').next().unwrap_or_default());
-    let context = || format!("invalid --env \"{}\"", key.to_string_lossy());
-
     if bytes.contains(&b'=') {
-        return env.push_entry(entry).with_context(context);
+        return Ok(Some(entry.to_owned()));
     }
-    // A bare key is looked up in the caller's values, so check it first: an empty or
-    // spaced name would otherwise just be "not found" and silently dropped.
-    if key.is_empty() {
+    if bytes.is_empty() {
         bail!(InvalidRequest, "invalid --env: the variable name is empty");
     }
     // Not named in the message: without `=`, a typo like `TOKEN secret`
@@ -71,15 +72,37 @@ pub(super) fn add_env(
     // The caller's value, as the caller gave it: never this process's own.
     let Some(value) = caller_env
         .iter()
-        .find(|(name, _)| name.as_os_str() == key)
+        .find(|(name, _)| name.as_os_str() == entry)
         .map(|(_, value)| value)
     else {
         // Not named here either: a value passed without `KEY=` (`-e "$TOKEN"`)
         // looks exactly like a name that isn't set.
         tracing::debug!("a bare --env name has no value from the caller; skipped");
+        return Ok(None);
+    };
+    let mut set = entry.to_owned();
+    set.push("=");
+    set.push(value);
+    Ok(Some(set))
+}
+
+/// Adds `entry` to `env`, resolved as [`resolved_env`] resolves it.
+pub(super) fn add_env(
+    env: &mut Env,
+    entry: &OsStr,
+    caller_env: &[(OsString, OsString)],
+) -> Result<()> {
+    let Some(set) = resolved_env(entry, caller_env)? else {
         return Ok(());
     };
-    env.set(key, value).with_context(context)
+    let key = OsStr::from_bytes(
+        set.as_bytes()
+            .split(|&b| b == b'=')
+            .next()
+            .unwrap_or_default(),
+    );
+    env.push_entry(&set)
+        .with_context(|| format!("invalid --env \"{}\"", key.to_string_lossy()))
 }
 
 /// Removes repeated groups, keeping the first occurrence of each.
@@ -191,9 +214,32 @@ impl RunRequest {
         &self,
         image: Option<&shipyard_image::RuntimeConfig>,
     ) -> Result<Vec<OsString>> {
+        let (entrypoint, arguments) = self.entrypoint_and_cmd(image);
+        let command: Vec<OsString> = entrypoint.into_iter().chain(arguments).collect();
+        if command.is_empty() {
+            bail!(InvalidRequest, "the image sets no command, so give one");
+        }
+        Ok(command)
+    }
+
+    /// The entrypoint and the command apart, as
+    /// [`resolve_command`](Self::resolve_command) joins them and `inspect`
+    /// shows them (F101: one rule, so a view never differs from what a
+    /// start runs).
+    pub(crate) fn entrypoint_and_cmd(
+        &self,
+        image: Option<&shipyard_image::RuntimeConfig>,
+    ) -> (Vec<OsString>, Vec<OsString>) {
         let Some(config) = image else {
-            // The CLI requires one without an image or a bundle.
-            return Ok(self.command.clone());
+            // Its own alone (a run without an image takes no entrypoint; a
+            // view whose image config is gone shows what it was given).
+            let entrypoint = self
+                .entrypoint
+                .iter()
+                .filter(|given| !given.is_empty())
+                .cloned()
+                .collect();
+            return (entrypoint, self.command.clone());
         };
         let owned = |list: &[String]| list.iter().map(OsString::from).collect::<Vec<_>>();
         let (entrypoint, default) = match &self.entrypoint {
@@ -208,11 +254,25 @@ impl RunRequest {
         } else {
             self.command.clone()
         };
-        let command: Vec<OsString> = entrypoint.into_iter().chain(arguments).collect();
-        if command.is_empty() {
-            bail!(InvalidRequest, "the image sets no command, so give one");
+        (entrypoint, arguments)
+    }
+
+    /// The variables a start gives it, as `inspect` shows them: its image's
+    /// (those with a value), then its own (which win), in order. No default
+    /// `PATH` (Docker's `inspect` shows none either). Its own are a
+    /// record's: resolved, `KEY=VALUE` each.
+    pub(crate) fn shown_env(&self, image: Option<&shipyard_image::RuntimeConfig>) -> Vec<String> {
+        let mut env = Env::new();
+        let image = image.map_or(&[][..], |config| &config.env);
+        for entry in image.iter().filter(|entry| entry.contains('=')) {
+            let _ = env.push_entry(OsStr::new(entry));
         }
-        Ok(command)
+        for entry in &self.env {
+            let _ = env.push_entry(entry);
+        }
+        env.iter()
+            .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+            .collect()
     }
 
     /// The working directory: `--workdir`, else the image's `WorkingDir`,
