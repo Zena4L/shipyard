@@ -23,11 +23,7 @@ use std::time::{Duration, Instant};
 const IMAGE: &str = "alpine:3.20";
 
 mod vm_support;
-use vm_support::Vm;
-
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
+use vm_support::{Vm, text};
 
 /// The milestone of 10.3a: the guest boots to its agent (within a bound:
 /// H7), a container runs in it with its stdout, stderr and exit code
@@ -247,6 +243,108 @@ fn commands_are_forwarded_as_on_linux() {
         "{:?}",
         began.elapsed()
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A build on the Mac: its context in the home (where a Mac keeps it
+/// private: `0750`, `~/Desktop` `0700`) is read by the guest's builder, and
+/// the image runs (the stage-12 close's Murphy review found every such build
+/// refused). Needs the network in the guest: BuildKit's image and the base.
+#[test]
+fn a_build_in_the_home_runs() {
+    let Some(vm) = Vm::new("build") else {
+        return;
+    };
+    let context =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vm-build-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&context);
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::write(
+        context.join("Dockerfile"),
+        "FROM busybox:1.37\nCOPY note /note\nCMD [\"cat\", \"/note\"]\n",
+    )
+    .unwrap();
+    std::fs::write(context.join("note"), "built on the mac\n").unwrap();
+    std::fs::set_permissions(
+        &context,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let built = vm.shipyard(&["build", "-t", "made-here:1", context.to_str().unwrap()]);
+    assert!(built.status.success(), "{built:?}");
+    let ran = vm.shipyard(&["run", "--rm", "--pull", "never", "made-here:1"]);
+    assert_eq!(text(&ran.stdout), "built on the mac\n", "{ran:?}");
+    std::fs::remove_dir_all(&context).unwrap();
+}
+
+/// Stage 12's archives through the VM: `save -o` and `export -o` write a
+/// file in the Mac's home, `load -i` and `import` read one, `save` to a
+/// pipe and `load` from one stream through the forwarded command; what was
+/// saved and loaded back runs, and so does what was exported and imported.
+#[test]
+fn archives_cross_as_files_in_the_home() {
+    let Some(vm) = Vm::new("archives") else {
+        return;
+    };
+    let pulled = vm.shipyard(&["pull", "-q", IMAGE]);
+    assert!(pulled.status.success(), "{pulled:?}");
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("vm-archives-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let saved = dir.join("image.tar");
+    let save = vm.shipyard(&["save", "-o", saved.to_str().unwrap(), IMAGE]);
+    assert!(save.status.success(), "{save:?}");
+    assert!(
+        std::fs::metadata(&saved).unwrap().len() > 1 << 20,
+        "a whole image"
+    );
+    let removed = vm.shipyard(&["rmi", IMAGE]);
+    assert!(removed.status.success(), "{removed:?}");
+    let load = vm.shipyard(&["load", "-i", saved.to_str().unwrap()]);
+    assert!(load.status.success(), "{load:?}");
+    assert!(text(&load.stdout).contains(IMAGE), "{load:?}");
+    let ran = vm.shipyard(&["run", "--rm", "--pull", "never", IMAGE, "echo", "loaded"]);
+    assert_eq!(text(&ran.stdout), "loaded\n", "{ran:?}");
+
+    // To a pipe and back from one: the same bytes as a stream.
+    let streamed = vm
+        .command(&["save", IMAGE])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(streamed.status.success(), "{streamed:?}");
+    let mut loading = vm
+        .command(&["load", "-q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    loading
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&streamed.stdout)
+        .unwrap();
+    let loaded = loading.wait_with_output().unwrap();
+    assert!(loaded.status.success(), "{loaded:?}");
+
+    // A container's files out, and in again as an image of their own.
+    let made = vm.shipyard(&["create", "--name", "exported", IMAGE, "true"]);
+    assert!(made.status.success(), "{made:?}");
+    let exported = dir.join("files.tar");
+    let export = vm.shipyard(&["export", "-o", exported.to_str().unwrap(), "exported"]);
+    assert!(export.status.success(), "{export:?}");
+    let import = vm.shipyard(&["import", exported.to_str().unwrap(), "imported:1"]);
+    assert!(import.status.success(), "{import:?}");
+    let release = vm.shipyard(&["run", "--rm", "imported:1", "cat", "/etc/alpine-release"]);
+    assert!(release.status.success(), "{release:?}");
+    assert!(text(&release.stdout).starts_with("3.20"), "{release:?}");
+    let history = vm.shipyard(&["history", "-q", "imported:1"]);
+    assert_eq!(text(&history.stdout).lines().count(), 1, "{history:?}");
+    let _ = vm.shipyard(&["rm", "exported"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

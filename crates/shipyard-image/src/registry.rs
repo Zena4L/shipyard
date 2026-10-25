@@ -44,6 +44,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::credentials::{Credential, Credentials, FoundCredential};
+
+mod upload;
 use crate::digest::Digest;
 
 /// The `Accept` header value offering every manifest and index media type the
@@ -124,12 +126,29 @@ pub enum RegistryError {
     },
     /// The registry turned the credentials down.
     #[error(
-        "{registry} refused the credentials from {from}: sign in again (`docker login \
-         {registry}`)"
+        "{registry} refused the credentials from {from}: sign in again (`shipyard login \
+         {registry}`, or `docker login`)"
     )]
     Refused {
         /// The registry.
         registry: String,
+        /// Where the credentials came from.
+        from: String,
+    },
+    /// The credentials were taken, but the account may not do this to
+    /// the repository (a token without the access asked for: Docker's
+    /// `denied: requested access to the resource is denied`).
+    #[error(
+        "denied: {registry} won't let the account from {from} {action} {repository} (it may not \
+         exist, or the account has no access to it)"
+    )]
+    Denied {
+        /// The registry.
+        registry: String,
+        /// The repository.
+        repository: String,
+        /// What was asked: `pull`, or `push to`.
+        action: &'static str,
         /// Where the credentials came from.
         from: String,
     },
@@ -150,7 +169,7 @@ pub enum RegistryError {
 fn status_meaning(status: u16) -> String {
     match status {
         401 | 403 => "access denied: it's private and you're not signed in, or the account \
-                     can't pull it (`docker login`)"
+                     has no access to it (`shipyard login`, or `docker login`)"
             .to_owned(),
         404 => "not found".to_owned(),
         429 => "rate-limited by the registry; try again later".to_owned(),
@@ -216,6 +235,10 @@ pub struct Registry {
     /// The credential, once looked up (at the first challenge), under a
     /// lock: two workers never ask a helper (and a keychain) twice.
     found: Mutex<Lookup>,
+    /// Whether it pushes: every token is then asked for `pull,push` (one
+    /// scope for every request, so workers never trade a token for a
+    /// narrower one), and a credential that can't be read is an error.
+    push: bool,
 }
 
 /// Whether a registry's credential was looked up, and what it was.
@@ -322,6 +345,7 @@ impl Registry {
             authorization: Mutex::new(None),
             credentials: None,
             found: Mutex::new(Lookup::Pending),
+            push: false,
         }
     }
 
@@ -331,6 +355,15 @@ impl Registry {
     #[must_use]
     pub fn with_credentials(mut self, credentials: Credentials, registry: &str) -> Self {
         self.credentials = Some((credentials, registry.to_owned()));
+        self
+    }
+
+    /// The same client, for a push ([`Registry::upload_blob`] and its kin):
+    /// its tokens asked for `pull,push`, and a credential that can't be
+    /// looked up fails it rather than pushing anonymously.
+    #[must_use]
+    pub fn for_push(mut self) -> Self {
+        self.push = true;
         self
     }
 
@@ -562,29 +595,50 @@ impl Registry {
         get: &Get<'_>,
         repository: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, Attempt> {
+        let response = self.with_auth(repository, |authorization| self.send(get, authorization))?;
+        successful(response, get.context)
+    }
+
+    /// Sends a request by `send` (given the `Authorization` to carry),
+    /// signing in once on a 401 from the registry itself and sending it
+    /// again; the response, whatever its status. A 401 after a sign-in is
+    /// the credential refused (one the registry takes itself: a password,
+    /// its own token) or the access denied (a token the service gave).
+    fn with_auth(
+        &self,
+        repository: &str,
+        mut send: impl FnMut(Option<String>) -> Result<ureq::http::Response<ureq::Body>, Attempt>,
+    ) -> Result<ureq::http::Response<ureq::Body>, Attempt> {
         use ureq::ResponseExt as _;
-        let mut response = self.send(get, self.current_authorization()?)?;
+        let response = send(self.current_authorization()?)?;
         // A challenge only from the registry itself: one from where a
         // redirect led (a blob CDN, anyone's) gets no credentials.
-        if response.status() == 401 && same_authority(response.get_uri(), &self.base) {
-            let challenges: Vec<String> = response
-                .headers()
-                .get_all("www-authenticate")
-                .iter()
-                .filter_map(|value| value.to_str().ok().map(str::to_owned))
-                .collect();
-            let found = self
-                .authenticate(&challenges, repository)
-                .map_err(Attempt::Fatal)?;
-            response = self.send(get, self.current_authorization()?)?;
-            if let (401, Some(found)) = (response.status().as_u16(), found) {
-                return Err(Attempt::Fatal(RegistryError::Refused {
+        if response.status() != 401 || !same_authority(response.get_uri(), &self.base) {
+            return Ok(response);
+        }
+        let signed = self
+            .authenticate(&challenges(&response), repository)
+            .map_err(Attempt::Fatal)?;
+        let response = send(self.current_authorization()?)?;
+        match (response.status().as_u16(), signed) {
+            // (A sign-in, `check`, asks for no repository: a 401 there is
+            // the credential refused whatever signed it in.)
+            (401, Some(SignedIn { found, direct })) if direct || repository.is_empty() => {
+                Err(Attempt::Fatal(RegistryError::Refused {
                     registry: self.host.clone(),
                     from: found.source,
-                }));
+                }))
             }
+            (401 | 403, Some(SignedIn { found, .. })) => {
+                Err(Attempt::Fatal(RegistryError::Denied {
+                    registry: self.host.clone(),
+                    repository: repository.to_owned(),
+                    action: if self.push { "push to" } else { "pull" },
+                    from: found.source,
+                }))
+            }
+            _ => Ok(response),
         }
-        successful(response, get.context)
     }
 
     /// Sends one GET with `authorization`, given time to receive its body
@@ -622,9 +676,9 @@ impl Registry {
     /// The authorization slot, locked. Poisoned only by a worker that
     /// panicked holding it: never taken for a success.
     fn authorization(&self) -> Result<std::sync::MutexGuard<'_, Option<String>>, RegistryError> {
-        self.authorization
-            .lock()
-            .map_err(|_| self.auth_error("a pull worker failed while holding the token"))
+        self.authorization.lock().map_err(|_| {
+            self.auth_error("a worker (a pull's or a push's) failed while holding the token")
+        })
     }
 
     /// The credential for this registry, looked up once. One that can't be
@@ -634,17 +688,22 @@ impl Registry {
         let Some((credentials, registry)) = &self.credentials else {
             return Ok(None);
         };
-        let mut found = self
-            .found
-            .lock()
-            .map_err(|_| self.auth_error("a pull worker failed while looking up credentials"))?;
+        let mut found = self.found.lock().map_err(|_| {
+            self.auth_error("a worker (a pull's or a push's) failed while looking up credentials")
+        })?;
         if let Lookup::Done(found) = &*found {
             return Ok(found.clone());
         }
-        let looked_up = credentials.lookup(registry).unwrap_or_else(|err| {
-            tracing::warn!("{err}; going on without signing in to {registry}");
-            None
-        });
+        let looked_up = match credentials.lookup(registry) {
+            Ok(looked_up) => looked_up,
+            // A push has nothing to do anonymously: why it can't sign in
+            // is what to say.
+            Err(err) if self.push => return Err(err.into()),
+            Err(err) => {
+                tracing::warn!("{err}; going on without signing in to {registry}");
+                None
+            }
+        };
         *found = Lookup::Done(looked_up.clone());
         Ok(looked_up)
     }
@@ -658,7 +717,7 @@ impl Registry {
         &self,
         challenges: &[String],
         repository: &str,
-    ) -> Result<Option<FoundCredential>, RegistryError> {
+    ) -> Result<Option<SignedIn>, RegistryError> {
         let parsed: Vec<Challenge> = challenges
             .iter()
             .flat_map(|header| parse_challenges(header))
@@ -670,7 +729,10 @@ impl Registry {
             found.as_ref().map(|found| &found.credential)
         {
             *self.authorization()? = Some(format!("Bearer {token}"));
-            return Ok(found);
+            return Ok(found.map(|found| SignedIn {
+                found,
+                direct: true,
+            }));
         }
         let Some(bearer) = parsed.iter().find(|challenge| challenge.scheme == "bearer") else {
             if !parsed.iter().any(|challenge| challenge.scheme == "basic") {
@@ -685,13 +747,16 @@ impl Registry {
                 }
                 None => {
                     return Err(self.auth_error(
-                        "the registry asks for a username and password: sign in with `docker \
-                         login`",
+                        "the registry asks for a username and password: sign in with `shipyard \
+                         login` (or `docker login`)",
                     ));
                 }
             };
             *self.authorization()? = Some(authorization);
-            return Ok(found);
+            return Ok(found.map(|found| SignedIn {
+                found,
+                direct: true,
+            }));
         };
         let realm = bearer
             .param("realm")
@@ -703,11 +768,17 @@ impl Registry {
         if !realm_allowed(realm, self.secure) {
             return Err(self.auth_error("the token realm isn't HTTPS"));
         }
-        // A sign-in (no repository, `check`) asks for none, as Docker's.
-        let scope = bearer
-            .param("scope")
-            .map(str::to_owned)
-            .or_else(|| (!repository.is_empty()).then(|| format!("repository:{repository}:pull")));
+        // A sign-in (no repository, `check`) asks for none, as Docker's; a
+        // push, `pull,push` for every request, whatever its challenge asked
+        // (a worker's `HEAD` challenged for `pull` must not trade the
+        // shared token for one an upload can't use).
+        let scope = if self.push && !repository.is_empty() {
+            Some(format!("repository:{repository}:pull,push"))
+        } else {
+            bearer.param("scope").map(str::to_owned).or_else(|| {
+                (!repository.is_empty()).then(|| format!("repository:{repository}:pull"))
+            })
+        };
         let service = bearer.param("service");
         let context = format!("fetching a token from {realm}");
         let token = Self::retrying(|| {
@@ -744,7 +815,10 @@ impl Registry {
                 .ok_or_else(|| Attempt::Fatal(self.auth_error("the token response had no token")))
         })?;
         *self.authorization()? = Some(format!("Bearer {token}"));
-        Ok(found)
+        Ok(found.map(|found| SignedIn {
+            found,
+            direct: false,
+        }))
     }
 
     /// Asks the token `realm` for a token for `scope`: anonymously, with a
@@ -830,6 +904,27 @@ impl Registry {
 /// The most redirects a request follows (a blob's to its CDN, say).
 const MAX_REDIRECTS: u32 = 10;
 
+/// What a sign-in signed in with.
+#[derive(Debug)]
+struct SignedIn {
+    /// The credential.
+    found: FoundCredential,
+    /// Whether it went to the registry itself (a password, its own token):
+    /// a 401 then is the credential refused; else a token service gave a
+    /// token, and a 401 is the access denied.
+    direct: bool,
+}
+
+/// Every `WWW-Authenticate` value of `response`.
+fn challenges(response: &ureq::http::Response<ureq::Body>) -> Vec<String> {
+    response
+        .headers()
+        .get_all("www-authenticate")
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect()
+}
+
 /// How long receiving a body of `size` bytes may take: [`BODY_TIMEOUT`],
 /// plus its size at [`SLOWEST_RATE`]; at most [`LONGEST_BODY`] if `capped`.
 fn body_deadline(size: u64, capped: bool) -> Duration {
@@ -847,16 +942,31 @@ fn blob_budget(size: u64) -> Duration {
     body_deadline(size, false) * 2 + LONGEST_WAIT * ATTEMPTS
 }
 
-/// Whether `uri` is on the registry at `base` (the same host and port).
+/// Whether `uri` is on the registry at `base` (the same scheme, host and
+/// port: a scheme's default port written or not).
 fn same_authority(uri: &ureq::http::Uri, base: &str) -> bool {
-    let authority = base
-        .split_once("://")
-        .map_or(base, |(_, rest)| rest)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    uri.authority()
-        .is_some_and(|there| there.as_str().eq_ignore_ascii_case(authority))
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return false;
+    };
+    let ours = normalised(scheme, rest.split('/').next().unwrap_or_default());
+    uri.scheme_str()
+        .is_some_and(|there| there.eq_ignore_ascii_case(scheme))
+        && uri
+            .authority()
+            .is_some_and(|there| normalised(scheme, there.as_str()) == ours)
+}
+
+/// `authority` lowercased, without `scheme`'s default port.
+fn normalised(scheme: &str, authority: &str) -> String {
+    let authority = authority.to_ascii_lowercase();
+    let default = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return authority,
+    };
+    authority
+        .strip_suffix(default)
+        .map_or(authority.clone(), str::to_owned)
 }
 
 /// A transport failure: worth a retry, unless it's one a retry can't
@@ -1209,6 +1319,20 @@ fn encode(value: &str) -> String {
 )]
 mod tests {
     use super::*;
+
+    /// The registry's own place, its scheme's default port written or not;
+    /// another host, port or scheme isn't.
+    #[test]
+    fn the_registry_is_known_by_its_scheme_host_and_port() {
+        let at = |uri: &str, base: &str| same_authority(&uri.parse().unwrap(), base);
+        assert!(at("https://ghcr.io:443/v2/x", "https://ghcr.io"));
+        assert!(at("https://GHCR.io/v2/x", "https://ghcr.io:443"));
+        assert!(at("http://127.0.0.1:5000/v2/", "http://127.0.0.1:5000"));
+        assert!(!at("https://ghcr.io:8443/v2/x", "https://ghcr.io"));
+        assert!(!at("http://ghcr.io/v2/x", "https://ghcr.io"));
+        assert!(!at("https://ghcr.io.evil/v2/x", "https://ghcr.io"));
+        assert!(!at("https://127.0.0.1:5001/v2/", "http://127.0.0.1:5000"));
+    }
 
     #[test]
     fn a_bearer_challenge_parses() {

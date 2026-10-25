@@ -391,21 +391,97 @@ pub fn copy_by_name(
 ) -> crate::Result<CpReport> {
     #[cfg(target_os = "linux")]
     {
-        crate::run::container_files(engine, transfer.container(), |files| {
-            let copied = match transfer {
-                Transfer::Out { path, to, .. } => {
-                    helpers::copy_out(files, path, to.as_deref(), &mut *streams.output, options)
-                }
-                Transfer::In { from, path, .. } => {
-                    helpers::copy_in(files, from.as_deref(), &mut *streams.input, path, options)
-                }
-            };
-            copied.map_err(crate::Error::from)
-        })
+        crate::run::container_files(
+            engine,
+            transfer.container(),
+            crate::run::Wanted::WithMounts,
+            |files| {
+                let copied = match transfer {
+                    Transfer::Out { path, to, .. } => {
+                        helpers::copy_out(files, path, to.as_deref(), &mut *streams.output, options)
+                    }
+                    Transfer::In { from, path, .. } => {
+                        helpers::copy_in(files, from.as_deref(), &mut *streams.input, path, options)
+                    }
+                };
+                copied.map_err(crate::Error::from)
+            },
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (engine, transfer, streams, options);
+        Err(crate::error::linux_only("containers"))
+    }
+}
+
+/// Fails an export of a running container that ended meanwhile and goes
+/// with its end (`--rm`), or is gone already: its `__cleanup` takes none of
+/// its locks, so its writable layer may have been deleted under the walk,
+/// whose files then read as the image's (Murphy's review of 12.2b). Never an
+/// archive that mixes the two, said as whole.
+#[cfg(target_os = "linux")]
+fn lost_its_layer(engine: &crate::Engine, root: &std::path::Path, id: &str) -> crate::Result<()> {
+    let up = shipyard_runtime::container::peek_status(root, id)
+        .ok()
+        .flatten()
+        .is_some_and(shipyard_runtime::container::Status::is_live);
+    if up {
+        return Ok(());
+    }
+    let removed = crate::containers::ContainerId::parse(id)
+        .and_then(|parsed| crate::containers::read_one(engine, &parsed))
+        .map_or(true, |record| record.auto_remove);
+    if removed {
+        crate::error::bail!(
+            Busy,
+            "container {id} ended during the export and is removed with its end (--rm): its \
+             files may have gone under it, so the archive can't be trusted; export it again \
+             while it runs"
+        );
+    }
+    Ok(())
+}
+
+/// `export` (step 12.2b, D12.2-5): the whole of container `name`'s own
+/// filesystem as one tar stream to `out`, named from its root (`bin/sh`, as
+/// Docker's `export` writes it): never its volumes, binds or tmpfs. Running,
+/// its root mount cloned alone by the helper, in its namespaces (what a
+/// volume covers is there as it is underneath); where the kernel won't clone
+/// it, its root as mounted, walked keeping to its mount (a covered
+/// directory empty: said, [`WarningKind::ExportPartial`](crate::WarningKind::ExportPartial)).
+/// Stopped, its writable layer over its image, no volume at all. The
+/// container is held while it streams (its operation lock: a start, stop
+/// or removal waits, then is refused busy).
+///
+/// # Errors
+///
+/// No such container; one being worked on ([`ErrorKind::Busy`](crate::ErrorKind::Busy));
+/// its image gone; the walk's or the stream's failure (a [`CpError`]).
+pub fn export_by_name(
+    engine: &crate::Engine,
+    name: &str,
+    out: &mut dyn std::io::Write,
+) -> crate::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let walk = engine.paths.export_walk();
+        let note =
+            crate::run::container_files(engine, name, crate::run::Wanted::OwnFiles, |files| {
+                let note = helpers::export(files, &mut *out, walk).map_err(crate::Error::from)?;
+                if let crate::run::Files::Live { root, id, .. } = files {
+                    lost_its_layer(engine, root, id)?;
+                }
+                Ok(note)
+            })?;
+        if let Some(note) = note {
+            engine.warn(crate::WarningKind::ExportPartial, format!("{name}: {note}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, name, out);
         Err(crate::error::linux_only("containers"))
     }
 }
@@ -468,7 +544,7 @@ impl PathStat {
 pub fn stat(engine: &crate::Engine, container: &str, path: &Path) -> crate::Result<PathStat> {
     #[cfg(target_os = "linux")]
     {
-        crate::run::container_files(engine, container, |files| {
+        crate::run::container_files(engine, container, crate::run::Wanted::WithMounts, |files| {
             helpers::stat(files, path).map_err(crate::Error::from)
         })
     }
@@ -496,7 +572,11 @@ pub fn copy_out(
     #[cfg(target_os = "linux")]
     {
         helpers::copy_out(
-            crate::run::Files::Live { root, id },
+            crate::run::Files::Live {
+                root,
+                id,
+                alone: false,
+            },
             path,
             to,
             stream,
@@ -527,7 +607,11 @@ pub fn copy_in(
     #[cfg(target_os = "linux")]
     {
         helpers::copy_in(
-            crate::run::Files::Live { root, id },
+            crate::run::Files::Live {
+                root,
+                id,
+                alone: false,
+            },
             from,
             stream,
             path,

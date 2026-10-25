@@ -27,7 +27,7 @@ use std::fmt;
 use crate::digest::{Digest, DigestError};
 
 /// Docker Hub's canonical name in a reference.
-pub(crate) const DOCKER_HUB_NAME: &str = "docker.io";
+pub const DOCKER_HUB_NAME: &str = "docker.io";
 /// Other names Docker Hub goes by.
 const DOCKER_HUB_ALIASES: [&str; 2] = ["index.docker.io", DOCKER_HUB_HOST];
 /// The host that actually serves Docker Hub's registry API.

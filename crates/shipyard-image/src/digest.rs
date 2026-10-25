@@ -106,13 +106,7 @@ impl Digest {
     /// This is the file name a blob takes in the store.
     #[must_use]
     pub fn hex(&self) -> String {
-        let mut hex = String::with_capacity(SHA256_HEX_LEN);
-        for byte in self.bytes {
-            // Each byte becomes exactly two lowercase hex characters.
-            hex.push(hex_nibble(byte >> 4));
-            hex.push(hex_nibble(byte & 0x0f));
-        }
-        hex
+        shipyard_sys::hex::lower(&self.bytes)
     }
 }
 
@@ -219,14 +213,6 @@ fn next_nibble(chars: &mut std::str::Chars<'_>) -> Result<u8, DigestError> {
         '0'..='9' => Ok(character as u8 - b'0'),
         'a'..='f' => Ok(character as u8 - b'a' + 10),
         other => Err(DigestError::NotHex(other)),
-    }
-}
-
-/// A 4-bit value as a lowercase hex character. `value` is always `0..=15`.
-fn hex_nibble(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        _ => (b'a' + value - 10) as char,
     }
 }
 

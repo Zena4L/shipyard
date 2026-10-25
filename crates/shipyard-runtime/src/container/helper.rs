@@ -59,9 +59,29 @@ pub struct HelperIo {
         allow(dead_code, reason = "paths are opened in it on Linux only")
     )]
     pub(crate) root: OwnedFd,
+    /// What its root is: as the container has it mounted, or its root
+    /// mount alone.
+    pub root_is: HelperRoot,
     /// This process's `/proc/self/fd`, opened before it joined the
     /// container (whose `/proc` doesn't show it).
     pub(crate) own_fds: OwnedFd,
+    /// What its function said, to be sent back with its success
+    /// ([`HelperIo::note`]).
+    pub(crate) note: std::sync::Mutex<Option<String>>,
+}
+
+/// What a helper's root is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperRoot {
+    /// The container's root with what's mounted on it (its volumes, its
+    /// `/proc`…), or a stopped container's view as it was mounted.
+    AsMounted,
+    /// A running container's root mount alone, nothing mounted on it: what
+    /// a volume covers shown as it is underneath (`export`).
+    Alone,
+    /// Asked alone, but the kernel refused the clone (this errno): the
+    /// root with what's mounted on it.
+    CloneRefused(i32),
 }
 
 impl HelperIo {
@@ -82,6 +102,15 @@ impl HelperIo {
         {
             let _ = (path, follow_last);
             Err(nix::errno::Errno::ENOSYS)
+        }
+    }
+
+    /// Says `text` back to the starter with this helper's success
+    /// ([`RunningHelper::wait_noting`]): the last said is sent, nothing if
+    /// the helper fails.
+    pub fn note(&self, text: impl Into<String>) {
+        if let Ok(mut note) = self.note.lock() {
+            *note = Some(text.into());
         }
     }
 
@@ -124,6 +153,10 @@ impl HelperFailure {
     /// The kind of a failure setting the helper up (joining, its
     /// credentials, its confinement).
     pub const SETUP: u16 = 0;
+
+    /// Not a failure: what a helper that succeeded said
+    /// ([`HelperIo::note`]), read back by [`RunningHelper::wait_noting`].
+    pub const NOTE: u16 = u16::MAX;
 
     /// The longest detail sent back, in bytes: with its JSON escapes, the
     /// report stays well within one pipe page.
@@ -208,9 +241,19 @@ impl RunningHelper {
     /// ([`ContainerError::HelperFailed`](super::ContainerError::HelperFailed)),
     /// or how it ended without saying
     /// ([`ContainerError::HelperEnded`](super::ContainerError::HelperEnded)).
-    pub fn wait(mut self) -> super::Result<()> {
+    pub fn wait(self) -> super::Result<()> {
+        self.wait_noting().map(drop)
+    }
+
+    /// Waits for it to end, as [`wait`](Self::wait): what it said with its
+    /// success ([`HelperIo::note`]), if anything.
+    ///
+    /// # Errors
+    ///
+    /// As [`wait`](Self::wait)'s.
+    pub fn wait_noting(mut self) -> super::Result<Option<String>> {
         let Some(mut child) = self.child.take() else {
-            return Ok(());
+            return Ok(None);
         };
         // Read first: it ends at the helper's end (it holds the only write
         // end), and a helper never waits on a report nobody reads.
@@ -224,6 +267,9 @@ impl RunningHelper {
         })?;
         if !said.is_empty() {
             return Err(match serde_json::from_slice::<HelperFailure>(&said) {
+                Ok(note) if note.kind == HelperFailure::NOTE && status.success() => {
+                    return Ok(Some(note.detail));
+                }
                 Ok(failure) => super::ContainerError::HelperFailed(failure),
                 Err(_) => {
                     super::ContainerError::HelperEnded("its report couldn't be read".to_owned())
@@ -231,7 +277,7 @@ impl RunningHelper {
             });
         }
         if status.success() {
-            return Ok(());
+            return Ok(None);
         }
         Err(super::ContainerError::HelperEnded(
             match std::os::unix::process::ExitStatusExt::signal(&status) {

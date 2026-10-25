@@ -53,6 +53,18 @@ pub mod media_type {
         media_type == OCI_MANIFEST || media_type == DOCKER_MANIFEST
     }
 
+    /// A manifest's own media type (its `mediaType`), OCI's when it says
+    /// none or one that isn't a manifest's: what a save and a push send it
+    /// as.
+    #[must_use]
+    pub fn of_manifest(bytes: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|value| value.get("mediaType")?.as_str().map(str::to_owned))
+            .filter(|given| is_manifest(given))
+            .unwrap_or_else(|| OCI_MANIFEST.to_owned())
+    }
+
     /// Whether `media_type` names a multi-platform index / manifest list.
     #[must_use]
     pub fn is_index(media_type: &str) -> bool {

@@ -39,7 +39,12 @@ pub(crate) fn vm_off(value: Option<&std::ffi::OsStr>) -> bool {
 /// Where `command` runs on a Mac.
 pub(crate) fn place(command: &Command) -> Place {
     match command {
-        Command::Vm(_) | Command::Doctor | Command::Compose(_) => Place::Here,
+        // A sign-in is the Mac's own: its helpers, its keychain (D12.4-2).
+        Command::Vm(_)
+        | Command::Doctor
+        | Command::Compose(_)
+        | Command::Login(_)
+        | Command::Logout { .. } => Place::Here,
         Command::System(SystemCommand::Recover | SystemCommand::Stop) => {
             Place::Refused("on a Mac, the VM's own start and stop settle and stop its containers")
         }
@@ -74,6 +79,41 @@ impl HostPath {
         Self {
             path: path.into(),
             may_be_new: true,
+        }
+    }
+}
+
+/// The image whose registry a forwarded command signs in to with the
+/// Mac's credential (D12.4-2): a `push`'s or `pull`'s alone.
+pub(crate) fn signs_in_to(command: &Command) -> Option<&str> {
+    match command {
+        Command::Push(args) => Some(&args.name),
+        Command::Pull(args) => Some(&args.reference),
+        _ => None,
+    }
+}
+
+/// The Mac's credential for the registry of the image `command` names, to
+/// hand the guest's command, if it signs in and the Mac has one. One that
+/// can't be read (a helper that's gone) is warned of, and the command goes
+/// on without: a registry that asks for none needs none, and one that asks
+/// says the command isn't signed in.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only a Mac forwards commands")
+)]
+fn handed_credential(
+    command: &Command,
+) -> anyhow::Result<Option<shipyard_runtime::attach::forward::RegistryAuth>> {
+    let Some(image) = signs_in_to(command) else {
+        return Ok(None);
+    };
+    match shipyard_engine::image::docker_credential_for(image) {
+        Ok(found) => Ok(found
+            .map(|given| shipyard_runtime::attach::forward::RegistryAuth(given.to_docker_auth()))),
+        Err(error) => {
+            crate::reporter::warn(format!("{error}; going on without signing in"))?;
+            Ok(None)
         }
     }
 }
@@ -127,6 +167,54 @@ pub(crate) fn needs(command: &Command) -> Needs {
         },
         Command::Exec(exec) => exec.needs(),
         Command::Cp(cp) => cp.needs(),
+        Command::Export(export) => Needs {
+            paths: export
+                .output
+                .iter()
+                .map(HostPath::new_or_existing)
+                .collect(),
+            ..Needs::default()
+        },
+        Command::Import(import) if import.reads_stdin() => Needs {
+            input: true,
+            ..Needs::default()
+        },
+        // A URL is refused in the guest, never taken for a path here.
+        Command::Import(import) if !import.source_is_url() => Needs {
+            paths: vec![HostPath::existing(&import.source)],
+            ..Needs::default()
+        },
+        Command::Build(build) => {
+            let mut paths = vec![HostPath::existing(&build.context)];
+            paths.extend(
+                build
+                    .file
+                    .iter()
+                    .filter(|_| !build.reads_stdin())
+                    .map(HostPath::existing),
+            );
+            paths.extend(build.secret_files().into_iter().map(HostPath::existing));
+            if let Ok(Some(
+                crate::building::OutputTo::Local(dest) | crate::building::OutputTo::Tar(Some(dest)),
+            )) = build.output_to()
+            {
+                paths.push(HostPath::new_or_existing(dest));
+            }
+            Needs {
+                input: build.reads_stdin(),
+                paths,
+                ..Needs::default()
+            }
+        }
+        Command::Save(save) => Needs {
+            paths: save.output.iter().map(HostPath::new_or_existing).collect(),
+            ..Needs::default()
+        },
+        Command::Load(load) => Needs {
+            input: load.input.is_none(),
+            paths: load.input.iter().map(HostPath::existing).collect(),
+            ..Needs::default()
+        },
         Command::Volume(VolumeCommand::Prune { force })
         | Command::Network(NetworkCommand::Prune { force }) => Needs {
             asks: !force,
@@ -251,10 +339,53 @@ pub(crate) fn copyable(names: &[String]) -> Result<(), String> {
 }
 
 /// Whether `command` would write a tar archive to this terminal (`cp
-/// CONTAINER:PATH -` with stdout a terminal): refused here, as on Linux
-/// (in the guest, its stdout isn't a terminal, so it can't tell).
+/// CONTAINER:PATH -`, `save` without `-o`, with stdout a terminal): refused
+/// here, as on Linux (in the guest, its stdout isn't a terminal, so it
+/// can't tell).
 pub(crate) fn tar_to_terminal(command: &Command, stdout_is_terminal: bool) -> bool {
-    matches!(command, Command::Cp(cp) if cp.writes_to_stdout()) && stdout_is_terminal
+    let writes = match command {
+        Command::Cp(cp) => cp.writes_to_stdout(),
+        Command::Save(save) => save.output.is_none(),
+        Command::Export(export) => export.output.is_none(),
+        Command::Build(build) => {
+            matches!(
+                build.output_to(),
+                Ok(Some(crate::building::OutputTo::Tar(None)))
+            )
+        }
+        _ => false,
+    };
+    writes && stdout_is_terminal
+}
+
+/// The hint a terminal refusal of `command` gives (what to name instead),
+/// as on Linux.
+pub(crate) fn terminal_hint(command: &Command) -> &'static str {
+    match command {
+        Command::Save(_) | Command::Export(_) => crate::output::GIVE_OUTPUT,
+        Command::Build(_) => crate::output::GIVE_TAR_DEST,
+        Command::Load(_) => crate::output::GIVE_INPUT,
+        Command::Import(_) => crate::output::GIVE_FILE,
+        _ => "",
+    }
+}
+
+/// Whether `command` reads its Dockerfile from this terminal (`build -f -`):
+/// refused here, as on Linux (the guest's standard input is a pipe: it
+/// would take what's typed as the Dockerfile, to Ctrl-D).
+pub(crate) fn dockerfile_from_terminal(command: &Command, stdin_is_terminal: bool) -> bool {
+    matches!(command, Command::Build(build) if build.reads_stdin()) && stdin_is_terminal
+}
+
+/// Whether `command` would read a tar archive from this terminal (`load`
+/// without `-i`, with stdin a terminal): refused here, as on Linux.
+pub(crate) fn tar_from_terminal(command: &Command, stdin_is_terminal: bool) -> bool {
+    let reads = match command {
+        Command::Load(load) => load.input.is_none(),
+        Command::Import(import) => import.reads_stdin(),
+        _ => false,
+    };
+    reads && stdin_is_terminal
 }
 
 /// Forwards the parsed command to the VM's guest, if it goes there: its
@@ -266,14 +397,12 @@ pub(crate) fn elsewhere(command: &Command) -> Option<std::process::ExitCode> {
     }
     match place(command) {
         Place::Here => None,
-        Place::Refused(why) => Some(crate::reporter::report(
-            &anyhow::anyhow!("{why}"),
-            command.failure_code(),
-        )),
-        Place::Guest => Some(
-            mac::forward(command)
-                .unwrap_or_else(|error| crate::reporter::report(&error, command.failure_code())),
-        ),
+        Place::Refused(why) => Some(crate::reporter::report(&why, command.failure_code())),
+        Place::Guest => {
+            Some(mac::forward(command).unwrap_or_else(|error| {
+                crate::reporter::report_error(&error, command.failure_code())
+            }))
+        }
     }
 }
 
@@ -312,8 +441,15 @@ mod mac {
         if let Err(why) = super::copyable(&needs.copied_env) {
             bail!(why);
         }
+        let hint = super::terminal_hint(command);
         if super::tar_to_terminal(command, std::io::stdout().is_terminal()) {
-            bail!("refusing to write a tar archive to a terminal: redirect it (> file.tar)");
+            return Err(crate::output::tar_to_terminal_refused(hint));
+        }
+        if super::tar_from_terminal(command, std::io::stdin().is_terminal()) {
+            return Err(crate::output::tar_from_terminal_refused(hint));
+        }
+        if super::dockerfile_from_terminal(command, std::io::stdin().is_terminal()) {
+            bail!(crate::building::DOCKERFILE_FROM_TERMINAL);
         }
         let Some(cwd) = guest_cwd(&cwd, &home) else {
             bail!("this directory's name isn't text: it can't be sent to the VM");
@@ -338,6 +474,9 @@ mod mac {
             shipyard_runtime::terminal::terminal_size(),
         );
         request.input = needs.reads_input(request.terminal.is_some());
+        if let Some(handed) = super::handed_credential(command)? {
+            request = request.with_registry_auth(handed);
+        }
         if client::status(&paths)? == Status::Stopped {
             warn_if_another_build(&paths);
         }
@@ -470,6 +609,32 @@ mod tests {
         ));
         assert_eq!(place(&parsed(&["shipyard", "ps"])), Place::Guest);
         assert_eq!(place(&parsed(&["shipyard", "system", "df"])), Place::Guest);
+        // A sign-in is the Mac's own (D12.4-2); a push or pull is the
+        // guest's, handed the Mac's credential for its image, alone.
+        assert_eq!(
+            place(&parsed(&["shipyard", "login", "ghcr.io"])),
+            Place::Here
+        );
+        assert_eq!(place(&parsed(&["shipyard", "logout"])), Place::Here);
+        assert_eq!(
+            place(&parsed(&["shipyard", "push", "ghcr.io/me/a:1"])),
+            Place::Guest
+        );
+        assert_eq!(
+            signs_in_to(&parsed(&["shipyard", "image", "push", "ghcr.io/me/a:1"]).flattened()),
+            Some("ghcr.io/me/a:1")
+        );
+        assert_eq!(
+            signs_in_to(&parsed(&["shipyard", "pull", "alpine"])),
+            Some("alpine")
+        );
+        for words in [
+            &["shipyard", "run", "ghcr.io/me/a:1"][..],
+            &["shipyard", "build", "-t", "a", "."],
+            &["shipyard", "images"],
+        ] {
+            assert_eq!(signs_in_to(&parsed(words)), None, "{words:?}");
+        }
         for (words, input) in [
             (&["shipyard", "run", "-i", "alpine", "cat"][..], true),
             (&["shipyard", "run", "--rm", "alpine", "cat"], false),
@@ -553,6 +718,33 @@ mod tests {
         assert!(copyable(&["TOKEN".to_owned(), "PATH".to_owned()]).is_err());
     }
 
+    /// `build -f -` with a terminal for its input is refused here, as on
+    /// Linux; from a pipe, or with a Dockerfile named, it isn't; each
+    /// refusal gives Linux's hint.
+    #[test]
+    fn a_dockerfile_is_never_read_from_a_terminal() {
+        use clap::Parser as _;
+        let parsed = |words: &[&str]| crate::cli::Cli::try_parse_from(words).unwrap().command;
+        let piped = parsed(&["shipyard", "build", "-f", "-", "-t", "a", "."]);
+        assert!(dockerfile_from_terminal(&piped, true));
+        assert!(!dockerfile_from_terminal(&piped, false));
+        let named = parsed(&["shipyard", "build", "-f", "Dockerfile", "-t", "a", "."]);
+        assert!(!dockerfile_from_terminal(&named, true));
+        assert_eq!(
+            terminal_hint(&parsed(&["shipyard", "save", "x"])),
+            crate::output::GIVE_OUTPUT
+        );
+        assert_eq!(
+            terminal_hint(&parsed(&["shipyard", "load"])),
+            crate::output::GIVE_INPUT
+        );
+        assert_eq!(
+            terminal_hint(&parsed(&["shipyard", "import", "-", "x:1"])),
+            crate::output::GIVE_FILE
+        );
+        assert_eq!(terminal_hint(&parsed(&["shipyard", "cp", "c:/x", "-"])), "");
+    }
+
     /// `cp C:/x -` onto a terminal is refused here; into a pipe, or `cp`
     /// the other way, it isn't.
     #[test]
@@ -566,5 +758,114 @@ mod tests {
             &parsed(&["shipyard", "cp", "-", "web:/x"]),
             true
         ));
+        // `save`'s archive (step 12.2a): to stdout, never with -o.
+        assert!(tar_to_terminal(
+            &parsed(&["shipyard", "save", "alpine"]),
+            true
+        ));
+        assert!(!tar_to_terminal(
+            &parsed(&["shipyard", "save", "alpine"]),
+            false
+        ));
+        assert!(!tar_to_terminal(
+            &parsed(&["shipyard", "image", "save", "-o", "a.tar", "alpine"]).flattened(),
+            true
+        ));
+        // `export`'s to stdout; `import -`'s from stdin (step 12.2b).
+        assert!(tar_to_terminal(&parsed(&["shipyard", "export", "c"]), true));
+        assert!(!tar_to_terminal(
+            &parsed(&["shipyard", "export", "-o", "x.tar", "c"]),
+            true
+        ));
+        assert!(tar_from_terminal(
+            &parsed(&["shipyard", "import", "-", "a:1"]),
+            true
+        ));
+        assert!(!tar_from_terminal(
+            &parsed(&["shipyard", "import", "x.tar", "a:1"]),
+            true
+        ));
+        // `load`'s, from stdin: never with -i.
+        assert!(tar_from_terminal(&parsed(&["shipyard", "load"]), true));
+        assert!(!tar_from_terminal(&parsed(&["shipyard", "load"]), false));
+        assert!(!tar_from_terminal(
+            &parsed(&["shipyard", "load", "-i", "a.tar"]),
+            true
+        ));
+    }
+
+    /// `save -o` and `load -i` name host paths, checked as `cp`'s (step
+    /// 12.2a); `load` from stdin reads its input, `-i`'s doesn't.
+    #[test]
+    fn save_and_load_name_their_files() {
+        use clap::Parser as _;
+        let parsed = |words: &[&str]| {
+            crate::cli::Cli::try_parse_from(words)
+                .unwrap()
+                .command
+                .flattened()
+        };
+        let save = needs(&parsed(&[
+            "shipyard", "image", "save", "-o", "out.tar", "a",
+        ]));
+        assert_eq!(save.paths, [HostPath::new_or_existing("out.tar")]);
+        assert!(!save.input);
+        assert!(needs(&parsed(&["shipyard", "save", "a"])).paths.is_empty());
+        // `export -o` and `import FILE` (step 12.2b): their files; `import
+        // -` its input; never `import`'s name, nor a URL.
+        let export = needs(&parsed(&[
+            "shipyard",
+            "container",
+            "export",
+            "-o",
+            "x.tar",
+            "c",
+        ]));
+        assert_eq!(export.paths, [HostPath::new_or_existing("x.tar")]);
+        let import = needs(&parsed(&["shipyard", "import", "rootfs.tar", "app:1"]));
+        assert_eq!(import.paths, [HostPath::existing("rootfs.tar")]);
+        assert!(!import.input);
+        let stdin = needs(&parsed(&["shipyard", "image", "import", "-", "app:1"]));
+        assert!(stdin.input && stdin.paths.is_empty());
+        let url = needs(&parsed(&["shipyard", "import", "https://x/y.tar", "app:1"]));
+        assert!(url.paths.is_empty() && !url.input);
+        // `build` (step 12.3): its context, `-f`, each secret's file and
+        // `-o`'s destination; `-f -` its input.
+        let build = needs(&parsed(&[
+            "shipyard",
+            "build",
+            "-t",
+            "a:1",
+            "-f",
+            "ci/Dockerfile",
+            "--secret",
+            "id=t,src=tok",
+            "-o",
+            "type=local,dest=out",
+            "ctx",
+        ]));
+        assert_eq!(
+            build.paths,
+            [
+                HostPath::existing("ctx"),
+                HostPath::existing("ci/Dockerfile"),
+                HostPath::existing("tok"),
+                HostPath::new_or_existing("out"),
+            ]
+        );
+        assert!(!build.input);
+        let stdin = needs(&parsed(&[
+            "shipyard", "image", "build", "-f", "-", "-t", "a:1", ".",
+        ]));
+        assert!(stdin.input);
+        assert_eq!(stdin.paths, [HostPath::existing(".")]);
+        assert!(tar_to_terminal(
+            &parsed(&["shipyard", "build", "-o", "-", "."]),
+            true
+        ));
+        let load = needs(&parsed(&["shipyard", "load", "-i", "in.tar"]));
+        assert_eq!(load.paths, [HostPath::existing("in.tar")]);
+        assert!(!load.input);
+        assert!(needs(&parsed(&["shipyard", "load"])).input);
     }
 }

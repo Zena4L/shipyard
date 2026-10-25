@@ -31,7 +31,12 @@
 //! the engine beforehand would fail rootless with `EPERM`. So this module
 //! only prepares directories; the mount is the init's job.
 
+mod archive;
+mod given;
 mod helper;
+mod import;
+mod push;
+mod signing;
 
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
@@ -48,15 +53,21 @@ use shipyard_image::{LayerOwners, LayerSpec, RuntimeConfig};
 #[cfg(target_os = "linux")]
 use shipyard_runtime::isolation::{IdMap, IdMaps, Overlay};
 
+pub use archive::{Loaded, check_saved, load, load_named, save};
+pub use given::{NotDockerAuth, docker_credential_for};
 #[cfg(target_os = "linux")]
 pub(crate) use helper::Request;
 pub use helper::entry_point as storage_helper_entry_point;
 #[cfg(target_os = "linux")]
 use helper::{Outcome, ranges};
+pub use import::{ImportRequest, Imported, host_platform_name, import, is_host_platform};
+pub use push::{PushRequest, PushedName, names_a_tag, push};
 /// A registry credential, as a client hands one in ([`GivenCredential`]).
 pub use shipyard_image::Credential;
 /// An image reference (`alpine:3.20`), as the API parses and shows one.
+pub use shipyard_image::reference::DOCKER_HUB_NAME;
 pub use shipyard_image::{ImageReference, ReferenceError};
+pub use signing::{Forgotten, Kept, Signed, login_and_keep, logout};
 
 use crate::Engine;
 #[cfg(target_os = "linux")]
@@ -611,6 +622,10 @@ struct Fetch {
 
 impl Fetch {
     /// As `policy` says, with Docker's credentials (its config file).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "a run's pull is Linux's only")
+    )]
     fn docker(policy: PullPolicy) -> Self {
         Self {
             policy,
@@ -809,15 +824,9 @@ pub fn pull_with(
             .get(&image.to_string())
             .map(|record| record.manifest.clone())
     });
-    let fetch = match given {
-        Some(given) => Fetch {
-            policy: PullPolicy::Always,
-            credentials: shipyard_image::Credentials::given(
-                given.credential,
-                given.registry.as_deref(),
-            ),
-        },
-        None => Fetch::docker(PullPolicy::Always),
+    let fetch = Fetch {
+        policy: PullPolicy::Always,
+        credentials: GivenCredential::or_docker(given),
     };
     let ready = ready(engine, &store, &shared, &image, fetch, None)?;
     drop(shared);
@@ -961,7 +970,7 @@ fn shift(maps: &IdMaps) -> Result<shipyard_image::Shift> {
 /// Gives `paths` to the host user and group the container's root is under
 /// `maps`.
 #[cfg(target_os = "linux")]
-fn give_to_container_root(paths: &[PathBuf], maps: &IdMaps) -> Result<()> {
+pub(crate) fn give_to_container_root(paths: &[PathBuf], maps: &IdMaps) -> Result<()> {
     let (Some(uid), Some(gid)) = (maps.host_uid(0), maps.host_gid(0)) else {
         bail!(
             InvalidRequest,
@@ -1101,6 +1110,57 @@ fn delete(store: &Store, held: &StoreLock, trash: &Trash) -> Result<()> {
     in_process
 }
 
+/// Removes the build caches `names` (`state-…`, step 12.3) from the store
+/// `engine` uses: in this process first, what's left (a rootless caller's
+/// subordinate IDs' files) through the storage helper. Under the store's
+/// shared lock; each state's own lock is the caller's.
+///
+/// # Errors
+///
+/// A name that isn't a state's; a state that couldn't be removed.
+pub(crate) fn remove_builder_states(engine: &Engine, names: &[String]) -> Result<()> {
+    let store = open_store(engine)?;
+    let held = store.lock(LockMode::Shared, USE_WAIT)?;
+    let builder =
+        crate::build::cache::builder_dir_of(store.root(), nix::unistd::geteuid().is_root());
+    let in_process = remove_states_in(&builder, names);
+    #[cfg(target_os = "linux")]
+    if let Err(err) = &in_process {
+        return through_helper(&store, &held, err, || {
+            Request::RemoveBuilderStates(names.to_vec())
+        });
+    }
+    let _ = held;
+    in_process
+}
+
+/// Removes the states `names` from the builder's directory `builder` (each
+/// a plain `state-…` name: never a path).
+pub(crate) fn remove_states_in(builder: &std::path::Path, names: &[String]) -> Result<()> {
+    for name in names {
+        // `state-<hex>`, or `state-<hex>.run-<hex>`: never a path.
+        let (state, run) = name.split_once('.').unwrap_or((name, ""));
+        let hex =
+            |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let plain = state
+            .strip_prefix(crate::build::cache::STATE_PREFIX)
+            .is_some_and(hex)
+            && (run.is_empty() || run.strip_prefix("run-").is_some_and(hex));
+        if !plain {
+            bail!(InvalidRequest, "{name:?} isn't a build cache's name");
+        }
+        match std::fs::remove_dir_all(builder.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::wrap(crate::ErrorKind::Storage, error))
+                    .with_context(|| format!("removing the build cache {name}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What deleting in this process left (`err`), deleted through the storage
 /// helper, if the caller is rootless: the files are an image's other users'
 /// (or what a container wrote as them). As root, `err` stands.
@@ -1140,14 +1200,7 @@ fn record_image(engine: &Engine, store: &Store, pulled: &Pulled) -> Result<()> {
         Some(kept.unwrap_or_else(std::time::SystemTime::now)),
     );
     if let Some(aside) = Index::record(store.root(), &key, record)? {
-        engine.warn(
-            WarningKind::IndexReset,
-            format!(
-                "the store index was corrupt; it was moved to {} and a new one started (images \
-                 pulled before aren't listed, and nothing is removed until it's deleted)",
-                aside.display()
-            ),
-        );
+        warn_index_reset(engine, &aside);
     }
     Ok(())
 }
@@ -1187,13 +1240,7 @@ pub fn tag(engine: &Engine, source: &str, target: &str) -> Result<String> {
         ..image.record
     };
     if let Some(aside) = Index::record(store.root(), &key, record)? {
-        engine.warn(
-            WarningKind::IndexReset,
-            format!(
-                "the store index was corrupt; it was moved to {} and a new one started",
-                aside.display()
-            ),
-        );
+        warn_index_reset(engine, &aside);
     }
     crate::events::emit_about(engine, crate::events::Kind::Image, "tag", &key);
     Ok(key)
@@ -1731,6 +1778,67 @@ pub fn disk_usage(engine: &Engine) -> Result<StoreUsage> {
         complete: disk.complete,
     };
     Ok(StoreUsage { images, containers })
+}
+
+/// Says the store's index was found corrupt and set `aside` (a pull, load,
+/// import or tag records into a new one).
+pub(crate) fn warn_index_reset(engine: &Engine, aside: &std::path::Path) {
+    engine.warn(
+        WarningKind::IndexReset,
+        format!(
+            "the store index was corrupt; it was moved to {} and a new one started (images \
+             pulled before aren't listed, and nothing is removed until it's deleted)",
+            aside.display()
+        ),
+    );
+}
+
+/// Every tagged name (no digest) of `asked`'s repository the index holds,
+/// with its record, by name: what `save REPOSITORY` and `push -a` take.
+pub(crate) fn tags_of_repository(
+    index: &Index,
+    asked: &ImageReference,
+) -> Vec<(ImageReference, shipyard_image::ImageRecord)> {
+    let mut tags: Vec<_> = index
+        .images()
+        .into_iter()
+        .filter_map(|image| {
+            let name = ImageReference::parse(&image.reference).ok()?;
+            (name.registry == asked.registry
+                && name.repository == asked.repository
+                && name.tag.is_some()
+                && name.digest.is_none())
+            .then_some((name, image.record))
+        })
+        .collect();
+    tags.sort_by_key(|(name, _)| name.to_string());
+    tags
+}
+
+/// The manifest's digest a record of `name` keeps, and the index's it came
+/// through, if one.
+///
+/// # Errors
+///
+/// [`ErrorKind::Storage`]: either isn't a
+/// digest (a damaged record, never taken for an image without an index:
+/// a push's guard against flattening that index would be off).
+pub(crate) fn record_digests(
+    record: &shipyard_image::ImageRecord,
+    name: &str,
+) -> Result<(shipyard_image::Digest, Option<shipyard_image::Digest>)> {
+    let damaged = |error| {
+        crate::Error::wrap(crate::ErrorKind::Storage, error)
+            .context(format!("the store's record of {name}"))
+    };
+    let manifest = shipyard_image::Digest::parse(&record.manifest).map_err(damaged)?;
+    let index = record
+        .index_digest
+        .as_deref()
+        .map(shipyard_image::Digest::parse)
+        .transpose()
+        .map_err(damaged)?;
+    Ok((manifest, index))
 }
 
 #[cfg(test)]

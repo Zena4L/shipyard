@@ -65,7 +65,7 @@ impl RunId {
     /// A new one, from the kernel's random numbers.
     pub(crate) fn new() -> Result<RunId> {
         let bytes = crate::random::bytes::<6>().context("the run's ID")?;
-        Ok(RunId(crate::random::hex(&bytes)))
+        Ok(RunId(shipyard_sys::hex::lower(&bytes)))
     }
 
     /// The ID.

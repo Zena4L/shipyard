@@ -27,14 +27,17 @@ sha2.workspace = true
 # The index written whole and read with a bound, locks (stage 10).
 shipyard-sys.workspace = true
 thiserror.workspace = true
+# Writing an image archive (`save`, step 12.2a): Shipyard's own bytes. An
+# archive is read by Shipyard's own reader (`tar_reader.rs`), which bounds what
+# an untrusted one can make it hold.
+tar.workspace = true
 tracing.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# Building test archives only: layers are read by Shipyard's own reader
-# (`tar_reader.rs`), which bounds what an untrusted archive can make it hold.
-tar.workspace = true
+# The registry a push goes to (tests/push.rs).
+shipyard-test-support.workspace = true
 
 [lints]
 workspace = true

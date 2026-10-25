@@ -83,7 +83,7 @@ pub use shipyard_engine::docker::Build;
 
 /// The service: where the engine keeps what it keeps, its idle time, and
 /// what it says of itself.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Service {
     /// The engine's places ([`Paths::from_env`], read once by the caller).
     pub paths: Paths,
@@ -91,6 +91,15 @@ pub struct Service {
     pub idle: Duration,
     /// What `/version` says.
     pub build: Build,
+    /// The socket it bound itself, if it did (not systemd's): its name
+    /// removed at the idle end before the last look at what's queued, so a
+    /// client never connects to a service about to go (F149); removed at
+    /// the end otherwise.
+    pub bound: Option<Bound>,
+    /// A test build's pause at the idle end, once the name is removed and
+    /// nothing was queued: the file it's said at (debug builds only, set
+    /// by the caller from `SHIPYARD_TEST_API_IDLE_PAUSE`).
+    pub idle_end_pause: Option<std::path::PathBuf>,
 }
 
 /// What every request's task shares.
@@ -107,6 +116,10 @@ pub(crate) struct Shared {
     build: Build,
     /// The `Server` header.
     server: HeaderValue,
+    /// [`Service::bound`].
+    bound: std::sync::Mutex<Option<Bound>>,
+    /// [`Service::idle_end_pause`].
+    idle_end_pause: Option<std::path::PathBuf>,
 }
 
 /// Serves the API on `listener` (systemd's, or one the caller bound) until
@@ -165,6 +178,8 @@ fn serve_blocked(listener: StdListener, service: Service, stops: SigSet) -> io::
         execs: exec::Execs::default(),
         build: service.build,
         server,
+        bound: std::sync::Mutex::new(service.bound),
+        idle_end_pause: service.idle_end_pause,
     });
     // What execs of services gone before left (F117's PID files).
     if let Ok(root) = shared.paths.runtime_root() {
@@ -199,9 +214,21 @@ async fn accept(listener: &UnixListener, shared: &Arc<Shared>, stopped: &Notify)
     let mut stopping = false;
     loop {
         let Some(wait) = shared.idle.left(Instant::now()) else {
-            // Idle, but one already waiting (a `shipyard compose` that saw
-            // it answer a moment ago) is served, never left to a closed
-            // socket: then it's busy again.
+            // Idle: a socket it bound itself loses its name first, so the
+            // look below is the last any client can be queued for (one
+            // that comes after finds no socket, and starts a service of
+            // its own); systemd's stays systemd's.
+            if let Ok(mut bound) = shared.bound.lock()
+                && let Some(bound) = bound.as_mut()
+            {
+                bound.unlink();
+            }
+            if let Some(path) = &shared.idle_end_pause {
+                test_pause(path).await;
+            }
+            // One already waiting (a `shipyard compose` that saw it answer
+            // a moment ago) is served, never left to a closed socket: then
+            // it's busy again.
             if !stopping
                 && let std::task::Poll::Ready(Ok((stream, _))) = std::future::poll_fn(|context| {
                     std::task::Poll::Ready(listener.poll_accept(context))
@@ -247,6 +274,19 @@ async fn accept(listener: &UnixListener, shared: &Arc<Shared>, stopped: &Notify)
                 _ => return Err(error),
             },
         }
+    }
+}
+
+/// A test build's pause (`Service::idle_end_pause`): this process's PID
+/// said at `path`, then a wait until the test removes it (a minute at
+/// most).
+async fn test_pause(path: &std::path::Path) {
+    if std::fs::write(path, std::process::id().to_string()).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while path.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -319,7 +359,43 @@ async fn prune(
         routes::Prune::Images => images::prune(shared, query).await,
         routes::Prune::Volumes => volumes::prune(shared, query, routes::asked_version(path)).await,
         routes::Prune::Networks => networks::prune(shared, query).await,
-        routes::Prune::Build => Ok(images::prune_build()),
+        routes::Prune::Build => images::prune_build(shared, query).await,
+    }
+}
+
+/// An image endpoint's answer (`answer`'s, apart for its length): `imports`
+/// whether `/images/create` is an import.
+async fn images_answer(
+    shared: &Arc<Shared>,
+    route: Route,
+    query: &Query,
+    body: Option<Incoming>,
+    request: &hyper::http::request::Parts,
+    imports: bool,
+) -> Result<Response<Body>, ApiError> {
+    match route {
+        Route::PullImage if imports => {
+            let body = body.ok_or_else(|| ApiError::internal("the import's body"))?;
+            images::import(shared, query, body).await
+        }
+        Route::PullImage => images::pull(shared, query, &request.headers),
+        Route::Auth => {
+            let body = body.ok_or_else(|| ApiError::internal("the credentials' body"))?;
+            images::auth(shared, body).await
+        }
+        Route::ListImages => images::list(shared, query).await,
+        Route::InspectImage(name) => images::inspect(shared, name).await,
+        Route::ImageHistory(name) => images::history(shared, name).await,
+        Route::SaveImage(name) => images::save(shared, vec![name]).await,
+        Route::SaveImages => images::save(shared, query.get_all("names")).await,
+        Route::LoadImages => {
+            let body = body.ok_or_else(|| ApiError::internal("the archive's body"))?;
+            images::load(shared, query, body).await
+        }
+        Route::TagImage(name) => images::tag(shared, name, query).await,
+        Route::PushImage(name) => images::push(shared, &name, query, &request.headers),
+        Route::RemoveImage(name) => images::remove(shared, name, query).await,
+        _ => Err(ApiError::internal("not an image's endpoint")),
     }
 }
 
@@ -332,7 +408,15 @@ async fn answer(
 ) -> Result<Response<Body>, ApiError> {
     let route = routes::route(&request.method, request.uri.path())?;
     let query = Query::parse(request.uri.query())?;
-    let body = if route.takes_body() {
+    // `/images/create` is an import, its body the archive, when it says
+    // where from (`fromSrc`); else a pull, with no body.
+    let imports = route == Route::PullImage
+        && query
+            .get("fromSrc")
+            .is_some_and(|source| !source.is_empty())
+        // A pull when it names an image, as Docker's daemon has it.
+        && query.get("fromImage").is_none_or(str::is_empty);
+    let body = if route.takes_body() || imports {
         Some(body)
     } else {
         // Not read: let go, so that the connection's end (the client gone)
@@ -380,15 +464,19 @@ async fn answer(
         }
         Route::Wait(id) => containers::wait(shared, id, &query).await,
         Route::Remove(id) => containers::remove(shared, id, &query).await,
-        Route::PullImage => images::pull(shared, &query, &request.headers),
-        Route::Auth => {
-            let body = body.ok_or_else(|| ApiError::internal("the credentials' body"))?;
-            images::auth(shared, body).await
+        Route::PullImage
+        | Route::Auth
+        | Route::ListImages
+        | Route::InspectImage(_)
+        | Route::ImageHistory(_)
+        | Route::SaveImage(_)
+        | Route::SaveImages
+        | Route::LoadImages
+        | Route::TagImage(_)
+        | Route::PushImage(_)
+        | Route::RemoveImage(_) => {
+            images_answer(shared, route, &query, body, request, imports).await
         }
-        Route::ListImages => images::list(shared, &query).await,
-        Route::InspectImage(name) => images::inspect(shared, name).await,
-        Route::TagImage(name) => images::tag(shared, name, &query).await,
-        Route::RemoveImage(name) => images::remove(shared, name, &query).await,
         Route::ListVolumes => volumes::list(shared, &query).await,
         Route::CreateVolume => {
             let body = body.ok_or_else(|| ApiError::internal("the volume's body"))?;
@@ -397,6 +485,7 @@ async fn answer(
         Route::InspectVolume(name) => volumes::inspect(shared, name).await,
         Route::RemoveVolume(name) => volumes::remove(shared, name, &query).await,
         Route::ArchiveGet(id) => archive::get(shared, id, &query).await,
+        Route::Export(id) => archive::export(shared, id).await,
         Route::ArchiveHead(id) => archive::head(shared, id, &query).await,
         Route::ArchivePut(id) => {
             let body = body.ok_or_else(|| ApiError::internal("the archive's body"))?;

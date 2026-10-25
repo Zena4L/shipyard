@@ -31,7 +31,8 @@ clap.workspace = true
 # Block device numbers for the I/O limit flags (`major`, `minor`).
 libc.workspace = true
 # `events --follow`'s polling.
-nix = { workspace = true, features = ["poll"] }
+# `term` for `login`'s prompt (echo off).
+nix = { workspace = true, features = ["poll", "term"] }
 # `--format`'s Go templates (step 11.3c).
 gotmpl.workspace = true
 # Docker's rows for `--format`, by their keys.
@@ -64,6 +65,8 @@ libc.workspace = true
 nix = { workspace = true, features = ["hostname", "term"] }
 proptest.workspace = true
 shipyard-test-support.workspace = true
+# Gzipped layers read back (tests/build.rs).
+flate2.workspace = true
 # `cp`'s tar streams (tests/runtime.rs).
 tar.workspace = true
 

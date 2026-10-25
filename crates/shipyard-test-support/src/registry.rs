@@ -3,7 +3,6 @@
 //! no network and no real registry. Used by `tests/image.rs` and the timing
 //! budgets (`tests/budgets.rs`).
 
-use std::fmt::Write as _;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -17,13 +16,10 @@ use crate::rootfs::RootFs;
 #[must_use]
 pub fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(bytes);
-    let mut hex = String::with_capacity(71);
-    hex.push_str("sha256:");
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    format!(
+        "sha256:{}",
+        shipyard_sys::hex::lower(&sha2::Sha256::digest(bytes))
+    )
 }
 
 /// Builds one image layer from `root`'s tree: the gzip-compressed tar, and
@@ -212,6 +208,49 @@ impl Scratch {
     #[must_use]
     pub fn store(&self) -> PathBuf {
         self.0.join("store")
+    }
+
+    /// `command` with this scratch's places: its image store, its
+    /// containers' records (a private directory in it), and the test
+    /// binary's other container places.
+    pub fn on<'c>(&self, command: &'c mut std::process::Command) -> &'c mut std::process::Command {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let containers = self.0.join("container-records");
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&containers);
+        crate::with_container_places(command)
+            .env("SHIPYARD_IMAGE_STORE", self.store())
+            .env("SHIPYARD_CONTAINER_DIR", containers)
+    }
+
+    /// `shipyard ARGS…` (the test's `binary`) on this scratch's places, its
+    /// input empty: its output.
+    ///
+    /// # Panics
+    ///
+    /// If it can't be run.
+    #[must_use]
+    pub fn shipyard(&self, binary: crate::Shipyard, args: &[&str]) -> std::process::Output {
+        self.on(&mut std::process::Command::new(binary.path()))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("running shipyard")
+    }
+
+    /// [`Scratch::shipyard`], which must succeed: its standard output.
+    ///
+    /// # Panics
+    ///
+    /// If it fails (its standard error said).
+    #[must_use]
+    pub fn ok(&self, binary: crate::Shipyard, args: &[&str]) -> String {
+        let output = self.shipyard(binary, args);
+        let (stdout, stderr) = crate::text(&output);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        stdout
     }
 }
 

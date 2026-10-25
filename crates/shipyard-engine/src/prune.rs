@@ -95,10 +95,14 @@ pub struct SystemPruned {
     /// The containers.
     pub containers: Result<ContainersPruned>,
     /// The networks (none where there are no networks of Shipyard's:
-    /// rootless, or not Linux).
-    pub networks: Result<Option<crate::network::Pruned>>,
+    /// rootless, or not Linux); as [`volumes`](Self::volumes), a part that
+    /// may not be one.
+    pub networks: Option<Result<crate::network::Pruned>>,
     /// The volumes, if asked for.
     pub volumes: Option<Result<crate::volumes::PruneReport>>,
+    /// The build cache (step 12.3): pruned before the images, so nothing
+    /// a prune needs is gone (and a prune never pulls).
+    pub build_cache: Result<crate::build::cache::Pruned>,
     /// The images.
     pub images: Result<ImagesPruned>,
 }
@@ -116,6 +120,14 @@ pub fn containers(engine: &Engine, filters: &ContainerPruneFilters) -> Result<Co
     crate::run::settle_for_prune(engine);
     for summary in crate::docker::list_containers(engine, true)? {
         if !STOPPED.contains(&summary.state) || !filters.wants(&summary) {
+            continue;
+        }
+        // A build's builder is its build's (made, then started; ended, then
+        // read): a killed build's goes with its cache (`builder prune`).
+        if summary
+            .labels
+            .contains_key(crate::build::cache::BUILDER_LABEL)
+        {
             continue;
         }
         let bytes = crate::image::owned_area_bytes(engine, &summary.id);
@@ -199,18 +211,27 @@ pub fn system(engine: &Engine, asked: &SystemPrune, now: i64) -> Result<SystemPr
     let containers = containers(engine, &containers_filters);
     let networks = crate::network::prune_where_any(engine, &|labels, created| {
         containers_filters.wants_made(created, labels)
-    });
+    })
+    .transpose();
     let volumes = asked.volumes.then(|| {
         crate::volumes::prune_where(engine, &|_, labels| {
             labels.contains_key(crate::docker::ANONYMOUS_VOLUME)
                 && containers_filters.wants_labels(labels)
         })
     });
+    // A prune with filters leaves the build cache (a context's cache has
+    // no labels or time a filter could read: never wiped for one).
+    let build_cache = if asked.filters.is_empty() {
+        crate::build::cache::prune(engine)
+    } else {
+        Ok(crate::build::cache::Pruned::default())
+    };
     let images = images(engine, &image_filters);
     Ok(SystemPruned {
         containers,
         networks,
         volumes,
+        build_cache,
         images,
     })
 }

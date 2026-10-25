@@ -563,7 +563,7 @@ pub(crate) fn store_id(engine: &Engine, make: bool) -> Result<Option<String>> {
     if let Some(id) = read() {
         return Ok(Some(id));
     }
-    let id = crate::random::hex(&crate::random::bytes::<16>()?);
+    let id = shipyard_sys::hex::lower(&crate::random::bytes::<16>()?);
     crate::fs::write_atomically(&store.dir, STORE_ID, id.as_bytes(), 0o600)
         .map_err(|err| err.io_as(ErrorKind::Storage))?
         .said(engine);

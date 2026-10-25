@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::digest::{Digest, Verifier, VerifyError};
 
 /// Mode for a finished blob: read-only for everyone (0o444).
-const BLOB_MODE: u32 = 0o444;
+pub(crate) const BLOB_MODE: u32 = 0o444;
 
 /// How many bytes to move at a time between the source and the blob file.
 /// Kept at 16 KiB: large enough that the per-call overhead is negligible for
@@ -426,6 +426,28 @@ impl Store {
             context: format!("opening the blob {}", path.display()),
             source,
         })
+    }
+
+    /// Opens blob `digest` with its size, or `None` if the store hasn't it
+    /// (an image's own blob gone: the image's to pull again, never the
+    /// caller's input to blame).
+    ///
+    /// # Errors
+    ///
+    /// It's there but can't be opened or looked at.
+    pub fn open_sized(&self, digest: &Digest) -> Result<Option<(File, u64)>, StoreError> {
+        if !self.contains(digest) {
+            return Ok(None);
+        }
+        let file = self.open_blob(digest)?;
+        let size = file
+            .metadata()
+            .map_err(|source| StoreError::Io {
+                context: format!("reading the blob {digest}"),
+                source,
+            })?
+            .len();
+        Ok(Some((file, size)))
     }
 
     /// Writes a blob read from `source`, verifying it hashes to `expected`.

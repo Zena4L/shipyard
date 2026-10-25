@@ -1329,7 +1329,7 @@ mod monitor;
 
 pub use control::{Waiter, hold, release, stop, wait, waiter};
 pub use exec::exec;
-pub use helper::{helper_entry_point, start_helper, start_helper_in_view};
+pub use helper::{helper_entry_point, start_helper, start_helper_alone, start_helper_in_view};
 
 pub use monitor::monitor_entry_point;
 
@@ -2517,8 +2517,7 @@ fn write_atomically_at(dir: &OwnedFd, name: &str, bytes: &[u8]) -> nix::Result<(
 /// A process's start time (`/proc/PID/stat` field 22), if it exists and
 /// hasn't exited (a zombie counts as gone).
 fn start_time(pid: i32) -> Option<u64> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    crate::process::start_time_in(&stat)
+    shipyard_sys::proc::start_time(pid)
 }
 
 /// Whether `pid` is still the process (an init or a monitor) recorded with
@@ -2759,14 +2758,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let line = format!("42 (a ) b (c) {fields_after} 777 23\n");
-        assert_eq!(crate::process::start_time_in(line.as_bytes()), Some(777));
+        assert_eq!(
+            shipyard_sys::proc::Stat::parse(line.as_bytes())
+                .filter(|stat| !stat.gone())
+                .map(|stat| stat.start),
+            Some(777)
+        );
         let zombie = line.replacen(") S", ") Z", 1);
         assert_eq!(
-            crate::process::start_time_in(zombie.as_bytes()),
+            shipyard_sys::proc::Stat::parse(zombie.as_bytes())
+                .filter(|stat| !stat.gone())
+                .map(|stat| stat.start),
             None,
             "a zombie is gone"
         );
-        assert_eq!(crate::process::start_time_in(b"garbage"), None);
+        assert_eq!(
+            shipyard_sys::proc::Stat::parse(b"garbage").map(|stat| stat.start),
+            None
+        );
     }
 
     #[test]

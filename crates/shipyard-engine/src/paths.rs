@@ -59,6 +59,14 @@ pub struct Paths {
         allow(dead_code, reason = "a start is Linux's")
     )]
     start_pause: Option<PathBuf>,
+    /// A test build's export of a running container by the walk that keeps
+    /// to its root mount, as where the kernel won't clone it alone
+    /// (`SHIPYARD_TEST_EXPORT_WALK`). A release never.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "an export is Linux's")
+    )]
+    export_walk: bool,
 }
 
 /// The variables that move a store (for [`Paths::store_overrides`]).
@@ -181,7 +189,20 @@ impl Paths {
             start_pause: std::env::var_os("SHIPYARD_TEST_START_PAUSE")
                 .filter(|path| cfg!(debug_assertions) && !path.is_empty())
                 .map(PathBuf::from),
+            export_walk: cfg!(debug_assertions)
+                && std::env::var_os("SHIPYARD_TEST_EXPORT_WALK").is_some_and(|set| set == "1"),
         }
+    }
+
+    /// Whether a test build exports a running container by the walk
+    /// (`SHIPYARD_TEST_EXPORT_WALK=1`), the clone left unused.
+    #[must_use]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "an export is Linux's")
+    )]
+    pub(crate) fn export_walk(&self) -> bool {
+        self.export_walk
     }
 
     /// A test build's pause in a create's fill, if one was asked for

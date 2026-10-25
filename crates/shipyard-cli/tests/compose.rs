@@ -24,21 +24,27 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use shipyard_test_support::registry::{Scratch, Serving, fixture, image_runs_here};
 use shipyard_test_support::{Shipyard, eventually, is_root, reference_tool};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
-/// One test's stores, socket, project directory and fixture image.
-struct Project {
-    scratch: Scratch,
-    image: String,
-    _registry: Serving,
+/// One test's stores, socket, project directory and fixture image:
+/// test-support's stores, with a compose project's place.
+struct Project(shipyard_test_support::stores::Stores);
+
+impl std::ops::Deref for Project {
+    type Target = shipyard_test_support::stores::Stores;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Project {
     /// Its stores, if `docker compose` is here and an image runs (else it
-    /// says why).
+    /// says why): the image in the store, so compose's `pull_policy:
+    /// missing` finds it (root's project runs where the registry can't be
+    /// reached).
     fn new() -> Option<Self> {
         if !reference_tool("docker") {
             return None;
@@ -52,33 +58,16 @@ impl Project {
             );
             return None;
         }
-        let (registry, image) = fixture();
-        let scratch = Scratch::new();
-        for dir in ["containers", "networks", "xdg", "sock", "docker", "project"] {
-            std::fs::create_dir_all(scratch.0.join(dir)).unwrap();
+        let stores = shipyard_test_support::stores::Stores::new(SHIPYARD)?;
+        for dir in ["sock", "docker", "project"] {
+            std::fs::create_dir_all(stores.scratch.0.join(dir)).unwrap();
         }
-        for dir in ["containers", "xdg", "sock"] {
-            std::fs::set_permissions(scratch.0.join(dir), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-        }
-        let project = Self {
-            scratch,
-            image,
-            _registry: registry,
-        };
-        // The image in the store: compose's `pull_policy: missing` finds it
-        // (root's project runs where the registry can't be reached).
-        let probe = project.shipyard(&[
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            &project.image,
-            "sh",
-            "-c",
-            "exit 0",
-        ]);
-        image_runs_here(&probe).then_some(project)
+        std::fs::set_permissions(
+            stores.scratch.0.join("sock"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        Some(Self(stores))
     }
 
     /// The API's socket for this test.
@@ -89,20 +78,13 @@ impl Project {
     /// `shipyard ARGS` on these stores (`compose …` too), in the project's
     /// directory.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(SHIPYARD.path());
+        let mut command = self.0.command(args);
         command
-            .args(args)
             .current_dir(self.scratch.0.join("project"))
-            .env("SHIPYARD_IMAGE_STORE", self.scratch.store())
-            .env("SHIPYARD_CONTAINER_DIR", self.scratch.0.join("containers"))
-            .env("SHIPYARD_NETWORK_DIR", self.scratch.0.join("networks"))
             .env("SHIPYARD_API_SOCKET", self.socket())
             .env("SHIPYARD_API_IDLE", "3")
             .env("DOCKER_CONFIG", self.scratch.0.join("docker"))
             .env("COMPOSE_PROJECT_NAME", "proj");
-        if !is_root() {
-            command.env("XDG_RUNTIME_DIR", self.scratch.0.join("xdg"));
-        }
         command
     }
 

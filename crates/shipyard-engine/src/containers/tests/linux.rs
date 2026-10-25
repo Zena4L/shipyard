@@ -26,16 +26,9 @@ fn the_state_reads_the_runtime_root_paths_give() {
         .unwrap();
     assert_eq!(state(&engine, &record).unwrap(), ContainerState::Created);
     let me = std::process::id();
-    let stat = fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
-    let started: u64 = stat
-        .rsplit(')')
-        .next()
+    let started = shipyard_sys::proc::stat(i32::try_from(me).unwrap())
         .unwrap()
-        .split_whitespace()
-        .nth(19)
-        .unwrap()
-        .parse()
-        .unwrap();
+        .start;
     let state_dir = runtime_root.join(record.id.as_str());
     fs::DirBuilder::new()
         .mode(0o700)

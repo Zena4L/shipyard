@@ -139,6 +139,12 @@ export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/shipyard/api.sock
 - `KillMode=process`: when the service exits (idle) or is stopped, only its own
   process ends. The containers it started run on: their monitors are in Shipyard's
   own cgroup (or, where there's no cgroup tree, left in the unit's).
+- `StartLimitIntervalSec=0`: started once a connection, the service has no start limit,
+  so a client retrying a request that made it fail never leaves the socket off until a
+  `systemctl reset-failed`. A service that can't start at all (a missing binary) with a
+  client waiting is started again at once, and the socket's own trigger limit (systemd's
+  default: 20 in 2 s) is what stops that: then the socket is off, said in its status,
+  until `systemctl [--user] restart shipyard.socket`.
 - `Environment=SHIPYARD_API_IDLE=SECONDS` (`systemctl [--user] edit shipyard.service`)
   sets another idle time. The stores' variables go there too, as for the boot units.
 - Edit `ExecStart` if `shipyard` isn't in `/usr/local/bin`.

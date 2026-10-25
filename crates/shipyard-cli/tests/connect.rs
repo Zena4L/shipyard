@@ -16,7 +16,7 @@
 )]
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use shipyard_network::dns::message::rtype;
 use shipyard_test_support::net::{NetworkDir, Upstream, addresses, resolve};
@@ -126,12 +126,13 @@ fn held_anywhere(path: &std::path::Path) -> bool {
 }
 
 /// Waits (up to 15 s) for `found`, naming `what` if it never comes.
-fn eventually(what: &str, mut found: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !found() {
-        assert!(Instant::now() < deadline, "never: {what}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+fn eventually(what: &str, found: impl FnMut() -> bool) {
+    shipyard_test_support::eventually_every(
+        Duration::from_secs(15),
+        Duration::from_millis(100),
+        what,
+        found,
+    );
 }
 
 /// A running container joins a network at once: a peer there finds it by

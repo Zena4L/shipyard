@@ -19,7 +19,16 @@ shipyard vm stop                         # its containers stopped, then the VM
   about a second, once its guest is built), and stops by itself when it's idle (below),
   or at `shipyard vm stop`.
 - **On the Mac:** `shipyard vm …` (the VM itself), `shipyard doctor` (this Mac's
-  checks), `--help` and `--version`.
+  checks), `shipyard login` and `logout` (your sign-ins are the Mac's: its keychain,
+  through Docker's credential helper), `--help` and `--version`.
+- **Signing in, in the VM:** `shipyard push` and `shipyard pull` sign in with the Mac's
+  credential for the image's registry, looked up on the Mac and handed to that one
+  command (never stored in the VM, never in any process's environment there). The Mac's
+  credential helper gets 15 seconds to answer for it (a keychain that asks to be
+  unlocked included); one that fails or doesn't answer is warned of, and the command goes
+  on without a credential (a public image needs none). A `run`
+  or `create` that pulls an image itself pulls anonymously: `shipyard pull` a private
+  image first.
 - **Not on a Mac:** `system recover` and `system stop` (a Linux host's boot and
   shutdown units run them; the VM's own start and stop do the same for its
   containers).

@@ -115,6 +115,10 @@ pub(crate) struct Packer<'r, W: Write> {
     refuse_link_copies: bool,
     /// How many such files it remembers ([`MAX_LINKS`]; fewer in a test).
     max_links: usize,
+    /// The mount its tree is on, if it keeps to it ([`Packer::within_mount`]).
+    own_mount: Option<u64>,
+    /// Whether a directory's name ends with `/` ([`Packer::naming_directories`]).
+    directory_slash: bool,
 }
 
 impl<'r, W: Write> Packer<'r, W> {
@@ -129,7 +133,43 @@ impl<'r, W: Write> Packer<'r, W> {
             sockets_skipped: 0,
             refuse_link_copies: false,
             max_links: MAX_LINKS,
+            own_mount: None,
+            directory_slash: false,
         }
+    }
+
+    /// One that names a directory with a trailing `/` (`bin/`), as Docker's
+    /// `export` and GNU tar write them (`export`'s, step 12.2b: checked
+    /// against Docker 29's).
+    pub(crate) fn naming_directories(mut self) -> Self {
+        self.directory_slash = true;
+        self
+    }
+
+    /// `name` as a directory's entry is named.
+    fn directory_name(&self, name: &Path) -> PathBuf {
+        if self.directory_slash && !name.as_os_str().is_empty() {
+            let mut named = name.as_os_str().to_owned();
+            named.push("/");
+            PathBuf::from(named)
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// One that keeps to the mount `root` is on (`export`'s walk where a
+    /// running container's root can't be cloned alone, step 12.2b): a mount
+    /// point under it is written as itself (a directory, an empty file),
+    /// never what's mounted there. Told by mount ID, never `st_dev`
+    /// (overlayfs gives a file its layer's device).
+    pub(crate) fn within_mount(mut self, root: &OwnedFd) -> Result<Self, PackError> {
+        let id = shipyard_sys::fs::mount_id(root).map_err(|source| PackError::Read {
+            doing: "reading the mount of",
+            path: "/".to_owned(),
+            source,
+        })?;
+        self.own_mount = Some(id);
+        Ok(self)
     }
 
     /// One that refuses a file with several names past [`MAX_LINKS`] rather
@@ -173,9 +213,27 @@ impl<'r, W: Write> Packer<'r, W> {
         let stat = fstat(fd).map_err(reading("reading", name))?;
         let kind = SFlag::from_bits_truncate(stat.st_mode & SFlag::S_IFMT.bits());
         let mut header = header_of(&stat);
+        if let Some(own) = self.own_mount {
+            let id = shipyard_sys::fs::mount_id(fd).map_err(|source| PackError::Read {
+                doing: "reading the mount of",
+                path: name.display().to_string(),
+                source,
+            })?;
+            if id != own {
+                // Another mount (a volume, a bind, /proc): only its place.
+                if kind == SFlag::S_IFDIR {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    let named = self.directory_name(name);
+                    return self.append(&mut header, &named, io::empty());
+                }
+                header.set_entry_type(tar::EntryType::Regular);
+                return self.append(&mut header, name, io::empty());
+            }
+        }
         if kind == SFlag::S_IFDIR {
             header.set_entry_type(tar::EntryType::Directory);
-            self.append(&mut header, name, io::empty())?;
+            let named = self.directory_name(name);
+            self.append(&mut header, &named, io::empty())?;
             return self.children(fd, name, depth);
         }
         if kind == SFlag::S_IFREG {

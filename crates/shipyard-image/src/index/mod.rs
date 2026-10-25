@@ -244,15 +244,33 @@ impl Index {
         reference: &str,
         record: ImageRecord,
     ) -> Result<Option<PathBuf>, IndexError> {
+        Self::record_many(root, &[(reference.to_owned(), record)])
+    }
+
+    /// [`record`](Self::record) of every one of `records` at once: one read
+    /// and one write of the index, whatever their number (a `load` of an
+    /// archive naming many tags, step 12.2a).
+    ///
+    /// # Errors
+    ///
+    /// As [`record`](Self::record)'s.
+    pub fn record_many(
+        root: &Path,
+        records: &[(String, ImageRecord)],
+    ) -> Result<Option<PathBuf>, IndexError> {
         let _lock = lock(root)?;
         let (mut index, moved) = match Self::open(root) {
             // Already there, the same: nothing to write (nor sync, on every run).
-            Ok(index) if index.images.get(reference) == Some(&record) => return Ok(None),
+            Ok(index)
+                if records
+                    .iter()
+                    .all(|(reference, record)| index.images.get(reference) == Some(record)) =>
+            {
+                return Ok(None);
+            }
             Ok(index) => (index, None),
             Err(IndexError::Corrupt { .. }) => {
-                let seconds = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_secs());
+                let seconds = shipyard_sys::time::unix_seconds();
                 // The PID too: two in the same second don't overwrite one
                 // another.
                 let aside = root.join(format!("{CORRUPT_PREFIX}{seconds}-{}", std::process::id()));
@@ -272,7 +290,9 @@ impl Index {
             }
             Err(err) => return Err(err),
         };
-        index.images.insert(reference.to_owned(), record);
+        for (reference, record) in records {
+            index.images.insert(reference.clone(), record.clone());
+        }
         index.save()?;
         Ok(moved)
     }

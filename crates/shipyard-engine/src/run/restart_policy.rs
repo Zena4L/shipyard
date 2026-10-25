@@ -161,25 +161,29 @@ pub(in crate::run) fn after_end(
     if !stateless(&root, id) {
         return;
     }
-    // Never started (its start failed before its command ran): no end.
-    let Some(started) = record.started else {
+    let Some(delay) = next_delay(&record) else {
         return;
     };
+    restart_after(engine, &root, id, delay, record.restart_count);
+}
+
+/// The delay before `record`'s policy starts it again after the end it
+/// records, as [`decide`] says; `None` if it won't, or if it never started
+/// (its start failed before its command ran: no end).
+pub(in crate::run) fn next_delay(record: &Record) -> Option<Duration> {
+    let started = record.started?;
     let ran_for = record
         .finished
         .and_then(|finished| finished.duration_since(started).ok())
         .unwrap_or_default();
-    let Some(delay) = decide(
+    decide(
         record.config.restart,
         record.exit.as_ref().and_then(|exit| exit.code),
         record.stopped_by_user,
         record.restart_count,
         ran_for,
         Duration::from_millis(record.restart_delay_ms),
-    ) else {
-        return;
-    };
-    restart_after(engine, &root, id, delay, record.restart_count);
+    )
 }
 
 /// Whether container `id` has no runtime state (none started it since).

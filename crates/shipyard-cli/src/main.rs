@@ -5,6 +5,7 @@
 //! `shipyard-runtime`.
 
 mod about;
+mod building;
 mod cli;
 mod compose;
 
@@ -34,6 +35,7 @@ mod output;
 mod prune;
 mod reporter;
 mod run;
+mod signing;
 mod stats;
 mod system;
 mod vm;
@@ -69,6 +71,13 @@ fn main() -> ExitCode {
     if let Err(err) = process::refuse_privileged_start() {
         return fail(&err.into(), EXIT_ENGINE_ERROR);
     }
+    // A credential handed to a forwarded push or pull (step 12.4): taken
+    // before anything opens a descriptor or starts a thread.
+    // SAFETY: one thread so far, nothing opened since the entry points.
+    let handed = match unsafe { signing::take_handed() } {
+        Ok(handed) => handed,
+        Err(err) => return fail(&err, EXIT_ENGINE_ERROR),
+    };
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -91,11 +100,15 @@ fn main() -> ExitCode {
         return code;
     }
     let failed = command.failure_code();
-    dispatch(command).unwrap_or_else(|err| fail(&err, failed))
+    dispatch(command, handed).unwrap_or_else(|err| fail(&err, failed))
 }
 
-/// Runs `command`: its exit code, or the error it failed with.
-fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
+/// Runs `command` (a `push` or `pull` with the credential it was `handed`,
+/// if one): its exit code, or the error it failed with.
+fn dispatch(
+    command: Command,
+    handed: Option<shipyard_engine::image::GivenCredential>,
+) -> anyhow::Result<ExitCode> {
     match command {
         Command::Run(command) => run::run_command(*command),
         Command::Create(command) => run::create(*command),
@@ -120,6 +133,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Wait(refs) => Ok(containers::wait(&refs.containers)),
         Command::Exec(args) => Ok(containers::exec(args)),
         Command::Cp(args) => containers::cp(&args),
+        Command::Export(args) => containers::export(&args),
         Command::Logs(args) => containers::logs(&args),
         Command::Events(args) => events_output::events(&args),
         Command::Rename(args) => containers::rename(&args.container, &args.new_name),
@@ -133,10 +147,19 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             &args.refs.containers,
             shipyard_engine::run::RemoveOptions::new(args.force, args.volumes),
         )),
-        Command::Pull(args) => images::pull(&args.reference, args.quiet),
+        Command::Pull(args) => images::pull(&args.reference, args.quiet, handed),
         Command::Images(args) => images::list(&args),
         Command::Rmi(args) => Ok(images::rmi(&args.images, args.force)),
         Command::Tag(args) => images::tag(&args.source, &args.target),
+        Command::Save(args) => images::save(&args),
+        Command::Load(args) => images::load(&args),
+        Command::History(args) => images::history(&args),
+        Command::Build(args) => building::build(&args),
+        Command::Builder(building::BuilderCommand::Prune(args)) => building::builder_prune(&args),
+        Command::Import(args) => images::import(&args),
+        Command::Push(args) => signing::push(&args, handed),
+        Command::Login(args) => signing::login(&args),
+        Command::Logout { server } => signing::logout(server.as_deref()),
         Command::Image(ImageCommand::Prune(args)) => prune::images(&args),
         Command::Container(ContainerCommand::Prune(args)) => prune::containers(&args),
         Command::Image(ImageCommand::Inspect { images, shown }) => {
@@ -148,7 +171,13 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             ImageCommand::Ls(_)
             | ImageCommand::Rm(_)
             | ImageCommand::Pull(_)
-            | ImageCommand::Tag(_),
+            | ImageCommand::Tag(_)
+            | ImageCommand::Save(_)
+            | ImageCommand::Load(_)
+            | ImageCommand::History(_)
+            | ImageCommand::Build(_)
+            | ImageCommand::Import(_)
+            | ImageCommand::Push(_),
         ) => anyhow::bail!("a group's command reached the dispatch unflattened"),
         Command::Volume(command) => volumes::command(&command),
         Command::Network(command) => networks::command(&command),
@@ -175,7 +204,7 @@ fn fail(err: &anyhow::Error, code: u8) -> ExitCode {
     if broken_pipe(err) {
         return ExitCode::SUCCESS;
     }
-    reporter::report(err, code)
+    reporter::report_error(err, code)
 }
 
 /// Whether `err` is a write to this process's output whose reader has gone

@@ -62,9 +62,12 @@ pub(crate) mod linux_test {
     /// it fails instead. (As `shipyard-test-support`'s `reference_tool`,
     /// which this crate can't use: that crate depends on this one.)
     pub(crate) fn reference_tool(name: &str) -> bool {
-        let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .chain(["/usr/sbin".into(), "/sbin".into()])
-            .any(|dir| dir.join(name).is_file());
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::env::split_paths(&path).chain(["/usr/sbin".into(), "/sbin".into()]);
+        let found = std::env::join_paths(dirs)
+            .ok()
+            .and_then(|path| shipyard_sys::path::find_program(name, Some(&path)))
+            .is_some();
         if !found {
             assert!(
                 std::env::var("SHIPYARD_TEST_TOOLS").as_deref() != Ok("required"),

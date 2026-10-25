@@ -260,16 +260,7 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 #[must_use]
 pub fn find(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let path = path.unwrap_or(std::ffi::OsStr::new(DEFAULT_PATH));
-    std::env::split_paths(path)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("pasta"))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    shipyard_sys::path::find_program("pasta", Some(path))
 }
 
 /// pasta's arguments for the container whose network namespace is
@@ -594,15 +585,10 @@ pub struct Lost {
 }
 
 /// Process `pid`'s start time (`/proc/PID/stat`'s 22nd field), if it's
-/// alive (a zombie has none worth following: it's ended).
+/// alive (a zombie, or one dead, has none worth following: it's ended).
 #[cfg(target_os = "linux")]
 fn start_time(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    if fields.first() == Some(&"Z") {
-        return None;
-    }
-    fields.get(19)?.parse().ok()
+    shipyard_sys::proc::start_time(pid)
 }
 
 #[cfg(target_os = "linux")]

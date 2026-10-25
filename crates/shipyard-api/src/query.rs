@@ -38,6 +38,16 @@ impl Query {
         Ok(Self(pairs))
     }
 
+    /// Every value of `key`, in order (`names=a&names=b`: `docker save A
+    /// B`), empty ones left out.
+    pub(crate) fn get_all(&self, key: &str) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|(name, value)| name == key && !value.is_empty())
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
     /// `key`'s value: its first, if it's given more than once (Go's
     /// `Form.Get`).
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
@@ -78,6 +88,17 @@ impl Query {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every value of a key given more than once, in order, an empty one
+    /// left out (`docker save A B` sends `names=A&names=B`: 12.2a's plan
+    /// review, `get` alone saved A only).
+    #[test]
+    fn every_value_of_a_key_is_had() {
+        let query = Query::parse(Some("names=alpine%3A3.20&names=busybox&names=&other=x")).unwrap();
+        assert_eq!(query.get_all("names"), ["alpine:3.20", "busybox"]);
+        assert_eq!(query.get("names"), Some("alpine:3.20"));
+        assert!(query.get_all("none").is_empty());
+    }
 
     #[test]
     fn values_are_decoded() {

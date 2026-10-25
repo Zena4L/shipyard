@@ -350,12 +350,7 @@ fn pasta_goes_with_a_killed_cli() {
         assert!(Path::new(&format!("/proc/{pasta}")).exists());
         // Out of the terminal's reach: a process group of its own, not
         // shipyard's (whose Ctrl-C is the container's to handle).
-        let group = |pid: i32| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-            // After the command's name (in parentheses): state, ppid, pgrp.
-            let after = &stat[stat.rfind(')').unwrap() + 2..];
-            after.split(' ').nth(2).unwrap().to_owned()
-        };
+        let group = |pid: i32| shipyard_sys::proc::stat(pid).unwrap().pgrp;
         assert_ne!(group(pasta), group(running.pid()));
         running.signal(libc::SIGKILL);
         let _ = running.finish_status();

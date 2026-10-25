@@ -21,9 +21,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use shipyard_test_support::registry::{
-    Scratch, Serving, fixture, fixture_requiring, image_runs_here,
-};
+use shipyard_test_support::registry::fixture_requiring;
 use shipyard_test_support::{Shipyard, api, eventually, is_root, reference_tool};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
@@ -31,66 +29,31 @@ const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 /// How long the service may take to listen.
 const LISTENING: Duration = Duration::from_secs(10);
 
-/// One test's stores, fixture image, and service.
-struct Stores {
-    scratch: Scratch,
-    image: String,
-    _registry: Serving,
+/// One test's stores, fixture image, and service: test-support's stores,
+/// with what only the API's tests do.
+struct Stores(shipyard_test_support::stores::Stores);
+
+impl std::ops::Deref for Stores {
+    type Target = shipyard_test_support::stores::Stores;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Stores {
     /// Its stores, if an image runs here (else it says why), with the
-    /// image pulled (the API's create never pulls).
+    /// image pulled (the API's create never pulls), and a Docker config
+    /// directory of its own.
     fn new() -> Option<Self> {
-        let scratch = Scratch::new();
-        for dir in ["containers", "networks", "xdg", "docker"] {
-            std::fs::create_dir_all(scratch.0.join(dir)).unwrap();
-        }
-        for dir in ["containers", "xdg"] {
-            std::fs::set_permissions(scratch.0.join(dir), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-        }
-        let (registry, image) = fixture();
-        let stores = Self {
-            scratch,
-            image,
-            _registry: registry,
-        };
-        let probe = stores.shipyard(&[
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            &stores.image,
-            "sh",
-            "-c",
-            "exit 0",
-        ]);
-        image_runs_here(&probe).then_some(stores)
+        let stores = shipyard_test_support::stores::Stores::new(SHIPYARD)?;
+        std::fs::create_dir_all(stores.scratch.0.join("docker")).unwrap();
+        Some(Self(stores))
     }
 
     /// The service's socket.
     fn socket(&self) -> PathBuf {
         self.scratch.0.join("run").join("api.sock")
-    }
-
-    /// `shipyard ARGS`, not yet run, on these stores.
-    fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(SHIPYARD.path());
-        command
-            .args(args)
-            .env("SHIPYARD_IMAGE_STORE", self.scratch.store())
-            .env("SHIPYARD_CONTAINER_DIR", self.scratch.0.join("containers"))
-            .env("SHIPYARD_NETWORK_DIR", self.scratch.0.join("networks"));
-        if !is_root() {
-            command.env("XDG_RUNTIME_DIR", self.scratch.0.join("xdg"));
-        }
-        command
-    }
-
-    /// `shipyard ARGS`, on these stores.
-    fn shipyard(&self, args: &[&str]) -> Output {
-        self.command(args).output().expect("running shipyard")
     }
 
     /// `shipyard system service` on [`socket`](Self::socket), listening.
@@ -810,6 +773,199 @@ fn docker_prunes() {
         let system = stores.docker(args);
         assert!(system.status.success(), "{args:?}: {system:?}");
     }
+}
+
+/// `docker login` and `docker push` through the API (step 12.4): the
+/// sign-in checked by the service (`POST /auth`) and kept by Docker's CLI,
+/// which hands it in with the push (`X-Registry-Auth`); the image on the
+/// registry under its ID, every write signed in; Docker's CLI reads the
+/// push's lines (its `digest: … size: …`).
+#[test]
+fn docker_pushes_through_the_api() {
+    use shipyard_test_support::push_registry::{Auth, PushRegistry};
+    if !reference_tool("docker") {
+        return;
+    }
+    let Some(stores) = Stores::new() else { return };
+    // The loopback registry reachable (a push, no container).
+    let _service = stores.serve_here(60);
+    let basic = {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("me:pw")
+        )
+    };
+    let registry = PushRegistry::start(Auth::Basic(basic.clone()));
+    let name = format!("{}/app:1", registry.base);
+    stores.docker_ok(&["tag", &stores.image, &name]);
+    let mut login =
+        stores.docker_command(&["login", "-u", "me", "--password-stdin", &registry.base]);
+    let mut child = login
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(b"pw\n").unwrap();
+    }
+    let signed = child.wait_with_output().unwrap();
+    assert!(signed.status.success(), "{signed:?}");
+    let pushed = stores.docker_ok(&["push", &name]);
+    let id = stores.docker_ok(&["image", "inspect", "--format", "{{.Id}}", &name]);
+    assert!(
+        pushed.contains(&format!("1: digest: {id} size: ")),
+        "{pushed}"
+    );
+    let state = registry.state();
+    assert!(
+        state
+            .manifests
+            .contains_key(&("app".to_owned(), "1".to_owned()))
+    );
+    assert!(
+        state
+            .log
+            .iter()
+            .filter(|seen| seen.method != "GET" && seen.method != "HEAD")
+            .all(|seen| seen.authorization.as_deref() == Some(basic.as_str())),
+        "{:?}",
+        state.log
+    );
+}
+
+/// `docker save`, `load` and `history` through the API (step 12.2a): two
+/// names in one archive (`/images/get?names=…&names=…`), the archive loaded
+/// back once both are removed, the same IDs; a cut archive refused, as
+/// Docker's CLI reads the failure; `history`'s rows.
+#[test]
+fn docker_saves_loads_and_shows_history() {
+    if !reference_tool("docker") {
+        return;
+    }
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let image = stores.image.clone();
+    stores.docker_ok(&["tag", &image, "saved/second:2"]);
+    let ids = || {
+        let mut lines: Vec<String> = stores
+            .docker_ok(&[
+                "images",
+                "--no-trunc",
+                "--format",
+                "{{.Repository}}:{{.Tag}} {{.ID}}",
+            ])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        // One load gives its names one time: in either order.
+        lines.sort();
+        lines
+    };
+    let before = ids();
+    let archive = stores.scratch.0.join("saved.tar");
+    let archive = archive.to_str().unwrap();
+    stores.docker_ok(&["save", "-o", archive, &image, "saved/second:2"]);
+    // One image, two names: Docker's `manifest.json` has both tags.
+    let listed = Command::new("tar")
+        .args(["-xOf", archive, "manifest.json"])
+        .output()
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(manifest.as_array().map(Vec::len), Some(1), "{manifest}");
+    assert_eq!(
+        manifest[0]["RepoTags"].as_array().map(Vec::len),
+        Some(2),
+        "{manifest}"
+    );
+
+    // A repository alone is every tag of it (here only `:2`, no
+    // `:latest`): found as the save finds it, not refused 404.
+    let repository = stores.scratch.0.join("repository.tar");
+    stores.docker_ok(&["save", "-o", repository.to_str().unwrap(), "saved/second"]);
+    // (Docker's CLI refuses a device for `-o` itself: a file.)
+    let nothing = stores.scratch.0.join("nothing.tar");
+    let missing = stores.docker(&["save", "-o", nothing.to_str().unwrap(), "no/such"]);
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("No such image: no/such"),
+        "{missing:?}"
+    );
+    stores.docker_ok(&["rmi", &image, "saved/second:2"]);
+    assert_eq!(stores.docker_ok(&["images", "-q"]), "");
+    let said = stores.docker_ok(&["load", "-i", archive]);
+    assert!(said.contains("Loaded image: saved/second:2"), "{said}");
+    assert_eq!(ids(), before, "the same names and IDs");
+
+    // Cut short: refused, nothing more loaded, and Docker's CLI fails.
+    let whole = std::fs::read(archive).unwrap();
+    let cut = stores.scratch.0.join("cut.tar");
+    std::fs::write(&cut, &whole[..whole.len() / 2]).unwrap();
+    let refused = stores.docker(&["load", "-i", cut.to_str().unwrap()]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("cut short"),
+        "{refused:?}"
+    );
+
+    let history = stores.docker_ok(&["history", "--no-trunc", "-q", "saved/second:2"]);
+    let rows: Vec<&str> = history.lines().collect();
+    assert!(rows[0].starts_with("sha256:"), "{history}");
+    assert_eq!(rows.len(), 1, "one layer: {history}");
+    let table = stores.docker_ok(&["history", "saved/second:2"]);
+    assert!(table.starts_with("IMAGE"), "{table}");
+}
+
+/// `docker export` and `docker import` through the API (step 12.2b): a
+/// container's own filesystem out, imported back with a change, run; an
+/// import with no name refused before anything is kept (its body several
+/// MiB: Docker's CLI reads the refusal, not a broken pipe); an export of a
+/// container that isn't there, Docker's 404.
+#[test]
+fn docker_exports_and_imports() {
+    if !reference_tool("docker") {
+        return;
+    }
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let image = stores.image.clone();
+    stores.docker_ok(&["create", "--name", "src", &image]);
+    let archive = stores.scratch.0.join("rootfs.tar");
+    let archive = archive.to_str().unwrap();
+    stores.docker_ok(&["export", "-o", archive, "src"]);
+    assert!(std::fs::metadata(archive).unwrap().len() > 1024 * 1024);
+    let id = stores.docker_ok(&[
+        "import",
+        "-c",
+        r#"CMD ["/bin/cat", "/marker"]"#,
+        "-m",
+        "via the API",
+        archive,
+        "imported:1",
+    ]);
+    assert!(id.starts_with("sha256:"), "{id}");
+    let ran = stores.docker_ok(&["run", "--rm", "--network", "none", "imported:1"]);
+    assert!(ran.contains("shipyard test root filesystem"), "{ran}");
+
+    // No `-m`: Docker's CLI sends `message` empty, and the comment is
+    // Docker's own.
+    stores.docker_ok(&["import", archive, "imported:2"]);
+    let comment = stores.docker_ok(&["history", "--format", "{{.Comment}}", "imported:2"]);
+    assert_eq!(comment, "Imported from -");
+    let unnamed = stores.docker(&["import", archive]);
+    assert!(!unnamed.status.success(), "{unnamed:?}");
+    assert!(
+        String::from_utf8_lossy(&unnamed.stderr).contains("give the image a name"),
+        "{unnamed:?}"
+    );
+    let missing = stores.docker(&["export", "-o", archive, "no-such"]);
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("No such container"),
+        "{missing:?}"
+    );
 }
 
 /// Docker's CLI drives a container's whole life through the API: create,
@@ -2250,6 +2406,249 @@ fn an_exec_s_detach_keys_end_its_session_only() {
     assert!(stores.shipyard(&["rm", "-f", "box"]).status.success());
 }
 
+/// A service that bound its own socket (`shipyard compose`'s, the guest's)
+/// ends idle with the socket's name gone and its lock let go first (F149):
+/// at its last look at what's queued, a client finds no socket, and a
+/// service of its own binds the same place at once (never refused until the
+/// old one has gone). The control: it answered while it served.
+#[test]
+fn an_idle_service_s_socket_goes_before_it_does() {
+    let Some(stores) = Stores::new() else { return };
+    let socket = stores.socket();
+    let pause = stores.scratch.0.join("idle-end");
+    let service_at = |pause: Option<&std::path::Path>| {
+        let mut command = stores.command(&["system", "service", "--socket"]);
+        command
+            .arg(&socket)
+            .env("SHIPYARD_API_IDLE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(pause) = pause {
+            command.env("SHIPYARD_TEST_API_IDLE_PAUSE", pause);
+        }
+        Running(command.spawn().unwrap())
+    };
+    let mut old = service_at(Some(&pause));
+    api::wait_for(&socket, LISTENING);
+    assert_eq!(
+        api::get(&socket, "/_ping").unwrap().status,
+        200,
+        "the control"
+    );
+    eventually(Duration::from_secs(30), "the idle end", || pause.exists());
+    let refused = std::os::unix::net::UnixStream::connect(&socket).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::NotFound, "{refused}");
+    assert!(
+        old.0.try_wait().unwrap().is_none(),
+        "still there, at its pause"
+    );
+    let mut next = service_at(None);
+    api::wait_for(&socket, LISTENING);
+    assert_eq!(
+        api::get(&socket, "/_ping").unwrap().status,
+        200,
+        "its successor"
+    );
+    std::fs::remove_file(&pause).unwrap();
+    eventually(Duration::from_secs(30), "the old one's end", || {
+        old.0.try_wait().unwrap().is_some()
+    });
+    eventually(Duration::from_secs(30), "its successor's idle end", || {
+        next.0.try_wait().unwrap().is_some()
+    });
+}
+
+/// An exec's input reaches its command as it comes, without a terminal
+/// too: a line answered while the client's input is still open, never held
+/// until it ends (`std::io::copy` from the client's socket to the command's
+/// pipe was a `splice` that waited: 12.5a's probe).
+#[test]
+fn an_exec_s_input_reaches_it_as_it_comes() {
+    use std::io::{Read as _, Write as _};
+    let Some(stores) = Stores::new() else { return };
+    assert!(
+        stores
+            .shipyard(&[
+                "run",
+                "-d",
+                "--network",
+                "none",
+                "--name",
+                "box",
+                &stores.image,
+                "sleep",
+                "300",
+            ])
+            .status
+            .success()
+    );
+    let _service = stores.serve(60);
+    let socket = stores.socket();
+    let body = json!({
+        "Cmd": ["sh", "-c", "read line; echo \"got $line\"; sleep 30"],
+        "AttachStdin": true, "AttachStdout": true
+    });
+    let made = api::post(&socket, "/containers/box/exec", Some(&body)).unwrap();
+    assert_eq!(made.status, 201, "{}", made.text());
+    let id = made.json()["Id"].as_str().unwrap().to_owned();
+    let (status, mut session) = api::upgrade(
+        &socket,
+        &format!("/exec/{id}/start"),
+        &json!({"Detach": false}),
+    )
+    .unwrap();
+    assert_eq!(status, 101);
+    session.write_all(b"hello\n").unwrap();
+    session
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut out = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !String::from_utf8_lossy(&out).contains("got hello") {
+        let read = session.read(&mut buffer);
+        assert!(
+            matches!(read, Ok(1..)),
+            "{read:?}, the input still open: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        out.extend_from_slice(&buffer[..read.unwrap()]);
+    }
+    assert!(stores.shipyard(&["rm", "-f", "box"]).status.success());
+}
+
+/// A finished exec's session ends both ways (F148): the client reads its
+/// stream's end, and what it writes after is refused (the service's end
+/// shut for reading too: its input thread, holding a copy of the client,
+/// gone), never taken by a thread that waits for the client to close. The
+/// control: its input reached the command while it ran.
+#[test]
+fn a_finished_exec_s_session_ends_both_ways() {
+    use std::io::{Read as _, Write as _};
+    let Some(stores) = Stores::new() else { return };
+    assert!(
+        stores
+            .shipyard(&[
+                "run",
+                "-d",
+                "--network",
+                "none",
+                "--name",
+                "box",
+                &stores.image,
+                "sleep",
+                "300",
+            ])
+            .status
+            .success()
+    );
+    let _service = stores.serve(60);
+    let socket = stores.socket();
+    let body = json!({
+        "Cmd": ["sh", "-c", "read line; echo \"got $line\""],
+        "Tty": true, "AttachStdin": true, "AttachStdout": true
+    });
+    let made = api::post(&socket, "/containers/box/exec", Some(&body)).unwrap();
+    assert_eq!(made.status, 201, "{}", made.text());
+    let id = made.json()["Id"].as_str().unwrap().to_owned();
+    let (status, mut session) = api::upgrade(
+        &socket,
+        &format!("/exec/{id}/start"),
+        &json!({"Detach": false}),
+    )
+    .unwrap();
+    assert_eq!(status, 101);
+    session.write_all(b"hello\r").unwrap();
+    session
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut out = Vec::new();
+    let read = session.read_to_end(&mut out);
+    assert!(
+        read.is_ok(),
+        "{read:?}: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out).contains("got hello"),
+        "the control: {out:?}"
+    );
+    eventually(
+        Duration::from_secs(10),
+        "a write after the end refused",
+        || session.write_all(b"more\n").is_err(),
+    );
+    assert!(stores.shipyard(&["rm", "-f", "box"]).status.success());
+}
+
+/// An exec's command gets its container's descriptor limit (the runtime's
+/// snapshot of it), never the one the service raised for itself (F151's
+/// premise, checked: the container here was started with this test's own
+/// soft limit). The control: the service's own soft limit is its hard one.
+#[test]
+fn an_exec_gets_its_container_s_descriptor_limit() {
+    use std::io::Read as _;
+    let Some(stores) = Stores::new() else { return };
+    assert!(
+        stores
+            .shipyard(&[
+                "run",
+                "-d",
+                "--network",
+                "none",
+                "--name",
+                "box",
+                &stores.image,
+                "sleep",
+                "300",
+            ])
+            .status
+            .success()
+    );
+    let (_, hard) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+    if hard <= 1024 {
+        eprintln!("skipping: the hard descriptor limit is 1024 here");
+        return;
+    }
+    let service = stores.serve_limited(60, (1024, hard));
+    let limits = std::fs::read_to_string(format!("/proc/{}/limits", service.0.id())).unwrap();
+    let open_files = limits
+        .lines()
+        .find(|line| line.starts_with("Max open files"))
+        .unwrap();
+    assert_eq!(
+        open_files.split_whitespace().nth(3),
+        Some(hard.to_string().as_str()),
+        "the control: the service raised its own: {open_files}"
+    );
+    let socket = stores.socket();
+    let body = json!({"Cmd": ["sh", "-c", "ulimit -n"], "AttachStdout": true});
+    let made = api::post(&socket, "/containers/box/exec", Some(&body)).unwrap();
+    assert_eq!(made.status, 201, "{}", made.text());
+    let id = made.json()["Id"].as_str().unwrap().to_owned();
+    let (status, mut session) = api::upgrade(
+        &socket,
+        &format!("/exec/{id}/start"),
+        &json!({"Detach": false}),
+    )
+    .unwrap();
+    assert_eq!(status, 101);
+    let mut out = Vec::new();
+    session.read_to_end(&mut out).unwrap();
+    let (soft, _) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+    let said = String::from_utf8_lossy(&out);
+    assert!(
+        said.contains(&format!("{soft}\n")),
+        "the container's: {said:?}"
+    );
+    assert!(
+        !said.contains(&format!("{hard}\n")),
+        "not the service's: {said:?}"
+    );
+    assert!(stores.shipyard(&["rm", "-f", "box"]).status.success());
+}
+
 /// `docker exec -e KEY=VALUE`: the value reaches the command, and no
 /// process but Docker's own CLI has it on its argv (the service's child
 /// names the key only).
@@ -2498,8 +2897,8 @@ fn a_pull_takes_the_client_s_credentials() {
     );
 }
 
-/// The image endpoints' refusals, through the raw API: an import, another
-/// platform, a pull without `fromImage`, a bad `X-Registry-Auth`, a filter
+/// The image endpoints' refusals, through the raw API: an import from a
+/// URL or with no name (step 12.2b), another platform, a pull without `fromImage`, a bad `X-Registry-Auth`, a filter
 /// not read, an unknown image (404, Docker's words).
 #[test]
 fn image_refusals_are_docker_s() {
@@ -2508,6 +2907,7 @@ fn image_refusals_are_docker_s() {
     let socket = stores.socket();
     for path in [
         "/images/create?fromSrc=-",
+        "/images/create?fromSrc=https%3A%2F%2Fexample.com%2Fx.tar&repo=a",
         "/images/create?fromImage=alpine&platform=windows/amd64",
         "/images/create?tag=1",
     ] {

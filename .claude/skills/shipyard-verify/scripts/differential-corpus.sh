@@ -264,7 +264,7 @@ WORK=$work perl -pe '
     s/[0-9]+ (seconds|second|minutes|minute) ago/<AGO>/g;
     s/"(secs_since_epoch|nanos_since_epoch)": [0-9]+/"$1": <N>/g;
     s/"Created": [0-9]+/"Created": <N>/g;
-    s/"(pid|started_at|finished_at|time|timeNano|started|finished|boot|boot_id|serial)": ?[^,}]+/"$1": <N>/g;
+    s/"(pid|Pid|started_at|finished_at|time|timeNano|started|finished|boot|boot_id|serial)": ?[^,}]+/"$1": <N>/g;
     s/(pid|PID) [0-9]+/$1 <N>/g;
     s/[0-9.]+ ?(B|kB|KB|MB|GB|KiB|MiB|GiB)\b/<SIZE>/g;
     s/in [0-9.]+(ms|s)\b/in <DUR>/g;

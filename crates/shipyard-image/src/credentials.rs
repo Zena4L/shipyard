@@ -24,7 +24,7 @@
 //! `poll(2)` on its pipes, not a thread, then it's killed.
 
 use std::collections::BTreeMap;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::AsFd as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+
+mod write;
+
+pub use write::{Forgotten, Kept};
 
 /// How long a credential helper may take to answer.
 pub const HELPER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -106,6 +110,14 @@ pub enum CredentialError {
         path: String,
         /// What's wrong with it.
         reason: String,
+    },
+    /// The config file couldn't be written.
+    #[error("writing {path}: {source}")]
+    Write {
+        /// The config file.
+        path: String,
+        /// The error.
+        source: std::io::Error,
     },
     /// A credential helper failed, or can't be run.
     #[error("the credential helper docker-credential-{helper}: {reason}")]
@@ -274,6 +286,25 @@ impl Credentials {
             helper: name.to_owned(),
             reason,
         };
+        match self.run_helper(name, "get", server.as_bytes())? {
+            Answer::Done(stdout) => parse_answer(&stdout).map_err(failed),
+            Answer::NotFound => Ok(None),
+        }
+    }
+
+    /// Runs the helper `name` with `action` (`get`, `store`, `erase`),
+    /// `input` on its standard input (a secret only ever there): what it
+    /// wrote, or that it had nothing for the server.
+    fn run_helper(
+        &self,
+        name: &str,
+        action: &str,
+        input: &[u8],
+    ) -> Result<Answer, CredentialError> {
+        let failed = |reason: String| CredentialError::Helper {
+            helper: name.to_owned(),
+            reason,
+        };
         if !valid_helper_name(name) {
             return Err(failed(
                 "not a helper name (letters, digits, `.`, `_` and `-` only)".to_owned(),
@@ -286,7 +317,7 @@ impl Credentials {
         };
         let spawn = || {
             Command::new(&program)
-                .arg("get")
+                .arg(action)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -317,11 +348,11 @@ impl Credentials {
         // Short: well under a pipe's buffer, so this can't block. A helper
         // that exits without reading it is no reason to fail here.
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(server.as_bytes());
+            let _ = stdin.write_all(input);
         }
         let (stdout, stderr, status) = collect(&mut child, self.helper_timeout).map_err(failed)?;
         if status.success() {
-            return parse_answer(&stdout).map_err(failed);
+            return Ok(Answer::Done(stdout));
         }
         // A failing helper says why on stdout (Docker's helpers do) or
         // stderr. Never anything that looks like an answer: one that printed
@@ -335,12 +366,20 @@ impl Credentials {
             .as_deref()
             .is_some_and(|message| message.contains("credentials not found"))
         {
-            return Ok(None);
+            return Ok(Answer::NotFound);
         }
         Err(failed(
             message.unwrap_or_else(|| format!("it failed ({status})")),
         ))
     }
+}
+
+/// What a helper answered.
+enum Answer {
+    /// It did it: what it wrote on its standard output.
+    Done(Vec<u8>),
+    /// It had nothing for that server (`credentials not found`).
+    NotFound,
 }
 
 /// The parts of Docker's `config.json` read here.
@@ -390,19 +429,12 @@ impl AuthEntry {
         let Some(auth) = self.auth.as_ref().filter(|auth| !auth.is_empty()) else {
             return Ok(None);
         };
-        let bad = || CredentialError::Config {
-            path: path.display().to_string(),
-            reason: "an `auth` that isn't base64 of `user:password`".to_owned(),
-        };
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(auth.trim())
-            .map_err(|_| bad())?;
-        let decoded = String::from_utf8(decoded).map_err(|_| bad())?;
-        let (username, password) = decoded.split_once(':').ok_or_else(bad)?;
-        Ok(Some(Credential::Basic {
-            username: username.to_owned(),
-            password: password.to_owned(),
-        }))
+        let (username, password) =
+            basic_from_auth(auth).ok_or_else(|| CredentialError::Config {
+                path: path.display().to_string(),
+                reason: "an `auth` that isn't base64 of `user:password`".to_owned(),
+            })?;
+        Ok(Some(Credential::Basic { username, password }))
     }
 }
 
@@ -416,39 +448,62 @@ where
     Ok(Option::<BTreeMap<String, V>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// The config file at `path`, through a link to its target: a regular file
+/// of at most [`MAX_CONFIG`] bytes, never a FIFO waited on; `None` if
+/// there's none.
+fn config_bytes(path: &Path) -> Result<Option<Vec<u8>>, CredentialError> {
+    match shipyard_sys::fs::read_bounded(&real_path(path), MAX_CONFIG) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CredentialError::Read {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
+/// `path`, or what it links to (a link that leads nowhere: `path`).
+fn real_path(path: &Path) -> PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+        }
+        _ => path.to_owned(),
+    }
+}
+
+/// Where in a config `err` is: never what (the values are secrets).
+fn where_invalid(path: &Path, err: &serde_json::Error) -> CredentialError {
+    CredentialError::Config {
+        path: path.display().to_string(),
+        reason: format!(
+            "not valid JSON at line {}, column {}",
+            err.line(),
+            err.column()
+        ),
+    }
+}
+
 /// The config at `path`; `None` if there's none.
 fn read_config(path: &Path) -> Result<Option<DockerConfig>, CredentialError> {
-    let read_error = |source| CredentialError::Read {
-        path: path.display().to_string(),
-        source,
+    let Some(bytes) = config_bytes(path)? else {
+        return Ok(None);
     };
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(read_error(err)),
-    };
-    let mut bytes = Vec::new();
-    file.take(MAX_CONFIG + 1)
-        .read_to_end(&mut bytes)
-        .map_err(read_error)?;
-    let invalid = |reason: String| CredentialError::Config {
-        path: path.display().to_string(),
-        reason,
-    };
-    if bytes.len() as u64 > MAX_CONFIG {
-        return Err(invalid(format!("larger than {MAX_CONFIG} bytes")));
-    }
     serde_json::from_slice(&bytes)
         .map(Some)
-        // Where, never what: serde's message can quote a value, and the
-        // values here are secrets.
-        .map_err(|err| {
-            invalid(format!(
-                "not valid JSON at line {}, column {}",
-                err.line(),
-                err.column()
-            ))
-        })
+        .map_err(|err| where_invalid(path, &err))
+}
+
+/// `auth`'s username and password (base64 of `user:password`, as
+/// Docker's config and `AuthConfig` hold them), if it's that.
+#[must_use]
+pub fn basic_from_auth(auth: &str) -> Option<(String, String)> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(auth.trim())
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_owned(), password.to_owned()))
 }
 
 /// Signs in to the registry `server` names (a client's

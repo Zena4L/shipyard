@@ -5,6 +5,143 @@ All notable changes to Shipyard. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change
 behaviour; each change is listed here).
 
+## 0.4.0 - unreleased
+
+### Added
+
+- **`save`, `load` and `history`** (step 12.2a), in the CLI (`image save|load|history`
+  too) and the API (`GET /images/{name}/get`, `GET /images/get?names=…`, `POST
+  /images/load`, `GET /images/{name}/history`), so `docker save`, `docker load` and
+  `docker history` work through it. `save` writes Docker 25's archive (an OCI layout
+  with `manifest.json`), each image's blobs as stored: its ID kept, the same bytes
+  each time. `load` reads that, Docker's older archive and BuildKit's OCI layout,
+  plain or gzipped, as hostile: members matched by name and never extracted, every
+  blob checked against its digest, staged and moved into the store only once the
+  whole archive is read and sound, nothing fetched from a registry; a cut archive
+  loads nothing, a tag it moves is said, an untagged image is refused (said).
+- **`export` and `import`** (step 12.2b), in the CLI (`container export`, `image
+  import` too) and the API (`GET /containers/{id}/export`, `POST
+  /images/create?fromSrc=-`), so `docker export` and `docker import` work through it.
+  `export` writes a container's own filesystem, running or stopped, never its volumes:
+  a running one's root mount is read alone (a copy of it with nothing mounted on it,
+  made in its namespaces), so what a volume covers is exported as it is underneath, as
+  Docker's. `import` makes a root filesystem's archive a one-layer image, named (a name
+  is required), gzipped as it's stored, its config set by `--change` (`CMD`,
+  `ENTRYPOINT`, `ENV`, `EXPOSE`, `LABEL`, `USER`, `VOLUME`, `WORKDIR`, `STOPSIGNAL`);
+  the archive read whole and checked before anything is kept.
+
+- **`build`** (step 12.3, D28), also `image build`: a Dockerfile built by BuildKit
+  (`moby/buildkit:v0.34.1`, pinned by digest) in a container Shipyard runs for the build
+  and removes at its end, in a user namespace with `CAP_SYS_ADMIN` only there and seccomp
+  unconfined (said in the docs). `-t`, `-f` (`-` too), `--build-arg`, `--target`,
+  `--no-cache`, `--pull`, `--label`, `-q`, `--progress`, `--secret`, `-o type=local|tar`.
+  The image loaded under the build's names alone; a context the builder couldn't read
+  whole refused by name (BuildKit would copy an unreadable file empty). A cache per
+  context directory, kept between builds; `builder prune`, `system prune`'s and the
+  API's `/build/prune` empty it; `system df` has its `Build Cache` row.
+
+- **`push`, `login` and `logout`** (step 12.4), also `image push`; and the API's `POST
+  /images/{name}/push`, so `docker push` works through it. A push sends an image's
+  stored blobs and manifest as they are (its ID kept), skips blobs the registry has,
+  signs in for push access, never follows an upload to another host, and starts an
+  upload over when a step fails or a token expires. `login` checks a sign-in, then keeps
+  it where `docker login` does (Docker's config: its credential helper, else the file,
+  warned as unencrypted; every other key, the file's mode, owner and link kept);
+  `logout` removes it. On a Mac, `login`/`logout` run on the Mac, and a forwarded
+  `push` or `pull` is handed the Mac's credential for its registry.
+
+- **A build uses the store's own images** (12.5's readiness review): a `FROM`, `COPY
+  --from` or `RUN --mount=from=` naming an image Shipyard has (built, pulled, loaded or
+  imported) is built from it, as Docker's builder does, never pulled (`--pull` asks the
+  registry again). Each image the Dockerfile or a build arg mentions is given to
+  BuildKit as a named context over an OCI layout of its blobs, hard-linked from the
+  store, read-only.
+- **A build cache no build has used for a week is removed** by the next build of
+  another context (said): a host that builds in a new directory each time (CI) no longer
+  keeps each one's cache, about 10 GB, for good.
+
+### Changed
+
+- **Pull and push progress show sizes as Docker's pull does** (`2.048kB`, `4.089MB`,
+  not `2.0 KiB`), with the rest of the CLI's formatter (F145).
+- **A program is never looked for through a relative `PATH` entry** (`.`, an empty
+  one): `newuidmap`/`newgidmap` were found through one before, so a program of that
+  name in the directory a rootless command was run from could have been run in their
+  place (the hint a `run` gives for a host command looked there too) (F145).
+- **A registry that takes a credential but not the account's access** (a token the
+  registry then refuses) is said as `denied: …` for the repository, no longer as
+  credentials to sign in again with; messages name `shipyard login` beside `docker
+  login`.
+
+### Fixed
+
+- **`rm` right after a container with no restart policy ended** (a `start -a`, a
+  script's `run` then `rm`) could be refused as "restarting": its clean-up held the
+  restart lock for a moment at every end. It holds it only for an end its policy starts
+  again (found by 12.5c3's full run).
+- **`docker exec -i` without a terminal** passed the client's input on only once it
+  ended (a line typed into an interactive `sh` waited for the client to close): it
+  goes on as it comes (found in 12.5a).
+- **A volume's `CreatedAt`** (`volume inspect`, the API) moved when its first fill made
+  and removed its marker beside the data: the making's time is kept in its own
+  `created.json` (a volume made before keeps the old answer) (F146).
+- **An exec whose start failed** (no process could be made) was left "started", and a
+  retry refused: it can be started again; and a finished exec's session now ends both
+  ways, so the service's thread passing its input on goes at once (F148).
+- **A service `shipyard compose` (or the macOS guest) started** removes its socket's name
+  before its idle end, so a client never connects to a service about to go (it starts a
+  new one); its output goes to `service.log` beside the socket (it went nowhere); and
+  the systemd units set no start limit, so a client retrying a request that crashed
+  the service can't leave its socket off (F149).
+- **`save` of an image pulled through a multi-platform index** now carries that index
+  (as Docker 25's), so a name with the index's digest loads back, and the image keeps
+  it (12.2a wrote the platform's manifest only, and `load` refused such a name).
+- **A load or import refused before its body's end** (no name, an archive found
+  unsound half way) no longer leaves Docker's CLI with a broken pipe instead of the
+  refusal: the API reads and drops the rest of the body (up to 1 GiB, a minute).
+- **`build` on a Mac** refused every context in the home (the guest checked it as root
+  for other users' access, which a Mac's home never gives): the home the VM shares is
+  read by the builder as you read it, and is checked so (the stage-12 close).
+- **A killed build's builder** ran on until the next build of its context, and a cache
+  prune removed the cache under it: `builder prune` (and `system prune`'s build cache)
+  removes the builder first, and `container prune` leaves a build's builder to it.
+- **`build -f -` on a Mac** read a Dockerfile typed at the terminal (until Ctrl-D): it's
+  refused there as on Linux; the Mac's terminal refusals give Linux's hints.
+- **`--platform linux`** was taken by `pull` and refused by `import` and `build`: one
+  rule for the three (the host's OS alone, its architecture alone, `os/arch`,
+  `os/arch/variant`).
+- **`save` of an image the store lost a blob of** was said as a bad request: it's the
+  store's (as `push` says it), and a damaged record is refused, never saved without
+  its index.
+- **Every rootless run with a named volume failed on Fedora** (and wherever `newuidmap`
+  has file capabilities instead of being setuid root): the volume's fill helper hid
+  itself before its ID maps were written, and such a `newuidmap` couldn't open them. It
+  lets them be written first (found by the stage-12 close's Fedora milestone; Ubuntu's
+  setuid `newuidmap` never showed it). The refusal now names both ways a `newuidmap`
+  may be allowed.
+- **An error whose reason was part of its own words said it twice** (`load` of an
+  archive with an unsafe entry: "…has an unsafe path: …has an unsafe path"): each reason
+  is said once (found by the stage-12 book's "Try it").
+- **A build said "waiting for another build"** when `system df` counted its cache at
+  the same moment: said only after a second's wait.
+
+### Security
+
+- **A repository's `Dockerfile` (or its `Dockerfile.dockerignore`) that's a link** was
+  followed anywhere: a hostile checkout could hand BuildKit any file you (or, as root,
+  root) can read, such as a private key, for a `# syntax=` frontend or a parse error to
+  show. Each is read only from inside the context or `-f`'s own directory; a link
+  leading out is refused.
+- **A build's secrets** were copied beside its Dockerfile, where a frontend reads every
+  file: they're bound apart.
+- **An archive `save -o`, `export -o` or `build -o type=tar` wrote** was readable to
+  every user (0644 by the umask, and an existing 0600 file replaced by one): it's 0600,
+  as Docker's (12.5's readiness review).
+- **As root, `build -o type=local,dest=DIR` followed a symbolic link** at DIR or on its
+  way: another user's `/tmp/out` linked to `/etc` would have had the build's files
+  written there as root. DIR is reached without following one, and one on its way is
+  refused (12.5's readiness review).
+
 ## 0.3.0 - unreleased
 
 ### Added

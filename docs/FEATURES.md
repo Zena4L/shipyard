@@ -374,12 +374,17 @@ Testcontainers, and Docker's clients on the Mac; what's left moved to stages 12,
 
 ## 12. Build and images — stage 12
 
-Decided 2026-10-15 (ROADMAP D28).
+Decided 2026-10-15 (ROADMAP D28). **Done** 2026-10-25, steps 12.1–12.5
+([notes](stages/12-build-images.md)): build, push and sign-in, archives; what's left moved
+to stage 15 (the notes' "moved out" table: F156–F162).
 
-- **`shipyard build`:** BuildKit, started on demand in a container and stopped after the
-  build, its cache in a volume; Dockerfiles in full (multi-stage, cache mounts) as
-  BuildKit reads them.
-- **Images:** `push`, `tag`, `login`/`logout`, `image inspect` / `history` / `save` /
+- **`shipyard build`:** BuildKit, started on demand in a container and removed after the
+  build (one per build, in a user namespace of its own: D12-2), its cache kept per build
+  context (a directory of the store's, not a volume: D12.3-5); Dockerfiles in full
+  (multi-stage, cache mounts, secrets) as BuildKit reads them; `-o` for files instead of an
+  image. On a Mac too, through its VM.
+- **Images:** `push`, `tag`, `login`/`logout` (where `docker login` keeps them; a Mac's
+  credential handed to its VM's push or pull), `image inspect` / `history` / `save` /
   `load`, `import`/`export`.
 
 ## 13. macOS production — stage 13

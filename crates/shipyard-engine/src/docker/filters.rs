@@ -75,8 +75,15 @@ impl Given {
         ))
     }
 
+    /// Whether no filter was given.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.values().all(Vec::is_empty)
+    }
+
     /// `KEY=VALUE` pairs, as the CLI's `-f` takes them (a key repeated
     /// adds a value).
+    #[must_use]
     pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut given: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (key, value) in pairs {

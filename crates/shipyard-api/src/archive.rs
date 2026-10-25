@@ -44,7 +44,7 @@ type Reply = Result<Response<Body>, ApiError>;
 const STAT_HEADER: &str = "x-docker-container-path-stat";
 
 /// How many of a PUT body's frames wait for the copy at most.
-const BODY_FRAMES: usize = 16;
+pub(crate) const BODY_FRAMES: usize = 16;
 
 /// How long a copy waits for its client to read or send more before it
 /// lets the container go.
@@ -192,17 +192,56 @@ pub(crate) async fn get(shared: &Arc<Shared>, id: String, query: &Query) -> Repl
     Ok(response)
 }
 
+/// `GET /containers/{id}/export` (`docker export`, step 12.2b): the
+/// container's own filesystem as one tar, as the engine's
+/// `cp::export_by_name` writes it, sent as it's made; never its volumes.
+/// One that isn't there is 404 before the headers; a failure after them
+/// breaks the stream off.
+///
+/// # Errors
+///
+/// Not there (404); more streams than are served (503).
+pub(crate) async fn export(shared: &Arc<Shared>, id: String) -> Reply {
+    let name = id.clone();
+    shared
+        .call(move |engine| shipyard_engine::docker::inspect_container(engine, &name))
+        .await
+        .map_err(|error| match error.status {
+            StatusCode::NOT_FOUND => {
+                ApiError::new(StatusCode::NOT_FOUND, format!("No such container: {id}"))
+            }
+            _ => error,
+        })?;
+    let permit = streams::stream_permit(shared)?;
+    let (sender, cut, body) = reply::cuttable();
+    let mut writer = ChannelWriter::new(shared, sender.clone());
+    let exporter = Arc::clone(shared);
+    tokio::spawn(async move {
+        let _permit = permit;
+        // Held until the export's fate is known: the stream ends only after.
+        let _sender = sender;
+        let exported = exporter
+            .call(move |engine| shipyard_engine::cp::export_by_name(engine, &id, &mut writer))
+            .await;
+        if let Err(error) = exported {
+            tracing::warn!(error = %error.message, "an export broke off: its archive was cut");
+            cut.cut();
+        }
+    });
+    Ok(reply::channelled(StatusCode::OK, "application/x-tar", body))
+}
+
 /// A tar written into a stream's channel, as the client reads it; given up
 /// on when the client has gone, the service stops, or nothing has been
 /// taken for [`STALL`].
-struct ChannelWriter {
+pub(crate) struct ChannelWriter {
     sender: Sender,
     gone: Gone,
     last: Arc<Mutex<Instant>>,
 }
 
 impl ChannelWriter {
-    fn new(shared: &Arc<Shared>, sender: Sender) -> Self {
+    pub(crate) fn new(shared: &Arc<Shared>, sender: Sender) -> Self {
         let base = streams::gone(shared, &sender);
         let last = Arc::new(Mutex::new(Instant::now()));
         let since = Arc::clone(&last);
@@ -320,7 +359,7 @@ fn read_only(error: &shipyard_engine::Error) -> bool {
 /// The body's frames into `frames`, as they come: an error in it sent as
 /// one (the copy fails), its end the channel's. Each frame sent, and its
 /// end however it comes, bumps `progress`: the copy's reader waits on it.
-async fn pump_body(
+pub(crate) async fn pump_body(
     mut body: Incoming,
     frames: mpsc::Sender<std::io::Result<Bytes>>,
     progress: Arc<reply::Progress>,
@@ -328,18 +367,60 @@ async fn pump_body(
     // (Its end: a guard for a task dropped mid-way, and below, the sender
     // dropped first, so the reader woken sees the body's end at once.)
     let _ended = reply::BumpOnDrop(Arc::clone(&progress));
-    pump_frames(&mut body, &frames, &progress).await;
+    let reader_gone = pump_frames(&mut body, &frames, &progress).await;
     drop(frames);
     progress.bump();
+    if reader_gone {
+        drain(&mut body).await;
+    }
+}
+
+/// The most of a body read and dropped once its reader has gone.
+const DRAIN_MOST: u64 = 1024 * 1024 * 1024;
+
+/// How long a body is read and dropped once its reader has gone.
+const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reads and drops what's left of `body` (at most [`DRAIN_MOST`], for
+/// [`DRAIN_WAIT`]): its reader refused it before its end (a load or an
+/// import with no name, an archive found unsound half way), and a client
+/// still sending would otherwise meet a closed connection, a broken pipe,
+/// instead of reading the refusal (Docker's CLI does: 12.2b).
+async fn drain(body: &mut Incoming) {
+    /// Drains at once: past it, a refused body's client meets a closed
+    /// connection, as before, rather than any number of them reading.
+    const MOST: usize = 8;
+    static DRAINING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    struct Draining;
+    impl Drop for Draining {
+        fn drop(&mut self) {
+            DRAINING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if DRAINING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MOST {
+        DRAINING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let _draining = Draining;
+    let deadline = tokio::time::Instant::now() + DRAIN_WAIT;
+    let mut drained = 0_u64;
+    while drained <= DRAIN_MOST {
+        match tokio::time::timeout_at(deadline, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                drained += frame.data_ref().map_or(0, |data| data.len() as u64);
+            }
+            _ => return,
+        }
+    }
 }
 
 /// [`pump_body`]'s frames, until the body's end, an error in it, or its
-/// reader gone.
+/// reader gone: whether it was that.
 async fn pump_frames(
     body: &mut Incoming,
     frames: &mpsc::Sender<std::io::Result<Bytes>>,
     progress: &reply::Progress,
-) {
+) -> bool {
     while let Some(frame) = body.frame().await {
         let next = match frame {
             Ok(frame) => match frame.into_data() {
@@ -350,17 +431,42 @@ async fn pump_frames(
             Err(error) => Err(std::io::Error::other(error)),
         };
         let failed = next.is_err();
-        if frames.send(next).await.is_err() || failed {
-            return;
+        if frames.send(next).await.is_err() {
+            return true;
+        }
+        if failed {
+            return false;
         }
         progress.bump();
     }
+    false
+}
+
+/// A request body as an engine call reads it (`load`'s, `import`'s): a
+/// stream permit, held for the call, and the body as a blocking reader,
+/// its frames pumped as they come (the rest drained if the call refuses it
+/// before its end, so the client reads the refusal).
+///
+/// # Errors
+///
+/// More streams than are served (503).
+pub(crate) fn body_input(
+    shared: &Arc<Shared>,
+    body: Incoming,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, BodyReader), ApiError> {
+    let permit = streams::stream_permit(shared)?;
+    let (frames, receiver) = mpsc::channel(BODY_FRAMES);
+    let progress = Arc::new(reply::Progress::default());
+    tokio::spawn(pump_body(body, frames, Arc::clone(&progress)));
+    let service = Arc::clone(shared);
+    let stopping = Gone::new(move || service.idle.is_stopping());
+    Ok((permit, BodyReader::new(receiver, progress, stopping)))
 }
 
 /// A request body, read on a blocking thread: its frames as they come. An
 /// error in it is one here too, and stays one (never its end); so is
 /// [`STALL`] without a byte, or the service stopping.
-struct BodyReader {
+pub(crate) struct BodyReader {
     frames: mpsc::Receiver<std::io::Result<Bytes>>,
     /// Bumped by the pump as frames come and as it ends.
     progress: Arc<reply::Progress>,
@@ -371,7 +477,7 @@ struct BodyReader {
 }
 
 impl BodyReader {
-    fn new(
+    pub(crate) fn new(
         frames: mpsc::Receiver<std::io::Result<Bytes>>,
         progress: Arc<reply::Progress>,
         stopping: Gone,

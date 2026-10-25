@@ -159,6 +159,10 @@ impl Index {
             }
         }
 
+        // A load's staging directory (`blobs/.load-<pid>-<n>`) a killed load
+        // left: its lock free.
+        crate::archive::staging::sweep_staging(&self.root.join("blobs"));
+
         // Extracted layer directories (`layers/<hex>`, and its `-caller`,
         // `-map-` and `-on-` forms) no image or running container needs, and
         // leftovers. Anything else

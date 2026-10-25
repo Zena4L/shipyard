@@ -170,7 +170,7 @@ as_tester() (
     exec setpriv --reuid tester --regid tester --init-groups \
         env HOME=/home/tester "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" \
         SHIPYARD_TEST_DELEGATED=required SHIPYARD_TEST_ROOTLESS=required \
-        SHIPYARD_TEST_TOOLS=required \
+        SHIPYARD_TEST_TOOLS=required SHIPYARD_TEST_NETWORK=required \
         "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" "$@"
 )
 
@@ -290,12 +290,34 @@ mount --bind /tmp/resolv.conf /etc/resolv.conf
 # any failure fails the run.
 failed=
 echo "== tests, as a normal user"
-as_tester cargo test --locked --workspace --no-fail-fast || failed="$failed tester"
+# The build tests (12.3) run on their own after both passes (below).
+as_tester env SHIPYARD_TEST_BUILD=later cargo test --locked --workspace --no-fail-fast \
+  || failed="$failed tester"
 as_root
 echo "== tests, including the root-only ones, run as root"
 # The image has ip, nft and dig: the differential tests (H5) must run.
-SHIPYARD_TEST_TOOLS=required cargo test --locked --workspace --no-fail-fast -- --include-ignored \
+SHIPYARD_TEST_TOOLS=required SHIPYARD_TEST_NETWORK=required SHIPYARD_TEST_BUILD=later \
+  cargo test --locked --workspace --no-fail-fast -- --include-ignored \
   || failed="$failed root"
+# The build tests (12.3) need a registry by name: a rootless builder's DNS
+# goes through pasta to the host's resolver, which the loopback one above
+# isn't (nothing serves it here; a systemd host's does). Run with the
+# container's own resolver, after the passes, four at a time, each step on a
+# fresh /tmp (each test holds a BuildKit image there: beside what the passes
+# left, rootless stores' subordinate files among it, the tmpfs ran out).
+umount /etc/resolv.conf
+fresh_tmp() {
+    umount -l /tmp && mount -t tmpfs -o mode=1777 tmpfs /tmp
+}
+echo "== build tests, as a normal user"
+fresh_tmp
+as_tester cargo test --locked -p shipyard-cli --test build -- --test-threads 4 \
+  || failed="$failed build-tester"
+echo "== build tests, as root"
+fresh_tmp
+SHIPYARD_TEST_NETWORK=required \
+  cargo test --locked -p shipyard-cli --test build -- --include-ignored --test-threads 4 \
+  || failed="$failed build-root"
 if [ -n "$failed" ]; then
   echo "== tests failed:$failed"
   exit 1

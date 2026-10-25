@@ -14,7 +14,34 @@ use super::{Decoder, Frame, FrameError, VERSION};
 
 /// The request's format, written in it from the first (H2): a newer one is
 /// refused, never guessed at.
-pub const REQUEST_VERSION: u32 = 2;
+pub const REQUEST_VERSION: u32 = 3;
+
+/// The version a request is written at unless it carries a credential
+/// ([`Request::registry_auth`], version 3): a guest of an older build
+/// reads every other request as before, and refuses only that one.
+const BASE_VERSION: u32 = 2;
+
+/// The descriptor a forwarded command finds its handed credential on
+/// ([`Request::registry_auth`]: a pipe, read whole and closed first thing),
+/// named in [`REGISTRY_AUTH_FD_ENV`] (step 12.4, D12.4-2).
+pub const REGISTRY_AUTH_FD: i32 = 3;
+
+/// The variable that says a command was handed a credential on
+/// [`REGISTRY_AUTH_FD`]: its value is that number, never the credential.
+pub const REGISTRY_AUTH_FD_ENV: &str = "SHIPYARD_REGISTRY_AUTH_FD";
+
+/// A credential the Mac hands a forwarded `push` or `pull` for its image's
+/// registry (Docker's `X-Registry-Auth` encoding: base64url of its auth
+/// JSON). Its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RegistryAuth(pub String);
+
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RegistryAuth(<redacted>)")
+    }
+}
 
 /// The guest agent's vsock port.
 pub const AGENT_PORT: u32 = 1024;
@@ -252,17 +279,11 @@ pub const HIDE_KEY: &str = "shipyard.hide=";
 /// `paths` as [`HIDE_KEY`]'s value.
 #[must_use]
 pub fn hidden_value(paths: &[&str]) -> String {
-    use std::fmt::Write as _;
-    let mut value = String::new();
-    for (at, path) in paths.iter().enumerate() {
-        if at > 0 {
-            value.push(',');
-        }
-        for byte in path.bytes() {
-            let _ = write!(value, "{byte:02x}");
-        }
-    }
-    value
+    paths
+        .iter()
+        .map(|path| shipyard_sys::hex::lower(path.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The paths a kernel command line's [`HIDE_KEY`] names (those it can't
@@ -459,6 +480,13 @@ pub fn hello(request: &Request) -> Result<Frame, RequestError> {
     })
 }
 
+/// This machine's clock, as [`Request::time`] carries it: `None` for one
+/// set before the epoch (the guest never follows that).
+#[must_use]
+pub fn clock() -> Option<u64> {
+    Some(shipyard_sys::time::unix_seconds()).filter(|&seconds| seconds > 0)
+}
+
 /// The most an encoded request may be: what one frame carries, less the
 /// hello's version.
 pub const MAX_REQUEST: usize = super::MAX_PAYLOAD - 4;
@@ -494,6 +522,11 @@ pub struct Request {
     /// follow after the Mac slept (version 2).
     #[serde(default)]
     pub time: Option<u64>,
+    /// The Mac's credential for a `push`'s or `pull`'s registry, handed to
+    /// that command alone (version 3, step 12.4): never stored in the
+    /// guest, never in any process's environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_auth: Option<RegistryAuth>,
 }
 
 impl From<shipyard_sys::versioned::Error> for RequestError {
@@ -527,7 +560,7 @@ impl Request {
     #[must_use]
     pub fn new(args: Vec<String>, cwd: String, env: Vec<(String, String)>) -> Self {
         Self {
-            version: REQUEST_VERSION,
+            version: BASE_VERSION,
             args,
             cwd,
             env,
@@ -535,7 +568,18 @@ impl Request {
             input: false,
             terminal: None,
             time: None,
+            registry_auth: None,
         }
+    }
+
+    /// The same, handing the command `auth` (written at version 3, which a
+    /// guest of an older build refuses, saying so: never a push or pull
+    /// that goes on anonymously by surprise).
+    #[must_use]
+    pub fn with_registry_auth(mut self, auth: RegistryAuth) -> Self {
+        self.registry_auth = Some(auth);
+        self.version = REQUEST_VERSION;
+        self
     }
 
     /// A request that isn't a command (`args`: [`PORTS_REQUEST`],
@@ -550,10 +594,7 @@ impl Request {
             "/".to_owned(),
             Vec::new(),
         );
-        request.time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|since| since.as_secs());
+        request.time = clock();
         request
     }
 
@@ -837,8 +878,23 @@ mod tests {
         );
         assert!(near.encode().unwrap().len() <= MAX_REQUEST, "the control");
         assert_eq!(
-            Request::decode(br#"{"version":3,"args":[],"cwd":"/","env":[]}"#),
-            Err(RequestError::Newer(3))
+            Request::decode(br#"{"version":4,"args":[],"cwd":"/","env":[]}"#),
+            Err(RequestError::Newer(4))
+        );
+        // Without a credential, version 2 (an older guest reads it); with
+        // one, 3 (an older guest refuses it, never runs it anonymously),
+        // read back whole, its `Debug` never showing it.
+        assert_eq!(request.version, 2);
+        let handed = request
+            .clone()
+            .with_registry_auth(RegistryAuth("c2VjcmV0".to_owned()));
+        assert_eq!(handed.version, 3);
+        assert_eq!(Request::decode(&handed.encode().unwrap()).unwrap(), handed);
+        assert!(!format!("{handed:?}").contains("c2VjcmV0"));
+        assert!(
+            !String::from_utf8(request.encode().unwrap())
+                .unwrap()
+                .contains("registry_auth")
         );
         // Version 1, as 10.3a's CLI wrote it: read, its new fields their
         // defaults.

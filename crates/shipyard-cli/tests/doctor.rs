@@ -140,10 +140,8 @@ fn rootless_without_pasta_isnt_ready() {
     let bin = scratch.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     for helper in ["newuidmap", "newgidmap"] {
-        let found = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-            .map(|dir| dir.join(helper))
-            .find(|path| path.is_file())
-            .unwrap();
+        let found =
+            shipyard_sys::path::find_program(helper, std::env::var_os("PATH").as_deref()).unwrap();
         std::os::unix::fs::symlink(found, bin.join(helper)).unwrap();
     }
     let report = doctor(|command| {

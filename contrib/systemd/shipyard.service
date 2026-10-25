@@ -7,6 +7,10 @@ Description=Shipyard: the Docker API
 Documentation=https://github.com/Zena4L/shipyard/tree/main/contrib/systemd
 Requires=shipyard.socket
 After=shipyard.socket
+# No start limit: socket-activated, it's started once a connection, and a
+# client retrying a request that ended it (a crash) must never leave the
+# socket off until `systemctl reset-failed` (F149).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

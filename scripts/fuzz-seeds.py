@@ -382,6 +382,88 @@ API_REQUESTS = {
 }
 
 
+def archive_seeds():
+    """Image archives as `load` reads them (step 12.2a): Docker 25's (an OCI
+    layout with `manifest.json`), BuildKit's OCI layout alone, Docker's
+    legacy archive (a duplicate layer as a symlink), gzipped, and hostile
+    members (`..`, absolute, links out)."""
+    import gzip
+    import hashlib
+
+    def blob(data):
+        return hashlib.sha256(data).hexdigest()
+
+    layer = tar_bytes(lambda tar: add(tar, "f", data=b"x"))
+    config = json.dumps({
+        "architecture": "amd64", "os": "linux", "rootfs": {"type": "layers",
+        "diff_ids": ["sha256:" + blob(layer)]},
+        "history": [{"created_by": "/bin/sh -c #(nop) ADD f /"}],
+    }).encode()
+    manifest = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": "sha256:" + blob(config), "size": len(config)},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:" + blob(layer), "size": len(layer)}],
+    }).encode()
+    index = json.dumps({
+        "schemaVersion": 2,
+        "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                       "digest": "sha256:" + blob(manifest), "size": len(manifest),
+                       "annotations": {"io.containerd.image.name": "docker.io/library/a:1",
+                                       "org.opencontainers.image.ref.name": "1"}}],
+    }).encode()
+
+    def oci(tar, with_manifest_json):
+        add(tar, "oci-layout", data=b'{"imageLayoutVersion":"1.0.0"}')
+        add(tar, "index.json", data=index)
+        add(tar, "blobs", tarfile.DIRTYPE, mode=0o755)
+        add(tar, "blobs/sha256", tarfile.DIRTYPE, mode=0o755)
+        for data in (layer, config, manifest):
+            add(tar, "blobs/sha256/" + blob(data), data=data)
+        if with_manifest_json:
+            add(tar, "manifest.json", data=json.dumps([{
+                "Config": "blobs/sha256/" + blob(config), "RepoTags": ["a:1"],
+                "Layers": ["blobs/sha256/" + blob(layer)]}]).encode())
+
+    def legacy(tar):
+        add(tar, blob(config) + ".json", data=config)
+        add(tar, "l1/layer.tar", data=layer)
+        add(tar, "l2/layer.tar", tarfile.SYMTYPE, link="../l1/layer.tar")
+        add(tar, "manifest.json", data=json.dumps([{
+            "Config": blob(config) + ".json", "RepoTags": ["a:1"],
+            "Layers": ["l1/layer.tar", "l2/layer.tar"]}]).encode())
+
+    def hostile(tar):
+        add(tar, "../outside/canary", data=b"dead")
+        add(tar, "/abs", data=b"x")
+        add(tar, "blobs/sha256/" + "0" * 64, data=b"not its digest")
+        add(tar, "l/layer.tar", tarfile.SYMTYPE, link="../l/layer.tar")
+        add(tar, "manifest.json", data=b'[{"Config":"../x","Layers":["l/layer.tar"]}]')
+
+    docker = tar_bytes(lambda tar: oci(tar, True))
+    yield "docker", docker
+    yield "oci", tar_bytes(lambda tar: oci(tar, False))
+    yield "legacy", tar_bytes(legacy)
+    yield "gzip", gzip.compress(docker, mtime=0)
+    yield "hostile", tar_bytes(hostile)
+    yield "cut", docker[: len(docker) // 2]
+
+
+# `import --change` (step 12.2b): a change a line, each form Docker's
+# import takes, and its refusals.
+IMPORT_CHANGES = {
+    "exec": 'CMD ["/bin/app", "--serve"]\nENTRYPOINT ["tini", "--"]',
+    "shell": "CMD echo hi && sleep 1\nENTRYPOINT [not json",
+    "env": 'ENV A=1 B="two words" C=it\\\'s\nENV LEGACY a whole line',
+    "label": 'LABEL org.example="x y" z=1',
+    "expose": "EXPOSE 80 53/udp 8000-8010/tcp 1-1024",
+    "simple": "USER app:app\nWORKDIR /srv\nSTOPSIGNAL SIGINT",
+    "volume": 'VOLUME ["/data", "/logs"]\nVOLUME /cache /tmp',
+    "refused": "RUN make\nONBUILD RUN x\nENV KEY\nEXPOSE 70000",
+}
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -418,6 +500,10 @@ def main():
         write(f"{root}/process_json", name, json.dumps(process).encode())
     for name, request in API_REQUESTS.items():
         write(f"{root}/api_request", name, request)
+    for name, archive in archive_seeds():
+        write(f"{root}/load_archive", name, archive)
+    for name, changes in IMPORT_CHANGES.items():
+        write(f"{root}/import_change", name, changes.encode())
 
 
 if __name__ == "__main__":

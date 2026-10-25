@@ -49,6 +49,8 @@ fn serve(idle: Duration) -> Served {
             version: "0.3.0".to_owned(),
             revision: "abc1234".to_owned(),
         },
+        bound: None,
+        idle_end_pause: None,
     };
     let (done, ended) = mpsc::channel();
     std::thread::spawn(move || {

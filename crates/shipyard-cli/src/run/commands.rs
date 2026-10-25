@@ -235,14 +235,6 @@ fn hint_host_command(word: Option<&str>) {
 /// names a program on this process's `PATH`: what `run sh` meant before
 /// the image came first.
 pub(super) fn is_host_command(image: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    if image.contains(['/', ':', '@', '.']) {
-        return false;
-    }
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(image))
-                .is_ok_and(|file| file.is_file() && file.permissions().mode() & 0o111 != 0)
-        })
-    })
+    !image.contains(['/', ':', '@', '.'])
+        && shipyard_sys::path::find_program(image, std::env::var_os("PATH").as_deref()).is_some()
 }

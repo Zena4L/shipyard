@@ -595,6 +595,27 @@ pub fn open_below(dir: BorrowedFd<'_>, below: &Path) -> io::Result<OwnedFd> {
     walk_below(dir, below, None)
 }
 
+/// The ID of the mount `fd` is on (`statx`'s `STX_MNT_ID`, Linux 5.8):
+/// what tells a mount point from its parent where `st_dev` can't (overlayfs
+/// gives a file the device of the layer it's in, without `xino`).
+///
+/// # Errors
+///
+/// The `statx`'s; [`io::ErrorKind::Unsupported`] from a kernel that doesn't
+/// give the mount's ID.
+#[cfg(target_os = "linux")]
+pub fn mount_id(fd: impl AsFd) -> io::Result<u64> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let stat = statx(fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this kernel doesn't give a mount's ID (statx's STX_MNT_ID, Linux 5.8)",
+        ));
+    }
+    Ok(stat.stx_mnt_id)
+}
+
 /// [`open_below`], making each missing component (`mkdirat`, `mode`) on
 /// the way: what a bind's missing source is made with, so no symlink
 /// another put on its path is ever followed (11.7). One made meanwhile by
