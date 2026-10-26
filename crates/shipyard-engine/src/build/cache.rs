@@ -56,37 +56,50 @@ pub(crate) fn builder_dir_of(store: &Path, root: bool) -> PathBuf {
     PathBuf::from(beside)
 }
 
-/// The states there are, by name: a state's directory, or only what a
-/// killed build of it left (its lock, a `….run-…` directory).
-pub(crate) fn states(builder: &Path) -> Vec<String> {
-    let mut states: Vec<String> = std::fs::read_dir(builder)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| name.starts_with(STATE_PREFIX))
-                .map(|name| name.split('.').next().unwrap_or_default().to_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    states.sort();
-    states.dedup();
-    states
+/// Every state in `builder` (a state's directory, or only what a killed
+/// build of it left: its lock, a `….run-…` directory), with its entries: its directory (if it has
+/// one) and every build directory of it (`state.run-…`), by name; never its
+/// lock. Read in one pass: a host that builds in a new directory each time
+/// leaves a lock a context, and a listing a state made each build's sweep
+/// grow as their square (12.5c3's Murphy review).
+fn entries_by_state(builder: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut by_state: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for name in std::fs::read_dir(builder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(STATE_PREFIX))
+    {
+        let (state, rest) = name.split_once('.').unwrap_or((&name, ""));
+        let entries = by_state.entry(state.to_owned()).or_default();
+        if rest.is_empty() || rest.starts_with("run-") {
+            entries.push(name.clone());
+        }
+    }
+    by_state
 }
 
-/// The entries of `state` in `builder`: its directory (if it has one) and
-/// every build directory of it (`state.run-…`), by name.
+/// The entries of `state` in `builder` ([`entries_by_state`]'s).
 fn entries_of(builder: &Path, state: &str) -> Vec<String> {
-    let run = format!("{state}.run-");
-    std::fs::read_dir(builder)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| name == state || name.starts_with(&run))
-                .collect()
-        })
-        .unwrap_or_default()
+    entries_by_state(builder).remove(state).unwrap_or_default()
+}
+
+/// Moves `state`'s directory in `builder` aside, to a build directory's
+/// name of its own (`state.run-<12 hex>`), under its lock: a removal killed
+/// half way (a Ctrl-C during another build's sweep) then leaves a build
+/// directory the state's next build removes, never half a state that build
+/// would use (12.5c3's Murphy review). The name it has now.
+fn set_aside(builder: &Path, state: &str) -> Result<String> {
+    let aside = format!(
+        "{state}.run-{}",
+        shipyard_sys::hex::lower(&crate::random::bytes::<6>()?)
+    );
+    std::fs::rename(builder.join(state), builder.join(&aside))
+        .map_err(|error| crate::Error::wrap(crate::ErrorKind::Storage, error))
+        .with_context(|| format!("setting the build cache {state} aside"))?;
+    Ok(aside)
 }
 
 /// `state`'s lock, tried once: `None` if a build holds it.
@@ -133,8 +146,7 @@ pub fn usage(engine: &Engine) -> Result<crate::image::Usage> {
     let Ok(dir) = shipyard_image::fsat::open_dir(&builder) else {
         return Ok(usage);
     };
-    for state in states(&builder) {
-        let entries = entries_of(&builder, &state);
+    for (state, entries) in entries_by_state(&builder) {
         // Its lock alone (pruned, or never built): no cache.
         if entries.is_empty() {
             continue;
@@ -286,21 +298,20 @@ fn unused(builder: &Path, state: &str, own: &str, now: std::time::SystemTime) ->
 
 /// [`prune`] of the states in `builder` that `wanted` names.
 fn prune_where(engine: &Engine, builder: &Path, wanted: impl Fn(&str) -> bool) -> Result<Pruned> {
-    let builder = builder.to_owned();
     let mut pruned = Pruned {
         complete: true,
         ..Pruned::default()
     };
-    let Ok(dir) = shipyard_image::fsat::open_dir(&builder) else {
+    let Ok(dir) = shipyard_image::fsat::open_dir(builder) else {
         return Ok(pruned);
     };
     let mut names = Vec::new();
     let mut held = Vec::new();
-    for state in states(&builder) {
-        if !wanted(&state) || entries_of(&builder, &state).is_empty() {
+    for (state, entries) in entries_by_state(builder) {
+        if entries.is_empty() || !wanted(&state) {
             continue;
         }
-        let Some(lock) = try_state_lock(&builder, &state)? else {
+        let Some(lock) = try_state_lock(builder, &state)? else {
             pruned.busy.push(state);
             continue;
         };
@@ -313,7 +324,13 @@ fn prune_where(engine: &Engine, builder: &Path, wanted: impl Fn(&str) -> bool) -
             pruned.busy.push(state);
             continue;
         }
-        for name in entries_of(&builder, &state) {
+        // Read again under its lock (a build of it may have ended
+        // meanwhile), its directory set aside first.
+        let mut entries = entries_of(builder, &state);
+        if let Some(own) = entries.iter_mut().find(|name| **name == state) {
+            *own = set_aside(builder, &state)?;
+        }
+        for name in entries {
             let usage = shipyard_image::fsat::tree_usage(&dir, std::ffi::OsStr::new(&name));
             pruned.bytes = pruned.bytes.saturating_add(usage.bytes);
             pruned.complete &= usage.complete;
@@ -410,6 +427,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// One listing groups every state's entries (its lock never one of
+    /// them, a state of a lock alone has none); a state set aside is a
+    /// build directory of its own, what its next build or a prune removes.
+    #[test]
+    fn a_state_is_listed_once_and_set_aside_whole() {
+        let dir = std::env::temp_dir().join(format!("shipyard-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state-aa/cache")).unwrap();
+        std::fs::write(dir.join("state-aa.lock"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("state-aa.run-01")).unwrap();
+        std::fs::write(dir.join("state-bb.lock"), b"").unwrap();
+        let by_state = entries_by_state(&dir);
+        let mut aa = by_state["state-aa"].clone();
+        aa.sort();
+        assert_eq!(aa, ["state-aa", "state-aa.run-01"]);
+        assert!(by_state["state-bb"].is_empty());
+        let aside = set_aside(&dir, "state-aa").unwrap();
+        assert!(aside.starts_with("state-aa.run-"), "{aside}");
+        assert!(!dir.join("state-aa").exists());
+        assert!(dir.join(&aside).join("cache").is_dir());
+        assert!(dir.join("state-aa.lock").exists(), "its lock kept");
+        let mut aa = entries_of(&dir, "state-aa");
+        aa.sort();
+        assert_eq!(aa.len(), 2, "{aa:?}");
+        // What a removal takes: a build directory's name.
+        crate::image::remove_states_in(&dir, &aa).unwrap();
+        assert!(entries_of(&dir, "state-aa").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The states are found from every entry of theirs (a killed build's
     /// lock or directory alone too), each once.
     #[test]
@@ -420,7 +467,10 @@ mod tests {
         std::fs::write(dir.join("state-aa.lock"), b"").unwrap();
         std::fs::create_dir_all(dir.join("state-bb.run-01")).unwrap();
         std::fs::write(dir.join("other"), b"").unwrap();
-        assert_eq!(states(&dir), ["state-aa", "state-bb"]);
+        assert_eq!(
+            entries_by_state(&dir).into_keys().collect::<Vec<_>>(),
+            ["state-aa", "state-bb"]
+        );
         let mut of = entries_of(&dir, "state-bb");
         of.sort();
         assert_eq!(of, ["state-bb.run-01"]);

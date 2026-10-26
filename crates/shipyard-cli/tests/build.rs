@@ -361,6 +361,24 @@ fn a_local_image_is_built_from_without_a_pull() {
         ],
     );
     assert_eq!(ran, "local\nlocal\nlocal\n");
+    // A stage of the store image's name is the stage, never the image
+    // (BuildKit would put a named context in its place): the image named
+    // `:latest` too, so it has the stage's very name.
+    ok(
+        &store,
+        &["tag", "shipyard-local-base:1", "shipyard-local-base"],
+    );
+    let staged = context(&[(
+        "Dockerfile",
+        &format!(
+            "FROM {BASE} AS shipyard-local-base\nRUN echo stage > /local\n\
+             FROM shipyard-local-base\n"
+        ),
+    )]);
+    let built = build(&store, &["build", "-t", "on-stage:1"], &staged.0);
+    assert!(built.status.success(), "{}", text(&built).1);
+    let ran = ok(&store, &["run", "--rm", "on-stage:1", "cat", "/local"]);
+    assert_eq!(ran, "stage\n");
     let pulled = build(&store, &["build", "--pull", "-t", "on-local:2"], &on_it.0);
     let (_, stderr) = text(&pulled);
     assert_eq!(pulled.status.code(), Some(1), "{stderr}");

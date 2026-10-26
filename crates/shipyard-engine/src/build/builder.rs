@@ -680,15 +680,36 @@ impl Job<'_> {
         // Under the store's lock: no collection takes a blob before it's
         // linked (once linked, it's the build's too).
         let _shared = store.lock(shipyard_image::LockMode::Shared, shipyard_image::USE_WAIT)?;
-        let images = Index::open(store.root())
-            .map(|index| index.images())
-            .unwrap_or_default();
+        let images = match Index::open(store.root()) {
+            Ok(index) => index.images(),
+            Err(error) => {
+                self.engine.warn(
+                    WarningKind::LeftForLater,
+                    format!(
+                        "the store's images aren't given to the build ({error}): a base image \
+                         is pulled"
+                    ),
+                );
+                Vec::new()
+            }
+        };
         let wanted = super::local::wanted(&images, &dockerfile, &self.request.build_args);
         if wanted.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
         let blobs = store.root().join("blobs").join("sha256");
-        super::local::lay_out(&wanted, &blobs, &places.layout)
+        let laid = super::local::lay_out(&wanted, &blobs, &places.layout)?;
+        if !laid.left_out.is_empty() {
+            self.engine.warn(
+                WarningKind::LeftForLater,
+                format!(
+                    "images of the store not given to the build (a base image of theirs is \
+                     pulled): {}",
+                    laid.left_out.join("; ")
+                ),
+            );
+        }
+        Ok((laid.images, laid.written))
     }
 
     /// The builder's request.
@@ -950,9 +971,18 @@ fn output_dir(dest: &Path, root: bool) -> Result<std::os::fd::OwnedFd> {
         Ok(below) => (Path::new("/"), below),
         Err(_) => (Path::new("."), dest),
     };
+    // `./out`, `.`: a leading `.` is the start itself (the walk takes plain
+    // names alone).
+    let below: PathBuf = below
+        .components()
+        .filter(|part| !matches!(part, std::path::Component::CurDir))
+        .collect();
     let start = shipyard_image::fsat::open_dir(start).with_context(making)?;
-    let made = shipyard_sys::fs::make_below(start.as_fd(), below, 0o755).map_err(|error| {
-        match error.raw_os_error().map(nix::errno::Errno::from_raw) {
+    let made =
+        shipyard_sys::fs::make_below(start.as_fd(), &below, 0o755).map_err(|error| match error
+            .raw_os_error()
+            .map(nix::errno::Errno::from_raw)
+        {
             Some(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => Error::new(
                 ErrorKind::InvalidRequest,
                 format!(
@@ -970,8 +1000,7 @@ fn output_dir(dest: &Path, root: bool) -> Result<std::os::fd::OwnedFd> {
                 ),
             ),
             _ => Error::wrap(ErrorKind::Storage, error).context(making()),
-        }
-    })?;
+        })?;
     // Made for reference only (`O_PATH`): opened again for the unpacker.
     nix::fcntl::openat(
         &made,
@@ -1110,6 +1139,10 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::InvalidRequest, "{error:#}");
         }
         assert!(!elsewhere.join("below").exists());
+        // A path from the working directory (the crate's, in a test): `.`
+        // and `./src` are made and opened, as root too.
+        output_dir(Path::new("."), true).unwrap();
+        output_dir(Path::new("./src"), true).unwrap();
         let error = output_dir(&dir.join("real/../real"), true).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidRequest, "{error:#}");
         std::fs::remove_dir_all(&dir).unwrap();

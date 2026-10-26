@@ -53,9 +53,9 @@ behaviour; each change is listed here).
 - **A build uses the store's own images** (12.5's readiness review): a `FROM`, `COPY
   --from` or `RUN --mount=from=` naming an image Shipyard has (built, pulled, loaded or
   imported) is built from it, as Docker's builder does, never pulled (`--pull` asks the
-  registry again). Each image the Dockerfile or a build arg mentions is given to
+  registry again); a stage of the Dockerfile's own name is always the stage. Each image the Dockerfile or a build arg mentions is given to
   BuildKit as a named context over an OCI layout of its blobs, hard-linked from the
-  store, read-only.
+  store, read-only (where they can't be linked, said, and pulled).
 - **A build cache no build has used for a week is removed** by the next build of
   another context (said): a host that builds in a new directory each time (CI) no longer
   keeps each one's cache, about 10 GB, for good.
@@ -75,10 +75,10 @@ behaviour; each change is listed here).
 
 ### Fixed
 
-- **`rm` right after a container with no restart policy ended** (a `start -a`, a
-  script's `run` then `rm`) could be refused as "restarting": its clean-up held the
-  restart lock for a moment at every end. It holds it only for an end its policy starts
-  again (found by 12.5c3's full run).
+- **`rm` right after a container ended for good** (a `start -a` then `rm`, a `stop`
+  then `rm` as compose's `down` does, whatever its restart policy) could be refused as
+  "restarting": its clean-up took the restart lock for a moment at every end. It takes
+  it only for an end its policy starts again (found by 12.5c3's full run and review).
 - **`docker exec -i` without a terminal** passed the client's input on only once it
   ended (a line typed into an interactive `sh` waited for the client to close): it
   goes on as it comes (found in 12.5a).

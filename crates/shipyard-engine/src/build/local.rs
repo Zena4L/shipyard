@@ -39,7 +39,11 @@ pub(super) struct Local {
 /// the Dockerfile or in an argument's value (a `FROM ${BASE}` is named by
 /// an `ARG` or a `--build-arg`), by every name it has; at most
 /// [`MAX_IMAGES`]. A name the Dockerfile doesn't use costs nothing:
-/// BuildKit reads a context only when it's asked for.
+/// BuildKit reads a context only when it's asked for. Never by a name one
+/// of the Dockerfile's own stages has (`FROM … AS base`): BuildKit puts a
+/// named context in place of the stage of its name, so a store's `base`
+/// would build in place of the Dockerfile's (12.5c3's review); Docker's
+/// rule is the stage's.
 pub(super) fn wanted(
     images: &[ListedImage],
     dockerfile: &[u8],
@@ -50,6 +54,7 @@ pub(super) fn wanted(
         !part.is_empty()
             && (text.contains(part) || build_args.iter().any(|(_, value)| value.contains(part)))
     };
+    let stages = stage_names(&text);
     let mut found: Vec<Local> = Vec::new();
     for image in images {
         let Ok(name) = ImageReference::parse(&image.reference) else {
@@ -63,6 +68,10 @@ pub(super) fn wanted(
         let mut keys = vec![key(&name)];
         for digest in std::iter::once(&record.manifest).chain(&record.index_digest) {
             keys.push(format!("{}@{digest}", name.familiar_name()));
+        }
+        keys.retain(|key| !stages.contains(&key.to_ascii_lowercase()));
+        if keys.is_empty() {
+            continue;
         }
         if let Some(had) = found.iter_mut().find(|had| had.manifest == record.manifest) {
             for key in keys {
@@ -86,6 +95,76 @@ pub(super) fn wanted(
     found
 }
 
+/// The names the Dockerfile `text` gives its stages (`FROM IMAGE AS
+/// NAME`), lowercase, as BuildKit compares them; an instruction continued
+/// over lines (its escape character, `\\` or the `# escape=` directive's,
+/// at a line's end) read as one.
+fn stage_names(text: &str) -> Vec<String> {
+    joined(text)
+        .iter()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let first = words.first()?;
+            if !first.eq_ignore_ascii_case("FROM") {
+                return None;
+            }
+            let at = words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case("AS"))?;
+            words.get(at + 1).map(|name| name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// The Dockerfile `text`'s instructions, each a line: a line ending in its
+/// escape character joined to the next.
+fn joined(text: &str) -> Vec<String> {
+    let escape = escape_of(text);
+    let mut lines = Vec::new();
+    let mut pending = String::new();
+    for line in text.lines() {
+        // A comment (a directive among them, `# escape=\``) is a line of
+        // its own, never continued.
+        if line.trim_start().starts_with('#') {
+            if pending.is_empty() {
+                lines.push(line.to_owned());
+            }
+            continue;
+        }
+        let trimmed = line.trim_end();
+        if let Some(head) = trimmed.strip_suffix(escape) {
+            pending.push_str(head);
+            pending.push(' ');
+            continue;
+        }
+        pending.push_str(line);
+        lines.push(std::mem::take(&mut pending));
+    }
+    if !pending.is_empty() {
+        lines.push(pending);
+    }
+    lines
+}
+
+/// The escape character the Dockerfile `text` sets (`# escape=` among the
+/// parser directives that open it), else `\\`.
+fn escape_of(text: &str) -> char {
+    for line in text.lines() {
+        let Some(directive) = line.trim().strip_prefix('#') else {
+            break;
+        };
+        let Some((key, value)) = directive.split_once('=') else {
+            break;
+        };
+        if key.trim().eq_ignore_ascii_case("escape")
+            && let Some(escape) = value.trim().chars().next()
+        {
+            return escape;
+        }
+    }
+    '\\'
+}
+
 /// The name BuildKit's frontend asks for `name` by: as Docker shows it
 /// (`alpine:3.20`, `ghcr.io/owner/app:1`), `:latest` left off.
 fn key(name: &ImageReference) -> String {
@@ -95,18 +174,29 @@ fn key(name: &ImageReference) -> String {
         .map_or_else(|| shown.clone(), str::to_owned)
 }
 
+/// What [`lay_out`] laid out.
+#[derive(Debug, Default)]
+pub(super) struct Laid {
+    /// The images given to the build.
+    pub(super) images: Vec<Local>,
+    /// The layout's own files and directories (the caller gives them to
+    /// the builder; the links stay the store's).
+    pub(super) written: Vec<std::path::PathBuf>,
+    /// Why an image matched was left out (pulled as before), other than
+    /// a blob removed meanwhile: said.
+    pub(super) left_out: Vec<String>,
+}
+
 /// Lays `images` out in `layout` (an empty directory of the caller's) as
 /// an OCI layout: `oci-layout`, `index.json`, each blob hard-linked from
-/// the store at `blobs` (its `blobs/sha256`), copied where a link can't
-/// cross filesystems. The caller holds the store's lock (shared), so no
-/// collection runs meanwhile; an image a blob of which is gone (removed
-/// before the lock) is left out. What was laid out, and the files written
-/// (the caller gives them to the builder; the links stay the store's).
-pub(super) fn lay_out(
-    images: &[Local],
-    blobs: &Path,
-    layout: &Path,
-) -> Result<(Vec<Local>, Vec<std::path::PathBuf>)> {
+/// the store at `blobs` (its `blobs/sha256`). The caller holds the store's
+/// lock (shared), so no collection runs meanwhile. An image a blob of which
+/// is gone (removed before the lock) is left out; one that can't be linked
+/// (another filesystem, no room, a link count's most) too, said: it may be
+/// a name the Dockerfile only mentions, and a pull is what a build did
+/// before (12.5c3's Murphy review: never a copy of gigabytes under the
+/// store's lock).
+pub(super) fn lay_out(images: &[Local], blobs: &Path, layout: &Path) -> Result<Laid> {
     use std::os::unix::fs::DirBuilderExt as _;
     let into = layout.join("blobs").join("sha256");
     let mut made = Vec::new();
@@ -117,29 +207,27 @@ pub(super) fn lay_out(
             .with_context(|| format!("making {}", dir.display()))?;
         made.push(dir);
     }
-    let mut laid = Vec::new();
+    let mut laid = Laid::default();
     let mut manifests = Vec::new();
-    for image in images {
-        let mut whole = true;
+    'images: for image in images {
         for digest in &image.blobs {
-            let Some(hex) = digest.strip_prefix("sha256:") else {
-                whole = false;
-                break;
+            // The store's own index, parsed as any digest is before it
+            // names a file.
+            let Ok(parsed) = shipyard_image::Digest::parse(digest) else {
+                laid.left_out
+                    .push(format!("{}: not a digest: {digest}", image.manifest));
+                continue 'images;
             };
-            match link_or_copy(&blobs.join(hex), &into.join(hex)) {
+            let hex = parsed.hex();
+            match link(&blobs.join(&hex), &into.join(&hex)) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    whole = false;
-                    break;
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue 'images,
                 Err(error) => {
-                    return Err(Error::wrap(ErrorKind::Storage, error))
-                        .with_context(|| format!("giving the build the blob {digest}"));
+                    laid.left_out
+                        .push(format!("{} (its blob {digest}: {error})", image.keys[0]));
+                    continue 'images;
                 }
             }
-        }
-        if !whole {
-            continue;
         }
         let hex = image.manifest.trim_start_matches("sha256:");
         let bytes =
@@ -151,7 +239,7 @@ pub(super) fn lay_out(
             "digest": image.manifest,
             "size": bytes.len(),
         }));
-        laid.push(image.clone());
+        laid.images.push(image.clone());
     }
     let oci_layout = layout.join("oci-layout");
     write_file(&oci_layout, br#"{"imageLayoutVersion":"1.0.0"}"#)?;
@@ -160,7 +248,8 @@ pub(super) fn lay_out(
     write_file(&index, text.as_bytes())?;
     made.push(oci_layout);
     made.push(index);
-    Ok((laid, made))
+    laid.written = made;
+    Ok(laid)
 }
 
 /// The media type a manifest's bytes say it is (the OCI one if they say
@@ -173,15 +262,10 @@ fn media_type(manifest: &[u8]) -> String {
 }
 
 /// `from` hard-linked at `to` (one there already, another image's same
-/// blob, is it); copied, read-only, where they're on two filesystems.
-fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+/// blob, is it).
+fn link(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(from, to) {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::copy(from, to)?;
-            std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o444))
-        }
         other => other,
     }
 }

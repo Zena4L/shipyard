@@ -359,7 +359,7 @@ standard output): the build's files, owned by you, instead of an image (`-t` and
 together are refused: one or the other; a `type=tar` file is yours alone, mode 0600, as
 `save -o`'s). As root, `-o type=local`'s directory is reached without following a
 symbolic link (another user's link in `/tmp` could lead the build's files anywhere): give
-its real path. The context is
+its real path (on Fedora Atomic, `/var/home/…`, not `/home/…`, a link there). The context is
 a directory (from standard input or a URL isn't supported). On a Mac, the context and
 every file named are in your home, as `cp`'s.
 
@@ -369,8 +369,11 @@ or imported) uses it, and asks no registry: `shipyard build -t base .` then `FRO
 works offline. `--pull` asks the registry for each base image again, as Docker's flag
 does (a name only this host has then fails). BuildKit is given each image of the store
 whose name the Dockerfile or a `--build-arg` mentions (by any of its names, or its
-digest; at most 256), its blobs linked from the store read-only, never copied (unless
-the builder's directory is on another filesystem than the store).
+digest; at most 256), its blobs linked from the store read-only, never copied: where they can't be linked (the
+builder's directory on another filesystem than the store), the build says so and pulls
+them, as before. A stage of the
+Dockerfile's own (`FROM … AS base`) is always the stage: an image named `base` in the
+store never takes its place. A store that can't be read is said, and the build pulls.
 
 **What the builder is given.** It runs in a user namespace (rootless: yours; as root,
 IDs from 2100000000, a range no user is given: a build as root is refused if

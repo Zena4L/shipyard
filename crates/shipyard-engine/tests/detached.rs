@@ -532,6 +532,10 @@ mod linux {
             one_no_policy_restarts_is_removed_at_once,
         ),
         (
+            "a_user_s_stop_never_waits_for_the_restart",
+            a_user_s_stop_never_waits_for_the_restart,
+        ),
+        (
             "an_image_a_record_names_is_kept_without_its_pin",
             an_image_a_record_names_is_kept_without_its_pin,
         ),
@@ -6344,6 +6348,57 @@ mod linux {
             nix::sys::signal::Signal::SIGKILL,
         );
         removed.unwrap();
+    }
+
+    /// A user's stop of a container whose policy is `always`: its policy
+    /// won't start it again, so its clean-up never takes (nor waits for)
+    /// its restart. Held here by the test meanwhile, a clean-up that waited
+    /// for it would live on for its 15 s (and a `rm` the moment it took it
+    /// would be refused as restarting: a `stop` then `rm`, compose's
+    /// `down`): gone at once.
+    fn a_user_s_stop_never_waits_for_the_restart() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = Stores::id(&stores.launch(&[
+            "--restart",
+            "always",
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sleep",
+            "300",
+        ]));
+        let restart = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(
+                containers::testing::record_dir(&engine, &id)
+                    .unwrap()
+                    .join("restarting"),
+            )
+            .unwrap();
+        restart.lock().unwrap();
+        let fast = shipyard_engine::run::StopOptions {
+            timeout: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let stopped = Instant::now();
+        shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
+        shipyard_test_support::eventually_every(
+            Duration::from_secs(8),
+            Duration::from_millis(20),
+            "its __cleanup gone, never waiting for the restart",
+            || {
+                processes_with("__cleanup")
+                    .iter()
+                    .all(|process| !process.contains(id.as_str()))
+            },
+        );
+        assert!(stopped.elapsed() < Duration::from_secs(8));
+        restart.unlock().unwrap();
+        shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
     }
 
     /// `image prune -a` keeps an image a container's record names even

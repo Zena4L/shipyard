@@ -59,6 +59,47 @@ fn the_images_a_dockerfile_could_name_are_given() {
     assert!(wanted(&images, b"FROM busybox\n", &[]).is_empty());
 }
 
+/// A store image is never given by a name one of the Dockerfile's stages
+/// has (BuildKit would build it in the stage's place): `base:latest` isn't
+/// `base` where a stage is `AS Base`, but stays `base:1` and by digest; one
+/// whose every name is a stage's isn't given at all.
+#[test]
+fn a_stage_s_name_is_never_a_store_image_s() {
+    let images = [
+        image("docker.io/library/base:latest", 'a', None),
+        image("docker.io/library/base:1", 'a', None),
+        image("docker.io/library/deps:latest", 'd', None),
+    ];
+    let dockerfile =
+        b"FROM busybox AS Base\nfrom --platform=$BUILDPLATFORM alpine as deps\nFROM base\n";
+    let found = wanted(&images, dockerfile, &[]);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found[0].keys,
+        [format!("base@{}", digest('a')), "base:1".to_owned()]
+    );
+    assert_eq!(found[1].keys, [format!("deps@{}", digest('d'))]);
+    // The control: without the stages, `base` and `deps` are given.
+    let plain = wanted(&images, b"FROM base\nFROM deps\n", &[]);
+    assert_eq!(plain[0].keys[0], "base");
+    assert_eq!(plain[1].keys[0], "deps");
+}
+
+/// A stage named on the line after its `FROM` (an instruction continued
+/// with the escape character, `\\` or the directive's) is a stage.
+#[test]
+fn a_continued_from_s_stage_is_found() {
+    assert_eq!(stage_names("FROM busybox \\\n  AS base\n"), ["base"]);
+    assert_eq!(
+        stage_names("# escape=`\nFROM busybox `\n  AS Deps\nRUN echo \\\n"),
+        ["deps"]
+    );
+    assert!(
+        stage_names("FROM busybox\nAS base\n").is_empty(),
+        "no escape, no stage"
+    );
+}
+
 /// One build is given at most [`MAX_IMAGES`] images; another name of one
 /// it has is still added to it.
 #[test]
@@ -104,8 +145,22 @@ fn the_layout_links_the_store_s_blobs() {
         manifest: digest('a'),
         blobs: vec![digest('a'), digest('9')],
     };
-    let (laid, written) = lay_out(&[whole.clone(), missing], &blobs, &layout).unwrap();
-    assert_eq!(laid, [whole]);
+    // One whose blob isn't a digest (the store's index read as any input).
+    let bad = Local {
+        keys: vec!["bad".to_owned()],
+        manifest: digest('a'),
+        blobs: vec!["sha256:../../etc/passwd".to_owned()],
+    };
+    let laid = lay_out(&[whole.clone(), missing, bad], &blobs, &layout).unwrap();
+    assert_eq!(laid.images, [whole]);
+    // The blob gone meanwhile is nothing to say; the bad digest is said.
+    assert_eq!(laid.left_out.len(), 1, "{:?}", laid.left_out);
+    assert!(
+        laid.left_out[0].contains("not a digest"),
+        "{:?}",
+        laid.left_out
+    );
+    let written = laid.written;
     for byte in ['a', 'c', '1', '2'] {
         let name = byte.to_string().repeat(64);
         let (from, to) = (

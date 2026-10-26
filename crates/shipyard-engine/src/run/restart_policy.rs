@@ -134,7 +134,11 @@ pub(in crate::run) fn after_end(
     let Ok(record) = containers::read_one(engine, id) else {
         return;
     };
-    if record.config.restart == RestartPolicy::No {
+    // An end its policy doesn't start again (no policy, a user's stop, a
+    // success `on-failure` takes, its most reached): ended for good, so the
+    // restart is never taken, nor waited for (a `stop` then `rm`, compose's
+    // `down`, found it "restarting" a moment: 12.5c3's review).
+    if next_delay(&record).is_none() {
         return;
     }
     let Ok(root) = engine.paths.runtime_root().map(Path::to_path_buf) else {
