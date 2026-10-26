@@ -77,8 +77,31 @@ pub fn inspect_volume(engine: &Engine, name: &str) -> Result<Volume> {
     let store = crate::volumes::open(engine)?;
     let volume = store.inspect(name)?;
     let labels = store.labels(name)?;
-    let created = store.created(name)?;
+    // A making's time that can't be read (a newer Shipyard's file, a damaged
+    // one) is said, never a failed inspect: the directory's stands in, as a
+    // listing does.
+    let created = store.created(name).or_else(|error| match error {
+        shipyard_storage::VolumeError::Created { .. } => {
+            engine.warn(
+                crate::report::WarningKind::RecordUnreadable,
+                error.to_string(),
+            );
+            Ok(volume_dir_time(&volume))
+        }
+        error => Err(error),
+    })?;
     Ok(of(volume, labels, created))
+}
+
+/// The time of the directory holding `volume`'s data (its making, but for
+/// what was made beside it since).
+fn volume_dir_time(volume: &shipyard_storage::Volume) -> std::time::SystemTime {
+    volume
+        .data
+        .parent()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// `volume` as Docker shows it, what can't be read of it said in

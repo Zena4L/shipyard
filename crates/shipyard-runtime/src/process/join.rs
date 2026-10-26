@@ -156,16 +156,7 @@ pub(crate) fn join_setup(namespaces: &[(Namespace, std::os::fd::RawFd)]) -> Join
 /// The start time of the process whose `/proc` directory is open at
 /// `directory` (none if it has exited).
 pub(crate) fn start_time_at(directory: &OwnedFd) -> Option<u64> {
-    let fd = openat(
-        directory,
-        "stat",
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()?;
-    let mut stat = Vec::new();
-    std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut stat).ok()?;
-    super::start_time_in(&stat)
+    shipyard_sys::proc::start_time_at(std::os::fd::AsFd::as_fd(directory))
 }
 
 /// The kernel said no: missing privileges, or, as root, a policy (a

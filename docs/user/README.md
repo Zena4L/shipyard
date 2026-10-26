@@ -29,7 +29,11 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > tells what happened. **Docker's own clients** drive it: Shipyard serves a subset of
 > Docker's Engine API ([API](api.md)), so the `docker` CLI, `docker compose`
 > ([Compose](compose.md)) and Testcontainers work against it, root's and rootless, and
-> `shipyard` takes Docker's everyday commands and flags itself.
+> `shipyard` takes Docker's everyday commands and flags itself. **Images are built**
+> from Dockerfiles by BuildKit (`shipyard build`, in a container of its own per build),
+> **pushed** to a registry (`push`, after `login`), **saved** and **loaded** as archives
+> Docker reads too (`save`, `load`), made from a filesystem (`import`, `export`), and
+> their layers shown (`history`).
 > It isn't a hardened boundary yet. It starts the command the way a container
 > runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
@@ -44,7 +48,7 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | [macOS](macos.md) | Shipyard on a Mac: its Linux VM, your files, input, signals and variables |
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
 | [Containers](containers.md) | `run -d`, `create`, `start`, `ps`, `inspect`, `rm`: containers that outlive the command, by name, ID or serial; their kept files |
-| [Images](images.md) | `shipyard pull`, `run IMAGE`, `images`, `rmi`, `image prune`, `system df`, `system prune`: pulling, private registries and the local store |
+| [Images](images.md) | `shipyard pull`, `run IMAGE`, `images`, `rmi`, `push`, `login`, `save`, `load`, `import`, `history`, `build`, `builder prune`, `system df`, `system prune`: pulling, pushing, building, archives, private registries and the local store |
 | [Networking](networking.md) | `--network`, `-p`, `--name`, `shipyard network …`: networks, addresses, names, published ports, other firewalls, the hostname and the `/etc` files |
 | [The Docker API](api.md) | `shipyard system service`: Docker's Engine API (a subset) on a socket, for Docker's own clients (`DOCKER_HOST`); the systemd units that start it |
 | [Compose](compose.md) | `shipyard compose`: Docker's own `docker compose` against Shipyard, what works and what doesn't yet |
@@ -72,6 +76,8 @@ On Linux:
   - for resource limits (`--memory`, `--cpus`, …), a cgroup subtree delegated to you:
     a desktop session has one; from an SSH login, run Shipyard under your user manager
     (`systemd-run --user --scope shipyard run …`; see [Cgroup](run.md#cgroup)).
+- **For `build`:** BuildKit's image (pulled on the first build, then kept, by its
+  digest) and, rootless, a delegated cgroup subtree (as for resource limits).
 - **For root's bridge networks:** nf_tables (every current kernel).
 
 ```sh
@@ -171,7 +177,7 @@ shipyard run -it alpine sh
 
 ```text
 Pulling docker.io/library/alpine:latest
-…: downloaded (3.9 MiB)
+…: downloaded (4.089MB)
 / # id
 uid=0(root) gid=0(root)
 / # wget -qO- example.com | grep -o '<title>.*</title>'
@@ -218,7 +224,8 @@ the host's name. Both take `--format`: a Go template over Docker's objects
 
 ## Limitations
 
-- **No image `history`, `save` or `load` yet.**
+- **`docker build` through the API isn't served** (`shipyard build` is how to build);
+  a push sends one platform's image (no multi-platform index), each blob uploaded whole.
 - **macOS is new:** commands run in Shipyard's Linux VM (on a terminal there when you're
   on one, published TCP ports on your Mac's `localhost`, the VM stopping by itself when
   idle); the guest is built from the source tree, and UDP ports aren't forwarded yet

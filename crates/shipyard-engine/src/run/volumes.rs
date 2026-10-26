@@ -471,7 +471,8 @@ pub(super) fn fill_volumes(
     if !wanted {
         return Ok(());
     }
-    let (view, held) = super::files::stopped_view(engine, record)?;
+    let (view, held) =
+        super::files::stopped_view(engine, record, super::files::Wanted::WithMounts)?;
     if view.root.overlay.is_none() {
         return Ok(());
     }

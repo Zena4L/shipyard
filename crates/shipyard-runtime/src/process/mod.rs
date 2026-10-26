@@ -138,22 +138,6 @@ pub(crate) fn proc_is_ours() -> bool {
         == Some(std::process::id())
 }
 
-/// The start time in a `/proc/PID/stat` line (field 22), unless the process
-/// is a zombie. The command name (field 2) can hold anything, spaces and `)`
-/// included, so the fields after it are counted from its last `)`.
-#[cfg(target_os = "linux")]
-pub(crate) fn start_time_in(stat: &[u8]) -> Option<u64> {
-    let after = stat.iter().rposition(|&b| b == b')')?;
-    let rest = std::str::from_utf8(stat.get(after + 1..)?).ok()?;
-    let mut fields = rest.split_whitespace();
-    // Fields 3 (the state) to 22 (the start time).
-    let state = fields.next()?;
-    if state == "Z" || state == "X" {
-        return None;
-    }
-    fields.nth(18)?.parse().ok()
-}
-
 /// Whether [`init_entry_point`] has run in this process.
 #[cfg(target_os = "linux")]
 static INIT_ENTRY_POINT_CALLED: std::sync::atomic::AtomicBool =

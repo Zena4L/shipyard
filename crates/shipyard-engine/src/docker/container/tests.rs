@@ -1,7 +1,9 @@
 use std::time::{Duration, SystemTime};
 
-use super::*;
+use crate::containers::Network;
 use crate::containers::tests::versions::V3_RECORD;
+
+use super::*;
 
 /// The released version 3 record (every field set), exited, as Docker's
 /// `inspect` shows it.

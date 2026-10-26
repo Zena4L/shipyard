@@ -98,8 +98,9 @@ pub enum WarningKind {
     /// to the disk (a file system that doesn't sync directories): it may
     /// not survive a power cut.
     NotSynced,
-    /// A container's record that can't be read (damaged, or a newer
-    /// Shipyard's): left out of what's listed.
+    /// A record that can't be read (damaged, or a newer Shipyard's): a
+    /// container's, left out of what's listed; a volume's making time,
+    /// its directory's said instead.
     RecordUnreadable,
     /// What the runtime said making a container (its cgroup mount left
     /// out, say).
@@ -125,11 +126,23 @@ pub enum WarningKind {
     /// A container others share the network or IPC namespace of stopped or
     /// went: they lose them until they're started again (D11.4b2-4).
     SharedNamespacesLost,
+    /// An export of a running container whose root couldn't be cloned
+    /// alone: what its volumes cover was exported empty (step 12.2b).
+    ExportPartial,
+    /// An import's tarball looks like an image archive (`load`'s), not a
+    /// root filesystem.
+    ImportedArchive,
 }
 
-/// A step of a pull.
+/// A step of a pull or a push, or a line of a build's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
+    /// A line of BuildKit's progress (step 12.3): as BuildKit wrote it
+    /// (escape it before a terminal).
+    Build {
+        /// The line, without its newline.
+        line: String,
+    },
     /// Pulling this image starts.
     Pulling {
         /// The image, as its canonical reference.
@@ -142,6 +155,19 @@ pub enum Progress {
         /// How many bytes were downloaded for it, if it was (`None`: the
         /// store had it already).
         downloaded: Option<u64>,
+    },
+    /// Pushing this image to this name starts (step 12.4).
+    Pushing {
+        /// The name, as its canonical reference.
+        name: String,
+    },
+    /// One of its blobs is on the registry.
+    Pushed {
+        /// The blob's digest, its first 12 hex digits.
+        short_digest: String,
+        /// How many bytes were sent, if it was (`None`: the registry had
+        /// it already).
+        sent: Option<u64>,
     },
 }
 

@@ -27,26 +27,11 @@ const IMAGE: &str = "alpine:3.20";
 const DOCKER_LIMIT: Duration = Duration::from_secs(180);
 
 mod vm_support;
-use vm_support::{Scratch, Vm, bounded};
+use vm_support::{Scratch, Vm, bounded, text};
 
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// Docker's CLI, found on `PATH`; `None` (said) if it isn't there, a
-/// failure where the VM tests are required.
+/// Docker's CLI, for the Mac's Docker API tests.
 fn docker_cli() -> Option<PathBuf> {
-    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|dir| dir.join("docker"))
-        .find(|path| path.is_file());
-    if found.is_none() {
-        assert!(
-            std::env::var("SHIPYARD_TEST_VM").as_deref() != Ok("required"),
-            "the Mac's Docker API tests need Docker's CLI on PATH"
-        );
-        eprintln!("no docker on PATH: skipped");
-    }
-    found
+    vm_support::docker_cli("the Mac's Docker API tests")
 }
 
 /// Docker's CLI pointed at `vm`'s socket, with a configuration directory

@@ -117,6 +117,7 @@ pub(crate) fn system(args: &SystemPruneArgs) -> Result<ExitCode> {
     } else {
         "  - all dangling images\n"
     });
+    warning.push_str("  - unused build cache\n");
     if !args.prune.filter.is_empty() {
         warning.push_str("\n  Items to be pruned will be filtered with:\n");
         for (key, value) in &args.prune.filter {
@@ -141,12 +142,12 @@ pub(crate) fn system(args: &SystemPruneArgs) -> Result<ExitCode> {
         Err(error) => failed |= fail(error),
     }
     match &pruned.networks {
-        Ok(Some(networks)) => {
+        Some(Ok(networks)) => {
             section(&mut out, "Deleted Networks:", &networks.removed)?;
             failed |= said(&networks.failed);
         }
-        Ok(None) => {}
-        Err(error) => failed |= fail(error),
+        Some(Err(error)) => failed |= fail(error),
+        None => {}
     }
     match &pruned.volumes {
         Some(Ok(volumes)) => {
@@ -156,6 +157,18 @@ pub(crate) fn system(args: &SystemPruneArgs) -> Result<ExitCode> {
         }
         Some(Err(error)) => failed |= fail(error),
         None => {}
+    }
+    match &pruned.build_cache {
+        Ok(cache) => {
+            section(&mut out, "Deleted build cache objects:", &cache.removed)?;
+            bytes = bytes.saturating_add(cache.bytes);
+            for busy in &cache.busy {
+                crate::reporter::warn(format!(
+                    "the build cache {busy} is in use by a build: kept"
+                ))?;
+            }
+        }
+        Err(error) => failed |= fail(error),
     }
     match &pruned.images {
         Ok(images) => {

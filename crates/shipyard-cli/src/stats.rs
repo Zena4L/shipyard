@@ -12,7 +12,7 @@ use shipyard_engine::docker::{self, ContainerStats};
 use crate::format::Output;
 use crate::format::rows::{STATS_TABLE, StatsRow};
 use crate::output::printable;
-use crate::reporter::{EXIT_FAILURE, report};
+use crate::reporter::{EXIT_FAILURE, report_error};
 
 /// How long between two samples: the first row's CPU share is over it.
 const INTERVAL: Duration = Duration::from_secs(1);
@@ -161,7 +161,7 @@ impl Sampler {
                 Err(err) => {
                     if self.gone.insert(reference) {
                         self.failed = true;
-                        report(&anyhow::Error::from(err), EXIT_FAILURE);
+                        report_error(&anyhow::Error::from(err), EXIT_FAILURE);
                     }
                 }
             }

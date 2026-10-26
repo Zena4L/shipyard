@@ -112,6 +112,9 @@ pub(crate) enum Command {
     /// CONTAINER:PATH to a host path (or - for a tar stream on stdout), or
     /// back.
     Cp(containers::CpArgs),
+    /// Write a container's own filesystem (never its volumes) as a tar
+    /// archive, to standard output or -o FILE; running or stopped.
+    Export(containers::ExportArgs),
     /// Print a container's logs: every start's, oldest first.
     Logs(containers::LogsArgs),
     /// Print what happens (containers made, started, ended; images pulled;
@@ -139,6 +142,34 @@ pub(crate) enum Command {
     Rmi(RmiArgs),
     /// Give an image another name (TARGET, a reference) beside its own.
     Tag(TagArgs),
+    /// Write images to a tar archive (to standard output, or -o FILE), as
+    /// Docker 25 writes one: an OCI image layout with Docker's
+    /// `manifest.json`.
+    Save(SaveArgs),
+    /// Load images from a tar archive (from standard input, or -i FILE):
+    /// Docker's (`docker save`'s) or an OCI layout (BuildKit's), plain or
+    /// gzipped.
+    Load(LoadArgs),
+    /// Build an image from a Dockerfile, with BuildKit (in a container of
+    /// its own, gone at the build's end): named with -t.
+    Build(crate::building::BuildArgs),
+    /// Show how an image was built: a row per step, newest first.
+    History(HistoryArgs),
+    /// Send an image to its registry (the name `tag` gave it: `NAME[:TAG]`),
+    /// signed in as `login` (or `docker login`) left you.
+    Push(crate::signing::PushArgs),
+    /// Sign in to a registry (Docker Hub if none), kept where Docker keeps
+    /// it: its credential helper, else ~/.docker/config.json.
+    Login(crate::signing::LoginArgs),
+    /// Sign out of a registry (Docker Hub if none).
+    Logout {
+        /// The registry.
+        #[arg(value_name = "SERVER")]
+        server: Option<String>,
+    },
+    /// Make an image of a root filesystem's tar archive (a file, or - for
+    /// standard input; plain or gzipped): one layer, named.
+    Import(ImportArgs),
     /// Manage containers (the same commands as at the top: `container ls`
     /// is `ps`, `container rm` is `rm`…).
     #[command(subcommand)]
@@ -158,6 +189,9 @@ pub(crate) enum Command {
     /// The Linux VM containers run in on a Mac: its status, start and stop.
     #[command(subcommand)]
     Vm(VmCommand),
+    /// The build cache.
+    #[command(subcommand)]
+    Builder(crate::building::BuilderCommand),
     /// Check whether this host can run containers, and what to fix.
     Doctor,
     /// Show Shipyard's version and its host's (`--format` a Go template
@@ -492,6 +526,91 @@ pub(crate) struct TagArgs {
     pub(crate) target: String,
 }
 
+/// `save`'s arguments.
+#[derive(Debug, Args)]
+pub(crate) struct SaveArgs {
+    /// Write the archive to FILE instead of standard output.
+    #[arg(short, long, value_name = "FILE")]
+    pub(crate) output: Option<std::path::PathBuf>,
+    /// The images: references (a repository alone is every tag of it) or
+    /// IDs (an image saved by ID has no name in the archive).
+    #[arg(value_name = "IMAGE", required = true)]
+    pub(crate) images: Vec<String>,
+}
+
+/// `load`'s arguments.
+#[derive(Debug, Args)]
+pub(crate) struct LoadArgs {
+    /// Read the archive from FILE instead of standard input.
+    #[arg(short, long, value_name = "FILE")]
+    pub(crate) input: Option<std::path::PathBuf>,
+    /// Don't say which tags moved to the loaded images (the names loaded,
+    /// and what was left out, are still said).
+    #[arg(short, long)]
+    pub(crate) quiet: bool,
+}
+
+/// `import`'s arguments.
+#[derive(Debug, Args)]
+pub(crate) struct ImportArgs {
+    /// Set a config instruction of the image's: CMD, ENTRYPOINT, ENV,
+    /// EXPOSE, LABEL, USER, VOLUME, WORKDIR or STOPSIGNAL, as a
+    /// Dockerfile's (repeat it for more).
+    #[arg(short, long = "change", value_name = "INSTRUCTION")]
+    pub(crate) changes: Vec<String>,
+    /// Its history's comment.
+    #[arg(short, long, value_name = "MESSAGE")]
+    pub(crate) message: Option<String>,
+    /// The platform: this host's only.
+    #[arg(long, value_name = "PLATFORM")]
+    pub(crate) platform: Option<String>,
+    /// The archive: a file, or - for standard input (a URL isn't taken).
+    #[arg(value_name = "FILE|-")]
+    pub(crate) source: std::path::PathBuf,
+    /// The image's name: `REPOSITORY[:TAG]` (required: Shipyard keeps no
+    /// untagged images).
+    #[arg(value_name = "REPOSITORY[:TAG]")]
+    pub(crate) name: Option<String>,
+}
+
+impl ImportArgs {
+    /// Whether its source is standard input (`-`).
+    pub(crate) fn reads_stdin(&self) -> bool {
+        self.source.as_os_str() == "-"
+    }
+
+    /// Whether its source is a URL, which `import` doesn't fetch.
+    pub(crate) fn source_is_url(&self) -> bool {
+        self.source
+            .to_str()
+            .is_some_and(|source| source.starts_with("http://") || source.starts_with("https://"))
+    }
+}
+
+/// `history`'s arguments.
+#[derive(Debug, Args)]
+pub(crate) struct HistoryArgs {
+    /// Sizes and times for a person (`7.8MB`, `3 weeks ago`); with
+    /// `-H=false`, bytes and RFC 3339 times.
+    #[arg(short = 'H', long, value_name = "BOOL", default_value_t = true,
+          action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true,
+          default_missing_value = "true")]
+    pub(crate) human: bool,
+    /// Don't cut the IDs and instructions short.
+    #[arg(long)]
+    pub(crate) no_trunc: bool,
+    /// Only the IDs.
+    #[arg(short, long)]
+    pub(crate) quiet: bool,
+    /// How to print it: `table` (the default), `json` (an object per
+    /// line), `table TEMPLATE`, or a Go TEMPLATE (`{{.CreatedBy}}`).
+    #[arg(long, value_name = "FORMAT")]
+    pub(crate) format: Option<String>,
+    /// The image: a reference or an ID.
+    #[arg(value_name = "IMAGE")]
+    pub(crate) image: String,
+}
+
 /// `shipyard container …`: the container commands at the top, under
 /// Docker's group (each flattened to its top-level command at once,
 /// [`Command::flattened`]).
@@ -533,6 +652,8 @@ pub(crate) enum ContainerCommand {
     Inspect(ContainerInspectArgs),
     /// Copy files between a container and the host (`cp`).
     Cp(containers::CpArgs),
+    /// Write a container's own filesystem as a tar archive (`export`).
+    Export(containers::ExportArgs),
     /// Show the host ports a container publishes (`port`).
     Port(PortArgs),
     /// Rename a container (`rename`).
@@ -566,6 +687,7 @@ impl From<ContainerCommand> for Command {
             ContainerCommand::Exec(args) => Self::Exec(args),
             ContainerCommand::Inspect(args) => Self::Inspect(args.into()),
             ContainerCommand::Cp(args) => Self::Cp(args),
+            ContainerCommand::Export(args) => Self::Export(args),
             ContainerCommand::Port(args) => Self::Port(args),
             ContainerCommand::Rename(args) => Self::Rename(args),
             ContainerCommand::Wait(args) => Self::Wait(args),
@@ -588,6 +710,12 @@ impl Command {
             Self::Image(ImageCommand::Rm(args)) => Self::Rmi(args),
             Self::Image(ImageCommand::Pull(args)) => Self::Pull(args),
             Self::Image(ImageCommand::Tag(args)) => Self::Tag(args),
+            Self::Image(ImageCommand::Save(args)) => Self::Save(args),
+            Self::Image(ImageCommand::Load(args)) => Self::Load(args),
+            Self::Image(ImageCommand::History(args)) => Self::History(args),
+            Self::Image(ImageCommand::Build(args)) => Self::Build(args),
+            Self::Image(ImageCommand::Import(args)) => Self::Import(args),
+            Self::Image(ImageCommand::Push(args)) => Self::Push(args),
             command => command,
         }
     }
@@ -802,6 +930,18 @@ pub(crate) enum ImageCommand {
     Pull(PullArgs),
     /// Give an image another name (`tag`).
     Tag(TagArgs),
+    /// Write images to a tar archive (`save`).
+    Save(SaveArgs),
+    /// Load images from a tar archive (`load`).
+    Load(LoadArgs),
+    /// Build an image from a Dockerfile (`build`).
+    Build(crate::building::BuildArgs),
+    /// Show how an image was built (`history`).
+    History(HistoryArgs),
+    /// Make an image of a root filesystem's tar archive (`import`).
+    Import(ImportArgs),
+    /// Send an image to its registry (`push`).
+    Push(crate::signing::PushArgs),
     /// Show images in full, as JSON: Docker's shape (`docker image
     /// inspect`'s).
     Inspect {
@@ -1309,6 +1449,46 @@ mod tests {
             parsed(&["image", "inspect", "a"]),
             Command::Image(ImageCommand::Inspect { .. })
         ));
+    }
+
+    /// `save`, `load` and `history` (step 12.2a), at the top and in the
+    /// image group; `-H` takes `=false`, as Docker's.
+    #[test]
+    fn save_load_and_history_parse() {
+        /// An argv, and what it must parse to.
+        type Case = (&'static [&'static str], fn(&Command) -> bool);
+        let parsed = |argv: &[&str]| {
+            Cli::try_parse_from(std::iter::once("shipyard").chain(argv.iter().copied()))
+                .unwrap()
+                .command
+                .flattened()
+        };
+        let cases: [Case; 4] = [
+            (
+                &["image", "save", "-o", "f", "a", "b"],
+                |c| matches!(c, Command::Save(s) if s.images == ["a", "b"] && s.output.is_some()),
+            ),
+            (
+                &["image", "load", "-q", "-i", "f"],
+                |c| matches!(c, Command::Load(l) if l.quiet && l.input.is_some()),
+            ),
+            (
+                &["image", "history", "-H=false", "a"],
+                |c| matches!(c, Command::History(h) if !h.human && h.image == "a"),
+            ),
+            (
+                &["history", "-H", "a"],
+                |c| matches!(c, Command::History(h) if h.human),
+            ),
+        ];
+        for (argv, is) in cases {
+            let command = parsed(argv);
+            assert!(is(&command), "{argv:?}: {command:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["shipyard", "save"]).is_err(),
+            "no image"
+        );
     }
 
     /// A failure exits as Docker's: 125 for `run`, 1 for every other

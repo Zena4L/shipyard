@@ -137,6 +137,7 @@ fn the_api_units_say_what_the_design_needs() {
         assert_eq!(value(&socket, "SocketMode"), ["0600"], "{dir:?}");
         assert_eq!(value(&socket, "DirectoryMode"), ["0700"], "{dir:?}");
         assert_eq!(value(&socket, "WantedBy"), ["sockets.target"], "{dir:?}");
+        assert_eq!(value(&service, "StartLimitIntervalSec"), ["0"], "{dir:?}");
         assert_eq!(
             value(&service, "ExecStart"),
             ["/usr/local/bin/shipyard system service"],

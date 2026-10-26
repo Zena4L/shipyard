@@ -635,9 +635,7 @@ const CLOCK_AHEAD: u64 = 30;
 /// if they're far enough apart ([`skewed`]: TLS to a registry fails on a
 /// clock that's behind).
 fn follow_clock(theirs: u64) {
-    let ours = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
+    let ours = shipyard_sys::time::unix_seconds();
     if !skewed(ours, theirs) {
         return;
     }
@@ -681,6 +679,27 @@ fn spawn(request: &Request, terminal: Option<&OwnedFd>) -> Result<Child, String>
     command
         .envs(forward::passed_env(env))
         .env(forward::CALLER_ENV, forward::caller_env_value(&named));
+    // A credential handed to a push or pull (step 12.4, D12.4-2): on a pipe
+    // at its descriptor, read whole and closed by the command first thing;
+    // never in an environment (no child of the command inherits it). Held
+    // here until the command is spawned.
+    let handed = request
+        .registry_auth
+        .as_ref()
+        .map(|auth| handed_pipe(&auth.0))
+        .transpose()?;
+    if let Some(read) = &handed {
+        let from = read.as_raw_fd();
+        command.env(
+            forward::REGISTRY_AUTH_FD_ENV,
+            forward::REGISTRY_AUTH_FD.to_string(),
+        );
+        // SAFETY: between fork and exec, `dup2` and `fcntl` only:
+        // async-signal-safe, no allocation, no lock.
+        unsafe {
+            command.pre_exec(move || at_descriptor(from, forward::REGISTRY_AUTH_FD));
+        }
+    }
     if let Some(slave) = terminal {
         let end = |slave: &OwnedFd| {
             slave
@@ -711,6 +730,40 @@ fn spawn(request: &Request, terminal: Option<&OwnedFd>) -> Result<Child, String>
     command
         .spawn()
         .map_err(|e| format!("running {SHIPYARD}: {e}"))
+}
+
+/// The most a handed credential may be: well under a pipe's buffer, so
+/// writing it whole before the command runs can't block.
+const MAX_HANDED: usize = 16 * 1024;
+
+/// A pipe holding `auth` whole, its write end closed: its read end.
+fn handed_pipe(auth: &str) -> Result<OwnedFd, String> {
+    if auth.len() > MAX_HANDED {
+        return Err(format!("the handed credential is over {MAX_HANDED} bytes"));
+    }
+    let (read, mut write) =
+        std::io::pipe().map_err(|e| format!("the handed credential's pipe: {e}"))?;
+    write
+        .write_all(auth.as_bytes())
+        .map_err(|e| format!("the handed credential's pipe: {e}"))?;
+    drop(write);
+    Ok(OwnedFd::from(read))
+}
+
+/// After `fork`: descriptor `from` placed at `to`, open across `exec`.
+/// `dup2(fd, fd)` does nothing, close-on-exec included, so the flag is
+/// cleared either way (AGENTS.md's gotcha).
+fn at_descriptor(from: std::os::fd::RawFd, to: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: plain system calls on numbers; async-signal-safe.
+    unsafe {
+        if from != to && libc::dup2(from, to) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(to, libc::F_SETFD, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Sends what the command writes on its pipes, as it comes: a thread for

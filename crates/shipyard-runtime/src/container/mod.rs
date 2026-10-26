@@ -47,7 +47,7 @@ pub use elsewhere::{
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
     monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
     peek_status, process_started, ps, release, remove_failed_logs, resume, start, start_helper,
-    start_helper_in_view, state, stats, status, stop, update, wait,
+    start_helper_alone, start_helper_in_view, state, stats, status, stop, update, wait,
 };
 #[cfg(target_os = "linux")]
 pub use lifecycle::{Waiter, waiter};
@@ -57,11 +57,11 @@ pub use lifecycle::{
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
     monitor_entry_point, network_namespace, network_namespace_live, pause, peek_init, peek_monitor,
     peek_status, process_started, ps, raise_own_descriptor_limit, release, remove_failed_logs,
-    remove_monitor_cgroup, resume, running_init, start, start_helper, start_helper_in_view, state,
-    stats, status, stop, update, wait,
+    remove_monitor_cgroup, resume, running_init, start, start_helper, start_helper_alone,
+    start_helper_in_view, state, stats, status, stop, update, wait,
 };
 
-pub use helper::{Helper, HelperFailure, HelperIo, RootView, RunningHelper};
+pub use helper::{Helper, HelperFailure, HelperIo, HelperRoot, RootView, RunningHelper};
 pub use plan::{Plan, PlanError};
 pub use versions::ExitRecord;
 

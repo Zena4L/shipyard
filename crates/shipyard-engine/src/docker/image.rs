@@ -462,3 +462,109 @@ pub fn list_images_where(engine: &Engine, filters: &ImageFilters) -> Result<Vec<
 
 #[cfg(test)]
 mod tests;
+
+/// One step of an image's history, as `GET /images/{name}/history` gives
+/// it (Docker's `HistoryResponseItem`), newest first (step 12.2a).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageHistoryItem {
+    /// The image's ID for the newest step; `<missing>` for the rest, as
+    /// Docker says for steps of an image it didn't build here.
+    pub id: String,
+    /// When it ran (Unix seconds; 0 if the config doesn't say).
+    pub created: i64,
+    /// The instruction that made it.
+    pub created_by: String,
+    /// The image's names, on the newest step; none on the rest.
+    pub tags: Option<Vec<String>>,
+    /// The size of the layer it made: compressed, as `images`' `Size` is
+    /// (Docker's is the layer's unpacked size); 0 for a step that made none.
+    pub size: u64,
+    /// A comment.
+    pub comment: String,
+}
+
+/// The history of the image `name`, newest first: each step of its
+/// config's `history` (read leniently: `shipyard_image::history`), the ones
+/// that made a layer paired with its layers in order; one with no history
+/// at all a step per layer.
+///
+/// # Errors
+///
+/// No such image ([`crate::ErrorKind::NotFound`]); the store can't be read.
+pub fn image_history(engine: &Engine, name: &str) -> Result<Vec<ImageHistoryItem>> {
+    let store = crate::image::open_store(engine)?;
+    let _shared = store.lock(LockMode::Shared, USE_WAIT)?;
+    let index = Index::open(store.root())?;
+    let (found, _) = crate::image::named(&index, name)?;
+    let Some(manifest) = found.first().map(|image| image.record.manifest.clone()) else {
+        crate::error::bail!(NotFound, "no such image: {name}");
+    };
+    let all: Vec<ListedImage> = index
+        .images()
+        .into_iter()
+        .filter(|image| image.record.manifest == manifest)
+        .collect();
+    let Some(read) = read(&store, &all)? else {
+        crate::error::bail!(NotFound, "no such image: {name} (its blobs are gone)");
+    };
+    let config = store.read_blob(
+        &read.pulled.manifest.config.digest,
+        shipyard_image::MANIFEST_SIZE_LIMIT,
+    )?;
+    Ok(history_of(
+        &read,
+        &shipyard_image::history::history(&config),
+    ))
+}
+
+/// `read`'s history items from its config's `entries`.
+fn history_of(
+    read: &Read,
+    entries: &[shipyard_image::history::HistoryEntry],
+) -> Vec<ImageHistoryItem> {
+    let layers = &read.pulled.manifest.layers;
+    let mut sizes = layers.iter().map(|layer| layer.size);
+    let mut items: Vec<ImageHistoryItem> = if entries.is_empty() {
+        layers
+            .iter()
+            .map(|layer| ImageHistoryItem {
+                id: "<missing>".to_owned(),
+                created: 0,
+                created_by: String::new(),
+                tags: None,
+                size: layer.size,
+                comment: String::new(),
+            })
+            .collect()
+    } else {
+        entries
+            .iter()
+            .map(|entry| ImageHistoryItem {
+                id: "<missing>".to_owned(),
+                created: entry
+                    .created
+                    .as_deref()
+                    .and_then(super::parse_time)
+                    .map_or(0, shipyard_runtime::logs::time::Timestamp::secs),
+                created_by: entry.created_by.clone(),
+                tags: None,
+                // A step that made a layer takes the next one's size; past
+                // the layers' end (a config that says more), none.
+                size: if entry.empty_layer {
+                    0
+                } else {
+                    sizes.next().unwrap_or(0)
+                },
+                comment: entry.comment.clone(),
+            })
+            .collect()
+    };
+    items.reverse();
+    if let Some(newest) = items.first_mut() {
+        newest.id = read.id();
+        let tags = read.repo_tags();
+        newest.tags = Some(tags).filter(|tags| !tags.is_empty());
+    }
+    items
+}

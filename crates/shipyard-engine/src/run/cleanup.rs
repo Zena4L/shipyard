@@ -252,9 +252,15 @@ mod linux {
     /// Container `id`'s restart, taken (if no one else has it) before its
     /// clean-up lets it go: a `rm` that waits on `running` then finds it
     /// restarting, never ended for good in the moment before its policy
-    /// decides. Handed to the policy, which holds it while it waits.
+    /// decides. Handed to the policy, which holds it while it waits. Only
+    /// if the end just recorded is one its policy starts again: one it
+    /// doesn't is ended for good, and a `rm` that comes at once (a `start
+    /// -a`'s, a script's) found it "restarting" in that moment (12.5c3's
+    /// full run).
     fn restart_held(engine: &Engine, id: &str) -> Option<nix::fcntl::Flock<std::fs::File>> {
         let id = ContainerId::parse(id).ok()?;
+        let record = crate::containers::read_one(engine, &id).ok()?;
+        crate::run::restart_policy::next_delay(&record)?;
         // A moment's wait, not none: a `restart_pending` look (a `network
         // rm`'s, a listing's) takes this lock for an instant, and a try that
         // met it would let the container go unheld (11.6b's engine review).

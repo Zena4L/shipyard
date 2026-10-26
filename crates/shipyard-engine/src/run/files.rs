@@ -10,6 +10,18 @@ use crate::Engine;
 use crate::containers::{self, Record};
 use crate::error::{Context as _, Error, ErrorKind, Result, bail};
 
+/// What of a container's files a copy wants ([`container_files`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wanted {
+    /// As the container sees them: its volumes, binds and tmpfs mounted
+    /// (`cp`).
+    WithMounts,
+    /// Its own filesystem alone, nothing mounted on it (`export`, step
+    /// 12.2b): a running one's root mount cloned alone, a stopped one's
+    /// view with no volume at all (none bound, made or held).
+    OwnFiles,
+}
+
 /// How a copy reaches a container's files ([`container_files`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Files<'a> {
@@ -20,6 +32,9 @@ pub(crate) enum Files<'a> {
         root: &'a std::path::Path,
         /// The runtime's container ID.
         id: &'a str,
+        /// Whether the helper's root is its root mount alone
+        /// ([`Wanted::OwnFiles`]).
+        alone: bool,
     },
     /// It isn't: its root as a start would mount it, held (its operation
     /// lock, its writable layer, its volumes) while this lasts.
@@ -42,6 +57,7 @@ pub(crate) enum Files<'a> {
 pub(crate) fn container_files<T>(
     engine: &Engine,
     reference: &str,
+    wanted: Wanted,
     mut copy: impl FnMut(Files<'_>) -> Result<T>,
 ) -> Result<T> {
     for _ in 0..3 {
@@ -57,7 +73,8 @@ pub(crate) fn container_files<T>(
                 let id = record.id.as_str();
                 let up = runtime::peek_status(root, id)?.is_some_and(Status::is_live);
                 if up {
-                    match copy(Files::Live { root, id }) {
+                    let alone = wanted == Wanted::OwnFiles;
+                    match copy(Files::Live { root, id, alone }) {
                         // Ended before its helper could join it
                         // (nothing copied yet: the helper comes first).
                         Err(error) if never_joined(&error) => {}
@@ -71,7 +88,7 @@ pub(crate) fn container_files<T>(
                 containers::wait_settled(engine, &record.id, containers::SETTLE_WAIT);
             }
             Took::Taken(taken) => {
-                let (view, held) = stopped_view(engine, &taken.record)?;
+                let (view, held) = stopped_view(engine, &taken.record, wanted)?;
                 let copied = copy(Files::Stopped(&view));
                 // Its layer and volumes let go, then the container.
                 drop(held);
@@ -126,6 +143,7 @@ pub(super) struct ViewHeld {
 pub(super) fn stopped_view(
     engine: &Engine,
     record: &Record,
+    wanted: Wanted,
 ) -> Result<(runtime::RootView, ViewHeld)> {
     let request = record.to_request()?;
     let is_root = nix::unistd::geteuid().is_root();
@@ -136,7 +154,7 @@ pub(super) fn stopped_view(
             let Some(image_id) = &record.image_id else {
                 bail!(
                     InvalidRequest,
-                    "container {} was made by an older Shipyard: start it once, then copy",
+                    "container {} was made by an older Shipyard: start it once, then try again",
                     record.name
                 );
             };
@@ -169,6 +187,18 @@ pub(super) fn stopped_view(
         ),
     };
     root.read_only = request.read_only;
+    if wanted == Wanted::OwnFiles {
+        // Its own files alone: no volume bound, made or held (a removed
+        // one, or a bind's source gone, is nothing to an export; a created
+        // container's volumes aren't made by one).
+        return Ok((
+            runtime::RootView { root, id_maps },
+            ViewHeld {
+                _area: area,
+                volumes: Vec::new(),
+            },
+        ));
+    }
     let mounts = request
         .volume_mounts()
         .with_context(|| format!("container {}'s volumes", record.name))?;

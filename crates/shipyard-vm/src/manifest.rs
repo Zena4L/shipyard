@@ -152,7 +152,7 @@ impl Guest {
                 }
                 hasher.update(&buffer[..read]);
             }
-            let found = hex(&hasher.finalize());
+            let found = shipyard_sys::hex::lower(&hasher.finalize());
             if &found != expected {
                 return Err(VmError::Guest(format!(
                     "{} isn't the file its manifest names (sha256 {found}, the manifest's \
@@ -163,15 +163,6 @@ impl Guest {
         }
         Ok(())
     }
-}
-
-/// `bytes` as lowercase hex.
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut text, byte| {
-        let _ = write!(text, "{byte:02x}");
-        text
-    })
 }
 
 impl Manifest {
@@ -248,8 +239,14 @@ mod tests {
         };
         assert!(why.contains("Image"), "{why}");
         let matched = V1
-            .replace("\"1993\"", &format!("\"{}\"", hex(&Sha256::digest(b"k"))))
-            .replace("\"e1c3\"", &format!("\"{}\"", hex(&Sha256::digest(b"i"))));
+            .replace(
+                "\"1993\"",
+                &format!("\"{}\"", shipyard_sys::hex::lower(&Sha256::digest(b"k"))),
+            )
+            .replace(
+                "\"e1c3\"",
+                &format!("\"{}\"", shipyard_sys::hex::lower(&Sha256::digest(b"i"))),
+            );
         std::fs::write(dir.join(MANIFEST), matched).unwrap();
         Guest::find(&dir).unwrap().verify().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();

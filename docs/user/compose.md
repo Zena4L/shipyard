@@ -30,7 +30,9 @@ anyone else), then becomes `docker compose` (its signals, terminal and exit code
 compose's). If nothing serves that socket yet (systemd's `shipyard.socket` isn't
 installed: see [the API](api.md)), it starts `shipyard system service` itself; that
 service ends once nothing has asked it anything for 60 seconds, so nothing is left
-running. With the socket units installed, systemd starts it instead.
+running (its output goes to `service.log` beside the socket, moved aside to
+`service.log.1` once it passes 4 MiB). With the socket units installed, systemd starts
+it instead.
 
 `docker compose` can also be run directly, with `DOCKER_HOST` set as above.
 

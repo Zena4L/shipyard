@@ -1419,12 +1419,8 @@ fn children_by_scanning_proc() -> Vec<libc::pid_t> {
         .flatten()
         .filter_map(|entry| {
             let pid: libc::pid_t = entry.file_name().to_str()?.parse().ok()?;
-            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            // Format: "pid (comm) state ppid ...". The name can contain
-            // spaces and parentheses, so parse from the last ')'.
-            let after_name = stat.get(stat.rfind(')')?.checked_add(2)?..)?;
-            let ppid: u32 = after_name.split_whitespace().nth(1)?.parse().ok()?;
-            (ppid == me).then_some(pid)
+            let ppid = shipyard_sys::proc::stat(pid)?.ppid;
+            (u32::try_from(ppid).ok()? == me).then_some(pid)
         })
         .collect()
 }

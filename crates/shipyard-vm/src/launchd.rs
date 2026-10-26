@@ -49,12 +49,7 @@ pub fn label(paths: &VmPaths, home: Option<&Path>) -> String {
         return LABEL.to_owned();
     }
     let digest = sha2::Sha256::digest(dir.as_os_str().as_encoded_bytes());
-    let hex = digest.iter().take(6).fold(String::new(), |mut hex, b| {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{b:02x}");
-        hex
-    });
-    format!("{LABEL}.{hex}")
+    format!("{LABEL}.{}", shipyard_sys::hex::lower(&digest[..6]))
 }
 
 /// [`label`] with the user's home.

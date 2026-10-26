@@ -193,20 +193,12 @@ fn start_holding(
     // that ran keeps its history (its end, its code; boot starts it
     // again), never reading as never started.
     let before = containers::PreviousStart::of(&record);
-    // Room for this start's logs, whoever starts it.
-    crate::run::restart_policy::prune_before_a_start(engine, &id);
-    // Its create's fill, cut short (killed): finished before it runs.
-    if record.started.is_none() {
-        super::volumes::fill_volumes(engine, &record, &[], super::volumes::Fill::Finish, &|| {
-            held.is_some_and(HeldOff::asked_to_stop)
-        })?;
-    }
     let PlannedStart {
         planned,
         image,
         interface_sysctls,
         stdin_once,
-    } = planned_start(engine, &record)?;
+    } = prepare_start(engine, &record, held)?;
     // Made to close its input once (the API's `StdinOnce`): each start's.
     let input = if stdin_once { Input::OnceItEnds } else { input };
     let (defaults, area) = image.unzip();
@@ -214,17 +206,14 @@ fn start_holding(
     // cleanly (everything undone); after, once the container runs on.
     let own = held.is_none().then(HeldOff::new);
     let held_off = held.or(own.as_ref());
-    let exposed = planned.exposed(defaults.as_ref());
-    // With `-P`'s ports, before its network is set up.
-    check_holds(&planned, &exposed)?;
-    let network = RunNetwork::set_up(engine, planned.network(), &exposed)?;
-    let ports = network.bound();
-    let streams = planned.request.streams;
-    let stdin = input.stdin(streams.interactive);
-    // Its health check, for its companion (`finish` takes the plan).
-    let health = planned.request.health.clone();
-    let (invocation, volumes) = planned.finish(engine, defaults, network.etc())?;
-    let plan = plan_of(engine, invocation, streams.tty)?;
+    let ReadyToCreate {
+        network,
+        ports,
+        stdin,
+        health,
+        plan,
+        volumes,
+    } = ready_to_create(engine, planned, defaults, input)?;
     let holds = collect_holds(&network, &volumes, area.as_ref(), &running);
     let fds = holds.for_runtime();
     let settings = StartSettings {
@@ -235,15 +224,7 @@ fn start_holding(
     let options = create_options(engine, &id, &network, &holds, &fds, settings)?;
     // The newest start directory before this one's: a failed start's goes.
     let last_start = last_start(engine, &id);
-    let created = if held_off.is_some_and(HeldOff::asked_to_stop) {
-        Err(Error::new(
-            ErrorKind::Interrupted,
-            "interrupted before the container was made",
-        ))
-    } else {
-        runtime::create_planned(&runtime_root, id.as_str(), &plan, &options).map_err(Error::from)
-    };
-    let created = match created {
+    let created = match create_unless_stopped(held_off, &runtime_root, &id, &plan, &options) {
         Ok(created) => created,
         Err(error) => {
             // Not made: everything is let go here (the writable layer
@@ -268,14 +249,7 @@ fn start_holding(
     drop(fds);
     drop(holds);
     running.give_up();
-    let mut detached = network.into_detached();
-    detached.interface_sysctls = interface_sysctls;
-    for volume in volumes {
-        volume.give_up();
-    }
-    if let Some(area) = area {
-        area.give_up();
-    }
+    let detached = given_up(network, volumes, area, interface_sysctls);
     for warning in created.warnings {
         engine.warn(WarningKind::Runtime, warning);
     }
@@ -302,6 +276,118 @@ fn start_holding(
     };
     containers::forget_previous_start(engine, &id);
     Ok(started)
+}
+
+/// Container `record`'s start, planned: room made for its logs, its
+/// create's fill finished if a kill cut it short (a Ctrl-C held off by
+/// `held` stops it), then its run checked and its image made ready.
+///
+/// # Errors
+///
+/// A fill that fails or is stopped, or [`planned_start`]'s.
+fn prepare_start(engine: &Engine, record: &Record, held: Option<&HeldOff>) -> Result<PlannedStart> {
+    // Room for this start's logs, whoever starts it.
+    crate::run::restart_policy::prune_before_a_start(engine, &record.id);
+    // Its create's fill, cut short (killed): finished before it runs.
+    if record.started.is_none() {
+        super::volumes::fill_volumes(engine, record, &[], super::volumes::Fill::Finish, &|| {
+            held.is_some_and(HeldOff::asked_to_stop)
+        })?;
+    }
+    planned_start(engine, record)
+}
+
+/// What [`ready_to_create`] makes ready for the runtime's create. Its
+/// network and volumes are held: let go, or handed to the monitor, by the
+/// start.
+struct ReadyToCreate {
+    /// Its network, set up.
+    network: RunNetwork,
+    /// The ports published on the host.
+    ports: Vec<BoundPort>,
+    /// How its input is kept.
+    stdin: StdinMode,
+    /// Its health check, for its companion.
+    health: Option<crate::health::HealthCheck>,
+    /// What the runtime makes.
+    plan: Plan,
+    /// Its named volumes, held.
+    volumes: Vec<shipyard_storage::VolumeHold>,
+}
+
+/// A planned start made ready: its ports checked (with `-P`'s, the image's
+/// `defaults` known), its network set up, its run finished with the image
+/// and turned into the runtime's plan.
+///
+/// # Errors
+///
+/// A port held elsewhere, a network that can't be set up, or what
+/// [`Planned::finish`](crate::run::Planned::finish) and [`plan_of`] refuse.
+fn ready_to_create(
+    engine: &Engine,
+    planned: crate::run::Planned,
+    defaults: Option<crate::run::ImageDefaults>,
+    input: Input,
+) -> Result<ReadyToCreate> {
+    let exposed = planned.exposed(defaults.as_ref());
+    // With `-P`'s ports, before its network is set up.
+    check_holds(&planned, &exposed)?;
+    let network = RunNetwork::set_up(engine, planned.network(), &exposed)?;
+    let ports = network.bound();
+    let streams = planned.request.streams;
+    let stdin = input.stdin(streams.interactive);
+    // Its health check, for its companion (`finish` takes the plan).
+    let health = planned.request.health.clone();
+    let (invocation, volumes) = planned.finish(engine, defaults, network.etc())?;
+    let plan = plan_of(engine, invocation, streams.tty)?;
+    Ok(ReadyToCreate {
+        network,
+        ports,
+        stdin,
+        health,
+        plan,
+        volumes,
+    })
+}
+
+/// What a made container's monitor now holds, given up by this process:
+/// its copies closed, never unlocked or released. The network goes on as
+/// what's left to do once it's started (its interfaces' own settings,
+/// `interface_sysctls`, among it).
+fn given_up(
+    network: RunNetwork,
+    volumes: Vec<shipyard_storage::VolumeHold>,
+    area: Option<crate::image::RunArea>,
+    interface_sysctls: Vec<(String, String)>,
+) -> crate::network::DetachedNetwork {
+    let mut detached = network.into_detached();
+    detached.interface_sysctls = interface_sysctls;
+    for volume in volumes {
+        volume.give_up();
+    }
+    if let Some(area) = area {
+        area.give_up();
+    }
+    detached
+}
+
+/// The runtime's create of container `id` from `plan`, unless a Ctrl-C held
+/// off by `held_off` has asked this process to stop.
+///
+/// # Errors
+///
+/// [`ErrorKind::Interrupted`], or the runtime's refusal.
+fn create_unless_stopped(
+    held_off: Option<&HeldOff>,
+    runtime_root: &std::path::Path,
+    id: &ContainerId,
+    plan: &Plan,
+    options: &CreateOptions<'_>,
+) -> Result<runtime::Created> {
+    if held_off.is_some_and(HeldOff::asked_to_stop) {
+        bail!(Interrupted, "interrupted before the container was made");
+    }
+    runtime::create_planned(runtime_root, id.as_str(), plan, options).map_err(Error::from)
 }
 
 /// Keeps `before` (what container `id`'s last start left) on disk

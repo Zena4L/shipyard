@@ -59,16 +59,29 @@ pub struct Bound {
     /// The socket and its device and inode, removed at the drop (`None`:
     /// left, as a killed service leaves it).
     path: Option<(PathBuf, (u64, u64))>,
-    _lock: File,
+    /// Its lock, held while it serves by its name.
+    lock: Option<File>,
+}
+
+impl Bound {
+    /// Removes the socket's name now (if it's still the one bound), then
+    /// lets go of its lock: no client can connect by it any more, and one
+    /// that finds it gone starts a service of its own, which binds at once
+    /// (F149: the service's idle end; this one only serves what it had
+    /// queued).
+    pub fn unlink(&mut self) {
+        if let Some((path, bound)) = self.path.take()
+            && identity(&path).is_ok_and(|now| now == bound)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        self.lock = None;
+    }
 }
 
 impl Drop for Bound {
     fn drop(&mut self) {
-        if let Some((path, bound)) = &self.path
-            && identity(path).is_ok_and(|now| now == *bound)
-        {
-            let _ = std::fs::remove_file(path);
-        }
+        self.unlink();
     }
 }
 
@@ -136,7 +149,7 @@ pub fn bind(path: &Path) -> Result<(UnixListener, Bound), BindError> {
         listener,
         Bound {
             path: Some((path.to_owned(), bound)),
-            _lock: lock,
+            lock: Some(lock),
         },
     ))
 }

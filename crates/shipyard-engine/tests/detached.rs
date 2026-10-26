@@ -528,6 +528,14 @@ mod linux {
             one_its_policy_restarts_is_never_removed_unasked,
         ),
         (
+            "one_no_policy_restarts_is_removed_at_once",
+            one_no_policy_restarts_is_removed_at_once,
+        ),
+        (
+            "a_user_s_stop_never_waits_for_the_restart",
+            a_user_s_stop_never_waits_for_the_restart,
+        ),
+        (
             "an_image_a_record_names_is_kept_without_its_pin",
             an_image_a_record_names_is_kept_without_its_pin,
         ),
@@ -931,20 +939,14 @@ mod linux {
                     ) {
                         Err(nix::errno::Errno::ECHILD) => println!("children=none"),
                         other => {
-                            let me = std::process::id().to_string();
+                            let me = i32::try_from(std::process::id()).unwrap();
                             let mine: Vec<String> = std::fs::read_dir("/proc")
                                 .into_iter()
                                 .flatten()
                                 .flatten()
                                 .filter_map(|entry| {
-                                    let stat =
-                                        std::fs::read_to_string(entry.path().join("stat")).ok()?;
-                                    let ppid = stat
-                                        .rsplit(')')
-                                        .next()?
-                                        .split_whitespace()
-                                        .nth(1)?
-                                        .to_owned();
+                                    let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+                                    let ppid = shipyard_sys::proc::stat(pid)?.ppid;
                                     (ppid == me).then(|| {
                                         let line = std::fs::read(entry.path().join("cmdline"))
                                             .unwrap_or_default();
@@ -1452,15 +1454,7 @@ mod linux {
 
     /// Process `pid`'s parent.
     fn parent(pid: i32) -> i32 {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        stat.rsplit(')')
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap()
+        shipyard_sys::proc::stat(pid).unwrap().ppid
     }
 
     /// Process `pid`'s blocked signals (`SigBlk` in its status, hex).
@@ -1481,15 +1475,7 @@ mod linux {
 
     /// Process `pid`'s session.
     fn session(pid: i32) -> i32 {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        stat.rsplit(')')
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(3)
-            .unwrap()
-            .parse()
-            .unwrap()
+        shipyard_sys::proc::stat(pid).unwrap().session
     }
 
     /// Whether this host has pasta (a test that needs it says so and skips
@@ -1594,12 +1580,13 @@ mod linux {
     }
 
     /// Waits for `found` (up to 30 s), naming `what` if it never comes.
-    fn eventually(what: &str, mut found: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !found() {
-            assert!(Instant::now() < deadline, "never: {what}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    fn eventually(what: &str, found: impl FnMut() -> bool) {
+        shipyard_test_support::eventually_every(
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+            what,
+            found,
+        );
     }
 
     /// A free TCP port on the host, for `--publish`.
@@ -5487,24 +5474,11 @@ mod linux {
         let (init, _) = shipyard_runtime::container::peek_init(&root, record.id.as_str())
             .unwrap()
             .unwrap();
-        let stat =
-            |pid: i32| std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-        // The monitor is the init's parent (the fourth field).
-        let monitor: i32 = stat(init)
-            .rsplit(')')
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
+        // The monitor is the init's parent.
+        let monitor = shipyard_sys::proc::stat(init).unwrap().ppid;
         kill(Pid::from_raw(monitor), Signal::SIGSTOP).unwrap();
         eventually("its init ended, unreaped", || {
-            stat(init)
-                .rsplit(')')
-                .next()
-                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+            shipyard_sys::proc::stat(init).is_some_and(|stat| stat.state == 'Z')
         });
         let resume = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(1));
@@ -6339,6 +6313,92 @@ mod linux {
         eventually("the clean-up gone, the restart free", || {
             shipyard_engine::run::remove(&engine, id.as_str(), false).is_ok()
         });
+    }
+
+    /// A container with no policy, in the same moment (its clean-up paused
+    /// there by its test hook): ended for good, so a removal without force
+    /// takes it at once, never "restarting" (12.5c3: a `start -a` then `rm`
+    /// lost this race under load). The policy's case is the one above.
+    fn one_no_policy_restarts_is_removed_at_once() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let hook = stores.scratch.0.join("restart-paused");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("launch").args([
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sh",
+            "-c",
+            "exit 3",
+        ]);
+        for (key, value) in stores.env() {
+            command.env(key, value);
+        }
+        command.env("SHIPYARD_TEST_CLEANUP_RESTART_PAUSE", &hook);
+        let id = Stores::id(&command.output().unwrap());
+        eventually("its clean-up paused, the container let go", || {
+            hook.exists()
+        });
+        assert!(stores.running_file(&id).try_lock().is_ok(), "let go");
+        let removed = shipyard_engine::run::remove(&engine, id.as_str(), false);
+        let pid: i32 = std::fs::read_to_string(&hook).unwrap().parse().unwrap();
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        removed.unwrap();
+    }
+
+    /// A user's stop of a container whose policy is `always`: its policy
+    /// won't start it again, so its clean-up never takes (nor waits for)
+    /// its restart. Held here by the test meanwhile, a clean-up that waited
+    /// for it would live on for its 15 s (and a `rm` the moment it took it
+    /// would be refused as restarting: a `stop` then `rm`, compose's
+    /// `down`): gone at once.
+    fn a_user_s_stop_never_waits_for_the_restart() {
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let id = Stores::id(&stores.launch(&[
+            "--restart",
+            "always",
+            "--network",
+            "none",
+            stores.image.as_str(),
+            "sleep",
+            "300",
+        ]));
+        let restart = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(
+                containers::testing::record_dir(&engine, &id)
+                    .unwrap()
+                    .join("restarting"),
+            )
+            .unwrap();
+        restart.lock().unwrap();
+        let fast = shipyard_engine::run::StopOptions {
+            timeout: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let stopped = Instant::now();
+        shipyard_engine::run::stop(&engine, id.as_str(), fast).unwrap();
+        shipyard_test_support::eventually_every(
+            Duration::from_secs(8),
+            Duration::from_millis(20),
+            "its __cleanup gone, never waiting for the restart",
+            || {
+                processes_with("__cleanup")
+                    .iter()
+                    .all(|process| !process.contains(id.as_str()))
+            },
+        );
+        assert!(stopped.elapsed() < Duration::from_secs(8));
+        restart.unlock().unwrap();
+        shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
     }
 
     /// `image prune -a` keeps an image a container's record names even

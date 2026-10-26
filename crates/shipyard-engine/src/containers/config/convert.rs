@@ -165,7 +165,7 @@ impl Config {
             network_alias: network_alias.clone(),
             ip: *ip,
             ip6: *ip6,
-            mac_address: mac_address.map(mac_text),
+            mac_address: mac_address.map(shipyard_network::store::format_mac),
             add_host: add_host
                 .iter()
                 .map(|entry| Host {
@@ -375,13 +375,6 @@ fn signal_text(signal: Signal) -> String {
     signal
         .name()
         .map_or_else(|| signal.as_raw().to_string(), std::borrow::Cow::into_owned)
-}
-
-fn mac_text(mac: [u8; 6]) -> String {
-    mac.iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 fn parse_mac(text: &str) -> Result<[u8; 6]> {
@@ -614,7 +607,7 @@ impl From<&NetworkMode> for Network {
                         name: joined.name.clone(),
                         ip: joined.ip,
                         ip6: joined.ip6,
-                        mac: joined.mac.map(mac_text),
+                        mac: joined.mac.map(shipyard_network::store::format_mac),
                         aliases: joined.aliases.clone(),
                     })
                     .collect(),

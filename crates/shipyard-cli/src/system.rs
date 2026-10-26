@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use crate::reporter::{engine, report};
+use crate::reporter::{engine, report_error};
 
 /// `system recover`'s and `system stop`'s code when some containers (not
 /// all) couldn't be started or stopped: the boot units' `SuccessExitStatus`
@@ -29,7 +29,7 @@ pub(crate) fn recover() -> Result<ExitCode> {
     let mut code = ExitCode::SUCCESS;
     for (name, error) in booted.failed {
         let error = anyhow::Error::from(error).context(format!("container {name}"));
-        code = report(&error, SOME_NOT_SETTLED);
+        code = report_error(&error, SOME_NOT_SETTLED);
     }
     Ok(code)
 }
@@ -48,7 +48,7 @@ pub(crate) fn stop() -> Result<ExitCode> {
     let mut code = ExitCode::SUCCESS;
     for (name, error) in stopped.failed {
         let error = anyhow::Error::from(error).context(format!("container {name}"));
-        code = report(&error, SOME_NOT_SETTLED);
+        code = report_error(&error, SOME_NOT_SETTLED);
     }
     Ok(code)
 }
@@ -91,6 +91,11 @@ pub(crate) fn service(socket: Option<&std::path::Path>, revision: &str) -> Resul
         );
         default
     });
+    // A test build's pause at the idle end (never a release's).
+    let idle_end_pause = cfg!(debug_assertions)
+        .then(|| std::env::var_os("SHIPYARD_TEST_API_IDLE_PAUSE"))
+        .flatten()
+        .map(std::path::PathBuf::from);
     let service = shipyard_api::Service {
         paths,
         idle,
@@ -98,24 +103,27 @@ pub(crate) fn service(socket: Option<&std::path::Path>, revision: &str) -> Resul
             version: env!("CARGO_PKG_VERSION").to_owned(),
             revision: revision.to_owned(),
         },
+        bound,
+        idle_end_pause,
     };
     shipyard_api::serve(listener, service).context("serving the API")?;
-    drop(bound);
     Ok(ExitCode::SUCCESS)
 }
 
-/// `shipyard system df`: what the images, the containers and the volumes
-/// take, and how much of it nothing uses, as Docker's (`--format` its
-/// rows). There's no build cache yet (stage 12 builds images).
+/// `shipyard system df`: what the images, the containers, the volumes and
+/// the build cache take, and how much of it nothing uses, as Docker's
+/// (`--format` its rows).
 pub(crate) fn df(format: Option<&str>) -> Result<ExitCode> {
     use crate::format::rows::{self, DfRow};
     let engine = engine();
     let store = shipyard_engine::image::disk_usage(&engine)?;
     let volumes = shipyard_engine::volumes::usage(&engine)?;
+    let cache = shipyard_engine::build::cache::usage(&engine)?;
     let rows = [
         DfRow::new("Images", &store.images),
         DfRow::new("Containers", &store.containers),
         DfRow::new("Local Volumes", &volumes),
+        DfRow::new("Build Cache", &cache),
     ];
     crate::format::Output::parse(format, rows::DF_TABLE)?
         .write(&mut std::io::stdout().lock(), &rows)?;

@@ -25,7 +25,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -708,9 +708,7 @@ impl Networks {
                 gateway,
                 bridge: bridge_name(&spec.name),
                 internal: spec.internal,
-                created: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |since| since.as_secs()),
+                created: shipyard_sys::time::unix_seconds(),
                 subnet6,
                 gateway6,
                 isolate_host: spec.isolate_host,

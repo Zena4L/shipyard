@@ -18,10 +18,14 @@ compile_error!("shipyard-sys only supports UNIX platforms (Linux, macOS)");
 pub mod fd;
 pub mod fdpass;
 pub mod fs;
+pub mod hex;
 pub mod listen;
 pub mod lock;
+pub mod path;
 #[cfg(target_os = "linux")]
 pub mod pidfd;
+pub mod proc;
 pub mod random;
 pub mod relay;
+pub mod time;
 pub mod versioned;

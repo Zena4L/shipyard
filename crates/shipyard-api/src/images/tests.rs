@@ -1,3 +1,6 @@
+use base64::Engine as _;
+use shipyard_engine::image::Credential;
+
 use super::*;
 
 fn query(text: &str) -> Query {
@@ -142,20 +145,6 @@ fn a_pull_s_progress_is_docker_s_lines() {
         serde_json::to_value(Line::error("no such image")).unwrap(),
         serde_json::json!({"errorDetail": {"message": "no such image"}, "error": "no such image"})
     );
-}
-
-/// Only this host's platform is pulled.
-#[test]
-fn only_this_host_s_platform_is_pulled() {
-    assert!(host_platform(&host_platform_name()));
-    assert!(host_platform("linux"));
-    assert!(!host_platform("windows/amd64"));
-    let other = if host_platform_name() == "linux/arm64" {
-        "linux/amd64"
-    } else {
-        "linux/arm64"
-    };
-    assert!(!host_platform(other));
 }
 
 /// A registry's words reach a terminal without its control characters.

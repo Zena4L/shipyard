@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 use crate::broken_pipe;
-use crate::reporter::{EXIT_FAILURE, report};
+use crate::reporter::{EXIT_FAILURE, report_error};
 
 /// Writes `rows` under `header`, in columns as wide as their widest cell,
 /// three spaces apart (the last one unpadded).
@@ -99,7 +99,7 @@ pub(crate) fn each(names: &[String], mut act: impl FnMut(&str) -> Result<()>) ->
             if broken_pipe(&err) {
                 break;
             }
-            code = report(&err, EXIT_FAILURE);
+            code = report_error(&err, EXIT_FAILURE);
         }
     }
     code
@@ -124,26 +124,6 @@ pub(crate) fn confirm(
     ))
 }
 
-/// A byte count in a human unit (B, KiB, MiB, GiB).
-pub(crate) fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "display only; precision loss at these magnitudes is immaterial"
-    )]
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 /// Each of `references` as `view` shows it, as one JSON array (the ones
 /// found: each that isn't is said); exits 1 if any wasn't. (`inspect`'s
 /// and `image inspect`'s, as Docker's.)
@@ -161,9 +141,118 @@ pub(crate) fn shown(
     Ok(code)
 }
 
+/// The refusal of a tar archive written to a terminal (`cp … -`, `save`,
+/// `export`): `hint`, the command's own other way (`, or give -o FILE`).
+pub(crate) fn tar_to_terminal_refused(hint: &str) -> anyhow::Error {
+    anyhow::anyhow!("refusing to write a tar archive to a terminal: redirect it (> file.tar){hint}")
+}
+
+/// The hints of the terminal refusals, by what each command takes instead
+/// (the same on Linux and from a Mac).
+pub(crate) const GIVE_OUTPUT: &str = ", or give -o FILE";
+/// `load`'s.
+pub(crate) const GIVE_INPUT: &str = ", or give -i FILE";
+/// `import`'s.
+pub(crate) const GIVE_FILE: &str = ", or give a FILE";
+/// `build -o type=tar`'s.
+pub(crate) const GIVE_TAR_DEST: &str = ", or give -o type=tar,dest=FILE";
+
+/// The refusal of a tar archive read from a terminal (`load`, `import -`):
+/// `hint` as [`tar_to_terminal_refused`]'s.
+pub(crate) fn tar_from_terminal_refused(hint: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to read a tar archive from a terminal: redirect one in (< file.tar){hint}"
+    )
+}
+
+/// Writes an archive to `path` with `write` (`save -o`, `export -o`): a
+/// regular file (or a new one) is written beside it and renamed at the end
+/// (as Docker's CLI does), so a failure leaves no half archive under the
+/// name asked for; anything else there (a device, a FIFO, a link:
+/// `/dev/null`, `/dev/stdout`) is written into as it is, never replaced (a
+/// rename over `/dev/null` as root would replace the host's). The file it
+/// writes is the caller's alone (0600, as Docker's `os.CreateTemp`): an
+/// image or a container's files may hold secrets.
+pub(crate) fn write_archive_to(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let writing = || format!("writing {}", path.display());
+    let there = match std::fs::symlink_metadata(path) {
+        Ok(there) => Some(there),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(writing),
+    };
+    if there.is_some_and(|there| !there.file_type().is_file()) {
+        // A link to a regular file: that file, written from its start (its
+        // old bytes past the archive's end cut off).
+        let to_a_file = std::fs::metadata(path).is_ok_and(|target| target.is_file());
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(to_a_file)
+            .open(path)
+            .with_context(writing)?;
+        let mut out = std::io::BufWriter::new(file);
+        write(&mut out)?;
+        return out.flush().with_context(writing);
+    }
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} names no file", path.display()))?;
+    let mut temporary = name.to_owned();
+    temporary.push(format!(".shipyard-{}", std::process::id()));
+    let temporary = path.with_file_name(temporary);
+    // One left by a write killed before its end, under this PID: no live
+    // process but this one has it.
+    let _ = std::fs::remove_file(&temporary);
+    let written = (|| {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(writing)?;
+        let mut out = std::io::BufWriter::new(&file);
+        write(&mut out)?;
+        out.flush()
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&temporary, path))
+            .with_context(writing)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_archive_written_to_a_file_is_the_caller_s_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("shipyard-archive-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        // A new file, then one there before that anyone could read.
+        let new = dir.join("new.tar");
+        write_archive_to(&new, |out| Ok(out.write_all(b"archive")?)).unwrap();
+        let had = dir.join("had.tar");
+        std::fs::write(&had, b"old").unwrap();
+        std::fs::set_permissions(&had, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_archive_to(&had, |out| Ok(out.write_all(b"archive")?)).unwrap();
+        for path in [&new, &had] {
+            assert_eq!(std::fs::read(path).unwrap(), b"archive");
+            assert_eq!(mode(path), 0o600, "{}", path.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_prompt_means_no_unless_it_says_yes() {
@@ -175,16 +264,6 @@ mod tests {
         };
         assert!(ask("y\n") && ask("YES\n") && ask(" yes "));
         assert!(!ask("\n") && !ask("n\n") && !ask("") && !ask("yep\n"));
-    }
-
-    #[test]
-    fn byte_counts_in_human_units() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1023), "1023 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
-        assert_eq!(human_bytes(3 << 40), "3.0 TiB");
-        assert_eq!(human_bytes(u64::MAX), "16777216.0 TiB");
     }
 
     #[test]

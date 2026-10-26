@@ -13,11 +13,10 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
 use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
-use serde::{Deserialize, Serialize};
-use shipyard_engine::image::{Credential, GivenCredential, ImageReference};
+use serde::Serialize;
+use shipyard_engine::image::{GivenCredential, ImageReference};
 use shipyard_engine::logs::Gone;
 use shipyard_engine::report::{Message, Progress, Reporter};
 
@@ -38,30 +37,23 @@ pub(crate) const AUTH_HEADER: &str = "x-registry-auth";
 const MAX_AUTH: usize = 16 * 1024;
 
 /// `POST /images/create` (`fromImage`, `tag`): the image pulled, its
-/// progress as it comes. `fromSrc` (an import) and a `platform` other than
-/// this host's are refused (400), as is a reference that isn't one.
+/// progress as it comes (an import, `fromSrc`, is [`import`]'s). A
+/// `platform` other than this host's is refused (400), as is a reference
+/// that isn't one.
 ///
 /// # Errors
 ///
 /// A request refused before the pull (400, 503); once it's under way, its
 /// failure is written in the stream (Docker's `errorDetail`).
 pub(crate) fn pull(shared: &Arc<Shared>, query: &Query, headers: &HeaderMap) -> Reply {
-    if query
-        .get("fromSrc")
-        .is_some_and(|source| !source.is_empty())
-    {
-        return Err(ApiError::bad(
-            "importing an image (fromSrc) isn't supported: pull it from a registry",
-        ));
-    }
     if let Some(platform) = query
         .get("platform")
         .filter(|platform| !platform.is_empty())
-        && !host_platform(platform)
+        && !shipyard_engine::image::is_host_platform(platform)
     {
         return Err(ApiError::bad(format!(
             "only this host's platform is pulled ({}), not {platform}",
-            host_platform_name()
+            shipyard_engine::image::host_platform_name()
         )));
     }
     let reference = reference(query)?;
@@ -71,7 +63,7 @@ pub(crate) fn pull(shared: &Arc<Shared>, query: &Query, headers: &HeaderMap) -> 
     let shown = reference.familiar();
     // The service's warnings (an index found corrupt) aren't a pull's
     // lines, as Docker's has none: the reporter keeps progress only.
-    let progress = Arc::new(PullProgress::new(sender.clone(), shared));
+    let progress = Arc::new(StreamedProgress::new(sender.clone(), shared));
     let puller = Arc::clone(shared);
     tokio::spawn(async move {
         let _permit = permit;
@@ -132,42 +124,6 @@ fn reference(query: &Query) -> Result<ImageReference, ApiError> {
     ImageReference::parse(&text).map_err(invalid)
 }
 
-/// Whether `platform` (`os[/arch[/variant]]`) is this host's.
-fn host_platform(platform: &str) -> bool {
-    let mut parts = platform.split('/');
-    let os = parts.next().unwrap_or_default();
-    let arch = parts.next();
-    os == "linux"
-        && arch.is_none_or(|arch| {
-            arch == std::env::consts::ARCH
-                || (arch == "arm64" && std::env::consts::ARCH == "aarch64")
-                || (arch == "amd64" && std::env::consts::ARCH == "x86_64")
-        })
-}
-
-/// This host's platform, as Docker names it.
-fn host_platform_name() -> String {
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
-        other => other,
-    };
-    format!("linux/{arch}")
-}
-
-/// What a Docker client puts in `X-Registry-Auth` (base64url of its JSON).
-/// No `Debug`: it holds the secrets in clear.
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct AuthConfig {
-    username: String,
-    password: String,
-    auth: String,
-    serveraddress: String,
-    identitytoken: String,
-    registrytoken: String,
-}
-
 /// The credential the request hands in, if it hands one: a registry's own
 /// bearer token (`registrytoken`, first, as Docker reads it: F118), an
 /// identity token, or a username and a password (or Docker's `auth`,
@@ -188,53 +144,8 @@ pub(crate) fn credentials(headers: &HeaderMap) -> Result<Option<GivenCredential>
             "X-Registry-Auth is over {MAX_AUTH} bytes"
         )));
     }
-    let text = header
-        .to_str()
-        .map_err(|_| refused())?
-        .trim()
-        .trim_end_matches('=');
-    if text.is_empty() {
-        return Ok(None);
-    }
-    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(text)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
-        .map_err(|_| refused())?;
-    let config: AuthConfig = serde_json::from_slice(&json).map_err(|_| refused())?;
-    given(config).map_err(|()| refused())
-}
-
-/// The credential `config` holds, if it holds one (see [`credentials`]);
-/// `Err` for an `auth` that isn't base64 of `user:password`.
-fn given(config: AuthConfig) -> Result<Option<GivenCredential>, ()> {
-    let registry = Some(config.serveraddress).filter(|address| !address.is_empty());
-    let credential = if !config.registrytoken.is_empty() {
-        Credential::RegistryToken(config.registrytoken)
-    } else if !config.identitytoken.is_empty() {
-        Credential::IdentityToken(config.identitytoken)
-    } else if !config.username.is_empty() || !config.password.is_empty() {
-        Credential::Basic {
-            username: config.username,
-            password: config.password,
-        }
-    } else if !config.auth.is_empty() {
-        let pair = base64::engine::general_purpose::STANDARD
-            .decode(config.auth.trim())
-            .ok()
-            .and_then(|pair| String::from_utf8(pair).ok())
-            .ok_or(())?;
-        let (username, password) = pair.split_once(':').ok_or(())?;
-        Credential::Basic {
-            username: username.to_owned(),
-            password: password.to_owned(),
-        }
-    } else {
-        return Ok(None);
-    };
-    Ok(Some(GivenCredential {
-        credential,
-        registry,
-    }))
+    let text = header.to_str().map_err(|_| refused())?;
+    GivenCredential::from_docker_auth(text).map_err(|_| refused())
 }
 
 /// `POST /auth` (`docker login`): the body's credentials (Docker's
@@ -255,9 +166,8 @@ pub(crate) async fn auth(shared: &Arc<Shared>, body: hyper::body::Incoming) -> R
         .await
         .map_err(|_| refused())?
         .to_bytes();
-    let config: AuthConfig = serde_json::from_slice(&bytes).map_err(|_| refused())?;
-    let given = given(config)
-        .map_err(|()| refused())?
+    let given = GivenCredential::from_auth_json(&bytes)
+        .map_err(|_| refused())?
         .ok_or_else(|| ApiError::bad("a username and a password, or a token, is needed"))?;
     let (login, _) = shared
         .call(move |_| shipyard_engine::image::login(given))
@@ -286,6 +196,18 @@ struct Line {
     error_detail: Option<ErrorDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// A push's last word for a tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aux: Option<PushAux>,
+}
+
+/// Docker's `aux` for a pushed tag.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PushAux {
+    tag: String,
+    digest: String,
+    size: u64,
 }
 
 /// A layer's bytes in a progress line: none once it's done.
@@ -299,13 +221,21 @@ struct ErrorDetail {
 }
 
 impl Line {
-    fn status(status: String) -> Self {
+    fn empty() -> Self {
         Self {
-            status: Some(status),
+            status: None,
             id: None,
             progress_detail: None,
             error_detail: None,
             error: None,
+            aux: None,
+        }
+    }
+
+    fn status(status: String) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::empty()
         }
     }
 
@@ -318,6 +248,7 @@ impl Line {
                 message: message.to_owned(),
             }),
             error: Some(message.to_owned()),
+            aux: None,
         }
     }
 
@@ -331,6 +262,8 @@ impl Line {
     /// The line the engine's `progress` makes.
     fn of(progress: &Progress) -> Line {
         match progress {
+            // (No build through the API: a line said as a status if one came.)
+            Progress::Build { line } => Line::status(line.clone()),
             Progress::Pulling { image } => {
                 let (name, tag) = ImageReference::parse(image).map_or_else(
                     |_| (image.clone(), String::new()),
@@ -365,17 +298,39 @@ impl Line {
                     .to_owned(),
                 )
             },
+            Progress::Pushing { name } => {
+                let repository = ImageReference::parse(name).map_or_else(
+                    |_| name.clone(),
+                    |reference| format!("{}/{}", reference.registry, reference.repository),
+                );
+                Line::status(format!(
+                    "The push refers to repository [{}]",
+                    plain(&repository)
+                ))
+            }
+            Progress::Pushed { short_digest, sent } => Line {
+                id: Some(short_digest.clone()),
+                progress_detail: Some(ProgressDetail {}),
+                ..Line::status(
+                    if sent.is_some() {
+                        "Pushed"
+                    } else {
+                        "Layer already exists"
+                    }
+                    .to_owned(),
+                )
+            },
         }
     }
 }
 
 /// A pull's reporter: each progress message a line on its stream.
-struct PullProgress {
+struct StreamedProgress {
     sender: Sender,
     gone: Gone,
 }
 
-impl PullProgress {
+impl StreamedProgress {
     fn new(sender: Sender, shared: &Arc<Shared>) -> Self {
         let gone = streams::gone(shared, &sender);
         Self { sender, gone }
@@ -388,13 +343,83 @@ impl PullProgress {
     }
 }
 
-impl Reporter for PullProgress {
+impl Reporter for StreamedProgress {
     fn report(&self, message: Message) {
         if let Message::Progress(progress) = message {
             // A client gone: the pull goes on, unwritten.
             let _ = self.write(&Line::of(&progress));
         }
     }
+}
+
+/// `POST /images/{name}/push` (`tag`; none, and the name none: every tag
+/// of the repository, as Docker's `push -a`): pushed, signing in with the
+/// client's `X-Registry-Auth` (else the service's Docker config), its
+/// progress as Docker's lines, then each tag's `TAG: digest: … size: …`
+/// and its `aux`. A client that goes doesn't cut it short (as a pull).
+///
+/// # Errors
+///
+/// A name that isn't one, or `X-Registry-Auth` that can't be read (400);
+/// once under way, the failure in the stream.
+pub(crate) fn push(shared: &Arc<Shared>, name: &str, query: &Query, headers: &HeaderMap) -> Reply {
+    let tag = query.get("tag").filter(|tag| !tag.is_empty());
+    let parsed = ImageReference::parse(name)
+        .map_err(|error| ApiError::bad(format!("invalid reference format: {error}")))?;
+    let all_tags = tag.is_none() && !shipyard_engine::image::names_a_tag(name);
+    let name = match tag {
+        Some(tag) => format!("{}/{}:{tag}", parsed.registry, parsed.repository),
+        None => name.to_owned(),
+    };
+    let given = credentials(headers)?;
+    let permit = streams::stream_permit(shared)?;
+    let (sender, body) = reply::channel();
+    let progress = Arc::new(StreamedProgress::new(sender.clone(), shared));
+    let pusher = Arc::clone(shared);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let request = shipyard_engine::image::PushRequest {
+            name,
+            all_tags,
+            given,
+        };
+        let pushed = pusher
+            .call_reporting(Arc::clone(&progress) as _, move |engine| {
+                shipyard_engine::image::push(engine, &request)
+            })
+            .await;
+        let lines: Vec<Line> = match pushed {
+            Ok(pushed) => pushed
+                .iter()
+                .flat_map(|name| {
+                    [
+                        Line::status(format!(
+                            "{}: digest: {} size: {}",
+                            plain(&name.tag),
+                            name.digest,
+                            name.size
+                        )),
+                        Line {
+                            progress_detail: Some(ProgressDetail {}),
+                            aux: Some(PushAux {
+                                tag: plain(&name.tag),
+                                digest: name.digest.clone(),
+                                size: name.size,
+                            }),
+                            ..Line::empty()
+                        },
+                    ]
+                })
+                .collect(),
+            Err(error) => vec![Line::error(&plain(&error.message))],
+        };
+        for line in lines {
+            if sender.send(line.bytes().into()).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(reply::channelled(StatusCode::OK, "application/json", body))
 }
 
 /// `GET /images/json` (`filters`: `reference`, `label`, `dangling`).
@@ -420,14 +445,8 @@ pub(crate) async fn inspect(shared: &Arc<Shared>, name: String) -> Reply {
     let inspected = shared
         .call(move |engine| shipyard_engine::docker::inspect_image(engine, &name))
         .await;
-    match inspected {
-        Ok((image, _)) => Ok(reply::json(StatusCode::OK, &image)),
-        Err(error) if error.status == StatusCode::NOT_FOUND => Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("No such image: {shown}"),
-        )),
-        Err(error) => Err(error),
-    }
+    let (image, _) = inspected.map_err(no_such_image(&shown))?;
+    Ok(reply::json(StatusCode::OK, &image))
 }
 
 /// `POST /images/{name}/tag` (`repo`, `tag`: `latest` if none): 201.
@@ -528,23 +547,209 @@ pub(crate) async fn prune(shared: &Arc<Shared>, query: &Query) -> Reply {
     ))
 }
 
-/// `POST /build/prune`: no build cache yet (stage 12 builds images), so
-/// nothing deleted, as Docker answers one without a cache (its `system
-/// prune` asks for it).
-pub(crate) fn prune_build() -> hyper::Response<crate::reply::Body> {
+/// `POST /build/prune` (`docker builder prune`, `system prune`'s last
+/// ask): every context's build cache no build is using, removed (step
+/// 12.3); Docker's `CachesDeleted` (`null` for none) and `SpaceReclaimed`.
+/// A cache a build is using is kept, as Docker keeps one in use. With
+/// `filters` or `keep-storage` (a context's cache has no labels or times to
+/// read, nor a part to keep), nothing is removed: `docker system prune
+/// --filter …` asks with its filters, and never wipes the cache for them.
+///
+/// # Errors
+///
+/// Filters that aren't Docker's JSON (400); the store's.
+pub(crate) async fn prune_build(shared: &Arc<Shared>, query: &Query) -> Reply {
     #[derive(Serialize)]
     #[serde(rename_all = "PascalCase")]
     struct Pruned {
         caches_deleted: Option<Vec<String>>,
         space_reclaimed: u64,
     }
-    reply::json(
+    let filtered = !shipyard_engine::docker::filters::Given::from_json(query.get("filters"))
+        .map_err(|error| ApiError::bad(error.to_string()))?
+        .is_empty()
+        || query
+            .get("keep-storage")
+            .is_some_and(|keep| !matches!(keep, "" | "0"));
+    let pruned = if filtered {
+        shipyard_engine::build::cache::Pruned::default()
+    } else {
+        shared.call(shipyard_engine::build::cache::prune).await?.0
+    };
+    Ok(reply::json(
         StatusCode::OK,
         &Pruned {
-            caches_deleted: None,
-            space_reclaimed: 0,
+            caches_deleted: Some(pruned.removed).filter(|removed| !removed.is_empty()),
+            space_reclaimed: pruned.bytes,
         },
-    )
+    ))
+}
+
+/// `GET /images/{name}/history`: Docker's `HistoryResponseItem`s, newest
+/// first; 404 `No such image: NAME`.
+///
+/// # Errors
+///
+/// As the engine's.
+pub(crate) async fn history(shared: &Arc<Shared>, name: String) -> Reply {
+    let shown = name.clone();
+    let history = shared
+        .call(move |engine| shipyard_engine::docker::image_history(engine, &name))
+        .await;
+    let (items, _) = history.map_err(no_such_image(&shown))?;
+    Ok(reply::json(StatusCode::OK, &items))
+}
+
+/// `GET /images/{name}/get` and `GET /images/get?names=…` (`docker save`):
+/// one archive of every image named, as it's written (Docker 25's form,
+/// D12.2-2). Each name is found first (404 `No such image: NAME` before any
+/// byte); an archive that fails after its headers breaks off, never ends as
+/// a whole one.
+///
+/// # Errors
+///
+/// No name (400); a name that names no image (404); more streams than are
+/// served (503).
+pub(crate) async fn save(shared: &Arc<Shared>, names: Vec<String>) -> Reply {
+    if names.is_empty() {
+        return Err(ApiError::bad("no image to save: give names=NAME"));
+    }
+    // Found as the save finds them (a repository alone is every tag of
+    // it), before the headers: a 404 then, never a cut archive.
+    let wanted = names.clone();
+    shared
+        .call(move |engine| shipyard_engine::image::check_saved(engine, &wanted))
+        .await
+        .map_err(|error| match error.status {
+            // Docker's words (`No such image: NAME`), the name the engine's.
+            StatusCode::NOT_FOUND => ApiError::new(
+                StatusCode::NOT_FOUND,
+                plain(&error.message).replacen("no such image", "No such image", 1),
+            ),
+            _ => error,
+        })?;
+    let permit = streams::stream_permit(shared)?;
+    let (sender, cut, body) = reply::cuttable();
+    let writer = crate::archive::ChannelWriter::new(shared, sender);
+    let saver = Arc::clone(shared);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let saved = saver
+            .call(move |engine| shipyard_engine::image::save(engine, &names, writer))
+            .await;
+        if let Err(error) = saved {
+            tracing::warn!(error = %error.message, "a save broke off: its archive was cut");
+            cut.cut();
+        }
+    });
+    Ok(reply::channelled(StatusCode::OK, "application/x-tar", body))
+}
+
+/// `POST /images/load` (`quiet`): the body, an archive (plain or gzip), read
+/// whole before anything is loaded; then Docker's JSON lines: `Loaded
+/// image: NAME` for each name, what was left out said too. A tag that moved
+/// to the archive's image is said, as Docker's load says it.
+///
+/// # Errors
+///
+/// The archive is cut, malformed, past a bound, or holds no image to load
+/// (400); the store's errors.
+pub(crate) async fn load(
+    shared: &Arc<Shared>,
+    query: &Query,
+    body: hyper::body::Incoming,
+) -> Reply {
+    let quiet = query.flag("quiet");
+    let (permit, input) = crate::archive::body_input(shared, body)?;
+    let (loaded, _) = shared
+        .call(move |engine| {
+            let _permit = permit;
+            shipyard_engine::image::load(engine, input)
+        })
+        .await
+        // Its refusal quotes the archive (a member's path, a left-out
+        // image's words): never sent raw either.
+        .map_err(|error| ApiError::new(error.status, plain(&error.message)))?;
+    // An archive's words, its names and its config's strings among them:
+    // never sent raw (Docker's CLI prints `stream` as it comes).
+    let mut lines = Vec::new();
+    for text in loaded.lines(quiet) {
+        let line = serde_json::json!({ "stream": format!("{}\n", plain(&text)) });
+        lines.extend(serde_json::to_vec(&line).unwrap_or_default());
+        lines.push(b'\n');
+    }
+    Ok(reply::with_type(StatusCode::OK, "application/json", lines))
+}
+
+/// `POST /images/create?fromSrc=-` (`docker import`, step 12.2b): the
+/// body, a root filesystem's tar (plain or gzip), made a one-layer image
+/// named `repo` (a whole reference, as Docker's CLI sends it; `tag` added
+/// to one without a tag), its config set by `changes` (repeated), its
+/// history's comment `message`. Docker's JSON line `{"status": ID}`. A
+/// `fromSrc` that's a URL is refused (400), as is no name (D12.2-9), a
+/// change import doesn't take, another `platform`.
+///
+/// # Errors
+///
+/// As the engine's `image::import`'s; more streams than are served (503).
+pub(crate) async fn import(
+    shared: &Arc<Shared>,
+    query: &Query,
+    body: hyper::body::Incoming,
+) -> Reply {
+    if query.get("fromSrc") != Some("-") {
+        return Err(ApiError::bad(
+            "importing from a URL isn't supported: download it, then import it (fromSrc=-)",
+        ));
+    }
+    let name = query
+        .get("repo")
+        .filter(|repo| !repo.is_empty())
+        .map(|repo| {
+            match query.get("tag").filter(|tag| !tag.is_empty()) {
+                // `repo` names no tag of its own (a port isn't one).
+                Some(tag) if !repo.rsplit('/').next().unwrap_or(repo).contains(':') => {
+                    format!("{repo}:{tag}")
+                }
+                _ => repo.to_owned(),
+            }
+        });
+    let request = shipyard_engine::image::ImportRequest {
+        name,
+        changes: query.get_all("changes"),
+        // Docker's CLI sends it empty without `-m`: Docker's comment then.
+        message: query
+            .get("message")
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned),
+        platform: query
+            .get("platform")
+            .filter(|platform| !platform.is_empty())
+            .map(str::to_owned),
+    };
+    let (permit, input) = crate::archive::body_input(shared, body)?;
+    let (imported, _) = shared
+        .call(move |engine| {
+            let _permit = permit;
+            shipyard_engine::image::import(engine, input, &request)
+        })
+        .await
+        .map_err(|error| ApiError::new(error.status, plain(&error.message)))?;
+    let line = serde_json::json!({ "status": plain(&imported.id) });
+    let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
+    bytes.push(b'\n');
+    Ok(reply::with_type(StatusCode::OK, "application/json", bytes))
+}
+
+/// An engine's 404 as Docker's `No such image: NAME`, for `shown`.
+fn no_such_image(shown: &str) -> impl FnOnce(ApiError) -> ApiError + '_ {
+    move |error| {
+        if error.status == StatusCode::NOT_FOUND {
+            ApiError::new(StatusCode::NOT_FOUND, format!("No such image: {shown}"))
+        } else {
+            error
+        }
+    }
 }
 
 #[cfg(test)]

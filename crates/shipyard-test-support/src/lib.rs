@@ -22,8 +22,10 @@ pub mod harness;
 pub mod net;
 pub mod pipes;
 pub mod pty;
+pub mod push_registry;
 pub mod registry;
 pub mod rootfs;
+pub mod stores;
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -39,11 +41,45 @@ pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// # Panics
 ///
 /// It didn't hold in time (`what` says what was waited for).
-pub fn eventually(bound: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+pub fn eventually(bound: Duration, what: &str, condition: impl FnMut() -> bool) {
+    eventually_every(bound, Duration::from_millis(50), what, condition);
+}
+
+/// [`eventually`], looking every `poll` (a short one for a test that must
+/// catch a brief state; no thread: a test binary that forks, the terminal
+/// harness, uses it too).
+///
+/// # Panics
+///
+/// It didn't hold in time.
+pub fn eventually_every(
+    bound: Duration,
+    poll: Duration,
+    what: &str,
+    mut condition: impl FnMut() -> bool,
+) {
+    eventually_some(bound, poll, what, || condition().then_some(()));
+}
+
+/// Waits (up to `bound`, looking every `poll`) until `found` finds
+/// something: it.
+///
+/// # Panics
+///
+/// It found nothing in time.
+pub fn eventually_some<T>(
+    bound: Duration,
+    poll: Duration,
+    what: &str,
+    mut found: impl FnMut() -> Option<T>,
+) -> T {
     let deadline = Instant::now() + bound;
-    while !condition() {
+    loop {
+        if let Some(it) = found() {
+            return it;
+        }
         assert!(Instant::now() < deadline, "{what}: not in {bound:?}");
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(poll);
     }
 }
 
@@ -131,9 +167,12 @@ pub fn is_anonymous_volume(name: &str) -> bool {
 /// comparison never ran.
 #[must_use]
 pub fn reference_tool(name: &str) -> bool {
-    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .chain(["/usr/sbin".into(), "/sbin".into()])
-        .any(|dir| dir.join(name).is_file());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::env::split_paths(&path).chain(["/usr/sbin".into(), "/sbin".into()]);
+    let found = std::env::join_paths(dirs)
+        .ok()
+        .and_then(|path| shipyard_sys::path::find_program(name, Some(&path)))
+        .is_some();
     if !found {
         assert!(
             std::env::var("SHIPYARD_TEST_TOOLS").as_deref() != Ok("required"),
@@ -220,6 +259,15 @@ impl Shipyard {
     pub fn run_unisolated_with(self, args: &[&str], setup: fn() -> std::io::Result<()>) -> Command {
         self.command_with(&[&["run", "--no-isolation"], args].concat(), setup)
     }
+}
+
+/// A process's standard output and error, as text (lossily).
+#[must_use]
+pub fn text(output: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 /// Removes the places [`with_container_places`] made for test binaries
@@ -491,8 +539,7 @@ fn rootless_unavailable(needs: Rootless) -> Option<String> {
         return None;
     }
     let on_path = |helper| {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .any(|dir| dir.join(helper).is_file())
+        shipyard_sys::path::find_program(helper, std::env::var_os("PATH").as_deref()).is_some()
     };
     if !on_path("newuidmap") || !on_path("newgidmap") {
         return Some("newuidmap and newgidmap aren't on PATH (the uidmap package)".to_owned());

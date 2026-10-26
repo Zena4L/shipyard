@@ -27,10 +27,11 @@ pub(crate) struct ComposeArgs {
 /// Runs `docker compose ARGS` against Shipyard's socket, served first
 /// ([`served_socket`]). Returns only if it couldn't.
 pub(crate) fn compose(args: &ComposeArgs) -> Result<ExitCode> {
-    let docker = on_path("docker", std::env::var_os("PATH").as_deref()).context(
-        "docker compose needs Docker's CLI and its compose plugin: install them (no Docker \
+    let docker = shipyard_sys::path::find_program("docker", std::env::var_os("PATH").as_deref())
+        .context(
+            "docker compose needs Docker's CLI and its compose plugin: install them (no Docker \
          daemon is needed)",
-    )?;
+        )?;
     let socket = served_socket()?;
     Err(run(&docker, &socket, &args.args)).context("running docker compose")
 }
@@ -108,20 +109,6 @@ fn service(socket: &Path) -> std::process::Command {
     command
 }
 
-/// The first `name` on `path` (`PATH`'s directories, the absolute ones
-/// only: never one found in the working directory) that's an executable
-/// file.
-fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::env::split_paths(path?)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,52 +126,5 @@ mod tests {
         assert_eq!(program, Path::new("/usr/bin/docker"));
         assert_eq!(argv, ["compose", "up", "-d"]);
         assert_eq!(host, "unix:///run/shipyard/api.sock");
-    }
-
-    /// `docker` found on `PATH` as an executable file only, and in an
-    /// absolute directory only: a relative entry that holds one (written
-    /// from the working directory up, as the repository may be read-only)
-    /// is skipped.
-    #[test]
-    fn docker_is_found_on_the_path() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("compose-path-{}", std::process::id()));
-        let executable = |at: &Path| {
-            std::fs::create_dir_all(at).unwrap();
-            std::fs::write(at.join("docker"), "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(at.join("docker"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        };
-        let (bin, other, elsewhere) = (dir.join("bin"), dir.join("other"), dir.join("elsewhere"));
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("docker"), "not executable").unwrap();
-        executable(&bin);
-        executable(&elsewhere);
-        let path = std::env::join_paths([&other, &bin]).unwrap();
-        assert_eq!(on_path("docker", Some(&path)), Some(bin.join("docker")));
-        assert_eq!(on_path("docker", None), None);
-        let only_other = std::env::join_paths([&other]).unwrap();
-        assert_eq!(on_path("docker", Some(&only_other)), None);
-        let up = std::env::current_dir().unwrap().components().count() - 1;
-        let relative: PathBuf = std::iter::repeat_n(std::path::Component::ParentDir, up)
-            .map(|parent| parent.as_os_str().to_owned())
-            .chain(
-                elsewhere
-                    .components()
-                    .skip(1)
-                    .map(|part| part.as_os_str().to_owned()),
-            )
-            .collect();
-        assert!(
-            relative.is_relative() && relative.join("docker").exists(),
-            "{relative:?}"
-        );
-        let path = std::env::join_paths([relative, bin.clone()]).unwrap();
-        assert_eq!(
-            on_path("docker", Some(&path)),
-            Some(bin.join("docker")),
-            "a relative entry skipped"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

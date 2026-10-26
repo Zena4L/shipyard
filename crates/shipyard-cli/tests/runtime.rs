@@ -300,14 +300,10 @@ fn cgroup_procs(path: &std::path::Path) -> Vec<i64> {
 }
 
 fn alive(pid: i64) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        !stat
-            .rsplit(')')
-            .next()
-            .unwrap_or_default()
-            .trim_start()
-            .starts_with('Z')
-    })
+    i32::try_from(pid)
+        .ok()
+        .and_then(shipyard_sys::proc::stat)
+        .is_some_and(|stat| !stat.gone())
 }
 
 // --- As any user ---------------------------------------------------------------
@@ -3137,37 +3133,23 @@ fn hooks_get_only_their_stdio_and_run_in_the_bundle() {
 /// When process `pid` started (`/proc/PID/stat`'s 22nd field, in clock
 /// ticks since boot): with its PID, which process it is.
 fn start_time_of(pid: i64) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit(')')
-        .next()?
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    Some(shipyard_sys::proc::stat(i32::try_from(pid).ok()?)?.start)
 }
 
 /// The parent of process `pid`, from `/proc/PID/stat`.
 fn parent_of(pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit(')')
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    Some(shipyard_sys::proc::stat(pid)?.ppid)
 }
 
 /// Polls `found` until it finds something, for up to 30 s (generous: under
 /// x86-64 emulation, setting a container up takes a while).
-fn eventually<T>(what: &str, mut found: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(it) = found() {
-            return it;
-        }
-        assert!(Instant::now() < deadline, "never: {what}");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+fn eventually<T>(what: &str, found: impl FnMut() -> Option<T>) -> T {
+    shipyard_test_support::eventually_some(
+        Duration::from_secs(30),
+        Duration::from_millis(1),
+        what,
+        found,
+    )
 }
 
 /// A setup that never finishes can still be deleted: `delete` stops it
@@ -3400,16 +3382,7 @@ fn the_container_dies_with_its_monitor() {
     assert_eq!(runtime.create("kept", &bundle, &[]).code, Some(0));
     assert_eq!(runtime.call(&["start", "kept"]).code, Some(0));
     let pid = runtime.state("kept").unwrap()["pid"].as_i64().unwrap();
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let monitor: i32 = stat
-        .rsplit(')')
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
+    let monitor = parent_of(i32::try_from(pid).unwrap()).unwrap();
     let comm = std::fs::read_to_string(format!("/proc/{monitor}/cmdline")).unwrap();
     // The hidden argument, not the first word: under x86-64 emulation the
     // emulator puts the binary's path first in `cmdline`.
@@ -3460,18 +3433,12 @@ fn the_monitor_has_a_session_of_its_own() {
         serde_json::from_slice(&std::fs::read(runtime.root.join("alone/state.json")).unwrap())
             .unwrap();
     let monitor = record["monitor"][0].as_i64().unwrap();
-    let stat = std::fs::read_to_string(format!("/proc/{monitor}/stat")).unwrap();
-    // After the name: state, parent, process group, session.
-    let fields: Vec<i64> = stat
-        .rsplit(')')
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .skip(1)
-        .take(3)
-        .map(|field| field.parse().unwrap())
-        .collect();
-    assert_eq!(fields[1..], [monitor, monitor], "group and session: {stat}");
+    let stat = shipyard_sys::proc::stat(i32::try_from(monitor).unwrap()).unwrap();
+    assert_eq!(
+        [i64::from(stat.pgrp), i64::from(stat.session)],
+        [monitor, monitor],
+        "group and session: {stat:?}"
+    );
 }
 
 #[test]
@@ -5092,10 +5059,9 @@ fn a_dropped_client_doesnt_keep_the_monitor_busy() {
         .unwrap();
     let monitor = parent_of(i32::try_from(init).unwrap()).unwrap();
     let cpu = || {
-        let stat = std::fs::read_to_string(format!("/proc/{monitor}/stat")).unwrap();
-        let fields: Vec<&str> = stat.rsplit_once(") ").unwrap().1.split(' ').collect();
         // utime and stime, in clock ticks (fields 14 and 15).
-        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        let stat = shipyard_sys::proc::stat(monitor).unwrap();
+        stat.utime + stat.stime
     };
     // Dropped about a second in; from 2 s to 5 s, it sends a frame every
     // 100 ms, never reading.

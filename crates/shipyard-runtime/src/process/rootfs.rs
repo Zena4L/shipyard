@@ -118,7 +118,7 @@ pub(crate) fn steered(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{enter, view};
+pub(crate) use linux::{clone_root_alone, enter, view};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -840,6 +840,17 @@ mod linux {
             )
         };
         Errno::result(result).map(drop)
+    }
+
+    /// A detached copy of the mount at `/` alone, nothing mounted on it
+    /// (`open_tree(OPEN_TREE_CLONE)`, not recursive): a container's own
+    /// filesystem, what its volumes cover shown as it is underneath
+    /// (`export`, step 12.2b). Needs `CAP_SYS_ADMIN` over the mount
+    /// namespace; the kernel refuses (`EINVAL`) a mount whose children are
+    /// locked (they'd reveal what they cover to a namespace that may not
+    /// see it).
+    pub(crate) fn clone_root_alone() -> nix::Result<OwnedFd> {
+        open_tree(libc::AT_FDCWD, c"/", 0)
     }
 
     /// `open_tree(OPEN_TREE_CLONE)` of the mount at `place` (an `O_PATH`

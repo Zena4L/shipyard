@@ -77,8 +77,18 @@ pub(crate) enum Route {
     ListImages,
     /// `GET /images/{name}/json` (a name may hold `/`s).
     InspectImage(String),
+    /// `GET /images/{name}/history`.
+    ImageHistory(String),
+    /// `GET /images/{name}/get` (`docker save NAME`).
+    SaveImage(String),
+    /// `GET /images/get?names=…` (`docker save A B`).
+    SaveImages,
+    /// `POST /images/load`.
+    LoadImages,
     /// `POST /images/{name}/tag`.
     TagImage(String),
+    /// `POST /images/{name}/push` (step 12.4).
+    PushImage(String),
     /// `DELETE /images/{name}`.
     RemoveImage(String),
     /// `GET /volumes`.
@@ -91,6 +101,8 @@ pub(crate) enum Route {
     RemoveVolume(String),
     /// `GET /containers/{id}/archive`.
     ArchiveGet(String),
+    /// `GET /containers/{id}/export`.
+    Export(String),
     /// `HEAD /containers/{id}/archive`.
     ArchiveHead(String),
     /// `PUT /containers/{id}/archive`.
@@ -145,6 +157,7 @@ impl Route {
                 | Self::ConnectNetwork(_)
                 | Self::DisconnectNetwork(_)
                 | Self::Auth
+                | Self::LoadImages
         )
     }
 }
@@ -186,6 +199,7 @@ pub(crate) fn route(method: &Method, path: &str) -> Result<Route, ApiError> {
         (&Method::GET, ["containers", id, "top"]) => Route::Top(decoded(id)?),
         (&Method::GET, ["containers", id, "stats"]) => Route::Stats(decoded(id)?),
         (&Method::GET, ["containers", id, "archive"]) => Route::ArchiveGet(decoded(id)?),
+        (&Method::GET, ["containers", id, "export"]) => Route::Export(decoded(id)?),
         (&Method::HEAD, ["containers", id, "archive"]) => Route::ArchiveHead(decoded(id)?),
         (&Method::PUT, ["containers", id, "archive"]) => Route::ArchivePut(decoded(id)?),
         (&Method::POST, ["containers", id, action]) => {
@@ -216,11 +230,22 @@ pub(crate) fn route(method: &Method, path: &str) -> Result<Route, ApiError> {
         (&Method::POST, ["images", "create"]) => Route::PullImage,
         (&Method::POST, ["auth"]) => Route::Auth,
         (&Method::GET, ["images", "json"]) => Route::ListImages,
+        (&Method::GET, ["images", "get"]) => Route::SaveImages,
+        (&Method::POST, ["images", "load"]) => Route::LoadImages,
+        (&Method::GET, ["images", name @ .., "history"]) if !name.is_empty() => {
+            Route::ImageHistory(image(name)?)
+        }
+        (&Method::GET, ["images", name @ .., "get"]) if !name.is_empty() => {
+            Route::SaveImage(image(name)?)
+        }
         (&Method::GET, ["images", name @ .., "json"]) if !name.is_empty() => {
             Route::InspectImage(image(name)?)
         }
         (&Method::POST, ["images", name @ .., "tag"]) if !name.is_empty() => {
             Route::TagImage(image(name)?)
+        }
+        (&Method::POST, ["images", name @ .., "push"]) if !name.is_empty() => {
+            Route::PushImage(image(name)?)
         }
         (&Method::DELETE, ["images", name @ ..]) if !name.is_empty() => {
             Route::RemoveImage(image(name)?)
@@ -315,6 +340,8 @@ mod tests {
         }
         let too_new = route(&Method::GET, "/v1.44/containers/json").unwrap_err();
         assert_eq!(too_new.status, hyper::StatusCode::BAD_REQUEST);
+        // Docker's daemon's own words, which its clients show: part of the
+        // API's contract (D25), so pinned whole, unlike Shipyard's own.
         assert_eq!(
             too_new.message,
             "client version 1.44 is too new. Maximum supported API version is 1.43"
@@ -364,6 +391,33 @@ mod tests {
             route(&Method::GET, "/containers/prune").is_err(),
             "a POST's"
         );
+    }
+
+    /// Save, load and history (step 12.2a): a name keeps its `/`s; a load
+    /// takes its body.
+    #[test]
+    fn save_load_and_history_are_found() {
+        assert!(matches!(
+            route(&Method::GET, "/v1.43/images/ghcr.io/me/app:1/get"),
+            Ok(Route::SaveImage(name)) if name == "ghcr.io/me/app:1"
+        ));
+        assert!(matches!(
+            route(&Method::GET, "/images/get"),
+            Ok(Route::SaveImages)
+        ));
+        assert!(matches!(
+            route(&Method::POST, "/images/load"),
+            Ok(Route::LoadImages)
+        ));
+        assert!(matches!(
+            route(&Method::GET, "/images/alpine:3.20/history"),
+            Ok(Route::ImageHistory(name)) if name == "alpine:3.20"
+        ));
+        assert!(Route::LoadImages.takes_body());
+        assert!(matches!(
+            route(&Method::GET, "/v1.43/containers/web/export"),
+            Ok(Route::Export(id)) if id == "web"
+        ));
     }
 
     /// The image, volume and archive endpoints: an image's name keeps its `/`s.
@@ -520,7 +574,6 @@ mod tests {
             (Method::GET, "/containers/web/json/extra"),
             (Method::GET, "/"),
             (Method::DELETE, "/images"),
-            (Method::GET, "/images/alpine/history"),
             (Method::POST, "/images/tag"),
             (Method::GET, "/shipyard/doctor"),
             (Method::GET, "/shipyard/containers"),
@@ -531,6 +584,7 @@ mod tests {
                 hyper::StatusCode::NOT_FOUND,
                 "{method} {path}"
             );
+            // Docker's daemon's words for it (its clients show them).
             assert_eq!(refused.message, "page not found");
         }
         assert_eq!(

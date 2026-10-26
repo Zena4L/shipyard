@@ -134,7 +134,11 @@ pub(in crate::run) fn after_end(
     let Ok(record) = containers::read_one(engine, id) else {
         return;
     };
-    if record.config.restart == RestartPolicy::No {
+    // An end its policy doesn't start again (no policy, a user's stop, a
+    // success `on-failure` takes, its most reached): ended for good, so the
+    // restart is never taken, nor waited for (a `stop` then `rm`, compose's
+    // `down`, found it "restarting" a moment: 12.5c3's review).
+    if next_delay(&record).is_none() {
         return;
     }
     let Ok(root) = engine.paths.runtime_root().map(Path::to_path_buf) else {
@@ -161,25 +165,29 @@ pub(in crate::run) fn after_end(
     if !stateless(&root, id) {
         return;
     }
-    // Never started (its start failed before its command ran): no end.
-    let Some(started) = record.started else {
+    let Some(delay) = next_delay(&record) else {
         return;
     };
+    restart_after(engine, &root, id, delay, record.restart_count);
+}
+
+/// The delay before `record`'s policy starts it again after the end it
+/// records, as [`decide`] says; `None` if it won't, or if it never started
+/// (its start failed before its command ran: no end).
+pub(in crate::run) fn next_delay(record: &Record) -> Option<Duration> {
+    let started = record.started?;
     let ran_for = record
         .finished
         .and_then(|finished| finished.duration_since(started).ok())
         .unwrap_or_default();
-    let Some(delay) = decide(
+    decide(
         record.config.restart,
         record.exit.as_ref().and_then(|exit| exit.code),
         record.stopped_by_user,
         record.restart_count,
         ran_for,
         Duration::from_millis(record.restart_delay_ms),
-    ) else {
-        return;
-    };
-    restart_after(engine, &root, id, delay, record.restart_count);
+    )
 }
 
 /// Whether container `id` has no runtime state (none started it since).

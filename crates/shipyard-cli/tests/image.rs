@@ -683,7 +683,7 @@ fn system_df_counts_images_containers_and_volumes() {
     );
     assert_eq!(
         text(&formatted).0,
-        "Images=1\nContainers=0\nLocal Volumes=1\n"
+        "Images=1\nContainers=0\nLocal Volumes=1\nBuild Cache=0\n"
     );
 }
 
@@ -935,6 +935,91 @@ fn a_store_on_overlayfs_is_explained() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(run.status.code(), Some(125), "{stderr}");
     assert!(stderr.contains("SHIPYARD_IMAGE_STORE"), "{stderr}");
+}
+
+/// A rootless run with a named volume, where `newuidmap` and `newgidmap`
+/// aren't setuid root but have file capabilities (Fedora's): the volume's
+/// fill helper, non-dumpable, had its `/proc/PID/uid_map` root's, which such
+/// a helper (run as the user) can't open, and every such run was refused
+/// (found by 12.5c2's Fedora milestone). The control: the same tools run a
+/// container with no volume.
+#[test]
+#[ignore = "needs root"]
+fn a_volume_fills_where_newuidmap_has_file_capabilities() {
+    use shipyard_test_support::net::TestUser;
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(user) = TestUser::find() else {
+        eprintln!("no unprivileged user to run rootless containers as; skipping");
+        return;
+    };
+    let (_serving, image) = shipyard_test_support::registry::fixture();
+    let scratch = Scratch::new();
+    std::os::unix::fs::chown(&scratch.0, Some(user.uid), Some(user.gid)).unwrap();
+    let tools = scratch.0.join("tools");
+    std::fs::create_dir(&tools).unwrap();
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, capability) in [
+        ("newuidmap", "cap_setuid+ep"),
+        ("newgidmap", "cap_setgid+ep"),
+    ] {
+        let found = shipyard_sys::path::find_program(
+            name,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+        )
+        .unwrap();
+        let copy = tools.join(name);
+        std::fs::copy(&found, &copy).unwrap();
+        // No setuid bit: only the file capability, as Fedora's.
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let set = Command::new("setcap")
+            .arg(capability)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(set.success(), "setcap {capability} {}", copy.display());
+    }
+    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", tools.display());
+    let run = |args: &[&str]| {
+        user.command(Command::new(SHIPYARD.path()), &scratch.0.join("runtime"))
+            .args(args)
+            .env("PATH", &path)
+            .env("SHIPYARD_IMAGE_STORE", scratch.store())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let plain = run(&[
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        &image,
+        "sh",
+        "-c",
+        "exit 0",
+    ]);
+    assert!(
+        plain.status.success(),
+        "the control: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let filled = run(&[
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--volume",
+        "filled:/data",
+        &image,
+        "sh",
+        "-c",
+        "exit 0",
+    ]);
+    assert!(
+        filled.status.success(),
+        "a volume with these tools: {}",
+        String::from_utf8_lossy(&filled.stderr)
+    );
 }
 
 /// Milestone v0.1, end to end: a normal user's interactive shell in an

@@ -2107,23 +2107,19 @@ fn children_of(parent: libc::pid_t) -> Vec<libc::pid_t> {
         .unwrap()
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
         .filter(|&pid: &libc::pid_t| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                stat.rsplit(')')
-                    .next()
-                    .and_then(|rest| rest.split_whitespace().nth(1))
-                    == Some(&parent.to_string())
-            })
+            shipyard_sys::proc::stat(pid).is_some_and(|stat| stat.ppid == parent)
         })
         .collect()
 }
 
 /// Waits (up to 10 s) for `done`.
-fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !done() {
-        assert!(std::time::Instant::now() < deadline, "never: {what}");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+fn eventually(what: &str, done: impl FnMut() -> bool) {
+    shipyard_test_support::eventually_every(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(20),
+        what,
+        done,
+    );
 }
 
 /// A bundle's `createRuntime` hook that never ends holds `run --bundle` up.

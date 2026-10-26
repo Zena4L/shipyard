@@ -8,30 +8,18 @@ use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 /// meanwhile (the container's monitor, a network's DNS server) empties
 /// its own before its `exec`.
 #[derive(Debug)]
-pub(super) struct HeldOff {
+pub(crate) struct HeldOff {
     before: Option<SigSet>,
 }
 
 impl HeldOff {
     /// Whether one of them was sent meanwhile (it waits, pending:
     /// `sigpending`).
-    pub(super) fn asked_to_stop(&self) -> bool {
-        if self.before.is_none() {
-            return false;
-        }
-        // SAFETY: an all-zero `sigset_t` is a valid one to fill.
-        let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `pending` is valid for writing.
-        if unsafe { libc::sigpending(&raw mut pending) } != 0 {
-            return false;
-        }
-        [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT]
-            .into_iter()
-            // SAFETY: `pending` was filled by `sigpending`.
-            .any(|signal| unsafe { libc::sigismember(&raw const pending, signal) } == 1)
+    pub(crate) fn asked_to_stop(&self) -> bool {
+        self.before.is_some() && stop_pending()
     }
 
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut set = SigSet::empty();
         for signal in [
             Signal::SIGINT,
@@ -47,6 +35,22 @@ impl HeldOff {
             before: held.ok().map(|()| before),
         }
     }
+}
+
+/// Whether SIGINT, SIGTERM, SIGHUP or SIGQUIT waits, pending, held off in
+/// this thread ([`HeldOff::asked_to_stop`] for a hold this thread made; a
+/// hook asked from a `Gone` has no hold to ask).
+pub(crate) fn stop_pending() -> bool {
+    // SAFETY: an all-zero `sigset_t` is a valid one to fill.
+    let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `pending` is valid for writing.
+    if unsafe { libc::sigpending(&raw mut pending) } != 0 {
+        return false;
+    }
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT]
+        .into_iter()
+        // SAFETY: `pending` was filled by `sigpending`.
+        .any(|signal| unsafe { libc::sigismember(&raw const pending, signal) } == 1)
 }
 
 impl Drop for HeldOff {

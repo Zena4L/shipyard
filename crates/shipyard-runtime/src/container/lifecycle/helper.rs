@@ -40,6 +40,36 @@ pub fn start_helper(
     stdin: &OwnedFd,
     stdout: &OwnedFd,
 ) -> Result<RunningHelper> {
+    start_helper_with(root, id, (name, action), args, (stdin, stdout), false)
+}
+
+/// Starts helper `name` as [`start_helper`] does; its root the container's
+/// root mount alone (a clone, nothing mounted on it: `export`, step 12.2b)
+/// if `alone`, where the kernel allows it ([`HelperRoot`](crate::container::HelperRoot)
+/// says).
+///
+/// # Errors
+///
+/// As [`start_helper`]'s.
+pub fn start_helper_alone(
+    root: &Path,
+    id: &str,
+    (name, action): (&str, &'static str),
+    args: &[u8],
+    (stdin, stdout): (&OwnedFd, &OwnedFd),
+) -> Result<RunningHelper> {
+    start_helper_with(root, id, (name, action), args, (stdin, stdout), true)
+}
+
+/// [`start_helper`] and [`start_helper_alone`].
+fn start_helper_with(
+    root: &Path,
+    id: &str,
+    (name, action): (&str, &'static str),
+    args: &[u8],
+    (stdin, stdout): (&OwnedFd, &OwnedFd),
+    alone: bool,
+) -> Result<RunningHelper> {
     const WANTED: &str = "created, running or paused";
     let dir = existing(root, id)?;
     let lock = lock(&dir)?;
@@ -67,7 +97,7 @@ pub fn start_helper(
     join.start_time = Some(started);
     let joining = crate::process::join::Joining::open(&join)
         .map_err(|err| stopped(ContainerError::Helper(Box::new(err))))?;
-    let helper = crate::process::helper::launch(&joining, name, args, stdin, stdout)
+    let helper = crate::process::helper::launch(&joining, name, args, stdin, stdout, alone)
         .map_err(|err| ContainerError::Helper(Box::new(err)))?;
     // It holds the namespaces now: the container may stop meanwhile.
     drop(lock);

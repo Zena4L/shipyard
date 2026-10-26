@@ -2,4 +2,4 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 # Names in doc comments that aren't code (`..` keeps clippy's own list).
-doc-valid-idents = ["AppArmor", "SELinux", ".."]
+doc-valid-idents = ["AppArmor", "SELinux", "BuildKit", ".."]

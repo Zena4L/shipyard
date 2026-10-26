@@ -47,6 +47,24 @@ const LABELS_MAX: u64 = 64 * 1024;
 /// removal moving it aside: moments).
 const CREATE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// When a volume was made, beside its data directory (F146: its
+/// directory's own time moves with what's made and removed beside `_data`,
+/// a first fill's `filling` marker among it).
+const CREATED_FILE: &str = "created.json";
+/// The newest `created.json` this Shipyard reads and writes.
+const CREATED_VERSION: u32 = 1;
+/// The most a `created.json` holds.
+const CREATED_MAX: u64 = 1024;
+
+/// `created.json`: its version, and the making's time since the epoch.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatedFile {
+    version: u32,
+    seconds: u64,
+    nanos: u32,
+}
+
 /// `labels.json`: its version, and the labels.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +100,16 @@ pub enum VolumeError {
     /// or not one at all.
     #[error("the labels of the volume {name}: {source}")]
     Labels {
+        /// The volume.
+        name: String,
+        /// Why.
+        #[source]
+        source: shipyard_sys::versioned::Error,
+    },
+    /// Its `created.json` isn't one this Shipyard reads: a newer version,
+    /// or not one at all.
+    #[error("when the volume {name} was made: {source}")]
+    Created {
         /// The volume.
         name: String,
         /// Why.
@@ -160,6 +188,7 @@ impl Volumes {
             context: format!("creating the volume {name}"),
             source,
         })?;
+        let _ = self.write_created(name);
         Ok(Volume {
             name: name.to_owned(),
             data,
@@ -216,18 +245,22 @@ impl Volumes {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(creating(error)),
         }
-        let made = self.write_labels(name, labels).and_then(|()| {
-            std::fs::create_dir(&data).map_err(|error| {
-                // Made meanwhile by what takes no lock (`create`): it's there.
-                if error.kind() == std::io::ErrorKind::AlreadyExists && data.is_dir() {
-                    VolumeError::Exists(name.to_owned())
-                } else {
-                    creating(error)
-                }
-            })
-        });
+        let made = self
+            .write_labels(name, labels)
+            .and_then(|()| self.write_created(name))
+            .and_then(|()| {
+                std::fs::create_dir(&data).map_err(|error| {
+                    // Made meanwhile by what takes no lock (`create`): it's there.
+                    if error.kind() == std::io::ErrorKind::AlreadyExists && data.is_dir() {
+                        VolumeError::Exists(name.to_owned())
+                    } else {
+                        creating(error)
+                    }
+                })
+            });
         if let Err(error) = made {
             let _ = std::fs::remove_file(dir.join(LABELS_FILE));
+            let _ = std::fs::remove_file(dir.join(CREATED_FILE));
             let _ = std::fs::remove_dir(&dir);
             return Err(error);
         }
@@ -293,16 +326,59 @@ impl Volumes {
         }
     }
 
-    /// When the volume `name` was made: its directory's last change, which
-    /// is its making (its data lives in `_data`; nothing is written beside
-    /// it after).
+    /// Writes now as the volume `name`'s making, in its `created.json`.
+    fn write_created(&self, name: &str) -> Result<(), VolumeError> {
+        let path = self.root.join(name).join(CREATED_FILE);
+        let io = |source| VolumeError::Io {
+            context: format!("writing {}", path.display()),
+            source,
+        };
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let file = CreatedFile {
+            version: CREATED_VERSION,
+            seconds: since.as_secs(),
+            nanos: since.subsec_nanos(),
+        };
+        let json = serde_json::to_vec(&file).map_err(|error| io(std::io::Error::other(error)))?;
+        shipyard_sys::fs::write_atomically(&path, &json, &shipyard_sys::fs::Write::new(0o644))
+            .map_err(|error| io(error.source))
+    }
+
+    /// When the volume `name` was made: its `created.json`'s time; one
+    /// made before it was kept (or whose making was cut before it was
+    /// written), its directory's last change, which a first fill moves.
     ///
     /// # Errors
     ///
-    /// [`VolumeError::NotFound`], or [`VolumeError::Io`].
+    /// [`VolumeError::NotFound`]; [`VolumeError::Created`] for a
+    /// `created.json` of a newer version, or that isn't one;
+    /// [`VolumeError::Io`].
     pub fn created(&self, name: &str) -> Result<std::time::SystemTime, VolumeError> {
         self.inspect(name)?;
         let dir = self.root.join(name);
+        let path = dir.join(CREATED_FILE);
+        match shipyard_sys::versioned::read_file::<CreatedFile>(&path, CREATED_MAX, CREATED_VERSION)
+        {
+            Ok(Some(file)) => {
+                return Ok(std::time::UNIX_EPOCH
+                    + std::time::Duration::new(file.seconds, file.nanos.min(999_999_999)));
+            }
+            Ok(None) => {}
+            Err(shipyard_sys::versioned::FileError::Io(source)) => {
+                return Err(VolumeError::Io {
+                    context: format!("reading {}", path.display()),
+                    source,
+                });
+            }
+            Err(shipyard_sys::versioned::FileError::Versioned(source)) => {
+                return Err(VolumeError::Created {
+                    name: name.to_owned(),
+                    source,
+                });
+            }
+        }
         std::fs::metadata(&dir)
             .and_then(|metadata| metadata.modified())
             .map_err(|source| VolumeError::Io {
@@ -335,6 +411,9 @@ impl Volumes {
                     // short left (a create holds the lock alone), not this
                     // volume's.
                     let _ = std::fs::remove_file(dir.join(LABELS_FILE));
+                    // Best effort: a time that can't be kept (a full disk)
+                    // fails no run; its directory's stands in.
+                    let _ = self.write_created(name);
                     true
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -971,6 +1050,45 @@ mod tests {
             volumes.trash("data").is_ok(),
             "free once the copy is closed"
         );
+    }
+
+    /// A volume's making is its own time: what's made and removed beside
+    /// its data later (a first fill's marker) never moves it, by a run's
+    /// making or Docker's API's alike; one made before the time was kept
+    /// reads its directory's (the previous version: none), and a newer
+    /// `created.json` is refused, never guessed at.
+    #[test]
+    fn a_volume_s_making_stays_its_own() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let moved = |name: &str| {
+            std::fs::File::open(scratch.0.join("volumes").join(name))
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        };
+        drop(volumes.hold("by-run").unwrap());
+        volumes.create_with("by-api", &BTreeMap::new()).unwrap();
+        for name in ["by-run", "by-api"] {
+            let made = volumes.created(name).unwrap();
+            moved(name);
+            assert_eq!(volumes.created(name).unwrap(), made, "{name}");
+            assert!(made < later, "{name}");
+        }
+        std::fs::remove_file(scratch.0.join("volumes").join("by-run").join(CREATED_FILE)).unwrap();
+        // (The removal itself moved the directory's time: set again.)
+        moved("by-run");
+        assert_eq!(volumes.created("by-run").unwrap(), later, "the directory's");
+        std::fs::write(
+            scratch.0.join("volumes").join("by-api").join(CREATED_FILE),
+            br#"{"version":2,"seconds":1,"nanos":0}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            volumes.created("by-api"),
+            Err(VolumeError::Created { .. })
+        ));
     }
 
     #[test]

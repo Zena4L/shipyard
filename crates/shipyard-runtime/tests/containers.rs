@@ -1084,15 +1084,14 @@ fn a_planned_container_runs_its_plan() {
 
 /// This process's children (from `/proc`: any, living or a zombie).
 fn my_children() -> Vec<i32> {
-    let me = std::process::id().to_string();
+    let me = i32::try_from(std::process::id()).unwrap();
     std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| {
-            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            let ppid = stat.rsplit(')').next()?.split_whitespace().nth(1)?;
-            (ppid == me).then(|| entry.file_name().to_str()?.parse().ok())?
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            (shipyard_sys::proc::stat(pid)?.ppid == me).then_some(pid)
         })
         .collect()
 }

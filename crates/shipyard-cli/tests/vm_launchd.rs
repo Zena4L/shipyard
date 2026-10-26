@@ -29,26 +29,11 @@ const LIMIT: Duration = Duration::from_secs(180);
 const AGENTS: &str = "agents";
 
 mod vm_support;
-use vm_support::{Scratch, Vm, bounded};
+use vm_support::{Scratch, Vm, bounded, text};
 
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// Docker's CLI, on `PATH`; `None` (said) if it isn't, a failure where
-/// the VM tests are required.
+/// Docker's CLI, for these tests.
 fn docker_cli() -> Option<std::path::PathBuf> {
-    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|dir| dir.join("docker"))
-        .find(|path| path.is_file());
-    if found.is_none() {
-        assert!(
-            std::env::var("SHIPYARD_TEST_VM").as_deref() != Ok("required"),
-            "these tests need Docker's CLI on PATH"
-        );
-        eprintln!("no docker on PATH: skipped");
-    }
-    found
+    vm_support::docker_cli("these tests")
 }
 
 /// Takes out the agents a killed run of these tests left: those whose

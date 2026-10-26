@@ -4,8 +4,9 @@
 
 use shipyard_runtime::isolation::{IdMaps, Isolation, Root};
 use shipyard_runtime::process::{Env, ProcessSpec};
-use shipyard_storage::VolumeHold;
+use shipyard_storage::{VolumeHold, VolumeMount};
 
+use super::RunRequest;
 use super::command::{add_env, add_image_env, last_wins};
 use super::plan::{Generated, Invocation, Planned};
 use super::prepare::ImageDefaults;
@@ -72,80 +73,11 @@ impl Planned {
             })
             .collect();
 
-        // The user: an explicit --user wins; else the image's User; else the
-        // isolation default (root inside) or the caller (unisolated).
-        let user = request.resolve_user(isolation.as_ref(), config)?;
-
-        // Environment: the image's variables first, then --env (which wins),
-        // then a default PATH if none. The image's are taken as they are:
-        // one without a value is never looked up here, on the host.
-        let mut env = Env::new();
-        if let Some(config) = config {
-            add_image_env(&mut env, &config.env, &mut warnings)?;
-        }
-        for entry in &request.env {
-            add_env(&mut env, entry, &request.caller_env)?;
-        }
-        env.fill_default_path();
-
-        let mut spec = ProcessSpec::new(request.resolve_command(config)?);
-        spec.env = env;
-        spec.cwd = request.resolve_workdir(config);
-        spec.user = user;
-        spec.rlimits = last_wins(request.ulimit.clone());
-        spec.oom_score_adj = request.oom_score_adj;
-        spec.validate()?;
-
-        let mut held = Vec::new();
-        if let Some(isolation) = isolation.as_mut() {
-            if let Some(image) = image {
-                // The image's layers become the root: an overlay mounted at
-                // this path inside the container's namespaces.
-                let mut root = Root::new(image.root);
-                root.read_only = request.read_only;
-                root.overlay = Some(image.overlay);
-                isolation.root = Some(root);
-            }
-            if let (Some(root), Some(etc)) = (isolation.root.as_mut(), etc) {
-                bind_etc_files(root, etc);
-            }
-            let named = match isolation.root.as_mut() {
-                Some(root) => {
-                    let named = bind_volumes(engine, root, volumes, &request.made_sources)?;
-                    // Fresh at each start (`check` saw no two on one place).
-                    root.mounts
-                        .extend(request.tmpfs.iter().map(super::TmpfsMount::to_runtime));
-                    // A parent before what's in it (Docker's `sortMounts`):
-                    // a tmpfs on `/data` mounted after a volume on
-                    // `/data/db` would hide it, and `/etc`'s after the
-                    // run's own `/etc` files. In the order given among
-                    // equals.
-                    root.mounts
-                        .sort_by_key(|mount| mount.destination.components().count());
-                    named
-                }
-                // `check` refused volumes and tmpfs mounts without a root.
-                None => Vec::new(),
-            };
-            // All checked before a volume is made. An overlay path that can't
-            // be used is the image store's.
-            isolation.validate().map_err(|err| {
-                let store = matches!(
-                    err,
-                    shipyard_runtime::isolation::IsolationError::InvalidOverlayPath { .. }
-                );
-                if store {
-                    // Where the store is: the host's setting, not the request.
-                    Error::wrap(ErrorKind::Environment, err).context(
-                        "the image store's path can't be used for an overlay (set \
-                         SHIPYARD_IMAGE_STORE to another directory)",
-                    )
-                } else {
-                    Error::from(err)
-                }
-            })?;
-            held = hold_volumes(engine, &named)?;
-        }
+        let spec = process_spec(&request, isolation.as_ref(), config, &mut warnings)?;
+        let held = match isolation.as_mut() {
+            Some(isolation) => root_and_mounts(engine, isolation, image, etc, volumes, &request)?,
+            None => Vec::new(),
+        };
         if isolation
             .as_ref()
             .and_then(|isolation| isolation.id_maps.as_ref())
@@ -176,4 +108,109 @@ impl Planned {
             held,
         ))
     }
+}
+
+/// The run's process: its user, environment, command, working directory and
+/// limits, the image's `config` (if it has one) where the request says
+/// nothing. What the image's environment holds wrong is added to `warnings`.
+///
+/// # Errors
+///
+/// No command, a user the image doesn't have, an environment entry or a
+/// process spec that's wrong.
+fn process_spec(
+    request: &RunRequest,
+    isolation: Option<&Isolation>,
+    config: Option<&shipyard_image::RuntimeConfig>,
+    warnings: &mut Vec<Warning>,
+) -> Result<ProcessSpec> {
+    // The user: an explicit --user wins; else the image's User; else the
+    // isolation default (root inside) or the caller (unisolated).
+    let user = request.resolve_user(isolation, config)?;
+
+    // Environment: the image's variables first, then --env (which wins),
+    // then a default PATH if none. The image's are taken as they are:
+    // one without a value is never looked up here, on the host.
+    let mut env = Env::new();
+    if let Some(config) = config {
+        add_image_env(&mut env, &config.env, warnings)?;
+    }
+    for entry in &request.env {
+        add_env(&mut env, entry, &request.caller_env)?;
+    }
+    env.fill_default_path();
+
+    let mut spec = ProcessSpec::new(request.resolve_command(config)?);
+    spec.env = env;
+    spec.cwd = request.resolve_workdir(config);
+    spec.user = user;
+    spec.rlimits = last_wins(request.ulimit.clone());
+    spec.oom_score_adj = request.oom_score_adj;
+    spec.validate()?;
+    Ok(spec)
+}
+
+/// The run's root in `isolation`: the image's layers (if it has one), the
+/// run's `/etc` files, its volumes and tmpfs mounts; all checked, then the
+/// named volumes held (keep what's returned until the run ends).
+///
+/// # Errors
+///
+/// An isolation its checks refuse (an overlay on a path that can't take
+/// one: the image store's), or a volume that can't be made or held.
+fn root_and_mounts(
+    engine: &Engine,
+    isolation: &mut Isolation,
+    image: Option<ImageDefaults>,
+    etc: Option<&RunDir>,
+    volumes: Vec<VolumeMount>,
+    request: &RunRequest,
+) -> Result<Vec<VolumeHold>> {
+    if let Some(image) = image {
+        // The image's layers become the root: an overlay mounted at
+        // this path inside the container's namespaces.
+        let mut root = Root::new(image.root);
+        root.read_only = request.read_only;
+        root.overlay = Some(image.overlay);
+        isolation.root = Some(root);
+    }
+    if let (Some(root), Some(etc)) = (isolation.root.as_mut(), etc) {
+        bind_etc_files(root, etc);
+    }
+    let named = match isolation.root.as_mut() {
+        Some(root) => {
+            let named = bind_volumes(engine, root, volumes, &request.made_sources)?;
+            // Fresh at each start (`check` saw no two on one place).
+            root.mounts
+                .extend(request.tmpfs.iter().map(super::TmpfsMount::to_runtime));
+            // A parent before what's in it (Docker's `sortMounts`):
+            // a tmpfs on `/data` mounted after a volume on
+            // `/data/db` would hide it, and `/etc`'s after the
+            // run's own `/etc` files. In the order given among
+            // equals.
+            root.mounts
+                .sort_by_key(|mount| mount.destination.components().count());
+            named
+        }
+        // `check` refused volumes and tmpfs mounts without a root.
+        None => Vec::new(),
+    };
+    // All checked before a volume is made. An overlay path that can't
+    // be used is the image store's.
+    isolation.validate().map_err(|err| {
+        let store = matches!(
+            err,
+            shipyard_runtime::isolation::IsolationError::InvalidOverlayPath { .. }
+        );
+        if store {
+            // Where the store is: the host's setting, not the request.
+            Error::wrap(ErrorKind::Environment, err).context(
+                "the image store's path can't be used for an overlay (set \
+                 SHIPYARD_IMAGE_STORE to another directory)",
+            )
+        } else {
+            Error::from(err)
+        }
+    })?;
+    hold_volumes(engine, &named)
 }

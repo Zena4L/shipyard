@@ -16,14 +16,19 @@
 #[cfg(not(unix))]
 compile_error!("shipyard-image only supports UNIX platforms (Linux, macOS)");
 
+pub mod archive;
+pub mod changes;
 pub mod containers;
 pub mod credentials;
 pub mod digest;
 pub mod fsat;
+pub mod history;
 pub mod images;
+pub mod import;
 pub mod index;
 pub mod manifest;
 pub mod pull;
+pub mod push;
 pub mod reference;
 pub mod registry;
 pub mod store;
@@ -48,7 +53,8 @@ pub use manifest::{
     Descriptor, ImageAbout, ImageConfig, ImageHealthcheck, ImageManifest, Index, ManifestError,
     Platform, RuntimeConfig,
 };
-pub use pull::{PullError, PullOptions, Pulled, from_store, pull};
+pub use pull::{PullError, PullOptions, Pulled, from_store, from_store_by_digest, pull};
+pub use push::{PushError, PushEvent, Pushed, ToPush};
 pub use reference::{ImageReference, ReferenceError};
 pub use registry::{BlobError, BlobSink, Registry, RegistryError};
 pub use store::{

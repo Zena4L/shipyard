@@ -12,7 +12,6 @@
 //!   `/etc/subgid`: how a rootless container gets 65536 IDs.
 
 use std::fmt::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr};
 use std::time::{Duration, Instant};
@@ -278,12 +277,13 @@ fn run_map_helper(pid: Pid, kind: MapKind, map: &[IdMap]) -> Result<()> {
         "" => status.to_string(),
         said => said.to_owned(),
     };
-    let file = match kind {
-        MapKind::Uids => "/etc/subuid",
-        MapKind::Gids => "/etc/subgid",
+    let (file, capability) = match kind {
+        MapKind::Uids => ("/etc/subuid", "setuid"),
+        MapKind::Gids => ("/etc/subgid", "setgid"),
     };
     Err(failed(format!(
-        "{said} ({helper} must be setuid root, and {file} must give you these IDs)"
+        "{said} ({helper} must be setuid root or have the {capability} capability, and {file} \
+         must give you these IDs)"
     )))
 }
 
@@ -385,18 +385,12 @@ impl StderrDrain {
     }
 }
 
-/// `name` on `PATH`, if it's there and executable. The helpers are found
-/// the way a shell would find them (Podman does the same).
+/// `name` on `PATH`, if it's there and executable, in an absolute
+/// directory: the helpers are found the way a shell would find them
+/// (Podman does the same), but never in the directory the caller stands
+/// in.
 fn find_helper(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    shipyard_sys::path::find_program(name, std::env::var_os("PATH").as_deref())
 }
 
 // --- A helper process in a user namespace of its own ---------------------------

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use shipyard_engine::report::{Message, Progress, Reporter};
 use shipyard_engine::{Engine, Paths};
 
-use crate::output::{human_bytes, printable_message};
+use crate::format::rows::human_size;
+use crate::output::printable_message;
 
 /// The engine, as every command uses it: its places from the environment,
 /// what it has to say printed on stderr.
@@ -38,14 +39,25 @@ impl CliReporter {
             Message::Hint(text) => format!("shipyard: hint: {text}"),
             Message::Progress(step) if self.progress => match step {
                 Progress::Pulling { image } => format!("Pulling {image}"),
+                // BuildKit's own line, as it wrote it (escaped as it's printed).
+                Progress::Build { line } => line,
                 Progress::Layer {
                     short_digest,
                     downloaded: Some(bytes),
-                } => format!("{short_digest}: downloaded ({})", human_bytes(bytes)),
+                } => format!("{short_digest}: downloaded ({})", human_size(bytes, 4)),
                 Progress::Layer {
                     short_digest,
                     downloaded: None,
                 } => format!("{short_digest}: already here"),
+                Progress::Pushing { name } => format!("Pushing {name}"),
+                Progress::Pushed {
+                    short_digest,
+                    sent: Some(bytes),
+                } => format!("{short_digest}: pushed ({})", human_size(bytes, 4)),
+                Progress::Pushed {
+                    short_digest,
+                    sent: None,
+                } => format!("{short_digest}: already there"),
             },
             Message::Progress(_) => return None,
         })
@@ -78,6 +90,16 @@ pub(crate) fn report(err: &dyn std::fmt::Display, code: u8) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// [`report`] of an error and its causes, each cause said once
+/// ([`said_once`](shipyard_engine::said_once): anyhow's own `{:#}` would
+/// repeat a cause an error already wrote into its words).
+pub(crate) fn report_error(err: &anyhow::Error, code: u8) -> ExitCode {
+    report(
+        &shipyard_engine::said_once(err.chain().map(ToString::to_string)),
+        code,
+    )
+}
+
 /// Prints `message` as a warning (`shipyard: warning: …`).
 pub(crate) fn warn(message: impl std::fmt::Display) -> std::io::Result<()> {
     writeln!(
@@ -99,6 +121,37 @@ pub(crate) fn hint(message: impl std::fmt::Display) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the archive: {0}")]
+    struct WritesItsSource(#[source] Inner);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("an unsafe path")]
+    struct Inner;
+
+    /// Through anyhow, as the CLI reports: a cause an error already wrote
+    /// into its words is said once (the stage-12 book's `load` of
+    /// `../outside` said it twice); the context and an error that doesn't
+    /// write its cause, the control, keep the whole chain.
+    #[test]
+    fn a_cause_already_said_is_said_once() {
+        let error = anyhow::Error::from(WritesItsSource(Inner)).context("loading");
+        assert_eq!(
+            shipyard_engine::said_once(error.chain().map(ToString::to_string)),
+            "loading: the archive: an unsafe path"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "loading: the archive: an unsafe path: an unsafe path",
+            "anyhow's own, what the CLI no longer prints"
+        );
+        let plain = anyhow::Error::from(Inner).context("loading");
+        assert_eq!(
+            shipyard_engine::said_once(plain.chain().map(ToString::to_string)),
+            "loading: an unsafe path"
+        );
+    }
 
     #[test]
     fn the_engines_messages_print_as_the_clis_lines() {
@@ -139,7 +192,7 @@ mod tests {
         });
         assert_eq!(
             loud.line(downloaded.clone()).as_deref(),
-            Some("0123456789ab: downloaded (2.0 KiB)")
+            Some("0123456789ab: downloaded (2.048kB)")
         );
         let stored = Message::Progress(Progress::Layer {
             short_digest: "0123456789ab".to_owned(),

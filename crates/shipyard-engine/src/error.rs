@@ -59,6 +59,9 @@ pub enum ErrorKind {
     /// The caller was told to stop (a Ctrl-C) before it was done: what it
     /// had made was undone.
     Interrupted,
+    /// A build's own steps failed: a Dockerfile's `RUN`, a file its `COPY`
+    /// names missing from the context (step 12.3).
+    Build,
 }
 
 /// An engine error: a [kind](ErrorKind), a message, and the errors that led
@@ -154,21 +157,43 @@ impl Error {
 
 impl fmt::Display for Error {
     /// The message; with `{:#}`, followed by each source's (`: `-separated),
-    /// as a CLI prints any error.
+    /// as a CLI prints any error. A source whose words already end what's
+    /// said (an error that writes its source into its own message, as
+    /// thiserror's `"{context}: {source}"` does) isn't said twice.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.repr {
-            Repr::Message(message) | Repr::Context { message, .. } => f.write_str(message)?,
-            Repr::Foreign(error) => write!(f, "{error}")?,
+        let first = match &self.repr {
+            Repr::Message(message) | Repr::Context { message, .. } => message.clone(),
+            Repr::Foreign(error) => error.to_string(),
+        };
+        if !f.alternate() {
+            return f.write_str(&first);
         }
-        if f.alternate() {
-            let mut next = self.source();
-            while let Some(error) = next {
-                write!(f, ": {error}")?;
-                next = error.source();
-            }
+        let mut sources = Vec::new();
+        let mut next = self.source();
+        while let Some(error) = next {
+            sources.push(error.to_string());
+            next = error.source();
         }
-        Ok(())
+        f.write_str(&said_once(std::iter::once(first).chain(sources)))
     }
+}
+
+/// An error's words and each of its causes' after them, `: `-separated, as
+/// a CLI says an error; a cause whose words already end what's said (an
+/// error that writes its source into its own message, as thiserror's
+/// `"{context}: {source}"` does) isn't said twice. The engine's `{:#}` and
+/// the CLI's reports (through anyhow's chain) alike.
+pub fn said_once(words: impl IntoIterator<Item = String>) -> String {
+    let mut said = String::new();
+    for words in words {
+        if said.is_empty() {
+            said = words;
+        } else if !said.ends_with(&words) {
+            said.push_str(": ");
+            said.push_str(&words);
+        }
+    }
+    said
 }
 
 impl fmt::Debug for Error {
@@ -339,6 +364,26 @@ impl From<shipyard_image::PullError> for Error {
     }
 }
 
+impl From<shipyard_image::archive::ArchiveError> for Error {
+    fn from(error: shipyard_image::archive::ArchiveError) -> Self {
+        use shipyard_image::archive::ArchiveError;
+        let kind = match &error {
+            ArchiveError::Io { .. } | ArchiveError::Store(_) | ArchiveError::Missing(_) => {
+                ErrorKind::Storage
+            }
+            ArchiveError::NoSpace { .. } => ErrorKind::Environment,
+            _ => ErrorKind::InvalidRequest,
+        };
+        Self::wrap(kind, error)
+    }
+}
+
+impl From<shipyard_image::changes::ChangeError> for Error {
+    fn from(error: shipyard_image::changes::ChangeError) -> Self {
+        Self::wrap(ErrorKind::InvalidRequest, error)
+    }
+}
+
 impl From<shipyard_image::ReferenceError> for Error {
     fn from(error: shipyard_image::ReferenceError) -> Self {
         Self::wrap(ErrorKind::InvalidRequest, error)
@@ -355,7 +400,8 @@ impl From<shipyard_storage::VolumeError> for Error {
             shipyard_storage::VolumeError::InUse(_) => ErrorKind::InUse,
             shipyard_storage::VolumeError::Busy(_) => ErrorKind::Busy,
             shipyard_storage::VolumeError::Io { .. }
-            | shipyard_storage::VolumeError::Labels { .. } => ErrorKind::Storage,
+            | shipyard_storage::VolumeError::Labels { .. }
+            | shipyard_storage::VolumeError::Created { .. } => ErrorKind::Storage,
         };
         Self::wrap(kind, error)
     }
@@ -542,6 +588,22 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("inner")]
     struct Inner;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the archive: {0}")]
+    struct Writes(#[source] Inner);
+
+    /// An error that writes its source into its own message (thiserror's
+    /// `"{context}: {0}"` with `#[from]`) says it once, not twice (stage 12's
+    /// close: `load`'s `../outside` refusal printed its reason twice); one
+    /// that doesn't, the control, says the whole chain.
+    #[test]
+    fn a_source_already_said_isn_t_said_again() {
+        let error = Error::wrap(ErrorKind::InvalidRequest, Writes(Inner));
+        assert_eq!(format!("{error:#}"), "the archive: inner");
+        let error = Error::wrap(ErrorKind::Io, Outer(Inner));
+        assert_eq!(format!("{error:#}"), "outer: inner");
+    }
 
     #[test]
     fn the_chain_prints_as_a_cli_prints_any_error() {

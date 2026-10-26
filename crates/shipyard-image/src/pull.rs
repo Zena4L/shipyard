@@ -247,7 +247,6 @@ pub fn from_store(
     platform: &Platform,
     store: &Store,
 ) -> Result<Option<Pulled>, PullError> {
-    let limit = crate::MANIFEST_SIZE_LIMIT;
     let index = StoreIndex::open(store.root())?;
     let record = index.get(&reference.to_string());
     let recorded = record.and_then(|record| Digest::parse(&record.manifest).ok());
@@ -258,6 +257,38 @@ pub fn from_store(
     let Some(top_digest) = recorded.or_else(|| reference.digest.clone()) else {
         return Ok(None);
     };
+    stored(reference, top_digest, recorded_index, platform, store)
+}
+
+/// The image whose manifest (or index) is `digest`, from the store's blobs
+/// alone, never its index's records: `None` if a piece is missing. What a
+/// load reads back once its blobs are in (step 12.2a): an archive's image
+/// by its own digest, whatever names it gives. `reference` is only what
+/// the result is called.
+///
+/// # Errors
+///
+/// As [`from_store`]'s, but for the index.
+pub fn from_store_by_digest(
+    reference: &ImageReference,
+    digest: &Digest,
+    platform: &Platform,
+    store: &Store,
+) -> Result<Option<Pulled>, PullError> {
+    stored(reference, digest.clone(), None, platform, store)
+}
+
+/// [`from_store`]'s and [`from_store_by_digest`]'s read: the image from its
+/// top blob `top_digest` (a manifest, or an index the platform's chosen
+/// from), `recorded_index` the index a manifest came through, if known.
+fn stored(
+    reference: &ImageReference,
+    top_digest: Digest,
+    recorded_index: Option<Digest>,
+    platform: &Platform,
+    store: &Store,
+) -> Result<Option<Pulled>, PullError> {
+    let limit = crate::MANIFEST_SIZE_LIMIT;
     if !store.contains(&top_digest) {
         return Ok(None);
     }

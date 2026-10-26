@@ -84,6 +84,10 @@ mod linux {
         /// Remove these volumes moved aside (by their names in the volume
         /// trash), for the same reason.
         RemoveVolumes(Vec<String>),
+        /// Remove these build caches (by name, `state-…` in the store's
+        /// `builder/`): what BuildKit wrote as a build's other users
+        /// (step 12.3).
+        RemoveBuilderStates(Vec<String>),
     }
 
     /// The helper's answer.
@@ -436,6 +440,13 @@ mod linux {
             }
             Request::RemoveVolumes(names) => {
                 crate::volumes::remove_trash(store.root(), &names)?;
+                Ok(LayerReport::default())
+            }
+            Request::RemoveBuilderStates(names) => {
+                // Only a rootless caller's come here: in its store (the
+                // helper is root in its namespace, so not asked by its ID).
+                let builder = crate::build::cache::builder_dir_of(store.root(), false);
+                crate::image::remove_states_in(&builder, &names)?;
                 Ok(LayerReport::default())
             }
         }

@@ -35,8 +35,8 @@ pub use container::{
 };
 pub use event::{Actor, EventMessage};
 pub use image::{
-    GraphDriver, ImageConfig, ImageInspect, ImageSummary, Metadata, RootFs, inspect_image,
-    list_images, list_images_where,
+    GraphDriver, ImageConfig, ImageHistoryItem, ImageInspect, ImageSummary, Metadata, RootFs,
+    image_history, inspect_image, list_images, list_images_where,
 };
 pub use inspect::{Inspected, Kind, inspect_any};
 pub use network::{
@@ -85,14 +85,7 @@ pub fn time(at: std::time::SystemTime) -> String {
 }
 
 /// Now, in Unix seconds: what a prune's `until` duration counts back from.
-#[must_use]
-pub fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
-}
+pub use shipyard_sys::time::unix_now;
 
 /// A new ID, as Docker writes one: 64 hex characters from the kernel's
 /// random bytes (an exec instance's).
@@ -101,7 +94,7 @@ pub fn unix_now() -> i64 {
 ///
 /// The kernel's random bytes couldn't be read.
 pub fn new_id() -> crate::Result<String> {
-    Ok(crate::random::hex(&crate::random::bytes::<32>()?))
+    Ok(shipyard_sys::hex::lower(&crate::random::bytes::<32>()?))
 }
 
 /// A time as Docker's clients send one (`since`, `until`): Unix seconds

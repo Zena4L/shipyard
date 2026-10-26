@@ -336,6 +336,21 @@ pub fn start_helper(
 /// # Errors
 ///
 /// Always [`ContainerError::LinuxOnly`].
+pub fn start_helper_alone(
+    _root: &Path,
+    _id: &str,
+    _named: (&str, &'static str),
+    _args: &[u8],
+    _streams: (&std::os::fd::OwnedFd, &std::os::fd::OwnedFd),
+) -> Result<super::RunningHelper> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
 pub fn start_helper_in_view(
     _view: &super::RootView,
     _name: &str,

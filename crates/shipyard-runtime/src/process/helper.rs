@@ -60,7 +60,7 @@ use super::internal::{
     split_namespaces, start_sealed,
 };
 use super::setup::read_sealed_json;
-use crate::container::{Helper, HelperFailure, HelperIo, RunningHelper};
+use crate::container::{Helper, HelperFailure, HelperIo, HelperRoot, RunningHelper};
 use crate::isolation::Namespace;
 use crate::security::Confinement;
 use crate::{Error, Result};
@@ -102,6 +102,10 @@ enum How {
         user: Option<RawFd>,
         late: Vec<(u64, RawFd)>,
         setgroups_allowed: bool,
+        /// Whether its root is to be the container's root mount alone, a
+        /// clone with nothing mounted on it (`export`), made before its
+        /// capabilities go.
+        clone_root: bool,
     },
     /// One that isn't: namespaces of its own, its root mounted there
     /// ([`launch_in_view`]).
@@ -142,13 +146,15 @@ impl HelperSetup {
 
 /// Starts helper function `name` with `args`, in `joining`'s namespaces
 /// (which must include a mount namespace), its standard input and output
-/// `stdin` and `stdout`.
+/// `stdin` and `stdout`; its root the container's root mount alone if
+/// `clone_root`.
 pub(crate) fn launch(
     joining: &super::join::Joining,
     name: &str,
     args: &[u8],
     stdin: &OwnedFd,
     stdout: &OwnedFd,
+    clone_root: bool,
 ) -> Result<RunningHelper> {
     super::internal::refuse_unsafe_dumpable("cp")?;
     let (early, late) = split_namespaces(joining)?;
@@ -157,6 +163,7 @@ pub(crate) fn launch(
         user: joining.user.as_ref().map(AsRawFd::as_raw_fd),
         late,
         setgroups_allowed: setgroups_allowed(joining),
+        clone_root,
     };
     Ok(spawn(name, args, how, stdin, stdout)?.0)
 }
@@ -356,12 +363,26 @@ fn run(setup_fd: RawFd, helpers: &[Helper]) -> ! {
     // Its own creation modes: what it makes gets its mode set anyway, but
     // never one the caller's umask narrowed.
     nix::sys::stat::umask(Mode::from_bits_truncate(0o022));
-    let outcome = enter(&setup, helpers).and_then(|(helper, io)| (helper.run)(&io));
-    let Err(failure) = outcome else {
-        std::process::exit(0);
-    };
-    say(report, &failure);
-    std::process::exit(1);
+    let outcome = enter(&setup, helpers).and_then(|(helper, io)| {
+        (helper.run)(&io)?;
+        Ok(io.note.into_inner().ok().flatten())
+    });
+    match outcome {
+        Ok(None) => std::process::exit(0),
+        // A success with something to say: its note, as a failure of the
+        // note's kind, which the starter reads as a success.
+        Ok(Some(note)) => {
+            say(
+                report,
+                &HelperFailure::new(HelperFailure::NOTE, Errno::UnknownErrno, note),
+            );
+            std::process::exit(0);
+        }
+        Err(failure) => {
+            say(report, &failure);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Sends `failure` back on the report pipe (once: the process then ends).
@@ -411,16 +432,17 @@ fn enter<'h>(
     // 2. Hidden from here on; the container's namespaces, the mount one
     //    last; or, for a stopped container, its own, its root mounted there.
     hide()?;
-    let (maps, mounted) = match &setup.how {
+    let (maps, mounted, root_is) = match &setup.how {
         How::Mount(view) => {
             let (maps, root) = made(view)?;
-            (maps, Some(root))
+            (maps, Some(root), HelperRoot::AsMounted)
         }
         How::Join {
             early,
             user,
             late,
             setgroups_allowed,
+            clone_root,
         } => {
             let maps = joined_all(early, *user, late)?;
             // 3. (begun) Root inside the user namespace it joined.
@@ -428,7 +450,23 @@ fn enter<'h>(
                 become_root(*setgroups_allowed)?;
                 hide()?;
             }
-            (maps, None)
+            // The clone while it may still mount (its capabilities go in
+            // step 3); refused, the container's root as it is, said.
+            if *clone_root {
+                match super::rootfs::clone_root_alone() {
+                    Ok(alone) => (maps, Some(alone), HelperRoot::Alone),
+                    // Locked children, no right to mount, a filter or an
+                    // emulator without the new mount API, an LSM's refusal.
+                    Err(errno @ (Errno::EINVAL | Errno::EPERM | Errno::ENOSYS | Errno::EACCES)) => {
+                        (maps, None, HelperRoot::CloneRefused(errno as i32))
+                    }
+                    Err(errno) => {
+                        return Err(setup_failure(errno, "cloning the container's root"));
+                    }
+                }
+            } else {
+                (maps, None, HelperRoot::AsMounted)
+            }
         }
     };
 
@@ -472,7 +510,9 @@ fn enter<'h>(
         uids,
         gids,
         root,
+        root_is,
         own_fds,
+        note: std::sync::Mutex::new(None),
     };
     Ok((helper, io))
 }
@@ -516,7 +556,13 @@ fn made(view: &ViewSetup) -> std::result::Result<(Option<IdRanges>, OwnedFd), He
         Some((ready, go)) => {
             unshare(CloneFlags::CLONE_NEWUSER)
                 .map_err(|errno| refused(errno, "making a user namespace"))?;
-            // (Making a user namespace leaves it as it was: hidden.)
+            // Dumpable while its starter maps it: a non-dumpable process's
+            // `/proc/PID/uid_map` is root's, and a `newuidmap` that isn't
+            // setuid root (Fedora's: file capabilities, run as the caller)
+            // can't open it. Nothing else is in this namespace, just made
+            // for a stopped container's view; hidden again once root in it.
+            nix::sys::prctl::set_dumpable(true)
+                .map_err(setting_up("letting its ID maps be written"))?;
             // SAFETY: inherited for this; each used once, then the process
             // ends with them.
             let (ready, go) = unsafe { (OwnedFd::from_raw_fd(ready), OwnedFd::from_raw_fd(go)) };
@@ -682,6 +728,7 @@ mod tests {
             user: Some(5),
             late: vec![(1, 6)],
             setgroups_allowed: true,
+            clone_root: false,
         };
         let mut inherited = setup(joined).inherited();
         inherited.sort_unstable();

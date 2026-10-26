@@ -387,6 +387,43 @@ impl CpArgs {
     }
 }
 
+/// `shipyard export`'s flags.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ExportArgs {
+    /// Write the archive to FILE instead of standard output.
+    #[arg(short, long, value_name = "FILE")]
+    pub(crate) output: Option<std::path::PathBuf>,
+    /// The container: its name, ID, serial or ID prefix.
+    pub(crate) container: String,
+}
+
+/// `shipyard export`: the container's own filesystem as one tar archive,
+/// to FILE or standard output (never a terminal, as `cp`'s); what was left
+/// out said as a warning.
+pub(crate) fn export(args: &ExportArgs) -> Result<ExitCode> {
+    use std::io::IsTerminal as _;
+    let engine = crate::reporter::engine();
+    if let Some(path) = &args.output {
+        crate::output::write_archive_to(path, |out| {
+            Ok(shipyard_engine::cp::export_by_name(
+                &engine,
+                &args.container,
+                out,
+            )?)
+        })?;
+    } else {
+        if std::io::stdout().is_terminal() {
+            return Err(crate::output::tar_to_terminal_refused(
+                crate::output::GIVE_OUTPUT,
+            ));
+        }
+        let mut stdout = std::io::stdout().lock();
+        shipyard_engine::cp::export_by_name(&engine, &args.container, &mut stdout)?;
+        stdout.flush()?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `shipyard cp`: the copy, its container by name, running or stopped;
 /// what it left out or changed said as warnings.
 pub(crate) fn cp(args: &CpArgs) -> Result<ExitCode> {
@@ -400,7 +437,7 @@ pub(crate) fn cp(args: &CpArgs) -> Result<ExitCode> {
     // As tar does: an archive on a terminal is noise (and escape sequences
     // a container chose).
     if matches!(transfer, Transfer::Out { to: None, .. }) && std::io::stdout().is_terminal() {
-        anyhow::bail!("refusing to write a tar archive to a terminal (redirect it)");
+        return Err(crate::output::tar_to_terminal_refused(""));
     }
     let options = CpOptions {
         archive: args.archive,

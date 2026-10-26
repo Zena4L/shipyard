@@ -13,8 +13,8 @@ use nix::sys::stat::{Mode, SFlag, fstat};
 use serde::{Deserialize, Serialize};
 use shipyard_image::{CopyOptions, IdRanges, LayerReport, Ownership, Top, UnpackError, unpack_tar};
 use shipyard_runtime::container::{
-    ContainerError, Helper, HelperFailure, HelperIo, RunningHelper, start_helper,
-    start_helper_in_view,
+    ContainerError, Helper, HelperFailure, HelperIo, HelperRoot, RunningHelper, start_helper,
+    start_helper_alone, start_helper_in_view,
 };
 
 use super::pack::{PackError, Packer};
@@ -22,7 +22,7 @@ use super::{CpError, CpOptions, CpReport, Source, limits, names_directory, warni
 use crate::run::Files;
 
 /// The helpers `cp` registers.
-pub(super) const HELPERS: [Helper; 4] = [
+pub(super) const HELPERS: [Helper; 5] = [
     Helper {
         name: "cp-out",
         run: cp_out,
@@ -39,7 +39,20 @@ pub(super) const HELPERS: [Helper; 4] = [
         name: "volume-fill",
         run: super::fill::volume_fill,
     },
+    Helper {
+        name: "export",
+        run: export_root,
+    },
 ];
+
+/// `export`'s arguments.
+#[derive(Debug, Serialize, Deserialize)]
+struct ExportArgs {
+    /// Whether to walk the root as it's mounted, keeping to its mount, as
+    /// where the kernel refuses the clone (a test build's, to test the
+    /// walk: its root then isn't asked alone).
+    walk: bool,
+}
 
 /// What a helper's failure means, in `cp`'s terms ([`HelperFailure::kind`]).
 pub(super) mod kind {
@@ -121,21 +134,7 @@ pub(super) fn copy_out(
     let (read, helper) = start(files, "cp-out", &args, None)?;
     let Some(to) = to else {
         // A stream: the helper's, passed on as it is.
-        let copied = std::io::copy(&mut std::fs::File::from(read), stream);
-        return match (copied, helper.wait()) {
-            (Ok(_), Ok(())) => Ok(CpReport::default()),
-            // This side couldn't write (a full disk, a closed pipe): the
-            // helper only saw its reader go.
-            (Err(error), Err(ended)) if helper_lost_reader(&ended) => Err(CpError::Io {
-                doing: "writing the archive".to_owned(),
-                error,
-            }),
-            (_, Err(ended)) => Err(failure(ended)),
-            (Err(error), Ok(())) => Err(CpError::Io {
-                doing: "writing the archive".to_owned(),
-                error,
-            }),
-        };
+        return streamed(read, helper, stream).map(|_| CpReport::default());
     };
     let Destination { dir, top, made } = destination_on_host(to, &source)?;
     let options = CopyOptions {
@@ -420,9 +419,16 @@ fn start(
     };
     let (read, write) = pipe()?;
     let helper = match files {
-        Files::Live { root, id } => {
-            start_helper(root, id, name, "copying files", &args, &stdin, &write)?
-        }
+        Files::Live {
+            root,
+            id,
+            alone: false,
+        } => start_helper(root, id, name, "copying files", &args, &stdin, &write)?,
+        Files::Live {
+            root,
+            id,
+            alone: true,
+        } => start_helper_alone(root, id, (name, "exporting it"), &args, (&stdin, &write))?,
         Files::Stopped(view) => start_helper_in_view(view, name, &args, &stdin, &write)?,
     };
     Ok((read, helper))
@@ -578,6 +584,88 @@ fn cp_out(io: &HelperIo) -> Result<(), HelperFailure> {
         .map_err(|err| pack_failure(&err))?;
     out.flush()
         .map_err(|err| pack_failure(&PackError::Write(err)))
+}
+
+/// See [`super::export_by_name`]: the archive to `stream`, and what the
+/// helper said (the clone refused). `walk`: a test build's walk instead of
+/// the clone.
+pub(super) fn export(
+    files: Files<'_>,
+    stream: &mut dyn Write,
+    walk: bool,
+) -> Result<Option<String>, CpError> {
+    let files = match files {
+        Files::Live { root, id, .. } if walk => Files::Live {
+            root,
+            id,
+            alone: false,
+        },
+        files => files,
+    };
+    // A stopped `--rootfs` container's view binds its directory with what's
+    // mounted under it on the host: walked keeping to that mount, as a
+    // running one's clone is.
+    let walk = walk || matches!(files, Files::Stopped(view) if view.root.overlay.is_none());
+    let (read, helper) = start(files, "export", &ExportArgs { walk }, None)?;
+    streamed(read, helper, stream)
+}
+
+/// The helper's archive on `read` passed on to `stream` as it is, then its
+/// end waited for: what it noted. This side's failure to write (a full
+/// disk, a closed pipe) is said as that: the helper only saw its reader go;
+/// the helper's own failure explains the stream's end otherwise.
+fn streamed(
+    read: OwnedFd,
+    helper: RunningHelper,
+    stream: &mut dyn Write,
+) -> Result<Option<String>, CpError> {
+    let copied = std::io::copy(&mut std::fs::File::from(read), stream);
+    match (copied, helper.wait_noting()) {
+        (Ok(_), Ok(note)) => Ok(note),
+        (Ok(_), Err(ended)) => Err(failure(ended)),
+        (Err(_), Err(ended)) if !helper_lost_reader(&ended) => Err(failure(ended)),
+        (Err(error), _) => Err(CpError::Io {
+            doing: "writing the archive".to_owned(),
+            error,
+        }),
+    }
+}
+
+/// Writes the container's whole root as a tar stream on standard output,
+/// named from it (`export`): its own filesystem alone. A running one's root
+/// is its root mount cloned alone; where the kernel refused that, the root
+/// as mounted, walked keeping to its mount (what's mounted on it written
+/// as its place alone, said back as a note); a stopped one's view has
+/// nothing mounted on it.
+fn export_root(io: &HelperIo) -> Result<(), HelperFailure> {
+    let args: ExportArgs = serde_json::from_slice(&io.args).map_err(|_| {
+        HelperFailure::new(kind::OTHER, Errno::EINVAL, "reading export's arguments")
+    })?;
+    let fd = open_asked(io, Path::new("/"), true)?;
+    let refused = match io.root_is {
+        HelperRoot::CloneRefused(errno) => Some(errno),
+        HelperRoot::Alone | HelperRoot::AsMounted => None,
+    };
+    let reopen = |fd: &OwnedFd, flags: OFlag| io.reopen(fd, flags);
+    let mut out = BufWriter::new(&io.stdout);
+    let mut packer = Packer::new(&mut out, &reopen).naming_directories();
+    if refused.is_some() || args.walk {
+        packer = packer.within_mount(&fd).map_err(|err| pack_failure(&err))?;
+    }
+    packer
+        .add_contents(&fd)
+        .and_then(|()| packer.finish().map(drop))
+        .map_err(|err| pack_failure(&err))?;
+    out.flush()
+        .map_err(|err| pack_failure(&PackError::Write(err)))?;
+    if let Some(errno) = refused {
+        io.note(format!(
+            "the kernel wouldn't clone its root alone ({}): what its volumes cover was \
+             exported empty",
+            Errno::from_raw(errno).desc()
+        ));
+    }
+    Ok(())
 }
 
 /// A writer's failure, from the helper: a broken pipe as one (its reader

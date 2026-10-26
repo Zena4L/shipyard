@@ -18,93 +18,46 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use shipyard_test_support::registry::{Scratch, Serving, fixture, image_runs_here};
 use shipyard_test_support::{Shipyard, is_root};
 
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 
-/// One test's stores and fixture image.
-struct Stores {
-    scratch: Scratch,
-    image: String,
-    _registry: Serving,
+/// One test's stores and fixture image: test-support's, with what only
+/// these tests do.
+struct Stores(shipyard_test_support::stores::Stores);
+
+impl std::ops::Deref for Stores {
+    type Target = shipyard_test_support::stores::Stores;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Stores {
     /// Its stores, if an image runs here (else it says why).
     fn new() -> Option<Self> {
-        Self::serving(fixture())
+        shipyard_test_support::stores::Stores::new(SHIPYARD).map(Self)
     }
 
     /// Stores whose image has `runtime` as its config's `config` (its
     /// `Entrypoint`, `Cmd`, `Env`…).
     fn with_image_config(runtime: &str) -> Option<Self> {
-        Self::serving(shipyard_test_support::registry::fixture_with_config(
-            runtime,
-        ))
+        shipyard_test_support::stores::Stores::serving(
+            SHIPYARD,
+            shipyard_test_support::registry::fixture_with_config(runtime),
+        )
+        .map(Self)
     }
 
     /// Stores whose image has the layer `extra` over the fixture's, and
     /// `runtime` as its config's `config`.
     fn with_layer(extra: (Vec<u8>, String), runtime: &str) -> Option<Self> {
-        Self::serving(shipyard_test_support::registry::fixture_with_layer(
-            extra, runtime,
-        ))
-    }
-
-    /// Stores for the image `(registry, image)` serves, if an image runs
-    /// here (else it says why).
-    fn serving((registry, image): (Serving, String)) -> Option<Self> {
-        let scratch = Scratch::new();
-        for dir in ["containers", "networks", "xdg"] {
-            std::fs::create_dir_all(scratch.0.join(dir)).unwrap();
-        }
-        for dir in ["containers", "xdg"] {
-            std::fs::set_permissions(scratch.0.join(dir), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-        }
-        let stores = Self {
-            scratch,
-            image,
-            _registry: registry,
-        };
-        let probe = stores.shipyard(&[
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            &stores.image,
-            "sh",
-            "-c",
-            "exit 0",
-        ]);
-        image_runs_here(&probe).then_some(stores)
-    }
-
-    /// `shipyard ARGS`, on these stores.
-    fn shipyard(&self, args: &[&str]) -> Output {
-        self.command(args).output().expect("running shipyard")
-    }
-
-    /// `shipyard ARGS`, which must succeed: its stdout.
-    fn ok(&self, args: &[&str]) -> String {
-        let output = self.shipyard(args);
-        assert!(output.status.success(), "{args:?}: {output:?}");
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    /// `shipyard ARGS`, not yet run, on these stores.
-    fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(SHIPYARD.path());
-        command
-            .args(args)
-            .env("SHIPYARD_IMAGE_STORE", self.scratch.store())
-            .env("SHIPYARD_CONTAINER_DIR", self.scratch.0.join("containers"))
-            .env("SHIPYARD_NETWORK_DIR", self.scratch.0.join("networks"));
-        if !is_root() {
-            command.env("XDG_RUNTIME_DIR", self.scratch.0.join("xdg"));
-        }
-        command
+        shipyard_test_support::stores::Stores::serving(
+            SHIPYARD,
+            shipyard_test_support::registry::fixture_with_layer(extra, runtime),
+        )
+        .map(Self)
     }
 
     /// `logs -f REFERENCE`, running in the background: it, and the next
@@ -165,12 +118,8 @@ impl Stores {
 }
 
 /// Waits (up to 20 s) for `found`, naming `what` if it never comes.
-fn eventually(what: &str, mut found: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !found() {
-        assert!(Instant::now() < deadline, "never: {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+fn eventually(what: &str, found: impl FnMut() -> bool) {
+    shipyard_test_support::eventually(Duration::from_secs(20), what, found);
 }
 
 /// A container is made, started, listed, looked at and removed by its name,
@@ -604,7 +553,7 @@ fn system_df_counts_what_is_in_use() {
         "{{.Type}}={{.TotalCount}}/{{.Active}}",
     ]);
     assert_eq!(
-        df, "Images=1/1\nContainers=2/1\nLocal Volumes=2/1\n",
+        df, "Images=1/1\nContainers=2/1\nLocal Volumes=2/1\nBuild Cache=0/0\n",
         "{df}"
     );
     assert_eq!(stores.ok(&["info", "--format", "{{.Images}}"]), "1\n");
@@ -2719,14 +2668,9 @@ fn a_container_stage_8s_runtime_made_is_left_to_it() {
         stores.scratch.0.join("xdg/shipyard")
     };
     let start_time = |pid: u32| -> u64 {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let after_name = stat.rsplit(')').next().unwrap();
-        after_name
-            .split_whitespace()
-            .nth(19)
+        shipyard_sys::proc::stat(i32::try_from(pid).unwrap())
             .unwrap()
-            .parse()
-            .unwrap()
+            .start
     };
     let mut monitor = Command::new("sleep").arg("300").spawn().unwrap();
     let mut init = Command::new("sleep").arg("300").spawn().unwrap();
@@ -2801,14 +2745,11 @@ fn a_monitor_lives_in_a_cgroup_of_its_own() {
             .to_owned()
     };
     let parent_of = |pid: i64| -> i64 {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let after_name = stat.rsplit(')').next().unwrap();
-        after_name
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap()
+        i64::from(
+            shipyard_sys::proc::stat(i32::try_from(pid).unwrap())
+                .unwrap()
+                .ppid,
+        )
     };
     let monitor_of = |name: &str| -> (i64, i64) {
         let init = stores.inspect(name)["state"]["pid"].as_i64().unwrap();

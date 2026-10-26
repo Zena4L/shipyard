@@ -24,6 +24,7 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard rename`↴](#shipyard-rename)
 * [`shipyard exec`↴](#shipyard-exec)
 * [`shipyard cp`↴](#shipyard-cp)
+* [`shipyard export`↴](#shipyard-export)
 * [`shipyard logs`↴](#shipyard-logs)
 * [`shipyard events`↴](#shipyard-events)
 * [`shipyard wait`↴](#shipyard-wait)
@@ -35,6 +36,14 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard images`↴](#shipyard-images)
 * [`shipyard rmi`↴](#shipyard-rmi)
 * [`shipyard tag`↴](#shipyard-tag)
+* [`shipyard save`↴](#shipyard-save)
+* [`shipyard load`↴](#shipyard-load)
+* [`shipyard build`↴](#shipyard-build)
+* [`shipyard history`↴](#shipyard-history)
+* [`shipyard push`↴](#shipyard-push)
+* [`shipyard login`↴](#shipyard-login)
+* [`shipyard logout`↴](#shipyard-logout)
+* [`shipyard import`↴](#shipyard-import)
 * [`shipyard container`↴](#shipyard-container)
 * [`shipyard container ls`↴](#shipyard-container-ls)
 * [`shipyard container run`↴](#shipyard-container-run)
@@ -52,6 +61,7 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard container exec`↴](#shipyard-container-exec)
 * [`shipyard container inspect`↴](#shipyard-container-inspect)
 * [`shipyard container cp`↴](#shipyard-container-cp)
+* [`shipyard container export`↴](#shipyard-container-export)
 * [`shipyard container port`↴](#shipyard-container-port)
 * [`shipyard container rename`↴](#shipyard-container-rename)
 * [`shipyard container wait`↴](#shipyard-container-wait)
@@ -64,6 +74,12 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard image rm`↴](#shipyard-image-rm)
 * [`shipyard image pull`↴](#shipyard-image-pull)
 * [`shipyard image tag`↴](#shipyard-image-tag)
+* [`shipyard image save`↴](#shipyard-image-save)
+* [`shipyard image load`↴](#shipyard-image-load)
+* [`shipyard image build`↴](#shipyard-image-build)
+* [`shipyard image history`↴](#shipyard-image-history)
+* [`shipyard image import`↴](#shipyard-image-import)
+* [`shipyard image push`↴](#shipyard-image-push)
 * [`shipyard image inspect`↴](#shipyard-image-inspect)
 * [`shipyard volume`↴](#shipyard-volume)
 * [`shipyard volume create`↴](#shipyard-volume-create)
@@ -91,6 +107,8 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard vm stop`↴](#shipyard-vm-stop)
 * [`shipyard vm install`↴](#shipyard-vm-install)
 * [`shipyard vm uninstall`↴](#shipyard-vm-uninstall)
+* [`shipyard builder`↴](#shipyard-builder)
+* [`shipyard builder prune`↴](#shipyard-builder-prune)
 * [`shipyard doctor`↴](#shipyard-doctor)
 * [`shipyard version`↴](#shipyard-version)
 * [`shipyard info`↴](#shipyard-info)
@@ -119,6 +137,7 @@ A lightweight container engine
 * `rename` — Rename a container (a running one's name on its networks too, at once)
 * `exec` — Run a command in a running container. Exits with its exit code (127 if it isn't found, 126 if it can't be run)
 * `cp` — Copy files between a container (running or not) and the host: CONTAINER:PATH to a host path (or - for a tar stream on stdout), or back
+* `export` — Write a container's own filesystem (never its volumes) as a tar archive, to standard output or -o FILE; running or stopped
 * `logs` — Print a container's logs: every start's, oldest first
 * `events` — Print what happens (containers made, started, ended; images pulled; volumes and networks made and removed) as it happens, or what did with --since
 * `wait` — Wait for containers to end, and print each one's exit code
@@ -130,12 +149,21 @@ A lightweight container engine
 * `images` — List images in the local store
 * `rmi` — Remove one or more images from the local store (reference-counted; shared layers survive)
 * `tag` — Give an image another name (TARGET, a reference) beside its own
+* `save` — Write images to a tar archive (to standard output, or -o FILE), as Docker 25 writes one: an OCI image layout with Docker's `manifest.json`
+* `load` — Load images from a tar archive (from standard input, or -i FILE): Docker's (`docker save`'s) or an OCI layout (BuildKit's), plain or gzipped
+* `build` — Build an image from a Dockerfile, with BuildKit (in a container of its own, gone at the build's end): named with -t
+* `history` — Show how an image was built: a row per step, newest first
+* `push` — Send an image to its registry (the name `tag` gave it: `NAME[:TAG]`), signed in as `login` (or `docker login`) left you
+* `login` — Sign in to a registry (Docker Hub if none), kept where Docker keeps it: its credential helper, else ~/.docker/config.json
+* `logout` — Sign out of a registry (Docker Hub if none)
+* `import` — Make an image of a root filesystem's tar archive (a file, or - for standard input; plain or gzipped): one layer, named
 * `container` — Manage containers (the same commands as at the top: `container ls` is `ps`, `container rm` is `rm`…)
 * `image` — Manage images
 * `volume` — Manage named volumes
 * `network` — Manage networks (bridges containers share; Linux, root)
 * `system` — System-wide information and maintenance
 * `vm` — The Linux VM containers run in on a Mac: its status, start and stop
+* `builder` — The build cache
 * `doctor` — Check whether this host can run containers, and what to fix
 * `version` — Show Shipyard's version and its host's (`--format` a Go template over `{Client, Server}`, as Docker's)
 * `info` — Show what Shipyard has and what its host is (`--format` a Go template over Docker's `SystemInfo`)
@@ -641,6 +669,22 @@ Copy files between a container (running or not) and the host: CONTAINER:PATH to 
 
 
 
+## `shipyard export`
+
+Write a container's own filesystem (never its volumes) as a tar archive, to standard output or -o FILE; running or stopped
+
+**Usage:** `shipyard export [OPTIONS] <CONTAINER>`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+
+###### **Options:**
+
+* `-o`, `--output <FILE>` — Write the archive to FILE instead of standard output
+
+
+
 ## `shipyard logs`
 
 Print a container's logs: every start's, oldest first
@@ -845,6 +889,154 @@ Give an image another name (TARGET, a reference) beside its own
 
 
 
+## `shipyard save`
+
+Write images to a tar archive (to standard output, or -o FILE), as Docker 25 writes one: an OCI image layout with Docker's `manifest.json`
+
+**Usage:** `shipyard save [OPTIONS] <IMAGE>...`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The images: references (a repository alone is every tag of it) or IDs (an image saved by ID has no name in the archive)
+
+###### **Options:**
+
+* `-o`, `--output <FILE>` — Write the archive to FILE instead of standard output
+
+
+
+## `shipyard load`
+
+Load images from a tar archive (from standard input, or -i FILE): Docker's (`docker save`'s) or an OCI layout (BuildKit's), plain or gzipped
+
+**Usage:** `shipyard load [OPTIONS]`
+
+###### **Options:**
+
+* `-i`, `--input <FILE>` — Read the archive from FILE instead of standard input
+* `-q`, `--quiet` — Don't say which tags moved to the loaded images (the names loaded, and what was left out, are still said)
+
+
+
+## `shipyard build`
+
+Build an image from a Dockerfile, with BuildKit (in a container of its own, gone at the build's end): named with -t
+
+**Usage:** `shipyard build [OPTIONS] <CONTEXT>`
+
+###### **Arguments:**
+
+* `<CONTEXT>` — The context: a directory
+
+###### **Options:**
+
+* `-t`, `--tag <NAME[:TAG]>` — Name the image `NAME[:TAG]` (repeat it for more names): required unless -o writes its files (Shipyard keeps no untagged images)
+* `-f`, `--file <FILE>` — The Dockerfile (default: CONTEXT/Dockerfile; - reads it from standard input)
+* `--build-arg <KEY[=VALUE]>` — A build arg: KEY=VALUE, or KEY for this shell's value (repeat it)
+* `--target <STAGE>` — The stage to build
+* `--no-cache` — Use no cache
+* `--pull` — Fetch the base images again
+* `-q`, `--quiet` — Print only the image's ID (no progress)
+* `--label <KEY=VALUE>` — A label of the image: KEY=VALUE (repeat it)
+* `--progress <TYPE>` — How progress is shown: auto, plain (BuildKit's lines, as auto) or quiet
+
+  Default value: `auto`
+* `--platform <PLATFORM>` — The platform: this host's only
+* `--secret <id=ID,src=FILE>` — A secret for `RUN --mount=type=secret`: id=ID,src=FILE (repeat it)
+* `-o`, `--output <OUTPUT>` — Write the build's files instead of an image: type=local,dest=DIR (or DIR), or type=tar,dest=FILE (- for standard output)
+
+
+
+## `shipyard history`
+
+Show how an image was built: a row per step, newest first
+
+**Usage:** `shipyard history [OPTIONS] <IMAGE>`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The image: a reference or an ID
+
+###### **Options:**
+
+* `-H`, `--human <BOOL>` — Sizes and times for a person (`7.8MB`, `3 weeks ago`); with `-H=false`, bytes and RFC 3339 times
+
+  Default value: `true`
+
+  Possible values: `true`, `false`
+
+* `--no-trunc` — Don't cut the IDs and instructions short
+* `-q`, `--quiet` — Only the IDs
+* `--format <FORMAT>` — How to print it: `table` (the default), `json` (an object per line), `table TEMPLATE`, or a Go TEMPLATE (`{{.CreatedBy}}`)
+
+
+
+## `shipyard push`
+
+Send an image to its registry (the name `tag` gave it: `NAME[:TAG]`), signed in as `login` (or `docker login`) left you
+
+**Usage:** `shipyard push [OPTIONS] <NAME[:TAG]>`
+
+###### **Arguments:**
+
+* `<NAME[:TAG]>` — The image: `NAME[:TAG]` (`:latest` if none), as `tag` named it for the registry (`ghcr.io/owner/app:1`)
+
+###### **Options:**
+
+* `-a`, `--all-tags` — Push every tag of the repository the store has
+* `-q`, `--quiet` — Print only each name pushed (no progress)
+
+
+
+## `shipyard login`
+
+Sign in to a registry (Docker Hub if none), kept where Docker keeps it: its credential helper, else ~/.docker/config.json
+
+**Usage:** `shipyard login [OPTIONS] [SERVER]`
+
+###### **Arguments:**
+
+* `<SERVER>` — The registry (Docker Hub if none): `ghcr.io`, `registry.example:5000`
+
+###### **Options:**
+
+* `-u`, `--username <USERNAME>` — The username (asked on the terminal if not given)
+* `-p`, `--password <PASSWORD>` — The password: seen by anyone who can list processes, and kept in the shell's history (use --password-stdin)
+* `--password-stdin` — Read the password (or token) from standard input
+
+
+
+## `shipyard logout`
+
+Sign out of a registry (Docker Hub if none)
+
+**Usage:** `shipyard logout [SERVER]`
+
+###### **Arguments:**
+
+* `<SERVER>` — The registry
+
+
+
+## `shipyard import`
+
+Make an image of a root filesystem's tar archive (a file, or - for standard input; plain or gzipped): one layer, named
+
+**Usage:** `shipyard import [OPTIONS] <FILE|-> [REPOSITORY[:TAG]]`
+
+###### **Arguments:**
+
+* `<FILE|->` — The archive: a file, or - for standard input (a URL isn't taken)
+* `<REPOSITORY[:TAG]>` — The image's name: `REPOSITORY[:TAG]` (required: Shipyard keeps no untagged images)
+
+###### **Options:**
+
+* `-c`, `--change <INSTRUCTION>` — Set a config instruction of the image's: CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, USER, VOLUME, WORKDIR or STOPSIGNAL, as a Dockerfile's (repeat it for more)
+* `-m`, `--message <MESSAGE>` — Its history's comment
+* `--platform <PLATFORM>` — The platform: this host's only
+
+
+
 ## `shipyard container`
 
 Manage containers (the same commands as at the top: `container ls` is `ps`, `container rm` is `rm`…)
@@ -869,6 +1061,7 @@ Manage containers (the same commands as at the top: `container ls` is `ps`, `con
 * `exec` — Run a command in a running container (`exec`)
 * `inspect` — Show containers in full, as JSON: Docker's shape (`inspect --type container`)
 * `cp` — Copy files between a container and the host (`cp`)
+* `export` — Write a container's own filesystem as a tar archive (`export`)
 * `port` — Show the host ports a container publishes (`port`)
 * `rename` — Rename a container (`rename`)
 * `wait` — Wait for containers to end (`wait`)
@@ -1359,6 +1552,22 @@ Copy files between a container and the host (`cp`)
 
 
 
+## `shipyard container export`
+
+Write a container's own filesystem as a tar archive (`export`)
+
+**Usage:** `shipyard container export [OPTIONS] <CONTAINER>`
+
+###### **Arguments:**
+
+* `<CONTAINER>` — The container: its name, ID, serial or ID prefix
+
+###### **Options:**
+
+* `-o`, `--output <FILE>` — Write the archive to FILE instead of standard output
+
+
+
 ## `shipyard container port`
 
 Show the host ports a container publishes (`port`)
@@ -1481,6 +1690,12 @@ Manage images
 * `rm` — Remove images (`rmi`)
 * `pull` — Pull an image (`pull`)
 * `tag` — Give an image another name (`tag`)
+* `save` — Write images to a tar archive (`save`)
+* `load` — Load images from a tar archive (`load`)
+* `build` — Build an image from a Dockerfile (`build`)
+* `history` — Show how an image was built (`history`)
+* `import` — Make an image of a root filesystem's tar archive (`import`)
+* `push` — Send an image to its registry (`push`)
 * `inspect` — Show images in full, as JSON: Docker's shape (`docker image inspect`'s)
 
 
@@ -1564,6 +1779,124 @@ Give an image another name (`tag`)
 
 * `<SOURCE_IMAGE>` — The image: a reference or an ID
 * `<TARGET_IMAGE>` — Its new name, like `registry.example/app:1.0`
+
+
+
+## `shipyard image save`
+
+Write images to a tar archive (`save`)
+
+**Usage:** `shipyard image save [OPTIONS] <IMAGE>...`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The images: references (a repository alone is every tag of it) or IDs (an image saved by ID has no name in the archive)
+
+###### **Options:**
+
+* `-o`, `--output <FILE>` — Write the archive to FILE instead of standard output
+
+
+
+## `shipyard image load`
+
+Load images from a tar archive (`load`)
+
+**Usage:** `shipyard image load [OPTIONS]`
+
+###### **Options:**
+
+* `-i`, `--input <FILE>` — Read the archive from FILE instead of standard input
+* `-q`, `--quiet` — Don't say which tags moved to the loaded images (the names loaded, and what was left out, are still said)
+
+
+
+## `shipyard image build`
+
+Build an image from a Dockerfile (`build`)
+
+**Usage:** `shipyard image build [OPTIONS] <CONTEXT>`
+
+###### **Arguments:**
+
+* `<CONTEXT>` — The context: a directory
+
+###### **Options:**
+
+* `-t`, `--tag <NAME[:TAG]>` — Name the image `NAME[:TAG]` (repeat it for more names): required unless -o writes its files (Shipyard keeps no untagged images)
+* `-f`, `--file <FILE>` — The Dockerfile (default: CONTEXT/Dockerfile; - reads it from standard input)
+* `--build-arg <KEY[=VALUE]>` — A build arg: KEY=VALUE, or KEY for this shell's value (repeat it)
+* `--target <STAGE>` — The stage to build
+* `--no-cache` — Use no cache
+* `--pull` — Fetch the base images again
+* `-q`, `--quiet` — Print only the image's ID (no progress)
+* `--label <KEY=VALUE>` — A label of the image: KEY=VALUE (repeat it)
+* `--progress <TYPE>` — How progress is shown: auto, plain (BuildKit's lines, as auto) or quiet
+
+  Default value: `auto`
+* `--platform <PLATFORM>` — The platform: this host's only
+* `--secret <id=ID,src=FILE>` — A secret for `RUN --mount=type=secret`: id=ID,src=FILE (repeat it)
+* `-o`, `--output <OUTPUT>` — Write the build's files instead of an image: type=local,dest=DIR (or DIR), or type=tar,dest=FILE (- for standard output)
+
+
+
+## `shipyard image history`
+
+Show how an image was built (`history`)
+
+**Usage:** `shipyard image history [OPTIONS] <IMAGE>`
+
+###### **Arguments:**
+
+* `<IMAGE>` — The image: a reference or an ID
+
+###### **Options:**
+
+* `-H`, `--human <BOOL>` — Sizes and times for a person (`7.8MB`, `3 weeks ago`); with `-H=false`, bytes and RFC 3339 times
+
+  Default value: `true`
+
+  Possible values: `true`, `false`
+
+* `--no-trunc` — Don't cut the IDs and instructions short
+* `-q`, `--quiet` — Only the IDs
+* `--format <FORMAT>` — How to print it: `table` (the default), `json` (an object per line), `table TEMPLATE`, or a Go TEMPLATE (`{{.CreatedBy}}`)
+
+
+
+## `shipyard image import`
+
+Make an image of a root filesystem's tar archive (`import`)
+
+**Usage:** `shipyard image import [OPTIONS] <FILE|-> [REPOSITORY[:TAG]]`
+
+###### **Arguments:**
+
+* `<FILE|->` — The archive: a file, or - for standard input (a URL isn't taken)
+* `<REPOSITORY[:TAG]>` — The image's name: `REPOSITORY[:TAG]` (required: Shipyard keeps no untagged images)
+
+###### **Options:**
+
+* `-c`, `--change <INSTRUCTION>` — Set a config instruction of the image's: CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, USER, VOLUME, WORKDIR or STOPSIGNAL, as a Dockerfile's (repeat it for more)
+* `-m`, `--message <MESSAGE>` — Its history's comment
+* `--platform <PLATFORM>` — The platform: this host's only
+
+
+
+## `shipyard image push`
+
+Send an image to its registry (`push`)
+
+**Usage:** `shipyard image push [OPTIONS] <NAME[:TAG]>`
+
+###### **Arguments:**
+
+* `<NAME[:TAG]>` — The image: `NAME[:TAG]` (`:latest` if none), as `tag` named it for the registry (`ghcr.io/owner/app:1`)
+
+###### **Options:**
+
+* `-a`, `--all-tags` — Push every tag of the repository the store has
+* `-q`, `--quiet` — Print only each name pushed (no progress)
 
 
 
@@ -1937,6 +2270,31 @@ Let launchd hold Docker's socket while the VM is stopped and start the VM at its
 Undo `vm install`: launchd lets go of Docker's socket (a VM it started is stopped first)
 
 **Usage:** `shipyard vm uninstall`
+
+
+
+## `shipyard builder`
+
+The build cache
+
+**Usage:** `shipyard builder <COMMAND>`
+
+###### **Subcommands:**
+
+* `prune` — Remove the build cache (every context's: one a build is using is kept, said)
+
+
+
+## `shipyard builder prune`
+
+Remove the build cache (every context's: one a build is using is kept, said)
+
+**Usage:** `shipyard builder prune [OPTIONS]`
+
+###### **Options:**
+
+* `-a`, `--all` — Taken, as Docker's: every build cache goes (each is a context's whole)
+* `-f`, `--force` — Don't ask (needed where there's no terminal to ask on)
 
 
 

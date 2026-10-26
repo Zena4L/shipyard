@@ -193,7 +193,7 @@ fn hashed(parts: &[&[u8]]) -> String {
         sha.update(part);
         sha.update([0]);
     }
-    crate::random::hex(&sha.finalize())
+    shipyard_sys::hex::lower(&sha.finalize())
 }
 
 /// What a network's options turn on: Shipyard's own features.
@@ -499,8 +499,9 @@ pub fn find_network(engine: &Engine, name_or_id: &str) -> Result<Found> {
 
 /// The built-ins listed with networks of the store's (root's).
 const BUILTINS: [&str; 2] = ["host", "none"];
-/// The built-ins listed rootless (no networks of its own).
-const BUILTINS_ROOTLESS: [&str; 3] = ["host", "none", "pasta"];
+/// The built-ins listed rootless (no networks of its own): every
+/// `--network` mode, pasta's among them.
+const BUILTINS_ROOTLESS: [&str; 3] = crate::network::RESERVED;
 
 /// The built-in network `name`, as Docker shows its own.
 fn builtin(name: &str) -> NetworkResource {

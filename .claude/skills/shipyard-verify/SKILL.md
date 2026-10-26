@@ -41,6 +41,7 @@ What it runs, if you need a piece alone:
 
 ```sh
 $S/differential.sh mac tester root   # v0.2.0's binaries against this tree's
+$S/differential.sh --base-dir DIR mac tester root   # a copy of the tree from before a change
 ```
 
 [scripts/differential.sh](scripts/differential.sh) builds the tag in a worktree of its

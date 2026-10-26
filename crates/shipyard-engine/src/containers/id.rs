@@ -30,7 +30,9 @@ impl ContainerId {
     ///
     /// The kernel's random numbers couldn't be read.
     pub(crate) fn new() -> Result<Self> {
-        Ok(Self(crate::random::hex(&crate::random::bytes::<32>()?)))
+        Ok(Self(shipyard_sys::hex::lower(
+            &crate::random::bytes::<32>()?
+        )))
     }
 
     /// `text`, if it's an ID: 64 lowercase hex characters.

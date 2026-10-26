@@ -12,23 +12,13 @@ pub(crate) fn bytes<const N: usize>() -> Result<[u8; N]> {
     shipyard_sys::random::bytes().context("reading /dev/urandom")
 }
 
-/// `bytes` as lowercase hex, two characters a byte.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut hex, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
     use super::*;
 
     #[test]
-    fn bytes_are_random_and_hex_is_lowercase() {
+    fn bytes_are_random() {
         assert_ne!(bytes::<32>().unwrap(), bytes::<32>().unwrap());
-        assert_eq!(hex(&[0x00, 0xab, 0x7f]), "00ab7f");
     }
 }

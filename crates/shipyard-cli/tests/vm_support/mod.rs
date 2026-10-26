@@ -247,6 +247,25 @@ impl Drop for Scratch {
     }
 }
 
+/// `bytes` as text (what isn't, replaced).
+pub(crate) fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Docker's CLI on `PATH`; `None` (said) if it isn't there, a failure
+/// where the VM tests are required (`needed` says for what).
+pub(crate) fn docker_cli(needed: &str) -> Option<PathBuf> {
+    let found = shipyard_sys::path::find_program("docker", std::env::var_os("PATH").as_deref());
+    if found.is_none() {
+        assert!(
+            std::env::var("SHIPYARD_TEST_VM").as_deref() != Ok("required"),
+            "{needed} need Docker's CLI on PATH"
+        );
+        eprintln!("no docker on PATH: skipped");
+    }
+    found
+}
+
 /// `command`'s output, its stdin nothing, killed past `limit` (a hung
 /// relay fails its test instead of holding the suite for good).
 pub(crate) fn bounded(mut command: Command, limit: std::time::Duration) -> Output {

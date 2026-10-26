@@ -16,7 +16,7 @@ outside a login session.)
 
 Every command here is also in Docker's `container` group: `container ls` (or
 `ps`, `list`) is `ps`, `container rm` is `rm`, and so on for `run`, `create`,
-`start`, `stop`, `restart`, `kill`, `logs`, `exec`, `inspect`, `cp`, `port`,
+`start`, `stop`, `restart`, `kill`, `logs`, `exec`, `inspect`, `cp`, `export`, `port`,
 `rename`, `wait`, `attach` and `update`. As Docker's, `run` and `create` take `-v`
 for `--volume` and `-h` for `--hostname` (their help is `--help`).
 
@@ -823,3 +823,29 @@ a copy into one of them is hidden by its network's at the next start.
 
 While a copy works on a container, running or not, it holds the container: a
 `start`, `stop` or `rm` that comes meanwhile waits for it (up to two minutes).
+
+## Its whole filesystem: `export`
+
+```sh
+shipyard export web > web.tar           # or: shipyard export -o web.tar web
+shipyard export web | shipyard import - web-snapshot:1
+```
+
+As `docker export`: the container's own filesystem as one tar archive (its image's
+files and what it changed, named from its root: `bin/sh`), running or stopped, to
+standard output (never a terminal) or `-o FILE` (written beside it and renamed at the
+end, as `save -o`, and yours alone: mode 0600). **Never its volumes, binds or tmpfs:** a directory a volume is
+mounted on is exported with what's under it in the container's own files, as
+Docker's. Running, it reads the container's root mount alone (a copy of the mount
+with nothing mounted on it, made inside the container's namespaces); where the kernel
+refuses that copy, it walks the root as it's mounted and leaves out whatever is
+mounted on it (each place written as an empty directory or file), and says so (a
+warning from `shipyard export`; Docker's API has no way to say it): a directory a
+volume covers is then exported empty. That walk tells a mount by its ID, which needs
+Linux 5.8. Stopped, it reads the container's
+writable layer over its image, and takes no volume at all (a removed volume, or a
+bind's source gone, is nothing to it). Like `cp`, it never follows a link (one that
+points out of the container is written as a link) and never opens a device or a FIFO.
+Like `cp`, it holds the container while it streams: a `start`, `stop` or `rm` waits
+for it (up to two minutes), so a slow reader of a large export holds those up. What's
+exported is what `import` makes an image of again.

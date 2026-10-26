@@ -27,6 +27,8 @@ mod foreground;
 mod health;
 #[cfg(target_os = "linux")]
 mod held_off;
+#[cfg(target_os = "linux")]
+pub(crate) use held_off::{HeldOff, stop_pending};
 mod helper;
 pub(crate) mod holds;
 mod isolation;
@@ -65,7 +67,7 @@ pub use detached::{
 pub(crate) use detached::{remove_for_prune, settle_for_prune};
 pub use devices::DeviceArg;
 #[cfg(target_os = "linux")]
-pub(crate) use files::{Files, container_files};
+pub(crate) use files::{Files, Wanted, container_files};
 pub use health::health_entry_point;
 pub(crate) use joined::resolve_joins;
 pub use launch::{Outcome, run};

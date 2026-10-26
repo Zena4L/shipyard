@@ -40,50 +40,6 @@ pub fn top(engine: &Engine, reference: &str) -> Result<Top> {
     }
 }
 
-/// What `/proc/PID/stat` says that `top` shows: the fields after the
-/// command's name (which may hold spaces and parentheses: the last `)`
-/// ends it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "read by `top`, which is Linux's (and the tests)")
-)]
-struct Stat {
-    /// The parent's PID.
-    ppid: i32,
-    /// The controlling terminal's device number (0: none).
-    tty: u64,
-    /// CPU time in user space, in clock ticks.
-    utime: u64,
-    /// CPU time in the kernel, in clock ticks.
-    stime: u64,
-    /// When it started, in clock ticks after boot.
-    start: u64,
-}
-
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "read by `top`, which is Linux's (and the tests)")
-)]
-impl Stat {
-    /// A `/proc/PID/stat` line's fields, or `None` if it isn't one.
-    fn parse(line: &str) -> Option<Self> {
-        let after = &line[line.rfind(')')? + 1..];
-        let fields: Vec<&str> = after.split_whitespace().collect();
-        // After the name: state (0), ppid (1), pgrp, session, tty_nr (4),
-        // tpgid, flags, minflt, cminflt, majflt, cmajflt, utime (11),
-        // stime (12), cutime, cstime, priority, nice, num_threads,
-        // itrealvalue, starttime (19).
-        Some(Self {
-            ppid: fields.get(1)?.parse().ok()?,
-            tty: fields.get(4)?.parse::<i64>().ok()?.try_into().ok()?,
-            utime: fields.get(11)?.parse().ok()?,
-            stime: fields.get(12)?.parse().ok()?,
-            start: fields.get(19)?.parse().ok()?,
-        })
-    }
-}
-
 /// A terminal's name as `ps` gives it, from its device number: `pts/3`,
 /// `tty1`, or `?` (none, or one `ps` wouldn't name).
 #[cfg_attr(
@@ -165,7 +121,7 @@ fn start_time(started: i64, now: i64) -> String {
 mod linux {
     use std::collections::HashMap;
 
-    use super::{Stat, TOP_TITLES, Top, cpu_share, cpu_time, start_time, tty_name};
+    use super::{TOP_TITLES, Top, cpu_share, cpu_time, start_time, tty_name};
     use crate::Engine;
     use crate::containers::{self, ContainerState};
     use crate::docker::proc;
@@ -240,7 +196,8 @@ mod linux {
         /// Process `pid`'s row, if it's still there.
         fn process(&self, pid: i32) -> Option<Vec<String>> {
             let dir = format!("/proc/{pid}");
-            let stat = Stat::parse(&read(&format!("{dir}/stat"))?)?;
+            // Bytes: a process may name itself what isn't text.
+            let stat = shipyard_sys::proc::stat(pid)?;
             // `Uid:`'s real, effective, saved and filesystem UIDs: `ps -ef`
             // shows the effective one.
             let user = read(&format!("{dir}/status"))
@@ -274,7 +231,7 @@ mod linux {
                 stat.ppid.to_string(),
                 cpu_share(used, self.ticks, alive).to_string(),
                 start_time(started, self.now),
-                tty_name(stat.tty),
+                tty_name(u64::try_from(stat.tty).unwrap_or(0)),
                 cpu_time(used / self.ticks),
                 command,
             ])
@@ -290,26 +247,6 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A `stat` line whose command holds spaces and parentheses: the last
-    /// `)` ends it, the fields after are counted from there.
-    #[test]
-    fn a_stat_line_is_read_past_its_name() {
-        let line = "1234 (my (odd) cmd) S 1 1234 1234 34816 1234 4194560 100 0 0 0 \
-                    250 150 0 0 20 0 1 0 98765 1000000 200 18446744073709551615";
-        assert_eq!(
-            Stat::parse(line),
-            Some(Stat {
-                ppid: 1,
-                tty: 34_816,
-                utime: 250,
-                stime: 150,
-                start: 98_765,
-            })
-        );
-        assert_eq!(Stat::parse("1234 no parenthesis"), None);
-        assert_eq!(Stat::parse("1234 (cut) S 1"), None);
-    }
 
     /// Terminals, CPU time and start times as `ps -ef` writes them.
     #[test]

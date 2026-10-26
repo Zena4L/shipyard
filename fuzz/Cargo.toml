@@ -127,3 +127,17 @@ path = "fuzz_targets/api_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "load_archive"
+path = "fuzz_targets/load_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_change"
+path = "fuzz_targets/import_change.rs"
+test = false
+doc = false
+bench = false

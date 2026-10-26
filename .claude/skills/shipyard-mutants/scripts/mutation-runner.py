@@ -8,11 +8,13 @@ Each mutant gets a scratch copy of the repository and a cargo target dir of its
 own (a shared one runs the wrong binary). `mac` mutants run their command here;
 `tester`/`root` mutants run in the Linux test container, in the
 `shipyard-mutation-target` volume, one subdirectory each. A mutant is CAUGHT
-only by a failing test, SURVIVED only with "test result: ok" (anything else is
-NO-RESULT: a build that never ran its tests is not a survivor). Each mutant's
+only by a failing test, SURVIVED only with "test result: ok" and a test run
+(anything else is NO-RESULT: a build that never ran its tests, or a filter that
+matched none, is not a survivor; a control that ran none fails). Each mutant's
 copy and build are deleted once its result is in."""
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,11 +116,15 @@ exit $status"""
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(WORK, exist_ok=True)
     open(f"{work}.log", "w").write(log)
+    # A filter that names no test passes with "test result: ok. 0 passed".
+    ran = re.search(r"test result: ok\. [1-9][0-9]* passed", log) is not None
     if CONTROL:
-        passed = out.returncode == 0 and "test result: ok" in log
+        if out.returncode == 0 and not ran:
+            return name, "CONTROL-FAILS (it ran no test: check its name)"
+        passed = out.returncode == 0 and ran
         return name, "CONTROL-OK" if passed else "CONTROL-FAILS (fix the test first)"
     if out.returncode == 0:
-        return name, "SURVIVED" if "test result: ok" in log else "NO-RESULT"
+        return name, "SURVIVED" if ran else "NO-RESULT (no test ran)"
     caught = "test result: FAILED" in log or "panicked" in log
     return name, "CAUGHT" if caught else "NO-RESULT (see log)"
 

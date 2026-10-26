@@ -49,6 +49,7 @@ compile_error!("shipyard-engine only supports UNIX platforms (Linux, macOS)");
 
 pub mod api_service;
 pub mod attach;
+pub mod build;
 pub mod containers;
 pub mod cp;
 pub mod docker;
@@ -75,7 +76,7 @@ pub mod volumes;
 use std::sync::Arc;
 
 pub use entry::{Hooks, entry_points};
-pub use error::{Error, ErrorKind, Result, StreamsError};
+pub use error::{Error, ErrorKind, Result, StreamsError, said_once};
 pub use paths::Paths;
 
 use report::{Message, Reporter, WarningKind};

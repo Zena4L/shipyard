@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-acceptance"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "shipyard-test-support",
  "testcontainers",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2260,12 +2260,13 @@ dependencies = [
 
 [[package]]
 name = "shipyard-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
  "clap",
  "clap-markdown",
+ "flate2",
  "gotmpl",
  "libc",
  "nix",
@@ -2289,9 +2290,10 @@ dependencies = [
 
 [[package]]
 name = "shipyard-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "libc",
  "nix",
  "proptest",
@@ -2311,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-image"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -2322,6 +2324,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shipyard-sys",
+ "shipyard-test-support",
  "tar",
  "thiserror",
  "tracing",
@@ -2330,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-network"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "nix",
@@ -2343,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "nix",
@@ -2359,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-storage"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "nix",
  "serde",
@@ -2370,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-sys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "nix",
@@ -2381,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard-test-support"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "libc",
@@ -2389,12 +2392,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "shipyard-network",
+ "shipyard-sys",
  "tar",
 ]
 
 [[package]]
 name = "shipyard-vm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "block2",
  "dispatch2",

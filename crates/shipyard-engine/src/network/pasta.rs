@@ -104,14 +104,7 @@ impl PastaPlan {
 /// adopted) or its cgroup can't be opened: pasta then stays where it starts.
 fn monitors_cgroup_procs(init: i32) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let stat = std::fs::read_to_string(format!("/proc/{init}/stat")).ok()?;
-    let parent: i32 = stat
-        .rsplit(')')
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
+    let parent = shipyard_sys::proc::stat(init)?.ppid;
     let cmdline = std::fs::read(format!("/proc/{parent}/cmdline")).ok()?;
     // The argument that makes the binary a monitor (the runtime's
     // `MONITOR_ARG`).

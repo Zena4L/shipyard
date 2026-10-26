@@ -3,10 +3,9 @@
 Shipyard pulls container images from a registry, keeps them in a local store,
 and runs them. An image's layers become a container's root filesystem.
 
-> **Status:** on Linux, `shipyard pull` and `shipyard run IMAGE` pull, store and
-> run images, rootless or as root. Running an image needs Linux (it uses
-> overlayfs); on macOS it will run in the VM a later version manages. Building,
-> pushing and signature verification aren't here yet.
+> **Status:** `pull`, `push`, `build`, `save`/`load`, `import`/`export` and
+> `history` work, rootless or as root; on a Mac, in Shipyard's VM (see
+> [macOS](macos.md)). Signature verification isn't here yet.
 
 ## Running an image
 
@@ -98,13 +97,29 @@ HTTP, as a local development registry; others over HTTPS only.
 
 ## Private registries
 
-Shipyard signs in with the credentials Docker keeps, so `docker login` works for
-both:
+Shipyard signs in with the credentials Docker keeps, and keeps its own sign-ins
+there too, so `shipyard login` and `docker login` work for both:
 
 ```sh
-docker login ghcr.io
+shipyard login ghcr.io                       # asks for the username and password
+echo "$TOKEN" | shipyard login -u me --password-stdin ghcr.io
 shipyard pull ghcr.io/owner/private-app:v1
+shipyard logout ghcr.io
 ```
+
+`login` checks the credential against the registry first (a refused one is said,
+`unauthorized: …`, and nothing is kept), then keeps it where `docker login` would:
+the registry's credential helper (below) if the config names one, else in
+`config.json` itself, base64 and **not encrypted** (said, as Docker says it). The
+password is asked on the terminal without echo (a Ctrl-C cancels it, the terminal put
+back); `--password-stdin` reads it from standard input (a trailing newline dropped);
+`-p` works but is warned of (anyone listing processes sees it). `logout` removes the
+sign-in from the helper and every spelling of the registry in the file (`ghcr.io`,
+`https://ghcr.io`), and says "Not logged in to …" when there was none. The rest of the
+file (its other keys, `currentContext`, `proxies`…) is kept as it was, its mode and
+owner too; a config that's a link (dotfiles) stays one; a file that isn't Docker's JSON
+is refused, never overwritten. A `docker login` at the same moment as a `shipyard login`
+can lose one of the two (each rewrites the file whole), as two `docker login`s can.
 
 It reads `$DOCKER_CONFIG/config.json` (or `~/.docker/config.json`), as Docker
 does:
@@ -132,6 +147,33 @@ without credentials may redirect.
 They never appear in messages or logs. If a registry turns them down, Shipyard
 says where they came from, so you know what to sign in to again.
 
+## Pushing (`push`)
+
+```sh
+shipyard tag app:1 ghcr.io/owner/app:1
+shipyard push ghcr.io/owner/app:1      # NAME[:TAG]: :latest if none
+shipyard push -a ghcr.io/owner/app     # every tag of the repository the store has
+```
+
+An image is pushed as it's stored: its blobs and manifest byte for byte, so the
+registry's copy has the same digests and the same ID (`digest:` in the last line, as
+Docker's: `1: digest: sha256:… size: 1234`). Each blob the registry has already is
+skipped (`already there`); the others are sent, up to three at once, and the manifest
+last, so the tag never names an image the registry hasn't got whole. A push signs in as
+a pull does (the sign-in for the name's registry, asking for push access); one whose
+credential can't be read (a helper that fails) fails, rather than going on anonymously.
+A registry that takes the credential but won't let the account push to the repository
+is said as that (`denied: …`), not as a sign-in to redo.
+
+What a push trusts of the registry: nothing it says leads the upload to another host
+(an upload `Location` elsewhere, a redirect: refused, never sent there); each upload
+step goes where the step before said; a step that fails, or a token that expires mid-way,
+starts that blob's upload over, and a blob whose commit went through though its answer
+was lost isn't sent twice. An image pulled through a multi-platform index keeps only
+this platform's manifest, so it's pushed as that platform's image; pushed back to the
+very tag that still names that index, it's refused (it would make that multi-platform
+image this platform's alone): push to another tag.
+
 ## Managing the store
 
 ```sh
@@ -145,7 +187,8 @@ shipyard system df              # the store's disk usage
 ```
 
 The `image` group has Docker's names for these too: `image ls` (`images`),
-`image rm` (`rmi`), `image pull`, `image tag`, `image inspect` and `image prune`.
+`image rm` (`rmi`), `image pull`, `image push`, `image tag`, `image save`, `image load`,
+`image history`, `image import`, `image build`, `image inspect` and `image prune`.
 
 `tag SOURCE TARGET` gives an image another name: SOURCE is a reference or an ID,
 TARGET a reference with a tag (a digest can't be given, as Docker's). The image
@@ -224,6 +267,202 @@ digest, whole or its first 4 hex digits or more (as `IMAGE ID` shows it), or its
 config's, whole. That removes every reference of the image, all of them or none; one
 with references in more than one repository is refused unless `--force`, as Docker's
 `rmi` does.
+
+## Saving and loading (`save`, `load`)
+
+```sh
+shipyard save -o images.tar alpine:3.20 app:1   # images to a file
+shipyard save alpine | gzip > alpine.tar.gz     # every alpine tag, to standard output
+shipyard load -i images.tar                     # back, here or on another host
+ssh build-host shipyard save app:1 | shipyard load   # straight across
+```
+
+`save` writes the images as one tar archive, as Docker 25 writes one: an OCI image
+layout (`oci-layout`, `index.json`, each blob at `blobs/sha256/<hex>`) with Docker's
+`manifest.json` beside it, so Docker, Podman and containerd load it too. Each
+image's own blobs go out as they're stored (its manifest, config and compressed
+layers): it keeps its ID and digests, a layer two images share goes once, and the
+same images give the same bytes. A name with a tag is that image; a repository
+alone (`alpine`) is every tag of it in the store; an ID is the image with no name
+in the archive (as Docker's). `-o FILE` writes it beside FILE and renames it at the
+end, so a failed save leaves no half archive (one killed half way leaves its
+`FILE.shipyard-PID` beside it), and the file is yours alone (mode 0600, as Docker's:
+an image may hold secrets); `-o` naming a device or a FIFO
+(`/dev/null`, a named pipe) writes into it, never replaces it. Without `-o` it goes
+to standard output, never to a terminal. Each blob is held open until it's written:
+`save` raises its descriptor limit as far as it may, and a save of more blobs than
+that is refused before it writes anything (save fewer images at once, or raise
+`ulimit -n`).
+
+`load` reads an archive from standard input, or `-i FILE`: Docker's (`docker save`,
+both the current form and the older one with a directory a layer), an OCI layout
+alone (BuildKit's `--output type=oci`, named by its `io.containerd.image.name`
+annotations), plain or gzipped. It says each name it loaded (`-q` leaves out the
+tags it moved):
+
+```text
+Loaded image: alpine:3.20
+```
+
+An archive is anyone's, and `load` treats it so:
+
+- **Nothing is extracted by its names.** Members are matched to blobs and documents
+  by name, and a blob is stored only if its bytes are its digest. A link is a name
+  too, never followed on disk; a member whose name climbs (`../`) refuses the whole
+  archive.
+- **Nothing reaches the store until the whole archive is read and sound.** It's read
+  first into a staging directory in the store (`blobs/.load-…`, removed at the end;
+  one a killed load left is removed by the next load, `rmi` or `image prune`). An archive cut
+  short, or missing a layer its image needs, loads nothing; nothing is ever fetched
+  from a registry for it.
+- **A name moves, and says so.** A name the store has for another image moves to
+  the archive's, as a pull's does, and `load` says which: `The image app:1 already
+  exists, renaming the old one with ID sha256:… to empty string` (Docker's words).
+  The old image keeps its other names; a container made from it keeps it.
+- **An image with no name isn't loaded** (an archive saved by ID): it's said, and
+  the rest load. Give it a name when saving (`save NAME`).
+- **Only this host's platform loads;** another is left out, said. A name with a
+  digest (`alpine@sha256:…`) loads only if it's the image's own.
+- **Bounds:** 64 GiB decoded, 16 MiB of documents, 1024 names, 1024 entries in
+  `manifest.json` or an index, 128 layers an image; the store's free space reserve is
+  kept. bzip2, xz and zstd archives are refused by name.
+
+An image from Docker's older archive form gets a manifest of its own on loading (its
+layers as they were), so its ID differs from the one Docker showed for it; its
+layers and config are the same.
+
+## Building one (`build`)
+
+```sh
+shipyard build -t app:1 .                       # ./Dockerfile, the image named app:1
+shipyard build -t app:1 -f ci/Dockerfile --build-arg VERSION=2 --target final .
+shipyard build -t app:1 --secret id=npm,src=$HOME/.npmrc .
+shipyard build -o type=local,dest=dist .        # the build's files, no image
+shipyard builder prune -f                       # the build cache, emptied
+```
+
+A Dockerfile is built by [BuildKit](https://github.com/moby/buildkit) (Docker's own
+builder: every Dockerfile feature it has, multi-stage builds, `RUN --mount=type=cache`,
+`--mount=type=secret`), run by Shipyard for the build in a container of its own
+(`shipyard-build-…`, gone at the build's end) from `moby/buildkit:v0.34.1`, pinned by
+its digest (pulled on the first build; a `load` of it serves a host offline). The image
+is loaded under the build's names alone (`-t`, at least one: Shipyard keeps no untagged
+images), its ID printed with `-q`.
+
+The flags, as Docker's: `-t NAME[:TAG]` (repeat it), `-f FILE` (`-f -` reads it from
+standard input; a `FILE.dockerignore` beside it is used), `--build-arg KEY=VALUE` (or
+`KEY`, this shell's value), `--target STAGE`, `--no-cache`, `--pull`, `--label`,
+`-q`, `--progress auto|plain|quiet` (`tty` taken, as `plain`), `--platform` (this host's only), `--secret
+id=ID,src=FILE` (at most 1 MiB; reaches `RUN --mount=type=secret,id=ID` and no
+layer), `-o type=local,dest=DIR` (or `-o DIR`) and `-o type=tar,dest=FILE` (`-` for
+standard output): the build's files, owned by you, instead of an image (`-t` and `-o`
+together are refused: one or the other; a `type=tar` file is yours alone, mode 0600, as
+`save -o`'s). As root, `-o type=local`'s directory is reached without following a
+symbolic link (another user's link in `/tmp` could lead the build's files anywhere): give
+its real path (on Fedora Atomic, `/var/home/…`, not `/home/…`, a link there). The context is
+a directory (from standard input or a URL isn't supported). On a Mac, the context and
+every file named are in your home, as `cp`'s.
+
+**The store's images are built on.** As Docker's builder does, a `FROM`, `COPY --from`
+or `RUN --mount=from=` that names an image Shipyard has (one you built, pulled, loaded
+or imported) uses it, and asks no registry: `shipyard build -t base .` then `FROM base`
+works offline. `--pull` asks the registry for each base image again, as Docker's flag
+does (a name only this host has then fails). BuildKit is given each image of the store
+whose name the Dockerfile or a `--build-arg` mentions (by any of its names, or its
+digest; at most 256), its blobs linked from the store read-only, never copied: where they can't be linked (the
+builder's directory on another filesystem than the store), the build says so and pulls
+them, as before. A stage of the
+Dockerfile's own (`FROM … AS base`) is always the stage: an image named `base` in the
+store never takes its place. A store that can't be read is said, and the build pulls.
+
+**What the builder is given.** It runs in a user namespace (rootless: yours; as root,
+IDs from 2100000000, a range no user is given: a build as root is refused if
+`/etc/subuid` or `/etc/subgid` gives anyone part of it) with `CAP_SYS_ADMIN` in that
+namespace alone, and **seccomp unconfined** (BuildKit needs the kernel's keyring there):
+a wider set of system calls than a container gets, so build only Dockerfiles you'd run.
+BuildKit runs a build's `RUN` steps without a sandbox of their own: they see the
+builder's processes (and `buildctl`'s arguments: build args are recorded in the image
+anyway, as Docker's; secrets go in `--secret`, never in args), not its files. It sees
+the context read-only, its own cache, the build's Dockerfile and secrets (copied in,
+each apart, removed after, a Ctrl-C included) and where it writes its result. Its
+network is the default one (base images are pulled; as root, the default bridge, so a
+build's steps reach what a container on it reaches). The Dockerfile and its own
+`.dockerignore` are read from inside the context, or `-f`'s own directory: one that's a
+link leading anywhere else is refused (a repository's link could hand BuildKit any file
+of yours).
+
+**The context must be readable to the builder, whole.** BuildKit would copy a file it
+can't read as an empty one, so `build` refuses one first, by name, `.dockerignore` or
+not: as root, every file must be readable to every user (`chmod o+r`, a directory
+`o+rx`), the context's own directory too and every directory above it enterable
+(`o+x`: not under `/root`), since the builder is another user; rootless, every file must
+be readable to you. On a Mac, the home the VM shares is read by the builder as you
+read it, so nothing there needs opening to others. Rootless builds need a delegated
+cgroup (a login session's), as rootless containers do.
+
+**The cache is the context's.** Each context directory has a cache of its own
+(BuildKit's state, in the store, `builder/state-…`; as root beside it, in
+`images-builder/`, which must be root's and writable by no one else, or a build refuses
+it): a project's builds reuse it, and nothing crosses projects (a
+hostile Dockerfile can affect its own project's later builds, never another's).
+Builds of one context run one at a time (another waits, said); of different contexts,
+at once. BuildKit keeps each under about 10 GB, and a context's cache no build has used
+for a week is removed by the next build of another context (said), so a host that
+builds in a new directory each time, as CI does, doesn't keep every one. `system df` counts it (`Build Cache`; one
+a build is using counts as active), and `builder prune -f` (or `system prune`, or the
+API's `/build/prune`) empties every one no build is using, with what killed builds left.
+A prune with filters (`system prune --filter …`, `/build/prune?filters=…`) leaves it: a
+cache has no labels or times to read.
+
+A build that fails says BuildKit's last lines and exits 1; one interrupted (Ctrl-C)
+removes its builder; one whose `shipyard` was killed leaves its builder running until
+the next build of that context, or `builder prune` (with the cache it's using), removes
+it. `container prune` and `system prune` leave a build's builder to it.
+
+## A filesystem made an image (`import`)
+
+```sh
+shipyard export web | shipyard import - web-snapshot:1
+shipyard import -c 'CMD ["/bin/app"]' -c 'ENV MODE=prod' rootfs.tar.gz app:1
+```
+
+As `docker import`: a root filesystem's tar archive (a file, or `-` for standard
+input; plain or gzipped) made an image of one layer, named `REPOSITORY[:TAG]`, its
+ID printed. **A name is required:** Shipyard keeps no untagged image (Docker would
+make a `<none>` one). A URL isn't fetched: download it, then import the file. Only
+this host's platform is made (`--platform` this host's or refused).
+
+`-c`/`--change` sets the image's config as a Dockerfile's instruction would: `CMD`
+and `ENTRYPOINT` (a JSON array, or a line run by `/bin/sh -c`), `ENV` and `LABEL`
+(`KEY=VALUE` pairs, quoted as a Dockerfile's, or the older `ENV KEY value`),
+`EXPOSE` (`80`, `53/udp`, a range of at most 1024 ports), `USER`, `VOLUME`,
+`WORKDIR` and `STOPSIGNAL`; repeat it for more (64 at most). Docker's `ONBUILD` and
+`HEALTHCHECK` aren't taken. `-m`/`--message` is its history's comment.
+
+The archive is read whole before anything is kept: an empty or cut one, or one that
+isn't a tar, makes nothing (16 GiB decoded at most; bzip2, xz and zstd refused by
+name). Its files are checked as any layer's are when it's unpacked (no `..`, no
+device nodes). The layer is stored gzipped (its digest is the gzip's, its `diff_id`
+the archive's own). An image archive (`save`'s) given to `import` by mistake is
+warned of: `load` reads those. A name that named another image moves to the new one,
+said.
+
+## How an image was built (`history`)
+
+```text
+$ shipyard history app:1
+IMAGE          CREATED        CREATED BY                                      SIZE      COMMENT
+2c3e5c8f1a2b   2 weeks ago    /bin/sh -c #(nop)  CMD ["sh"]                   0B
+<missing>      2 weeks ago    /bin/sh -c #(nop) ADD file:1f4a… in /           3.62MB
+```
+
+A row per step of the image's build, newest first, from its config's `history`;
+an image whose config has none shows a row a layer. The newest row has the image's
+ID, the rest `<missing>` (as Docker shows an image it didn't build). `SIZE` is the
+step's layer as stored (compressed, as `images`' `SIZE`; Docker's is unpacked).
+`--no-trunc` shows whole IDs and instructions, `-H=false` bytes and RFC 3339 times,
+`-q` the IDs; `--format` takes Docker's fields (`ID`, `CreatedSince`, `CreatedAt`,
+`CreatedBy`, `Size`, `Comment`).
 
 ## Where the store lives
 
@@ -307,9 +546,12 @@ removes partial downloads.
 
 ## Not yet
 
-- Building images, `push`, and signature verification (cosign/sigstore).
-- `history`, `save`/`load`, `import`/`export`.
+- Signature verification (cosign/sigstore); pushing a multi-platform index; a blob
+  mounted from another repository of the registry (each is uploaded); an upload resumed
+  where it stopped (a broken one starts over).
+- Untagged images (a `build`, `load` or `import` without a name is refused).
+- `docker build` through the API (use `shipyard build`), a build context from standard
+  input or a URL, `--ssh`, `--cache-from`/`--cache-to`, other platforms.
 - zstd-compressed layers (gzip works today; a zstd layer is refused by name).
 - A fallback to `fuse-overlayfs` where the kernel won't let a normal user mount
   overlay.
-- Running an image on macOS (it needs the Linux VM backend).

@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use shipyard_engine::containers::RestartPolicy;
 use shipyard_engine::network::{Joined, NetworkMode};
 use shipyard_engine::run::{CapabilityArg, SecurityOpt};
+use shipyard_runtime::resources::DockerLimits;
 
 use super::*;
 
@@ -477,6 +478,9 @@ fn an_inline_seccomp_profile_is_refused_as_one() {
         &json!({"HostConfig": {"SecurityOpt": ["seccomp={\"defaultAction\":\"SCMP_ACT_ALLOW\"}"]}}),
     );
     let error = create(&body, None).unwrap_err();
+    assert_eq!(error.status, hyper::StatusCode::BAD_REQUEST);
+    // Two refusals of one field (a path, a profile inline): the words are
+    // what tells which was made, as an error kind would.
     assert!(
         error.message.contains("a seccomp profile given inline"),
         "{}",
@@ -664,20 +668,6 @@ fn tmpfs_and_mounts_are_docker_s() {
             ),
         ]
     );
-}
-
-/// Go's `os.FileMode` bits (Docker's API's `TmpfsOptions.Mode`) as the
-/// kernel's octal mode: the sticky bit Go keeps high up becomes `01000`.
-#[test]
-fn go_s_modes_are_the_kernel_s() {
-    assert_eq!(super::go_mode(0o1777), "1777");
-    assert_eq!(super::go_mode((1 << 20) | 0o777), "1777", "Go's sticky bit");
-    assert_eq!(
-        super::go_mode((1 << 31) | 0o755),
-        "755",
-        "a directory's type bit"
-    );
-    assert_eq!(super::go_mode((1 << 23) | (1 << 22) | 0o700), "6700");
 }
 
 /// What a mount asks that Shipyard can't do is refused (400), naming it:

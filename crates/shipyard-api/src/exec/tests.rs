@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::session::pump;
 use super::*;
 
 fn exec_config() -> ExecConfig {
@@ -213,4 +216,21 @@ fn old_pid_files_are_swept() {
     left.sort();
     assert_eq!(left, [".exec-live.pid", "api.sock.lock"]);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A start is claimed once (a second is refused); one whose spawn failed
+/// gives its claim back, so the exec can be started again, never left
+/// "started" with nothing running (F148).
+#[test]
+fn a_start_s_claim_is_given_back_when_nothing_ran() {
+    let instance = Instance {
+        container: String::new(),
+        config: exec_config(),
+        state: Mutex::new(State::new(Instant::now())),
+        pid_file: None,
+    };
+    assert!(instance.claim(), "the first start");
+    assert!(!instance.claim(), "a second, refused");
+    instance.unclaim();
+    assert!(instance.claim(), "startable again once its spawn failed");
 }

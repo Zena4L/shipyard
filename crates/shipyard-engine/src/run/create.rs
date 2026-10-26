@@ -20,62 +20,17 @@ pub(super) fn create(engine: &Engine, request: RunRequest, auto_remove: bool) ->
 /// it was made, still held.
 pub(super) fn create_holding(
     engine: &Engine,
-    mut request: RunRequest,
+    request: RunRequest,
     auto_remove: bool,
 ) -> Result<(Record, HeldOff)> {
-    // Its starts' streams are its monitor's: no terminal of the
-    // caller's is looked for (`create -it` from a script).
-    request.detached = true;
-    // Removed as it ends, it can't be started again (Docker's rule).
-    if auto_remove && request.restart != crate::containers::RestartPolicy::No {
-        bail!(
-            InvalidRequest,
-            "--rm can't go with a restart policy (--restart {}): a container removed as it \
-             ends can't be started again",
-            request.restart
-        );
-    }
-    let (no_copy, mut anonymous) = settle_volumes(&mut request)?;
-    // Another container's network or IPC namespace: that one found now,
-    // and named by its ID from here on (a rename never re-points it).
-    super::joined::name_the_joined(engine, &mut request)?;
-    let mut planned = checked(engine, request)?;
-    if let Some(path) = &planned.request.cidfile {
-        check_cidfile(path)?;
-    }
-    // Its labels checked before anything is pulled.
-    let labels = Labels::new(planned.request.labels.clone())?;
-    // A request refused settles nothing (but a bind's source it asked
-    // to make).
-    crate::run::recover::recover_others(engine, None);
-    // The image first: a pull that fails, or is interrupted, leaves no
-    // record behind (Docker's order).
-    let made_ready = ready_image(engine, &planned)?;
-    let (image_id, image_config) = made_ready.unzip();
-    // Again, with `-P`'s ports, now the image's are known.
-    if let Some(config) = &image_config {
-        check_holds(
-            &planned,
-            &containers::exposed_ports(&config.exposed_ports, &planned.request.expose),
-        )?;
-    }
-    settle_the_health_check(engine, &mut planned.request, image_config.as_ref());
-    // The image's own `VOLUME`s no mount covers: an anonymous one each
-    // (Docker's, D11.4a2-1).
-    if let Some(config) = &image_config {
-        anonymous.extend(super::volumes::image_volumes(
-            engine,
-            &config.volumes,
-            &mut planned.request.volume,
-            &planned.request.tmpfs,
-        )?);
-    }
-    let name = planned
-        .request
-        .name
-        .as_deref()
-        .map(Name::parse)
-        .transpose()?;
+    let Prepared {
+        planned,
+        no_copy,
+        anonymous,
+        labels,
+        image_id,
+        name,
+    } = prepare(engine, request, auto_remove)?;
     // From the record on, a Ctrl-C waits: it ends the call cleanly
     // (the record and its pin undone).
     let held_off = HeldOff::new();
@@ -141,6 +96,90 @@ pub(super) fn create_holding(
     drop(guard);
     crate::events::emit(engine, &crate::events::container(&record, "create"));
     Ok((record, held_off))
+}
+
+/// What [`prepare`] settles for a create before anything is made.
+struct Prepared {
+    /// The run, checked, with the image's health check and volumes.
+    planned: crate::run::Planned,
+    /// The volumes not to fill from the image (`nocopy`).
+    no_copy: Vec<String>,
+    /// The anonymous volumes to make: the request's and the image's.
+    anonymous: Vec<String>,
+    /// Its labels, checked.
+    labels: Labels,
+    /// Its image's ID, if it has an image.
+    image_id: Option<String>,
+    /// The name it's given, if one is.
+    name: Option<Name>,
+}
+
+/// A create's checks and its image, before anything of it is made: the
+/// request refused here settles nothing (but a bind's source it asked to
+/// make), and an image pull that fails, or is interrupted, leaves no record
+/// behind (Docker's order).
+fn prepare(engine: &Engine, mut request: RunRequest, auto_remove: bool) -> Result<Prepared> {
+    // Its starts' streams are its monitor's: no terminal of the
+    // caller's is looked for (`create -it` from a script).
+    request.detached = true;
+    // Removed as it ends, it can't be started again (Docker's rule).
+    if auto_remove && request.restart != crate::containers::RestartPolicy::No {
+        bail!(
+            InvalidRequest,
+            "--rm can't go with a restart policy (--restart {}): a container removed as it \
+             ends can't be started again",
+            request.restart
+        );
+    }
+    let (no_copy, mut anonymous) = settle_volumes(&mut request)?;
+    // Another container's network or IPC namespace: that one found now,
+    // and named by its ID from here on (a rename never re-points it).
+    super::joined::name_the_joined(engine, &mut request)?;
+    let mut planned = checked(engine, request)?;
+    if let Some(path) = &planned.request.cidfile {
+        check_cidfile(path)?;
+    }
+    // Its labels checked before anything is pulled.
+    let labels = Labels::new(planned.request.labels.clone())?;
+    // A request refused settles nothing (but a bind's source it asked
+    // to make).
+    crate::run::recover::recover_others(engine, None);
+    // The image first: a pull that fails, or is interrupted, leaves no
+    // record behind (Docker's order).
+    let made_ready = ready_image(engine, &planned)?;
+    let (image_id, image_config) = made_ready.unzip();
+    // Again, with `-P`'s ports, now the image's are known.
+    if let Some(config) = &image_config {
+        check_holds(
+            &planned,
+            &containers::exposed_ports(&config.exposed_ports, &planned.request.expose),
+        )?;
+    }
+    settle_the_health_check(engine, &mut planned.request, image_config.as_ref());
+    // The image's own `VOLUME`s no mount covers: an anonymous one each
+    // (Docker's, D11.4a2-1).
+    if let Some(config) = &image_config {
+        anonymous.extend(super::volumes::image_volumes(
+            engine,
+            &config.volumes,
+            &mut planned.request.volume,
+            &planned.request.tmpfs,
+        )?);
+    }
+    let name = planned
+        .request
+        .name
+        .as_deref()
+        .map(Name::parse)
+        .transpose()?;
+    Ok(Prepared {
+        planned,
+        no_copy,
+        anonymous,
+        labels,
+        image_id,
+        name,
+    })
 }
 
 /// F62: whether a container's starts give it the default process limit
