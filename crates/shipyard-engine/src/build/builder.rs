@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use shipyard_image::ImageReference;
 use shipyard_image::index::Index;
+use shipyard_runtime::attach::forward;
 use shipyard_runtime::isolation::{IdMap, IdMaps};
 
 use super::args::{buildctl_args, places};
@@ -102,7 +103,12 @@ pub(super) fn build(
     // On a Mac's home, shared into its VM, every user of the guest reads as
     // the Mac's user does (each file seen as the asker's own: probed): the
     // modes say nothing there, so it's checked as a rootless caller's is.
-    readable_to_the_builder(&context, root && !on_the_macs_home(&context))?;
+    readable_to_the_builder(
+        &context,
+        // The home's share alone: `/tmp`'s holds other Mac users' files,
+        // whose modes the guest can't trust to say what the builder reads.
+        root && !crate::guest::shares::on_a_macs_share(&context, |tag| tag == forward::HOME_TAG),
+    )?;
     let maps = root.then(root_maps).transpose()?;
     // Before Ctrl-C is held off: a first pull of BuildKit's image can be
     // stopped.
@@ -337,35 +343,6 @@ fn readable_to_the_builder(context: &Path, root: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Whether `path` is on the Mac's home as Shipyard's VM shares it: the
-/// `virtiofs` mount tagged [`HOME_TAG`](shipyard_runtime::attach::forward::HOME_TAG)
-/// (only ever in the guest), found by the mount `path` is on.
-fn on_the_macs_home(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let Ok(id) = shipyard_sys::fs::mount_id(&file) else {
-        return false;
-    };
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .is_ok_and(|mountinfo| is_the_home_share(&mountinfo, id))
-}
-
-/// Whether the mount `id` in `mountinfo` (`/proc/PID/mountinfo`'s lines:
-/// its ID first, its type and source after the ` - `) is the Mac's shared
-/// home.
-fn is_the_home_share(mountinfo: &str, id: u64) -> bool {
-    mountinfo.lines().any(|line| {
-        let mut fields = line.split(' ');
-        fields.next().and_then(|first| first.parse::<u64>().ok()) == Some(id)
-            && line.split_once(" - ").is_some_and(|(_, rest)| {
-                let mut after = rest.split(' ');
-                after.next() == Some("virtiofs")
-                    && after.next() == Some(shipyard_runtime::attach::forward::HOME_TAG)
-            })
-    })
 }
 
 /// Whether every user may read `path` (`read`: a file `o+r`, a directory
@@ -669,6 +646,7 @@ impl Job<'_> {
     /// base image again (Docker's rule). The images, and the layout's own
     /// files (the store's blobs, linked, stay the store's).
     fn local_images(&self, places: &Places) -> Result<(Vec<super::local::Local>, Vec<PathBuf>)> {
+        // Not with `--pull` (each base image fetched again).
         if self.request.pull {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -693,7 +671,28 @@ impl Job<'_> {
                 Vec::new()
             }
         };
-        let wanted = super::local::wanted(&images, &dockerfile, &self.request.build_args);
+        let mut wanted = super::local::wanted(&images, &dockerfile, &self.request.build_args);
+        // Each image for its own platform alone, read from its own config: a
+        // name can be another's (an earlier `pull --platform linux/amd64`, an
+        // amd64-only image run through Rosetta), and a stage of another
+        // platform (the build's, or its own `FROM --platform=`) built on it
+        // would make an image of mixed platforms (13.3's and 13.8c's
+        // reviews). Such a stage's base BuildKit pulls. One whose config
+        // can't be read is left out.
+        for image in &mut wanted {
+            image.platform = image
+                .blobs
+                .get(1)
+                .and_then(|config| shipyard_image::Digest::parse(config).ok())
+                .and_then(|config| {
+                    store
+                        .read_blob(&config, shipyard_image::MANIFEST_SIZE_LIMIT)
+                        .ok()
+                })
+                .and_then(|bytes| shipyard_image::ImageConfig::parse(&bytes).ok())
+                .map(|config| super::local::buildkit_platform(&config.platform()));
+        }
+        wanted.retain(|image| image.platform.is_some());
         if wanted.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -948,14 +947,17 @@ fn outputs(
 /// symlink: a `/tmp/out` another user linked to `/etc` would have the
 /// build's files written there as root (12.5's review); a link on the way
 /// is refused, said. A rootless caller's, and one on a Mac's home (every
-/// file there the Mac's user's), are followed as the caller would.
+/// file there the Mac's user's; not its shared `/tmp`, where any of the
+/// Mac's users makes links), are followed as the caller would.
 fn output_dir(dest: &Path, root: bool) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd as _;
     let making = || format!("making {}", dest.display());
     let on_the_home = || {
         dest.ancestors()
             .find(|up| !up.as_os_str().is_empty() && up.exists())
-            .is_some_and(on_the_macs_home)
+            .is_some_and(|up| {
+                crate::guest::shares::on_a_macs_share(up, |tag| tag == forward::HOME_TAG)
+            })
     };
     if !root || on_the_home() {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -1015,21 +1017,6 @@ fn output_dir(dest: &Path, root: bool) -> Result<std::os::fd::OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The Mac's shared home is told by its mount's ID, type and tag: the
-    /// share (`virtiofs` tagged `home`) is; another mount's ID, another
-    /// virtiofs tag, and a FUSE mount of a user's aren't.
-    #[test]
-    fn the_macs_home_is_told_by_its_mount() {
-        let mountinfo = "22 1 0:20 / / rw - rootfs rootfs rw\n\
-                         31 22 0:27 / /Users/me rw,nosuid,nodev - virtiofs home rw\n\
-                         32 22 0:28 / /mnt/x rw - virtiofs other rw\n\
-                         33 22 0:29 / /home/u/s rw,nosuid,nodev shared:5 - fuse.sshfs u@h:/ rw\n";
-        assert!(is_the_home_share(mountinfo, 31));
-        for other in [22, 32, 33, 99] {
-            assert!(!is_the_home_share(mountinfo, other), "{other}");
-        }
-    }
 
     /// A repository's Dockerfile is read only from inside the context, or
     /// `-f`'s own directory: a link inside (`Dockerfile ->

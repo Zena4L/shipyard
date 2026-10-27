@@ -8,6 +8,13 @@
 //! BuildKit v0.34.1: the frontend asks for a context by the name as Docker
 //! shows it, `:latest` left off, so `FROM localbase:1` and `FROM
 //! docker.io/library/localbase:1` find the same one.
+//!
+//! Each is given for its own platform alone (`context:NAME::linux/arm64`,
+//! 13.8c): BuildKit's frontend asks for a stage's base by the name and the
+//! stage's platform first, and takes the plain name for any platform after,
+//! so a plain one would put an arm64 image in a `FROM --platform=linux/amd64`
+//! stage. Another platform's stage finds none, and its base is pulled, as
+//! Docker's builder does.
 
 use std::path::Path;
 
@@ -30,8 +37,28 @@ pub(super) struct Local {
     pub(super) keys: Vec<String>,
     /// Its manifest's digest.
     pub(super) manifest: String,
-    /// Every blob it is: its manifest, config and layers.
+    /// Every blob it is: its manifest, its config (second: what the build
+    /// reads its platform from), then its layers.
     pub(super) blobs: Vec<String>,
+    /// Its platform as BuildKit's frontend names a stage's
+    /// ([`buildkit_platform`]), read from its config: `None` until it's
+    /// been read, and then it's given to no stage.
+    pub(super) platform: Option<String>,
+}
+
+/// `platform` as BuildKit's frontend writes a stage's in a named context's
+/// key (containerd's `FormatAll(Normalize(…))`): `os/architecture`, and a
+/// variant only past its architecture's baseline (`arm64`'s `v8` and
+/// `amd64`'s `v1` are left off).
+pub(super) fn buildkit_platform(platform: &shipyard_image::Platform) -> String {
+    let baseline = matches!(
+        (platform.architecture.as_str(), platform.variant.as_deref()),
+        ("arm64", Some("v8")) | ("amd64", Some("v1"))
+    );
+    match platform.variant.as_deref().filter(|_| !baseline) {
+        Some(variant) => format!("{}/{}/{variant}", platform.os, platform.architecture),
+        None => format!("{}/{}", platform.os, platform.architecture),
+    }
 }
 
 /// The images of `images` (the store's) that a build of `dockerfile`, with
@@ -90,6 +117,7 @@ pub(super) fn wanted(
             keys,
             manifest: record.manifest.clone(),
             blobs,
+            platform: None,
         });
     }
     found
@@ -284,22 +312,31 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// `buildctl`'s arguments for the images `laid` out in the layout at
-/// `layout` (the builder's path): the layout once, then a context a name.
+/// `layout` (the builder's path): the layout once, then a context a name,
+/// for the image's own platform alone (one whose platform wasn't read is
+/// given to no stage).
 pub(super) fn buildctl_args(laid: &[Local], layout: &str) -> Vec<String> {
-    if laid.is_empty() {
-        return Vec::new();
-    }
-    let mut args = vec!["--oci-layout".to_owned(), format!("{LAYOUT_NAME}={layout}")];
+    let mut args = Vec::new();
     for image in laid {
+        let Some(platform) = &image.platform else {
+            continue;
+        };
         for key in &image.keys {
             args.push("--opt".to_owned());
             args.push(format!(
-                "context:{key}=oci-layout://{LAYOUT_NAME}@{}",
+                "context:{key}::{platform}=oci-layout://{LAYOUT_NAME}@{}",
                 image.manifest
             ));
         }
     }
-    args
+    if args.is_empty() {
+        return args;
+    }
+    [
+        vec!["--oci-layout".to_owned(), format!("{LAYOUT_NAME}={layout}")],
+        args,
+    ]
+    .concat()
 }
 
 #[cfg(test)]

@@ -50,8 +50,8 @@ pub use images::{
 // index); its other types are re-exported.
 pub use index::{DiskUsage, ImageRecord, IndexError, ListedImage};
 pub use manifest::{
-    Descriptor, ImageAbout, ImageConfig, ImageHealthcheck, ImageManifest, Index, ManifestError,
-    Platform, RuntimeConfig,
+    AnyPlatform, Descriptor, ImageAbout, ImageConfig, ImageHealthcheck, ImageManifest, Index,
+    ManifestError, Platform, PlatformChoice, RuntimeConfig,
 };
 pub use pull::{PullError, PullOptions, Pulled, from_store, from_store_by_digest, pull};
 pub use push::{PushError, PushEvent, Pushed, ToPush};

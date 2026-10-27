@@ -110,7 +110,7 @@ fn say_it(lost: &shipyard_network::pasta::Lost, said: &NetworkLost) {
     // places (its image store, runtime root) would be root's.
     let engine = crate::Engine::new(
         crate::Paths::from_env().with_containers(containers),
-        std::sync::Arc::new(Quiet),
+        std::sync::Arc::new(crate::report::Quiet),
     );
     let Ok(id) = crate::containers::ContainerId::parse(id) else {
         return;
@@ -122,15 +122,6 @@ fn say_it(lost: &shipyard_network::pasta::Lost, said: &NetworkLost) {
             &crate::events::container(&record, "network_lost").with("how", &said.how),
         );
     }
-}
-
-/// A reporter that says nothing: the launcher's output is pasta's log.
-#[cfg(target_os = "linux")]
-struct Quiet;
-
-#[cfg(target_os = "linux")]
-impl crate::report::Reporter for Quiet {
-    fn report(&self, _event: crate::report::Message) {}
 }
 
 #[cfg(test)]

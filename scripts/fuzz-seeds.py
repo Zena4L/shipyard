@@ -273,6 +273,19 @@ ATTACH_FRAMES = {
 }
 
 
+def datagram(peer, payload):
+    return peer.to_bytes(4, "big") + len(payload).to_bytes(2, "big") + payload
+
+
+# A forwarded UDP port's stream (step 13.5a): datagrams tagged with their
+# Mac peer's ID; an empty one, two peers, a frame cut short.
+UDP_FRAMES = {
+    "one": datagram(1, b"ping\n"),
+    "two-peers": datagram(1, b"a") + datagram(7, b"") + datagram(2**32 - 1, b"b" * 300),
+    "cut": datagram(3, b"whole") + datagram(4, b"cut short")[:8],
+}
+
+
 def write(directory, name, data):
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, name), "wb") as out:
@@ -496,6 +509,11 @@ def main():
     write(f"{root}/logs_dir", "torn", log[: len(log) // 2] + log)
     for name, frames in ATTACH_FRAMES.items():
         write(f"{root}/attach_frames", name, frames)
+    # The target's first byte is the size of the pieces an `Inbox` is fed
+    # (13.8c): a byte at a time, a few, and all at once.
+    for name, frames in UDP_FRAMES.items():
+        for piece in (1, 5, 255):
+            write(f"{root}/udp_frames", f"{name}-{piece}", bytes([piece]) + frames)
     for name, process in PROCESS_JSON.items():
         write(f"{root}/process_json", name, json.dumps(process).encode())
     for name, request in API_REQUESTS.items():

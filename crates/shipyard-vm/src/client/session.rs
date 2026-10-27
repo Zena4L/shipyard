@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use shipyard_runtime::attach::Frame;
 use shipyard_runtime::attach::client::{self, Act, AttachError, AttachOptions, Ended};
-use shipyard_runtime::attach::forward::{self, Connection};
+use shipyard_runtime::attach::forward::{self, Connection, Request};
 use shipyard_runtime::process::SignalWatch;
 
 use crate::{VmError, VmPaths};
@@ -28,7 +28,7 @@ pub(super) type Writer = std::sync::Arc<std::sync::Mutex<UnixStream>>;
 pub(super) fn on_terminal(
     paths: &VmPaths,
     stream: UnixStream,
-    hello: &Frame,
+    (hello, internal): (&Frame, bool),
     input: bool,
     watch: &mut Option<SignalWatch>,
 ) -> Result<Outcome, Tried> {
@@ -38,22 +38,36 @@ pub(super) fn on_terminal(
         held: false,
         output: client::Output::BOTH,
     };
-    let welcomed = match client::welcomed_with(stream, hello, &options) {
+    let mut welcomed = match client::welcomed_with(stream, hello, &options) {
         Ok(welcomed) => welcomed,
         Err(error) => {
             return Err(match refusal_of(&error) {
                 Some(forward::Refusal::Stopping) => stopping(paths),
                 Some(forward::Refusal::NotReady) => Tried::NotReady,
-                _ => session_error(error).into(),
+                // Another build's guest, or a newer peer's code: its words
+                // (F167: what to do said).
+                Some(refusal) => VmError::Refused(refusal.to_string()).into(),
+                None => session_error(error).into(),
             });
         }
     };
+    // Its control connection opened before any signal is passed on (F94).
+    // (None for one of the host's own asks, typed by hand: the agent gives
+    // those none.)
+    let token = if internal {
+        None
+    } else {
+        welcomed.session_token().map_err(session_error)?
+    };
+    if let Some(control) = token.and_then(|token| open_control(paths, token)) {
+        welcomed = welcomed.with_control(control);
+    }
     let Some(watch) = watch.take() else {
         return Err(VmError::Host("no signal watch left".to_owned()).into());
     };
     let mut leaving = Leaving::default();
     let mut left = None;
-    let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let over = std::sync::Arc::new(std::sync::Mutex::new(false));
     let mut decide = |signal: shipyard_runtime::process::Signal| {
         let (raw, now) = (signal.as_raw(), Instant::now());
         let grace_was_on = leaving.terminated_at.is_some();
@@ -68,8 +82,11 @@ pub(super) fn on_terminal(
     };
     let ended = welcomed.session_signalled(&watch, &mut decide);
     // No wake-up from here: the session's watch, its handlers, are going,
-    // and a SIGTERM would end this process.
-    over.store(true, std::sync::atomic::Ordering::SeqCst);
+    // and a SIGTERM would end this process. (Under the lock the wake-up
+    // raises in: one under way has been taken by the watch by now.)
+    *over
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
     let ended = ended.map_err(session_error)?;
     Ok(match ended {
         Ended::Exited(code) => Outcome::Exited(code),
@@ -124,14 +141,46 @@ fn session_error(error: AttachError) -> VmError {
 /// After [`TERM_GRACE`], a SIGTERM to this process: the wake-up the
 /// terminal's session (which sees only signals) needs to find the grace
 /// over, and leave with its terminal set back. None once the session is
-/// `over`.
-fn wake_at_grace_end(over: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+/// `over`: looked at and raised under its lock, so the session can't end
+/// and its handlers go between the two (F109: a 143 at the grace's end).
+fn wake_at_grace_end(over: std::sync::Arc<std::sync::Mutex<bool>>) {
     std::thread::spawn(move || {
         std::thread::sleep(TERM_GRACE);
-        if !over.load(std::sync::atomic::Ordering::SeqCst) {
+        let over = over
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*over {
+            // (`raise` runs the watch's handler on this thread before it
+            // returns.)
             let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM);
         }
+        drop(over);
     });
+}
+
+/// How long the guest may take to welcome a control connection.
+const CONTROL_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The control connection of the forwarded command `token` names (F94):
+/// a second connection through the host, welcomed by the agent, for the
+/// command's signals and resizes (the agent reads them on a thread of their
+/// own, whatever the command's input waits on). `None` if it can't be had
+/// (the command's signals then go among its input, as before).
+pub(super) fn open_control(paths: &VmPaths, token: u128) -> Option<UnixStream> {
+    let mut stream = UnixStream::connect(paths.socket()).ok()?;
+    stream.set_read_timeout(Some(CONTROL_OPEN_WAIT)).ok()?;
+    let text = forward::session_token_text(token);
+    let hello = forward::hello(&Request::internal(&[forward::CONTROL_REQUEST, &text])).ok()?;
+    forward::send(&mut stream, &hello).ok()?;
+    let mut connection = Connection::new(stream);
+    if !matches!(connection.next_frame(), Ok(Some(Frame::Welcome { .. }))) {
+        return None;
+    }
+    let control = connection.into_parts().0;
+    // A few bytes a frame, read at once on the other side: one that waits
+    // is a control gone wrong, and the frames go in-band then.
+    control.set_write_timeout(Some(CONTROL_OPEN_WAIT)).ok()?;
+    Some(control)
 }
 
 /// What the guest sends, to this process's stdout and stderr, until the
@@ -159,7 +208,7 @@ pub(super) fn relay(
             Some(Frame::Stderr(bytes)) if stderr_open => {
                 stderr_open = write_out(&mut std::io::stderr(), &bytes).is_ok();
             }
-            Some(Frame::Welcome { .. } | Frame::Stderr(_)) => {}
+            Some(Frame::Welcome { .. } | Frame::Stderr(_) | Frame::Session(_)) => {}
             Some(Frame::Exited(code)) => return Ok(Outcome::Exited(code)),
             // A refusal of any kind, a newer peer's too: its words.
             Some(frame) if let Some(refusal) = forward::Refusal::of(&frame) => {
@@ -277,8 +326,10 @@ pub fn linux_number(signal: i32) -> Option<u8> {
 /// that owns the watch for as long as this process runs (its handlers stay
 /// till the process ends: the forwarding is the process's last work). The
 /// way out: a third Ctrl-C ends this process at once (130), and so does a
-/// SIGTERM the command hasn't ended by within [`TERM_GRACE`] (143).
-pub(super) fn pass_signals(watch: SignalWatch, writer: &Writer) {
+/// SIGTERM the command hasn't ended by within [`TERM_GRACE`] (143). They
+/// go on `control` (the command's control connection, F94) while it takes
+/// them, else on `writer`, among the input.
+pub(super) fn pass_signals(watch: SignalWatch, writer: &Writer, mut control: Option<Writer>) {
     let writer = std::sync::Arc::clone(writer);
     std::thread::spawn(move || {
         let mut leaving = Leaving::default();
@@ -302,7 +353,14 @@ pub(super) fn pass_signals(watch: SignalWatch, writer: &Writer) {
                 let Some(number) = linux_number(raw) else {
                     continue;
                 };
-                if send(&writer, &Frame::Signal(number)).is_err() {
+                let frame = Frame::Signal(number);
+                if let Some(theirs) = &control
+                    && send(theirs, &frame).is_ok()
+                {
+                    continue;
+                }
+                control = None;
+                if send(&writer, &frame).is_err() {
                     return;
                 }
             }

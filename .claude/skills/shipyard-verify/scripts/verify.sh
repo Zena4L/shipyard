@@ -63,6 +63,12 @@ if [ "$mode" != --linux ] && [ "$mode" != --vm ]; then
     run "fuzz-only code (--cfg fuzzing)" "$logs/cfg-fuzzing.log" \
         env RUSTFLAGS="--cfg fuzzing" CARGO_TARGET_DIR=target/cfg-fuzzing \
         cargo check --workspace
+    # A Mac's signing (step 13.7): one identity across builds, in a throwaway
+    # keychain; the minimum macOS. (Off a Mac there's nothing to sign.)
+    if [ "$(uname)" = Darwin ]; then
+        run "signing (macOS)" "$logs/sign.log" bash -c \
+            'cargo build -p shipyard-cli --bins && scripts/macos/test-sign.sh target/debug/shipyard target/debug/shipyard-runtime'
+    fi
 fi
 
 if [ "$mode" = --all ] || [ "$mode" = --linux ]; then

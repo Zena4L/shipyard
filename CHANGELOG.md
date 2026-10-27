@@ -5,6 +5,170 @@ All notable changes to Shipyard. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change
 behaviour; each change is listed here).
 
+## 0.5.0 - unreleased
+
+### Added
+
+- **The Mac's VM takes its size from the Mac** (step 13.2): a quarter of its memory (4 to
+  16 GiB) and half its cores (at most 8), instead of a fixed 4 GiB and 4 CPUs;
+  `shipyard vm set --memory SIZE --cpus N` (or `default`) changes them for every start
+  after, and `vm status` says what a start takes.
+- **The VM gives freed disk space back to the Mac at each stop** (F103): its sparse
+  `data.img` shrinks after a prune; `doctor` says what the disk takes and warns when the
+  Mac runs short of free space.
+- **A VM whose Linux hangs or reboots in place is stopped** (F90): the host asks for its
+  boot ID every 10 seconds; the console log is capped at 4 MiB while it runs.
+
+- **One signing identity across rebuilds on a Mac** (step 13.7, D13-3, F140):
+  `scripts/macos/make-signing-identity.sh` makes a local code-signing identity (only
+  its own key's access changed in your keychain), and
+  `sign.sh` signs every build with it (without the hardened runtime, so a debugger
+  attaches; a release's Developer ID signing has it), so macOS asks once,
+  not after each rebuild, before a VM launchd started reads your guarded folders;
+  `doctor` says how `shipyard` is signed. `scripts/macos/notarize.sh` does a release's
+  Developer ID signing and notarization (not run until a release). Builds target
+  macOS 13, and the VM refuses an older macOS by name.
+- **The VM can start at login for containers that come back** (step 13.6b2, F106):
+  `shipyard vm install --at-login` boots it as you log in only when containers with a
+  restart policy would come back (the guest says how many as it runs; `vm status` says
+  it too), and it stops by itself once none runs.
+- **amd64 images on a Mac, through Rosetta** (step 13.3, D13-2): the VM shares the
+  Mac's Rosetta for Linux and registers it at boot, so `linux/amd64` images run; one with
+  no arm64 build is pulled as amd64, with a warning; `--platform` on `pull`, `run`,
+  `create` and `build` (and the API's `platform`) asks for a platform, refused where it
+  doesn't run. `doctor` says Rosetta's state, on the Mac and in the VM.
+- **The Mac's VM shares Docker Desktop's places** (step 13.4, D13.4-1): `/Volumes`,
+  `/tmp` and `/var/folders` beside the home, each at its own path, so a project in
+  `/tmp` or on an external drive binds as it does in the home. `doctor` lists them and
+  says which of the folders macOS guards (Desktop, Documents, Downloads) the VM may
+  read; a refusal for one names the permission (F105, F140).
+
+- **UDP ports reach the Mac** (step 13.5a, F96): a container's `-p …/udp` port answers on
+  the Mac's `127.0.0.1` and `::1`, every program's datagrams told apart and answered
+  back to it; `vm status` and `doctor` list them. The VM reaches each container at its
+  own address for a forwarded port, TCP's too, not through its port rules (F97).
+
+- **The Mac says when another program shadows a forwarded port** (step 13.5b, F98):
+  `vm status` and `doctor` name a port another Mac program holds on every address,
+  which `localhost` doesn't reach (the container does).
+
+### Security
+
+- **The VM's agent port can't be taken** (F108): the VM's init holds it from boot to
+  stop and hands it to each agent it starts, so no container that can open vsock sockets
+  takes it while the agent restarts; a command that waited past a minute for it is
+  refused, not run late. `doctor` checks no command holds it.
+- **Published ports don't answer on the VM's own network address** (F108): the guest's
+  firewall (ruleset 9, an `outside` set) refuses what reaches them from its link to the
+  Mac's virtual network, so other VMs there don't.
+- **A bind in a Mac's share is bound from the share itself** (step 13.8c, F173a): its
+  source is judged once more as the container starts, then reached from the share without
+  following any link and bound by descriptor, so a container that writes in the share can
+  no longer swap in a link, after the check, that binds the VM's own files into another
+  container. A link put there makes the start fail instead.
+
+### Changed
+
+- **A bind source Shipyard made is refused, not followed, once its directory has become a
+  symbolic link** (step 13.8c): each start reaches the directory it was made in without
+  following a link at its end (one higher up is followed, as before); a container whose
+  directory was swapped for a link since its create fails to start, saying so. A source
+  Shipyard made, or one bound by descriptor, is a directory or a regular file, never a
+  device, a FIFO or a socket put in its place.
+- **A bind outside what the Mac shares is refused, through Docker's API too** (F143):
+  `mounts denied: the path … isn't shared from the Mac`, as Docker Desktop says, where it
+  used to bind an empty directory made in the VM. So is a bind of the VM's own files or
+  of a socket. A container made before with such a bind keeps it; one whose source is
+  in a share is checked again at each start (a link in it may lead out since).
+- **The VM's `/tmp` is the Mac's**: what the guest itself writes there moved to its
+  `/run/tmp`.
+
+### Fixed
+
+- **A Mac's signals reach a command that doesn't read its input** (step 13.6a, F94):
+  a Ctrl-C, a `kill`, a hang-up or a resize used to wait behind input the command hadn't
+  read (`yes | shipyard run -i … sleep 1000`, a paste into a busy terminal); they go on a
+  connection of their own now (attach protocol 6).
+- **A VM started by another build is said** (F167, F173b): `vm status`, `doctor` and
+  each command say when the running VM booted another build's Linux than the one there
+  now, with what to do, and a request it can't read is refused with those words, not
+  "a request of version 3, newer than this guest's 2".
+- **A Docker client's hang-up on the Mac reaches the right connection** (F155): it's
+  named by a token, not by a port another connection may have taken.
+- **A Mac command whose command ends just as the 10 s after a SIGTERM run out** exits
+  with the command's code, not 143 (F109); and a connection whose other side still sends isn't cut a minute after one
+  side has finished (the wait counts from the last byte, 10 minutes at most).
+- **`vm stop` asks the VM's host, never a PID** (step 13.6b1, F93): on the host's own
+  socket (`host.sock`), there from its start; a stop sent while the VM starts succeeds
+  (taken once it's up: a disk check is never cut), where it used to report a failure.
+  The stop signals can no longer end the host before its stop runs.
+- **A slow start is waited for by the host's own word** (F100, F144): a first command
+  that gives up never stops a VM that's still booting in time or already up, and never
+  signals a PID; a launchd start whose run count couldn't be read sees its host's
+  failure at once.
+- **The VM's host keeps its own log short** (F106): a second command no longer moves
+  a running host's log aside, so the reason a start failed is where it's looked for;
+  `vm status` and `doctor` say when the running VM shares another home or guest
+  directory. launchd now gives the host about 15 minutes to stop at a logout (a disk check
+  under way, then its containers).
+- **A foreground `run -i` whose container ended with input still queued** could lose
+  the container's exit code ("the container's monitor is gone", 125): what the monitor
+  said before it closed is now read.
+- **The VM's host serves every connection blocking** (F147): one accepted from launchd's
+  socket after a start that failed could have been non-blocking, its copy ending early.
+- **The host's sockets share one budget** (F152): 1,024 connections in all, the
+  forwarded ports at most 768 of them, so a load on a published port never shuts out
+  `shipyard` or `docker`; `vm status` and `doctor` say when launchd's agent is installed
+  but not loaded (nothing serves `docker.sock` then); `system service` on a Mac points
+  at the VM's `docker.sock`.
+- **The VM asks its guest for ports less often while nothing runs** (F106): from every
+  2 s to every 10 s, at once again after any command.
+- **The VM's guest is built from exactly the packages it was pinned to** (F92): every
+  Alpine package it installs, dependencies too, is checked against
+  `scripts/guest/alpine.installed`, so two builds of one lock can't differ.
+- **A `shipyard` built from the source tree finds its guest** (`target/guest`) without
+  `SHIPYARD_GUEST_DIR`; `vm install` checks the guest it records is there.
+- **A copy of the VM's directory run as a second VM** shared the first's network address,
+  and the two clashed on the Mac's network (F138): each directory's card has its own
+  (`network.json` v2; an older `shipyard` refuses it: remove it, and that one makes a new
+  address).
+- **A UDP port that streams to a Mac client no longer holds `vm stop`** (step 13.8c): the
+  relay took the guest's answers for as long as any was waiting, so a container that never
+  paused kept the stop (and the idle stop) waiting for good.
+- **Heavy UDP traffic both ways no longer resets a forwarded port's stream** (step 13.8c):
+  each side of it waited to write while the other did the same, then broke the stream off
+  after a second, and every client's source port changed. Neither side waits now; a
+  datagram with no room is dropped, as UDP drops it.
+- **A Mac killed during the VM's first boot can't leave a half-made disk** (step 13.8c):
+  the new disk was kept as `data.img` once the guest's agent answered, while the guest was
+  still formatting it; it's kept once the guest is ready, so a first boot cut short starts
+  over with a new disk instead of one every later boot refuses.
+- **A build's `FROM --platform=` stage no longer gets the store's image of another
+  platform** (step 13.8c): the store's images are given to BuildKit for their own platform
+  alone, so a stage of another platform pulls its base, as Docker's builder does.
+- **`save`, and `cp` from a stopped container, read an image of any platform** (step
+  13.8c): an amd64 image could no longer be saved, or copied out of, once the VM had lost
+  Rosetta.
+
+### Known limitations
+
+- **The VM keeps the memory it was given** (F168): a balloon was tried, and macOS took
+  nothing back; `vm set --memory` sizes it instead.
+- **Small files on a share are slower than OrbStack's** (F172): about 3.6 times when
+  writing many, on par for reads and large files; nothing in Virtualization.framework's
+  virtiofs to tune.
+- **No installer yet** (F178): the guest is built from the source tree, which a `shipyard`
+  built there finds by itself; an installed binary needs `SHIPYARD_GUEST_DIR`.
+- **A bind of Docker's socket is refused on a Mac** (F171): Testcontainers' Ryuk needs
+  `TESTCONTAINERS_RYUK_DISABLED=true` there for now.
+- **A build's context must be in your home on a Mac** (F181): one in `/tmp`,
+  `$TMPDIR` or `/Volumes` is refused as one the builder can't enter.
+- **Upgrading from 0.4 on a Mac** takes a `vm stop`, a guest built again and, if it was
+  installed, `vm install` again ([macOS](docs/user/macos.md#upgrading-from-04)): `vm
+  status` and `doctor` say when the running VM or launchd's agent is the older build's,
+  and an older guest refuses a command naming `/tmp` or `/Volumes` rather than bind a
+  directory of its own.
+
 ## 0.4.0 - unreleased
 
 ### Added

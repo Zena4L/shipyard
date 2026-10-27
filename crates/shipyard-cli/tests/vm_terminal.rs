@@ -271,6 +271,49 @@ mod mac {
         session.finish();
     }
 
+    /// Step 13.6a (F94): a SIGTERM to this `shipyard` reaches a terminal's
+    /// command whose input is stuck behind a paste it never reads (typed
+    /// until nothing more is taken: every buffer on the way full): it goes
+    /// on the command's control connection, not behind the paste.
+    fn a_signal_passes_a_paste_the_command_never_reads(vm: &Vm) {
+        let mut session = session(vm, |shell| {
+            let job = shell.spawn(
+                Mode::Foreground,
+                &[
+                    "run",
+                    "--rm",
+                    "-it",
+                    "--name",
+                    "pty-paste",
+                    IMAGE,
+                    "sh",
+                    "-c",
+                    "trap 'exit 42' TERM; echo re''ady; sleep 600 & wait",
+                ],
+            );
+            shell.wait(job);
+        });
+        let job = session.job();
+        session.expect("ready");
+        let line = [vec![b'x'; 79], vec![b'\r']].concat();
+        let taken =
+            session.type_until_stuck(&line, Duration::from_secs(3), Duration::from_secs(60));
+        println!("({taken} bytes taken before the input stuck)");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(job),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        assert_eq!(
+            session.status(),
+            Status::Exited(42),
+            "{}",
+            session.transcript()
+        );
+        session.finish();
+        gone(vm, "pty-paste");
+    }
+
     pub(super) fn main() -> ExitCode {
         let tests: &[Test] = &[
             (
@@ -296,6 +339,10 @@ mod mac {
             (
                 "a_plain_command_on_a_terminal_gets_one",
                 a_plain_command_on_a_terminal_gets_one,
+            ),
+            (
+                "a_signal_passes_a_paste_the_command_never_reads",
+                a_signal_passes_a_paste_the_command_never_reads,
             ),
         ];
         if std::env::args().any(|arg| arg == "--list") {

@@ -24,6 +24,8 @@
 
 #[cfg(target_os = "linux")]
 mod agent;
+#[cfg(target_os = "linux")]
+mod control;
 #[cfg_attr(
     not(target_os = "linux"),
     allow(
@@ -34,10 +36,16 @@ mod agent;
 mod disk;
 #[cfg(target_os = "linux")]
 mod doctor;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the guest's; tested everywhere")
+)]
+mod forwarded;
 #[cfg(target_os = "linux")]
 mod init;
 #[cfg(target_os = "linux")]
 mod ports;
+pub mod shares;
 
 /// The argument that makes this binary the guest's init.
 #[cfg(target_os = "linux")]
@@ -47,8 +55,13 @@ const INIT_ARG: &str = "__guest-init";
 /// disk checked, repaired if need be, and mounted; the home shared): until
 /// then, the agent, started first, refuses every request at once (D10.4-3:
 /// a long repair never runs against a bound, nor is cut short by one).
-#[cfg(target_os = "linux")]
+/// Also what tells the guest from a host where `/proc` can't be read.
 const READY: &str = "/run/shipyard-guest-ready";
+
+/// The guest's own temporary files (`TMPDIR` for everything its PID 1
+/// starts): in its memory, as `/tmp` is the Mac's (step 13.4).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "the guest's"))]
+const GUEST_TMP: &str = "/run/tmp";
 
 /// The argument that makes this binary the guest's agent.
 #[cfg(target_os = "linux")]
@@ -119,6 +132,46 @@ fn kernel_cmdline_unmounted() -> Option<String> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok();
     let _ = umount("/proc");
     cmdline
+}
+
+/// The home the kernel's command line names: an absolute path, nothing
+/// that steps out of it.
+fn home_of(cmdline: &str) -> Option<&str> {
+    let home = cmdline
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix(shipyard_runtime::attach::forward::HOME_KEY))?;
+    (home.starts_with('/') && never_climbs(home)).then_some(home)
+}
+
+/// Whether `place` is an absolute path, not `/`, that never climbs: one
+/// the guest mounts a share at.
+fn is_plain_place(place: &str) -> bool {
+    place.starts_with('/') && place != "/" && never_climbs(place)
+}
+
+/// Whether `path` has no `..` in it.
+fn never_climbs(path: &str) -> bool {
+    !path.split('/').any(|part| part == "..")
+}
+
+/// Whether this process runs in Shipyard's own VM (its kernel's command
+/// line says so, [`in_the_guest`]).
+///
+/// # Errors
+///
+/// [`ErrorKind::Storage`](crate::ErrorKind::Storage) if the command line
+/// can't be read where it should be (the guest's ready mark there): never
+/// taken for "not the guest".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "the guest's"))]
+pub(crate) fn booted_by_shipyard() -> crate::error::Result<bool> {
+    match std::fs::read_to_string("/proc/cmdline") {
+        Ok(cmdline) => Ok(in_the_guest(0, &cmdline, false)),
+        Err(error) if std::path::Path::new(READY).exists() => Err(crate::Error::new(
+            crate::ErrorKind::Storage,
+            format!("the guest's command line can't be read: {error}"),
+        )),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Whether a process `pid` under a kernel booted with `cmdline` is in

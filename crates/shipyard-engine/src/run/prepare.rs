@@ -39,7 +39,10 @@ pub(crate) fn prepare_image(
     let prepared = crate::image::prepare(
         engine,
         reference,
-        planned.request.pull.unwrap_or(PullPolicy::Missing),
+        (
+            planned.request.pull.unwrap_or(PullPolicy::Missing),
+            planned.request.platform.clone(),
+        ),
         maps,
     )?;
     Ok(Some((
@@ -76,7 +79,15 @@ pub(crate) fn prepare_owned_image(
         .as_ref()
         .and_then(|isolation| isolation.id_maps.as_ref())
         .filter(|_| nix::unistd::geteuid().is_root());
-    let prepared = crate::image::prepare_owned(engine, id, owner, reference, image_id, maps)?;
+    let prepared = crate::image::prepare_owned(
+        engine,
+        id,
+        owner,
+        reference,
+        image_id,
+        maps,
+        &crate::image::platforms_here(),
+    )?;
     Ok(Some((
         ImageDefaults {
             root: prepared.root,

@@ -169,6 +169,9 @@ pub(super) fn stopped_view(
                 reference,
                 image_id,
                 maps,
+                // A view runs nothing: an image of any platform is read (an
+                // amd64 one where Rosetta was lost included).
+                &shipyard_image::AnyPlatform,
             )?;
             let mut root = shipyard_runtime::isolation::Root::new(prepared.root);
             root.overlay = Some(prepared.overlay);

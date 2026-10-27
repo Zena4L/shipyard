@@ -209,3 +209,28 @@ fn a_command_waits_for_a_guest_that_isnt_ready() {
     host.join().unwrap();
     let _ = std::fs::remove_dir_all(&paths.dir);
 }
+
+/// The host waited for is gone once stopped or replaced; one whose PID
+/// isn't known yet, or that's the same, isn't.
+#[test]
+fn a_host_is_gone_once_stopped_or_replaced() {
+    use super::{Status, gone_or_replaced};
+    assert!(gone_or_replaced(Status::Stopped, Some(7)));
+    assert!(gone_or_replaced(Status::Stopped, None));
+    assert!(
+        gone_or_replaced(Status::Running(Some(8)), Some(7)),
+        "another host"
+    );
+    assert!(
+        !gone_or_replaced(Status::Running(Some(7)), Some(7)),
+        "the same"
+    );
+    assert!(
+        !gone_or_replaced(Status::Running(None), Some(7)),
+        "its PID not yet written"
+    );
+    assert!(
+        !gone_or_replaced(Status::Running(Some(8)), None),
+        "whose PID wasn't known"
+    );
+}

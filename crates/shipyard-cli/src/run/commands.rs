@@ -36,6 +36,7 @@ pub(crate) fn run_command(command: RunCommand) -> Result<ExitCode> {
         Ok(request) => request,
         Err(code) => return Ok(code),
     };
+    shipyard_engine::guest::shares::check_binds(&request.volume)?;
     let engine = engine(quiet);
     let detached = shipyard_engine::run::detached(&engine, request, command.rm)?;
     writeln!(std::io::stdout().lock(), "{}", detached.id.as_str())?;
@@ -51,6 +52,7 @@ pub(crate) fn create(command: CreateCommand) -> Result<ExitCode> {
         Ok(request) => request,
         Err(code) => return Ok(code),
     };
+    shipyard_engine::guest::shares::check_binds(&request.volume)?;
     let engine = engine(quiet);
     let record = shipyard_engine::run::create(&engine, request, command.rm)?;
     writeln!(std::io::stdout().lock(), "{}", record.id.as_str())?;
@@ -142,6 +144,8 @@ fn run(
         Ok(request) => request,
         Err(error) => return Ok(usage_error(error, "run")),
     };
+    // In the macOS guest, a bind only of what the Mac shares (step 13.4).
+    shipyard_engine::guest::shares::check_binds(&request.volume)?;
     // Its input attached (`-i`, no terminal): it ends at this run's end of
     // file, and at each later start's, as `docker run -i` makes it
     // (`StdinOnce`, kept with the container).

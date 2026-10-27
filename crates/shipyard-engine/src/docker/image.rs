@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 use shipyard_image::index::Index;
-use shipyard_image::{ImageReference, ListedImage, LockMode, Platform, Pulled, USE_WAIT};
+use shipyard_image::{ImageReference, ListedImage, LockMode, Pulled, USE_WAIT};
 
 use super::filters::ImageFilters;
 use super::{HealthConfig, ZERO_TIME};
@@ -412,7 +412,9 @@ fn read(store: &shipyard_image::Store, listed: &[ListedImage]) -> Result<Option<
     let Some(first) = references.first() else {
         return Ok(None);
     };
-    let pulled = shipyard_image::from_store(first, &Platform::host(), store)
+    // Any platform: a listing shows an image whatever runs here now (an amd64
+    // one on a VM that has lost Rosetta still takes its room).
+    let pulled = shipyard_image::from_store(first, &shipyard_image::AnyPlatform, store)
         .with_context(|| format!("reading {first} from the image store"))?;
     let tagged = listed
         .iter()

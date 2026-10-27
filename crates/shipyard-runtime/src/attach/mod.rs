@@ -60,7 +60,13 @@ fn coded(payload: &[u8]) -> Option<(u8, String)> {
 }
 
 /// The protocol's version: what [`Frame::Hello`] and [`Frame::Welcome`] carry.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = SESSION_VERSION;
+
+/// The first version whose forwarded commands are given a session token
+/// ([`Frame::Session`], step 13.6a, F94): a control connection of their
+/// own carries their signals, resizes and hang-up, never behind their
+/// input. A container's monitor sends none.
+pub const SESSION_VERSION: u32 = 6;
 
 /// The first version with control clients ([`Frame::HelloControl`]).
 pub const CONTROL_VERSION: u32 = 2;
@@ -89,6 +95,10 @@ pub enum Decline {
     /// The guest is still starting (its data disk checked): the client
     /// asks again.
     NotReady,
+    /// The guest is another build's, older than the client's (a request
+    /// newer than it reads: step 13.6a, F167): the VM is to be stopped,
+    /// and starts again as the client's build.
+    Newer,
     /// A reason this side doesn't know, by its number. 0 is never
     /// assigned.
     Other(u8),
@@ -101,6 +111,7 @@ impl Decline {
         match self {
             Self::Stopping => 1,
             Self::NotReady => 2,
+            Self::Newer => 3,
             Self::Other(code) => code,
         }
     }
@@ -111,6 +122,7 @@ impl Decline {
         match code {
             1 => Self::Stopping,
             2 => Self::NotReady,
+            3 => Self::Newer,
             other => Self::Other(other),
         }
     }
@@ -290,6 +302,11 @@ pub enum Frame {
     /// (a Ctrl-C, a kill), for the command; only a forwardable one
     /// ([`crate::process::is_forwardable`]) is passed on.
     Signal(u8),
+    /// The macOS guest's agent, right after its welcome of a forwarded
+    /// command or an API connection (to a client of [`SESSION_VERSION`]):
+    /// the token that names it, for a control connection
+    /// ([`forward::CONTROL_REQUEST`]) or a hang-up ([`forward::API_HANG_UP`]).
+    Session(u128),
     /// Client, first: a command to run, for the macOS guest's agent (step
     /// 10.3: the Mac CLI's commands, forwarded). A container's monitor
     /// never lets one in. Its request is a [`forward::Request`], encoded:
@@ -389,6 +406,7 @@ mod kind {
     pub(super) const DONE: u8 = 23;
     pub(super) const NOT_DONE: u8 = 24;
     pub(super) const DECLINED: u8 = 25;
+    pub(super) const SESSION: u8 = 26;
 }
 
 impl Frame {
@@ -436,6 +454,7 @@ impl Frame {
             Self::Hold { label } => put(out, kind::HOLD, truncated_to(label, MAX_LABEL)),
             Self::Release { label } => put(out, kind::RELEASE, truncated_to(label, MAX_LABEL)),
             Self::Signal(signal) => put(out, kind::SIGNAL, &[*signal]),
+            Self::Session(token) => put(out, kind::SESSION, &token.to_be_bytes()),
             Self::HelloRun { version, request } => {
                 // (A request past `forward::MAX_REQUEST` makes a frame too
                 // long to read: its encoder refuses one first.)
@@ -568,6 +587,10 @@ impl Frame {
             }
             kind::REFUSED => Self::Refused(text()?),
             kind::DECLINED => return Self::decode_declined(payload),
+            kind::SESSION => {
+                let token: [u8; 16] = payload.try_into().map_err(|_| malformed())?;
+                Self::Session(u128::from_be_bytes(token))
+            }
             kind::STDOUT => Self::Stdout(payload.to_vec()),
             kind::STDERR => Self::Stderr(payload.to_vec()),
             kind::STDIN_END if payload.is_empty() => Self::StdinEnd,
@@ -910,6 +933,7 @@ mod tests {
                 request: br#"{"version":1}"#.to_vec(),
             },
             Frame::Signal(2),
+            Frame::Session(u128::MAX - 7),
             Frame::Hold {
                 label: "lease:app".to_owned(),
             },
@@ -1163,6 +1187,8 @@ mod tests {
         assert_eq!(negotiate(2), Some(2));
         assert_eq!(negotiate(3), Some(HOLD_VERSION));
         assert_eq!(negotiate(4), Some(REASON_VERSION));
+        assert_eq!(negotiate(5), Some(DECLINE_VERSION));
+        assert_eq!(negotiate(6), Some(SESSION_VERSION));
         assert_eq!(negotiate(0), None);
         // Not all there yet: nothing, and no error.
         assert_eq!(decode(&[kind::STDOUT, 0, 0, 0, 9, 1]), Ok(None));

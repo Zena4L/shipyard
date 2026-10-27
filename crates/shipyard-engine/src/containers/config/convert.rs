@@ -121,6 +121,9 @@ impl Config {
             joined: _,
             // Another's IPC namespace is `created.json`'s (`ipc_from`).
             ipc: _,
+            // Settled at the create: the image is kept by its manifest's
+            // digest, which is the platform's own (step 13.3).
+            platform: _,
         } = request;
         // A check with nothing to run is refused at once, not at each start.
         if let Some(check) = health {
@@ -214,6 +217,7 @@ impl Config {
             container: None,
             joined: crate::run::Joined::default(),
             ipc: crate::run::IpcMode::Private,
+            platform: None,
             streams: RunStreams {
                 interactive: self.interactive,
                 tty: self.tty,

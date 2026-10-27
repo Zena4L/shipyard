@@ -40,13 +40,17 @@ pub(crate) fn list(args: &crate::cli::ImagesArgs) -> Result<ExitCode> {
 /// `shipyard pull IMAGE`: pulls it, then prints its digest.
 pub(crate) fn pull(
     reference: &str,
+    platform: Option<&str>,
     quiet: bool,
     handed: Option<shipyard_engine::image::GivenCredential>,
 ) -> Result<ExitCode> {
+    let platform = platform
+        .map(|asked| shipyard_engine::image::platform_here(asked, "pulled"))
+        .transpose()?;
     // A Mac's credential, if one was handed to its forwarded pull (step
     // 12.4); else Docker's config.
     let engine = engine_with(CliReporter { progress: !quiet });
-    let digest = shipyard_engine::image::pull_with(&engine, reference, handed)?.digest;
+    let digest = shipyard_engine::image::pull_with(&engine, reference, handed, platform)?.digest;
     let mut out = std::io::stdout().lock();
     if quiet {
         writeln!(out, "{digest}")?;

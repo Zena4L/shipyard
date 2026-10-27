@@ -160,6 +160,17 @@ impl RunArgs {
         request.image = image;
         request.entrypoint = self.entrypoint;
         request.pull = self.pull.map(Into::into);
+        request.platform = self
+            .platform
+            .as_deref()
+            .map(|asked| shipyard_engine::image::platform_here(asked, "run"))
+            .transpose()
+            .map_err(|error| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("{error}\n"),
+                )
+            })?;
         request.read_only = self.read_only;
         request.cap_add = self.cap_add;
         request.cap_drop = self.cap_drop;

@@ -52,8 +52,13 @@ fn the_ruleset_installs_is_current_and_is_rebuilt() {
     in_new_netns(|| {
         let mut nft = Nftables::new().unwrap();
         assert_eq!(nft.ruleset().unwrap(), Ruleset::Missing);
-        nft.install(&[bridge()], &[port(8080, None)], &ClosedRouting::default())
-            .unwrap();
+        nft.install(
+            &[bridge()],
+            &[port(8080, None)],
+            &ClosedRouting::default(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(nft.ruleset().unwrap(), Ruleset::Current);
         // Every base chain is there, accepting by default.
         let ours: Vec<_> = nft
@@ -86,7 +91,7 @@ fn the_ruleset_installs_is_current_and_is_rebuilt() {
             )
             .unwrap();
         assert_eq!(nft.ruleset().unwrap(), Ruleset::Outdated);
-        nft.install(&[bridge()], &[], &ClosedRouting::default())
+        nft.install(&[bridge()], &[], &ClosedRouting::default(), &[])
             .unwrap();
         assert_eq!(nft.ruleset().unwrap(), Ruleset::Current);
         assert!(nft.elements(set::PORTS).unwrap().is_empty());
@@ -103,11 +108,11 @@ fn many_ports_install_with_the_table_or_after_it() {
         for (count, one_batch) in [(1000, true), (4000, false)] {
             let ports: Vec<PortRule> = (0..count).map(|n| port(1000 + n, None)).collect();
             // (Without the second round's `delete_table`: a few bytes.)
-            let table = super::ruleset::install(&[bridge()], &[], &ClosedRouting::default());
+            let table = super::ruleset::install(&[bridge()], &[], &ClosedRouting::default(), &[]);
             let (_, more) =
                 super::ruleset::fit_ports(table, super::ruleset::port_items(&ports, false));
             assert_eq!(more.is_empty(), one_batch, "{count} ports");
-            nft.install(&[bridge()], &ports, &ClosedRouting::default())
+            nft.install(&[bridge()], &ports, &ClosedRouting::default(), &[])
                 .unwrap();
             assert_eq!(nft.elements(set::PORTS).unwrap().len(), usize::from(count));
         }
@@ -130,6 +135,7 @@ fn a_refused_port_leaves_the_table_installed() {
             &[bridge()],
             &[port(8080, None), clash],
             &ClosedRouting::default(),
+            &[],
         );
         assert!(refused.is_err());
         assert_eq!(nft.ruleset().unwrap(), Ruleset::Current);
@@ -142,7 +148,8 @@ fn a_refused_port_leaves_the_table_installed() {
 fn networks_and_ports_come_and_go() {
     in_new_netns(|| {
         let mut nft = Nftables::new().unwrap();
-        nft.install(&[], &[], &ClosedRouting::default()).unwrap();
+        nft.install(&[], &[], &ClosedRouting::default(), &[])
+            .unwrap();
         let internal = NetworkRules {
             bridge: "shy-internal".into(),
             subnet: "10.89.0.0/24".parse().unwrap(),
@@ -209,6 +216,7 @@ fn ipv6_ports_are_published_and_unpublished() {
                 families: vec![crate::Family::V6],
                 interfaces: vec!["eth0".into()],
             },
+            &[],
         )
         .unwrap();
         assert_eq!(nft.elements(set::CLOSED).unwrap().len(), 1);
@@ -236,7 +244,8 @@ fn ipv6_ports_are_published_and_unpublished() {
 fn adjacent_subnets_and_closed_routing() {
     in_new_netns(|| {
         let mut nft = Nftables::new().unwrap();
-        nft.install(&[], &[], &ClosedRouting::default()).unwrap();
+        nft.install(&[], &[], &ClosedRouting::default(), &[])
+            .unwrap();
         // 10.88.0.0/16 ends where 10.89.0.0/24 starts.
         nft.add_network(&bridge()).unwrap();
         nft.add_network(&NetworkRules {
@@ -264,6 +273,7 @@ fn adjacent_subnets_and_closed_routing() {
                 families: vec![crate::Family::V4],
                 interfaces: uplinks.to_vec(),
             },
+            &[],
         )
         .unwrap();
         assert_eq!(nft.elements(set::CLOSED).unwrap().len(), 1);
@@ -336,6 +346,7 @@ fn install_everything(nft: &mut Nftables) -> Vec<PortRule> {
             families: vec![crate::Family::V4, crate::Family::V6],
             interfaces: vec!["eth0".to_owned()],
         },
+        &[],
     )
     .unwrap();
     ports

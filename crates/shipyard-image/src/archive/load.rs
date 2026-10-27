@@ -31,7 +31,7 @@ use serde_json::Value;
 use super::staging::Staging;
 use super::{ArchiveError, CONTAINERD_NAME, OCI_REF_NAME};
 use crate::digest::Digest;
-use crate::manifest::{ImageConfig, ImageManifest, Index, Platform, media_type};
+use crate::manifest::{ImageConfig, ImageManifest, Index, PlatformChoice, media_type};
 use crate::reference::ImageReference;
 use crate::store::Store;
 use crate::tar_reader::{Kind, TarLimits, TarReader};
@@ -351,7 +351,7 @@ impl Archive {
     ///
     /// A document that doesn't parse, or names a blob the archive doesn't
     /// carry; an archive with no images at all.
-    pub fn images(&mut self, platform: &Platform) -> Result<Images, ArchiveError> {
+    pub fn images(&mut self, platform: &dyn PlatformChoice) -> Result<Images, ArchiveError> {
         let mut images = if let Some(bytes) = self.manifest_json.clone() {
             self.by_manifest_json(&bytes, platform)?
         } else if let Some(bytes) = self.index_json.clone() {
@@ -389,7 +389,7 @@ impl Archive {
     fn by_manifest_json(
         &mut self,
         bytes: &[u8],
-        platform: &Platform,
+        platform: &dyn PlatformChoice,
     ) -> Result<Images, ArchiveError> {
         #[derive(Deserialize)]
         struct Entry {
@@ -474,7 +474,11 @@ impl Archive {
     /// The images an OCI layout's index names (BuildKit's `type=oci`), by
     /// their annotations: containerd's name, or `ref.name` when it's a
     /// name in full.
-    fn by_index(&mut self, bytes: &[u8], platform: &Platform) -> Result<Images, ArchiveError> {
+    fn by_index(
+        &mut self,
+        bytes: &[u8],
+        platform: &dyn PlatformChoice,
+    ) -> Result<Images, ArchiveError> {
         let mut images = Images::default();
         let manifests = self.index_manifests(bytes, platform)?;
         for named in annotated_names(bytes, &manifests)? {
@@ -490,7 +494,7 @@ impl Archive {
     fn index_manifests(
         &self,
         bytes: &[u8],
-        platform: &Platform,
+        platform: &dyn PlatformChoice,
     ) -> Result<Vec<IndexManifest>, ArchiveError> {
         let top = Index::parse(bytes).map_err(|source| ArchiveError::Document {
             what: "index.json".to_owned(),
@@ -529,7 +533,7 @@ impl Archive {
                         .filter(|manifest| self.staging.has(&manifest.digest))
                         .collect(),
                 };
-                let Ok(chosen) = carried.select(platform) else {
+                let Ok(chosen) = carried.select_among(platform.choices()) else {
                     continue;
                 };
                 let bytes = self
@@ -553,7 +557,7 @@ impl Archive {
 
     /// Whether `found` can be loaded here: its manifest and config parse,
     /// every blob is in the archive, and it runs on `platform`.
-    fn check(&self, found: &Found, platform: &Platform) -> Result<(), LeftOut> {
+    fn check(&self, found: &Found, platform: &dyn PlatformChoice) -> Result<(), LeftOut> {
         let first = found
             .names
             .first()
@@ -587,11 +591,11 @@ impl Archive {
             .map_err(|error| left_out(error.to_string()))?;
         let config = ImageConfig::parse(&config).map_err(|error| left_out(error.to_string()))?;
         let theirs = config.platform();
-        if !theirs.runs_on(platform) {
+        if !crate::manifest::runs_on_any(&theirs, platform.choices()) {
             return Err(LeftOut::OtherPlatform {
                 name: first,
                 theirs: format!("{:?}", theirs.to_string()),
-                host: platform.to_string(),
+                host: crate::manifest::named(platform.choices()),
             });
         }
         Ok(())

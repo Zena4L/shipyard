@@ -20,6 +20,31 @@ pub struct VmPaths {
     pub guest: PathBuf,
 }
 
+/// The guest's files when `SHIPYARD_GUEST_DIR` doesn't say (13.6b2, F106):
+/// the VM directory's `guest` if a guest is there; else the `guest`
+/// directory beside the binary's own (`exe`, canonical:
+/// `target/debug/shipyard` finds `target/guest`, where `build.sh` puts it),
+/// only if it and the directory it's in are the user's alone (a `shipyard`
+/// run from `/tmp/x` mustn't boot a guest another user put in `/tmp/guest`,
+/// with the home shared: 13.6b2's review); else the VM directory's, whose
+/// absence is then said.
+#[must_use]
+pub(crate) fn guest_dir(vm_dir: &Path, exe: Option<&Path>) -> PathBuf {
+    let kept = vm_dir.join("guest");
+    let has_guest = |dir: &Path| dir.join(crate::MANIFEST).is_file();
+    if has_guest(&kept) {
+        return kept;
+    }
+    let theirs_alone =
+        |dir: &Path| shipyard_sys::fs::unsafe_dir(dir).is_ok_and(|why| why.is_none());
+    exe.and_then(Path::parent)
+        .and_then(Path::parent)
+        .filter(|built| theirs_alone(built))
+        .map(|built| built.join("guest"))
+        .filter(|beside| has_guest(beside) && theirs_alone(beside))
+        .unwrap_or(kept)
+}
+
 impl VmPaths {
     /// The places, from the environment: `SHIPYARD_VM_DIR` (else
     /// `~/Library/Application Support/Shipyard/vm`) and `SHIPYARD_GUEST_DIR`
@@ -38,7 +63,13 @@ impl VmPaths {
             })?;
             Self::default_dir(Path::new(&home))
         };
-        let guest = var("SHIPYARD_GUEST_DIR").map_or_else(|| dir.join("guest"), PathBuf::from);
+        let guest = var("SHIPYARD_GUEST_DIR").map_or_else(
+            || {
+                let exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+                guest_dir(&dir, exe.as_deref())
+            },
+            PathBuf::from,
+        );
         Self::at(dir, guest)
     }
 
@@ -86,6 +117,13 @@ impl VmPaths {
         self.dir.join("docker.sock")
     }
 
+    /// `vm install`'s mark that the run at load it causes is its own, never a
+    /// login's (13.6b2: it boots no VM).
+    #[must_use]
+    pub fn just_installed(&self) -> PathBuf {
+        self.dir.join("just-installed")
+    }
+
     /// The CLI's mark that it asked launchd's agent to start the host (no
     /// connection waits for it then: step 11.5b2a).
     #[must_use]
@@ -118,6 +156,26 @@ impl VmPaths {
         self.dir.join("host.log")
     }
 
+    /// The host's own socket (step 13.6b1): where it stands, and a stop
+    /// asked of it, from its lock to its end, booting or not.
+    #[must_use]
+    pub fn host_socket(&self) -> PathBuf {
+        self.dir.join("host.sock")
+    }
+
+    /// How many containers would come back if the VM started again
+    /// ([`crate::comes_back::ComesBack`]), kept across its stops.
+    #[must_use]
+    pub fn comes_back(&self) -> PathBuf {
+        self.dir.join("comes-back.json")
+    }
+
+    /// What the running host booted ([`crate::booted::Booted`]).
+    #[must_use]
+    pub fn booted(&self) -> PathBuf {
+        self.dir.join("booted.json")
+    }
+
     /// What the host forwards ([`crate::ports::PortsFile`]).
     #[must_use]
     pub fn ports(&self) -> PathBuf {
@@ -128,6 +186,12 @@ impl VmPaths {
     #[must_use]
     pub fn network(&self) -> PathBuf {
         self.dir.join("network.json")
+    }
+
+    /// The VM's size, as `vm set` asked for it (`vm.json`).
+    #[must_use]
+    pub fn settings(&self) -> PathBuf {
+        self.dir.join("vm.json")
     }
 
     /// Makes the VM's directory if it isn't there, and checks it's the
@@ -207,6 +271,67 @@ fn checked_dir(dir: &Path, metadata: &std::fs::Metadata, uid: u32) -> Result<(),
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
     use super::*;
+
+    /// The VM directory's guest first; else the one beside the binary's
+    /// directory; else the VM directory's (to be said missing).
+    #[test]
+    fn the_guest_is_found_beside_the_binary() {
+        let root = std::env::temp_dir().join(format!("shipyard-guest-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (vm, built) = (root.join("vm"), root.join("target"));
+        let exe = built.join("debug/shipyard");
+        std::fs::create_dir_all(vm.join("guest")).unwrap();
+        std::fs::create_dir_all(built.join("guest")).unwrap();
+        for dir in [&built, &built.join("guest")] {
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            vm.join("guest"),
+            "neither has one"
+        );
+        std::fs::write(built.join("guest").join(crate::MANIFEST), b"{}").unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            built.join("guest"),
+            "beside the binary"
+        );
+        assert_eq!(guest_dir(&vm, None), vm.join("guest"), "no binary known");
+        // One others may write to (or the directory it's in): not taken.
+        let shared: std::fs::Permissions = std::os::unix::fs::PermissionsExt::from_mode(0o777);
+        std::fs::set_permissions(&built, shared.clone()).unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            vm.join("guest"),
+            "its directory shared"
+        );
+        std::fs::set_permissions(&built, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(built.join("guest"), shared).unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            vm.join("guest"),
+            "the guest's shared"
+        );
+        std::fs::set_permissions(
+            built.join("guest"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            built.join("guest"),
+            "theirs alone again"
+        );
+        std::fs::write(vm.join("guest").join(crate::MANIFEST), b"{}").unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            vm.join("guest"),
+            "the VM's own first"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// `doctor`'s look at the directory: none yet is fine; one others may
     /// enter, or a path too long for the socket, isn't; nothing is made.

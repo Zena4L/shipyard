@@ -105,6 +105,7 @@ impl RunRequest {
             image,
             entrypoint: _,
             pull: _,
+            platform: _,
             read_only: _,
             cap_add,
             cap_drop,
@@ -200,6 +201,7 @@ impl RunRequest {
             ),
             ("--publish-all", self.publish_all, has_image, "an image"),
             ("--pull", self.pull.is_some(), has_image, "an image"),
+            ("--platform", self.platform.is_some(), has_image, "an image"),
             (
                 "--read-only",
                 self.read_only,

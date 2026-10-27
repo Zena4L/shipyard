@@ -19,7 +19,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use super::{Decoder, DetachKeys, Frame, FrameError, VERSION};
+use super::{Decoder, DetachKeys, Frame, FrameError, SESSION_VERSION, VERSION};
 use crate::container::ContainerError;
 use crate::process::ResizeWatch;
 use crate::process::{Signal, SignalWatch};
@@ -175,10 +175,14 @@ pub fn attach(stream: UnixStream, options: &AttachOptions) -> Result<Ended, Atta
 pub struct Welcomed {
     stream: UnixStream,
     decoder: Decoder,
+    /// The protocol version the welcome said.
+    version: u32,
     terminal: bool,
     stdin: bool,
     /// What its session goes on with.
     options: AttachOptions,
+    /// Where its signals and resizes go too ([`with_control`](Self::with_control)).
+    control: Option<UnixStream>,
 }
 
 /// Says hello through `stream` (connected to the container's
@@ -222,13 +226,15 @@ pub fn welcomed_with(
     // was read (said in a frame waiting to be read: `welcome` reads it).
     let said = stream.write_all(&hello);
     let mut decoder = Decoder::new();
-    let (terminal, stdin) = welcome(&mut stream, &mut decoder, said.is_ok())?;
+    let (version, terminal, stdin) = welcome(&mut stream, &mut decoder, said.is_ok())?;
     Ok(Welcomed {
         stream,
         decoder,
+        version,
         terminal,
         stdin,
         options: options.clone(),
+        control: None,
     })
 }
 
@@ -271,6 +277,57 @@ pub struct WelcomedParts {
 }
 
 impl Welcomed {
+    /// The session token a forwarded command's welcome is followed by
+    /// ([`Frame::Session`], from version 6: the macOS guest's agent sends
+    /// one to every user's command), `None` before version 6 or if the
+    /// agent had none to give (0). Asked only of a forwarded command: a
+    /// container's monitor sends none.
+    ///
+    /// # Errors
+    ///
+    /// [`AttachError`]: no token in time, or another frame first.
+    pub fn session_token(&mut self) -> Result<Option<u128>, AttachError> {
+        if self.version < SESSION_VERSION {
+            return Ok(None);
+        }
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match self.decoder.next_frame()? {
+                Some(Frame::Session(token)) => return Ok((token != 0).then_some(token)),
+                Some(other) => return Err(AttachError::Unexpected(name(&other))),
+                None => {}
+            }
+            match self.stream.read(&mut buffer) {
+                Ok(0) => return Err(AttachError::MonitorGone),
+                Ok(read) => self.decoder.push(buffer.get(..read).unwrap_or_default()),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(AttachError::NoAnswer);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// Its session's signals sent on `control` (a forwarded command's
+    /// control connection, F94) rather than among its input, and its
+    /// resizes there too: they reach the command even while its input is
+    /// stuck. Its input and its resizes still go on the session's stream
+    /// (typing never before the size it was typed at, F68). Written whole
+    /// and waited for (a few bytes, read at once on the other side); one
+    /// that fails is let go, and the session goes on in-band.
+    #[must_use]
+    pub fn with_control(mut self, control: UnixStream) -> Self {
+        let _ = control.set_write_timeout(Some(CONTROL_WAIT));
+        self.control = Some(control);
+        self
+    }
+
     /// Its parts: the caller runs the session itself.
     #[must_use]
     pub fn into_parts(self) -> WelcomedParts {
@@ -337,6 +394,8 @@ impl Welcomed {
             terminal,
             stdin,
             options,
+            control,
+            version: _,
         } = self;
         let typing = options.stdin && stdin;
         // Raw only for a terminal, typed into from one, in the foreground
@@ -385,6 +444,7 @@ impl Welcomed {
                 Window::NotATerminal
             },
             output: options.output,
+            control,
         };
         session.resize_if_changed();
         // A signalled session's watch is woken for every signal, terminal
@@ -404,7 +464,7 @@ fn welcome(
     stream: &mut UnixStream,
     decoder: &mut Decoder,
     said: bool,
-) -> Result<(bool, bool), AttachError> {
+) -> Result<(u32, bool, bool), AttachError> {
     stream.set_read_timeout(Some(WELCOME_WAIT))?;
     let mut buffer = [0_u8; 4096];
     loop {
@@ -419,7 +479,7 @@ fn welcome(
                     version,
                     terminal,
                     stdin,
-                } if (1..=VERSION).contains(&version) => Ok((terminal, stdin)),
+                } if (1..=VERSION).contains(&version) => Ok((version, terminal, stdin)),
                 Frame::Welcome { version, .. } => Err(AttachError::Version(version)),
                 other => Err(AttachError::Unexpected(name(&other))),
             };
@@ -470,7 +530,13 @@ struct Session {
     window: Window,
     /// Which output streams are written.
     output: Output,
+    /// A forwarded command's control connection: its signals go there, its
+    /// resizes too ([`Welcomed::with_control`]).
+    control: Option<UnixStream>,
 }
+
+/// How long a frame on a control connection may take to be written.
+const CONTROL_WAIT: Duration = Duration::from_secs(2);
 
 impl Session {
     fn run(
@@ -544,6 +610,7 @@ impl Session {
                 self.resize_if_changed();
             }
             if stdin_ready && self.hangs_up && stdin_hung_up {
+                self.hang_up_controlled();
                 return Ok(Ended::HungUp);
             }
             if stdin_ready {
@@ -559,7 +626,10 @@ impl Session {
                     }
                     Err(Errno::EAGAIN | Errno::EINTR) => {}
                     // The user's terminal is gone.
-                    Err(Errno::EIO) if self.hangs_up => return Ok(Ended::HungUp),
+                    Err(Errno::EIO) if self.hangs_up => {
+                        self.hang_up_controlled();
+                        return Ok(Ended::HungUp);
+                    }
                     // The user's input ended: the monitor is told (with
                     // `--stdin-once`, the container's stdin then ends too),
                     // and the output goes on.
@@ -587,7 +657,7 @@ impl Session {
                 continue;
             }
             match decide(signal) {
-                Act::Send(number) => Frame::Signal(number).encode(&mut self.out),
+                Act::Send(number) => self.send_signal(number),
                 Act::Skip => {}
                 Act::Leave(code) => return Some(Ended::Left(code)),
             }
@@ -613,8 +683,42 @@ impl Session {
             && self.window != Window::Sent(size)
         {
             self.window = Window::Sent(size);
-            Frame::Resize { rows, cols }.encode(&mut self.out);
+            let frame = Frame::Resize { rows, cols };
+            // Both ways: a resize is the same twice.
+            self.controlled(&frame);
+            frame.encode(&mut self.out);
         }
+    }
+
+    /// Sends signal `number` to the other end: on the control connection if
+    /// there is one, else among the input.
+    fn send_signal(&mut self, number: u8) {
+        let frame = Frame::Signal(number);
+        if !self.controlled(&frame) {
+            frame.encode(&mut self.out);
+        }
+    }
+
+    /// Sends `frame` on the control connection, if there is one: whether it
+    /// went. One that fails is let go (the frames go in-band from then on).
+    fn controlled(&mut self, frame: &Frame) -> bool {
+        let Some(control) = self.control.as_mut() else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        frame.encode(&mut bytes);
+        if control.write_all(&bytes).is_ok() {
+            return true;
+        }
+        self.control = None;
+        false
+    }
+
+    /// Sends a hang-up (`SIGHUP`, Linux's 1) on the control connection, if
+    /// there is one: the terminal closed, and the command, whose input may
+    /// be stuck, must hear it.
+    fn hang_up_controlled(&mut self) {
+        self.controlled(&Frame::Signal(1));
     }
 
     /// Whether raw mode is wanted and not on: left or resumed in the
@@ -650,8 +754,15 @@ impl Session {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                // The monitor stopped reading (the container ended while
+                // input was queued): what it said before it closed, its
+                // exit among it, is still to be read, so the input is
+                // dropped and the session reads on (13.6b1's verify: a
+                // stuck input made the race likely, and the exit was lost).
                 Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
-                    return Err(AttachError::MonitorGone);
+                    self.out.clear();
+                    self.stdin_open = false;
+                    return Ok(());
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -690,8 +801,9 @@ impl Session {
                     write_all(libc::STDERR_FILENO, &bytes)?;
                 }
                 // Not asked for (`-a`): read, so the container isn't held
-                // up, and dropped.
-                Frame::Stdout(_) | Frame::Stderr(_) => {}
+                // up, and dropped; and a forwarded command's token, read by
+                // whoever wants it ([`Welcomed::session_token`]).
+                Frame::Stdout(_) | Frame::Stderr(_) | Frame::Session(_) => {}
                 Frame::Detached => return Ok(Some(Ended::Detached)),
                 Frame::Exited(code) => return Ok(Some(Ended::Exited(code))),
                 Frame::Dropped(reason) => return Ok(Some(Ended::Dropped(reason))),
@@ -716,6 +828,7 @@ fn name(frame: &Frame) -> &'static str {
         Frame::Detached => "detached",
         Frame::Dropped(_) => "dropped",
         Frame::Exited(_) => "exited",
+        Frame::Session(_) => "session",
         _ => "unknown",
     }
 }
@@ -836,6 +949,170 @@ pub fn to_runtime(
 mod tests {
     use super::*;
 
+    /// A welcome said by a fake peer on `stream`'s other end: `frames`
+    /// written after it reads the hello.
+    fn welcomed_by(frames: Vec<Frame>) -> Welcomed {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut hello = [0_u8; 256];
+            let _ = peer.read(&mut hello).unwrap();
+            let mut bytes = Vec::new();
+            for frame in frames {
+                frame.encode(&mut bytes);
+            }
+            peer.write_all(&bytes).unwrap();
+            // Held open till the test's reads are done.
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let options = AttachOptions {
+            detach_keys: DetachKeys::none(),
+            stdin: false,
+            held: false,
+            output: Output::BOTH,
+        };
+        let hello = Frame::Hello {
+            version: VERSION,
+            detach_keys: Vec::new(),
+        };
+        welcomed_with(stream, &hello, &options).unwrap()
+    }
+
+    fn welcome(version: u32) -> Frame {
+        Frame::Welcome {
+            version,
+            terminal: false,
+            stdin: true,
+        }
+    }
+
+    /// From version 6 a welcome is followed by the session's token (0:
+    /// none); before, nothing is read for one; another frame first is
+    /// refused.
+    #[test]
+    fn a_session_token_follows_a_version_6_welcome() {
+        let mut welcomed = welcomed_by(vec![welcome(SESSION_VERSION), Frame::Session(7)]);
+        assert_eq!(welcomed.session_token().unwrap(), Some(7));
+        let mut welcomed = welcomed_by(vec![welcome(SESSION_VERSION), Frame::Session(0)]);
+        assert_eq!(welcomed.session_token().unwrap(), None);
+        let mut older = welcomed_by(vec![
+            welcome(SESSION_VERSION - 1),
+            Frame::Stdout(b"x".to_vec()),
+        ]);
+        assert_eq!(older.session_token().unwrap(), None);
+        assert_eq!(
+            older.decoder.next_frame().unwrap(),
+            Some(Frame::Stdout(b"x".to_vec())),
+            "left unread"
+        );
+        let mut out_of_order =
+            welcomed_by(vec![welcome(SESSION_VERSION), Frame::Stdout(b"x".to_vec())]);
+        assert!(matches!(
+            out_of_order.session_token(),
+            Err(AttachError::Unexpected("stdout"))
+        ));
+    }
+
+    /// A monitor that stopped reading (it closed after the container's end)
+    /// fails the session's write; what it sent before, the exit, is still
+    /// read, and the queued input dropped.
+    #[test]
+    fn an_exit_sent_before_the_monitor_closed_is_read() {
+        let (stream, mut monitor) = UnixStream::pair().unwrap();
+        let mut said = Vec::new();
+        Frame::Exited(42).encode(&mut said);
+        monitor.write_all(&said).unwrap();
+        drop(monitor);
+        let mut session = Session {
+            stream,
+            decoder: Decoder::new(),
+            out: b"typing the container never read".to_vec(),
+            stdin_open: true,
+            hangs_up: false,
+            raw: None,
+            wants_raw: false,
+            window: Window::NotATerminal,
+            output: Output::BOTH,
+            control: None,
+        };
+        session.flush().unwrap();
+        assert!(session.out.is_empty() && !session.stdin_open);
+        let mut buffer = [0_u8; 64];
+        assert_eq!(
+            session.receive(&mut buffer).unwrap(),
+            Some(Ended::Exited(42))
+        );
+    }
+
+    /// With a control connection, a signal goes on it alone, a resize both
+    /// on it and in-band, a hang-up on it; one whose peer is gone is let go,
+    /// and the frames go in-band from then on.
+    #[test]
+    fn a_control_connection_takes_the_signals_and_resizes() {
+        let (stream, _other) = UnixStream::pair().unwrap();
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        let mut session = Session {
+            stream,
+            decoder: Decoder::new(),
+            out: Vec::new(),
+            stdin_open: true,
+            hangs_up: true,
+            raw: None,
+            wants_raw: false,
+            window: Window::Unsent,
+            output: Output::BOTH,
+            control: Some(control),
+        };
+        session.send_signal(2);
+        session.resize_to(Some(Size::new(30, 100)));
+        session.hang_up_controlled();
+        let in_band = |session: &Session| {
+            let mut decoder = Decoder::new();
+            decoder.push(&session.out);
+            std::iter::from_fn(|| decoder.next_frame().unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            in_band(&session),
+            [Frame::Resize {
+                rows: 30,
+                cols: 100
+            }],
+            "the resize in-band too, the signals on the control alone"
+        );
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut on_control = Decoder::new();
+        let mut frames = Vec::new();
+        let mut buffer = [0_u8; 64];
+        while frames.len() < 3 {
+            let read = peer.read(&mut buffer).unwrap();
+            on_control.push(&buffer[..read]);
+            while let Some(frame) = on_control.next_frame().unwrap() {
+                frames.push(frame);
+            }
+        }
+        assert_eq!(
+            frames,
+            [
+                Frame::Signal(2),
+                Frame::Resize {
+                    rows: 30,
+                    cols: 100
+                },
+                Frame::Signal(1)
+            ]
+        );
+        drop(peer);
+        // (A write to a closed peer fails at once, EPIPE; Rust ignores
+        // SIGPIPE.)
+        session.out.clear();
+        session.send_signal(15);
+        assert!(session.control.is_none(), "let go");
+        assert_eq!(
+            in_band(&session),
+            [Frame::Signal(15)],
+            "in-band once let go"
+        );
+    }
+
     /// A terminal session's size is sent once per change (F68: it's
     /// looked at before every piece of typing): the first, not the same
     /// again, a new one; a session that isn't a terminal's sends none.
@@ -852,6 +1129,7 @@ mod tests {
             wants_raw: false,
             window: Window::Unsent,
             output: Output::BOTH,
+            control: None,
         };
         let sent = |session: &mut Session, size| {
             session.out.clear();

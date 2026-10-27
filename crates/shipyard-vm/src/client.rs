@@ -25,8 +25,40 @@ pub use session::{TERM_GRACE, linux_number};
 /// for the guest (`host::BOOT_LIMIT`), and the VM's own start.
 const START_LIMIT: Duration = Duration::from_secs(150);
 
-/// How long `vm stop` waits for the host to be gone.
+/// How long `vm stop` waits for a host's PID to be written, and for an older
+/// host (one with no `host.sock`) to be gone.
 const STOP_LIMIT: Duration = Duration::from_secs(120);
+
+/// How long the host has to answer on its own socket.
+const HOST_ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+/// The most a host's answer on its own socket holds.
+const MAX_HOST_ANSWER: usize = 256;
+
+/// The most `vm stop` waits in all, its host's phases' waits included.
+const STOP_MOST: Duration = Duration::from_mins(20);
+
+/// The most a start waits in all, its host's phases' waits included.
+const START_MOST: Duration = Duration::from_mins(20);
+
+/// The start's failure (`in_time`: it was given up on, not failed), with
+/// the host's last lines.
+fn didnt_start(paths: &VmPaths, in_time: bool) -> VmError {
+    VmError::Host(format!(
+        "the VM didn't start{}: {}",
+        if in_time { " in time" } else { "" },
+        last_lines(&paths.host_log(), 5)
+    ))
+}
+
+/// The host's answer to `ask` ([`forward::HOST_PHASE_REQUEST`] or
+/// [`forward::HOST_STOP_REQUEST`]) on its own socket: `None` if there's no
+/// host, or it's older than this (no `host.sock`), or it didn't answer.
+fn ask_host(paths: &VmPaths, ask: &str) -> Option<crate::phase::PhaseAnswer> {
+    let stream = UnixStream::connect(paths.host_socket()).ok()?;
+    let said = ask::answer_on(stream, &[ask], MAX_HOST_ANSWER, HOST_ANSWER_WAIT).ok()?;
+    crate::phase::PhaseAnswer::decode(std::str::from_utf8(&said).ok()?)
+}
 
 /// Whether the VM's host is running, and its PID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,24 +139,58 @@ fn connect_watching(paths: &VmPaths, watch: Option<&SignalWatch>) -> Result<Unix
     if let Ok(stream) = UnixStream::connect(paths.socket()) {
         return Ok(stream);
     }
-    let deadline = Instant::now() + START_LIMIT;
+    // A Mac the VM can't run on, said by name before a host is started
+    // (step 13.7; only a build made for an older macOS than this tree's
+    // deployment target, 13.0, gets this far there: dyld refuses the rest).
+    if let Some(why) = crate::doctor::this_macs_floor_refusal() {
+        return Err(VmError::Unsupported(why));
+    }
+    let began = Instant::now();
+    let mut deadline = began + START_LIMIT;
     let mut host = start_host(paths)?;
     loop {
         if let Ok(stream) = UnixStream::connect(paths.socket()) {
             return Ok(stream);
         }
         let ended = host.ended(paths);
-        let failed = ended.is_some_and(|status| !status.success());
-        if failed || Instant::now() > deadline {
-            if !failed {
-                // Not killed: asked to stop, it stops its guest first.
-                host.terminate(paths);
+        // (A launchd run that ended badly while another host holds the lock,
+        // booting, isn't this start's failure: F144's review.)
+        let failed =
+            ended.is_some_and(|status| !status.success()) && status(paths)? == Status::Stopped;
+        let now = Instant::now();
+        // Stopped as it started (a `vm stop` came first): said so, and no
+        // other start made (13.6b1's review).
+        if ended.and_then(|status| status.code()) == Some(crate::phase::STOPPED_BEFORE_SERVING) {
+            return Err(VmError::Refused(forward::Refusal::Stopping.to_string()));
+        }
+        if failed {
+            return Err(didnt_start(paths, false));
+        }
+        if now > deadline {
+            // By the host's own phase (F100): a healthy one is waited for,
+            // never stopped by a CLI that gave up; and never signalled.
+            let answer = ask_host(paths, forward::HOST_PHASE_REQUEST);
+            // No host yet (launchd's throttle on its kick): looked at again.
+            let no_host_yet = answer.is_none()
+                && matches!(status(paths)?, Status::Stopped | Status::Running(None));
+            let decided = if no_host_yet {
+                crate::phase::AtDeadline::Wait(Duration::from_secs(5))
+            } else {
+                crate::phase::at_deadline(answer)
+            };
+            match decided {
+                crate::phase::AtDeadline::Connect => deadline = now + Duration::from_secs(10),
+                crate::phase::AtDeadline::Wait(more) => deadline = now + more,
+                crate::phase::AtDeadline::GiveUp { ask_stop } => {
+                    if ask_stop {
+                        let _ = ask_host(paths, forward::HOST_STOP_REQUEST);
+                    }
+                    return Err(didnt_start(paths, true));
+                }
             }
-            return Err(VmError::Host(format!(
-                "the VM didn't start{}: {}",
-                if failed { "" } else { " in time" },
-                last_lines(&paths.host_log(), 5)
-            )));
+            if now.duration_since(began) > START_MOST {
+                return Err(didnt_start(paths, true));
+            }
         }
         // Ours left (another host had the lock), and there's still no
         // socket: once no host holds the lock, start one again (launchd's
@@ -200,10 +266,12 @@ fn interrupted(watch: Option<&SignalWatch>) -> Option<i32> {
         .map(|raw| 128 + raw)
 }
 
-/// Stops the VM in order (its host asked by SIGTERM: the guest stops its
-/// containers and powers off), and waits for that host to be gone (a host
-/// another command starts meanwhile is another VM, not waited for).
-/// Nothing to do if it isn't running.
+/// Stops the VM in order (its host asked on its own socket, F93: the guest
+/// stops its containers and powers off, once it's up: a boot's disk check
+/// is never cut), and waits for that host to be gone by the host's own
+/// bounds (a host another command starts meanwhile is another VM, not
+/// waited for). An older host, with no socket of its own, is sent SIGTERM
+/// by the PID its lock says, as before. Nothing to do if it isn't running.
 ///
 /// # Errors
 ///
@@ -225,13 +293,61 @@ pub fn stop(paths: &VmPaths) -> Result<(), VmError> {
             }
         }
     };
-    let pid = i32::try_from(pid).map_err(|_| VmError::Host(format!("a PID of {pid}")))?;
-    // (The lock was held just now: the PID is still its holder's.)
+    // A host binds its socket before it writes its PID: one with a PID
+    // and no socket is older than this.
+    if let Some(answer) = ask_host(paths, forward::HOST_STOP_REQUEST) {
+        let deadline = Instant::now() + crate::phase::stop_wait(answer);
+        return wait_for_host_gone(paths, Some(pid), deadline);
+    }
+    // A host of this build whose ask failed (its asks all taken, or it's
+    // ending): asked once more, else waited for, never signalled (the
+    // whole-stage review: its PID may be no one's by now).
+    if paths.host_socket().exists() {
+        std::thread::sleep(Duration::from_millis(500));
+        let deadline = ask_host(paths, forward::HOST_STOP_REQUEST).map_or(deadline, |answer| {
+            Instant::now() + crate::phase::stop_wait(answer)
+        });
+        return wait_for_host_gone(paths, Some(pid), deadline);
+    }
+    if status(paths)? != Status::Running(Some(pid)) {
+        return Ok(());
+    }
+    let raw = i32::try_from(pid).map_err(|_| VmError::Host(format!("a PID of {pid}")))?;
+    // (The lock is held just now by the PID it holds: an older host's.)
     let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
+        nix::unistd::Pid::from_raw(raw),
         nix::sys::signal::Signal::SIGTERM,
     );
-    wait_for_host_gone(paths, u32::try_from(pid).ok(), deadline)
+    wait_for_host_gone(paths, Some(pid), deadline)
+}
+
+/// Whether the host `pid` (its PID, if known) is gone, as `status` says:
+/// stopped, or another host runs (a VM a command started since, not the one
+/// waited for). A host whose PID isn't known yet (it has the lock, not yet
+/// its PID written) is still the one waited for.
+pub(super) fn gone_or_replaced(status: Status, pid: Option<u32>) -> bool {
+    match status {
+        Status::Stopped => true,
+        Status::Running(Some(now)) => pid.is_some_and(|pid| pid != now),
+        Status::Running(None) => false,
+    }
+}
+
+/// A stopping host's `deadline`, put back past it if the host, asked again,
+/// is still within its own bound (a stop asked as it booted, waiting out a
+/// disk check), so long as the wait `began` less than the longest stop ago
+/// (13.6b1's review; a command refused as stopping too: the whole-stage
+/// review).
+fn waited_on(paths: &VmPaths, began: Instant, deadline: Instant) -> Instant {
+    if Instant::now() > deadline
+        && began.elapsed() < STOP_MOST
+        && let Some(answer) = ask_host(paths, forward::HOST_PHASE_REQUEST)
+        && answer.left > Duration::ZERO
+    {
+        Instant::now() + answer.left + crate::phase::MARGIN
+    } else {
+        deadline
+    }
 }
 
 /// Waits for the host `pid` to be gone, by `deadline`: its lock free, or
@@ -239,12 +355,12 @@ pub fn stop(paths: &VmPaths) -> Result<(), VmError> {
 /// wasn't asked about).
 fn wait_for_host_gone(paths: &VmPaths, pid: Option<u32>, deadline: Instant) -> Result<(), VmError> {
     let began = Instant::now();
+    let mut deadline = deadline;
     loop {
-        match status(paths)? {
-            Status::Stopped => return Ok(()),
-            Status::Running(Some(now)) if Some(now) != pid => return Ok(()),
-            Status::Running(_) => {}
+        if gone_or_replaced(status(paths)?, pid) {
+            return Ok(());
         }
+        deadline = waited_on(paths, began, deadline);
         if Instant::now() > deadline {
             return Err(VmError::Host(format!(
                 "the VM's host (PID {}) still runs after {} s",

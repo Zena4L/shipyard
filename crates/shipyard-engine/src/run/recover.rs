@@ -151,14 +151,70 @@ fn btime_of(stat: &str) -> Option<std::time::SystemTime> {
     Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
 }
 
+/// The exit code a container the host's stop ends has: its SIGTERM's
+/// (128 + 15).
+#[cfg(target_os = "linux")]
+const HOST_STOP_EXIT: i32 = 143;
+
+/// Whether container `record`'s restart policy starts it again after an end
+/// with `code` (the host's boot's rule, Docker's).
+#[cfg(target_os = "linux")]
+fn policy_restarts(record: &crate::containers::Record, code: Option<i32>) -> bool {
+    use crate::containers::RestartPolicy;
+    match record.config.restart {
+        RestartPolicy::Always => true,
+        RestartPolicy::UnlessStopped => !record.stopped_by_user,
+        policy @ RestartPolicy::OnFailure { .. } => super::restart_policy::decide(
+            policy,
+            code,
+            record.stopped_by_user,
+            record.restart_count,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .is_some(),
+        _ => false,
+    }
+}
+
+/// Whether the container `record` is (`up`: it's up already) is started
+/// when the host starts again, as its restart policy says (see [`boot`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn starts_at_boot(record: &crate::containers::Record, up: bool) -> bool {
+    !up && record.started.is_some()
+        && policy_restarts(record, record.exit.as_ref().and_then(|exit| exit.code))
+}
+
+/// Whether container `record` (`up`: it runs now) would come back if the
+/// host restarted (step 13.6b2: what a Mac's login start goes by): one up,
+/// as the host's stop leaves it ([`HOST_STOP_EXIT`], not stopped by its
+/// user), else [`starts_at_boot`]'s rule. One whose last start failed before
+/// its command ran (the runtime's 125) isn't counted: a login boot for it
+/// would only fail again.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub(crate) fn comes_back(record: &crate::containers::Record, up: bool) -> bool {
+    if record.started.is_none() {
+        return false;
+    }
+    if up {
+        return policy_restarts(record, Some(HOST_STOP_EXIT));
+    }
+    let failed_to_start = record.exit.as_ref().and_then(|exit| exit.code)
+        == Some(i32::from(shipyard_runtime::process::EXIT_ENGINE_ERROR));
+    !failed_to_start && starts_at_boot(record, false)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::time::{Duration, SystemTime};
 
+    use super::starts_at_boot;
+
     use shipyard_runtime::container::{self as runtime, Status};
 
     use crate::Engine;
-    use crate::containers::{self, ContainerId, Record, RestartPolicy};
+    use crate::containers::{self, ContainerId, Record};
     use crate::error::Result;
     use crate::report::WarningKind;
 
@@ -264,29 +320,6 @@ mod linux {
     /// flight, which reads as created), or a restart waiting.
     pub(super) fn stopped_for_the_host(record: &Record, status: Option<Status>) -> bool {
         record.next_start.is_some() || status.is_some_and(|status| status != Status::Stopped)
-    }
-
-    /// Whether the container `record` is (`up`: it's up already) is started
-    /// when the host starts again, as its restart policy says (see
-    /// [`super::boot`]).
-    pub(super) fn starts_at_boot(record: &Record, up: bool) -> bool {
-        if up || record.started.is_none() {
-            return false;
-        }
-        match record.config.restart {
-            RestartPolicy::Always => true,
-            RestartPolicy::UnlessStopped => !record.stopped_by_user,
-            policy @ RestartPolicy::OnFailure { .. } => crate::run::restart_policy::decide(
-                policy,
-                record.exit.as_ref().and_then(|exit| exit.code),
-                record.stopped_by_user,
-                record.restart_count,
-                Duration::ZERO,
-                Duration::ZERO,
-            )
-            .is_some(),
-            _ => false,
-        }
     }
 
     /// Settles every container that ended unwatched, but the one `except`
@@ -550,7 +583,8 @@ mod tests {
     use shipyard_runtime::container::Status;
 
     use super::btime_of;
-    use super::linux::{starts_at_boot, stopped_for_the_host};
+    use super::linux::stopped_for_the_host;
+    use super::starts_at_boot;
     use crate::containers::{Exit, Record, RestartPolicy};
 
     /// A record of `policy`, started and ended with `code` (none: an end
@@ -608,6 +642,33 @@ mod tests {
         let mut never = record(Always, None, false);
         never.started = None;
         assert!(!starts_at_boot(&never, false));
+    }
+
+    /// What would come back after a restart (a Mac's login start, 13.6b2):
+    /// one up, as the host's stop leaves it, so `on-failure` too (its 143);
+    /// `unless-stopped` stopped by its user, never; one down, by the boot's
+    /// rule, but one whose last start failed before it ran (125).
+    #[test]
+    fn what_comes_back_is_what_a_boot_starts() {
+        use RestartPolicy::{Always, No, OnFailure, UnlessStopped};
+        let on_failure = OnFailure { max: Some(2) };
+        for (policy, stopped, back) in [
+            (Always, false, true),
+            (UnlessStopped, false, true),
+            (UnlessStopped, true, false),
+            (on_failure, false, true),
+            (No, false, false),
+        ] {
+            let record = record(policy, None, stopped);
+            assert_eq!(super::comes_back(&record, true), back, "{policy} up");
+        }
+        let down = record(Always, Some(0), false);
+        assert!(super::comes_back(&down, false), "always, down");
+        let failed_to_start = record(Always, Some(125), false);
+        assert!(!super::comes_back(&failed_to_start, false));
+        let mut never = record(Always, None, false);
+        never.started = None;
+        assert!(!super::comes_back(&never, true));
     }
 
     /// The host's stop takes every container with runtime state that

@@ -101,6 +101,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "udp_frames"
+path = "fuzz_targets/udp_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "attach_frames"
 path = "fuzz_targets/attach_frames.rs"
 test = false

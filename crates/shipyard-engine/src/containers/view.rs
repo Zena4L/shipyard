@@ -12,7 +12,7 @@ use crate::Engine;
 use crate::error::Result;
 use crate::events::rfc3339;
 use crate::report::WarningKind;
-use shipyard_runtime::attach::forward::{PortsAnswer, PublishedPort};
+use shipyard_runtime::attach::forward::{PortsAnswer, Protocol, PublishedPort};
 
 /// A container as `ps` lists it: its record and its state.
 #[derive(Debug, Clone)]
@@ -484,8 +484,8 @@ fn init_pid(engine: &Engine, record: &Record) -> Option<i32> {
 
 /// What the macOS guest's VM host asks (step 10.3c1): how many containers
 /// are active (running, paused, stopping, waiting to restart: what keeps
-/// the VM from being idle), and the TCP ports those running or paused
-/// publish, once each (the UDP ones counted). Read without taking any
+/// the VM from being idle), and the ports those running or paused
+/// publish, TCP and UDP, once each. Read without taking any
 /// lock; a container whose state can't be read is left out.
 ///
 /// # Errors
@@ -493,18 +493,38 @@ fn init_pid(engine: &Engine, record: &Record) -> Option<i32> {
 /// As [`super::list`].
 pub fn published(engine: &Engine) -> Result<PortsAnswer> {
     let mut answer = PortsAnswer::new();
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_mut, reason = "counted in the guest alone")
+    )]
+    let mut comes_back = 0_u32;
     for record in super::list(engine)? {
         if let Ok(state) = super::state(engine, &record) {
-            count_published(&mut answer, &state, &record.ports);
+            add_published(&mut answer, &state, &record.ports);
+            // What a restart of the guest would start (a Mac's login start
+            // goes by it: 13.6b2).
+            #[cfg(target_os = "linux")]
+            {
+                let up = matches!(
+                    state,
+                    ContainerState::Running { .. }
+                        | ContainerState::Paused
+                        | ContainerState::Stopping
+                );
+                if crate::run::comes_back(&record, up) {
+                    comes_back = comes_back.saturating_add(1);
+                }
+            }
         }
     }
+    answer.comes_back = Some(comes_back);
     answer.ports.sort_unstable();
     answer.ports.dedup();
     Ok(answer)
 }
 
 /// Adds a container in `state`, publishing `ports`, to `answer`.
-fn count_published(answer: &mut PortsAnswer, state: &ContainerState, ports: &[BoundPort]) {
+fn add_published(answer: &mut PortsAnswer, state: &ContainerState, ports: &[BoundPort]) {
     if state.is_active() {
         answer.active = answer.active.saturating_add(1);
     }
@@ -515,14 +535,16 @@ fn count_published(answer: &mut PortsAnswer, state: &ContainerState, ports: &[Bo
         return;
     }
     for port in ports {
-        match port.protocol.as_str() {
-            "tcp" => answer.ports.push(PublishedPort {
-                ip: port.host_ip,
-                port: port.host_port,
-            }),
-            "udp" => answer.udp = answer.udp.saturating_add(1),
-            _ => {}
-        }
+        let protocol = match port.protocol.as_str() {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => continue,
+        };
+        answer.ports.push(PublishedPort {
+            ip: port.host_ip,
+            port: port.host_port,
+            protocol,
+        });
     }
 }
 
@@ -531,8 +553,9 @@ fn count_published(answer: &mut PortsAnswer, state: &ContainerState, ports: &[Bo
 mod tests {
     use super::*;
 
-    /// Every active container counts; only a running or paused one's TCP
-    /// ports are published (a stopped one's record keeps its last ports).
+    /// Every active container counts; only a running or paused one's ports
+    /// are published, each with its protocol (a stopped one's record keeps
+    /// its last ports).
     #[test]
     fn only_up_containers_publish_and_active_ones_count() {
         let any = std::net::Ipv4Addr::UNSPECIFIED.into();
@@ -541,41 +564,39 @@ mod tests {
             BoundPort::new(any, 5353, 53, "udp"),
         ];
         let mut answer = PortsAnswer::new();
-        count_published(
+        add_published(
             &mut answer,
             &ContainerState::Running { since: None },
             &ports,
         );
-        count_published(&mut answer, &ContainerState::Paused, &ports);
-        count_published(&mut answer, &ContainerState::Stopping, &ports);
+        add_published(&mut answer, &ContainerState::Paused, &ports);
+        add_published(&mut answer, &ContainerState::Stopping, &ports);
         let restarting = ContainerState::Restarting {
             code: None,
             finished: None,
             attempt: 1,
             at: None,
         };
-        count_published(&mut answer, &restarting, &ports);
+        add_published(&mut answer, &restarting, &ports);
         let exited = ContainerState::Exited {
             code: Some(0),
             oom: None,
             finished: None,
         };
-        count_published(&mut answer, &exited, &ports);
-        count_published(&mut answer, &ContainerState::Created, &ports);
+        add_published(&mut answer, &exited, &ports);
+        add_published(&mut answer, &ContainerState::Created, &ports);
         assert_eq!(answer.active, 4);
-        assert_eq!(answer.udp, 2);
-        assert_eq!(
-            answer.ports,
-            [
-                PublishedPort {
-                    ip: any,
-                    port: 8080
-                },
-                PublishedPort {
-                    ip: any,
-                    port: 8080
-                }
-            ]
-        );
+        assert_eq!(answer.udp, 0, "a v2 answer lists them");
+        let tcp = PublishedPort {
+            ip: any,
+            port: 8080,
+            protocol: Protocol::Tcp,
+        };
+        let udp = PublishedPort {
+            ip: any,
+            port: 5353,
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(answer.ports, [tcp, udp, tcp, udp]);
     }
 }

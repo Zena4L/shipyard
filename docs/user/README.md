@@ -226,9 +226,13 @@ the host's name. Both take `--format`: a Go template over Docker's objects
 
 - **`docker build` through the API isn't served** (`shipyard build` is how to build);
   a push sends one platform's image (no multi-platform index), each blob uploaded whole.
-- **macOS is new:** commands run in Shipyard's Linux VM (on a terminal there when you're
-  on one, published TCP ports on your Mac's `localhost`, the VM stopping by itself when
-  idle); the guest is built from the source tree, and UDP ports aren't forwarded yet
+- **On a Mac,** commands run in Shipyard's Linux VM: sized from your Mac, its clock kept
+  right after a sleep, amd64 images through Rosetta, your home, `/Volumes`, `/tmp` and
+  `/var/folders` shared, TCP and UDP ports on your Mac's `localhost`, stopping by itself
+  when idle (and, with `vm install --at-login`, starting at login while containers would
+  come back). There's no installer yet: the guest is built from the source tree, and
+  `shipyard` signed by `scripts/macos/sign.sh`. The VM keeps the memory it was given, and
+  small files on a share are slower than OrbStack's
   ([macOS](macos.md#limits-this-version)).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge
   networks, and names between containers, are root's

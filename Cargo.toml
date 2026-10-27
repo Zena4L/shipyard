@@ -6,7 +6,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 # Only the pinned toolchain (rust-toolchain.toml) is built and tested.
 rust-version = "1.98"
@@ -53,6 +53,7 @@ objc2-virtualization = { version = "0.3", default-features = false, features = [
   "VZStorageDeviceAttachment", "VZDiskImageStorageDeviceAttachment",
   "VZDirectorySharingDeviceConfiguration", "VZVirtioFileSystemDeviceConfiguration",
   "VZDirectoryShare", "VZSingleDirectoryShare", "VZSharedDirectory",
+  "VZLinuxRosettaDirectoryShare",
   "VZNetworkDeviceConfiguration", "VZVirtioNetworkDeviceConfiguration",
   "VZNetworkDeviceAttachment", "VZNATNetworkDeviceAttachment", "VZMACAddress",
 ] }

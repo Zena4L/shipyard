@@ -1263,3 +1263,43 @@ impl Drop for Console {
         let _ = self.child.wait();
     }
 }
+
+/// Step 13.3: a `--platform` that doesn't run here is refused before
+/// anything is pulled or made, saying what does (`run` and `create` with
+/// Docker's 125, `pull` 1); this host's own is taken (the control: a pull
+/// of a missing local name fails later, for the name).
+#[test]
+fn a_platform_that_doesnt_run_here_is_refused_first() {
+    let store = Scratch::new();
+    for (args, code) in [
+        (
+            // (`--rm` added by `removed_at_its_end`.)
+            &["run", "--platform", "linux/s390x", "nothing:1", "true"][..],
+            125,
+        ),
+        (
+            &["create", "--platform", "linux/s390x", "nothing:1"][..],
+            125,
+        ),
+        (&["pull", "--platform", "linux/s390x", "nothing:1"][..], 1),
+    ] {
+        let refused = shipyard(&store, args);
+        let (_, stderr) = text(&refused);
+        assert_eq!(refused.status.code(), Some(code), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("only a platform that runs here can be"),
+            "{args:?}: {stderr}"
+        );
+    }
+    // `linux` alone names this host's own platform.
+    let pulled = shipyard(
+        &store,
+        &["pull", "--platform", "linux", "localhost:1/nothing:1"],
+    );
+    let (_, stderr) = text(&pulled);
+    assert!(!pulled.status.success());
+    assert!(
+        !stderr.contains("only a platform that runs here"),
+        "{stderr}"
+    );
+}

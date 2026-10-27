@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 
 use shipyard_image::archive::{load, save};
 use shipyard_image::index::Index;
-use shipyard_image::{ImageRecord, ImageReference, LockMode, Platform, USE_WAIT};
+use shipyard_image::{ImageRecord, ImageReference, LockMode, USE_WAIT};
 
 use crate::Engine;
 use crate::error::{Context as _, Result, bail};
@@ -176,7 +176,9 @@ fn repository_alone(name: &str) -> bool {
 }
 
 /// The image whose manifest is `manifest`, from the store's blobs by that
-/// digest alone (never the index's records, whatever it's named).
+/// digest alone (never the index's records, whatever it's named), of any
+/// platform: a save runs nothing (an amd64 image saved where Rosetta was
+/// lost, to be kept).
 pub(super) fn stored_image(
     store: &shipyard_image::Store,
     named: Option<&ImageReference>,
@@ -190,7 +192,12 @@ pub(super) fn stored_image(
         tag: None,
         digest: Some(manifest.clone()),
     });
-    match shipyard_image::from_store_by_digest(&called, manifest, &Platform::host(), store)? {
+    match shipyard_image::from_store_by_digest(
+        &called,
+        manifest,
+        &shipyard_image::AnyPlatform,
+        store,
+    )? {
         Some(pulled) => Ok(pulled),
         None => bail!(
             NotFound,
@@ -250,7 +257,7 @@ fn named_only(images: &mut load::Images, names: &[ImageReference]) -> Result<()>
 fn load_as(engine: &Engine, input: impl Read, names: Option<&[ImageReference]>) -> Result<Loaded> {
     let store = super::open_store(engine)?;
     let mut archive = load::read(input, &store)?;
-    let mut images = archive.images(&Platform::host())?;
+    let mut images = archive.images(&super::platforms_here())?;
     if let Some(names) = names {
         named_only(&mut images, names)?;
     }
@@ -362,5 +369,41 @@ mod tests {
                 Err(crate::ErrorKind::InvalidRequest)
             );
         }
+    }
+
+    /// A save reads an image of any platform (13.8c): one that can't run
+    /// here (an amd64 image where Rosetta was lost; here `s390x`, which
+    /// runs nowhere this does) is saved, where reading it for what runs
+    /// here (the control) refuses it as another platform's.
+    #[test]
+    fn a_save_reads_an_image_of_any_platform() {
+        let dir = std::env::temp_dir().join(format!("shipyard-save-any-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = shipyard_image::Store::open(&dir).unwrap();
+        let blob = |bytes: &[u8]| {
+            let digest = shipyard_image::Digest::sha256(bytes);
+            store.write_blob(&digest, &mut &bytes[..]).unwrap();
+            digest
+        };
+        let config = blob(
+            br#"{"architecture":"s390x","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#,
+        );
+        let manifest = blob(
+            format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config}","size":1}},"layers":[]}}"#
+            )
+            .as_bytes(),
+        );
+        let saved = stored_image(&store, None, &manifest).unwrap();
+        assert_eq!(saved.config.platform().architecture, "s390x");
+        let here = shipyard_image::from_store_by_digest(
+            &ImageReference::parse("x:1").unwrap(),
+            &manifest,
+            &super::super::platforms_here(),
+            &store,
+        )
+        .unwrap_err();
+        assert!(here.is_other_platform(), "{here}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

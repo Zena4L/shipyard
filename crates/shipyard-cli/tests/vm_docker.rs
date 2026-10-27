@@ -27,6 +27,7 @@ const IMAGE: &str = "alpine:3.20";
 const DOCKER_LIMIT: Duration = Duration::from_secs(180);
 
 mod vm_support;
+use vm_support::BoundedOutput as _;
 use vm_support::{Scratch, Vm, bounded, text};
 
 /// Docker's CLI, for the Mac's Docker API tests.
@@ -133,7 +134,7 @@ fn dockers_cli_uses_shipyard_on_the_mac() {
         .spawn()
         .unwrap();
     piped.stdin.take().unwrap().write_all(b"typed\n").unwrap();
-    let piped = piped.wait_with_output().unwrap();
+    let piped = vm_support::finish_within(piped, vm_support::COMMAND_LIMIT, "piped");
     assert!(piped.status.success(), "{piped:?}");
     assert_eq!(text(&piped.stdout), "typed\nafter\n");
 
@@ -278,8 +279,7 @@ fn an_api_connection_keeps_the_vm_up() {
         .command(&["vm", "start"])
         .env("SHIPYARD_VM_IDLE", "3")
         .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        .bounded_output();
     assert!(started.status.success(), "{started:?}");
     let mut events = docker
         .command(&["events"])

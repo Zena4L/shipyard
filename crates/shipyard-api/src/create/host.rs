@@ -44,6 +44,10 @@ pub(super) fn the_host_config(host: &HostConfig, request: &mut RunRequest) -> Re
             shipyard_engine::run::DockerMount::Tmpfs(tmpfs) => request.tmpfs.push(tmpfs),
         }
     }
+    // In the macOS guest, a bind only of what the Mac shares, as Docker
+    // Desktop's "mounts denied" (step 13.4, F143): never one made empty in
+    // the VM.
+    shipyard_engine::guest::shares::check_binds(&request.volume)?;
     request.publish = published(host.port_bindings.as_ref())?;
     request.publish_all = host.publish_all_ports.unwrap_or(false);
     request.restart = restart_policy(host)?;

@@ -35,11 +35,29 @@ pub(super) fn ensure_firewall(
                 networks.list()?.iter().map(NetworkRules::from).collect();
             let ports = networks.live_port_rules()?;
             let closed = closed_now(networks.routing_closed(), reporter)?;
-            nft.install(&rules, &ports, &closed)?;
+            nft.install(&rules, &ports, &closed, &outside_links()?)?;
         }
     }
     nft.add_network(&NetworkRules::from(config))?;
     Ok(())
+}
+
+/// The links no published port is reached from: the macOS guest's NAT
+/// link in the guest ([`forward::GUEST_LINK`], F108), none on a Linux host.
+///
+/// [`forward::GUEST_LINK`]: shipyard_runtime::attach::forward::GUEST_LINK
+///
+/// # Errors
+///
+/// In the guest, if its command line can't be read (never taken for "not
+/// the guest": the link would be left open).
+#[cfg(target_os = "linux")]
+fn outside_links() -> Result<Vec<String>> {
+    Ok(if crate::guest::booted_by_shipyard()? {
+        vec![shipyard_runtime::attach::forward::GUEST_LINK.to_owned()]
+    } else {
+        Vec::new()
+    })
 }
 
 /// The routing to close, from `records`: what they say, and, for each

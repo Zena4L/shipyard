@@ -62,27 +62,44 @@ pub fn until_guest_ready(paths: &VmPaths) -> Result<(), VmError> {
     }
 }
 
+/// What `stream` (connected to the host's `vm.sock` or `host.sock`)
+/// answers internal request `args`: its stdout, up to `cap`, each read
+/// within `wait`. (A host that's stopping may refuse, and close, before
+/// the request is written: its answer is read either way.)
+pub(super) fn answer_on(
+    mut stream: UnixStream,
+    args: &[&str],
+    cap: usize,
+    wait: Duration,
+) -> Result<Vec<u8>, Unanswered> {
+    // (macOS refuses a timeout, EINVAL, on a socket whose peer has closed
+    // already: its reads end at once then, and need none.)
+    let _ = stream.set_read_timeout(Some(wait));
+    let hello =
+        forward::hello(&Request::internal(args)).map_err(|e| Unanswered::Broken(e.to_string()))?;
+    let _ = forward::send(&mut stream, &hello);
+    crate::forwarding::output(&mut Connection::new(stream), cap)
+}
+
 /// [`ask`]'s one try.
 fn ask_once(paths: &VmPaths, args: &[&str], cap: usize) -> Result<Option<Vec<u8>>, VmError> {
     if status(paths)? == Status::Stopped {
         return Ok(None);
     }
-    let Ok(mut stream) = UnixStream::connect(paths.socket()) else {
+    let Ok(stream) = UnixStream::connect(paths.socket()) else {
         return Ok(None);
     };
-    // (macOS refuses a timeout, EINVAL, on a socket whose peer has closed
-    // already: its reads end at once then, and need none.)
-    let _ = stream.set_read_timeout(Some(ASK_LIMIT));
-    let hello =
-        forward::hello(&Request::internal(args)).map_err(|e| VmError::Host(e.to_string()))?;
-    // (A host that's stopping refuses, maybe before this is written.)
-    let _ = forward::send(&mut stream, &hello);
-    match crate::forwarding::output(&mut Connection::new(stream), cap) {
+    match answer_on(stream, args, cap, ASK_LIMIT) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(Unanswered::Refused(forward::Refusal::Stopping)) => Ok(None),
         Err(Unanswered::Refused(forward::Refusal::NotReady)) => Err(VmError::NotReady),
         Err(Unanswered::Refused(forward::Refusal::Other(why)) | Unanswered::Broken(why)) => {
             Err(VmError::Gone(why))
         }
+        // Another build's guest (F167): what to do said.
+        Err(Unanswered::Refused(newer @ forward::Refusal::Newer)) => {
+            Err(VmError::Gone(newer.to_string()))
+        }
+        Err(failed @ Unanswered::Failed(_)) => Err(VmError::Gone(failed.to_string())),
     }
 }

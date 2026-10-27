@@ -107,6 +107,10 @@ const PLANNED: &[(&str, fn())] = &[
         a_made_bind_source_is_bound_by_descriptor,
     ),
     (
+        "a_shared_bind_source_is_bound_by_descriptor",
+        a_shared_bind_source_is_bound_by_descriptor,
+    ),
+    (
         "a_planned_overlay_root_writes_to_its_upper",
         a_planned_overlay_root_writes_to_its_upper,
     ),
@@ -1043,6 +1047,75 @@ fn a_made_bind_source_is_bound_by_descriptor() {
         "a symlink in a made source's place was bound: {made:?}"
     );
     assert!(!outside.join("note").exists(), "written through the link");
+}
+
+/// A bind reached from its share by descriptor (13.8c, F173a: the macOS
+/// guest binds every source given in a share so): a file is bound as a
+/// file, the whole share as its directory (the controls: each read in the
+/// container); a link at its end or on its way, put there after the
+/// engine's check, is refused, never followed to what it names; so is
+/// what's neither a directory nor a file (a FIFO).
+fn a_shared_bind_source_is_bound_by_descriptor() {
+    use shipyard_runtime::container;
+    let test = PlanTest::new("shared");
+    let rootfs = RootFs::minimal();
+    let shared = test.dir.join("share");
+    let outside = test.dir.join("outside");
+    std::fs::create_dir_all(shared.join("dir")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(shared.join("dir/file"), "shared\n").unwrap();
+    std::fs::write(outside.join("file"), "outside\n").unwrap();
+    std::os::unix::fs::symlink(&outside, shared.join("way")).unwrap();
+    std::os::unix::fs::symlink(outside.join("file"), shared.join("end")).unwrap();
+    nix::unistd::mkfifo(
+        &shared.join("fifo"),
+        nix::sys::stat::Mode::from_bits_truncate(0o666),
+    )
+    .unwrap();
+    let from_share = |below: &str, at: &str| {
+        let mut root = Root::new(rootfs.path());
+        root.mounts
+            .push(shipyard_runtime::isolation::Mount::bind_made(
+                &shared,
+                std::path::Path::new(below),
+                at,
+            ));
+        root
+    };
+    let plan = test.plan(
+        from_share("dir/file", "/f"),
+        "cat /f > /out/file; touch /out/started",
+    );
+    test.run("file", &plan);
+    assert_eq!(test.out("file"), "shared\n");
+    let plan = test.plan(
+        from_share("", "/w"),
+        "cat /w/dir/file > /out/whole; touch /out/started",
+    );
+    test.run("whole", &plan);
+    assert_eq!(test.out("whole"), "shared\n");
+    let state = test.state_root();
+    for (id, below) in [
+        ("on-its-way", "way/file"),
+        ("at-its-end", "end"),
+        ("a-fifo", "fifo"),
+    ] {
+        let plan = test.plan(
+            from_share(below, "/f"),
+            "cat /f > /out/through; touch /out/started",
+        );
+        let made =
+            container::create_planned(&state, id, &plan, &container::CreateOptions::default())
+                .and_then(|_| container::start(&state, id));
+        assert!(
+            matches!(made, Err(container::ContainerError::Setup(_))),
+            "{below}: a link in a share was bound: {made:?}"
+        );
+    }
+    assert!(
+        !test.dir.join("out/through").exists(),
+        "read through a link"
+    );
 }
 
 /// A container from a plan runs what the plan says, in its root, and ends

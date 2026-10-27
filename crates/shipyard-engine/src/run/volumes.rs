@@ -48,8 +48,10 @@ pub(super) fn canonical_source(source: &str) -> Result<String> {
 }
 
 /// Binds `volumes` into `root`: a host path as it is (resolved again, as
-/// close to the run as can be), a named volume's directory (made or not:
-/// [`hold_volumes`] makes it). Returns the named volumes' names.
+/// close to the run as can be; in the macOS guest, one given in a share
+/// judged once more and bound by descriptor from its share: 13.8c), a named
+/// volume's directory (made or not: [`hold_volumes`] makes it). Returns the
+/// named volumes' names.
 pub(super) fn bind_volumes(
     engine: &Engine,
     root: &mut Root,
@@ -58,33 +60,36 @@ pub(super) fn bind_volumes(
 ) -> Result<Vec<String>> {
     let mut named = Vec::new();
     let mut store = None;
+    let shared = crate::guest::shares::Shared::here()?;
     for mount in volumes {
-        // One Shipyard made: by descriptor from where it was made, never by
-        // its path (11.7).
-        if let Some(made) = made
+        let mut bind = if let Some(made) = made
             .iter()
             .find(|made| made.source == Path::new(&mount.source))
         {
-            let mut bind = Mount::bind_made(&made.dir, &made.below, mount.destination);
-            if mount.read_only {
-                bind.flags
-                    .push(shipyard_runtime::isolation::MountFlag::ReadOnly);
-            }
-            root.mounts.push(bind);
-            continue;
-        }
-        let source = if shipyard_storage::volume::is_named_volume(&mount.source) {
+            // One Shipyard made: by descriptor from where it was made, never
+            // by its path (11.7).
+            Mount::bind_made(&made.dir, &made.below, mount.destination)
+        } else if shipyard_storage::volume::is_named_volume(&mount.source) {
             let store = match &store {
                 Some(store) => store,
                 None => store.insert(crate::volumes::open(engine)?),
             };
             let data = store.data_path(&mount.source)?;
             named.push(mount.source);
-            data
+            Mount::bind(data, mount.destination)
+        } else if let Some((place, rest)) = shared
+            .as_ref()
+            .map(|shared| shared.bind_of(Path::new(&mount.source)))
+            .transpose()
+            .with_context(|| format!("the bind {}", mount.source))?
+            .flatten()
+        {
+            // From its share, never following a link (a container writing in
+            // the share may have swapped one in since the plan's check).
+            Mount::bind_made(place, &rest, mount.destination)
         } else {
-            PathBuf::from(canonical_source(&mount.source)?)
+            Mount::bind(canonical_source(&mount.source)?, mount.destination)
         };
-        let mut bind = Mount::bind(source, mount.destination);
         if mount.read_only {
             bind.flags
                 .push(shipyard_runtime::isolation::MountFlag::ReadOnly);
@@ -269,19 +274,20 @@ pub(super) fn take_no_copy(specs: &mut [String]) -> Result<Vec<String>> {
     Ok(places)
 }
 
-/// A bind source Shipyard made (step 11.7): `source` as it was asked,
-/// `below` the deepest directory that was there already, `dir`, resolved
-/// as Docker resolves it. Kept beside the record (`created.json` v6), so
-/// each start makes and binds it again by descriptor from `dir`: a symlink
-/// put on its path later (a container sharing a directory above it) is
-/// refused, never followed.
+/// A bind source Shipyard made (step 11.7): `source` as it was asked, made
+/// `below` a directory, `dir`, resolved as Docker resolves it: the deepest
+/// that was there already, or, in the macOS guest, the share it's in (its
+/// path in the share then in `below` too: 13.8c). Kept beside the record
+/// (`created.json` v6), so each start makes and binds it again by
+/// descriptor from `dir`: a symlink put on its path later (a container
+/// sharing a directory above it) is refused, never followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MadeSource {
     /// The source as the bind asks for it.
     pub source: PathBuf,
-    /// The directory that was there, canonical.
+    /// The directory it's reached from, canonical.
     pub dir: PathBuf,
-    /// What was made below it: plain, relative.
+    /// Its path below `dir`: plain, relative.
     pub below: PathBuf,
 }
 
@@ -313,9 +319,61 @@ impl MadeSource {
     /// ([`ErrorKind::InvalidRequest`]); its directory gone, or one that
     /// can't be made.
     pub fn make_again(&self) -> Result<()> {
-        let dir = std::fs::File::open(&self.dir)
-            .with_context(|| format!("opening {} for the bind's source", self.dir.display()))?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Canonical when it was made: a link at its end now was put since,
+        // refused (13.8c; one higher up is followed, as Docker resolves the
+        // directory). In the macOS guest it's a share's place, reached so
+        // after `from_its_share` judged the source.
+        let dir = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&self.dir)
+        {
+            Ok(dir) => dir,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                return Err(link_in_the_way(&self.source));
+            }
+            Err(error) => {
+                return Err(Error::from(error)).with_context(|| {
+                    format!("opening {} for the bind's source", self.dir.display())
+                });
+            }
+        };
         make_below(&dir, &self.below, &self.source)
+    }
+
+    /// In the macOS guest, one whose directory is in a share, reached from
+    /// that share instead (13.8c, F173a): its directory judged and split
+    /// ([`Shared::bind_of`](crate::guest::shares::Shared::bind_of)), so
+    /// it's made and bound from the share's own mount, never through a link
+    /// a container writing in the share swapped in on its directory's path.
+    /// Anywhere else, as it is.
+    ///
+    /// # Errors
+    ///
+    /// The share's refusal ([`ErrorKind::InvalidRequest`]).
+    pub fn from_its_share(self) -> Result<Self> {
+        let Some(shared) = crate::guest::shares::Shared::here()? else {
+            return Ok(self);
+        };
+        // Judged as itself (where it's made, if it isn't yet), not as its
+        // directory: a directory holding the VM's own places (the home) is
+        // let through only while their hiding holds, which a bind of the
+        // source never reaches.
+        let Some((place, rest)) = shared
+            .bind_of(&self.dir.join(&self.below))
+            .with_context(|| format!("the bind {}", self.source.display()))?
+        else {
+            return Ok(self);
+        };
+        if rest.as_os_str().is_empty() {
+            return Ok(self);
+        }
+        Ok(Self {
+            below: rest,
+            dir: place,
+            source: self.source,
+        })
     }
 
     /// [`MadeSource::make_again`] where its directory is still there, else
@@ -327,8 +385,9 @@ impl MadeSource {
     /// As those two.
     pub fn made_for_this_start(&self) -> Result<Option<Self>> {
         if self.dir.is_dir() {
-            self.make_again()?;
-            return Ok(Some(self.clone()));
+            let made = self.clone().from_its_share()?;
+            made.make_again()?;
+            return Ok(Some(made));
         }
         make_bind_source(&self.source)
     }
@@ -373,12 +432,14 @@ pub fn make_bind_source(path: &Path) -> Result<Option<MadeSource>> {
         .to_path_buf();
     let dir = std::fs::canonicalize(there)
         .with_context(|| format!("resolving {} for the bind's source", there.display()))?;
-    let made = MadeSource::checked(path.to_path_buf(), dir, below).ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidRequest,
-            format!("{}: not a plain path to make", path.display()),
-        )
-    })?;
+    let made = MadeSource::checked(path.to_path_buf(), dir, below)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidRequest,
+                format!("{}: not a plain path to make", path.display()),
+            )
+        })?
+        .from_its_share()?;
     made.make_again()?;
     Ok(Some(made))
 }
@@ -388,15 +449,25 @@ fn make_below(dir: &std::fs::File, below: &Path, source: &Path) -> Result<()> {
     use std::os::fd::AsFd as _;
     match shipyard_sys::fs::make_below(dir.as_fd(), below, 0o755) {
         Ok(_) => Ok(()),
-        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => bail!(
-            InvalidRequest,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            Err(link_in_the_way(source))
+        }
+        Err(error) => Err(Error::from(error))
+            .with_context(|| format!("making the bind's source {}", source.display())),
+    }
+}
+
+/// The refusal of a made bind `source` with a symlink or a file where
+/// Shipyard reaches or makes a directory.
+fn link_in_the_way(source: &Path) -> Error {
+    Error::new(
+        ErrorKind::InvalidRequest,
+        format!(
             "the bind's source {} has a symlink or a file where Shipyard makes a directory: \
              give the path it names instead",
             source.display()
         ),
-        Err(error) => Err(Error::from(error))
-            .with_context(|| format!("making the bind's source {}", source.display())),
-    }
+    )
 }
 
 /// How long a fill waits for another one of the same volume.
@@ -950,6 +1021,16 @@ mod tests {
         let again = gone.made_for_this_start().unwrap().unwrap();
         assert!(made.is_dir());
         assert_eq!(again.dir, std::fs::canonicalize(&dir).unwrap());
+        // Its directory itself swapped for a link since (13.8c): refused,
+        // nothing made where the link leads.
+        let held =
+            super::MadeSource::checked(dir.join("held/x"), dir.join("held"), "x".into()).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("held")).unwrap();
+        assert_eq!(
+            held.make_again().unwrap_err().kind(),
+            crate::error::ErrorKind::InvalidRequest
+        );
+        assert!(!outside.join("x").exists(), "nothing made through the link");
         assert_eq!(
             super::make_bind_source(std::path::Path::new("rel/dir"))
                 .unwrap_err()

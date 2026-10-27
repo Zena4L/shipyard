@@ -16,6 +16,7 @@
 //! | `ports6`, `ports6_addr` | the same for IPv6                                  |
 //! | `closed`      | `ipv4`, `ipv6`: those Shipyard turned forwarding on for      |
 //! | `uplinks`     | the host's own interfaces when it did                        |
+//! | `outside`     | links no published port is reached from (the macOS VM's NAT) |
 //! | `isolated`    | the bridges of networks kept from the host (`--isolate-host`) |
 //! | `dns_allow`   | `bridge . gateway . protocol . 53`: what those may still reach |
 //! | `limited`     | the bridges of networks with a connection limit              |
@@ -37,7 +38,9 @@
 //!   or out of a container's bridge, is dropped; replies pass; so does what stays on
 //!   one bridge (a host with `br_netfilter` hands switched frames to this
 //!   hook too); nothing goes into or out of an internal network; what was
-//!   DNAT'd (a published port) passes; anything else for a container's bridge
+//!   DNAT'd (a published port) passes, unless it came in on a link in
+//!   `outside` (the macOS guest's `eth0`: only the Mac reaches its ports,
+//!   over vsock, never another VM on its network); anything else for a container's bridge
 //!   is dropped, so neither another network nor the outside reaches a
 //!   container, except through a published port. And if the host didn't
 //!   route before Shipyard turned forwarding on (`closed`), it doesn't start
@@ -109,8 +112,10 @@ pub(crate) const FAMILY: u8 = NFPROTO_INET;
 // and a host saving and restoring its firewall with nft would fail on it.
 // 7: the `input` chain and the metadata drops, for networks made with
 // `--isolate-host`, stage 9, step 9.7c1. 8: the connection limit, for
-// networks made with `--conntrack-limit`, step 9.7c2.)
-pub(crate) const VERSION: &[u8] = b"shipyard ruleset 8";
+// networks made with `--conntrack-limit`, step 9.7c2. 9: the `outside` set
+// and its drop of what was DNAT'd from it, the macOS guest's NAT link, step
+// 13.5b, F108.)
+pub(crate) const VERSION: &[u8] = b"shipyard ruleset 9";
 
 /// The most connections a container on a network made with
 /// `--conntrack-limit` may have open, of those it opened (counted per
@@ -144,6 +149,7 @@ pub(crate) mod set {
     pub(crate) const INTERNAL: &str = "internal";
     pub(crate) const CLOSED: &str = "closed";
     pub(crate) const UPLINKS: &str = "uplinks";
+    pub(crate) const OUTSIDE: &str = "outside";
     pub(crate) const MASQUERADE: &str = "masquerade4";
     pub(crate) const MASQUERADE6: &str = "masquerade6";
     pub(crate) const PORTS: &str = "ports";
@@ -235,7 +241,7 @@ const fn reg(n: u32) -> u32 {
     NFT_REG32_00 + n
 }
 
-pub(super) fn sets() -> [SetSpec; 16] {
+pub(super) fn sets() -> [SetSpec; 17] {
     let ifname_len = u32::try_from(IFNAMSIZ).unwrap_or(16);
     let ifname = (TYPE_IFNAME, ifname_len);
     let [isolated, dns_allow, limited, conns4, conns6] = option_sets();
@@ -263,6 +269,12 @@ pub(super) fn sets() -> [SetSpec; 16] {
         },
         SetSpec {
             name: set::UPLINKS,
+            flags: 0,
+            key: ifname,
+            data: None,
+        },
+        SetSpec {
+            name: set::OUTSIDE,
             flags: 0,
             key: ifname,
             data: None,
@@ -434,12 +446,15 @@ pub struct ClosedRouting {
 }
 
 /// The batch that creates the whole table, filled with `networks` and
-/// `ports`, and with routing `closed` (on a table that isn't there: the
-/// caller deletes an old one in the same batch).
+/// `ports`, with routing `closed`, and with the links no published port is
+/// reached from (`outside`: none on a Linux host; the macOS guest's NAT
+/// link) (on a table that isn't there: the caller deletes an old one in the
+/// same batch).
 pub(crate) fn install(
     networks: &[NetworkRules],
     ports: &[PortRule],
     closed: &ClosedRouting,
+    outside: &[String],
 ) -> Vec<BatchItem> {
     let mut items = vec![new_table(FAMILY, TABLE, VERSION)];
     items.extend(
@@ -461,6 +476,13 @@ pub(crate) fn install(
     items.extend(port_items(ports, false));
     for &family in &closed.families {
         items.extend(close_routing(family, &closed.interfaces));
+    }
+    if !outside.is_empty() {
+        let links: Vec<Element> = outside
+            .iter()
+            .map(|name| Element::key(ifname_key(name)))
+            .collect();
+        items.push(add_elements(FAMILY, TABLE, set::OUTSIDE, &links, false));
     }
     items
 }

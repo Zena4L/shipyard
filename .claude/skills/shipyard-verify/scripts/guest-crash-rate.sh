@@ -8,7 +8,9 @@
 #   target/guest, scripts/guest/build.sh's); OUT_DIR keeps each boot's
 #   console and log (default target/guest-crash-rate/<time>).
 # Settings to compare go through the environment, as the VM reads them:
-#   SHIPYARD_VM_CPUS, SHIPYARD_VM_MEMORY_MIB (diagnosis overrides).
+#   SHIPYARD_VM_CPUS, SHIPYARD_VM_MEMORY_MIB (diagnosis overrides, above
+#   `vm.json` and 13.2's default of a quarter of the Mac's memory: set both
+#   for a run whose size must be known).
 #
 # The work: a container, the home's share bound in (read, then 64 MiB
 # written and read back), a detached container on the bridge network (its
@@ -18,9 +20,10 @@
 # (its `network.json`), as one VM does: a new address each boot would take
 # another of the Mac's NAT leases (253, an hour each) and use them up.
 #
-# Prints a line per boot (ok, CRASH, HANG, or NET: the guest had its lease
-# and a lookup failed, the Mac's network, not counted; a guest with no lease
-# is a HANG), with its seconds, then the rate with its 95% bounds (Wilson).
+# Prints a line per boot (ok, CRASH, HANG, NET: the guest had its lease
+# and a lookup failed, the Mac's network, not counted; REGISTRY: the pull
+# failed with the console clean, not counted; a guest with no lease is a
+# HANG), with its seconds, then the rate with its 95% bounds (Wilson).
 # Each boot is bounded (90 s a step, 150 s its stop); a slot whose VM
 # didn't stop gets a new address. Interrupted, it stops its VMs and removes
 # their directories.
@@ -94,7 +97,11 @@ boot() {
     # stopped: two VMs with one address clash on the NAT.
     if timeout 150 env -u SHIPYARD_VM SHIPYARD_VM_DIR="$dir" "$shipyard" vm stop \
         </dev/null >>"$log" 2>&1; then
-        [ -f "$dir/network.json" ] && cp "$dir/network.json" "$card"
+        # As v1, the address alone (13.2's v2 names its directory, and the
+        # next boot's directory would then make a new address: a new lease).
+        local mac
+        mac=$(sed -n 's/.*"mac" *: *"\([^"]*\)".*/\1/p' "$dir/network.json" 2>/dev/null)
+        [ -n "$mac" ] && printf '{"version":1,"mac":"%s"}' "$mac" >"$card"
     else
         rm -f "$card"
     fi
@@ -105,6 +112,12 @@ boot() {
         grep -q "udhcpc: lease of" "$out/console-$i.log" 2>/dev/null; then
         # An address, and still no name: the Mac's network, not counted.
         verdict=NET
+    elif grep -q "^shipyard: pulling " "$log" ||
+        { [ "$worked" -ne 0 ] && tail -1 "$log" | grep -q "^Pulling "; }; then
+        # The registry said no (a blob it lost for a while, 13.8a's run B)
+        # or never answered the pull, the guest's console clean: not the
+        # guest's, not counted.
+        verdict=REGISTRY
     elif [ "$worked" -ne 0 ]; then
         verdict=HANG
     else
@@ -129,7 +142,10 @@ done
 sort -t' ' -k3n "$out/verdicts"
 bad=$(grep -cE "^(CRASH|HANG) " "$out/verdicts")
 net=$(grep -c "^NET " "$out/verdicts")
+registry=$(grep -c "^REGISTRY " "$out/verdicts")
 [ "$net" -gt 0 ] && echo "$net boots without the Mac's network (NET): not counted"
+[ "$registry" -gt 0 ] && echo "$registry boots whose pull the registry failed (REGISTRY): not counted"
+net=$((net + registry))
 [ "$net" -lt "$n" ] || { echo "no boot counted" >&2; exit 1; }
 python3 - "$bad" "$((n - net))" <<'EOF'
 import math, sys

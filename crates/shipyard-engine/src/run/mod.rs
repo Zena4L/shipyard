@@ -41,6 +41,8 @@ mod plan;
 mod prepare;
 mod recover;
 #[cfg(target_os = "linux")]
+pub(crate) use recover::comes_back;
+#[cfg(target_os = "linux")]
 mod remove;
 mod rename;
 mod request;

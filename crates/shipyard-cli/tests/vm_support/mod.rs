@@ -96,11 +96,20 @@ impl Vm {
         let cards = repo.join("target/vm-test-cards");
         std::fs::create_dir_all(&cards).unwrap();
         let card = cards.join(format!("slot-{slot}.json"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         if card.is_file() {
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::copy(&card, dir.join("network.json")).unwrap();
         }
+        // Each test VM the size they had before 13.2 (4 GiB, 4 CPUs), not a
+        // quarter of this Mac's each: four at once are what F132's crashes
+        // came with, and the timings were set at that size. (`vm set` in a
+        // test changes it.)
+        std::fs::write(
+            dir.join("vm.json"),
+            r#"{"version":1,"memory_mib":4096,"cpus":4}"#,
+        )
+        .unwrap();
         Some(Self {
             dir,
             guest,
@@ -138,10 +147,7 @@ impl Vm {
 
     /// `shipyard ARGS`, with nothing on its stdin.
     pub(crate) fn shipyard(&self, args: &[&str]) -> Output {
-        self.command(args)
-            .stdin(Stdio::null())
-            .output()
-            .expect("running shipyard")
+        bounded(self.command(args), COMMAND_LIMIT)
     }
 
     /// The guest's files it boots.
@@ -199,10 +205,20 @@ impl Drop for Vm {
             .status()
             .is_ok_and(|status| status.success());
         // The slot's address kept for its next VM, unless this one may
-        // still run: two VMs with one address would clash on the NAT.
+        // still run: two VMs with one address would clash on the NAT. Kept
+        // as a v1 file (the address alone): a v2 one names this directory,
+        // and the next test's new directory would make a new address
+        // (F138's rule), a NAT lease spent per test (AGENTS.md §10).
         let kept = self.dir.join("network.json");
         if stopped && kept.is_file() {
-            let _ = std::fs::copy(&kept, &self.card);
+            let mac = std::fs::read(&kept)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|file| file.get("mac")?.as_str().map(str::to_owned));
+            if let Some(mac) = mac {
+                let card = serde_json::json!({ "version": 1, "mac": mac });
+                let _ = std::fs::write(&self.card, card.to_string());
+            }
         } else if !stopped {
             let _ = std::fs::remove_file(&self.card);
         }
@@ -224,9 +240,15 @@ impl Scratch {
         Self::at(&std::env::temp_dir(), name)
     }
 
-    /// Under the home: the VM shares only it.
+    /// Under the home, which the VM shares.
     pub(crate) fn in_home(name: &str) -> Self {
         Self::at(Path::new(&std::env::var("HOME").unwrap()), name)
+    }
+
+    /// Under `/tmp`, which the VM shares too (step 13.4), by the path a
+    /// user names (`/tmp`, a link to `/private/tmp` on a Mac).
+    pub(crate) fn in_tmp(name: &str) -> Self {
+        Self::at(Path::new("/tmp"), name)
     }
 
     /// Its own, though tests of one process run at once: the process's
@@ -266,16 +288,51 @@ pub(crate) fn docker_cli(needed: &str) -> Option<PathBuf> {
     found
 }
 
+/// How long a VM test's command may take: past the slowest pull and build
+/// seen, and a cold boot (F132: a guest that died fails its test, never
+/// holds the suite).
+pub(crate) const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// `command`'s output, its stdin nothing, killed past `limit` (a hung
 /// relay fails its test instead of holding the suite for good).
 pub(crate) fn bounded(mut command: Command, limit: std::time::Duration) -> Output {
-    use std::io::Read as _;
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawning");
+    finish_within(child, limit, &format!("{command:?}"))
+}
+
+/// A command's output within [`COMMAND_LIMIT`], as `bounded`'s, for a
+/// command built in place (its stdin as it was set).
+pub(crate) trait BoundedOutput {
+    /// Its output; killed past the limit, the test failing.
+    fn bounded_output(&mut self) -> Output;
+}
+
+impl BoundedOutput for Command {
+    fn bounded_output(&mut self) -> Output {
+        let child = self
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning");
+        finish_within(child, COMMAND_LIMIT, &format!("{self:?}"))
+    }
+}
+
+/// What a running `child` (`what`, for its failure) said, once it ends
+/// within `limit`; killed past it, the test failing then (F132: the VM
+/// tests' every wait is bounded). Its piped stdout and stderr are read as it
+/// runs.
+pub(crate) fn finish_within(
+    mut child: std::process::Child,
+    limit: std::time::Duration,
+    what: &str,
+) -> Output {
+    use std::io::Read as _;
     let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -305,7 +362,7 @@ pub(crate) fn bounded(mut command: Command, limit: std::time::Duration) -> Outpu
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{command:?} still ran after {limit:?}: killed");
+            panic!("{what} still ran after {limit:?}: killed");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };

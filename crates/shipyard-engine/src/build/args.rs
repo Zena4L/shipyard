@@ -114,16 +114,8 @@ pub(super) fn checked(request: &BuildRequest) -> Result<Vec<ImageReference>> {
             bail!(InvalidRequest, "two secrets with the id {:?}", secret.id);
         }
     }
-    if let Some(platform) = &request.platform
-        && !crate::image::is_host_platform(platform)
-    {
-        let host = shipyard_image::Platform::host();
-        bail!(
-            InvalidRequest,
-            "only this host's platform can be built ({}/{}), not {platform:?}",
-            host.os,
-            host.architecture
-        );
+    if let Some(platform) = &request.platform {
+        crate::image::platform_here(platform, "built")?;
     }
     if let Some(target) = &request.target
         && target.is_empty()
@@ -172,6 +164,15 @@ pub(super) fn buildctl_args(request: &BuildRequest, names: &[ImageReference]) ->
     }
     if request.pull {
         opt("image-resolve-mode=pull".to_owned());
+    }
+    // The platform asked for (checked to run here: `checked`), as BuildKit
+    // names it; its `RUN` steps run through Rosetta's `binfmt_misc` entry.
+    if let Some(platform) = request
+        .platform
+        .as_deref()
+        .and_then(|asked| crate::image::named_in(asked, &crate::image::platforms_here()))
+    {
+        opt(format!("platform={platform}"));
     }
     if request.no_cache {
         args.push("--no-cache".to_owned());
@@ -226,6 +227,16 @@ mod tests {
         assert!(has(["--opt", "label:org.example=x y"]));
         assert!(has(["--opt", "target=final"]));
         assert!(has(["--opt", "image-resolve-mode=pull"]));
+        // A platform asked for reaches BuildKit as it's named here.
+        let mut other = request.clone();
+        other.platform = Some("linux".to_owned());
+        let args = buildctl_args(&other, &names);
+        let named = crate::image::platforms_here()[0].to_string();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--opt" && pair[1] == format!("platform={named}")),
+            "{args:?}"
+        );
         assert!(has(["--secret", "id=token,src=/secrets/token"]));
         assert!(args.contains(&"--no-cache".to_owned()));
         assert_eq!(

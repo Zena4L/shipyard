@@ -497,6 +497,10 @@ pub(crate) struct PullArgs {
     /// Print nothing but the image's digest.
     #[arg(short, long)]
     pub(crate) quiet: bool,
+    /// The platform to pull (`linux/amd64`: on a Mac, run through Rosetta);
+    /// by default the image's own among what runs here, this host's first.
+    #[arg(long, value_name = "PLATFORM")]
+    pub(crate) platform: Option<String>,
     /// The image, like `alpine:3.20` or `ghcr.io/owner/app@sha256:...`.
     #[arg(value_name = "IMAGE")]
     pub(crate) reference: String,
@@ -561,7 +565,7 @@ pub(crate) struct ImportArgs {
     /// Its history's comment.
     #[arg(short, long, value_name = "MESSAGE")]
     pub(crate) message: Option<String>,
-    /// The platform: this host's only.
+    /// The image's platform: one that runs here (on a Mac, `linux/amd64` too).
     #[arg(long, value_name = "PLATFORM")]
     pub(crate) platform: Option<String>,
     /// The archive: a file, or - for standard input (a URL isn't taken).
@@ -1003,10 +1007,35 @@ pub(crate) enum VmCommand {
     /// Let launchd hold Docker's socket while the VM is stopped and start
     /// the VM at its first connection (`docker` works any time; nothing runs
     /// until then). Run again after moving shipyard.
-    Install,
+    Install(VmInstallArgs),
     /// Undo `vm install`: launchd lets go of Docker's socket (a VM it
     /// started is stopped first).
     Uninstall,
+    /// Set the VM's memory and CPUs (taken at its next start).
+    Set(VmSetArgs),
+}
+
+/// `shipyard vm install`'s flags.
+#[derive(Debug, Args)]
+pub(crate) struct VmInstallArgs {
+    /// Also start the VM at login, when containers with a restart policy
+    /// would come back (they're brought back in it, and the VM stops by
+    /// itself once none runs). `vm install` without it turns that off.
+    #[arg(long)]
+    pub(crate) at_login: bool,
+}
+
+/// `shipyard vm set`'s flags.
+#[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("size").required(true).multiple(true))]
+pub(crate) struct VmSetArgs {
+    /// The VM's memory (`8g`, `6144m`), or `default` (a quarter of this
+    /// Mac's, from 4 GiB to 16 GiB).
+    #[arg(long, value_name = "SIZE", group = "size")]
+    pub(crate) memory: Option<String>,
+    /// The VM's CPUs, or `default` (half this Mac's cores, at most 8).
+    #[arg(long, value_name = "N", group = "size")]
+    pub(crate) cpus: Option<String>,
 }
 
 #[cfg(test)]

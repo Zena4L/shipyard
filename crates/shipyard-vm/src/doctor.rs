@@ -66,18 +66,116 @@ pub fn checks(paths: Result<&VmPaths, &VmError>, revision: &str) -> Vec<Finding>
             docker(
                 &paths.docker_socket(),
                 crate::launchd::socket_there(&paths.docker_socket()),
-                crate::launchd::program(paths).as_deref(),
+                (
+                    crate::launchd::program(paths).as_deref(),
+                    crate::launchd::state(paths),
+                ),
                 crate::launchd::this_binary().ok().as_deref(),
             ),
-            home(),
+            shares(),
             files(paths),
+            disk(&paths.disk(), &paths.dir),
+            rosetta(crate::machine::rosetta()),
         ]),
         Err(error) => found.extend([
-            home(),
+            shares(),
             Finding::new(Level::Fail, "files", error.to_string()),
         ]),
     }
+    if let Ok(paths) = paths
+        && crate::launchd::installed_by_older(paths)
+    {
+        found.push(Finding::new(
+            Level::Warn,
+            "launchd",
+            crate::launchd::OLDER_AGENT,
+        ));
+    }
     found
+}
+
+/// This Mac's Rosetta for Linux: amd64 images run in the VM through it
+/// (step 13.3); without it, how to have it.
+fn rosetta(rosetta: crate::machine::Rosetta) -> Finding {
+    use crate::machine::Rosetta;
+    match rosetta {
+        Rosetta::Installed => Finding::new(
+            Level::Ok,
+            "rosetta",
+            "installed: amd64 images run in the VM through it (slower than arm64 ones)",
+        ),
+        Rosetta::NotInstalled => Finding::new(
+            Level::Warn,
+            "rosetta",
+            "not installed: amd64 images won't run (`softwareupdate --install-rosetta \
+             --agree-to-license`, then `shipyard vm stop`)",
+        ),
+        Rosetta::NotSupported => Finding::new(
+            Level::Warn,
+            "rosetta",
+            "not supported on this Mac: amd64 images won't run",
+        ),
+    }
+}
+
+/// The Mac's free space below which `doctor` warns: the guest's ext4 goes
+/// read-only when its sparse image can't grow (F103).
+const FREE_WARN: u64 = 10 << 30;
+
+/// The Mac's free space below which `doctor` fails.
+const FREE_FAIL: u64 = 2 << 30;
+
+/// The data disk (`image`): what its sparse image takes on the Mac (it
+/// gives freed space back at each stop: D13.2-3), and the Mac's free space
+/// where it lives (`dir`'s volume).
+fn disk(image: &Path, dir: &Path) -> Finding {
+    use std::os::unix::fs::MetadataExt as _;
+    let taken = std::fs::metadata(image).ok().map(|m| m.blocks() * 512);
+    let free = nix::sys::statvfs::statvfs(dir)
+        .ok()
+        .map(|vfs| u64::from(vfs.blocks_available()) * vfs.fragment_size());
+    disk_finding(taken, free)
+}
+
+/// [`disk`]'s finding from the image's bytes `taken` (none: no disk yet)
+/// and the Mac's `free` bytes.
+fn disk_finding(taken: Option<u64>, free: Option<u64>) -> Finding {
+    // To a tenth of a GiB, in whole numbers (no float's rounding).
+    let gib = |bytes: u64| {
+        let tenths = u128::from(bytes) * 10 / (1 << 30);
+        format!("{}.{} GiB", tenths / 10, tenths % 10)
+    };
+    let taken = taken.map_or_else(
+        || "not made yet".to_owned(),
+        |bytes| format!("takes {}", gib(bytes)),
+    );
+    match free {
+        None => Finding::new(
+            Level::Warn,
+            "disk",
+            format!("{taken}; this Mac's free space can't be read"),
+        ),
+        Some(free) if free < FREE_FAIL => Finding::new(
+            Level::Fail,
+            "disk",
+            format!(
+                "{taken}; this Mac has {} free: the VM's disk can't grow, and its files go \
+                 read-only (free some space; what `shipyard system prune` frees comes back at \
+                 the VM's stop: `shipyard vm stop`)",
+                gib(free)
+            ),
+        ),
+        Some(free) if free < FREE_WARN => Finding::new(
+            Level::Warn,
+            "disk",
+            format!("{taken}; this Mac has only {} free", gib(free)),
+        ),
+        Some(free) => Finding::new(
+            Level::Ok,
+            "disk",
+            format!("{taken}; {} free on this Mac", gib(free)),
+        ),
+    }
 }
 
 /// Docker's socket (`socket`): launchd's any time, once `shipyard vm
@@ -85,9 +183,20 @@ pub fn checks(paths: Result<&VmPaths, &VmError>, revision: &str) -> Vec<Finding>
 /// while the VM runs. An agent whose socket isn't `there` (another host
 /// took it, or the directory was emptied) is said, with the fix. An agent that runs another binary than this one
 /// (`ours`: moved, or rebuilt elsewhere) is said, with the fix.
-fn docker(socket: &Path, there: bool, agent: Option<&Path>, ours: Option<&Path>) -> Finding {
+fn docker(
+    socket: &Path,
+    there: bool,
+    (agent, state): (Option<&Path>, crate::launchd::AgentState),
+    ours: Option<&Path>,
+) -> Finding {
     let socket = socket.display();
     match agent {
+        // (Docker's socket is then no one's: F152.)
+        None if state == crate::launchd::AgentState::NotLoaded => Finding::new(
+            Level::Warn,
+            "docker",
+            format!("{socket}: {}", crate::launchd::NOT_LOADED),
+        ),
         None => Finding::new(
             Level::Ok,
             "docker",
@@ -137,26 +246,23 @@ fn docker(socket: &Path, there: bool, agent: Option<&Path>, ours: Option<&Path>)
 
 /// This Mac's version, as `sw_vers` says it (`kern.osproductversion`).
 fn os_version() -> Option<String> {
-    let name = c"kern.osproductversion";
-    let mut buffer = [0_u8; 64];
-    let mut len = buffer.len();
-    // SAFETY: `name` is a C string; `buffer` and `len` are valid, `len` its
-    // size, which the call updates to what it wrote; no new value is set.
-    let done = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if done != 0 {
-        return None;
-    }
-    let text = buffer.get(..len)?;
-    let text = text.split(|&byte| byte == 0).next()?;
-    String::from_utf8(text.to_vec()).ok()
+    crate::sysctl::string_named(c"kern.osproductversion")
+}
+
+/// Why the VM can't run on this Mac's macOS (`version`, `sw_vers`'s), if it
+/// can't: older than [`MACOS_FLOOR`] (step 13.7: refused by name at the
+/// VM's start, as `doctor` says it). One that can't be read isn't refused.
+#[must_use]
+pub fn floor_refusal(version: Option<&str>) -> Option<String> {
+    let version = version?;
+    (major(version)? < MACOS_FLOOR)
+        .then(|| format!("macOS {version}: the VM needs macOS {MACOS_FLOOR} or later"))
+}
+
+/// [`floor_refusal`] for this Mac.
+#[must_use]
+pub fn this_macs_floor_refusal() -> Option<String> {
+    floor_refusal(os_version().as_deref())
 }
 
 /// The major version of a macOS version (`13.6.1` → 13).
@@ -176,16 +282,14 @@ fn macos(version: Option<&str>, arch: &str) -> Finding {
             format!("macOS {version} on {arch}: the VM needs Apple Silicon"),
         );
     }
+    if let Some(refused) = floor_refusal(Some(version)) {
+        return Finding::new(Level::Fail, "macos", refused);
+    }
     match major(version) {
-        Some(major) if major >= MACOS_FLOOR => Finding::new(
+        Some(_) => Finding::new(
             Level::Ok,
             "macos",
             format!("macOS {version}, Apple Silicon"),
-        ),
-        Some(_) => Finding::new(
-            Level::Fail,
-            "macos",
-            format!("macOS {version}: the VM needs macOS {MACOS_FLOOR} or later"),
         ),
         None => Finding::new(
             Level::Warn,
@@ -201,7 +305,7 @@ fn entitlement() -> Finding {
         return Finding::new(Level::Warn, "entitlement", "this binary can't be found");
     };
     match codesign(&exe) {
-        Ok(shown) => entitled(&shown, &exe),
+        Ok((shown, signature)) => entitled(&shown, signer(&signature).as_deref(), &exe),
         Err(why) => Finding::new(
             Level::Warn,
             "entitlement",
@@ -213,45 +317,53 @@ fn entitlement() -> Finding {
 /// How long `codesign` may take.
 const CODESIGN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// What `codesign` shows of `exe`'s entitlements, within
-/// [`CODESIGN_LIMIT`] (a stalled one is killed). Its output is small: it
-/// fits in the pipe while it's waited for.
-fn codesign(exe: &Path) -> Result<Vec<u8>, String> {
-    use std::io::Read as _;
-    let mut child = std::process::Command::new("/usr/bin/codesign")
-        .args(["-d", "--entitlements", "-", "--xml"])
-        .arg(exe)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("can't be run ({e})"))?;
-    let began = std::time::Instant::now();
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
-        if began.elapsed() > CODESIGN_LIMIT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "didn't answer within {} s",
-                CODESIGN_LIMIT.as_secs()
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let mut shown = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut shown).map_err(|e| e.to_string())?;
-    }
-    Ok(shown)
+/// What `codesign` shows of `exe`: its entitlements (stdout) and its
+/// signature (stderr: `-dvv`), within [`CODESIGN_LIMIT`] (a stalled one is
+/// killed).
+fn codesign(exe: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let shown = crate::child::output_within(
+        std::process::Command::new("/usr/bin/codesign")
+            .args(["-dvv", "--entitlements", "-", "--xml"])
+            .arg(exe),
+        CODESIGN_LIMIT,
+    )
+    .map_err(|e| format!("can't be run ({e})"))?
+    .ok_or_else(|| format!("didn't answer within {} s", CODESIGN_LIMIT.as_secs()))?;
+    Ok((shown.stdout, shown.stderr))
 }
 
-/// [`entitlement`]'s finding from `codesign`'s output for `exe`.
-fn entitled(shown: &[u8], exe: &Path) -> Finding {
+/// Who signed a binary, as `codesign -dvv` says it (`signature`): its first
+/// authority, or `None` for an ad-hoc signature (or none read).
+fn signer(signature: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(signature)
+        .lines()
+        .find_map(|line| line.strip_prefix("Authority="))
+        .map(str::to_owned)
+}
+
+/// [`entitlement`]'s finding from `codesign`'s output for `exe` (`shown`,
+/// its entitlements; `signer`, who signed it, `None` ad hoc): signed to run
+/// a VM, and by an identity that's the same across rebuilds or not (step
+/// 13.7, F140: macOS asks again for the guarded folders after each rebuild
+/// of an ad-hoc one).
+fn entitled(shown: &[u8], signer: Option<&str>, exe: &Path) -> Finding {
     let shown = String::from_utf8_lossy(shown);
     let key = format!("<key>{ENTITLEMENT}</key>");
     match shown.find(&key) {
         Some(at) if shown[at + key.len()..].trim_start().starts_with("<true/>") => {
-            Finding::new(Level::Ok, "entitlement", "signed to run a VM")
+            let how = signer.map_or_else(
+                || {
+                    "ad hoc: macOS asks again for your folders after each rebuild; \
+                     scripts/macos/make-signing-identity.sh makes an identity that stays"
+                        .to_owned()
+                },
+                |signer| format!("{signer}: one identity across rebuilds"),
+            );
+            Finding::new(
+                Level::Ok,
+                "entitlement",
+                format!("signed to run a VM ({how})"),
+            )
         }
         _ => Finding::new(
             Level::Fail,
@@ -307,6 +419,16 @@ fn vm(paths: &VmPaths) -> Finding {
         );
     let idle = format!("it stops after {} with nothing running", span(limit));
     match client::status(paths) {
+        // Another build's guest booted (F173b): what to do said.
+        Ok(Status::Running(Some(pid)))
+            if let Some(another) = crate::booted::running_elsewhere(paths) =>
+        {
+            Finding::new(
+                Level::Warn,
+                "vm",
+                format!("running (host PID {pid}), but {another}"),
+            )
+        }
         Ok(Status::Running(Some(pid))) => {
             Finding::new(Level::Ok, "vm", format!("running (host PID {pid}); {idle}"))
         }
@@ -335,13 +457,24 @@ fn ports(paths: &VmPaths) -> Finding {
         return Finding::new(Level::Ok, "ports", ONLY);
     }
     match PortsFile::read(&paths.ports()) {
-        Ok(file) => ports_found(file.as_ref(), ONLY),
+        Ok(file) => {
+            let shadowed = file
+                .as_ref()
+                .map(crate::ports::shadowed)
+                .unwrap_or_default();
+            ports_found(file.as_ref(), &shadowed, ONLY)
+        }
         Err(error) => Finding::new(Level::Warn, "ports", error.to_string()),
     }
 }
 
-/// [`ports`]'s finding from what the host wrote (`only`: the rule said).
-fn ports_found(file: Option<&PortsFile>, only: &str) -> Finding {
+/// [`ports`]'s finding from what the host wrote, with the forwarded ports
+/// another program shadows (`shadowed`, F98; `only`: the rule said).
+fn ports_found(
+    file: Option<&PortsFile>,
+    shadowed: &[(u16, shipyard_runtime::attach::forward::Protocol)],
+    only: &str,
+) -> Finding {
     let Some(file) = file else {
         return Finding::new(Level::Ok, "ports", only);
     };
@@ -349,40 +482,64 @@ fn ports_found(file: Option<&PortsFile>, only: &str) -> Finding {
     for (address, why) in &file.unbound {
         not.push(format!("{address} ({why})"));
     }
-    if file.udp > 0 {
-        not.push(format!("{} UDP (only TCP is, for now)", file.udp));
+    for (address, why) in &file.unbound_udp {
+        not.push(format!("{address}/udp ({why})"));
     }
-    if not.is_empty() {
+    if file.udp > 0 {
+        not.push(format!("{} UDP (an older guest's)", file.udp));
+    }
+    let shadows: Vec<String> = shadowed
+        .iter()
+        .map(|(port, protocol)| format!("{port}{}", if protocol.is_tcp() { "" } else { "/udp" }))
+        .collect();
+    if not.is_empty() && shadows.is_empty() {
         return Finding::new(
             Level::Ok,
             "ports",
-            format!("{} forwarded; {only}", file.forwarded.len()),
+            format!(
+                "{} forwarded; {only}",
+                file.forwarded.len() + file.forwarded_udp.len()
+            ),
         );
     }
-    Finding::new(
-        Level::Warn,
-        "ports",
-        format!("not forwarded: {}; {only}", not.join(", ")),
-    )
+    let mut said = Vec::new();
+    if !not.is_empty() {
+        said.push(format!("not forwarded: {}", not.join(", ")));
+    }
+    if !shadows.is_empty() {
+        said.push(format!(
+            "shadowed: {} (another program on this Mac listens on every address of it, yet \
+             localhost reaches the container)",
+            shadows.join(", ")
+        ));
+    }
+    Finding::new(Level::Warn, "ports", format!("{}; {only}", said.join("; ")))
 }
 
-/// The home the VM shares, at its own path.
-fn home() -> Finding {
+/// The places the VM shares, each at its own path: the home, and those
+/// beside it (step 13.4).
+fn shares() -> Finding {
     let Some(home) = std::env::var_os("HOME") else {
-        return Finding::new(Level::Fail, "home", "HOME isn't set: nothing to share");
+        return Finding::new(Level::Fail, "shares", "HOME isn't set: nothing to share");
     };
     match std::fs::canonicalize(&home) {
-        Ok(home) => match crate::host::cmdline(&home.to_string_lossy(), &[]) {
-            Ok(_) => Finding::new(
-                Level::Ok,
-                "home",
-                format!("{} is shared with the VM, read-write", home.display()),
-            ),
-            Err(error) => Finding::new(Level::Fail, "home", error.to_string()),
+        Ok(home) => match crate::host::cmdline(&home.to_string_lossy(), &[], &[], false) {
+            Ok(_) => {
+                let shared: Vec<String> = crate::shares::all(&home)
+                    .iter()
+                    .map(|place| place.display().to_string())
+                    .collect();
+                Finding::new(
+                    Level::Ok,
+                    "shares",
+                    format!("{} shared with the VM, read-write", shared.join(", ")),
+                )
+            }
+            Err(error) => Finding::new(Level::Fail, "shares", error.to_string()),
         },
         Err(error) => Finding::new(
             Level::Fail,
-            "home",
+            "shares",
             format!("{}: {error}", Path::new(&home).display()),
         ),
     }
@@ -400,25 +557,60 @@ fn files(paths: &VmPaths) -> Finding {
 mod tests {
     use super::*;
 
+    /// The disk's line: what the image takes, the Mac's free space, a warning
+    /// under 10 GiB free, a failure under 2 GiB.
+    #[test]
+    fn the_disk_is_said_with_the_macs_free_space() {
+        let ok = disk_finding(Some(3 << 30), Some(100 << 30));
+        assert_eq!(ok.level, Level::Ok);
+        assert_eq!(ok.text, "takes 3.0 GiB; 100.0 GiB free on this Mac");
+        assert_eq!(
+            disk_finding(Some(1 << 30), Some(9 << 30)).level,
+            Level::Warn
+        );
+        let full = disk_finding(None, Some(1 << 30));
+        assert_eq!(full.level, Level::Fail);
+        assert!(
+            full.text
+                .starts_with("not made yet; this Mac has 1.0 GiB free"),
+            "{}",
+            full.text
+        );
+        assert_eq!(disk_finding(Some(0), None).level, Level::Warn);
+    }
+
     /// Docker's socket: while the VM runs without an agent; launchd's with
     /// one that runs this binary; a warning, with the fix, for one that
     /// runs another.
     #[test]
     fn dockers_socket_says_who_holds_it() {
+        use crate::launchd::AgentState;
         let socket = Path::new("/vm/docker.sock");
         let ours = Path::new("/bin/shipyard");
-        let none = docker(socket, false, None, Some(ours));
+        let none = docker(socket, false, (None, AgentState::NotInstalled), Some(ours));
         assert_eq!(none.level, Level::Ok);
         assert!(none.text.contains("while the VM runs"), "{}", none.text);
-        let installed = docker(socket, true, Some(ours), Some(ours));
+        let installed = docker(socket, true, (Some(ours), AgentState::Loaded), Some(ours));
         assert_eq!(installed.level, Level::Ok);
         assert!(installed.text.contains("launchd's"), "{}", installed.text);
-        let moved = docker(socket, true, Some(Path::new("/old/shipyard")), Some(ours));
+        let moved = docker(
+            socket,
+            true,
+            (Some(Path::new("/old/shipyard")), AgentState::Loaded),
+            Some(ours),
+        );
         assert_eq!(moved.level, Level::Warn);
         assert!(moved.text.contains("shipyard vm install"), "{}", moved.text);
-        let lost = docker(socket, false, Some(ours), Some(ours));
+        let lost = docker(socket, false, (Some(ours), AgentState::Loaded), Some(ours));
         assert_eq!(lost.level, Level::Warn);
         assert!(lost.text.contains("isn't there"), "{}", lost.text);
+        let unloaded = docker(socket, false, (None, AgentState::NotLoaded), Some(ours));
+        assert_eq!(unloaded.level, Level::Warn);
+        assert!(
+            unloaded.text.contains("installed but not loaded"),
+            "{}",
+            unloaded.text
+        );
     }
 
     /// macOS 13 or later on Apple Silicon; an older one, or Intel, fails;
@@ -444,12 +636,50 @@ mod tests {
         let granted = format!(
             "<?xml version=\"1.0\"?><plist><dict><key>{ENTITLEMENT}</key>\n\t<true/></dict></plist>"
         );
-        assert_eq!(entitled(granted.as_bytes(), exe).level, Level::Ok);
+        assert_eq!(entitled(granted.as_bytes(), None, exe).level, Level::Ok);
         let refused = format!("<plist><dict><key>{ENTITLEMENT}</key><false/></dict></plist>");
-        assert_eq!(entitled(refused.as_bytes(), exe).level, Level::Fail);
-        assert_eq!(entitled(b"", exe).level, Level::Fail);
+        assert_eq!(entitled(refused.as_bytes(), None, exe).level, Level::Fail);
+        assert_eq!(entitled(b"", None, exe).level, Level::Fail);
         let other = b"<plist><dict><key>com.apple.security.app-sandbox</key><true/></dict></plist>";
-        assert_eq!(entitled(other, exe).level, Level::Fail);
+        assert_eq!(entitled(other, None, exe).level, Level::Fail);
+        // Who signed it said: an identity kept across rebuilds, or ad hoc.
+        let by = entitled(granted.as_bytes(), Some("Shipyard Local Signing"), exe);
+        assert!(
+            by.text
+                .contains("Shipyard Local Signing: one identity across rebuilds"),
+            "{}",
+            by.text
+        );
+        let ad_hoc = entitled(granted.as_bytes(), None, exe);
+        assert!(
+            ad_hoc.text.contains("make-signing-identity.sh"),
+            "{}",
+            ad_hoc.text
+        );
+    }
+
+    /// The signer is `codesign -dvv`'s first authority; an ad-hoc
+    /// signature has none.
+    #[test]
+    fn the_signer_is_codesigns_first_authority() {
+        let signed = b"Executable=/x\nIdentifier=shipyard\nAuthority=Shipyard Local Signing\nAuthority=Other\n";
+        assert_eq!(signer(signed).as_deref(), Some("Shipyard Local Signing"));
+        assert_eq!(signer(b"Executable=/x\nSignature=adhoc\n"), None);
+        assert_eq!(signer(b""), None);
+    }
+
+    /// A Mac older than the floor is refused by name; the floor and newer,
+    /// or a version that can't be read, aren't.
+    #[test]
+    fn an_older_macos_is_refused_by_name() {
+        let refused = floor_refusal(Some("12.7.4")).unwrap();
+        assert!(
+            refused.contains("macOS 12.7.4: the VM needs macOS 13 or later"),
+            "{refused}"
+        );
+        for fine in [Some("13.0"), Some("27.0.1"), Some("x"), None] {
+            assert_eq!(floor_refusal(fine), None, "{fine:?}");
+        }
     }
 
     /// No guest fails; another build's warns; this build's is fine.
@@ -488,26 +718,46 @@ mod tests {
     #[test]
     fn ports_not_forwarded_are_said() {
         use crate::ports::Unbound;
+        use shipyard_runtime::attach::forward::Protocol::{Tcp, Udp};
         let only = "loopback only";
-        assert_eq!(ports_found(None, only).level, Level::Ok);
+        assert_eq!(ports_found(None, &[], only).level, Level::Ok);
         let fine = PortsFile::new(
-            vec!["127.0.0.1:80".parse().unwrap()],
-            Vec::new(),
+            &[
+                (Tcp, "127.0.0.1:80".parse().unwrap()),
+                (Udp, "127.0.0.1:53".parse().unwrap()),
+            ],
+            &[],
             0,
             IDLE_LIMIT,
         );
-        assert_eq!(ports_found(Some(&fine), only).level, Level::Ok);
+        let said = ports_found(Some(&fine), &[], only);
+        assert_eq!(said.level, Level::Ok);
+        assert!(said.text.starts_with("2 forwarded"), "{}", said.text);
+        // A shadowed port alone warns, though everything's forwarded.
+        let shadowed = ports_found(Some(&fine), &[(80, Tcp)], only);
+        assert_eq!(shadowed.level, Level::Warn);
+        assert!(
+            shadowed.text.starts_with("shadowed: 80 ("),
+            "{}",
+            shadowed.text
+        );
         let busy = PortsFile::new(
-            Vec::new(),
-            vec![("127.0.0.1:5432".parse().unwrap(), Unbound::InUse)],
+            &[],
+            &[
+                ((Tcp, "127.0.0.1:5432".parse().unwrap()), Unbound::InUse),
+                ((Udp, "127.0.0.1:53".parse().unwrap()), Unbound::InUse),
+            ],
             1,
             IDLE_LIMIT,
         );
-        let said = ports_found(Some(&busy), only);
+        let said = ports_found(Some(&busy), &[(8080, Tcp)], only);
         assert_eq!(said.level, Level::Warn);
         assert!(
-            said.text
-                .contains("127.0.0.1:5432 (in use on this Mac), 1 UDP"),
+            said.text.contains(
+                "not forwarded: 127.0.0.1:5432 (in use on this Mac), 127.0.0.1:53/udp (in use \
+                 on this Mac), 1 UDP (an older guest's); shadowed: 8080 (another program on \
+                 this Mac listens on every address of it, yet localhost reaches the container)"
+            ),
             "{}",
             said.text
         );

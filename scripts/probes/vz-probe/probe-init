@@ -1,0 +1,18 @@
+#!/bin/sh
+# The probe's PID 1 in the guest (appended to the guest's initramfs by run.sh): the
+# filesystems, the modules, the share, then probe.sh; powered off at its end.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /tmp /mnt/probe /mnt/rosetta /mnt/disk
+mount -t tmpfs tmp /tmp
+for module in virtio_blk ext4 virtiofs virtio_balloon binfmt_misc; do
+    modprobe "$module" || echo "probe-init: modprobe $module failed"
+done
+if mount -t virtiofs probe /mnt/probe; then
+    sh /mnt/probe/probe.sh >/mnt/probe/guest.log 2>&1
+    sync
+else
+    echo "probe-init: the probe share didn't mount"
+fi
+poweroff -f

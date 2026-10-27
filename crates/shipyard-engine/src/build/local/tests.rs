@@ -44,6 +44,7 @@ fn the_images_a_dockerfile_could_name_are_given() {
                 ],
                 manifest: digest('a'),
                 blobs: vec![digest('a'), digest('c'), digest('1'), digest('2')],
+                platform: None,
             },
             Local {
                 keys: vec![
@@ -53,6 +54,7 @@ fn the_images_a_dockerfile_could_name_are_given() {
                 ],
                 manifest: digest('b'),
                 blobs: vec![digest('b'), digest('c'), digest('1'), digest('2')],
+                platform: None,
             },
         ]
     );
@@ -139,17 +141,20 @@ fn the_layout_links_the_store_s_blobs() {
         keys: vec!["alpine".to_owned()],
         manifest: digest('a'),
         blobs: vec![digest('a'), digest('c'), digest('1'), digest('2')],
+        platform: None,
     };
     let missing = Local {
         keys: vec!["gone".to_owned()],
         manifest: digest('a'),
         blobs: vec![digest('a'), digest('9')],
+        platform: None,
     };
     // One whose blob isn't a digest (the store's index read as any input).
     let bad = Local {
         keys: vec!["bad".to_owned()],
         manifest: digest('a'),
         blobs: vec!["sha256:../../etc/passwd".to_owned()],
+        platform: None,
     };
     let laid = lay_out(&[whole.clone(), missing, bad], &blobs, &layout).unwrap();
     assert_eq!(laid.images, [whole]);
@@ -199,20 +204,51 @@ fn the_layout_links_the_store_s_blobs() {
 #[test]
 fn each_name_is_a_context_over_the_layout() {
     assert!(buildctl_args(&[], "/layout").is_empty());
-    let laid = [Local {
+    let mut laid = [Local {
         keys: vec!["alpine".to_owned(), "alpine:3.20".to_owned()],
         manifest: digest('a'),
         blobs: Vec::new(),
+        platform: None,
     }];
+    // Its platform not read: given to no stage, so no layout either.
+    assert!(buildctl_args(&laid, "/layout").is_empty());
+    laid[0].platform = Some("linux/arm64".to_owned());
     assert_eq!(
         buildctl_args(&laid, "/layout"),
         [
             "--oci-layout".to_owned(),
             "store=/layout".to_owned(),
             "--opt".to_owned(),
-            format!("context:alpine=oci-layout://store@{}", digest('a')),
+            format!(
+                "context:alpine::linux/arm64=oci-layout://store@{}",
+                digest('a')
+            ),
             "--opt".to_owned(),
-            format!("context:alpine:3.20=oci-layout://store@{}", digest('a')),
+            format!(
+                "context:alpine:3.20::linux/arm64=oci-layout://store@{}",
+                digest('a')
+            ),
         ]
     );
+}
+
+/// A platform as BuildKit names a stage's: its architecture's baseline
+/// variant left off, another kept.
+#[test]
+fn a_platform_is_named_as_buildkit_names_it() {
+    use shipyard_image::Platform;
+    let with = |architecture: &str, variant: Option<&str>| Platform {
+        variant: variant.map(str::to_owned),
+        ..Platform::new("linux", architecture)
+    };
+    for (platform, named) in [
+        (with("arm64", Some("v8")), "linux/arm64"),
+        (with("arm64", None), "linux/arm64"),
+        (with("amd64", None), "linux/amd64"),
+        (with("amd64", Some("v1")), "linux/amd64"),
+        (with("amd64", Some("v3")), "linux/amd64/v3"),
+        (with("arm", Some("v7")), "linux/arm/v7"),
+    ] {
+        assert_eq!(buildkit_platform(&platform), named, "{platform}");
+    }
 }

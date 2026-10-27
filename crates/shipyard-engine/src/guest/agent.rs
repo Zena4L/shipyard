@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::socket::{
     AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept4, bind, getpeername, listen,
     socket,
@@ -42,11 +42,24 @@ const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 /// memory): it would otherwise be ready again at once, forever.
 const ACCEPT_REST: Duration = Duration::from_millis(100);
 
+/// How long a client has to say its hello.
+const HELLO_WAIT: Duration = Duration::from_secs(10);
+
+/// Sets `stream`'s read timeout (`SO_RCVTIMEO`): `None` waits for ever. A
+/// failure leaves it as it was.
+fn set_read_wait(stream: &std::fs::File, wait: Option<Duration>) {
+    let wait = wait.map_or(nix::sys::time::TimeVal::new(0, 0), |wait| {
+        nix::sys::time::TimeVal::new(i64::try_from(wait.as_secs()).unwrap_or(i64::MAX), 0)
+    });
+    let _ = nix::sys::socket::setsockopt(stream, nix::sys::socket::sockopt::ReceiveTimeout, &wait);
+}
+
 /// One connection's stream: what's written to it from several threads.
 type Stream = Arc<Mutex<std::fs::File>>;
 
 /// The agent's run: never returns.
 pub(super) fn run() -> ! {
+    let _ = STARTED.set(std::time::Instant::now());
     raise_descriptor_limit();
     let code = match serve() {
         Ok(()) => 0,
@@ -81,8 +94,13 @@ fn say(line: &str) {
     let _ = writeln!(std::io::stderr(), "shipyard-agent: {line}");
 }
 
-/// Accepts the host's connections, each on a thread of its own.
-fn serve() -> Result<(), String> {
+/// The agent's listening vsock socket, bound to [`forward::AGENT_PORT`]
+/// (close-on-exec): what PID 1 makes first thing and keeps (F108).
+///
+/// # Errors
+///
+/// The socket's, the bind's (the port taken) or the listen's.
+pub(super) fn bound_listener() -> Result<OwnedFd, String> {
     let listener = socket(
         AddressFamily::Vsock,
         SockType::Stream,
@@ -98,6 +116,39 @@ fn serve() -> Result<(), String> {
     // Room for a burst: forwarded connections, the host's polls, commands.
     listen(&listener, Backlog::new(128).unwrap_or(Backlog::MAXCONN))
         .map_err(|e| format!("listening: {e}"))?;
+    Ok(listener)
+}
+
+/// Whether descriptor `fd` is a vsock socket on [`forward::AGENT_PORT`]:
+/// the agent's (one that isn't open, or isn't a socket, isn't).
+pub(super) fn is_agent_socket(fd: std::os::fd::RawFd) -> bool {
+    nix::sys::socket::getsockname::<VsockAddr>(fd)
+        .is_ok_and(|address| address.port() == forward::AGENT_PORT)
+}
+
+/// The listener PID 1 handed this agent at [`forward::AGENT_FD`] (a vsock
+/// socket on [`forward::AGENT_PORT`]), taken over close-on-exec. None (an
+/// agent PID 1 didn't start, or a hand-over gone wrong) is an error, said:
+/// the port is PID 1's, and an agent that bound another would never be
+/// reached.
+fn listener() -> Result<OwnedFd, String> {
+    if is_agent_socket(forward::AGENT_FD) {
+        // SAFETY: PID 1 left it for this process alone, and nothing here has
+        // opened anything yet that could be it.
+        return unsafe {
+            shipyard_sys::fd::take_inherited(forward::AGENT_FD, shipyard_sys::fd::OnExec::Close)
+        }
+        .map_err(|e| format!("taking the agent's socket: {e}"));
+    }
+    Err(format!(
+        "no listening socket at descriptor {} (the agent is started by the guest's init)",
+        forward::AGENT_FD
+    ))
+}
+
+/// Accepts the host's connections, each on a thread of its own.
+fn serve() -> Result<(), String> {
+    let listener = listener()?;
     loop {
         let fd = match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
             Ok(fd) => fd,
@@ -144,10 +195,18 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
             .try_clone()
             .map_err(|e| format!("a connection: {e}"))?,
     ));
+    // The hello within a bound (F109): a client that connects and says
+    // nothing doesn't hold a thread for good. Cleared once it's read, on
+    // every path: a forwarded port's quiet stream is never cut by it.
+    set_read_wait(&stream, Some(HELLO_WAIT));
     let mut connection = Connection::new(stream);
     // The version both speak, as a monitor agrees it: the older one's (a
     // newer client is answered at this guest's, never refused for it).
-    let (agreed, request) = match connection.next_frame().map_err(|e| e.to_string())? {
+    let hello = connection.next_frame().map_err(|e| e.to_string());
+    if let Ok(stream) = writer.lock() {
+        set_read_wait(&stream, None);
+    }
+    let (agreed, request) = match hello? {
         Some(Frame::HelloRun { version, request }) => {
             match shipyard_runtime::attach::negotiate(version) {
                 Some(agreed) => (agreed, request),
@@ -159,6 +218,11 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
     };
     let request = match Request::decode(&request) {
         Ok(request) => request,
+        // Another build's request: said so, for the Mac to stop this VM
+        // and start its own (F167).
+        Err(shipyard_runtime::attach::forward::RequestError::Newer(_)) => {
+            return send(&writer, &forward::Refusal::Newer.frame(agreed));
+        }
         Err(error) => return refuse(&writer, &error.to_string()),
     };
     if request.args == [forward::STOP_REQUEST] {
@@ -168,6 +232,11 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
         let _ = send(&writer, &Frame::Exited(i32::from(told.is_err())));
         return told.map_err(|e| format!("telling the guest's init to stop: {e}"));
     }
+    if request.args == [forward::BOOT_REQUEST] {
+        // Answered before the guest is ready: a long check of the data disk
+        // mustn't look like a hang to the host's watch.
+        return answer_boot(&writer, agreed);
+    }
     if !std::path::Path::new(super::READY).exists() {
         // Said by its code to a client that reads one (F99).
         return send(&writer, &forward::Refusal::NotReady.frame(agreed));
@@ -176,6 +245,10 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
         Some(Asked::Port(ip, port)) => {
             return forward_port((&writer, agreed), connection, ip, port);
         }
+        Some(Asked::Udp(ip, port)) => {
+            return forward_udp((&writer, agreed), connection, ip, port);
+        }
+        Some(Asked::Control(token)) => return control((&writer, agreed), connection, token),
         Some(Asked::Api) => return forward_api((&writer, agreed), connection, port),
         Some(Asked::HangUp(theirs)) => {
             hang_up_api(theirs);
@@ -183,19 +256,50 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
         }
         None => {}
     }
+    // A request that waited in the backlog while the agent restarted (its
+    // client may have given up since) isn't run, and its old stamp never
+    // sets the clock back (F108).
     if let Some(theirs) = request.time {
-        follow_clock(theirs);
+        let since_start = STARTED
+            .get()
+            .map_or(Duration::ZERO, std::time::Instant::elapsed);
+        let ours = shipyard_sys::time::unix_seconds();
+        if waited_too_long(ours, theirs, since_start) {
+            return refuse(
+                &writer,
+                "this command waited too long for the VM (its agent was restarting): run it again",
+            );
+        }
+        if follows(ours, theirs, since_start) {
+            follow_clock(theirs);
+        }
     }
-    if !std::path::Path::new(&request.cwd).is_dir() {
-        return refuse(
-            &writer,
-            &format!(
-                "{} isn't in the guest: is it under your home, which the VM shares?",
-                request.cwd
-            ),
-        );
+    if let Some(why) = not_a_directory_here(&request.cwd) {
+        return refuse(&writer, &why);
     }
     relay(&request, (&writer, agreed), connection)
+}
+
+/// Why `cwd` (a forwarded command's directory) can't be the command's, if
+/// it can't: not in the guest, or in a folder macOS hasn't let the VM read
+/// (named with the permission, F140).
+fn not_a_directory_here(cwd: &str) -> Option<String> {
+    match std::fs::metadata(cwd) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Some(
+            super::shares::Shared::here()
+                .ok()
+                .flatten()
+                .and_then(|shared| {
+                    super::shares::privacy_hint(shared.home(), std::path::Path::new(cwd))
+                })
+                .unwrap_or_else(|| format!("{cwd}: {error}")),
+        ),
+        _ => Some(format!(
+            "{cwd} isn't in the guest: is it in a place the VM shares (your home, /Volumes, \
+             /tmp)?"
+        )),
+    }
 }
 
 /// Runs the request's command, on a terminal of its own if the caller has
@@ -236,6 +340,24 @@ fn relay_running(
     (writer, agreed): (&Stream, u32),
     connection: Connection<std::fs::File>,
 ) -> Result<(), String> {
+    let group = i32::try_from(child.id()).ok().map(Pid::from_raw);
+    let ended = Arc::new(AtomicBool::new(false));
+    let master = pty.as_ref().and_then(|(master, _)| master.try_clone().ok());
+    let controlled = Arc::new(super::control::Controlled::new(
+        group,
+        master,
+        Arc::clone(&ended),
+    ));
+    // A user's command gets a control connection of its own (F94): its
+    // token said to a client that reads one, 0 if none could be made (the
+    // client then stays in-band); the host's own asks never get one. Said
+    // right after the welcome, before anything pumps the command's output:
+    // the client reads it as the next frame.
+    let session =
+        agreed >= shipyard_runtime::attach::SESSION_VERSION && !forward::is_internal(&request.args);
+    let registered = session
+        .then(|| super::control::Registered::new(Arc::clone(&controlled)))
+        .flatten();
     send(
         writer,
         &Frame::Welcome {
@@ -244,6 +366,12 @@ fn relay_running(
             stdin: request.input,
         },
     )?;
+    if session {
+        let token = registered
+            .as_ref()
+            .map_or(0, super::control::Registered::token);
+        send(writer, &Frame::Session(token))?;
+    }
     let (input, outputs) = if let Some((master, slave)) = pty {
         // Only the command holds its side now: its end is the master's end
         // of output (EIO).
@@ -257,9 +385,7 @@ fn relay_running(
         let input = Input::Pipe(child.stdin.take());
         (input, pump_outputs(child, writer)?)
     };
-    let group = i32::try_from(child.id()).ok().map(Pid::from_raw);
-    let ended = Arc::new(AtomicBool::new(false));
-    pump_input(connection, input, group, Arc::clone(&ended));
+    pump_input(connection, input, Arc::clone(&controlled));
     let status = child
         .wait()
         .map_err(|e| format!("waiting for {SHIPYARD}: {e}"))?;
@@ -327,7 +453,8 @@ fn answers(
 /// process of its own (a panic or a hang there costs this answer, never
 /// the agent and its sessions), within [`PORTS_LIMIT`].
 fn read_published() -> Result<forward::PortsAnswer, String> {
-    let mut child = guest_command(&[forward::PORTS_REQUEST], "/")
+    let version = forward::PORTS_VERSION.to_string();
+    let mut child = guest_command(&[forward::PORTS_REQUEST, &version], "/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -369,8 +496,8 @@ fn read_within(out: Option<std::process::ChildStdout>, limit: Duration) -> Resul
     }
 }
 
-/// `shipyard ARGS` in `cwd`, with the guest's environment only: its `PATH`
-/// and root's home.
+/// `shipyard ARGS` in `cwd`, with the guest's environment only: its `PATH`,
+/// root's home and its own temporary place (its `/tmp` is the Mac's).
 fn guest_command(args: &[&str], cwd: &str) -> Command {
     let mut command = Command::new(SHIPYARD);
     command
@@ -378,39 +505,80 @@ fn guest_command(args: &[&str], cwd: &str) -> Command {
         .current_dir(cwd)
         .env_clear()
         .env("PATH", PATH)
-        .env("HOME", "/root");
+        .env("HOME", "/root")
+        .env("TMPDIR", super::GUEST_TMP);
     command
 }
 
 /// How long a forwarded connection waits for its port in the guest.
 const FORWARD_CONNECT: Duration = Duration::from_secs(10);
 
+/// Whether a TCP connection was ever dialled through the guest's own
+/// address (said once: a pasta network's port, or a lease unread).
+static DNAT_SAID: AtomicBool = AtomicBool::new(false);
+
+/// [`forward::FORWARD_REQUEST`]'s and [`forward::FORWARD_UDP_REQUEST`]'s
+/// `IP PORT`, as the port a running container publishes with `protocol`,
+/// and an engine to find its container with: `None` once refused (said to
+/// `writer`).
+///
+/// # Errors
+///
+/// The refusal's write.
+fn published_or_refuse(
+    writer: &Stream,
+    (ip, port): (&str, &str),
+    protocol: forward::Protocol,
+) -> Result<Option<(forward::PublishedPort, crate::Engine)>, String> {
+    let (Ok(ip), Ok(port)) = (ip.parse::<std::net::IpAddr>(), port.parse::<u16>()) else {
+        refuse(writer, &format!("{ip} {port} isn't an address and a port"))?;
+        return Ok(None);
+    };
+    let wanted = forward::PublishedPort { ip, port, protocol };
+    let published = match is_published(wanted) {
+        Ok(published) => published,
+        Err(why) => {
+            refuse(writer, &format!("the guest's ports: {why}"))?;
+            return Ok(None);
+        }
+    };
+    if port == 0 || !published {
+        refuse(
+            writer,
+            &format!("no running container publishes {protocol} port {port} on {ip}"),
+        )?;
+        return Ok(None);
+    }
+    let engine = crate::Engine::new(crate::Paths::from_env(), Arc::new(crate::report::Quiet));
+    Ok(Some((wanted, engine)))
+}
+
 /// [`forward::FORWARD_REQUEST`] `IP PORT`: a connection to the port a
 /// running container publishes on `IP` (never the guest's own services),
-/// through the guest's own address for it ([`dialled`]: `output`'s DNAT
-/// takes it to the container); then the bytes both ways, raw, until both
-/// have ended.
+/// dialled at the container's own address ([`super::forwarded::find_target`],
+/// F97); then the bytes both ways, raw, until both have ended.
 fn forward_port(
     (writer, agreed): (&Stream, u32),
     connection: Connection<std::fs::File>,
     ip: &str,
     port: &str,
 ) -> Result<(), String> {
-    let (Ok(ip), Ok(port)) = (ip.parse::<std::net::IpAddr>(), port.parse::<u16>()) else {
-        return refuse(writer, &format!("{ip} {port} isn't an address and a port"));
+    let Some((wanted, engine)) = published_or_refuse(writer, (ip, port), forward::Protocol::Tcp)?
+    else {
+        return Ok(());
     };
-    let wanted = forward::PublishedPort { ip, port };
-    let published = match is_published(wanted) {
-        Ok(published) => published,
-        Err(why) => return refuse(writer, &format!("the guest's ports: {why}")),
-    };
-    if port == 0 || !published {
-        return refuse(
-            writer,
-            &format!("no running container publishes port {port} on {ip}"),
-        );
-    }
-    let address = std::net::SocketAddr::new(dialled(ip), port);
+    // The container itself; one no lease explains (a pasta network's),
+    // through the guest's DNAT, said once.
+    let address = super::forwarded::find_target(&engine, &wanted).unwrap_or_else(|| {
+        if !DNAT_SAID.swap(true, Ordering::SeqCst) {
+            say(&format!(
+                "port {} on {}: no container's address for it, dialled through the guest's own \
+                 address",
+                wanted.port, wanted.ip
+            ));
+        }
+        std::net::SocketAddr::new(dialled(wanted.ip), wanted.port)
+    });
     let tcp = match std::net::TcpStream::connect_timeout(&address, FORWARD_CONNECT) {
         Ok(tcp) => tcp,
         Err(error) => return refuse(writer, &format!("{address} in the guest: {error}")),
@@ -420,8 +588,76 @@ fn forward_port(
         after_one: LINGER,
         after_other: LINGER,
     };
-    welcome_and_relay((writer, agreed), connection, tcp.into(), lingers)
-        .map_err(|e| format!("the forwarded connection: {e}"))
+    welcome_and_relay(
+        (writer, agreed),
+        connection,
+        tcp.into(),
+        (lingers, Named::NotNamed),
+    )
+    .map_err(|e| format!("the forwarded connection: {e}"))
+}
+
+/// [`forward::CONTROL_REQUEST`] `TOKEN`: the control of the command `token`
+/// names ([`super::control`]), welcomed, then served until it ends. One no
+/// command runs under (ended, or never given) is refused.
+fn control(
+    (writer, agreed): (&Stream, u32),
+    connection: Connection<std::fs::File>,
+    token: &str,
+) -> Result<(), String> {
+    let Some(controlled) = forward::session_token_of(token).and_then(super::control::find) else {
+        return refuse(writer, "no command runs under that token");
+    };
+    send(
+        writer,
+        &Frame::Welcome {
+            version: agreed,
+            terminal: false,
+            stdin: true,
+        },
+    )?;
+    super::control::serve(connection, &controlled);
+    Ok(())
+}
+
+/// [`forward::FORWARD_UDP_REQUEST`] `IP PORT`: the Mac's datagrams to a UDP
+/// port a running container publishes on `IP`, relayed to the container
+/// itself ([`super::forwarded::relay_udp`]: its address looked up again as
+/// it goes). One no lease explains is refused: the guest's own address
+/// would take its datagrams into the socket the port's holder keeps, never
+/// answering.
+fn forward_udp(
+    (writer, agreed): (&Stream, u32),
+    connection: Connection<std::fs::File>,
+    ip: &str,
+    port: &str,
+) -> Result<(), String> {
+    let Some((wanted, engine)) = published_or_refuse(writer, (ip, port), forward::Protocol::Udp)?
+    else {
+        return Ok(());
+    };
+    if super::forwarded::find_target(&engine, &wanted).is_none() {
+        return refuse(
+            writer,
+            &format!(
+                "UDP port {} on {}: no container's address for it",
+                wanted.port, wanted.ip
+            ),
+        );
+    }
+    send(
+        writer,
+        &Frame::Welcome {
+            version: agreed,
+            terminal: false,
+            stdin: true,
+        },
+    )?;
+    let (vsock, unread) = connection.into_parts();
+    super::forwarded::relay_udp(&vsock, &unread, || {
+        super::forwarded::find_target(&engine, &wanted)
+    })
+    .map_err(|e| format!("the forwarded UDP port: {e}"))
 }
 
 /// A connection the host asks for instead of a command: to a published
@@ -430,10 +666,15 @@ fn forward_port(
 enum Asked<'a> {
     /// [`forward::FORWARD_REQUEST`] `IP PORT`.
     Port(&'a str, &'a str),
+    /// [`forward::FORWARD_UDP_REQUEST`] `IP PORT`.
+    Udp(&'a str, &'a str),
+    /// [`forward::CONTROL_REQUEST`] `TOKEN`.
+    Control(&'a str),
     /// [`forward::API_REQUEST`].
     Api,
-    /// [`forward::API_HANG_UP`] `PORT`: the client of the API connection
-    /// from the host's `PORT` has gone.
+    /// [`forward::API_HANG_UP`] `NAME`: the client of the API connection
+    /// `NAME` names (its token, or from an older host the host's port) has
+    /// gone.
     HangUp(&'a str),
 }
 
@@ -441,10 +682,23 @@ enum Asked<'a> {
 fn connection_asked(args: &[String]) -> Option<Asked<'_>> {
     match args {
         [kind, ip, port] if kind == forward::FORWARD_REQUEST => Some(Asked::Port(ip, port)),
+        [kind, ip, port] if kind == forward::FORWARD_UDP_REQUEST => Some(Asked::Udp(ip, port)),
+        [kind, token] if kind == forward::CONTROL_REQUEST => Some(Asked::Control(token)),
         [kind] if kind == forward::API_REQUEST => Some(Asked::Api),
-        [kind, port] if kind == forward::API_HANG_UP => Some(Asked::HangUp(port)),
+        [kind, name] if kind == forward::API_HANG_UP => Some(Asked::HangUp(name)),
         _ => None,
     }
+}
+
+/// Whether a relayed connection's welcome is followed by a token, to a
+/// client of version 6 or later ([`Frame::Session`]).
+#[derive(Debug, Clone, Copy)]
+enum Named {
+    /// None: a port's connection, which nothing hangs up.
+    NotNamed,
+    /// An API connection's, named by its token for a hang-up (`None`: none
+    /// could be made, said as 0, so its client names it by its port).
+    ByToken(Option<u128>),
 }
 
 /// Welcomes the host's connection, then relays its bytes (those read
@@ -454,7 +708,7 @@ fn welcome_and_relay(
     (writer, agreed): (&Stream, u32),
     connection: Connection<std::fs::File>,
     peer: OwnedFd,
-    lingers: shipyard_sys::relay::Lingers,
+    (lingers, named): (shipyard_sys::relay::Lingers, Named),
 ) -> Result<(), String> {
     send(
         writer,
@@ -464,6 +718,11 @@ fn welcome_and_relay(
             stdin: true,
         },
     )?;
+    if let Named::ByToken(token) = named
+        && agreed >= shipyard_runtime::attach::SESSION_VERSION
+    {
+        send(writer, &Frame::Session(token.unwrap_or(0)))?;
+    }
     let (vsock, unread) = connection.into_parts();
     let mut peer = std::fs::File::from(peer);
     peer.write_all(&unread).map_err(|e| e.to_string())?;
@@ -493,43 +752,51 @@ fn forward_api(
         Ok(api) => api,
         Err(why) => return refuse(writer, &format!("the guest's Docker API: {why}")),
     };
-    // Kept by the host's port while it's relayed: a hang-up names it.
-    let _kept = api
-        .try_clone()
-        .ok()
-        .map(|api| KeptApiConnection::keep(port, api));
+    // Kept by the host's port, and by a token of its own, while it's
+    // relayed: a hang-up names it by either (F155: a port can be another's
+    // by then, a token never is).
+    let token = super::control::new_token();
+    let _kept = KeptApiConnection::keep(port, token, &api);
     welcome_and_relay(
         (writer, agreed),
         connection,
         api.into(),
-        forward::API_LINGERS,
+        (forward::API_LINGERS, Named::ByToken(token)),
     )
     .map_err(|e| format!("the Docker API's connection: {e}"))
 }
 
-/// The API connections being relayed, by the host's port, each with an
-/// identity of its own: what a hang-up ([`forward::API_HANG_UP`]) reaches.
+/// The API connections being relayed, each under its names (the host's
+/// port, in decimal; its token, 32 hex digits), with an identity of its
+/// own: what a hang-up ([`forward::API_HANG_UP`]) reaches.
 static API_CONNECTIONS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<u32, (u64, std::os::unix::net::UnixStream)>>,
+    Mutex<std::collections::HashMap<String, (u64, std::os::unix::net::UnixStream)>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// One of [`API_CONNECTIONS`], let go when dropped (its relay's end): only
-/// while it's still the one kept by its port (a new connection that took
-/// the port since is its own).
+/// One of [`API_CONNECTIONS`], let go when dropped (its relay's end): each
+/// name only while it's still this one's (a new connection that took the
+/// port since is its own).
 struct KeptApiConnection {
-    port: u32,
+    names: Vec<String>,
     identity: u64,
 }
 
 impl KeptApiConnection {
-    fn keep(port: u32, api: std::os::unix::net::UnixStream) -> Self {
+    fn keep(port: u32, token: Option<u128>, api: &std::os::unix::net::UnixStream) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let identity = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        API_CONNECTIONS
+        let names: Vec<String> = std::iter::once(port.to_string())
+            .chain(token.map(forward::session_token_text))
+            .collect();
+        let mut kept = API_CONNECTIONS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(port, (identity, api));
-        Self { port, identity }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in &names {
+            if let Ok(copy) = api.try_clone() {
+                kept.insert(name.clone(), (identity, copy));
+            }
+        }
+        Self { names, identity }
     }
 }
 
@@ -538,26 +805,26 @@ impl Drop for KeptApiConnection {
         let mut kept = API_CONNECTIONS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if kept
-            .get(&self.port)
-            .is_some_and(|(identity, _)| *identity == self.identity)
-        {
-            kept.remove(&self.port);
+        for name in &self.names {
+            if kept
+                .get(name)
+                .is_some_and(|(identity, _)| *identity == self.identity)
+            {
+                kept.remove(name);
+            }
         }
     }
 }
 
-/// The API connection from the host's `port` shut both ways: the service
-/// sees its client hang up (`POLLHUP`), as a client's on Linux is seen,
-/// and its relay here ends. One not kept (ended already): nothing.
-fn hang_up_api(port: &str) {
-    let Ok(port) = port.parse::<u32>() else {
-        return;
-    };
+/// The API connection `name` names (the host's port from an older host,
+/// else its token) shut both ways: the service sees its client hang up
+/// (`POLLHUP`), as a client's on Linux is seen, and its relay here ends.
+/// One not kept (ended already): nothing.
+fn hang_up_api(name: &str) {
     if let Some((_, api)) = API_CONNECTIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&port)
+        .get(name)
     {
         let _ = api.shutdown(std::net::Shutdown::Both);
     }
@@ -631,6 +898,32 @@ const CLOCK_BEHIND: u64 = 2;
 /// may have waited (two CLIs' clocks never pull it back and forth).
 const CLOCK_AHEAD: u64 = 30;
 
+/// The guest's boot ID ([`forward::BOOT_REQUEST`]): `Welcome`, the ID, then
+/// `Exited` 0 ([`forward::BOOT_UNREADABLE`] if the kernel won't say it).
+fn answer_boot(writer: &Stream, agreed: u32) -> Result<(), String> {
+    send(
+        writer,
+        &Frame::Welcome {
+            version: agreed,
+            terminal: false,
+            stdin: false,
+        },
+    )?;
+    match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        Ok(id) => {
+            send(writer, &Frame::Stdout(id.trim().as_bytes().to_vec()))?;
+            send(writer, &Frame::Exited(0))
+        }
+        Err(error) => {
+            send(
+                writer,
+                &Frame::Stderr(format!("the boot ID: {error}").into_bytes()),
+            )?;
+            send(writer, &Frame::Exited(forward::BOOT_UNREADABLE))
+        }
+    }
+}
+
 /// Sets the guest's clock to the Mac's (`theirs`, seconds since the epoch)
 /// if they're far enough apart ([`skewed`]: TLS to a registry fails on a
 /// clock that's behind).
@@ -646,6 +939,38 @@ fn follow_clock(theirs: u64) {
         )),
         Err(error) => say(&format!("setting the clock to the Mac's: {error}")),
     }
+}
+
+/// How long a request may have waited for the agent before it's run: past
+/// this, its client has likely given up (F108's backlog).
+const STALE_REQUEST: u64 = 60;
+
+/// When this agent started: requests can have waited for it only in its
+/// first [`STALE_REQUEST`] seconds (PID 1's backlog, drained at once).
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Whether a request stamped `theirs` (the Mac's clock) waited too long for
+/// the agent: past [`STALE_REQUEST`] by the guest's clock (`ours`), in the
+/// agent's first [`STALE_REQUEST`] (`since_start`). Later, nothing can have
+/// waited for it (it's up, taking each at once): an old stamp is a guest
+/// whose clock ran ahead, set right by the request instead.
+fn waited_too_long(ours: u64, theirs: u64, since_start: Duration) -> bool {
+    early(since_start) && ours.saturating_sub(theirs) > STALE_REQUEST
+}
+
+/// Whether the guest's clock follows a request stamped `theirs`: always
+/// forward (the Mac slept, the guest's clock stood still), and back only
+/// past an agent's first [`STALE_REQUEST`] (`since_start`), when an old
+/// stamp is the guest's clock ahead, not a request that waited for the
+/// agent (whose stamp would move the clock backwards by its wait).
+fn follows(ours: u64, theirs: u64, since_start: Duration) -> bool {
+    theirs >= ours || !early(since_start)
+}
+
+/// Whether an agent `since_start` old is in its first [`STALE_REQUEST`]:
+/// when what waited for it in PID 1's backlog comes.
+fn early(since_start: Duration) -> bool {
+    since_start < Duration::from_secs(STALE_REQUEST)
 }
 
 /// Whether the guest's clock (`ours`) is far enough from the Mac's
@@ -753,7 +1078,10 @@ fn handed_pipe(auth: &str) -> Result<OwnedFd, String> {
 /// After `fork`: descriptor `from` placed at `to`, open across `exec`.
 /// `dup2(fd, fd)` does nothing, close-on-exec included, so the flag is
 /// cleared either way (AGENTS.md's gotcha).
-fn at_descriptor(from: std::os::fd::RawFd, to: std::os::fd::RawFd) -> std::io::Result<()> {
+pub(super) fn at_descriptor(
+    from: std::os::fd::RawFd,
+    to: std::os::fd::RawFd,
+) -> std::io::Result<()> {
     // SAFETY: plain system calls on numbers; async-signal-safe.
     unsafe {
         if from != to && libc::dup2(from, to) < 0 {
@@ -805,28 +1133,17 @@ fn pump(
 
 /// What the client sends, on a thread of its own: its typing to the
 /// command, its window's size to the command's terminal, its signals to the
-/// command's group (on a terminal, its foreground group: what a key would
-/// signal); the client gone, the command hung up on (as a terminal's close
-/// would). Nothing is signalled once the command has `ended`.
+/// command (`controlled`: on a terminal, its foreground group, what a key
+/// would signal); the client gone, the command hung up on (as a terminal's
+/// close would). Nothing is signalled once the command has ended. (A client
+/// with a control connection sends its signals there: they never wait
+/// behind its input here.)
 fn pump_input(
     mut connection: Connection<std::fs::File>,
     mut input: Input,
-    group: Option<Pid>,
-    ended: Arc<AtomicBool>,
+    controlled: Arc<super::control::Controlled>,
 ) {
     let pumped = std::thread::Builder::new().spawn(move || {
-        let send_signal = |input: &Input, signal| {
-            if ended.load(Ordering::SeqCst) {
-                return;
-            }
-            let foreground = match input {
-                Input::Terminal(master) => nix::unistd::tcgetpgrp(master).ok(),
-                Input::Pipe(_) => None,
-            };
-            if let Some(target) = signal_target(foreground, group) {
-                let _ = killpg(target, signal);
-            }
-        };
         loop {
             match connection.next_frame() {
                 Ok(Some(Frame::Stdin(bytes))) => match &mut input {
@@ -846,21 +1163,12 @@ fn pump_input(
                         *stdin = None;
                     }
                 }
-                Ok(Some(Frame::Resize { rows, cols })) => {
-                    if let Input::Terminal(master) = &input {
-                        let size = shipyard_runtime::terminal::Size::new(rows, cols);
-                        let _ =
-                            shipyard_runtime::terminal::set_window_size(master.as_raw_fd(), size);
-                    }
-                }
-                Ok(Some(Frame::Signal(number))) => {
-                    if let Some(forwarded) = forwarded(number) {
-                        send_signal(&input, forwarded);
-                    }
+                Ok(Some(frame @ (Frame::Resize { .. } | Frame::Signal(_)))) => {
+                    controlled.apply(&frame);
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
-                    send_signal(&input, Signal::SIGHUP);
+                    controlled.signal(Signal::SIGHUP);
                     return;
                 }
             }
@@ -869,26 +1177,6 @@ fn pump_input(
     if let Err(error) = pumped {
         say(&format!("no thread for the client's input: {error}"));
     }
-}
-
-/// Whose group a client's signal goes to: the command's terminal's
-/// `foreground` group, else the command's own `group`. A terminal whose
-/// session has ended has none, and says 0, which `killpg` would take for
-/// this process's own group (and PID 1's, were they one): never a target,
-/// nor is 1.
-fn signal_target(foreground: Option<Pid>, group: Option<Pid>) -> Option<Pid> {
-    foreground.filter(|pgrp| pgrp.as_raw() > 1).or(group)
-}
-
-/// The signal a client's `Signal` frame asks for, if it's one a client may
-/// pass on ([`shipyard_runtime::process::is_forwardable`]: never SIGKILL
-/// or SIGSTOP, never a fault's).
-pub(super) fn forwarded(number: u8) -> Option<Signal> {
-    let number = i32::from(number);
-    if !shipyard_runtime::process::is_forwardable(number) {
-        return None;
-    }
-    Signal::try_from(number).ok()
 }
 
 /// A command's end as an exit code: its own, or 128 plus the signal that
@@ -917,6 +1205,33 @@ fn refuse(writer: &Stream, why: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// In an agent's first minute, a request that waited past a minute for it
+    /// isn't run (each of a backlog, the second too: the first never set the
+    /// clock back); one just sent, or stamped ahead (the Mac's clock ahead),
+    /// is. Later, an old stamp is the guest's clock ahead: served (its clock
+    /// set right).
+    #[test]
+    fn a_request_that_waited_too_long_is_refused() {
+        let early = Duration::from_secs(1);
+        assert!(!waited_too_long(1_000, 1_000, early));
+        assert!(!waited_too_long(1_060, 1_000, early));
+        assert!(waited_too_long(1_100, 1_000, early));
+        assert!(
+            waited_too_long(1_100, 1_005, early),
+            "the next of the backlog"
+        );
+        assert!(
+            !waited_too_long(1_000, 5_000, early),
+            "the Mac's clock ahead"
+        );
+        assert!(!waited_too_long(1_100, 1_000, Duration::from_secs(61)));
+        // The clock: forward always; back (a 45 s wait's stamp) only past the
+        // agent's first minute.
+        assert!(follows(1_000, 1_500, early));
+        assert!(!follows(1_045, 1_000, early));
+        assert!(follows(1_045, 1_000, Duration::from_secs(61)));
+    }
+
     /// A ports answer read after a caller asked answers it, yes or no
     /// (waiters share one read, F110); an older one, only while fresh
     /// and saying yes.
@@ -934,16 +1249,96 @@ mod tests {
         assert!(!answers(before, asked, stale, true), "stale");
     }
 
-    /// A signal goes to the terminal's foreground group, else the command's
-    /// own; a terminal with no session left (0), or 1, is never a target.
+    /// Every request of the host's own is internal (no session token: the
+    /// ports poll, `doctor`, the boot ID read their answers whole), and a
+    /// user's command never is.
     #[test]
-    fn a_signal_never_goes_to_this_group_or_init() {
-        let (job, command) = (Pid::from_raw(40), Some(Pid::from_raw(30)));
-        assert_eq!(signal_target(Some(job), command), Some(job));
-        assert_eq!(signal_target(None, command), command);
-        assert_eq!(signal_target(Some(Pid::from_raw(0)), command), command);
-        assert_eq!(signal_target(Some(Pid::from_raw(1)), command), command);
-        assert_eq!(signal_target(Some(Pid::from_raw(0)), None), None);
+    fn the_hosts_own_requests_are_internal() {
+        for own in [
+            forward::STOP_REQUEST,
+            forward::BOOT_REQUEST,
+            forward::PORTS_REQUEST,
+            forward::DOCTOR_REQUEST,
+            forward::FORWARD_REQUEST,
+            forward::FORWARD_UDP_REQUEST,
+            forward::CONTROL_REQUEST,
+            forward::API_REQUEST,
+            forward::API_HANG_UP,
+        ] {
+            assert!(
+                forward::is_internal(&Request::internal(&[own]).args),
+                "{own}"
+            );
+        }
+        for command in [&["run", "-i", "x"][..], &["ps"], &[], &["guest-ports"]] {
+            assert!(
+                !forward::is_internal(&Request::internal(command).args),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// An API connection is kept under its port and its token, either of
+    /// which hangs it up; one that took the port since keeps it when the
+    /// first's relay ends, and both names go with their own connection.
+    #[test]
+    fn an_api_connection_is_named_by_its_port_and_its_token() {
+        use std::io::Read as _;
+        let (first, mut first_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (second, mut second_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let named = |name: &str| API_CONNECTIONS.lock().unwrap().contains_key(name);
+        // (Ports past any real vsock one's: no test beside this shares them.)
+        let (port, token) = (4_000_000_001, 0x5eed_u128);
+        let token_name = forward::session_token_text(token);
+        let kept_first = KeptApiConnection::keep(port, Some(token), &first);
+        assert!(named(&port.to_string()) && named(&token_name));
+        hang_up_api(&token_name);
+        first_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(
+            first_peer.read(&mut [0_u8; 8]).unwrap(),
+            0,
+            "shut by its token"
+        );
+        let kept_second = KeptApiConnection::keep(port, None, &second);
+        drop(kept_first);
+        assert!(named(&port.to_string()), "the second's port kept");
+        assert!(!named(&token_name), "the first's token gone");
+        hang_up_api(&port.to_string());
+        second_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(
+            second_peer.read(&mut [0_u8; 8]).unwrap(),
+            0,
+            "shut by its port"
+        );
+        drop(kept_second);
+        assert!(!named(&port.to_string()));
+    }
+
+    /// A client that says nothing is given up on within its wait; with none
+    /// set again, a read waits for what comes.
+    #[test]
+    fn a_silent_client_is_given_up_on() {
+        use std::io::Read as _;
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut ours = std::fs::File::from(std::os::fd::OwnedFd::from(ours));
+        set_read_wait(&ours, Some(Duration::from_secs(1)));
+        let began = std::time::Instant::now();
+        let error = ours.read(&mut [0_u8; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(began.elapsed() < Duration::from_secs(5));
+        set_read_wait(&ours, None);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::io::Write::write_all(&mut theirs, b"hi").unwrap();
+        });
+        let mut got = [0_u8; 2];
+        ours.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hi", "no wait left set");
+        writer.join().unwrap();
     }
 
     /// A port published on every address is reached at the guest's
@@ -990,22 +1385,6 @@ mod tests {
         assert!(from_host(Some(2)));
         for cid in [Some(0), Some(1), Some(3), Some(u32::MAX), None] {
             assert!(!from_host(cid), "{cid:?}");
-        }
-    }
-
-    /// A client may pass on an interrupt, a stop request, a hang-up; not a
-    /// kill, a stop, a fault, or a number that isn't a signal.
-    #[test]
-    fn only_forwardable_signals_pass() {
-        for (number, signal) in [
-            (2, Signal::SIGINT),
-            (15, Signal::SIGTERM),
-            (1, Signal::SIGHUP),
-        ] {
-            assert_eq!(forwarded(number), Some(signal), "{number}");
-        }
-        for number in [0, 9, 19, 11, 17, 200] {
-            assert_eq!(forwarded(number), None, "{number}");
         }
     }
 

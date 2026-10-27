@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::credentials::Credentials;
 use crate::digest::Digest;
 use crate::index::Index as StoreIndex;
-use crate::manifest::{Descriptor, ImageConfig, ImageManifest, Index, Platform, media_type};
+use crate::manifest::{
+    Descriptor, ImageConfig, ImageManifest, Index, Platform, PlatformChoice, media_type,
+};
 use crate::reference::ImageReference;
 use crate::registry::{BlobError, BlobSink, Registry, RegistryError};
 use crate::store::{BlobWriter, Store, StoreError};
@@ -126,6 +128,20 @@ pub enum PullError {
     },
 }
 
+impl PullError {
+    /// Whether it says the image (or the index a reference pins) is for
+    /// another platform than those wanted: a reason to pull the one wanted,
+    /// never a store that can't be read.
+    #[must_use]
+    pub fn is_other_platform(&self) -> bool {
+        matches!(
+            self,
+            Self::Platform { .. }
+                | Self::Manifest(crate::manifest::ManifestError::NoMatchingPlatform { .. })
+        )
+    }
+}
+
 /// How a pull goes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PullOptions {
@@ -147,7 +163,7 @@ pub struct PullOptions {
 /// wouldn't fit.
 pub fn pull(
     image: &ImageReference,
-    platform: &Platform,
+    platform: &dyn PlatformChoice,
     store: &Store,
     credentials: Credentials,
     options: PullOptions,
@@ -165,7 +181,7 @@ pub fn pull(
 /// As [`pull`].
 pub fn pull_with(
     image: &ImageReference,
-    platform: &Platform,
+    platform: &dyn PlatformChoice,
     store: &Store,
     registry: &Registry,
     options: PullOptions,
@@ -188,7 +204,7 @@ pub fn pull_with(
     let (manifest_bytes, manifest_digest) = if through_index {
         store.write_blob(&top_digest, &mut &top.bytes[..])?;
         let index = Index::parse(&top.bytes)?;
-        let entry = index.select(platform)?;
+        let entry = index.select_among(platform.choices())?;
         let fetched = registry.get_manifest(
             &image.repository,
             &entry.digest.to_string(),
@@ -244,7 +260,7 @@ pub fn pull_with(
 /// or the stored image is for another platform.
 pub fn from_store(
     reference: &ImageReference,
-    platform: &Platform,
+    platform: &dyn PlatformChoice,
     store: &Store,
 ) -> Result<Option<Pulled>, PullError> {
     let index = StoreIndex::open(store.root())?;
@@ -272,7 +288,7 @@ pub fn from_store(
 pub fn from_store_by_digest(
     reference: &ImageReference,
     digest: &Digest,
-    platform: &Platform,
+    platform: &dyn PlatformChoice,
     store: &Store,
 ) -> Result<Option<Pulled>, PullError> {
     stored(reference, digest.clone(), None, platform, store)
@@ -285,7 +301,7 @@ fn stored(
     reference: &ImageReference,
     top_digest: Digest,
     recorded_index: Option<Digest>,
-    platform: &Platform,
+    platform: &dyn PlatformChoice,
     store: &Store,
 ) -> Result<Option<Pulled>, PullError> {
     let limit = crate::MANIFEST_SIZE_LIMIT;
@@ -295,7 +311,10 @@ fn stored(
     let top = store.read_blob(&top_digest, limit)?;
     // A pinned index: the platform's manifest, if that's stored too.
     let (manifest_bytes, manifest_digest, index_digest) = if is_index(&top, None) {
-        let digest = Index::parse(&top)?.select(platform)?.digest.clone();
+        let digest = Index::parse(&top)?
+            .select_among(platform.choices())?
+            .digest
+            .clone();
         if !store.contains(&digest) {
             return Ok(None);
         }
@@ -372,14 +391,17 @@ fn check_manifest(manifest: &ImageManifest) -> Result<(), PullError> {
     Ok(())
 }
 
-/// The image's platform, if it runs on `wanted`.
-fn check_platform(config: &ImageConfig, wanted: &Platform) -> Result<Platform, PullError> {
+/// The image's platform, if it runs on one of `wanted`'s.
+fn check_platform(
+    config: &ImageConfig,
+    wanted: &dyn PlatformChoice,
+) -> Result<Platform, PullError> {
     let image = config.platform();
-    if image.runs_on(wanted) {
+    if crate::manifest::runs_on_any(&image, wanted.choices()) {
         Ok(image)
     } else {
         Err(PullError::Platform {
-            wanted: wanted.to_string(),
+            wanted: crate::manifest::named(wanted.choices()),
             image: image.to_string(),
         })
     }

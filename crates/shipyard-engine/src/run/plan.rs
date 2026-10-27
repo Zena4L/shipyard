@@ -281,6 +281,10 @@ impl RunRequest {
                 "--volume needs a root filesystem (an image or --rootfs)"
             );
         }
+        // In the macOS guest, a source given in a share judged again before
+        // its links are followed: one may lead elsewhere since the create
+        // (step 13.4).
+        let shared = crate::guest::shares::Shared::here()?;
         self.volume
             .iter()
             .map(|spec| {
@@ -288,6 +292,11 @@ impl RunRequest {
                     Error::new(ErrorKind::InvalidRequest, format!("--volume {spec}: {err}"))
                 })?;
                 if !shipyard_storage::volume::is_named_volume(&mount.source) {
+                    if let Some(shared) = &shared {
+                        shared
+                            .check_again(Path::new(&mount.source))
+                            .with_context(|| format!("--volume {spec}"))?;
+                    }
                     mount.source = canonical_source(&mount.source)
                         .with_context(|| format!("--volume {spec}"))?;
                 }

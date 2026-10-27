@@ -6,7 +6,8 @@
 //!    initramfs's root is the kernel's first mount, which `pivot_root`
 //!    refuses to move (`EINVAL`), and every container's start pivots.
 //! 2. With `moved`: it mounts what the engine needs, loads the kernel's
-//!    modules, prepares the data disk and the shared home, settles the
+//!    modules, holds the agent's vsock port (13.5b), prepares the data disk,
+//!    mounts the Mac's shares and Rosetta's (13.3, 13.4), settles the
 //!    containers the last boot left, starts the agent, then reaps and waits
 //!    for its stop (SIGTERM, SIGINT or SIGPWR), when it stops the
 //!    containers and powers off.
@@ -15,6 +16,7 @@
 //! VM off (a kernel panic would reboot it in place instead).
 
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -59,7 +61,7 @@ const REQUIRED_MODULES: &[&str] = &[
 ];
 
 /// Modules that help but aren't needed: their failure is said, not fatal.
-const OPTIONAL_MODULES: &[&str] = &["virtio_rng", "virtio_balloon"];
+const OPTIONAL_MODULES: &[&str] = &["virtio_rng", "virtio_balloon", "binfmt_misc"];
 
 /// How long the containers are given to stop, and the recovery to run.
 const SETTLE: Duration = Duration::from_secs(60);
@@ -125,7 +127,12 @@ fn moved_root() -> Result<String, String> {
         .map_err(|e| format!("moving the new root onto /: {e}"))?;
     nix::unistd::chroot(".").map_err(|e| format!("chroot into the new root: {e}"))?;
     std::env::set_current_dir("/").map_err(|e| format!("entering /: {e}"))?;
-    let error = Command::new(SHIPYARD).args([super::INIT_ARG, MOVED]).exec();
+    // The guest's own temporary files in its memory (step 13.4): its `/tmp`
+    // is the Mac's, shared. Everything PID 1 starts inherits it.
+    let error = Command::new(SHIPYARD)
+        .args([super::INIT_ARG, MOVED])
+        .env("TMPDIR", super::GUEST_TMP)
+        .exec();
     Ok(format!("running {SHIPYARD} again: {error}"))
 }
 
@@ -192,9 +199,18 @@ fn boot() -> Result<Child, String> {
     // The agent first: until the guest is ready it refuses every request
     // at once, saying why, so a long check or repair of the data disk
     // never runs against the host's boot bound (D10.4-3).
+    // The agent's port, held before anything else runs (F108): a guest
+    // that can't hold it powers off (said), as without its agent it can do
+    // nothing.
+    let listener =
+        super::agent::bound_listener().map_err(|e| format!("the agent's socket: {e}"))?;
+    if let Ok(mut held) = AGENT_LISTENER.lock() {
+        *held = Some(listener);
+    }
     let agent = start_agent()?;
     data_disk()?;
-    home();
+    shares();
+    rosetta();
     std::fs::write(super::READY, b"").map_err(|e| format!("making {}: {e}", super::READY))?;
     // Containers the last boot left (killed with the VM, or stopped), as a
     // Linux host's boot unit settles them: after the agent, so a slow
@@ -262,7 +278,11 @@ fn mount_kernel_file_systems() -> Result<(), String> {
         mount(Some(*source), *target, Some(*kind), *flags, *options)
             .map_err(|e| format!("mounting {kind} on {target}: {e}"))?;
     }
-    Ok(())
+    std::fs::create_dir_all(super::GUEST_TMP)
+        .and_then(|()| {
+            std::fs::set_permissions(super::GUEST_TMP, std::fs::Permissions::from_mode(0o1777))
+        })
+        .map_err(|e| format!("making {}: {e}", super::GUEST_TMP))
 }
 
 /// The modules, by the image's `modprobe` (the same the kernel runs for
@@ -303,8 +323,11 @@ fn network() {
     // `udhcpc` doesn't bring the link up itself: without it, it loops on
     // "Network is down". Five tries two seconds apart, then the background
     // (it keeps the lease renewed there either way).
-    if !ran("/sbin/ip", &["link", "set", "eth0", "up"])
-        || !ran("/sbin/udhcpc", &["-i", "eth0", "-b", "-t", "5", "-T", "2"])
+    if !ran("/sbin/ip", &["link", "set", forward::GUEST_LINK, "up"])
+        || !ran(
+            "/sbin/udhcpc",
+            &["-i", forward::GUEST_LINK, "-b", "-t", "5", "-T", "2"],
+        )
     {
         say("no address for eth0: the guest has no network");
     }
@@ -390,57 +413,172 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
 /// files mean nothing in the guest, nor in a container a bind of it gives
 /// them to (a bind keeps both flags): a file made on the Mac is never a
 /// way to root in the VM.
-const HOME_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
+const SHARE_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
 
-/// The Mac's home, shared at its own path (`shipyard.home=` on the kernel's
-/// command line). Without it, commands run, but no path of the Mac's does.
-fn home() {
+/// The Mac's places, each shared at its own path: the home
+/// (`shipyard.home=` on the kernel's command line) and those beyond it
+/// (`shipyard.shares=`, step 13.4), then macOS's own links to them
+/// (`/tmp`), then the VM's own places in any of them hidden. Without the
+/// home, commands run, but no path of the Mac's does.
+fn shares() {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let Some(home) = home_of(&cmdline) else {
+    let Some(home) = super::home_of(&cmdline) else {
         say("no home on the kernel's command line: the Mac's files aren't shared");
         return;
     };
-    let shared = std::fs::create_dir_all(home)
-        .map_err(|e| e.to_string())
-        .and_then(|()| {
-            mount(
-                Some(forward::HOME_TAG),
-                home,
-                Some("virtiofs"),
-                HOME_FLAGS,
-                None::<&str>,
-            )
-            .map_err(|e| e.to_string())
-        });
-    if let Err(error) = shared {
-        say(&format!("the Mac's home isn't shared at {home}: {error}"));
-        return;
+    let mut wanted = vec![(forward::HOME_TAG.to_owned(), home.to_owned())];
+    for (n, place) in forward::numbered_places_of(&cmdline, forward::SHARES_KEY) {
+        if super::is_plain_place(&place) {
+            wanted.push((forward::share_tag(n), place));
+        } else {
+            say(&format!("{place:?} isn't a place to share"));
+        }
     }
-    for place in hidden_in(home, &forward::hidden_of(&cmdline)) {
+    // The shallowest first: a home on an external drive
+    // (`/Volumes/Disk/Users/me`) is mounted over `/Volumes`'s share, not
+    // buried by it.
+    wanted.sort_by_key(|(_, place)| Path::new(place).components().count());
+    let mut shared = Vec::new();
+    for (tag, place) in wanted {
+        match mount_share(&tag, &place) {
+            Ok(()) => shared.push(place),
+            Err(error) => say(&format!("the Mac's {place} isn't shared: {error}")),
+        }
+    }
+    for place in hidden_in(&shared, &forward::places_of(&cmdline, forward::HIDE_KEY)) {
         hide(&place);
+    }
+    // After the hiding: a recursive bind carries the hidden places too.
+    for (alias, place) in forward::MAC_ALIASES {
+        if shared.iter().any(|shared| shared == place)
+            && let Err(error) = bind_alias(place, alias)
+        {
+            say(&format!("{alias} isn't the Mac's {place}: {error}"));
+        }
     }
 }
 
-/// The places to hide (`hidden`, from the command line) that are in the
-/// shared `home` and nothing that steps out of it.
-pub(super) fn hidden_in(home: &str, hidden: &[String]) -> Vec<String> {
+/// The Mac's share `tag` mounted at `place` (made if missing).
+fn mount_share(tag: &str, place: &str) -> Result<(), String> {
+    std::fs::create_dir_all(place).map_err(|e| e.to_string())?;
+    mount(
+        Some(tag),
+        place,
+        Some("virtiofs"),
+        SHARE_FLAGS,
+        None::<&str>,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// `place` (a share, its hidden places in it) bound at `alias` too, over
+/// what the guest had there (its own `/tmp`: empty at this point, its
+/// temporary files are in [`super::GUEST_TMP`]). A bind keeps the share's
+/// `nosuid,nodev`.
+fn bind_alias(place: &str, alias: &str) -> Result<(), String> {
+    std::fs::create_dir_all(alias).map_err(|e| e.to_string())?;
+    mount(
+        Some(place),
+        alias,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Where Rosetta's share is mounted.
+const ROSETTA_MOUNT: &str = "/run/rosetta";
+
+/// The kernel's `binfmt_misc`: the interpreters `execve` runs a program of
+/// another format through.
+const BINFMT: &str = "/proc/sys/fs/binfmt_misc";
+
+/// Rosetta's registration, as Apple documents it: an x86-64 ELF
+/// executable's header (`e_machine` 0x3e), masked, run through Rosetta's
+/// interpreter; `C`, the credentials the program's own (as a setuid one's
+/// would be), and `F`, the interpreter opened now: a container's mount
+/// namespace, which has no `/run/rosetta`, still runs it.
+const ROSETTA_REGISTRATION: &str = concat!(
+    r":rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:",
+    r"\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:",
+    "/run/rosetta/rosetta:CF"
+);
+
+/// Rosetta (step 13.3, D13-2), when the Mac gives its share (`shipyard.rosetta=1`
+/// on the command line): mounted read-only, registered with `binfmt_misc`,
+/// so amd64 programs run through it. A failure is said, never fatal: amd64
+/// images are then refused, as on a Mac without Rosetta.
+fn rosetta() {
+    if !rosetta_given(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default()) {
+        return;
+    }
+    match register_rosetta() {
+        Ok(()) => say("Rosetta registered: amd64 programs run through it"),
+        Err(error) => say(&format!(
+            "Rosetta isn't registered ({error}): amd64 images won't run"
+        )),
+    }
+}
+
+/// Whether the kernel's command line (`cmdline`) says the Mac gives
+/// Rosetta's share ([`forward::ROSETTA_WORD`]).
+pub(super) fn rosetta_given(cmdline: &str) -> bool {
+    cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == forward::ROSETTA_WORD)
+}
+
+/// [`rosetta`]'s mount and registration.
+fn register_rosetta() -> Result<(), String> {
+    std::fs::create_dir_all(ROSETTA_MOUNT).map_err(|e| format!("{ROSETTA_MOUNT}: {e}"))?;
+    mount(
+        Some(forward::ROSETTA_TAG),
+        ROSETTA_MOUNT,
+        Some("virtiofs"),
+        MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        None::<&str>,
+    )
+    .map_err(|e| format!("mounting its share: {e}"))?;
+    let register = Path::new(BINFMT).join("register");
+    if !register.exists() {
+        mount(
+            Some("binfmt_misc"),
+            BINFMT,
+            Some("binfmt_misc"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(|e| format!("mounting binfmt_misc: {e}"))?;
+    }
+    std::fs::write(&register, ROSETTA_REGISTRATION).map_err(|e| format!("registering it: {e}"))
+}
+
+/// The places to hide (`hidden`, from the command line) that are in one
+/// of the `shared` places (not one itself) and nothing that steps out.
+pub(super) fn hidden_in(shared: &[String], hidden: &[String]) -> Vec<String> {
     hidden
         .iter()
         .filter(|place| {
-            std::path::Path::new(place).starts_with(home)
-                && *place != home
-                && !place.split('/').any(|part| part == "..")
+            shared
+                .iter()
+                .any(|shared| std::path::Path::new(place).starts_with(shared) && *place != shared)
+                && super::never_climbs(place)
         })
         .cloned()
         .collect()
 }
 
-/// `place` (the VM's own files, in the shared home) covered with an empty,
+/// `place` (the VM's own files, in a share) covered with an empty,
 /// read-only tmpfs: a container given the home (`--volume ~:/h`, binds are
 /// recursive) sees nothing there, so it can't rewrite the VM's data disk
 /// or its boot files (the guest needs neither through the share).
 fn hide(place: &str) {
     if !std::path::Path::new(place).is_dir() {
+        // Said: a bind holding it is then refused (`shares`' check).
+        say(&format!(
+            "{place} isn't hidden from containers: it isn't a directory here"
+        ));
         return;
     }
     let flags = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
@@ -453,15 +591,6 @@ fn hide(place: &str) {
     ) {
         say(&format!("{place} isn't hidden from containers: {error}"));
     }
-}
-
-/// The home the kernel's command line names: an absolute path, nothing
-/// that steps out of it.
-pub(super) fn home_of(cmdline: &str) -> Option<&str> {
-    let home = cmdline
-        .split_ascii_whitespace()
-        .find_map(|word| word.strip_prefix(forward::HOME_KEY))?;
-    (home.starts_with('/') && !home.split('/').any(|part| part == "..")).then_some(home)
 }
 
 /// Runs `shipyard ARGS`, waited for up to `limit` (killed past it).
@@ -494,14 +623,36 @@ fn shipyard(args: &[&str], limit: Duration) {
     }
 }
 
+/// The agent's listening vsock socket (step 13.5b, F108): made by PID 1
+/// before anything else runs, kept for the guest's life (close-on-exec in
+/// it), and handed to each agent it starts: the port is never free for a
+/// container that can open vsock to take while the agent restarts, and
+/// connections that come meanwhile wait in its backlog for the next.
+static AGENT_LISTENER: std::sync::Mutex<Option<std::os::fd::OwnedFd>> = std::sync::Mutex::new(None);
+
 /// Starts the agent, in a process group of its own: a group it signals
 /// by mistake (0: its own) is never PID 1's, which would take a SIGTERM or
-/// SIGINT for the VM's stop.
+/// SIGINT for the VM's stop. It's given [`AGENT_LISTENER`] at
+/// [`forward::AGENT_FD`].
 fn start_agent() -> Result<Child, String> {
-    Command::new(SHIPYARD)
+    use std::os::fd::AsRawFd as _;
+    let listener = AGENT_LISTENER
+        .lock()
+        .map_err(|_| "the agent's socket's lock, poisoned".to_owned())?
+        .as_ref()
+        .ok_or_else(|| "the agent's socket isn't made".to_owned())?
+        .as_raw_fd();
+    let mut command = Command::new(SHIPYARD);
+    command
         .arg(super::AGENT_ARG)
         .stdin(Stdio::null())
-        .process_group(0)
+        .process_group(0);
+    // SAFETY: between fork and exec, `dup2` and `fcntl` only:
+    // async-signal-safe, no allocation, no lock.
+    unsafe {
+        command.pre_exec(move || super::agent::at_descriptor(listener, forward::AGENT_FD));
+    }
+    command
         .spawn_unblocked()
         .map_err(|e| format!("starting the agent: {e}"))
 }
@@ -681,14 +832,77 @@ fn reap_all(deadline: Instant, mut reap_one: impl FnMut() -> nix::Result<WaitSta
     }
 }
 
+/// `FITRIM`'s argument (`struct fstrim_range`, `<linux/fs.h>`): the bytes
+/// of the filesystem to trim, from `start` for `len`, in free runs of at least
+/// `minlen`; the kernel sets `len` to the bytes it trimmed.
+#[repr(C)]
+struct FstrimRange {
+    start: u64,
+    len: u64,
+    minlen: u64,
+}
+
+// `FITRIM`: `_IOWR('X', 121, struct fstrim_range)`.
+nix::ioctl_readwrite!(fitrim, b'X', 121, FstrimRange);
+
+/// The data disk's free space given back to the Mac (D13.2-3, F103): its
+/// image is a sparse file there, which a delete in the guest never shrinks;
+/// the filesystem's free blocks discarded (`FITRIM`, what `fstrim` does), and
+/// the framework punches them out of the image (13.1's probe). At each stop,
+/// once nothing writes: no cost while the guest runs. A failure is said,
+/// never fatal (the stop goes on).
+fn trim_data() {
+    use std::os::fd::AsRawFd as _;
+    let dir = match std::fs::File::open(DATA) {
+        Ok(dir) => dir,
+        Err(error) => {
+            say(&format!(
+                "giving {DATA}'s free space back to the Mac: {error}"
+            ));
+            return;
+        }
+    };
+    let mut range = FstrimRange {
+        start: 0,
+        len: u64::MAX,
+        minlen: 0,
+    };
+    let began = Instant::now();
+    // SAFETY: `dir` is an open descriptor of the mounted filesystem for the
+    // call's length; `range` is a valid `fstrim_range` the kernel reads and
+    // writes back, alive across the call.
+    match unsafe { fitrim(dir.as_raw_fd(), &raw mut range) } {
+        Ok(_) => say(&format!(
+            "{} free bytes of {DATA} given back to the Mac ({} ms)",
+            range.len,
+            began.elapsed().as_millis()
+        )),
+        Err(error) => say(&format!(
+            "giving {DATA}'s free space back to the Mac: {error}"
+        )),
+    }
+}
+
 /// The VM's stop: the containers stopped (as `system stop` does on a Linux
-/// host's shutdown), every process ended, the disk synced and let go.
+/// host's shutdown), every process ended, the disk synced, its free space
+/// given back to the Mac, and let go.
 fn stop() -> ! {
     say("stopping");
     // What's written so far, on the disk first: a Mac that shuts down may
     // end the VM before its containers have all stopped.
     sync_data();
     shipyard(&["system", "stop"], SETTLE);
+    // The agent's port shut (the socket PID 1 and the agent share): what
+    // comes now is refused at once, never left waiting in its backlog until
+    // the power-off.
+    if let Ok(mut held) = AGENT_LISTENER.lock()
+        && let Some(listener) = held.take()
+    {
+        let _ = nix::sys::socket::shutdown(
+            std::os::fd::AsRawFd::as_raw_fd(&listener),
+            nix::sys::socket::Shutdown::Both,
+        );
+    }
     let _ = nix::sys::signal::kill(Pid::from_raw(-1), Signal::SIGTERM);
     std::thread::sleep(Duration::from_secs(2));
     let _ = nix::sys::signal::kill(Pid::from_raw(-1), Signal::SIGKILL);
@@ -698,6 +912,7 @@ fn stop() -> ! {
         waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
     });
     sync_data();
+    trim_data();
     if let Err(error) = nix::mount::umount(DATA) {
         say(&format!(
             "unmounting {DATA}: {error}; made read-only instead"
@@ -717,11 +932,43 @@ fn stop() -> ! {
 mod tests {
     use super::*;
 
+    /// Rosetta's registration is Apple's, field by field: its name, a magic
+    /// (`M`) at offset 0, the x86-64 ELF header and its mask (20 bytes each,
+    /// `e_machine` 0x3e at byte 18), the interpreter in the share, `C` and
+    /// `F` (the interpreter opened at registration: containers run it).
+    #[test]
+    fn rosetta_s_registration_is_apple_s() {
+        let fields: Vec<&str> = ROSETTA_REGISTRATION.split(':').collect();
+        assert_eq!(fields.len(), 8, "{fields:?}");
+        assert_eq!(&fields[..4], ["", "rosetta", "M", ""]);
+        let bytes = |text: &str| -> Vec<u8> {
+            text.split("\\x")
+                .filter(|hex| !hex.is_empty())
+                .flat_map(|chunk| {
+                    let (hex, rest) = chunk.split_at(2);
+                    std::iter::once(u8::from_str_radix(hex, 16).unwrap()).chain(rest.bytes())
+                })
+                .collect()
+        };
+        let magic = bytes(fields[4]);
+        assert_eq!(magic.len(), 20);
+        assert_eq!(&magic[..4], b"\x7fELF");
+        assert_eq!(magic[18], 0x3e, "x86-64's e_machine");
+        assert_eq!(bytes(fields[5]).len(), 20);
+        assert_eq!(fields[6], format!("{ROSETTA_MOUNT}/rosetta"));
+        assert_eq!(
+            fields[6],
+            crate::image::ROSETTA_INTERPRETER,
+            "what the engine looks for"
+        );
+        assert_eq!(fields[7], "CF");
+    }
+
     /// The home is mounted without set-user-ID bits or device files.
     #[test]
-    fn the_home_is_mounted_nosuid_and_nodev() {
-        assert!(HOME_FLAGS.contains(MsFlags::MS_NOSUID));
-        assert!(HOME_FLAGS.contains(MsFlags::MS_NODEV));
+    fn the_shares_are_mounted_nosuid_and_nodev() {
+        assert!(SHARE_FLAGS.contains(MsFlags::MS_NOSUID));
+        assert!(SHARE_FLAGS.contains(MsFlags::MS_NODEV));
     }
 
     /// The stop's reaping ends once nothing is left, or at its deadline
@@ -787,22 +1034,32 @@ mod tests {
         );
     }
 
-    /// Only places inside the home are hidden: not the home itself, not
-    /// one elsewhere, nothing that steps out of it.
+    /// Only places inside a share are hidden: not a share itself, not one
+    /// elsewhere, nothing that steps out of one.
     #[test]
-    fn only_places_in_the_home_are_hidden() {
+    fn only_places_in_a_share_are_hidden() {
         let named = [
             "/Users/me/Library/Application Support/Shipyard/vm",
             "/Users/me",
-            "/tmp/vm",
+            "/private/var/folders/x/T/vm",
+            "/private/var/folders",
+            "/opt/vm",
             "/Users/me/../other",
             "/Users/meagain/vm",
         ]
         .map(str::to_owned);
+        let shared = ["/Users/me", "/private/var/folders"].map(str::to_owned);
         assert_eq!(
-            hidden_in("/Users/me", &named),
-            ["/Users/me/Library/Application Support/Shipyard/vm"]
+            hidden_in(&shared, &named),
+            [
+                "/Users/me/Library/Application Support/Shipyard/vm",
+                "/private/var/folders/x/T/vm"
+            ]
         );
+        assert!(super::super::is_plain_place("/Volumes"));
+        for not in ["/", "Volumes", "/Volumes/../etc", ""] {
+            assert!(!super::super::is_plain_place(not), "{not:?}");
+        }
     }
 
     /// The home is the kernel's command line's `shipyard.home=`, absolute,
@@ -810,11 +1067,11 @@ mod tests {
     #[test]
     fn the_home_is_an_absolute_path_from_the_command_line() {
         assert_eq!(
-            home_of("console=hvc0 shipyard.home=/Users/me panic=-1"),
+            super::super::home_of("console=hvc0 shipyard.home=/Users/me panic=-1"),
             Some("/Users/me")
         );
-        assert_eq!(home_of("console=hvc0"), None);
-        assert_eq!(home_of("shipyard.home=Users/me"), None);
-        assert_eq!(home_of("shipyard.home=/Users/../etc"), None);
+        assert_eq!(super::super::home_of("console=hvc0"), None);
+        assert_eq!(super::super::home_of("shipyard.home=Users/me"), None);
+        assert_eq!(super::super::home_of("shipyard.home=/Users/../etc"), None);
     }
 }
