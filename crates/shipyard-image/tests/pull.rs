@@ -912,6 +912,88 @@ fn an_artifact_or_another_platforms_image_is_refused() {
     assert!(matches!(err, PullError::Platform { .. }), "{err}");
 }
 
+/// Step 13.3 (D13-2): among the platforms that run here (an arm64 Mac's VM
+/// with Rosetta: arm64, then amd64), an image with no arm64 build is pulled
+/// as amd64, an index's or a single manifest's alike, and found again in the
+/// store for what runs here; where only arm64 runs, it's refused, as before.
+/// An index with both gives arm64 (the host's first).
+#[test]
+fn an_image_is_pulled_for_the_first_platform_that_runs_here() {
+    let mut fixture = FixtureRegistry::default();
+    let amd = host_image(&mut fixture, "multi", "amd64-only", "amd64", 1);
+    let arm = host_image(&mut fixture, "multi", "arm64-only", "arm64", 2);
+    host_image(&mut fixture, "single", "v1", "amd64", 1);
+    let entry = |hosted: &Hosted, arch: &str| {
+        format!(
+            r#"{{"mediaType":"{OCI_MANIFEST}","digest":"{}","size":{},"platform":{{"architecture":"{arch}","os":"linux"}}}}"#,
+            hosted.manifest,
+            hosted.manifest_bytes.len()
+        )
+    };
+    let index = |entries: &[String]| {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[{}]}}"#,
+            entries.join(",")
+        )
+        .into_bytes()
+    };
+    fixture.route(
+        "/v2/multi/manifests/amd",
+        Response::ok(OCI_INDEX, index(&[entry(&amd, "amd64")])),
+    );
+    fixture.route(
+        "/v2/multi/manifests/both",
+        Response::ok(
+            OCI_INDEX,
+            index(&[entry(&amd, "amd64"), entry(&arm, "arm64")]),
+        ),
+    );
+    let serving = fixture.serve();
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let arm64 = Platform::new("linux", "arm64");
+    let here = vec![arm64.clone(), amd64()];
+    let quiet = |_: &Descriptor, _: bool| {};
+    let pull_here = |image: &str, choices: &Vec<Platform>| {
+        shipyard_image::pull::pull_with(
+            &reference(image),
+            choices,
+            &store,
+            &serving.registry(),
+            shipyard_image::PullOptions::default(),
+            &quiet,
+        )
+    };
+    let pulled = pull_here("localhost/multi:amd", &here).unwrap();
+    assert_eq!(pulled.manifest_digest, amd.manifest);
+    assert_eq!(pulled.platform, amd64());
+    let single = pull_here("localhost/single:v1", &here).unwrap();
+    assert_eq!(single.platform, amd64());
+    let both = pull_here("localhost/multi:both", &here).unwrap();
+    assert_eq!(both.manifest_digest, arm.manifest, "the host's first");
+    // Found again in the store for what runs here, not for arm64 alone.
+    let record = shipyard_image::ImageRecord::of(&pulled, None);
+    shipyard_image::index::Index::record(store.root(), "localhost/multi:amd", record).unwrap();
+    let found = shipyard_image::from_store(&reference("localhost/multi:amd"), &here, &store)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.manifest_digest, amd.manifest);
+    assert!(matches!(
+        shipyard_image::from_store(&reference("localhost/multi:amd"), &arm64, &store),
+        Err(PullError::Platform { .. })
+    ));
+    // Where only arm64 runs: refused, an index's and a single manifest's.
+    let arm_only = vec![arm64];
+    assert!(matches!(
+        pull_here("localhost/multi:amd", &arm_only),
+        Err(PullError::Manifest(_))
+    ));
+    assert!(matches!(
+        pull_here("localhost/single:v1", &arm_only),
+        Err(PullError::Platform { .. })
+    ));
+}
+
 #[test]
 fn a_pulled_image_is_found_in_the_store_without_the_registry() {
     let mut fixture = FixtureRegistry::default();
@@ -1602,4 +1684,38 @@ fn a_registry_without_ranges_that_keeps_cutting_isnt_progress() {
     // The manifest, the config, and the blob: once with progress, then
     // four times without.
     assert_eq!(serving.requests(), 2 + 5);
+}
+
+/// Step 13.3's reviews: "for another platform" is one thing whichever way
+/// it comes (the image's config, or an index without the platform), and
+/// nothing else is it (a store or registry failure is never a reason to
+/// pull another platform's image).
+#[test]
+fn another_platform_is_told_from_other_failures() {
+    let mut fixture = FixtureRegistry::default();
+    let amd = host_image(&mut fixture, "multi", "amd64-only", "amd64", 1);
+    host_image(&mut fixture, "single", "v1", "amd64", 1);
+    let entry = format!(
+        r#"{{"mediaType":"{OCI_MANIFEST}","digest":"{}","size":{},"platform":{{"architecture":"amd64","os":"linux"}}}}"#,
+        amd.manifest,
+        amd.manifest_bytes.len()
+    );
+    fixture.route(
+        "/v2/multi/manifests/v1",
+        Response::ok(
+            OCI_INDEX,
+            format!(r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[{entry}]}}"#)
+                .into_bytes(),
+        ),
+    );
+    let serving = fixture.serve();
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let arm64 = Platform::new("linux", "arm64");
+    let index = pull(&serving, "localhost/multi:v1", &arm64, &store).unwrap_err();
+    assert!(index.is_other_platform(), "{index}");
+    let single = pull(&serving, "localhost/single:v1", &arm64, &store).unwrap_err();
+    assert!(single.is_other_platform(), "{single}");
+    let missing = pull(&serving, "localhost/nothing:v1", &arm64, &store).unwrap_err();
+    assert!(!missing.is_other_platform(), "{missing}");
 }

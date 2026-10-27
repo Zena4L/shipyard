@@ -46,16 +46,18 @@ const MAX_AUTH: usize = 16 * 1024;
 /// A request refused before the pull (400, 503); once it's under way, its
 /// failure is written in the stream (Docker's `errorDetail`).
 pub(crate) fn pull(shared: &Arc<Shared>, query: &Query, headers: &HeaderMap) -> Reply {
-    if let Some(platform) = query
+    // A platform asked for must run here (step 13.3: amd64 on a Mac's VM,
+    // through Rosetta); none asked, the image's own among what does.
+    let platform = match query
         .get("platform")
         .filter(|platform| !platform.is_empty())
-        && !shipyard_engine::image::is_host_platform(platform)
     {
-        return Err(ApiError::bad(format!(
-            "only this host's platform is pulled ({}), not {platform}",
-            shipyard_engine::image::host_platform_name()
-        )));
-    }
+        None => None,
+        Some(asked) => Some(
+            shipyard_engine::image::platform_here(asked, "pulled")
+                .map_err(|error| ApiError::bad(error.to_string()))?,
+        ),
+    };
     let reference = reference(query)?;
     let given = credentials(headers)?;
     let permit = streams::stream_permit(shared)?;
@@ -70,7 +72,7 @@ pub(crate) fn pull(shared: &Arc<Shared>, query: &Query, headers: &HeaderMap) -> 
         let canonical = reference.to_string();
         let pulled = puller
             .call_reporting(Arc::clone(&progress) as _, move |engine| {
-                shipyard_engine::image::pull_with(engine, &canonical, given)
+                shipyard_engine::image::pull_with(engine, &canonical, given, platform)
             })
             .await;
         let lines: Vec<Line> = match pulled {

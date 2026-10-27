@@ -48,9 +48,11 @@ pub(crate) fn place(command: &Command) -> Place {
         Command::System(SystemCommand::Recover | SystemCommand::Stop) => {
             Place::Refused("on a Mac, the VM's own start and stop settle and stop its containers")
         }
-        Command::System(SystemCommand::Service { .. }) => {
-            Place::Refused("on a Mac, Docker's API isn't served yet: use shipyard's own commands")
-        }
+        Command::System(SystemCommand::Service { .. }) => Place::Refused(
+            "on a Mac, Docker's API is the VM's, served at its `docker.sock` (`shipyard vm \
+             status` says where: point DOCKER_HOST at it; `shipyard vm install` keeps it there \
+             any time)",
+        ),
         _ => Place::Guest,
     }
 }
@@ -236,25 +238,37 @@ pub(crate) fn needs(command: &Command) -> Needs {
     }
 }
 
-/// Checks that `path` (relative to `cwd`) is under `home` once its links
-/// are followed (both canonical). A path that isn't there is judged by
+/// Checks that `path` (relative to `cwd`) is in one of the places the VM
+/// shares (`shares`, the home first: step 13.4) once its links are
+/// followed (all canonical). A path that isn't there is judged by
 /// where it would be: its directory if it may be new, else the nearest of
 /// its directories that is there (the guest has files of its own outside
 /// the home, `/var/lib/shipyard` or `/run`, that the Mac hasn't: never
-/// sent); one under the home is the guest's to refuse. A link on its way
+/// sent); one in a share is the guest's to refuse. A link on its way
 /// that leads nowhere here is refused (it may lead somewhere in the
 /// guest), as is any other error resolving it.
 ///
 /// # Errors
 ///
-/// Where it really is, and why that's refused.
-pub(crate) fn within_home(path: &HostPath, cwd: &Path, home: &Path) -> Result<(), String> {
+/// Where it really is, and why that's refused. Shared, whether it's
+/// beyond the home (`shares`' first): a guest that shares only the home
+/// mustn't be sent it (`Request::beyond_home`).
+pub(crate) fn within_shares(
+    path: &HostPath,
+    cwd: &Path,
+    shares: &[PathBuf],
+) -> Result<bool, String> {
     let absolute = cwd.join(&path.path);
     let refused = |why: &str| {
+        let shared: Vec<String> = shares
+            .iter()
+            .map(|place| place.display().to_string())
+            .collect();
         Err(format!(
-            "{} {why}: on a Mac, only your home ({}) is shared with the VM, at the same path",
+            "{} {why}: on a Mac, only your home and a few places beside it ({}) are shared \
+             with the VM, at the same paths",
             path.path.display(),
-            home.display()
+            shared.join(", ")
         ))
     };
     let real = match std::fs::canonicalize(&absolute) {
@@ -276,10 +290,10 @@ pub(crate) fn within_home(path: &HostPath, cwd: &Path, home: &Path) -> Result<()
         }
         Err(error) => return refused(&format!("can't be resolved ({error})")),
     };
-    if real.starts_with(home) {
-        Ok(())
+    if shares.iter().any(|shared| real.starts_with(shared)) {
+        Ok(!shares.first().is_some_and(|home| real.starts_with(home)))
     } else {
-        refused(&format!("is {}, outside your home", real.display()))
+        refused(&format!("is {}, not shared", real.display()))
     }
 }
 
@@ -307,12 +321,12 @@ fn has_dangling_link(path: &Path) -> bool {
     })
 }
 
-/// The directory a forwarded command runs in: the caller's, if it's under
-/// the home (both canonical: the guest has it at the same path), else `/`
-/// (and every relative path it names is then outside the home, refused).
-/// `None` for one under the home whose name isn't text.
-pub(crate) fn guest_cwd(cwd: &Path, home: &Path) -> Option<String> {
-    if cwd.starts_with(home) {
+/// The directory a forwarded command runs in: the caller's, if it's in a
+/// share (all canonical: the guest has it at the same path), else `/`
+/// (and every relative path it names is then outside them, refused).
+/// `None` for one in a share whose name isn't text.
+pub(crate) fn guest_cwd(cwd: &Path, shares: &[PathBuf]) -> Option<String> {
+    if shares.iter().any(|shared| cwd.starts_with(shared)) {
         cwd.to_str().map(str::to_owned)
     } else {
         Some("/".to_owned())
@@ -417,7 +431,7 @@ mod mac {
     use shipyard_vm::client::{self, Outcome, Status};
     use shipyard_vm::{Guest, VmPaths};
 
-    use super::{guest_cwd, needs, within_home};
+    use super::{guest_cwd, needs, within_shares};
     use crate::cli::Command;
 
     use crate::REVISION;
@@ -432,10 +446,17 @@ mod mac {
         let cwd = std::env::current_dir()
             .and_then(std::fs::canonicalize)
             .context("this directory")?;
+        let shares = shipyard_vm::shares::all(&home);
         let needs = needs(command);
+        // (A directory or a path in a share beyond the home: a guest that
+        // shares only the home refuses the request, never runs it in a
+        // directory of its own: stage 13's close.)
+        let mut beyond_home =
+            !cwd.starts_with(&home) && shares.iter().any(|shared| cwd.starts_with(shared));
         for path in &needs.paths {
-            if let Err(why) = within_home(path, &cwd, &home) {
-                bail!(why);
+            match within_shares(path, &cwd, &shares) {
+                Ok(beyond) => beyond_home |= beyond,
+                Err(why) => bail!(why),
             }
         }
         if let Err(why) = super::copyable(&needs.copied_env) {
@@ -451,7 +472,7 @@ mod mac {
         if super::dockerfile_from_terminal(command, std::io::stdin().is_terminal()) {
             bail!(crate::building::DOCKERFILE_FROM_TERMINAL);
         }
-        let Some(cwd) = guest_cwd(&cwd, &home) else {
+        let Some(cwd) = guest_cwd(&cwd, &shares) else {
             bail!("this directory's name isn't text: it can't be sent to the VM");
         };
         let args = std::env::args_os()
@@ -477,8 +498,15 @@ mod mac {
         if let Some(handed) = super::handed_credential(command)? {
             request = request.with_registry_auth(handed);
         }
+        if beyond_home {
+            request = request.beyond_home();
+        }
         if client::status(&paths)? == Status::Stopped {
             warn_if_another_build(&paths);
+        } else if let Some(another) = shipyard_vm::booted::running_elsewhere(&paths) {
+            // A VM an older build started (F173b): what this command meets
+            // there may not be what this build would do.
+            let _ = crate::reporter::warn(another);
         }
         let code = |code: i32| {
             ExitCode::from(
@@ -527,23 +555,35 @@ mod tests {
         std::fs::canonicalize(&dir).unwrap()
     }
 
-    /// A path in the home passes, relative or not; one a link takes out of
-    /// it (to the guest's own files, say), or one outside, is refused; a
+    /// A path in a share passes, relative or not; one a link takes out of
+    /// them (to the guest's own files, say), or one outside, is refused; a
     /// new destination is judged by its directory; one that isn't there,
-    /// by where it would be: in the home, the guest's to refuse; outside
+    /// by where it would be: in a share, the guest's to refuse; outside
     /// (the guest's own `/var/lib/shipyard`, which the Mac hasn't), refused.
     #[test]
-    fn only_paths_in_the_home_are_forwarded() {
+    fn only_paths_in_the_shares_are_forwarded() {
         let root = scratch("paths");
         let home = root.join("home");
         let project = home.join("project");
         std::fs::create_dir_all(project.join("data")).unwrap();
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::create_dir_all(root.join("volume/data")).unwrap();
         std::os::unix::fs::symlink("/var/lib", project.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("volume"), project.join("to-volume")).unwrap();
         // Dangling here, it could lead somewhere in the guest.
         std::os::unix::fs::symlink("/var/lib/shipyard", project.join("guest-state")).unwrap();
-        let check = |path: HostPath| within_home(&path, &project, &home);
-        assert!(check(HostPath::existing("data")).is_ok());
+        let shares = [home.clone(), root.join("volume")];
+        let check = |path: HostPath| within_shares(&path, &project, &shares);
+        assert_eq!(check(HostPath::existing("data")), Ok(false), "in the home");
+        assert_eq!(
+            check(HostPath::existing(root.join("volume/data"))),
+            Ok(true),
+            "beyond the home"
+        );
+        assert!(
+            check(HostPath::existing("to-volume/data")).is_ok(),
+            "a link to a share"
+        );
         assert!(check(HostPath::existing(project.join("data"))).is_ok());
         assert!(check(HostPath::existing("escape")).is_err(), "a link out");
         assert!(check(HostPath::existing("../../elsewhere")).is_err());
@@ -569,14 +609,15 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The guest's directory is the caller's under the home, else `/`.
+    /// The guest's directory is the caller's in a share, else `/`.
     #[test]
-    fn the_directory_is_the_callers_under_the_home() {
-        let home = Path::new("/Users/me");
-        let cwd = |dir: &str| guest_cwd(Path::new(dir), home);
+    fn the_directory_is_the_callers_in_a_share() {
+        let shares = [PathBuf::from("/Users/me"), PathBuf::from("/private/tmp")];
+        let cwd = |dir: &str| guest_cwd(Path::new(dir), &shares);
         assert_eq!(cwd("/Users/me/app").as_deref(), Some("/Users/me/app"));
         assert_eq!(cwd("/Users/me").as_deref(), Some("/Users/me"));
-        assert_eq!(cwd("/private/tmp").as_deref(), Some("/"));
+        assert_eq!(cwd("/private/tmp/x").as_deref(), Some("/private/tmp/x"));
+        assert_eq!(cwd("/opt").as_deref(), Some("/"));
         assert_eq!(cwd("/Users/meow").as_deref(), Some("/"));
     }
 

@@ -279,8 +279,9 @@ mod linux {
             self.each_if_present(&format!("forgetting the port {}", guard.port), items)
         }
 
-        /// Makes Shipyard's table, with `networks` in its sets and routing
-        /// `closed` as recorded, replacing whatever table of that name is
+        /// Makes Shipyard's table, with `networks` in its sets, routing
+        /// `closed` as recorded and the `outside` links no published port
+        /// is reached from (the macOS guest's NAT link), replacing whatever table of that name is
         /// there: in one batch, so the old rules give way to the new at
         /// once. `ports` are published again in that batch too, so the new
         /// table never lacks them, unless there are too many for one, or one
@@ -291,12 +292,13 @@ mod linux {
             networks: &[NetworkRules],
             ports: &[PortRule],
             closed: &ClosedRouting,
+            outside: &[String],
         ) -> Result<(), NetlinkError> {
             let mut items = Vec::new();
             if self.ruleset()? != Ruleset::Missing {
                 items.push(delete_table(FAMILY, TABLE));
             }
-            items.extend(ruleset::install(networks, &[], closed));
+            items.extend(ruleset::install(networks, &[], closed, outside));
             let table = items.len();
             let (items, more) = ruleset::fit_ports(items, ruleset::port_items(ports, false));
             let more = match self.batch("installing shipyard's firewall rules", &items) {

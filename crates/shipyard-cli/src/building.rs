@@ -47,7 +47,8 @@ pub(crate) struct BuildArgs {
     /// quiet.
     #[arg(long, value_name = "TYPE", default_value = "auto")]
     pub(crate) progress: String,
-    /// The platform: this host's only.
+    /// The platform to build for: one that runs here (on a Mac, `linux/amd64`
+    /// too, through Rosetta).
     #[arg(long, value_name = "PLATFORM")]
     pub(crate) platform: Option<String>,
     /// A secret for `RUN --mount=type=secret`: id=ID,src=FILE (repeat it).

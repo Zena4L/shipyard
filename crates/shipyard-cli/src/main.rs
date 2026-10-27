@@ -147,7 +147,12 @@ fn dispatch(
             &args.refs.containers,
             shipyard_engine::run::RemoveOptions::new(args.force, args.volumes),
         )),
-        Command::Pull(args) => images::pull(&args.reference, args.quiet, handed),
+        Command::Pull(args) => images::pull(
+            &args.reference,
+            args.platform.as_deref(),
+            args.quiet,
+            handed,
+        ),
         Command::Images(args) => images::list(&args),
         Command::Rmi(args) => Ok(images::rmi(&args.images, args.force)),
         Command::Tag(args) => images::tag(&args.source, &args.target),

@@ -58,6 +58,9 @@ pub enum WarningKind {
     LeftForLater,
     /// The store's copy of an image couldn't be read: it's pulled again.
     StoredImageUnreadable,
+    /// An image has no build for this host's platform: another that runs
+    /// here (an amd64 one, through Rosetta, on a Mac: step 13.3) is used.
+    OtherPlatform,
     /// An image's files all belong to the caller, not to its users.
     OwnersCollapsed,
     /// Extracting a layer left something out (a file it couldn't make as
@@ -177,6 +180,19 @@ pub(crate) fn warn(reporter: &dyn Reporter, kind: WarningKind, message: impl Int
         kind,
         message: message.into(),
     }));
+}
+
+/// A [`Reporter`] that says nothing: for a helper process whose findings
+/// are in what it returns (the macOS guest's ports and checks, pasta's
+/// launcher, a forwarded port's lookup).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the guest's and pasta's")
+)]
+pub(crate) struct Quiet;
+
+impl Reporter for Quiet {
+    fn report(&self, _message: Message) {}
 }
 
 /// A [`Reporter`] that keeps every message, in order: for a caller that

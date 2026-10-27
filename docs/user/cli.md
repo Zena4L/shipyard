@@ -107,6 +107,7 @@ This document contains the help content for the `shipyard` command-line program.
 * [`shipyard vm stop`↴](#shipyard-vm-stop)
 * [`shipyard vm install`↴](#shipyard-vm-install)
 * [`shipyard vm uninstall`↴](#shipyard-vm-uninstall)
+* [`shipyard vm set`↴](#shipyard-vm-set)
 * [`shipyard builder`↴](#shipyard-builder)
 * [`shipyard builder prune`↴](#shipyard-builder-prune)
 * [`shipyard doctor`↴](#shipyard-doctor)
@@ -281,6 +282,7 @@ shipyard run [OPTIONS] --bundle DIR
   - `never`:
     Never: the store's, or nothing
 
+* `--platform <PLATFORM>` — The image's platform (`linux/amd64`: on a Mac, run through Rosetta); by default the image's own among what runs here, this host's first
 * `--read-only` — Make the container's root filesystem read-only (with an image or --rootfs)
 * `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
 * `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
@@ -398,6 +400,7 @@ shipyard create [OPTIONS] --rootfs DIR COMMAND...
   - `never`:
     Never: the store's, or nothing
 
+* `--platform <PLATFORM>` — The image's platform (`linux/amd64`: on a Mac, run through Rosetta); by default the image's own among what runs here, this host's first
 * `--read-only` — Make the container's root filesystem read-only (with an image or --rootfs)
 * `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
 * `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
@@ -836,6 +839,7 @@ Pull an image into the local store (and extract it, on Linux), so a run starts a
 ###### **Options:**
 
 * `-q`, `--quiet` — Print nothing but the image's digest
+* `--platform <PLATFORM>` — The platform to pull (`linux/amd64`: on a Mac, run through Rosetta); by default the image's own among what runs here, this host's first
 
 
 
@@ -941,7 +945,7 @@ Build an image from a Dockerfile, with BuildKit (in a container of its own, gone
 * `--progress <TYPE>` — How progress is shown: auto, plain (BuildKit's lines, as auto) or quiet
 
   Default value: `auto`
-* `--platform <PLATFORM>` — The platform: this host's only
+* `--platform <PLATFORM>` — The platform to build for: one that runs here (on a Mac, `linux/amd64` too, through Rosetta)
 * `--secret <id=ID,src=FILE>` — A secret for `RUN --mount=type=secret`: id=ID,src=FILE (repeat it)
 * `-o`, `--output <OUTPUT>` — Write the build's files instead of an image: type=local,dest=DIR (or DIR), or type=tar,dest=FILE (- for standard output)
 
@@ -1033,7 +1037,7 @@ Make an image of a root filesystem's tar archive (a file, or - for standard inpu
 
 * `-c`, `--change <INSTRUCTION>` — Set a config instruction of the image's: CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, USER, VOLUME, WORKDIR or STOPSIGNAL, as a Dockerfile's (repeat it for more)
 * `-m`, `--message <MESSAGE>` — Its history's comment
-* `--platform <PLATFORM>` — The platform: this host's only
+* `--platform <PLATFORM>` — The image's platform: one that runs here (on a Mac, `linux/amd64` too)
 
 
 
@@ -1185,6 +1189,7 @@ Run an image in a container (`run`)
   - `never`:
     Never: the store's, or nothing
 
+* `--platform <PLATFORM>` — The image's platform (`linux/amd64`: on a Mac, run through Rosetta); by default the image's own among what runs here, this host's first
 * `--read-only` — Make the container's root filesystem read-only (with an image or --rootfs)
 * `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
 * `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
@@ -1297,6 +1302,7 @@ Make a container, to start later (`create`)
   - `never`:
     Never: the store's, or nothing
 
+* `--platform <PLATFORM>` — The image's platform (`linux/amd64`: on a Mac, run through Rosetta); by default the image's own among what runs here, this host's first
 * `--read-only` — Make the container's root filesystem read-only (with an image or --rootfs)
 * `--cap-add <CAP>` — Give the command a capability on top of the default set, like `NET_ADMIN` (or `CAP_NET_ADMIN`); `ALL` for every one. Repeatable (Linux)
 * `--cap-drop <CAP>` — Take a capability out of the default set; `ALL` for every one. Repeatable (Linux)
@@ -1766,6 +1772,7 @@ Pull an image (`pull`)
 ###### **Options:**
 
 * `-q`, `--quiet` — Print nothing but the image's digest
+* `--platform <PLATFORM>` — The platform to pull (`linux/amd64`: on a Mac, run through Rosetta); by default the image's own among what runs here, this host's first
 
 
 
@@ -1834,7 +1841,7 @@ Build an image from a Dockerfile (`build`)
 * `--progress <TYPE>` — How progress is shown: auto, plain (BuildKit's lines, as auto) or quiet
 
   Default value: `auto`
-* `--platform <PLATFORM>` — The platform: this host's only
+* `--platform <PLATFORM>` — The platform to build for: one that runs here (on a Mac, `linux/amd64` too, through Rosetta)
 * `--secret <id=ID,src=FILE>` — A secret for `RUN --mount=type=secret`: id=ID,src=FILE (repeat it)
 * `-o`, `--output <OUTPUT>` — Write the build's files instead of an image: type=local,dest=DIR (or DIR), or type=tar,dest=FILE (- for standard output)
 
@@ -1879,7 +1886,7 @@ Make an image of a root filesystem's tar archive (`import`)
 
 * `-c`, `--change <INSTRUCTION>` — Set a config instruction of the image's: CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, USER, VOLUME, WORKDIR or STOPSIGNAL, as a Dockerfile's (repeat it for more)
 * `-m`, `--message <MESSAGE>` — Its history's comment
-* `--platform <PLATFORM>` — The platform: this host's only
+* `--platform <PLATFORM>` — The image's platform: one that runs here (on a Mac, `linux/amd64` too)
 
 
 
@@ -2230,6 +2237,7 @@ The Linux VM containers run in on a Mac: its status, start and stop
 * `stop` — Stop the VM: its containers stopped in order, then the guest powered off
 * `install` — Let launchd hold Docker's socket while the VM is stopped and start the VM at its first connection (`docker` works any time; nothing runs until then). Run again after moving shipyard
 * `uninstall` — Undo `vm install`: launchd lets go of Docker's socket (a VM it started is stopped first)
+* `set` — Set the VM's memory and CPUs (taken at its next start)
 
 
 
@@ -2261,7 +2269,11 @@ Stop the VM: its containers stopped in order, then the guest powered off
 
 Let launchd hold Docker's socket while the VM is stopped and start the VM at its first connection (`docker` works any time; nothing runs until then). Run again after moving shipyard
 
-**Usage:** `shipyard vm install`
+**Usage:** `shipyard vm install [OPTIONS]`
+
+###### **Options:**
+
+* `--at-login` — Also start the VM at login, when containers with a restart policy would come back (they're brought back in it, and the VM stops by itself once none runs). `vm install` without it turns that off
 
 
 
@@ -2270,6 +2282,19 @@ Let launchd hold Docker's socket while the VM is stopped and start the VM at its
 Undo `vm install`: launchd lets go of Docker's socket (a VM it started is stopped first)
 
 **Usage:** `shipyard vm uninstall`
+
+
+
+## `shipyard vm set`
+
+Set the VM's memory and CPUs (taken at its next start)
+
+**Usage:** `shipyard vm set <--memory <SIZE>|--cpus <N>>`
+
+###### **Options:**
+
+* `--memory <SIZE>` — The VM's memory (`8g`, `6144m`), or `default` (a quarter of this Mac's, from 4 GiB to 16 GiB)
+* `--cpus <N>` — The VM's CPUs, or `default` (half this Mac's cores, at most 8)
 
 
 

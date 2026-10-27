@@ -537,7 +537,10 @@ fn ready_image(
             Some(crate::image::make_ready(
                 engine,
                 reference,
-                planned.request.pull.unwrap_or(PullPolicy::Missing),
+                (
+                    planned.request.pull.unwrap_or(PullPolicy::Missing),
+                    planned.request.platform.clone(),
+                ),
                 maps,
             )?)
         }

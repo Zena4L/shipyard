@@ -91,7 +91,7 @@ pub struct BuildRequest {
     pub pull: bool,
     /// `--label KEY=VALUE`.
     pub labels: Vec<(String, String)>,
-    /// `--platform`: this host's only.
+    /// `--platform`: one that runs here ([`crate::image::platforms_here`]).
     pub platform: Option<String>,
     /// `--secret id=ID,src=FILE`.
     pub secrets: Vec<Secret>,

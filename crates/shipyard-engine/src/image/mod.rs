@@ -60,7 +60,10 @@ pub(crate) use helper::Request;
 pub use helper::entry_point as storage_helper_entry_point;
 #[cfg(target_os = "linux")]
 use helper::{Outcome, ranges};
-pub use import::{ImportRequest, Imported, host_platform_name, import, is_host_platform};
+pub use import::{
+    ImportRequest, Imported, here_names, host_platform_name, import, is_host_platform, named_in,
+    platform_here,
+};
 pub use push::{PushRequest, PushedName, names_a_tag, push};
 /// A registry credential, as a client hands one in ([`GivenCredential`]).
 pub use shipyard_image::Credential;
@@ -236,7 +239,8 @@ pub(crate) fn runtime_config(
 ) -> Option<shipyard_image::RuntimeConfig> {
     let mut image = ImageReference::parse(reference).ok()?;
     image.digest = Some(shipyard_image::Digest::parse(image_id).ok()?);
-    let pulled = shipyard_image::from_store(&image, &Platform::host(), store).ok()??;
+    // Any platform: a view shows the image whatever runs here now.
+    let pulled = shipyard_image::from_store(&image, &shipyard_image::AnyPlatform, store).ok()??;
     Some(pulled.config.config)
 }
 
@@ -348,7 +352,7 @@ pub(crate) fn manifests_named(engine: &Engine, name: &str) -> Vec<String> {
 pub(crate) fn prepare(
     engine: &Engine,
     reference: &str,
-    policy: PullPolicy,
+    (policy, platform): (PullPolicy, Option<Platform>),
     maps: Option<&IdMaps>,
 ) -> Result<Prepared> {
     let store = open_store(engine)?;
@@ -361,7 +365,14 @@ pub(crate) fn prepare(
     let Ready {
         pulled,
         extracted: (directories, names),
-    } = ready(engine, &store, &shared, &image, Fetch::docker(policy), maps)?;
+    } = ready(
+        engine,
+        &store,
+        &shared,
+        &image,
+        Fetch::docker(policy, platform),
+        maps,
+    )?;
 
     // The run's own writable area, listing the layers it stacks, so garbage
     // collection keeps them while it runs.
@@ -406,13 +417,20 @@ pub(crate) fn prepare(
 pub(crate) fn make_ready(
     engine: &Engine,
     reference: &str,
-    policy: PullPolicy,
+    (policy, platform): (PullPolicy, Option<Platform>),
     maps: Option<&IdMaps>,
 ) -> Result<(String, shipyard_image::RuntimeConfig)> {
     let store = open_store(engine)?;
     let shared = store.lock(LockMode::Shared, USE_WAIT)?;
     let image = ImageReference::parse(reference)?;
-    let ready = ready(engine, &store, &shared, &image, Fetch::docker(policy), maps)?;
+    let ready = ready(
+        engine,
+        &store,
+        &shared,
+        &image,
+        Fetch::docker(policy, platform),
+        maps,
+    )?;
     Ok((
         ready.pulled.manifest_digest.to_string(),
         ready.pulled.config.config,
@@ -430,7 +448,9 @@ const OWNED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// reference in the index; its layers extracted (again, if a collection
 /// took them); and the container's own writable area (`ctr-<id>`, its
 /// container store `owner`), taken if it exists: then its overlay stacks
-/// the layers the area lists, the same every start.
+/// the layers the area lists, the same every start. Read for `platforms`:
+/// a start's, what runs here; a stopped container's `cp` view, any (it
+/// runs nothing).
 ///
 /// # Errors
 ///
@@ -445,6 +465,7 @@ pub(crate) fn prepare_owned(
     reference: &str,
     image_id: &str,
     maps: Option<&IdMaps>,
+    platforms: &dyn shipyard_image::PlatformChoice,
 ) -> Result<Prepared> {
     let store = open_store(engine)?;
     let shared = store.lock(LockMode::Shared, USE_WAIT)?;
@@ -456,8 +477,17 @@ pub(crate) fn prepare_owned(
         shipyard_image::Digest::parse(image_id)
             .map_err(|err| Error::new(crate::ErrorKind::Storage, format!("{image_id}: {err}")))?,
     );
-    let Some(pulled) = shipyard_image::from_store(&image, &Platform::host(), &store)
-        .with_context(|| format!("reading {reference} ({image_id}) from the image store"))?
+    let Some(pulled) = shipyard_image::from_store(&image, platforms, &store).map_err(|error| {
+        // An amd64 image on a VM that has lost Rosetta: said how to have it.
+        let hint = if error.is_other_platform() {
+            rosetta_hint("amd64")
+        } else {
+            ""
+        };
+        Error::from(error).context(format!(
+            "reading {reference} ({image_id}) from the image store{hint}"
+        ))
+    })?
     else {
         bail!(
             NotFound,
@@ -542,7 +572,7 @@ pub(crate) fn pin(
                 .map_err(|err| Error::new(ErrorKind::Storage, format!("{digest}: {err}")))?,
         );
     }
-    let Some(pulled) = shipyard_image::from_store(&image, &Platform::host(), &store)
+    let Some(pulled) = shipyard_image::from_store(&image, &platforms_here(), &store)
         .with_context(|| format!("reading {reference} from the image store"))?
     else {
         bail!(NotFound, "{reference} isn't in the image store");
@@ -618,6 +648,9 @@ struct Ready {
 struct Fetch {
     policy: PullPolicy,
     credentials: shipyard_image::Credentials,
+    /// The platform asked for (`--platform`), if one was: else the image's
+    /// own, among what runs here.
+    platform: Option<Platform>,
 }
 
 impl Fetch {
@@ -626,10 +659,11 @@ impl Fetch {
         not(target_os = "linux"),
         allow(dead_code, reason = "a run's pull is Linux's only")
     )]
-    fn docker(policy: PullPolicy) -> Self {
+    fn docker(policy: PullPolicy, platform: Option<Platform>) -> Self {
         Self {
             policy,
             credentials: shipyard_image::Credentials::docker(),
+            platform,
         }
     }
 }
@@ -676,12 +710,23 @@ fn obtain(engine: &Engine, store: &Store, image: &ImageReference, fetch: Fetch) 
     let Fetch {
         policy,
         credentials,
+        platform,
     } = fetch;
-    let platform = Platform::host();
+    // What the image may be for: the platform asked for (it must run here),
+    // else what runs here, the host's first (step 13.3).
+    let wanted = match &platform {
+        // (Checked to run here: the one rule, `platform_here`.)
+        Some(asked) => vec![platform_here(&asked.to_string(), "run")?],
+        None => platforms_here(),
+    };
     if policy != PullPolicy::Always {
-        match shipyard_image::from_store(image, &platform, store) {
-            Ok(Some(found)) => return Ok(found),
+        match shipyard_image::from_store(image, &wanted, store) {
+            Ok(Some(found)) => return Ok(said_if_other(engine, image, platform.as_ref(), found)),
             Ok(None) => {}
+            // Stored for another platform than wanted (the one asked for, or
+            // an amd64 one on a VM that has lost Rosetta): the one wanted is
+            // pulled, as Docker's `--platform` does; the store is sound.
+            Err(err) if err.is_other_platform() && policy != PullPolicy::Never => {}
             Err(err) if policy == PullPolicy::Never => {
                 return Err(err).with_context(|| format!("reading {image} from the image store"));
             }
@@ -701,7 +746,91 @@ fn obtain(engine: &Engine, store: &Store, image: &ImageReference, fetch: Fetch) 
     let options = shipyard_image::PullOptions {
         recheck: policy == PullPolicy::Always,
     };
-    download(engine, store, image, &platform, options, credentials)
+    let pulled = download(engine, store, image, &wanted, options, credentials)?;
+    Ok(said_if_other(engine, image, platform.as_ref(), pulled))
+}
+
+/// `pulled`, said if it isn't for this host's platform and none was asked
+/// for (D13-2, Docker Desktop's rule): it runs through Rosetta, slower.
+/// Said at each run, as Docker's is: pulled for it, or found in the store
+/// (a name an earlier `--platform` pull left on another platform's image).
+fn said_if_other(
+    engine: &Engine,
+    image: &ImageReference,
+    asked: Option<&Platform>,
+    pulled: Pulled,
+) -> Pulled {
+    if asked.is_none() && !pulled.platform.runs_on(&Platform::host()) {
+        engine.warn(
+            WarningKind::OtherPlatform,
+            format!(
+                "{image} is a {} image, not this host's ({}): it runs through Rosetta (slower)",
+                pulled.platform,
+                host_platform_name()
+            ),
+        );
+    }
+    pulled
+}
+
+/// The platforms an image may be for here, the best first (step 13.3,
+/// D13-2): this host's, then `linux/amd64` on an arm64 host where Rosetta
+/// runs it (Shipyard's macOS guest registers Rosetta's interpreter at boot:
+/// `binfmt_misc`'s `rosetta` entry, enabled). Another binfmt handler (a
+/// Linux host's qemu) isn't taken.
+#[must_use]
+pub fn platforms_here() -> Vec<Platform> {
+    platforms_given(Platform::host(), rosetta_registered())
+}
+
+/// [`platforms_here`] for a `host`, with Rosetta registered or not.
+fn platforms_given(host: Platform, rosetta: bool) -> Vec<Platform> {
+    let arm64 = host.architecture == "arm64";
+    let mut here = vec![host];
+    if arm64 && rosetta {
+        here.push(Platform::new("linux", "amd64"));
+    }
+    here
+}
+
+/// Whether Rosetta's interpreter is registered (and enabled) with the
+/// kernel's `binfmt_misc` as Shipyard's macOS guest registers it: its entry
+/// enabled, its interpreter the guest's share's, and `binfmt_misc` itself
+/// enabled. Another's entry of that name (a Lima VM's, at
+/// `/mnt/lima-rosetta`) isn't taken: a Linux host runs its own platform only.
+fn rosetta_registered() -> bool {
+    let entry = std::fs::read_to_string(ROSETTA_BINFMT).unwrap_or_default();
+    let status = std::fs::read_to_string(BINFMT_STATUS).unwrap_or_default();
+    shipyards_rosetta(&entry, &status)
+}
+
+/// [`rosetta_registered`] from what the entry and `binfmt_misc`'s status say.
+fn shipyards_rosetta(entry: &str, status: &str) -> bool {
+    status.trim() == "enabled"
+        && entry.lines().next() == Some("enabled")
+        && entry
+            .lines()
+            .any(|line| line == format!("interpreter {ROSETTA_INTERPRETER}"))
+}
+
+/// `binfmt_misc`'s own switch.
+const BINFMT_STATUS: &str = "/proc/sys/fs/binfmt_misc/status";
+
+/// Rosetta's interpreter as the macOS guest registers it (its share's).
+pub(crate) const ROSETTA_INTERPRETER: &str = "/run/rosetta/rosetta";
+
+/// Rosetta's `binfmt_misc` entry, as the macOS guest registers it.
+pub(crate) const ROSETTA_BINFMT: &str = "/proc/sys/fs/binfmt_misc/rosetta";
+
+/// What's said after an amd64 platform that doesn't run here: where Rosetta
+/// would run it (a Mac's VM), how to have it.
+fn rosetta_hint(asked: &str) -> &'static str {
+    if asked.contains("amd64") && Platform::host().architecture == "arm64" {
+        " (on a Mac, Rosetta runs amd64 images in Shipyard's VM: \
+         `softwareupdate --install-rosetta --agree-to-license`, then `shipyard vm stop`)"
+    } else {
+        ""
+    }
 }
 
 /// Pulls `image` into the store, signing in with `credentials` if the
@@ -710,7 +839,7 @@ fn download(
     engine: &Engine,
     store: &Store,
     image: &ImageReference,
-    platform: &Platform,
+    platform: &dyn shipyard_image::PlatformChoice,
     options: shipyard_image::PullOptions,
     credentials: shipyard_image::Credentials,
 ) -> Result<Pulled> {
@@ -724,7 +853,15 @@ fn download(
         }));
     };
     let pulled = shipyard_image::pull(image, platform, store, credentials, options, &progress)
-        .with_context(|| format!("pulling {image}"))?;
+        .map_err(|error| {
+            // An amd64-only image where Rosetta isn't there: said how to have it.
+            let hint = if error.is_other_platform() && error.to_string().contains("amd64") {
+                rosetta_hint("amd64")
+            } else {
+                ""
+            };
+            Error::from(error).context(format!("pulling {image}{hint}"))
+        })?;
     crate::events::emit_about(
         engine,
         crate::events::Kind::Image,
@@ -742,7 +879,7 @@ fn download(
 ///
 /// If the image can't be pulled, extracted or recorded.
 pub fn pull(engine: &Engine, reference: &str) -> Result<String> {
-    Ok(pull_with(engine, reference, None)?.digest)
+    Ok(pull_with(engine, reference, None, None)?.digest)
 }
 
 /// What [`pull_with`] pulled.
@@ -805,7 +942,9 @@ pub fn login(given: GivenCredential) -> Result<Login> {
 }
 
 /// [`pull`], signing in with `given` instead of Docker's config file when
-/// a client handed one in (an anonymous pull for any other registry).
+/// a client handed one in (an anonymous pull for any other registry), for
+/// `platform` if one is asked for (`--platform`: it must run here), else
+/// the image's own among what runs here.
 ///
 /// # Errors
 ///
@@ -814,6 +953,7 @@ pub fn pull_with(
     engine: &Engine,
     reference: &str,
     given: Option<GivenCredential>,
+    platform: Option<Platform>,
 ) -> Result<PulledImage> {
     let store = open_store(engine)?;
     let shared = store.lock(LockMode::Shared, USE_WAIT)?;
@@ -827,6 +967,7 @@ pub fn pull_with(
     let fetch = Fetch {
         policy: PullPolicy::Always,
         credentials: GivenCredential::or_docker(given),
+        platform,
     };
     let ready = ready(engine, &store, &shared, &image, fetch, None)?;
     drop(shared);
@@ -1246,22 +1387,30 @@ pub fn tag(engine: &Engine, source: &str, target: &str) -> Result<String> {
     Ok(key)
 }
 
-/// Whether the store has the image `reference` names whole, for this
-/// host's platform, as a run would take it without pulling (the API's
-/// create answers "No such image" otherwise, and its client pulls).
+/// Whether the store has the image `reference` names whole, for `platform`
+/// if one is asked (else for one that runs here), as a run would take it
+/// without pulling (the API's create answers "No such image" otherwise, and
+/// its client pulls).
 ///
 /// # Errors
 ///
 /// The reference isn't one ([`crate::ErrorKind::InvalidRequest`]), or the
 /// store can't be opened or read: never "not stored" (a client told so
 /// would pull it again).
-pub fn stored(engine: &Engine, reference: &str) -> Result<bool> {
+pub fn stored(engine: &Engine, reference: &str, platform: Option<&Platform>) -> Result<bool> {
     let image = ImageReference::parse(reference)
         .map_err(|error| crate::Error::new(crate::ErrorKind::InvalidRequest, error.to_string()))?;
     let store = open_store(engine)?;
-    let found = shipyard_image::from_store(&image, &Platform::host(), &store)
-        .with_context(|| format!("reading {reference} from the image store"))?;
-    Ok(found.is_some())
+    let wanted = platform.map_or_else(platforms_here, |asked| vec![asked.clone()]);
+    match shipyard_image::from_store(&image, &wanted, &store) {
+        Ok(found) => Ok(found.is_some()),
+        // Stored for another platform than wanted: not stored for it (the
+        // API's client then pulls the one wanted).
+        Err(error) if error.is_other_platform() => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading {reference} from the image store"))
+        }
+    }
 }
 
 /// Lists the images in the store (for `shipyard images`).
@@ -1890,7 +2039,7 @@ mod tests {
     #[test]
     fn never_pulling_an_image_the_store_lacks_is_not_found() {
         let (engine, collect, parent) = engine_on_a_new_store("never");
-        let Err(error) = prepare(&engine, "alpine", PullPolicy::Never, None) else {
+        let Err(error) = prepare(&engine, "alpine", (PullPolicy::Never, None), None) else {
             panic!("an empty store has no alpine");
         };
         assert_eq!(error.kind(), ErrorKind::NotFound, "{error:#}");

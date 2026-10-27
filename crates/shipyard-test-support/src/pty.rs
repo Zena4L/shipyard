@@ -470,6 +470,44 @@ impl Session {
         master.write_all(keys).expect("typing into the terminal");
     }
 
+    /// Types `line` again and again while the terminal takes it (never
+    /// waiting for it: each write non-blocking), reading its output
+    /// meanwhile, until it has taken nothing for `still`: what reads it has
+    /// stopped. How many bytes it took. Fails past `limit` (it never
+    /// stopped taking them).
+    pub fn type_until_stuck(&mut self, line: &[u8], still: Duration, limit: Duration) -> usize {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let (began, mut moved, mut taken) = (Instant::now(), Instant::now(), 0);
+        while moved.elapsed() < still {
+            assert!(
+                began.elapsed() < limit,
+                "the terminal still took typing after {limit:?} ({taken} bytes)"
+            );
+            let wrote = {
+                let master = self.master.as_ref().expect("the terminal is still open");
+                let flags = OFlag::from_bits_truncate(
+                    fcntl(master, FcntlArg::F_GETFL).expect("the terminal's flags"),
+                );
+                fcntl(master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+                    .expect("the terminal non-blocking");
+                let wrote = nix::unistd::write(master, line);
+                fcntl(master, FcntlArg::F_SETFL(flags)).expect("the terminal blocking again");
+                wrote
+            };
+            match wrote {
+                Ok(written) if written > 0 => {
+                    taken += written;
+                    moved = Instant::now();
+                }
+                Ok(_) | Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
+                    self.pump(Instant::now() + Duration::from_millis(50));
+                }
+                Err(error) => panic!("typing into the terminal: {error}"),
+            }
+        }
+        taken
+    }
+
     /// Changes the terminal's size, like resizing its window: the kernel
     /// then sends SIGWINCH to the terminal's foreground process group.
     pub fn resize(&mut self, rows: u16, cols: u16) {

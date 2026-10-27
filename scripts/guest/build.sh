@@ -6,6 +6,8 @@
 # image: scripts/test-image/Dockerfile); writes only files, into OUT.
 #
 # usage: scripts/guest/build.sh [OUT]   (default: target/guest)
+#   Every package installed is checked against scripts/guest/alpine.installed
+#   (F92); UPDATE_GUEST_LOCK=1 writes that lock from this build instead.
 set -euo pipefail
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 out=${1:-$repo/target/guest}
@@ -17,10 +19,17 @@ revision=$(git -C "$repo" rev-parse --short=12 HEAD)
 # (Untracked files count: new code is code the binary is built from.)
 dirty=$(git -C "$repo" status --porcelain | head -c1)
 [ -n "$dirty" ] && revision="$revision-dirty"
-exec timeout 3600 docker run --rm --privileged \
+timeout 3600 docker run --rm --privileged \
     --volume "$repo:/src:ro" --volume "$out:/out" \
     --volume "${TARGET_VOLUME:-shipyard-linux-target}:/target" \
     --volume shipyard-linux-cargo:/usr/local/cargo \
     --volume shipyard-linux-rustup:/usr/local/rustup \
     --env CARGO_TARGET_DIR=/target --env REVISION="$revision" \
+    --env SHIPYARD_GUEST_MIRROR="${SHIPYARD_GUEST_MIRROR:-}" \
+    --env UPDATE_GUEST_LOCK="${UPDATE_GUEST_LOCK:-}" \
     --workdir /src "$image" bash /src/scripts/guest/build-inside.sh
+# A lock this build wrote (UPDATE_GUEST_LOCK=1) into the tree.
+if [ "${UPDATE_GUEST_LOCK:-}" = 1 ]; then
+  mv "$out/alpine.installed" "$repo/scripts/guest/alpine.installed"
+  echo "scripts/guest/alpine.installed written: commit it with alpine.lock"
+fi

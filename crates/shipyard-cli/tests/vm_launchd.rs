@@ -176,6 +176,27 @@ impl Installed {
             .success()
     }
 
+    /// The agent taken out of launchd (as macOS's Login Items switch, or a
+    /// logout, does).
+    fn unload(&self) {
+        let target = format!("gui/{}/{}", nix::unistd::getuid().as_raw(), self.label);
+        let mut command = Command::new("/bin/launchctl");
+        command.args(["bootout", &target]);
+        let _ = bounded(command, LIMIT);
+    }
+
+    /// The agent loaded again from its property list, as a login loads it
+    /// (no `vm install`, so no mark of its).
+    fn load_again(&self) {
+        self.unload();
+        let plist = self.agents.0.join(format!("{}.plist", self.label));
+        let gui = format!("gui/{}", nix::unistd::getuid().as_raw());
+        let mut command = Command::new("/bin/launchctl");
+        command.args(["bootstrap", &gui, &plist.to_string_lossy()]);
+        let loaded = bounded(command, LIMIT);
+        assert!(loaded.status.success(), "{loaded:?}");
+    }
+
     fn host_log(&self) -> String {
         std::fs::read_to_string(self.vm.dir.join("host.log")).unwrap_or_default()
     }
@@ -289,6 +310,175 @@ fn launchd_holds_dockers_socket() {
     assert!(removed.status.success(), "{removed:?}");
     assert!(!installed.loaded(), "launchd still has the agent");
     assert!(!socket.exists(), "the socket outlived the agent");
+}
+
+/// Step 13.6b1 (F109): a logout's stop, as launchd gives it (`bootout`:
+/// SIGTERM, then `ExitTimeOut`), stops the guest in order, once it's up and
+/// while it boots alike (that one taken once the boot ends).
+#[test]
+fn a_logout_stops_the_vm_in_order() {
+    let Some(installed) = Installed::new("logout") else {
+        return;
+    };
+    let up = installed.shipyard(&["vm", "start"]);
+    assert!(up.status.success(), "{up:?}");
+    let removed = installed.shipyard(&["vm", "uninstall"]);
+    assert!(removed.status.success(), "{removed:?}");
+    let log = installed.host_log();
+    assert!(log.contains("SIGTERM: stopping the guest"), "{log}");
+    assert!(
+        !log.contains("stopped at once"),
+        "the stop was forced:\n{log}"
+    );
+    assert!(
+        installed.vm.console().contains("stopped; powering off"),
+        "{}",
+        installed.vm.console()
+    );
+
+    // Installed again, and taken away as the VM boots.
+    let again = installed.shipyard(&["vm", "install"]);
+    assert!(again.status.success(), "{again:?}");
+    let boots = installed.host_log().matches("booting the guest").count();
+    let starting = installed.command(&["vm", "start"]);
+    let starting = std::thread::spawn(move || bounded(starting, LIMIT));
+    let began = Instant::now();
+    while installed.host_log().matches("booting the guest").count() == boots {
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "{}",
+            installed.host_log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let removed = installed.shipyard(&["vm", "uninstall"]);
+    assert!(removed.status.success(), "{removed:?}");
+    let _ = starting.join();
+    let log = installed.host_log();
+    // Before its guest started (nothing to stop), or the guest stopped in
+    // order a second time (once its agent answered, or once up).
+    let before = log.contains("SIGTERM: stopped before its guest started");
+    let powered_off = installed
+        .vm
+        .console()
+        .matches("stopped; powering off")
+        .count();
+    assert!(
+        before || powered_off >= 2,
+        "{log}\n{}",
+        installed.vm.console()
+    );
+    assert!(
+        !log.contains("stopped at once"),
+        "the stop was forced:\n{log}"
+    );
+}
+
+/// Step 13.6b2 (F106): `vm install --at-login` starts the VM at login when
+/// containers would come back, and only then. A login is launchd loading
+/// the agent again (`bootout`, then `bootstrap` of its property list, as at
+/// a session's start). The install itself boots nothing; without
+/// `--at-login`, the same load leaves the VM stopped (the control); an
+/// agent taken out of launchd is said by `vm status`.
+#[test]
+fn the_vm_starts_at_login_for_containers_that_come_back() {
+    let Some(installed) = Installed::new("at-login") else {
+        return;
+    };
+    let login = || installed.load_again();
+    let comes_back = installed.vm.dir.join("comes-back.json");
+    let ran = installed.shipyard(&[
+        "run",
+        "-d",
+        "--restart",
+        "always",
+        "--name",
+        "back",
+        IMAGE,
+        "sleep",
+        "600",
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    let began = Instant::now();
+    while !std::fs::read_to_string(&comes_back).is_ok_and(|said| said.contains(r#""containers":1"#))
+    {
+        assert!(began.elapsed() < Duration::from_secs(30), "never counted");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(installed.shipyard(&["vm", "stop"]).status.success());
+
+    // The run at load's own word that it started nothing, waited for.
+    let nothing_asked = |before: usize| {
+        let began = Instant::now();
+        while installed.host_log().matches("nothing asked").count() == before {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "{}",
+                installed.host_log()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    // The control: an agent installed without `--at-login`, loaded again.
+    let before = installed.host_log().matches("nothing asked").count();
+    login();
+    nothing_asked(before);
+    let status = installed.shipyard(&["vm", "status"]);
+    assert!(text(&status.stdout).starts_with("stopped"), "{status:?}");
+
+    // Installed to start at login: the install boots nothing.
+    let before = installed.host_log().matches("nothing asked").count();
+    let at_login = installed.shipyard(&["vm", "install", "--at-login"]);
+    assert!(at_login.status.success(), "{at_login:?}");
+    nothing_asked(before);
+    let status = installed.shipyard(&["vm", "status"]);
+    assert!(text(&status.stdout).starts_with("stopped"), "{status:?}");
+    assert!(
+        text(&status.stdout).contains("at login: starts the VM (1 container would come back)"),
+        "{status:?}"
+    );
+
+    // A login: the VM starts by itself (`vm status` starts nothing, where a
+    // command would start it the CLI's way), and the container is back.
+    login();
+    let began = Instant::now();
+    while !text(&installed.shipyard(&["vm", "status"]).stdout).starts_with("running") {
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the login didn't start the VM:\n{}",
+            installed.host_log()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        installed
+            .host_log()
+            .contains("at login: 1 container would come back: starting the VM"),
+        "{}",
+        installed.host_log()
+    );
+    let began = Instant::now();
+    loop {
+        let ps = installed.shipyard(&["ps", "--format", "{{.Names}} {{.Status}}"]);
+        if text(&ps.stdout).contains("back Up") {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(120),
+            "{ps:?}\n{}",
+            installed.host_log()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // Taken out of launchd (as macOS's Login Items switch does): said.
+    assert!(installed.shipyard(&["rm", "-f", "back"]).status.success());
+    assert!(installed.shipyard(&["vm", "stop"]).status.success());
+    installed.unload();
+    let status = installed.shipyard(&["vm", "status"]);
+    assert!(
+        text(&status.stdout).contains("installed but not loaded"),
+        "{status:?}"
+    );
 }
 
 /// `shipyard compose` on the Mac: Docker's compose against the VM's

@@ -184,6 +184,62 @@ impl Platform {
     }
 }
 
+/// The platforms an image may be for, the best first (step 13.3): one, or
+/// all that run here (a Mac's VM runs amd64 images too, through Rosetta).
+pub trait PlatformChoice {
+    /// Them, the best first.
+    fn choices(&self) -> &[Platform];
+}
+
+impl PlatformChoice for Platform {
+    fn choices(&self) -> &[Platform] {
+        std::slice::from_ref(self)
+    }
+}
+
+impl PlatformChoice for [Platform] {
+    fn choices(&self) -> &[Platform] {
+        self
+    }
+}
+
+impl PlatformChoice for Vec<Platform> {
+    fn choices(&self) -> &[Platform] {
+        self
+    }
+}
+
+/// Any platform: what a view (`images`, `inspect`) reads an image with, so
+/// one of a platform that doesn't run here (an amd64 image on a VM that has
+/// lost Rosetta) is still shown, never hidden. Its choices are none, which
+/// [`runs_on_any`] and [`Index::select_among`] take as any (an index's
+/// entry: the host's, else its first).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnyPlatform;
+
+impl PlatformChoice for AnyPlatform {
+    fn choices(&self) -> &[Platform] {
+        &[]
+    }
+}
+
+/// `choices` as a person reads them: `linux/arm64/v8 or linux/amd64`.
+#[must_use]
+pub fn named(choices: &[Platform]) -> String {
+    choices
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// Whether an image built for `image` runs on one of `choices` (none:
+/// [`AnyPlatform`], any).
+#[must_use]
+pub fn runs_on_any(image: &Platform, choices: &[Platform]) -> bool {
+    choices.is_empty() || choices.iter().any(|wanted| image.runs_on(wanted))
+}
+
 impl std::fmt::Display for Platform {
     /// `os/architecture[/variant]`, as Docker writes a platform.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -695,6 +751,36 @@ impl Index {
             })
     }
 
+    /// The entry for the first of `choices` the index has ([`select`]'s
+    /// rule for each, in order): the host's, then another that runs here.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::NoMatchingPlatform`] if it has none of them.
+    ///
+    /// [`select`]: Self::select
+    pub fn select_among(&self, choices: &[Platform]) -> Result<&Descriptor, ManifestError> {
+        if choices.is_empty() {
+            // Any ([`AnyPlatform`]): the host's, else the first image there.
+            return self.select(&Platform::host()).or_else(|error| {
+                self.manifests
+                    .iter()
+                    .find(|descriptor| {
+                        media_type::is_manifest(&descriptor.media_type)
+                            && descriptor.platform.is_some()
+                    })
+                    .ok_or(error)
+            });
+        }
+        choices
+            .iter()
+            .find_map(|wanted| self.select(wanted).ok())
+            .ok_or_else(|| ManifestError::NoMatchingPlatform {
+                wanted: named(choices),
+                available: self.available_platforms(),
+            })
+    }
+
     /// A human list of the platforms the index offers, for an error message.
     fn available_platforms(&self) -> String {
         let mut platforms: Vec<String> = self
@@ -974,6 +1060,37 @@ mod tests {
         // A plain arm64 request matches the v8 entry (specific is a superset).
         let arm64 = index.select(&Platform::new("linux", "arm64")).unwrap();
         assert_eq!(arm64.digest, Digest::parse(D2).unwrap());
+    }
+
+    /// Among choices (what runs here, the best first), the first the index
+    /// has wins: the host's when there, else another that runs here
+    /// (step 13.3); none of them, said with every choice.
+    #[test]
+    fn the_first_choice_the_index_has_is_taken() {
+        let index = Index::parse(two_platform_index().as_bytes()).unwrap();
+        let arm64 = Platform::new("linux", "arm64");
+        let amd64 = Platform::new("linux", "amd64");
+        let s390x = Platform::new("linux", "s390x");
+        let both = [arm64.clone(), amd64.clone()];
+        assert_eq!(
+            index.select_among(&both).unwrap().digest,
+            Digest::parse(D2).unwrap(),
+            "the host's first"
+        );
+        assert_eq!(
+            index.select_among(&[s390x.clone(), amd64]).unwrap().digest,
+            Digest::parse(D).unwrap(),
+            "else the next that runs here"
+        );
+        assert!(
+            index.select_among(&[]).is_ok(),
+            "any platform: the host's, else the first"
+        );
+        assert!(runs_on_any(&s390x, &[]), "any");
+        let none = index.select_among(&[s390x]).unwrap_err().to_string();
+        assert!(none.contains("linux/s390x"), "{none}");
+        assert!(runs_on_any(&arm64, &both));
+        assert!(!runs_on_any(&Platform::new("linux", "riscv64"), &both));
     }
 
     #[test]

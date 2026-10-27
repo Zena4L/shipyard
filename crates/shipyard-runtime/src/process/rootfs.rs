@@ -414,21 +414,52 @@ mod linux {
             .collect()
     }
 
-    /// A made `source`, below `dir`, cloned by descriptor: `dir` opened as
-    /// it is (Docker's resolution), then each component below it without
-    /// following a symlink (`shipyard_sys::fs::open_below`).
+    /// A `source` below `dir` (one Shipyard made, or, in the macOS guest, one
+    /// in a share: 13.8c), cloned by descriptor: `dir` opened as it is,
+    /// canonical (a link at its end refused), then each component below it
+    /// without following a symlink (`shipyard_sys::fs::open_below`), the
+    /// last one a directory or a regular file (a link: `ELOOP`; anything
+    /// else, `ENOTDIR`).
     fn clone_made(dir: &Path, source: &Path, recursive: bool) -> nix::Result<ClonedSource> {
         let below = source.strip_prefix(dir).map_err(|_| Errno::EINVAL)?;
         let dir = nix::fcntl::open(
             dir,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
-        let made = shipyard_sys::fs::open_below(dir.as_fd(), below)
-            .map_err(|error| Errno::from_raw(error.raw_os_error().unwrap_or(libc::EINVAL)))?;
+        let below_dirs = |path: &Path| {
+            shipyard_sys::fs::open_below(dir.as_fd(), path)
+                .map_err(|error| Errno::from_raw(error.raw_os_error().unwrap_or(libc::EINVAL)))
+        };
+        let made = match (below.parent(), below.file_name()) {
+            (Some(parent), Some(name)) => {
+                let parent = below_dirs(parent)?;
+                nix::fcntl::openat(
+                    &parent,
+                    name,
+                    OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )?
+            }
+            // The directory itself (a whole share).
+            _ => below_dirs(below)?,
+        };
+        let kind =
+            SFlag::from_bits_truncate(nix::sys::stat::fstat(&made)?.st_mode & SFlag::S_IFMT.bits());
+        // A directory or a file: never a link, nor a device, a FIFO or a
+        // socket someone sharing its directory put in its place.
+        if kind == SFlag::S_IFLNK {
+            return Err(Errno::ELOOP);
+        }
+        if kind != SFlag::S_IFDIR && kind != SFlag::S_IFREG {
+            return Err(Errno::ENOTDIR);
+        }
         let recursive = if recursive { libc::AT_RECURSIVE } else { 0 };
         let tree = open_tree(made.as_raw_fd(), c"", libc::AT_EMPTY_PATH | recursive)?;
-        Ok(ClonedSource { tree, is_dir: true })
+        Ok(ClonedSource {
+            tree,
+            is_dir: kind == SFlag::S_IFDIR,
+        })
     }
 
     /// `open_tree(path, OPEN_TREE_CLONE)`, with what's mounted below it if

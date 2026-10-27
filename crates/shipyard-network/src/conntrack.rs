@@ -266,7 +266,7 @@ mod tests {
                 .unwrap();
             crate::nft::Nftables::new()
                 .unwrap()
-                .install(&[], &[], &crate::nft::ClosedRouting::default())
+                .install(&[], &[], &crate::nft::ClosedRouting::default(), &[])
                 .unwrap();
             let client = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
             client.send_to(b"x", "127.0.0.1:9").unwrap();

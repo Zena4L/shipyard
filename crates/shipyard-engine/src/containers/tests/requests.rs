@@ -196,6 +196,8 @@ fn a_request_is_kept_whole() {
         image: _,
         entrypoint: _,
         pull: _,
+        // Not kept: the image is kept by its manifest's digest (step 13.3).
+        platform: _,
         read_only: _,
         cap_add: _,
         cap_drop: _,

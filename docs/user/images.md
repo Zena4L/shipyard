@@ -91,6 +91,19 @@ list* with one image per platform. Shipyard picks the one matching the host
 (`linux/amd64`, `linux/arm64`, …). If an index has no image for the host, it says
 which platforms it does have.
 
+**Platforms that run here, and `--platform`.** On a Linux host, only its own platform
+runs. On a Mac, Shipyard's VM also runs `linux/amd64` images, through Apple's Rosetta
+(see [Shipyard on a Mac](macos.md)): an image with no arm64 build is pulled as amd64,
+with a warning, and `pull`, `run`, `create` and `build` take `--platform linux/amd64`
+to ask for amd64 where an arm64 build exists. A `--platform` that doesn't run here is
+refused before anything is pulled, saying what does. A `run --platform` whose stored
+image is another platform's pulls the one asked for, as Docker's does. A name holds one
+image at a time: `pull --platform linux/amd64 alpine` moves `alpine` to the amd64 one
+(containers made from the other keep it), and a later `run alpine` runs it, saying it
+runs through Rosetta; `pull alpine` takes it back to this host's. So two compose
+services that ask one tag for two platforms race each other, as on Docker's classic
+image store: give them two tags.
+
 **Registries.** Docker Hub, GHCR and other registries that speak the OCI
 distribution protocol work. A `localhost`/`127.0.0.1` registry is reached over
 HTTP, as a local development registry; others over HTTPS only.
@@ -321,7 +334,8 @@ An archive is anyone's, and `load` treats it so:
   The old image keeps its other names; a container made from it keeps it.
 - **An image with no name isn't loaded** (an archive saved by ID): it's said, and
   the rest load. Give it a name when saving (`save NAME`).
-- **Only this host's platform loads;** another is left out, said. A name with a
+- **Only a platform that runs here loads** (on a Mac's VM, amd64 too); another is left
+  out, said. A name with a
   digest (`alpine@sha256:…`) loads only if it's the image's own.
 - **Bounds:** 64 GiB decoded, 16 MiB of documents, 1024 names, 1024 entries in
   `manifest.json` or an index, 128 layers an image; the store's free space reserve is
@@ -352,7 +366,7 @@ images), its ID printed with `-q`.
 The flags, as Docker's: `-t NAME[:TAG]` (repeat it), `-f FILE` (`-f -` reads it from
 standard input; a `FILE.dockerignore` beside it is used), `--build-arg KEY=VALUE` (or
 `KEY`, this shell's value), `--target STAGE`, `--no-cache`, `--pull`, `--label`,
-`-q`, `--progress auto|plain|quiet` (`tty` taken, as `plain`), `--platform` (this host's only), `--secret
+`-q`, `--progress auto|plain|quiet` (`tty` taken, as `plain`), `--platform` (one that runs here: on a Mac, `linux/amd64` too, its `RUN` steps through Rosetta and its base images pulled for it), `--secret
 id=ID,src=FILE` (at most 1 MiB; reaches `RUN --mount=type=secret,id=ID` and no
 layer), `-o type=local,dest=DIR` (or `-o DIR`) and `-o type=tar,dest=FILE` (`-` for
 standard output): the build's files, owned by you, instead of an image (`-t` and `-o`
@@ -429,8 +443,9 @@ shipyard import -c 'CMD ["/bin/app"]' -c 'ENV MODE=prod' rootfs.tar.gz app:1
 As `docker import`: a root filesystem's tar archive (a file, or `-` for standard
 input; plain or gzipped) made an image of one layer, named `REPOSITORY[:TAG]`, its
 ID printed. **A name is required:** Shipyard keeps no untagged image (Docker would
-make a `<none>` one). A URL isn't fetched: download it, then import the file. Only
-this host's platform is made (`--platform` this host's or refused).
+make a `<none>` one). A URL isn't fetched: download it, then import the file. The
+image is this host's platform, or another that runs here (`--platform linux/amd64` on a
+Mac: its files run through Rosetta); another is refused.
 
 `-c`/`--change` sets the image's config as a Dockerfile's instruction would: `CMD`
 and `ENTRYPOINT` (a JSON array, or a line run by `/bin/sh -c`), `ENV` and `LABEL`
@@ -551,7 +566,8 @@ removes partial downloads.
   where it stopped (a broken one starts over).
 - Untagged images (a `build`, `load` or `import` without a name is refused).
 - `docker build` through the API (use `shipyard build`), a build context from standard
-  input or a URL, `--ssh`, `--cache-from`/`--cache-to`, other platforms.
+  input or a URL, `--ssh`, `--cache-from`/`--cache-to`, a platform that doesn't run here
+  (a Linux host runs its own only: an emulator such as qemu isn't used).
 - zstd-compressed layers (gzip works today; a zstd layer is refused by name).
 - A fallback to `fuse-overlayfs` where the kernel won't let a normal user mount
   overlay.

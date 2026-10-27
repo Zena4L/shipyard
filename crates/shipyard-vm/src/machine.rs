@@ -19,7 +19,8 @@ use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode,
     VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
     VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
-    VZMACAddress, VZNATNetworkDeviceAttachment, VZSerialPortConfiguration, VZSharedDirectory,
+    VZLinuxRosettaAvailability, VZLinuxRosettaDirectoryShare, VZMACAddress,
+    VZNATNetworkDeviceAttachment, VZSerialPortConfiguration, VZSharedDirectory,
     VZSingleDirectoryShare, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
     VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
@@ -44,6 +45,9 @@ pub(crate) struct Settings {
     /// The Mac's directory shared with the guest (the home: D10.3-3), by
     /// the tag `home`.
     pub(crate) home: PathBuf,
+    /// The places shared beyond it (step 13.4), the `n`th by the tag
+    /// [`forward::share_tag`]`(n)`.
+    pub(crate) others: Vec<PathBuf>,
     /// The guest's console, written to.
     pub(crate) console: std::fs::File,
     /// The network card's address, the same at every boot.
@@ -51,6 +55,8 @@ pub(crate) struct Settings {
     /// CPUs and memory.
     pub(crate) cpus: usize,
     pub(crate) memory: u64,
+    /// Whether Rosetta's share is given (the Mac has Rosetta for Linux).
+    pub(crate) rosetta: bool,
 }
 
 /// A value used only on the VM's queue: `objc2`'s objects aren't `Send`,
@@ -58,15 +64,21 @@ pub(crate) struct Settings {
 /// every use here does.
 struct OnQueue<T>(T);
 
-// SAFETY: an `OnQueue` is only ever read inside closures run on the VM's
-// serial queue (`Machine::on_queue`), one at a time: never from two threads
-// at once, never off the queue the framework requires.
-unsafe impl<T> Send for OnQueue<T> {}
+// SAFETY: an `OnQueue` of the VM or of its configuration (the only two
+// made, F109: no other type is claimed) is only ever read inside closures
+// run on the VM's serial queue (`Machine::on_queue`), one at a time: never
+// from two threads at once, never off the queue the framework requires.
+unsafe impl Send for OnQueue<Retained<VZVirtualMachine>> {}
 
-// SAFETY: shared between the host's threads only to be cloned (an atomic
-// retain) and handed to the queue, as above: the object itself is used on
-// the queue alone.
-unsafe impl<T> Sync for OnQueue<T> {}
+// SAFETY: as above; the configuration is only ever moved to the queue,
+// where the VM is made from it.
+unsafe impl Send for OnQueue<Retained<VZVirtualMachineConfiguration>> {}
+
+// SAFETY: only the VM's is shared between the host's threads (the
+// `Machine` behind an `Arc`), and only to be cloned (an atomic retain) and
+// handed to the queue, as above: the object itself is used on the queue
+// alone.
+unsafe impl Sync for OnQueue<Retained<VZVirtualMachine>> {}
 
 /// The VM, made and on its queue.
 pub(crate) struct Machine {
@@ -157,20 +169,66 @@ fn data_disk(path: &Path) -> Result<Retained<VZStorageDeviceConfiguration>, VmEr
     }
 }
 
-/// The home, shared read-write by the tag the guest mounts.
-fn home_share(home: &Path) -> Retained<VZDirectorySharingDeviceConfiguration> {
+/// `place`, shared read-write by the `tag` the guest mounts.
+fn share(place: &Path, tag: &str) -> Retained<VZDirectorySharingDeviceConfiguration> {
     // SAFETY: new objects, each given valid ones of the classes it takes.
     unsafe {
         let share = VZSingleDirectoryShare::initWithDirectory(
             VZSingleDirectoryShare::alloc(),
-            &VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url(home), false),
+            &VZSharedDirectory::initWithURL_readOnly(
+                VZSharedDirectory::alloc(),
+                &url(place),
+                false,
+            ),
         );
         let files = VZVirtioFileSystemDeviceConfiguration::initWithTag(
             VZVirtioFileSystemDeviceConfiguration::alloc(),
-            &NSString::from_str(forward::HOME_TAG),
+            &NSString::from_str(tag),
         );
         files.setShare(Some(&share));
         Retained::into_super(files)
+    }
+}
+
+/// What this Mac's Rosetta for Linux is: installed, not installed (it can
+/// be: `softwareupdate --install-rosetta`), or not supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rosetta {
+    /// Installed: the guest runs amd64 programs through it.
+    Installed,
+    /// Not installed.
+    NotInstalled,
+    /// This Mac can't have it.
+    NotSupported,
+}
+
+/// This Mac's [`Rosetta`].
+pub(crate) fn rosetta() -> Rosetta {
+    // SAFETY: a class property, read: it takes no object, so none can be
+    // used from the wrong thread (the serial queue guards a VM's own
+    // objects, which this never touches), and returns a plain enumeration.
+    match unsafe { VZLinuxRosettaDirectoryShare::availability() } {
+        VZLinuxRosettaAvailability::Installed => Rosetta::Installed,
+        VZLinuxRosettaAvailability::NotInstalled => Rosetta::NotInstalled,
+        _ => Rosetta::NotSupported,
+    }
+}
+
+/// Rosetta's share, by the tag the guest mounts.
+fn rosetta_share() -> Result<Retained<VZDirectorySharingDeviceConfiguration>, VmError> {
+    // SAFETY: new objects, each given valid ones of the classes it takes.
+    unsafe {
+        let share =
+            VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc())
+                .map_err(|error| {
+                    VmError::Machine(format!("Rosetta's share: {}", described(&error)))
+                })?;
+        let files = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            &NSString::from_str(forward::ROSETTA_TAG),
+        );
+        files.setShare(Some(&share));
+        Ok(Retained::into_super(files))
     }
 }
 
@@ -183,11 +241,35 @@ fn mac_address(mac: crate::network::Mac) -> Result<Retained<VZMACAddress>, VmErr
     .ok_or_else(|| VmError::Machine(format!("the network card's address {mac} is refused")))
 }
 
+/// The most CPUs Virtualization.framework lets a VM have on this Mac.
+pub(crate) fn max_cpus() -> u32 {
+    // SAFETY: a class property, read: it takes no object, so none can be
+    // used from the wrong thread (the serial queue guards a VM's own
+    // objects, which this never touches), and returns a plain integer.
+    let most = unsafe { VZVirtualMachineConfiguration::maximumAllowedCPUCount() };
+    u32::try_from(most).unwrap_or(u32::MAX)
+}
+
 /// The VM's configuration from `settings`, validated.
 fn configuration(settings: Settings) -> Result<Retained<VZVirtualMachineConfiguration>, VmError> {
     let boot = boot_loader(&settings);
     let disk = data_disk(&settings.disk)?;
-    let share = home_share(&settings.home);
+    let mut shares = vec![share(&settings.home, forward::HOME_TAG)];
+    shares.extend(
+        settings
+            .others
+            .iter()
+            .enumerate()
+            .map(|(n, place)| share(place, &forward::share_tag(n))),
+    );
+    // A share the framework won't make (Rosetta mid-update) leaves the VM
+    // without it: the guest finds none to mount, says so, and amd64 images
+    // are refused, rather than the VM not starting.
+    if settings.rosetta
+        && let Ok(share) = rosetta_share()
+    {
+        shares.push(share);
+    }
     let console = console(settings.console);
     let mac = mac_address(settings.mac)?;
     // SAFETY: property setters on a new configuration, each given valid
@@ -200,7 +282,7 @@ fn configuration(settings: Settings) -> Result<Retained<VZVirtualMachineConfigur
         config.setMemorySize(settings.memory);
         config.setSerialPorts(&NSArray::from_retained_slice(&[console]));
         config.setStorageDevices(&NSArray::from_retained_slice(&[disk]));
-        config.setDirectorySharingDevices(&NSArray::from_retained_slice(&[share]));
+        config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
         let network = VZVirtioNetworkDeviceConfiguration::new();
         network.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
         network.setMACAddress(&mac);

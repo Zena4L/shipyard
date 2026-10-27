@@ -317,6 +317,11 @@ pub(crate) struct RunArgs {
     #[arg(long, value_enum, value_name = "WHEN")]
     pull: Option<PullPolicy>,
 
+    /// The image's platform (`linux/amd64`: on a Mac, run through Rosetta);
+    /// by default the image's own among what runs here, this host's first.
+    #[arg(long, value_name = "PLATFORM")]
+    platform: Option<String>,
+
     /// Make the container's root filesystem read-only (with an image or
     /// --rootfs).
     #[arg(long)]

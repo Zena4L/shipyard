@@ -15,8 +15,17 @@
 
 #[cfg(target_os = "macos")]
 mod api;
+pub mod booted;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the Mac's tools'; tested everywhere")
+)]
+mod child;
 #[cfg(target_os = "macos")]
 pub mod client;
+pub mod comes_back;
+#[cfg(target_os = "macos")]
+mod control;
 #[cfg(target_os = "macos")]
 pub mod doctor;
 #[cfg(target_os = "macos")]
@@ -30,6 +39,11 @@ mod host;
 mod idle;
 #[cfg(target_os = "macos")]
 pub mod launchd;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the host's; tested everywhere")
+)]
+mod liveness;
 #[cfg(target_os = "macos")]
 mod machine;
 mod manifest;
@@ -40,10 +54,20 @@ mod manifest;
 mod network;
 mod paths;
 mod peer;
+pub mod phase;
 pub mod ports;
 #[cfg(target_os = "macos")]
 mod serving;
+pub mod settings;
+pub mod shares;
 mod state_file;
+#[cfg(target_os = "macos")]
+mod sysctl;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the host's; tested everywhere")
+)]
+mod udp;
 
 pub use manifest::{
     Build, Guest, Hashed, Kernel, MANIFEST, MANIFEST_VERSION, Manifest, ManifestError,
@@ -61,6 +85,9 @@ pub enum VmError {
     /// A place that can't be the VM's.
     #[error("{0}")]
     Place(String),
+    /// A size this Mac can't give the VM (`vm set`), said with its bounds.
+    #[error("{0}")]
+    Size(String),
     /// No guest to boot, or one that can't be read.
     #[error("{0}")]
     Guest(String),

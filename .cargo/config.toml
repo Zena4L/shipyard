@@ -11,3 +11,8 @@ runner = "scripts/macos/sign-and-run.sh"
 # that native path. A value in your shell wins; the VM tests unset it.
 [env]
 SHIPYARD_VM = { value = "off", force = false }
+# The oldest macOS a build runs on (step 13.7, D29: the VM needs macOS 13): the
+# linker writes it in the binary (`vtool -show-build`). Ignored off a Mac.
+# Forced: one a shell exports (Xcode's, Homebrew's) would lower the floor in
+# silence.
+MACOSX_DEPLOYMENT_TARGET = { value = "13.0", force = true }

@@ -3,15 +3,16 @@
 
 use std::time::{Duration, Instant};
 
+use shipyard_runtime::attach::Frame;
 use shipyard_runtime::attach::forward::{self, Connection, Request};
 use shipyard_runtime::process::SignalWatch;
 
 use crate::{VmError, VmPaths};
 
 use super::host::last_lines;
-use super::session::{Writer, on_terminal, pass_signals, pump_stdin, relay, send};
+use super::session::{Writer, on_terminal, open_control, pass_signals, pump_stdin, relay, send};
 use super::{
-    NOT_READY_REST, Outcome, SAY_NOT_READY_AFTER, START_LIMIT, Status, Tried, connect_watching,
+    NOT_READY_REST, Outcome, SAY_NOT_READY_AFTER, START_LIMIT, Tried, connect_watching,
     interrupted, status, stopping,
 };
 
@@ -93,27 +94,29 @@ fn until_ready(
 
 /// Waits for the stopping host (`host`, its PID) to be gone: its lock free,
 /// or held by another (a new host another CLI started meanwhile), within
-/// [`START_LIMIT`]; given up on as `watch` catches a signal that ends a
-/// wait.
+/// [`START_LIMIT`], or past it while the host says it's still within its
+/// own bound (a stop that waits out a disk check, up to the longest stop:
+/// the whole-stage review); given up on as `watch` catches a signal that
+/// ends a wait.
 fn wait_until_stopped(
     paths: &VmPaths,
     host: Option<u32>,
     watch: Option<&SignalWatch>,
 ) -> Result<(), VmError> {
-    let deadline = Instant::now() + START_LIMIT;
+    let began = Instant::now();
+    let mut deadline = began + START_LIMIT;
     loop {
-        match status(paths)? {
-            Status::Stopped => return Ok(()),
-            Status::Running(Some(pid)) if host.is_some_and(|host| host != pid) => return Ok(()),
-            Status::Running(_) => {}
+        if super::gone_or_replaced(status(paths)?, host) {
+            return Ok(());
         }
         if let Some(code) = interrupted(watch) {
             return Err(VmError::Interrupted(code));
         }
+        deadline = super::waited_on(paths, began, deadline);
         if Instant::now() > deadline {
             return Err(VmError::Host(format!(
                 "the VM was stopping, and still is after {} s: {}",
-                START_LIMIT.as_secs(),
+                began.elapsed().as_secs(),
                 last_lines(&paths.host_log(), 5)
             )));
         }
@@ -133,7 +136,8 @@ fn attempt(
     request.time = forward::clock();
     let hello = forward::hello(&request).map_err(|e| VmError::Host(e.to_string()))?;
     if request.terminal.is_some() {
-        return on_terminal(paths, stream, &hello, request.input, watch);
+        let internal = forward::is_internal(&request.args);
+        return on_terminal(paths, stream, (&hello, internal), request.input, watch);
     }
     let writer: Writer = std::sync::Arc::new(std::sync::Mutex::new(
         stream
@@ -156,9 +160,28 @@ fn attempt(
         _ => {}
     }
     sent?;
-    let first = first.map_err(|e| VmError::Gone(format!("the VM's answer can't be read: {e}")))?;
+    let mut first =
+        first.map_err(|e| VmError::Gone(format!("the VM's answer can't be read: {e}")))?;
+    // A newer guest's token (F94) follows its welcome: the command's
+    // control connection, opened before any signal is passed on, takes its
+    // signals (a command that reads no input still gets them).
+    let mut control = None;
+    if let Some(Frame::Welcome { version, .. }) = first
+        && version >= shipyard_runtime::attach::SESSION_VERSION
+        && !forward::is_internal(&request.args)
+    {
+        first = connection
+            .next_frame()
+            .map_err(|e| VmError::Gone(format!("the VM's answer can't be read: {e}")))?;
+        if let Some(Frame::Session(token)) = first {
+            control = (token != 0)
+                .then(|| open_control(paths, token))
+                .flatten()
+                .map(|control| std::sync::Arc::new(std::sync::Mutex::new(control)));
+        }
+    }
     if let Some(watch) = watch.take() {
-        pass_signals(watch, &writer);
+        pass_signals(watch, &writer, control);
     }
     if request.input {
         let writer = std::sync::Arc::clone(&writer);

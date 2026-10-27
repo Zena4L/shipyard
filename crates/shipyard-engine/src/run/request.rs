@@ -125,6 +125,9 @@ pub struct RunRequest {
     /// When to pull the image (`--pull`): `None` is `missing`, the
     /// default; given without an image, it's refused.
     pub pull: Option<PullPolicy>,
+    /// The image's platform (`--platform`, step 13.3): it must run here;
+    /// `None`, the image's own among what runs here.
+    pub platform: Option<shipyard_image::Platform>,
     /// A read-only root filesystem.
     pub read_only: bool,
     /// Capabilities added to the default set.
@@ -349,6 +352,7 @@ impl Default for RunRequest {
             image: None,
             entrypoint: None,
             pull: None,
+            platform: None,
             read_only: false,
             cap_add: Vec::new(),
             cap_drop: Vec::new(),

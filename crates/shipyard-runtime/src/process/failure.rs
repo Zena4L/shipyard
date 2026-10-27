@@ -1058,6 +1058,13 @@ fn describe_mount(step: ChildStep, errno: Errno, detail: u64, ctx: &FailureConte
         MountKind::Bind { source, .. } => format!("{}", source.display()),
         _ => "a tmpfs".to_owned(),
     };
+    let by_descriptor = matches!(
+        &mount.kind,
+        MountKind::Bind {
+            made_below: Some(_),
+            ..
+        }
+    );
     let doing = match (step, errno) {
         (ChildStep::MountTarget, Errno::ENOTDIR | Errno::EISDIR) => format!(
             "making the mount point {destination} in the root filesystem \
@@ -1084,6 +1091,12 @@ fn describe_mount(step: ChildStep, errno: Errno, detail: u64, ctx: &FailureConte
         (ChildStep::Mount, Errno::ENOENT) => {
             format!("mounting {what} at {destination} (it doesn't exist)")
         }
+        // Reached without following a link (a source Shipyard made, or one
+        // in a Mac's share: 11.7, 13.8c): one put on its path since.
+        (ChildStep::Mount, Errno::ELOOP | Errno::ENOTDIR) if by_descriptor => format!(
+            "mounting {what} at {destination} (a symbolic link or a file is now on its path, \
+             put there since it was checked: refused, never followed)"
+        ),
         (ChildStep::Mount, _) => format!("mounting {what} at {destination}"),
         _ => format!("restricting the mount at {destination} (read-only, nosuid, …)"),
     };

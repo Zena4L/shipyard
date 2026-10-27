@@ -299,7 +299,7 @@ fn guard_rules() -> [Vec<Expr>; 2] {
 }
 
 /// `forward`'s (see the module).
-fn forward_rules() -> [Vec<Expr>; 18] {
+fn forward_rules() -> [Vec<Expr>; 19] {
     let [link_local, alibaba, aws, aws_dns, google] = metadata_rules();
     let [tcp4, other4, tcp6, other6] = limit_rules();
     let drop = || Expr::Verdict(NF_DROP);
@@ -348,6 +348,14 @@ fn forward_rules() -> [Vec<Expr>; 18] {
         .concat(),
         [
             interface_in(NFT_META_OIFNAME, set::INTERNAL, false),
+            vec![drop()],
+        ]
+        .concat(),
+        // A published port reached from a link no one outside the host may
+        // reach it from (the macOS guest's NAT link: F108), never accepted.
+        [
+            interface_in(NFT_META_IIFNAME, set::OUTSIDE, false),
+            ct_bits(NFT_CT_STATUS, IPS_DST_NAT, true),
             vec![drop()],
         ]
         .concat(),

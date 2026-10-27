@@ -3,7 +3,10 @@
 # packages are installed at exactly these versions by the minirootfs's own
 # apk, which checks each package's signature against the keys inside the
 # (pinned) minirootfs. A version Alpine has dropped fails the build: re-pin
-# here, then rebuild.
+# here, then rebuild. Every package installed, dependencies too, is pinned by
+# its identity in scripts/guest/alpine.installed (F92, step 13.8b): a build
+# that installs anything else fails, saying what; after a re-pin here,
+# `UPDATE_GUEST_LOCK=1 scripts/guest/build.sh` writes it again.
 ALPINE_BRANCH=v3.24
 ALPINE_RELEASE=3.24.2
 MINIROOTFS=alpine-minirootfs-3.24.2-aarch64.tar.gz

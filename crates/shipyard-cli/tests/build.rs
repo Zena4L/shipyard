@@ -379,6 +379,27 @@ fn a_local_image_is_built_from_without_a_pull() {
     assert!(built.status.success(), "{}", text(&built).1);
     let ran = ok(&store, &["run", "--rm", "on-stage:1", "cat", "/local"]);
     assert_eq!(ran, "stage\n");
+    // A stage of another platform (its own `FROM --platform=`) is never
+    // given the store's image (13.8c): its base is asked of the registry,
+    // which has none. The control: the build's own platform, named as
+    // `$BUILDPLATFORM`, is.
+    let other = if std::env::consts::ARCH == "aarch64" {
+        "linux/amd64"
+    } else {
+        "linux/arm64"
+    };
+    for (from, builds) in [(other, false), ("$BUILDPLATFORM", true)] {
+        let staged = context(&[(
+            "Dockerfile",
+            &format!("FROM --platform={from} shipyard-local-base:1\n"),
+        )]);
+        let built = build(&store, &["build", "-t", "on-platform:1"], &staged.0);
+        let (_, stderr) = text(&built);
+        assert_eq!(built.status.success(), builds, "{from}: {stderr}");
+        if !builds {
+            assert!(stderr.contains("shipyard-local-base"), "{stderr}");
+        }
+    }
     let pulled = build(&store, &["build", "--pull", "-t", "on-local:2"], &on_it.0);
     let (_, stderr) = text(&pulled);
     assert_eq!(pulled.status.code(), Some(1), "{stderr}");

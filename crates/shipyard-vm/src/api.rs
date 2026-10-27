@@ -30,7 +30,7 @@ pub(crate) const SERVED: crate::serving::Served = crate::serving::Served {
 /// ([`API_LINGERS`]). A refusal (the guest not ready, its service not
 /// starting, an older guest) is said to the client as Docker's error.
 fn serve(machine: &Machine, client: UnixStream) {
-    let (agent, unread, port) = match joined_once_ready(machine) {
+    let (agent, unread, name) = match joined_once_ready(machine) {
         Ok(joined) => joined,
         Err(refusal) => return refuse(client, &refusal.to_string()),
     };
@@ -41,7 +41,7 @@ fn serve(machine: &Machine, client: UnixStream) {
         // Its client gone (killed in a quiet `exec`, say): the guest can't
         // see it from the vsock, so it's told, and its service hangs the
         // session up as Linux's does (11.7).
-        Ok(ended) if ended.one_gone => crate::forwarding::hang_up(machine, port),
+        Ok(ended) if ended.one_gone => crate::forwarding::hang_up(machine, &name),
         Ok(_) => {}
         Err(error) => log(&format!("an API connection: {error}")),
     }
@@ -54,10 +54,10 @@ const READY_WAIT: Duration = Duration::from_secs(150);
 /// [`crate::forwarding::joined_from`] to the guest's API, asked again while the
 /// guest says it isn't ready yet (a `docker` that started the VM: Docker's
 /// clients don't try again), for at most [`READY_WAIT`].
-fn joined_once_ready(machine: &Machine) -> Result<(UnixStream, Vec<u8>, u32), Unanswered> {
+fn joined_once_ready(machine: &Machine) -> Result<(UnixStream, Vec<u8>, String), Unanswered> {
     let began = std::time::Instant::now();
     loop {
-        match crate::forwarding::joined_from(machine, &[API_REQUEST]) {
+        match crate::forwarding::joined_from(machine, &[API_REQUEST], true) {
             Err(Unanswered::Refused(Refusal::NotReady)) if began.elapsed() < READY_WAIT => {
                 std::thread::sleep(Duration::from_millis(250));
             }

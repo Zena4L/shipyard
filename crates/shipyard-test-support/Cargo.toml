@@ -17,7 +17,7 @@ libc.workspace = true
 serde_json.workspace = true
 # `term` for `openpty`; `sched` (a workspace feature) for network namespaces;
 # `socket` for receiving a console's terminal (console.rs).
-nix = { workspace = true, features = ["socket", "term"] }
+nix = { workspace = true, features = ["fs", "socket", "term"] }
 # Interfaces for the network tests (an uplink, a container's eth0).
 shipyard-network.workspace = true
 # The fixture registry's images (registry.rs).

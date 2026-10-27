@@ -17,7 +17,7 @@ Shipyard is before 1.0: only the latest release gets fixes.
 
 ## What Shipyard defends, and what it doesn't yet
 
-Shipyard (0.3, an internal milestone before 1.0) confines containers, but **isn't a
+Shipyard (0.5, an internal milestone before 1.0) confines containers, but **isn't a
 hardened security boundary yet**. Run
 only code you would run as your own user (rootless) or trust with root (as root).
 
@@ -77,26 +77,40 @@ is wherever rootless containers are.
 **On a Mac**, containers run in Shipyard's own Linux VM, and the VM is part of what
 you trust:
 
-- **Your home, shared:** the VM can read and write your whole home (as Docker
-  Desktop's file sharing can), so a container that escaped into the VM could too. A
-  container sees only what you bind into it, and a path outside your home is refused
-  before anything runs, for the `shipyard` CLI's commands. Docker's socket on the
-  Mac (`docker.sock`, `shipyard vm install`) reaches the VM's own Docker API as
-  root in the VM: a `docker run -v /:/host` there sees the VM's whole file system,
-  your home included. It's yours alone (mode 0600, your user checked), as Docker
+- **Your files, shared:** the VM can read and write your whole home, `/Volumes`, `/tmp`
+  and `/var/folders` (Docker Desktop's set), so a container that escaped into the VM
+  could too. A container sees only what you bind into it, and a bind of anything else
+  (the VM's own files among them, `-v /:/host` too) is refused as Docker Desktop's
+  "mounts denied", by the `shipyard` CLI and through Docker's socket on the Mac
+  (`docker.sock`, `shipyard vm install`) alike. That socket reaches the VM's Docker API
+  as root in the VM. A container given `--cap-add SYS_ADMIN` (or `--privileged`, or a
+  `--device` of the VM's own) isn't held by that: it can mount a share whole, or uncover
+  the VM's own files in one, as on Docker Desktop. Give those only to containers you
+  trust with the VM and every share. It's yours alone (mode 0600, your user checked), as Docker
   Desktop's is. Set-user-ID bits and device files in your home mean nothing in
   the VM, nor in a container you bind them into (a file copied into a container with
   `shipyard cp` keeps its mode, as on Linux). The VM's own files (its disk, its
   socket) are hidden from a bind of your home.
 - **Ports:** a published port listens on your Mac's loopback only, never on its
-  network. One published on every address also answers on the VM's address on the
-  Mac's private virtual network (`192.168.64.x`), which other VMs on your Mac using
-  that shared network can reach.
+  network, and the VM's firewall refuses it on the VM's own address on the Mac's
+  private virtual network (`192.168.64.x`), so other VMs on that network don't reach
+  it. What isn't a published port isn't covered there: a container on
+  `--network host` listening in the VM answers on that address, as a port published
+  on one of the VM's addresses reaches its holder's socket (a TCP reset; UDP waits
+  unread).
 - **The Mac, from a container:** a container can reach your Mac's own services at the
   VM's gateway (`192.168.64.1`), as it can a Linux host's.
-- **The VM's agent** answers only the Mac (vsock's host, CID 2). A container started
-  with `--security-opt seccomp=unconfined` can open vsock sockets (the default profile
-  refuses them), and could take the agent's port while the agent is down.
+- **The VM's agent** answers only the Mac (vsock's host, CID 2). Its port is held by
+  the VM's init from its boot to its end, so a container that can open vsock sockets
+  (one started with `--security-opt seccomp=unconfined`; the default profile refuses
+  them) can never take it, even while the agent restarts. A command that waited
+  longer than a minute for a restarting agent is refused rather than run late.
+- **Your local signing identity** (`scripts/macos/make-signing-identity.sh`) lets
+  `codesign` use its key without asking, so any program you run can sign with it, and
+  carry the folder permissions macOS gave `shipyard` (Desktop, Documents, Downloads) to
+  another binary. A program you run can already reach those folders through the VM
+  (`docker.sock` is yours), so this adds no reach; it's a key for this Mac's
+  development, never for anyone else's (F180).
 
 What isn't done yet (tracked in the [roadmap](docs/ROADMAP.md#open-findings)):
 

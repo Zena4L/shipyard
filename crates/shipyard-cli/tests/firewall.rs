@@ -143,6 +143,46 @@ fn published_ports_reach_the_container_from_everywhere() {
     });
 }
 
+/// Step 13.5b (F108): a link in the `outside` set (the macOS guest's NAT
+/// link, `eth0` there; here the upstream's, `up0`) reaches no published
+/// port, while the host itself still does; out of the set, it reaches it
+/// again (the control). A Linux host's set is empty: as before.
+#[test]
+#[ignore = "needs root"]
+fn a_link_outside_reaches_no_published_port() {
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        let (running, netns) = networks.sleeping(&["-p", "8090:80"]);
+        let _server = Server::start(&netns, 80, "eighty");
+        let world = SocketAddr::from((Upstream::HOST, 8090));
+        assert_eq!(
+            fetch_from(upstream.netns(), world).as_deref(),
+            Some("eighty"),
+            "the control"
+        );
+        let Some(_) = nft(&["add", "element", "inet", "shipyard", "outside", "{ up0 }"]) else {
+            running.stop();
+            return;
+        };
+        assert_eq!(fetch_from(upstream.netns(), world), None, "from up0");
+        assert_eq!(
+            fetch(SocketAddr::from((Ipv4Addr::LOCALHOST, 8090))).as_deref(),
+            Some("eighty"),
+            "the host itself"
+        );
+        nft(&[
+            "delete", "element", "inet", "shipyard", "outside", "{ up0 }",
+        ]);
+        assert_eq!(
+            fetch_from(upstream.netns(), world).as_deref(),
+            Some("eighty"),
+            "out of the set"
+        );
+        running.stop();
+    });
+}
+
 #[test]
 #[ignore = "needs root"]
 fn a_published_port_is_held_while_its_run_lives() {

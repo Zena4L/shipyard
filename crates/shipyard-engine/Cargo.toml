@@ -14,7 +14,8 @@ publish.workspace = true
 base64.workspace = true
 libc.workspace = true
 # `sysconf(_SC_CLK_TCK)` for `top`'s and `stats`' clock ticks (`feature`).
-nix = { workspace = true, features = ["feature"] }
+# `ioctl`: the macOS guest's `FITRIM` at its stop (step 13.2).
+nix = { workspace = true, features = ["feature", "ioctl"] }
 serde.workspace = true
 serde_json.workspace = true
 # Networks' IDs, derived from what makes each one (step 11.2c2b).

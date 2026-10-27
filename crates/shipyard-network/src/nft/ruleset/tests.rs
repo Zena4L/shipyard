@@ -4,9 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 
 use super::super::consts::{
-    CT_STATE_INVALID, IPS_CONFIRMED, NF_DROP, NFT_CMP_EQ, NFT_CMP_GTE, NFT_CMP_LTE, NFT_CMP_NEQ,
-    NFT_CT_STATE, NFT_CT_STATUS, NFT_DYNSET_OP_ADD, NFT_META_IIFNAME, NFT_META_OIFNAME,
-    NFT_NAT_DNAT, NFT_REJECT_ICMPX_ADMIN_PROHIBITED, NFT_REJECT_ICMPX_UNREACH, NFT_REJECT_TCP_RST,
+    CT_STATE_INVALID, IPS_CONFIRMED, IPS_DST_NAT, NF_DROP, NFT_CMP_EQ, NFT_CMP_GTE, NFT_CMP_LTE,
+    NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS, NFT_DYNSET_OP_ADD, NFT_META_IIFNAME,
+    NFT_META_OIFNAME, NFT_NAT_DNAT, NFT_REJECT_ICMPX_ADMIN_PROHIBITED, NFT_REJECT_ICMPX_UNREACH,
+    NFT_REJECT_TCP_RST,
 };
 use super::super::expr::Expr;
 use super::elements::subnet_range;
@@ -116,7 +117,7 @@ fn ports_go_in_the_tables_batch_while_they_fit() {
             })
             .collect()
     };
-    let table = || install(&[], &[], &ClosedRouting::default());
+    let table = || install(&[], &[], &ClosedRouting::default(), &[]);
     let tables = table().len();
     let few = port_items(&ports(3), false);
     let (batch, more) = fit_ports(table(), few.clone());
@@ -513,11 +514,11 @@ fn only_dnated_traffic_reaches_a_bridge_and_internal_networks_are_closed() {
         .filter(|(chain, _)| *chain == "forward")
         .map(|(_, exprs)| exprs)
         .collect();
-    assert_eq!(forward.len(), 18);
+    assert_eq!(forward.len(), 19);
     // What conntrack finds invalid on a bridge first, then replies, an
     // isolated network's to the metadata addresses, the limit, what stays on a
-    // bridge, the internal networks, DNAT, the rest, then routing for
-    // others if closed.
+    // bridge, the internal networks, DNAT from an outside link dropped, DNAT,
+    // the rest, then routing for others if closed.
     let invalid = ct_bits(NFT_CT_STATE, CT_STATE_INVALID, true);
     for (rule, key) in forward[..2]
         .iter()
@@ -550,11 +551,29 @@ fn only_dnated_traffic_reaches_a_bridge_and_internal_networks_are_closed() {
             invert: false
         }
     );
-    assert_eq!(forward[4].last(), Some(&Expr::Verdict(NF_ACCEPT)));
-    assert_eq!(forward[5].last(), Some(&Expr::Verdict(NF_DROP)));
+    // A published port from an outside link (the macOS guest's NAT): dropped,
+    // before DNAT is accepted (F108).
+    assert_eq!(
+        forward[4],
+        [
+            interface_in(NFT_META_IIFNAME, set::OUTSIDE, false),
+            ct_bits(NFT_CT_STATUS, IPS_DST_NAT, true),
+            vec![Expr::Verdict(NF_DROP)],
+        ]
+        .concat()
+    );
+    assert_eq!(
+        forward[5],
+        [
+            ct_bits(NFT_CT_STATUS, IPS_DST_NAT, true),
+            vec![Expr::Verdict(NF_ACCEPT)]
+        ]
+        .concat()
+    );
+    assert_eq!(forward[6].last(), Some(&Expr::Verdict(NF_DROP)));
     // Routing closed: between the host's own interfaces only.
     assert_eq!(
-        forward[6],
+        forward[7],
         [
             routing_closed(),
             interface_in(NFT_META_IIFNAME, set::UPLINKS, false),
@@ -587,21 +606,23 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
             families: vec![Family::V4, Family::V6],
             interfaces: vec!["eth0".into()],
         },
+        &["eth0".to_owned()],
     );
     let what: Vec<&str> = items.iter().map(|item| item.what.as_str()).collect();
     assert_eq!(what[0], "adding the table shipyard");
     assert_eq!(what[1], "adding the set bridges");
-    assert_eq!(what[17], "adding the chain guard");
-    assert!(what.contains(&"adding rule 18 of the chain forward"));
+    assert_eq!(what[18], "adding the chain guard");
+    assert!(what.contains(&"adding rule 19 of the chain forward"));
     assert!(what.contains(&"adding rule 9 of the chain input"));
     assert_eq!(
-        what[what.len() - 5..],
+        what[what.len() - 6..],
         [
             "adding to the set ports",
             "adding to the set uplinks",
             "adding to the set closed",
             "adding to the set uplinks",
             "adding to the set closed",
+            "adding to the set outside",
         ]
     );
     for item in &items {

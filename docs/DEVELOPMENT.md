@@ -352,8 +352,14 @@ scripts/guest/build.sh            # in the test container; writes target/guest/
 It's Alpine's `linux-virt` kernel (unpacked: the framework boots a raw arm64
 `Image`) and an initramfs holding the whole guest: Alpine's minirootfs, the
 kernel's modules, `e2fsprogs` and the static `shipyard` as `/init`. What it's
-built from is pinned in `scripts/guest/alpine.lock`; `manifest.json` beside it says
-what it was made of, and the VM checks the files against it before it boots.
+built from is pinned in `scripts/guest/alpine.lock`, and every package it installs,
+dependencies too, in `scripts/guest/alpine.installed` (each by its identity in apk's
+database: a build that installs anything else fails, saying what; after a re-pin,
+`UPDATE_GUEST_LOCK=1 scripts/guest/build.sh` writes it again); `manifest.json` beside it says
+what it was made of, and the VM checks the files against it before it boots. On a
+network that breaks Alpine's TLS (one met in 13.2 drops OpenSSL 3.5's post-quantum
+hello), `SHIPYARD_GUEST_MIRROR=http://dl-cdn.alpinelinux.org/alpine scripts/guest/build.sh`
+fetches the packages over plain HTTP: `apk` still checks each one's signature.
 
 **The entitlement.** macOS gives a VM only to a binary signed with
 `com.apple.security.virtualization` (`contrib/macos/shipyard.entitlements`). The
@@ -367,10 +373,42 @@ scripts/macos/sign.sh             # every shipyard binary under target/
 `scripts/macos/sign-and-run.sh` cargo's runner on a Mac. A binary the tests start
 (`CARGO_BIN_EXE_shipyard`) isn't run by cargo: the VM tests sign it first.
 
+**A signing identity of your own** (step 13.7). Signed ad hoc, each rebuild is a new
+program to macOS's privacy permissions, so a VM launchd started (`shipyard vm install`)
+is asked again for your Desktop, Documents and Downloads after every rebuild. Make one
+identity, once, and every build is signed with it:
+
+```sh
+scripts/macos/make-signing-identity.sh   # "Shipyard Local Signing", in your login keychain
+```
+
+It's a self-signed certificate for code signing, its key kept in the keychain: nothing
+is trusted system-wide, and what it signs is for this Mac alone. It needs OpenSSL 3
+(`brew install openssl@3`: macOS's own `openssl` is LibreSSL), and asks for your
+keychain's password once, there, so `codesign` may use this key from then on without a
+dialog (a background build never waits on one); every other key in the keychain is left
+as it is, and the script says how many it changed (one). Any program you run can then
+sign with it too (SECURITY.md says what that reaches). `sign.sh` then signs with it, by its
+SHA-1 (`SHIPYARD_SIGN_IDENTITY` names another identity; without one it signs ad hoc, as
+before; if the keychain is locked, or the session can't reach it, it says so and signs
+ad hoc, so a build never fails for it), and `shipyard doctor`'s `entitlement` line says
+which. Local builds aren't signed with the hardened runtime, so a debugger attaches
+(`notarize.sh` adds it for a release).
+`scripts/macos/test-sign.sh` (in `verify.sh --mac`) checks both ways in a throwaway
+keychain: two builds signed with an identity keep one designated requirement (what the
+permissions are kept by), two ad-hoc ones don't. Builds target macOS 13
+(`MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml`).
+
+**A release's signing** (stage 15): `scripts/macos/notarize.sh FILE…` signs with a
+Developer ID (`SHIPYARD_DEVELOPER_ID`) and the hardened runtime and a secure timestamp,
+and has Apple notarize the files (`SHIPYARD_NOTARY_PROFILE`, a `notarytool` profile).
+It isn't run by any check here.
+
 Then:
 
 ```sh
-export SHIPYARD_GUEST_DIR=$PWD/target/guest
+# (A shipyard built in this tree finds target/guest by itself, unless the VM's
+# directory has a guest of its own: SHIPYARD_GUEST_DIR says it outright.)
 target/debug/shipyard vm start    # boots the guest (about a second)
 target/debug/shipyard vm status
 target/debug/shipyard run --rm alpine echo hi   # any command: run in the VM

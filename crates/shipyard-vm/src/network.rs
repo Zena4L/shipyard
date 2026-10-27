@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::VmError;
 
-/// The newest `network.json` this Shipyard reads and the one it writes.
-const NETWORK_FILE_VERSION: u32 = 1;
+/// The newest `network.json` this Shipyard reads and the one it writes: v2
+/// adds the directory it belongs to (F138), v1 had the address alone.
+const NETWORK_FILE_VERSION: u32 = 2;
 
 /// The most a `network.json` is read of: it holds a few dozen bytes.
 const NETWORK_FILE_CAP: u64 = 4096;
@@ -27,6 +28,48 @@ pub(crate) struct NetworkFile {
     pub(crate) version: u32,
     /// The card's address: six hex pairs, locally administered unicast.
     pub(crate) mac: Mac,
+    /// The VM directory it was made for, by device and inode (v2): a copy
+    /// of the directory run as a second VM on the same Mac (a backup
+    /// restored beside the live one) must not share its address, or the two
+    /// clash on the NAT network (F138). Absent in a v1 file. (APFS gives a
+    /// volume its device number when it's mounted: a VM directory on an
+    /// external disk mounted in another order takes a new address, one NAT
+    /// lease, and is said as a copy; the home's volume keeps its number.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dir: Option<DirId>,
+}
+
+/// A directory's identity: its device and inode, the same for as long as it
+/// exists, another for a copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirId {
+    /// Its device.
+    pub(crate) dev: u64,
+    /// Its inode.
+    pub(crate) ino: u64,
+}
+
+impl DirId {
+    /// The identity of the directory at `dir`.
+    fn of(dir: &Path) -> Result<Self, VmError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(dir).map_err(|e| VmError::io(dir, e))?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
+/// The card's address, and whether it's new where an address was kept: the
+/// file was another directory's (said in the host's log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Card {
+    /// Its address.
+    pub(crate) mac: Mac,
+    /// Made again: the kept one was another directory's.
+    pub(crate) remade: bool,
 }
 
 /// A card's address: always unicast and locally administered (the
@@ -89,28 +132,56 @@ impl TryFrom<String> for Mac {
 }
 
 impl NetworkFile {
-    /// The card's address kept at `path`, or a new random one written
-    /// there first if there's none, or only an empty file (a crash before
-    /// the first write reached the disk). Called by the VM's host alone,
-    /// under its lock: one writer.
+    /// The card's address kept at `path` for the VM directory `dir`, or a
+    /// new random one written there first if there's none, only an empty
+    /// file (a crash before the first write reached the disk), or one made
+    /// for another directory (a copy of this one: F138). A v1 file (no
+    /// directory) is this directory's: rewritten v2, the same address.
+    /// Called by the VM's host alone, under its lock: one writer.
     ///
     /// # Errors
     ///
     /// [`VmError::Io`]: unreadable, not this format or a newer version
-    /// (each says removing it makes a new address), or no randomness to
-    /// make one with.
-    pub(crate) fn kept_or_made(path: &Path) -> Result<Mac, VmError> {
-        if let Some(kept) = Self::read(path)? {
-            return Ok(kept.mac);
+    /// (each says removing it makes a new address), `dir` can't be looked
+    /// at, or no randomness to make one with.
+    pub(crate) fn kept_or_made(path: &Path, dir: &Path) -> Result<Card, VmError> {
+        let here = DirId::of(dir)?;
+        let kept = Self::read(path)?;
+        if let Some(kept) = &kept {
+            match kept.dir {
+                Some(made_for) if made_for == here => {
+                    return Ok(Card {
+                        mac: kept.mac,
+                        remade: false,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    Self {
+                        version: NETWORK_FILE_VERSION,
+                        mac: kept.mac,
+                        dir: Some(here),
+                    }
+                    .write(path)?;
+                    return Ok(Card {
+                        mac: kept.mac,
+                        remade: false,
+                    });
+                }
+            }
         }
         let bytes =
             shipyard_sys::random::bytes().map_err(|e| VmError::io(Path::new("/dev/urandom"), e))?;
         let made = Self {
             version: NETWORK_FILE_VERSION,
             mac: Mac::local(bytes),
+            dir: Some(here),
         };
         made.write(path)?;
-        Ok(made.mac)
+        Ok(Card {
+            mac: made.mac,
+            remade: kept.is_some(),
+        })
     }
 
     /// Writes it at `path`, whole and synced: it's written once, and a
@@ -150,26 +221,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// The card's address at `path`, in its own directory.
+    fn card(path: &Path) -> Card {
+        NetworkFile::kept_or_made(path, path.parent().unwrap()).unwrap()
+    }
+
     /// The address is made once and the same at every boot after: each new
     /// one would take another of the NAT network's 253 leases for an hour.
     #[test]
     fn the_address_is_made_once_and_kept() {
         let path = scratch("kept");
-        let first = NetworkFile::kept_or_made(&path).unwrap();
-        assert_eq!(NetworkFile::kept_or_made(&path).unwrap(), first);
+        let first = card(&path);
+        assert!(!first.remade);
+        assert_eq!(card(&path), first);
+        let file = NetworkFile::read(&path).unwrap().unwrap();
         assert_eq!(
-            NetworkFile::read(&path).unwrap().unwrap(),
+            file,
             NetworkFile {
-                version: 1,
-                mac: first
+                version: 2,
+                mac: first.mac,
+                dir: Some(DirId::of(path.parent().unwrap()).unwrap()),
             }
         );
         // A second directory's is another.
         let other_path = scratch("other");
-        let other = NetworkFile::kept_or_made(&other_path).unwrap();
-        assert_ne!(other, first);
+        assert_ne!(card(&other_path).mac, first.mac);
         remove(&path);
         remove(&other_path);
+    }
+
+    /// F138: a copy of a VM directory (its `network.json` with it) gets an
+    /// address of its own, said; a v1 file (the address alone) is the
+    /// directory's own, kept and made v2.
+    #[test]
+    fn a_copied_directory_gets_its_own_address() {
+        let path = scratch("original");
+        let original = card(&path);
+        let copy = scratch("copy");
+        std::fs::copy(&path, &copy).unwrap();
+        let copied = card(&copy);
+        assert!(copied.remade);
+        assert_ne!(copied.mac, original.mac);
+        assert_eq!(
+            card(&copy),
+            Card {
+                mac: copied.mac,
+                remade: false
+            },
+            "kept after"
+        );
+        assert_eq!(card(&path), original, "the original's untouched");
+        // A v1 file: adopted.
+        let old = scratch("v1");
+        std::fs::write(&old, r#"{"version":1,"mac":"02:11:22:33:44:55"}"#).unwrap();
+        let adopted = card(&old);
+        assert_eq!(adopted.mac.to_string(), "02:11:22:33:44:55");
+        assert!(!adopted.remade);
+        assert_eq!(NetworkFile::read(&old).unwrap().unwrap().version, 2);
+        assert_eq!(card(&old), adopted);
+        for made in [path, copy, old] {
+            remove(&made);
+        }
     }
 
     /// Whatever the random bytes, the address is unicast and locally
@@ -179,7 +291,7 @@ mod tests {
         assert_eq!(Mac::local([0xff; 6]).to_string(), "fe:ff:ff:ff:ff:ff");
         assert_eq!(Mac::local([0; 6]).to_string(), "02:00:00:00:00:00");
         let path = scratch("local");
-        let made = NetworkFile::kept_or_made(&path).unwrap();
+        let made = card(&path).mac;
         assert_eq!(made.0[0] & 0x03, 0x02);
         remove(&path);
     }
@@ -195,25 +307,22 @@ mod tests {
             r#"{"version":1,"mac":"02:11:22:33:44:55:66"}"#,
             r#"{"version":1,"mac":"02:11:22:33:44:5"}"#,
             r#"{"version":1,"mac":"+2:11:22:33:44:55"}"#,
-            r#"{"version":2,"mac":"02:11:22:33:44:55"}"#,
+            r#"{"version":3,"mac":"02:11:22:33:44:55"}"#,
+            r#"{"version":2,"mac":"02:11:22:33:44:55","dir":{"dev":1}}"#,
             "not json",
         ] {
             let path = scratch("wrong");
             std::fs::write(&path, text).unwrap();
             assert!(
-                matches!(NetworkFile::kept_or_made(&path), Err(VmError::Io { .. })),
+                matches!(
+                    NetworkFile::kept_or_made(&path, path.parent().unwrap()),
+                    Err(VmError::Io { .. })
+                ),
                 "{text}"
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
             remove(&path);
         }
-        let path = scratch("right");
-        std::fs::write(&path, r#"{"version":1,"mac":"02:11:22:33:44:55"}"#).unwrap();
-        assert_eq!(
-            NetworkFile::kept_or_made(&path).unwrap().to_string(),
-            "02:11:22:33:44:55"
-        );
-        remove(&path);
     }
 
     /// An empty file (a crash before the first write reached the disk) is
@@ -222,8 +331,9 @@ mod tests {
     fn an_empty_file_makes_a_new_address() {
         let path = scratch("empty");
         std::fs::write(&path, "").unwrap();
-        let made = NetworkFile::kept_or_made(&path).unwrap();
-        assert_eq!(NetworkFile::read(&path).unwrap().unwrap().mac, made);
+        let made = card(&path);
+        assert!(!made.remade);
+        assert_eq!(NetworkFile::read(&path).unwrap().unwrap().mac, made.mac);
         remove(&path);
     }
 }

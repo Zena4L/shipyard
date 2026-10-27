@@ -8,7 +8,7 @@
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use sha2::Digest as _;
@@ -26,9 +26,10 @@ const SOCKET_NAME: &std::ffi::CStr = c"docker";
 const LAUNCHCTL: &str = "/bin/launchctl";
 
 /// How long launchd lets the agent's host stop before it kills it (at
-/// `uninstall`, at logout): its guest's orderly stop (90 s, then 10 s to
-/// force it) and a margin. launchd's own default is 20 s.
-const EXIT_TIMEOUT: u64 = 120;
+/// `uninstall`, at logout): its longest ordered stop (`host::LONGEST_STOP`:
+/// asked as it boots, a disk check no stop cuts, its containers) and a
+/// margin. launchd's own default is 20 s.
+const EXIT_TIMEOUT: u64 = crate::host::LONGEST_STOP.as_secs() + 60;
 
 /// How long `install` waits for launchd's socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -97,15 +98,10 @@ pub fn protected(home: Option<&Path>, path: &Path) -> Option<&'static str> {
     let home = home?;
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let path = canonical(path);
-    [
-        ("Desktop", "Desktop"),
-        ("Documents", "Documents"),
-        ("Downloads", "Downloads"),
-        ("Library/Mobile Documents", "iCloud Drive"),
-    ]
-    .into_iter()
-    .find(|(dir, _)| path.starts_with(canonical(&home.join(dir))))
-    .map(|(_, name)| name)
+    shipyard_runtime::attach::forward::GUARDED_FOLDERS
+        .into_iter()
+        .find(|(dir, _)| path.starts_with(canonical(&home.join(dir))))
+        .map(|(_, name)| name)
 }
 
 /// The agent: what it runs (`program`, the host's argument), its socket
@@ -117,7 +113,7 @@ pub fn agent(
     label: &str,
     program: &Path,
     paths: &VmPaths,
-    env: &[(String, String)],
+    (env, at_login): (&[(String, String)], bool),
 ) -> plist::Value {
     use plist::{Dictionary, Value};
     let text = |path: &Path| Value::String(path.to_string_lossy().into_owned());
@@ -135,6 +131,12 @@ pub fn agent(
     for (name, value) in env {
         variables.insert(name.clone(), Value::String(value.clone()));
     }
+    if at_login {
+        variables.insert(
+            crate::comes_back::AT_LOGIN_VAR.to_owned(),
+            Value::String(crate::comes_back::AT_LOGIN_ON.to_owned()),
+        );
+    }
     let mut agent = Dictionary::new();
     agent.insert("Label".to_owned(), Value::String(label.to_owned()));
     agent.insert(
@@ -149,9 +151,11 @@ pub fn agent(
     agent.insert("WorkingDirectory".to_owned(), Value::String("/".to_owned()));
     agent.insert("StandardOutPath".to_owned(), text(&paths.host_log()));
     agent.insert("StandardErrorPath".to_owned(), text(&paths.host_log()));
-    // Started only by a connection, or the CLI's kickstart: never at login
-    // nor again once it ends (daemonless, D20).
-    agent.insert("RunAtLoad".to_owned(), Value::Boolean(false));
+    // Started only by a connection, or the CLI's kickstart: never again
+    // once it ends (daemonless, D20); at login only when asked
+    // (`--at-login`, 13.6b2: its host then boots the VM only while
+    // containers would come back).
+    agent.insert("RunAtLoad".to_owned(), Value::Boolean(at_login));
     agent.insert("KeepAlive".to_owned(), Value::Boolean(false));
     agent.insert(
         "ExitTimeOut".to_owned(),
@@ -183,11 +187,25 @@ struct Said {
 
 /// `launchctl ARGS`, its output kept.
 fn launchctl(args: &[&str]) -> Result<Said, VmError> {
-    let output = Command::new(LAUNCHCTL)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
+    launchctl_within(args, LAUNCHCTL_LIMIT)
+}
+
+/// How long `launchctl` may take to answer (a `bootout` waits for its job's
+/// stop: [`UNLOAD_WAIT`]).
+const LAUNCHCTL_LIMIT: Duration = Duration::from_secs(30);
+
+/// [`launchctl`] within `limit`: one that doesn't answer is killed, and said
+/// as not done (stage 13's close: `vm status` and `doctor` ask it).
+fn launchctl_within(args: &[&str], limit: Duration) -> Result<Said, VmError> {
+    let output = crate::child::output_within(Command::new(LAUNCHCTL).args(args), limit)
         .map_err(|e| VmError::io(Path::new(LAUNCHCTL), e))?;
+    let Some(output) = output else {
+        return Ok(Said {
+            worked: false,
+            out: String::new(),
+            err: format!("launchctl didn't answer within {} s", limit.as_secs()),
+        });
+    };
     Ok(Said {
         worked: output.status.success(),
         out: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -205,6 +223,83 @@ fn has(label: &str) -> bool {
 pub(crate) fn installed(paths: &VmPaths) -> bool {
     plist_file(paths).is_ok_and(|file| file.is_file())
 }
+
+/// Where the agent for a VM stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    /// None installed (`vm install` never run, or `vm uninstall`ed).
+    NotInstalled,
+    /// Its property list is there, but launchd hasn't loaded it (a manual
+    /// `bootout`, or its Login Items switch off): Docker's socket is then
+    /// no one's (F152).
+    NotLoaded,
+    /// Loaded: launchd holds Docker's socket.
+    Loaded,
+}
+
+/// Where the agent for `paths` stands.
+#[must_use]
+pub fn state(paths: &VmPaths) -> AgentState {
+    if loaded(paths) {
+        AgentState::Loaded
+    } else if installed(paths) {
+        AgentState::NotLoaded
+    } else {
+        AgentState::NotInstalled
+    }
+}
+
+/// Whether the agent for `paths` was installed to start the VM at login
+/// (`--at-login`), as its property list says.
+#[must_use]
+pub fn starts_at_login(paths: &VmPaths) -> bool {
+    let value = agent_plist(paths).and_then(|agent| {
+        agent
+            .get("EnvironmentVariables")?
+            .as_dictionary()?
+            .get(crate::comes_back::AT_LOGIN_VAR)?
+            .as_string()
+            .map(std::ffi::OsString::from)
+    });
+    crate::comes_back::at_login(value.as_deref())
+}
+
+/// The agent's property list for `paths`, as it's installed, if it can be
+/// read.
+fn agent_plist(paths: &VmPaths) -> Option<plist::Dictionary> {
+    plist::Value::from_file(plist_file(paths).ok()?)
+        .ok()?
+        .into_dictionary()
+}
+
+/// Whether the agent for `paths` was installed by an older shipyard, as
+/// its property list says: one whose `ExitTimeOut` is below this build's
+/// (stage 12's was 120 s), so launchd would kill the host in the middle of
+/// an ordered stop at a logout (stage 13's close).
+#[must_use]
+pub fn installed_by_older(paths: &VmPaths) -> bool {
+    agent_plist(paths).is_some_and(|agent| older(&agent))
+}
+
+/// Whether `agent`, a property list as installed, is an older build's
+/// ([`installed_by_older`]).
+fn older(agent: &plist::Dictionary) -> bool {
+    agent
+        .get("ExitTimeOut")
+        .and_then(plist::Value::as_unsigned_integer)
+        .is_none_or(|timeout| timeout < EXIT_TIMEOUT)
+}
+
+/// What to do about an agent an older shipyard installed (`vm status`'s
+/// and `doctor`'s words).
+pub const OLDER_AGENT: &str = "launchd's agent was installed by an older shipyard, whose stop \
+                               launchd would cut short at a logout: `shipyard vm install` again";
+
+/// What to do about an agent installed but not loaded (`vm status`'s and
+/// `doctor`'s words).
+pub const NOT_LOADED: &str = "launchd's agent is installed but not loaded, so nothing serves \
+                              Docker's socket: `shipyard vm install` loads it (macOS's Login \
+                              Items may have turned it off)";
 
 /// Whether the agent for `paths` is loaded in the user's session.
 #[must_use]
@@ -265,7 +360,7 @@ pub struct Installed {
 ///
 /// [`VmError::Host`] while the VM runs, or launchd's refusal;
 /// [`VmError::Io`] and [`VmError::Place`] for the files.
-pub fn install(paths: &VmPaths) -> Result<Installed, VmError> {
+pub fn install(paths: &VmPaths, at_login: bool) -> Result<Installed, VmError> {
     if crate::client::status(paths)? != crate::client::Status::Stopped {
         return Err(VmError::Host(
             "the VM runs: stop it first (shipyard vm stop), then install".to_owned(),
@@ -283,6 +378,9 @@ pub fn install(paths: &VmPaths) -> Result<Installed, VmError> {
             )));
         }
     }
+    // The guest it will boot, there now: a login start of a guest that has
+    // gone would fail with only the host's log to say so.
+    crate::Guest::find(&paths.guest)?;
     let env: Vec<(String, String)> = std::env::var("SHIPYARD_VM_IDLE")
         .ok()
         .filter(|value| !value.is_empty())
@@ -295,13 +393,17 @@ pub fn install(paths: &VmPaths) -> Result<Installed, VmError> {
         std::fs::create_dir_all(dir).map_err(|e| VmError::io(dir, e))?;
     }
     let mut bytes = Vec::new();
-    agent(&label, &program, paths, &env)
+    agent(&label, &program, paths, (&env, at_login))
         .to_writer_xml(&mut bytes)
         .map_err(|e| VmError::io(&file, std::io::Error::other(e)))?;
     let how = shipyard_sys::fs::Write::new(0o644).durability(shipyard_sys::fs::Durability::Synced);
     shipyard_sys::fs::write_atomically(&file, &bytes, &how)
         .map_err(|e| VmError::io(&file, std::io::Error::from(e)))?;
     unload(&label)?;
+    // The run at load this causes is the install's, never a login's: it
+    // boots no VM.
+    let mark = paths.just_installed();
+    std::fs::write(&mark, b"").map_err(|e| VmError::io(&mark, e))?;
     bootstrap(&file)?;
     // launchd makes the socket when its run at load checks in: a `docker`
     // right after this finds it there.
@@ -345,7 +447,7 @@ fn unload(label: &str) -> Result<bool, VmError> {
     if !has(label) {
         return Ok(false);
     }
-    let said = launchctl(&["bootout", &target(label)])?;
+    let said = launchctl_within(&["bootout", &target(label)], UNLOAD_WAIT)?;
     if !until(UNLOAD_WAIT, || !has(label)) {
         return Err(VmError::Host(format!(
             "launchd still has {label} after {} s ({})",
@@ -425,11 +527,6 @@ pub(crate) fn kickstart(paths: &VmPaths) -> Result<(), VmError> {
     }
 }
 
-/// Asks the agent's host to stop (SIGTERM: its guest stopped in order).
-pub(crate) fn terminate(paths: &VmPaths) {
-    let _ = launchctl(&["kill", "SIGTERM", &target(&label_of(paths))]);
-}
-
 /// The program the agent for `paths` runs, as its property list says, if
 /// it's loaded.
 #[must_use]
@@ -437,9 +534,8 @@ pub fn program(paths: &VmPaths) -> Option<PathBuf> {
     if !loaded(paths) {
         return None;
     }
-    let agent = plist::Value::from_file(plist_file(paths).ok()?).ok()?;
+    let agent = agent_plist(paths)?;
     let program = agent
-        .as_dictionary()?
         .get("ProgramArguments")?
         .as_array()?
         .first()?
@@ -553,11 +649,11 @@ mod tests {
     fn the_agent_says_what_runs_and_what_it_holds() {
         let paths = paths("/tmp/vm-agent");
         let env = vec![("SHIPYARD_VM_DIR".to_owned(), "/tmp/vm-agent".to_owned())];
-        let agent = agent(
+        let agent = super::agent(
             "dev.shipyard.vm.x",
             Path::new("/bin/shipyard"),
             &paths,
-            &env,
+            (&env, false),
         );
         let mut bytes = Vec::new();
         agent.to_writer_xml(&mut bytes).unwrap();
@@ -594,6 +690,33 @@ mod tests {
         // The VM's places always, the guest's too: the host's are the CLI's.
         let variables = read["EnvironmentVariables"].as_dictionary().unwrap();
         assert_eq!(variables["SHIPYARD_GUEST_DIR"].as_string(), Some("/g"));
+        // Asked to start at login (`--at-login`): run at load, its host then
+        // deciding by what comes back.
+        let agent = super::agent(
+            "dev.shipyard.vm.x",
+            Path::new("/bin/shipyard"),
+            &paths,
+            (&env, true),
+        );
+        let read = agent.as_dictionary().unwrap();
+        assert_eq!(read["RunAtLoad"].as_boolean(), Some(true));
+        assert_eq!(
+            read["EnvironmentVariables"].as_dictionary().unwrap()[crate::comes_back::AT_LOGIN_VAR]
+                .as_string(),
+            Some("1")
+        );
+        // Long enough for the host's longest ordered stop.
+        assert!(
+            read["ExitTimeOut"].as_unsigned_integer().unwrap()
+                > crate::host::LONGEST_STOP.as_secs()
+        );
+        // This build's isn't an older one's; stage 12's 120 s (or none) is.
+        assert!(!older(read));
+        let mut stage_12 = read.clone();
+        stage_12.insert("ExitTimeOut".to_owned(), plist::Value::Integer(120.into()));
+        assert!(older(&stage_12));
+        stage_12.remove("ExitTimeOut");
+        assert!(older(&stage_12));
     }
 
     /// A program or the guest's files in a folder macOS guards (or below

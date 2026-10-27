@@ -1,7 +1,8 @@
 //! The VM's host process started for the CLI: spawned as a process of its own,
-//! or kicked through launchd once `vm install` has loaded its agent, its log
-//! kept short.
+//! or kicked through launchd once `vm install` has loaded its agent (the host
+//! keeps its own log short).
 
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -9,9 +10,6 @@ use std::time::{Duration, Instant};
 use crate::{HOST_ARG, VmError, VmPaths};
 
 use super::{Status, status};
-
-/// The host's log's size past which it's moved aside at a start.
-const HOST_LOG_KEPT: u64 = 1 << 20;
 
 /// The most the lock file's PID is read as.
 pub(super) const PID_CAP: u64 = 64;
@@ -29,6 +27,8 @@ pub(super) enum Started {
         runs: Option<u64>,
         /// When it was last kicked.
         kicked: Instant,
+        /// Whether this start wrote the start mark (its host takes it).
+        marked: bool,
     },
 }
 
@@ -42,23 +42,12 @@ impl Started {
     pub(super) fn ended(&mut self, paths: &VmPaths) -> Option<std::process::ExitStatus> {
         match self {
             Self::Spawned(host) => host.try_wait().ok().flatten(),
-            Self::Launchd { runs, .. } => {
+            Self::Launchd { runs, marked, .. } => {
                 let job = crate::launchd::job(paths)?;
-                ended_in_launchd(*runs, job)
+                // (A mark this start never wrote is no run of its.)
+                let mark_taken = *marked && !paths.start_asked().exists();
+                ended_in_launchd(*runs, job, mark_taken)
             }
-        }
-    }
-
-    /// Asks it to stop (SIGTERM: its guest stopped in order).
-    pub(super) fn terminate(&self, paths: &VmPaths) {
-        match self {
-            Self::Spawned(host) => {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(i32::try_from(host.id()).unwrap_or(-1)),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-            }
-            Self::Launchd { .. } => crate::launchd::terminate(paths),
         }
     }
 
@@ -78,15 +67,18 @@ impl Started {
 }
 
 /// A launchd start's end, from its job (`runs` when it was kicked): a run
-/// since then, not running now, whose exit code launchd kept. (One that
-/// ended well, a run at load that found nothing asked, isn't an end: the
-/// start goes on.)
+/// since then, not running now, whose exit code launchd kept. With `runs`
+/// unknown (`launchctl print` failed at the kick, F144), a run since is
+/// one that took this start's mark (`mark_taken`: only a host removes it).
+/// (One that ended well, a run at load that found nothing asked, isn't an
+/// end: the start goes on.)
 fn ended_in_launchd(
     runs: Option<u64>,
     job: crate::launchd::Job,
+    mark_taken: bool,
 ) -> Option<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt as _;
-    let since = runs.is_some_and(|runs| job.runs > runs);
+    let since = runs.map_or(mark_taken, |runs| job.runs > runs);
     let code = job.last_exit.filter(|&code| code != 0)?;
     (since && !job.running)
         .then(|| std::process::ExitStatus::from_raw(i32::try_from(code & 0xff).unwrap_or(1) << 8))
@@ -99,8 +91,8 @@ pub(super) fn start_host(paths: &VmPaths) -> Result<Started, VmError> {
         let runs = crate::launchd::job(paths).map(|job| job.runs);
         // A host runs already (booting): no mark, no kick, only the wait
         // (a mark it would never take would boot the VM at the next login).
-        if status(paths)? == Status::Stopped {
-            rotate_host_log(paths);
+        let marked = status(paths)? == Status::Stopped;
+        if marked {
             // Its host boots only when asked (else it takes itself for
             // launchd's run at load): the mark says the CLI asked.
             let mark = paths.start_asked();
@@ -110,18 +102,10 @@ pub(super) fn start_host(paths: &VmPaths) -> Result<Started, VmError> {
         return Ok(Started::Launchd {
             runs,
             kicked: Instant::now(),
+            marked,
         });
     }
     spawn_host(paths).map(Started::Spawned)
-}
-
-/// The host's log moved aside past [`HOST_LOG_KEPT`] (the host appends to
-/// it, as launchd does for its agent's).
-fn rotate_host_log(paths: &VmPaths) {
-    let log_path = paths.host_log();
-    if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > HOST_LOG_KEPT) {
-        let _ = std::fs::rename(&log_path, log_path.with_extension("log.1"));
-    }
 }
 
 /// Starts the host here: this binary again, in a session of its own (a
@@ -129,11 +113,12 @@ fn rotate_host_log(paths: &VmPaths) {
 /// caller's), with nothing the CLI inherited, its output to its log.
 fn spawn_host(paths: &VmPaths) -> Result<std::process::Child, VmError> {
     let exe = std::env::current_exe().map_err(|e| VmError::Host(format!("this binary: {e}")))?;
-    rotate_host_log(paths);
+    // (The host keeps its own log short: F106.)
     let log_path = paths.host_log();
     let log = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
+        .mode(0o600)
         .open(&log_path)
         .map_err(|e| VmError::io(&log_path, e))?;
     let err = log.try_clone().map_err(|e| VmError::io(&log_path, e))?;

@@ -9,8 +9,9 @@
 
 use std::fs::File;
 use std::io;
+use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,10 +19,16 @@ use std::time::{Duration, Instant};
 /// that ended has gone altogether.
 const HANG_UP_LOOK: Duration = Duration::from_secs(1);
 
+/// The longest a finite linger is drawn out by bytes still coming (F109):
+/// a direction still sending holds the relay this long past the other's
+/// end at most (or the linger, if that's longer).
+const LINGER_BOUND: Duration = Duration::from_secs(600);
+
 /// Relays `one` and `other` until both directions have ended. Once one
-/// has, the other has `linger` to end too, and is then cut (both sockets
-/// shut down): a peer that never closes its side (an idle pooled client
-/// whose server went) doesn't hold the relay for good. The caller ignores
+/// has, the other has `linger` from its last byte to end too (a side still
+/// sending isn't cut, for 10 minutes at most), and is then cut (both
+/// sockets shut down): a peer that never closes its side (an idle pooled
+/// client whose server went) doesn't hold the relay for good. The caller ignores
 /// `SIGPIPE` (Rust's default): a write to a gone peer is an `EPIPE` then,
 /// on macOS too, which has no `MSG_NOSIGNAL`.
 ///
@@ -72,19 +79,23 @@ pub struct Lingers {
 pub fn both_ways_lingering(one: OwnedFd, other: OwnedFd, lingers: Lingers) -> io::Result<Ended> {
     let ends = (one.as_raw_fd(), other.as_raw_fd());
     let ended = Arc::new((Mutex::new(0_u8), Condvar::new()));
+    let moved = Arc::new(Moved::new());
     let one_gone = Arc::new(AtomicBool::new(false));
     let (one_in, other_out) = (File::from(one.try_clone()?), File::from(other.try_clone()?));
-    let theirs = Arc::clone(&ended);
+    let theirs = (Arc::clone(&ended), Arc::clone(&moved));
     let gone = Arc::clone(&one_gone);
     let outward = std::thread::Builder::new().spawn(move || {
-        if copy_then_end(one_in, other_out, &theirs, ends, lingers.after_one) == Cut::PeerGone {
+        let (ended, moved) = theirs;
+        if copy_then_end(one_in, other_out, (&ended, &moved), ends, lingers.after_one)
+            == Cut::PeerGone
+        {
             gone.store(true, Ordering::Release);
         }
     })?;
     copy_then_end(
         File::from(other),
         File::from(one),
-        &ended,
+        (&ended, &moved),
         ends,
         lingers.after_other,
     );
@@ -105,8 +116,68 @@ enum Cut {
     PeerGone,
 }
 
+/// When a relay's bytes last moved, either way.
+struct Moved {
+    began: Instant,
+    /// Milliseconds after `began`.
+    last: AtomicU64,
+}
+
+impl Moved {
+    fn new() -> Self {
+        Self {
+            began: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Bytes moved now.
+    fn stamp(&self) {
+        let now = u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// When they last did.
+    fn last(&self) -> Instant {
+        self.began + Duration::from_millis(self.last.load(Ordering::Relaxed))
+    }
+}
+
+/// Copies `from` to `to` until `from`'s end (or a failure either side),
+/// each write stamped in `moved`. A read, then a write: never `io::copy`,
+/// whose `splice` on Linux can hold bytes back (AGENTS.md §10).
+fn copy_stamping(from: &mut File, to: &mut File, moved: &Moved) {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match from.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if to
+            .write_all(buffer.get(..read).unwrap_or_default())
+            .is_err()
+        {
+            return;
+        }
+        moved.stamp();
+    }
+}
+
+/// When a direction that has ended cuts the other, which `moved` last at
+/// `last`: `linger` after that, or after its own end (`ended_at`) if that's
+/// later; never past [`LINGER_BOUND`] (or `linger`, if longer) after its
+/// end. `None`: never (an unlimited linger).
+fn cut_at(ended_at: Instant, last: Instant, linger: Duration) -> Option<Instant> {
+    let from_last = last.max(ended_at).checked_add(linger)?;
+    let bound = ended_at.checked_add(linger.max(LINGER_BOUND))?;
+    Some(from_last.min(bound))
+}
+
 /// Copies `from` to `to`, half-closes `to`, then gives the other direction
-/// `linger` to end, and cuts both `ends` if it hasn't, or as soon as
+/// `linger` from its last byte ([`cut_at`]) to end, and cuts both `ends`
+/// if it hasn't, or as soon as
 /// `from`'s peer has gone altogether (11.7: a Docker client killed in a
 /// quiet `exec` on the Mac only ever reached the guest's service as a
 /// half-close, so its exec ran on and its relays stayed). The descriptors
@@ -115,11 +186,11 @@ enum Cut {
 fn copy_then_end(
     mut from: File,
     mut to: File,
-    ended: &(Mutex<u8>, Condvar),
+    (ended, moved): (&(Mutex<u8>, Condvar), &Moved),
     ends: (RawFd, RawFd),
     linger: Duration,
 ) -> Cut {
-    let _ = io::copy(&mut from, &mut to);
+    copy_stamping(&mut from, &mut to, moved);
     let (count, changed) = ended;
     let Ok(mut done) = count.lock() else {
         return Cut::No;
@@ -130,9 +201,11 @@ fn copy_then_end(
     let _ = nix::sys::socket::shutdown(to.as_raw_fd(), nix::sys::socket::Shutdown::Write);
     *done += 1;
     changed.notify_all();
-    // None: no limit (`Duration::MAX`).
-    let deadline = Instant::now().checked_add(linger);
+    let ended_at = Instant::now();
     while *done < 2 {
+        // Again each look: the other direction's bytes move it on. None: no
+        // limit (`Duration::MAX`).
+        let deadline = cut_at(ended_at, moved.last(), linger);
         let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if left == Some(Duration::ZERO) {
             cut(ends);
@@ -183,7 +256,6 @@ fn peer_gone(socket: BorrowedFd<'_>) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
-    use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
@@ -304,6 +376,61 @@ mod tests {
         client.read_to_end(&mut answer).unwrap();
         assert_eq!(answer, b"answer");
         relay.join().unwrap();
+    }
+
+    /// The cut comes a linger after the last byte, or the end if later, and
+    /// never past the bound; an unlimited linger never.
+    #[test]
+    fn the_cut_is_a_linger_after_the_last_byte_within_a_bound() {
+        let ended = Instant::now();
+        let linger = Duration::from_secs(60);
+        assert_eq!(cut_at(ended, ended, linger), Some(ended + linger));
+        let before = ended.checked_sub(Duration::from_secs(5)).unwrap();
+        assert_eq!(cut_at(ended, before, linger), Some(ended + linger));
+        let later = ended + Duration::from_secs(30);
+        assert_eq!(cut_at(ended, later, linger), Some(later + linger));
+        let much_later = ended + LINGER_BOUND;
+        assert_eq!(
+            cut_at(ended, much_later, linger),
+            Some(ended + LINGER_BOUND),
+            "bounded"
+        );
+        let long = LINGER_BOUND * 2;
+        assert_eq!(cut_at(ended, much_later, long), Some(ended + long));
+        assert_eq!(cut_at(ended, ended, Duration::MAX), None);
+    }
+
+    /// A side still sending after the other's end isn't cut while its bytes
+    /// keep coming within the linger (F109: a command's output past its
+    /// input's end), and is once they stop.
+    #[test]
+    fn a_side_still_sending_is_not_cut() {
+        let linger = Duration::from_secs(2);
+        let (mut client, mut server, relay) = relayed(linger);
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut nothing = Vec::new();
+        server.read_to_end(&mut nothing).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            got
+        });
+        // Past a linger and a half in all, a byte every eighth of one.
+        for _ in 0..12 {
+            server.write_all(b"x").unwrap();
+            std::thread::sleep(linger / 8);
+        }
+        assert!(!relay.is_finished(), "cut while bytes still came");
+        let began = Instant::now();
+        while !relay.is_finished() {
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "never cut once the bytes stopped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        relay.join().unwrap();
+        assert_eq!(reader.join().unwrap(), b"x".repeat(12));
     }
 
     /// One side gone and the other idle, open: the relay ends after the

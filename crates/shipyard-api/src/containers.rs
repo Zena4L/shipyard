@@ -120,10 +120,20 @@ pub(crate) async fn create(shared: &Arc<Shared>, query: &Query, body: Incoming) 
     let body: create::CreateBody = crate::read_json(body).await?;
     let mut create = create::request(&body, query.get("name"))?;
     create.request.pull = Some(image::PullPolicy::Never);
+    // `?platform=` (Docker's CLI sends its `--platform`): it must run here,
+    // and an image stored for another is "No such image", so the client
+    // pulls the one asked for (step 13.3).
+    create.request.platform = match query.get("platform").filter(|asked| !asked.is_empty()) {
+        None => None,
+        Some(asked) => Some(
+            image::platform_here(asked, "run").map_err(|error| ApiError::bad(error.to_string()))?,
+        ),
+    };
     let reference = create.request.image.clone().unwrap_or_default();
+    let platform = create.request.platform.clone();
     let (made, warnings) = shared
         .call(move |engine| {
-            if !image::stored(engine, &reference)? {
+            if !image::stored(engine, &reference, platform.as_ref())? {
                 return Ok(Err(reference));
             }
             run::create(engine, create.request, create.auto_remove).map(Ok)

@@ -387,21 +387,34 @@ to stage 15 (the notes' "moved out" table: F156–F162).
   credential handed to its VM's push or pull), `image inspect` / `history` / `save` /
   `load`, `import`/`export`.
 
-## 13. macOS production — stage 13
+## 13. macOS production — stage 13 (built)
 
 Decided 2026-10-15 (ROADMAP D29). Apple Silicon only.
 
-- **Rosetta:** amd64 images on Apple Silicon.
-- **Memory:** ballooning returns unused memory to macOS.
-- **Clock sync after sleep:** a small agent in the guest, over vsock.
-- **File sharing fast enough for real projects** (virtiofs, its caching tuned), and bind
-  mounts of macOS paths that just work.
-- **Ports and DNS** from macOS into the VM.
-- **Lifecycle:** the VM starts on first use and stops when idle.
-- **The Mac's `shipyard` over the API** (moved from stage 11, D11.5b-1): its commands
-  as API calls instead of forwarded argument lists, with Shipyard's own endpoints for what
-  Docker's API lacks.
-- **Entitlements and notarization** (`com.apple.security.virtualization`).
+- **Rosetta:** amd64 images on Apple Silicon, when asked (`--platform linux/amd64` on
+  `pull`, `run`, `create`, `build`) or when an image has no arm64 variant (pulled as amd64,
+  with a warning: D13-2).
+- **Memory:** the VM's size from the Mac's (a quarter of its memory, half its cores),
+  `vm set` to change it. The balloon was tried and not kept: macOS took nothing back
+  (D13.2-2, F168).
+- **Clock sync after sleep:** the host gives the guest the Mac's time with each look at
+  its ports, over vsock.
+- **File sharing:** the home, `/Volumes`, `/tmp` and `/var/folders`, at their own paths, so
+  bind mounts of macOS paths just work, and a bind outside them refused as Docker Desktop
+  refuses it. virtiofs as it is: nothing to tune (D13.4-2; OrbStack's speed with small
+  files not met, F172).
+- **Ports** from macOS into the VM: TCP and UDP on the Mac's loopback, dialled at each
+  container; the guest's own address answers none.
+- **Lifecycle:** the VM starts on first use and stops when idle; with `vm install
+  --at-login`, at login too while containers would come back.
+- **The Mac's `shipyard` forwarded, its wire fixed** (D13-1: the move onto the API, D11.5b-1,
+  is dropped; Docker's clients use the API, the Mac's `shipyard` runs the same `shipyard`
+  in the VM): signals, resizes and hang-ups on a channel of their own (F94), an older
+  guest's refusals said plainly (F167).
+- **Entitlements and signing** (`com.apple.security.virtualization`): a stable signing
+  identity across rebuilds (a self-signed certificate in the keychain), so macOS asks its
+  privacy questions once; Developer ID signing and notarization scripted, run at release in
+  stage 15 (D13-3).
 - **The macOS version floor:** macOS 13 Ventura (decided in step 10.3, D10.3-4: what
   Rosetta in Virtualization.framework needs).
 
