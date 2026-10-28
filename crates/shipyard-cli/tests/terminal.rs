@@ -1706,7 +1706,26 @@ fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
         session.expect("ready");
         // XOFF: the terminal stops taking output.
         session.type_keys(b"\x13");
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Waited for, never slept on (F193: under a full pass's load, 3 s
+        // weren't always enough): the small output's command ended (its
+        // `sh`, there since "ready", gone: its output held in buffers); the
+        // large one's writer blocked behind the stalled terminal (`tr`
+        // there, its bytes written no longer moving).
+        if ends == Status::Exited(0) {
+            wait_until(&format!("{bytes}: the command ends"), || {
+                descendants_named(shipyard, "sh").is_empty()
+            });
+        } else {
+            let mut last = None;
+            wait_until(&format!("{bytes}: the writer blocks"), || {
+                let written = descendants_named(shipyard, "tr")
+                    .first()
+                    .and_then(|tr| written_by(*tr));
+                let stuck = written.is_some_and(|now| now > 0 && last == Some(now));
+                last = written;
+                stuck
+            });
+        }
         // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the
         // job.
         unsafe { libc::kill(shipyard, libc::SIGTERM) };
@@ -1714,6 +1733,54 @@ fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
         // (The shell is done and its terminal closed: nothing to resume.)
         session.finish();
     }
+}
+
+/// Polls `done` every 300 ms until it holds, failing past 60 s with `what`.
+/// (No thread: this binary forks a shell that keeps running Rust.)
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// The PIDs of `root`'s descendants (each process's parent followed from
+/// `root`) whose name (`/proc/PID/comm`) is `name`.
+fn descendants_named(root: i32, name: &str) -> Vec<i32> {
+    let parents: Vec<(i32, i32)> = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(|pid| Some((pid, shipyard_sys::proc::stat(pid)?.ppid)))
+        .collect();
+    let mut tree = vec![root];
+    let mut at = 0;
+    while let Some(&parent) = tree.get(at) {
+        tree.extend(
+            parents
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        at += 1;
+    }
+    tree.into_iter()
+        .skip(1)
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() == name)
+        })
+        .collect()
+}
+
+/// The bytes process `pid` has written (`/proc/PID/io`'s `wchar`).
+fn written_by(pid: i32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("wchar: ")?.trim().parse().ok())
 }
 
 /// The size of [`a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request`]'s

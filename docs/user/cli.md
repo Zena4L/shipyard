@@ -804,7 +804,7 @@ Show objects in full, as JSON: a container, an image, a network or a volume, by 
   - `volume`:
     A volume
 
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 * `-s`, `--size` — Taken, as Docker's: Shipyard doesn't measure a container's size
 
 
@@ -1534,7 +1534,7 @@ Show containers in full, as JSON: Docker's shape (`inspect --type container`)
 ###### **Options:**
 
 * `--shipyard` — Shipyard's own view instead (its serial, its health history, its network's loss, the config as its record keeps it)
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 * `-s`, `--size` — Taken, as Docker's: Shipyard doesn't measure a container's size
 
 
@@ -1919,7 +1919,7 @@ Show images in full, as JSON: Docker's shape (`docker image inspect`'s)
 
 ###### **Options:**
 
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 
 
 
@@ -1934,7 +1934,7 @@ Manage named volumes
 * `create` — Create a named volume (one with a new name of its own without NAME; one that's there already is left as it is)
 * `ls` — List named volumes
 * `inspect` — Show a volume's details
-* `rm` — Remove one or more named volumes (never one a running container uses)
+* `rm` — Remove one or more named volumes (never one a container names, running or not)
 * `prune` — Remove every named volume no container uses, running or not (asks first)
 
 
@@ -1987,13 +1987,13 @@ Show a volume's details
 
 ###### **Options:**
 
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 
 
 
 ## `shipyard volume rm`
 
-Remove one or more named volumes (never one a running container uses)
+Remove one or more named volumes (never one a container names, running or not)
 
 **Usage:** `shipyard volume rm <VOLUME>...`
 
@@ -2089,7 +2089,7 @@ Show networks' details, and the containers on them, as JSON
 ###### **Options:**
 
 * `--shipyard` — Shipyard's own view instead (the containers on it by their leases, its bridge, its DNS server)
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 
 
 
@@ -2221,6 +2221,7 @@ Serve Docker's Engine API (a subset, version 1.43) on a UNIX socket, for Docker'
 ###### **Options:**
 
 * `--socket <PATH>` — The socket to listen on, when systemd passes none (by default api.sock in the containers' state directory: /run/shipyard for root, shipyard in the user's runtime directory for anyone else)
+* `--ensure` — Start the service in the background if nothing answers on its socket (as `shipyard compose` does), and exit once it answers: it runs on until it's idle. Refused for a socket in a directory that isn't yours alone
 
 
 
@@ -2339,7 +2340,7 @@ Show Shipyard's version and its host's (`--format` a Go template over `{Client, 
 
 ###### **Options:**
 
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 
 
 
@@ -2351,7 +2352,7 @@ Show what Shipyard has and what its host is (`--format` a Go template over Docke
 
 ###### **Options:**
 
-* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (a JSON array for `inspect`); `json`, as JSON; or a Go TEMPLATE over it (`{{.Name}}`, `{{json .Config}}`), a line each
+* `-f`, `--format <FORMAT>` — How to show it: as Docker's command does without it (`inspect`: a JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json .Config}}`)
 
 
 

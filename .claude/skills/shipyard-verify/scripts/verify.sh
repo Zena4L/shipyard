@@ -3,8 +3,10 @@
 #
 #   verify.sh            everything: macOS, then Linux (both test passes, then
 #                        rustdoc and the clippy targets the passes don't run)
-#   verify.sh --mac      fmt, clippy, the macOS suite, cargo deny
-#   verify.sh --linux    the Linux half only
+#   verify.sh --mac      fmt, clippy, the macOS suite, cargo deny, signing,
+#                        the desktop app (page, shell, WebKit, the .app bundle)
+#   verify.sh --linux    the Linux half only (and the desktop app on Linux,
+#                        driven in the desktop image: scripts/desktop-linux.sh)
 #   verify.sh --vm       the macOS VM's: the guest built from this tree, then
 #                        the VM tests (each boots a VM; four at once)
 #
@@ -68,6 +70,25 @@ if [ "$mode" != --linux ] && [ "$mode" != --vm ]; then
     if [ "$(uname)" = Darwin ]; then
         run "signing (macOS)" "$logs/sign.log" bash -c \
             'cargo build -p shipyard-cli --bins && scripts/macos/test-sign.sh target/debug/shipyard target/debug/shipyard-runtime'
+        # The desktop app (stage 14): its page (installed with no package's
+        # scripts run, typed, tested, built; no markup from strings), and its
+        # Tauri shell, a workspace of its own (D14.2-1).
+        run "desktop: page" "$logs/desktop-ui.log" bash -c \
+            'cd desktop/ui && npm ci --no-audit --no-fund && npm run check && npm test && npm run build &&
+             ! grep -rnE "\{@html|innerHTML|outerHTML|insertAdjacentHTML" src'
+        run "desktop: shell" "$logs/desktop-shell.log" bash -c \
+            'cd desktop && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings &&
+             cargo test && cargo deny check && ../.claude/skills/shipyard-verify/scripts/client-versions.py'
+        # The page in WebKit (as the Mac's window draws it): the design's mock,
+        # pixel for pixel, and the built page under the release CSP.
+        run "desktop: in WebKit" "$logs/desktop-visual.log" bash -c \
+            'cd desktop/ui && npx playwright install webkit && timeout 600 npm run visual'
+        # The Mac's app bundle (step 14.7): built, signed by the local
+        # identity's rule, and whole.
+        run "desktop: the app bundle" "$logs/desktop-bundle.log" bash -c \
+            'cd desktop/ui && timeout 1800 npm run tauri -- build --bundles app &&
+             cd ../.. && app=desktop/target/release/bundle/macos/Shipyard.app &&
+             scripts/macos/sign.sh --bundle "$app" && codesign --verify --deep --strict "$app"'
     fi
 fi
 
@@ -77,6 +98,8 @@ if [ "$mode" = --all ] || [ "$mode" = --linux ]; then
     summary+=("        tests (Linux, both passes): $(totals "$logs/test-linux.log")")
     run "Linux: rustdoc, clippy glibc + musl" "$logs/linux-lints.log" \
         timeout 3000 "$here/run-in-linux.sh" root "$here/linux-lints.sh"
+    # The desktop app on Linux (step 14.7): WebKitGTK, rootless, driven.
+    run "desktop: on Linux" "$logs/desktop-linux.log" timeout 3600 scripts/desktop-linux.sh
 fi
 
 if [ "$mode" = --vm ] || { [ "$mode" = --all ] && [ "$(uname)" = Darwin ]; }; then

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-volumes"
+description = "Enables the volumes command without any pre-configured scope."
+commands.allow = ["volumes"]
+
+[[permission]]
+identifier = "deny-volumes"
+description = "Denies the volumes command without any pre-configured scope."
+commands.deny = ["volumes"]

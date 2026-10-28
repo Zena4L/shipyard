@@ -1,0 +1,5 @@
+# The main workspace's toolchain, so the client crate it shares builds alike.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -158,3 +158,18 @@ pub(crate) mod testing {
         (engine, collect, parent)
     }
 }
+
+/// What the fuzz targets drive (`#[cfg(fuzzing)]`: compiled by the fuzz
+/// build alone).
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    /// A compose `depends_on` label's entries, each its service and its
+    /// condition, as the map's declared links read them.
+    #[must_use]
+    pub fn depends_on(label: &str) -> Vec<(String, String)> {
+        crate::containers::links::parse_depends_on(label)
+            .into_iter()
+            .map(|depends| (depends.service, depends.condition))
+            .collect()
+    }
+}

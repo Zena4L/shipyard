@@ -255,8 +255,8 @@ using: it waits for them, up to 15 seconds, then says the store is busy.
 how much of each nothing uses now (reclaimable), as Docker's: `TOTAL` how many,
 `ACTIVE` how many are in use (images a container's layers use, containers
 running, volumes a container names). A stopped container's layer counts in `SIZE`,
-not as reclaimable (as Docker's: `rm`, or a `container prune`, reclaims it). There's no `Build Cache` row:
-Shipyard builds no images yet.
+not as reclaimable (as Docker's: `rm`, or a `container prune`, reclaims it). The
+`Build Cache` row is the builds' kept state (see below).
 
 ```text
 TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE

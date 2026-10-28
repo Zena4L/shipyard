@@ -1104,6 +1104,24 @@ pub fn remove_monitor_cgroup(id: &str) {
     }
 }
 
+/// The most of a cgroup's `memory.current` read (a number and a newline).
+const MEMORY_CURRENT_MAX: u64 = 64;
+
+/// The memory container `id`'s monitor uses (its cgroup's
+/// `memory.current`, bytes): none without a tree, or a cgroup of its own.
+#[must_use]
+pub fn monitor_memory(id: &str) -> Option<u64> {
+    let tree = cgroup::Tree::find().ok()?;
+    memory_current(&tree.base().join(cgroup::monitor_cgroup(id)))
+}
+
+/// The cgroup at `dir`'s `memory.current`, bytes, read with a bound.
+fn memory_current(dir: &Path) -> Option<u64> {
+    let bytes =
+        shipyard_sys::fs::read_bounded(&dir.join("memory.current"), MEMORY_CURRENT_MAX).ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+}
+
 /// The descriptor limit this process had before
 /// [`raise_own_descriptor_limit`] raised it: every monitor started here gets
 /// it back, so its container (and its exit command's restarts) has the
@@ -1924,6 +1942,29 @@ pub fn peek_init(root: &Path, id: &str) -> Result<Option<(i32, u64)>> {
     Ok(read_record(&dir)?.and_then(|record| record.init))
 }
 
+/// What container `id`'s cgroup has used, read without taking its lock
+/// (as [`peek_init`]: a `start`, `delete` or `exec` holding it never holds
+/// this up): `None` if it has no record yet, no such container, or its
+/// cgroup went as it was read (ended meanwhile).
+///
+/// # Errors
+///
+/// Its state can't be read; it has no cgroup of its own.
+pub fn peek_stats(root: &Path, id: &str) -> Result<Option<crate::cgroup::Stats>> {
+    let dir = match existing(root, id) {
+        Ok(dir) => dir,
+        Err(ContainerError::NotFound(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(record) = read_record(&dir)? else {
+        return Ok(None);
+    };
+    let cgroup = cgroup_of(id, Some(&record))?;
+    let stats = cgroup.stats();
+    // A cgroup that went reads as zeros: none.
+    Ok(cgroup.path().exists().then_some(stats))
+}
+
 /// Container `id`'s monitor's PID and start time, as its state records
 /// them, read without taking its lock (as [`peek_init`]): `None` if it has
 /// none (or no such container). Each start has a monitor of its own: what
@@ -2576,6 +2617,22 @@ fn signal_process(pid: i32, started: u64, signal: libc::c_int) -> nix::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cgroup's memory is its `memory.current`; one gone (or a file
+    /// past the bound) is none.
+    #[test]
+    fn a_cgroup_s_memory_is_its_memory_current() {
+        let dir = std::env::temp_dir().join(format!("shipyard-memory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), "1234\n").unwrap();
+        assert_eq!(memory_current(&dir), Some(1234));
+        // A number padded past the bound: refused, never read whole.
+        std::fs::write(dir.join("memory.current"), format!("5{}", " ".repeat(100))).unwrap();
+        assert_eq!(memory_current(&dir), None);
+        assert_eq!(memory_current(&dir.join("gone")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Only where pidfds can't be had does a signal go by number (F110):
     /// running out of descriptors, or the process gone, is the signal's

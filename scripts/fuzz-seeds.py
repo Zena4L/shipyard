@@ -286,6 +286,17 @@ UDP_FRAMES = {
 }
 
 
+# Compose's `depends_on` labels (step 14.1a), as compose 5.5 writes them.
+COMPOSE_LABELS = {
+    "none": "",
+    "one": "db:service_started:false",
+    "several": "db:service_healthy:true,cache:service_started:false,job:service_completed_successfully:false",
+    "four-fields": "db:service_started:false:true",
+    "bare": "db",
+    "odd": " ,:,::,db:,:x",
+}
+
+
 def write(directory, name, data):
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, name), "wb") as out:
@@ -520,6 +531,8 @@ def main():
         write(f"{root}/api_request", name, request)
     for name, archive in archive_seeds():
         write(f"{root}/load_archive", name, archive)
+    for name, label in COMPOSE_LABELS.items():
+        write(f"{root}/compose_labels", name, label.encode())
     for name, changes in IMPORT_CHANGES.items():
         write(f"{root}/import_change", name, changes.encode())
 

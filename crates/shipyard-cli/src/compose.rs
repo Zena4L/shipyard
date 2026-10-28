@@ -52,21 +52,36 @@ fn served_socket() -> Result<PathBuf> {
 fn served_socket() -> Result<PathBuf> {
     let engine = crate::reporter::engine();
     let socket = engine.paths().api_socket()?;
-    // Compose's project, its variables and a registry's credentials go to
-    // whatever answers there: never through a directory another user can
-    // change (one not there yet, the service makes as its own).
-    if let Some(dir) = socket.parent()
-        && let Ok(Some(why)) = shipyard_sys::fs::unsafe_dir(dir)
-    {
-        anyhow::bail!(
-            "the API's socket's directory {} isn't yours alone: {why}",
-            dir.display()
-        );
-    }
-    // (Left to run on: after the `exec`, it's compose's child, and ends
-    // once idle.)
-    let _service = shipyard_engine::api_service::ensure(&socket, &|| service(&socket))?;
+    ensure_served(&socket)?;
     Ok(socket)
+}
+
+/// Makes sure something serves `socket`: `shipyard system service` started
+/// if nothing answers (the engine's rule), left to run on to its idle end
+/// (after compose's `exec` it's compose's child; after `system service
+/// --ensure`, no one's: its own process group). What's sent there (compose's
+/// project, its variables, a registry's credentials) goes to whatever
+/// answers: never through a directory another user can change (one not
+/// there yet, the service makes as its own).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ensure_served(socket: &Path) -> Result<()> {
+    if let Some(dir) = socket.parent() {
+        match shipyard_sys::fs::unsafe_dir(dir) {
+            Ok(Some(why)) => anyhow::bail!(
+                "the API's socket's directory {} isn't yours alone: {why}",
+                dir.display()
+            ),
+            // Not there yet: the service makes it, as its own.
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => anyhow::bail!(
+                "the API's socket's directory {} can't be checked: {error}",
+                dir.display()
+            ),
+        }
+    }
+    let _service = shipyard_engine::api_service::ensure(socket, &|| service(socket))?;
+    Ok(())
 }
 
 /// Becomes `docker compose ARGS` against `socket`: returns only its

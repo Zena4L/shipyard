@@ -24,8 +24,9 @@ sudo shipyard run --network front --network back alpine:3.20 ip addr   # two net
 > the internet, and you can publish their ports. Without root, each container
 > gets its own network through pasta: a way out and published ports, but no
 > networks shared with others (one can join another's: `--network container:NAME`). A network made with `--ipv6`
-> gives its containers IPv6 too; pasta gives them the host's IPv6. Networking
-> isn't available on macOS yet.
+> gives its containers IPv6 too; pasta gives them the host's IPv6. On a Mac,
+> networks are the Linux VM's (its commands run as root there: bridge networks), and
+> published ports answer on the Mac's `localhost` ([macOS](macos.md)).
 
 ## Rootless containers: pasta
 

@@ -55,12 +55,14 @@ A network a stopped container still names is removed by `down`, as Docker's is (
 
 ## Not yet
 
-- **`build`:** images are built in a later stage; use `image:`.
+- **`build`:** the API doesn't serve `docker build`, so compose can't build a service's
+  image: build it with `shipyard build -t NAME .` and give it as `image:`.
 - **Rootless, a project's network:** a normal user's Shipyard has no shared networks,
   so a rootless project's services need `network_mode: none` (or `host`, `pasta`, or
   `service:NAME`, another service's), and can't reach each other by name. (`ipc:
   "service:NAME"` shares another service's IPC namespace and `/dev/shm`, root and
   rootless.)
 - **On a Mac:** `shipyard compose` runs against the Mac's `docker.sock` (the VM's API),
-  started as `vm start` starts it: a project's binds must be under your home, as any
-  `docker run -v` there ([macOS](macos.md)).
+  started as `vm start` starts it: a project's binds must be in a place the VM shares
+  (the home, `/Volumes`, `/tmp`, `/var/folders`), as any `docker run -v` there
+  ([macOS](macos.md)).

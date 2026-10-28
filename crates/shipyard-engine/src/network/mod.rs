@@ -42,7 +42,7 @@ pub(crate) use dns_server::{IDLE_ENV as DNS_IDLE_ENV, UPSTREAM_ENV as DNS_UPSTRE
 pub(crate) use firewall::describe_conflict;
 #[cfg(target_os = "linux")]
 pub(crate) use live::{
-    Joining, check_bridge, connect_live, container_addresses, container_leases, disconnect_live,
+    Joining, check_bridge, connect_live, container_leases, disconnect_live, lease_owners,
     next_interface, way_out,
 };
 pub use lost::{NetworkLost, pasta_lost};

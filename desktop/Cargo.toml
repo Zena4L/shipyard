@@ -1,0 +1,40 @@
+# The desktop app (stage 14, D14.2-1): a workspace of its own, kept out of
+# the main one (Tauri needs WebKitGTK on Linux, which the test container
+# doesn't have). Its logic is `crates/shipyard-client`, tested there; this
+# is the window around it.
+[workspace]
+resolver = "3"
+members = ["src-tauri"]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Zena4L/shipyard"
+authors = ["Clement Owireku-Bogyah"]
+publish = false
+
+# The main workspace's lints, kept the same.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+missing_errors_doc = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+allow_attributes_without_reason = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

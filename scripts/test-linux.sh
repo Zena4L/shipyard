@@ -205,7 +205,9 @@ case "$MODE" in
         # /target/fuzz.
         as_tester bash -c '
             set -euo pipefail
-            rustup toolchain install nightly --profile minimal >/dev/null
+            # Installed once: asked again, rustup fetches the channel each time.
+            rustup toolchain list | grep -q "^nightly" \
+                || rustup toolchain install nightly --profile minimal >/dev/null
             [ -x "$CARGO_HOME/bin/cargo-fuzz" ] || cargo install --locked cargo-fuzz
             python3 scripts/fuzz-seeds.py /target/fuzz/corpus
             # cargo-fuzz writes beside its crate, and /src is read-only: a

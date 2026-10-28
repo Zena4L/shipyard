@@ -5,6 +5,116 @@ All notable changes to Shipyard. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change
 behaviour; each change is listed here).
 
+## Unreleased (stage 14)
+
+### Added
+
+- **The data of the desktop UI's map, in the API** (step 14.1a): `GET /shipyard/links`,
+  every container with the links compose declares (`depends_on`, and whether its
+  condition is met) and the connections seen between containers (root's networks; said
+  unavailable rootless), and the ports they publish; `GET /shipyard/containers/{id}/sockets`,
+  a container's sockets with each connection's peer.
+- **The desktop app's first window, on a Mac** (step 14.2, [desktop](docs/user/desktop.md)):
+  a Tauri app, run from the source tree for now, that starts Shipyard's VM when it opens
+  (a setting turns that off), lists your containers in the design's Manifest view and
+  keeps the list current from Shipyard's events, counts images, volumes and networks,
+  and lets go of its connections while its window is hidden, so the VM's idle stop can
+  come. A client crate of its own (`shipyard-client`) reaches the API on the Mac and on
+  Linux. Its page is checked against the design's mock pixel for pixel, light and dark,
+  and loaded under its release content security policy in the checks.
+
+- **The desktop app's Map** (step 14.3, [desktop](docs/user/desktop.md)): containers
+  laid out by what depends on what from the ports they publish; declared, undeclared
+  (observed) and refused links; live traffic as moving dots (the links read every 2 s
+  while shown); network and volume overlays; degraded and affected containers, with a
+  Start button for what's stopped; each compose project's start order; hover traces,
+  click selects. The map is the design's, pixel for pixel. `GET /shipyard/links` says
+  each published port's open connections from outside (`entries[].connections`).
+
+- **A container's isolation and the volumes' sizes, in the API** (step 14.1b, [API](docs/user/api.md)):
+  `GET /shipyard/containers/{id}/isolation`, a running container's namespaces (each its
+  own or the host's), cgroup, command (with its host PID, beside its init's) and user
+  mapping, as the kernel has them; `GET /shipyard/volumes`, every volume's size (a bounded
+  walk, said "at least" past its bounds) and its top-level files.
+
+- **The desktop app's Yard and inspector** (step 14.4a, [desktop](docs/user/desktop.md)):
+  compose projects as bays under the crane; for the selected container, what it needs and
+  what needs it, what a stop would do, the `depends_on` lines to copy for a connection its
+  compose file doesn't declare, what's attached, live CPU and memory (Docker's stats, its
+  numbers as Docker's CLI computes them), its isolation and ports. Both are the design's,
+  pixel for pixel.
+
+- **The desktop app's actions and Run image sheet** (step 14.4b, [desktop](docs/user/desktop.md)):
+  Start, Stop, Pause, Resume, Restart and Remove in the inspector, each with its
+  `shipyard` command as its tooltip; Remove confirmed inline (a running container stopped
+  first), greyed out while running containers need it; the Run image sheet (image, name,
+  memory limit, port, its `shipyard run -d …` as you type) pulls what Shipyard lacks, runs it
+  detached and selects it. The page sends only these fields: the app builds the container.
+
+- **The desktop app's console** (step 14.5, [desktop](docs/user/desktop.md)): the selected
+  container's logs (its last 500 lines, then followed, as text with escape sequences taken
+  out) and a shell in it on a real terminal (xterm.js on `shipyard exec -it NAME sh`: Tab,
+  Ctrl-C, full-screen programs, resized with the dock), docked under the Yard section, as
+  the design draws it. The window keeps its strict CSP: xterm's styles become constructed
+  stylesheets.
+- **The desktop app's Images section** (step 14.6a, [desktop](docs/user/desktop.md)): every
+  image as a strip of its layers (a layer is its digest: stored once, however many images have
+  it), families of a shared base coloured alike, what's on disk and what sharing saves, a
+  hovered layer lit everywhere with its step and sharers; an image's inspector with Run and
+  Remove, and "Remove N unused" (the images it lists, tag by tag, never forced: Shipyard
+  refuses one a container uses); the map's Images overlay. As the design draws it.
+- **The desktop app's Volumes and Networks sections** (step 14.6b, [desktop](docs/user/desktop.md)):
+  each volume as a drum filled by its size, who mounts it and who can write, its place and top
+  level; Delete and "Delete N unused" (by name, never forced: Shipyard refuses a volume any
+  container names); each bridge network as a bus from its gateway to its containers, with
+  their addresses and the host's end of each veth pair, the containers that join two
+  networks, and its way out. The map's and inspector's volumes and networks open them. As the
+  design draws it. `GET /shipyard/networks/{name}` says its `version` (1).
+- **The desktop app on Linux** (step 14.7, [desktop](docs/user/desktop.md)): built and run
+  with WebKitGTK; it shows the user's own (rootless) containers, and starts the API's service
+  itself when nothing answers (`shipyard system service --ensure`, new: what `shipyard
+  compose` does, then exits once the service answers). The rail says root's containers
+  aren't shown. On a Mac, `Shipyard.app` built and signed with the local identity
+  (`scripts/macos/sign.sh --bundle`).
+- **The desktop app's live numbers** (step 14.8a2, [desktop](docs/user/desktop.md)): the
+  Manifest's CPU and memory for each running container, the rail's memory in use and the
+  status bar's monitors' memory, read every 2 seconds while the window is seen (they were
+  drawn only in the design's preview until now). `GET /shipyard/usage` (version 1, new):
+  the host's memory and CPU time, each running container's CPU time and memory and its
+  monitor's, as counters.
+### Changed
+
+- **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
+  the old one can no longer be installed).
+
+### Fixed
+
+- **On a Mac, `stats` said 0B of memory for every container** (since stage 10): the VM's
+  guest has no systemd, so nothing turned on the memory and CPU controllers at its cgroup
+  root, and Shipyard's cgroups below had only `pids`. The guest's PID 1 now turns on CPU,
+  I/O, memory and processes at boot, as a host's systemd does; containers' and monitors'
+  memory is counted (`stats`, the desktop app's live numbers). Found by the stage-14 close's
+  check of `/shipyard/usage` in the VM.
+- **The desktop app's window was blank** (since step 14.5): Tauri's `freezePrototype` froze
+  `Object.prototype` before the page's scripts, and the Shell tab's terminal (xterm.js)
+  can't load then. It's off; the page's CSP test runs the built page under the window's own
+  settings. Found by trying the built app (step 14.7).
+- **The desktop app's Images caption flickered under the pointer:** a lit layer's two-line
+  caption was taller than its place, pushed the rows from under the pointer, unlit the layer
+  and came back. It keeps one height, each line cut with "…" (the step whole in its tooltip).
+- **Rootless, an `exec` failed when run with a lower hard limit than its container started
+  with** ("setting resource limit rttime=…: Operation not permitted"): a service started
+  under a desktop session's limits failed every `exec`, the app's Shell and `docker exec`
+  through it alike. An exec keeps to its own hard limit where it can't raise one, never
+  above the container's. Found by the desktop app's Linux test (step 14.7).
+- **The desktop app showed Tauri's own icon** (the template's): it has Shipyard's, the design's
+  brand mark (`desktop/src-tauri/icons/shipyard.svg`, every size made from it).
+- **The desktop app's map said "All 0 active links healthy"** with no links at all: it says
+  there are none yet, and what makes a container drawn.
+- **The API's image inspect leaves `Created` out when an image doesn't say when it was
+  built**, as Docker's does: it said `""`, and a client that parses the date (the desktop
+  app's) refused the whole answer.
+
 ## 0.5.0 - unreleased
 
 ### Added

@@ -33,7 +33,10 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > from Dockerfiles by BuildKit (`shipyard build`, in a container of its own per build),
 > **pushed** to a registry (`push`, after `login`), **saved** and **loaded** as archives
 > Docker reads too (`save`, `load`), made from a filesystem (`import`, `export`), and
-> their layers shown (`history`).
+> their layers shown (`history`). A **desktop app** ([desktop](desktop.md)) shows it all,
+> live: a map of which containers talk to which (declared in compose, or seen in their
+> sockets), each container's inspector, logs and shell, and the images, volumes and
+> networks.
 > It isn't a hardened boundary yet. It starts the command the way a container
 > runtime does (clean environment, chosen user, working directory and
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
@@ -45,6 +48,7 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 
 | Page | What it covers |
 |---|---|
+| [The desktop app](desktop.md) | Shipyard's window on a Mac and on Linux: your containers live on a map of who talks to whom, the Yard and the Manifest, each one's inspector, logs and shell; images, volumes and networks; the VM or the service started for you |
 | [macOS](macos.md) | Shipyard on a Mac: its Linux VM, your files, input, signals and variables |
 | [Running commands](run.md) | `shipyard run`: isolation, environment, users, working directory, resource limits, stopping |
 | [Containers](containers.md) | `run -d`, `create`, `start`, `ps`, `inspect`, `rm`: containers that outlive the command, by name, ID or serial; their kept files |
@@ -234,6 +238,9 @@ the host's name. Both take `--format`: a Go template over Docker's objects
   `shipyard` signed by `scripts/macos/sign.sh`. The VM keeps the memory it was given, and
   small files on a share are slower than OrbStack's
   ([macOS](macos.md#limits-this-version)).
+- **The desktop app is built from the source tree** (no installer yet), and on Linux shows
+  your own (rootless) containers: root's are the CLI's (`sudo shipyard …`), and rootless
+  connections between containers aren't seen on its map ([desktop](desktop.md)).
 - **Rootless containers have no shared networks:** each gets its own (pasta); bridge
   networks, and names between containers, are root's
   (see [Networking](networking.md#rootless-containers-pasta)).

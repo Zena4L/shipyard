@@ -20,9 +20,9 @@ mod image;
 mod inspect;
 mod network;
 #[cfg(target_os = "linux")]
-mod proc;
+pub(crate) mod proc;
 mod standing;
-mod stats;
+pub(crate) mod stats;
 mod summary;
 mod system;
 mod top;

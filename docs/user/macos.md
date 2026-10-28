@@ -214,9 +214,11 @@ reaches every image and volume: give those only to containers you trust with the
 VM and every share.
 
 **The folders macOS guards** (Desktop, Documents, Downloads, iCloud Drive) are read by
-the VM only with your permission. A VM started from your terminal has the terminal's.
-One that launchd started (`shipyard vm install`) asks for its own the first time it
-reads one. Until you allow it, a command run from one of those folders, or a bind of
+the VM only with your permission. A VM started from your terminal has the terminal's;
+one the desktop app started has the app's (Shipyard, which macOS asks about once it's
+signed with your local identity): grant the one that started the VM that's running. One
+that launchd started (`shipyard vm install`) asks for its own the first time it reads
+one. Until you allow it, a command run from one of those folders, or a bind of
 one, is refused and the refusal names the folder:
 `macOS hasn't let the VM read /Users/you/Desktop: allow shipyard in System Settings →
 Privacy & Security → Files and Folders`. External and network drives under `/Volumes`

@@ -420,11 +420,20 @@ Decided 2026-10-15 (ROADMAP D29). Apple Silicon only.
 
 ## 14. Desktop UI — stage 14
 
+Built ([notes](stages/14-ui.md)): the map, the Yard, the Manifest and each container's
+inspector with its actions, logs and shell; Images, Volumes and Networks; the live numbers;
+on a Mac and on Linux. Each container's rx/tx rate on the map and an installer moved to
+stage 15.
+
 - **Built on the stage 11 API.** The spec is [`design/README.md`](design/README.md), with
   an interactive mock in [`design/shipyard-ui.html`](design/shipyard-ui.html).
 - **The observed-traffic map first:** dependencies seen in containers' sockets, declared
   or not, the feature no other engine has.
-- **Likely built with Tauri:** Rust core, small binaries.
+- **Built with Tauri 2 and Svelte** (D14-1, D14-3): a Rust core that's a client of the API
+  (D14-6), small binaries; macOS first, Linux by the stage's close (D14-2).
+- **Declared links from compose's own label** (`com.docker.compose.depends_on`); observed
+  ones from each container's socket tables, polled (D14-5); the fix for an undeclared one
+  is the YAML to copy (D14-4).
 
 ## 15. CLI — grows with every stage
 

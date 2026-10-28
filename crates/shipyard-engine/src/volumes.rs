@@ -5,6 +5,10 @@
 //! `volumes/` subtree. These back `shipyard volume create/ls/inspect/
 //! rm/prune` and `system df`.
 
+mod listing;
+
+pub use listing::{VOLUMES_VERSION, VolumeContent, VolumeContents, VolumeFile, contents};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -596,12 +600,13 @@ mod tests {
             .unwrap();
         lock.lock().unwrap();
         let held = std::time::Duration::from_millis(300);
-        let pruning = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
-            let pruned = prune(&engine);
-            (pruned, began.elapsed())
-        });
+        // One clock for both, started before the prune's thread: started in
+        // it, it would start late and measure a held lock as a moment short.
         let letting_go = std::time::Instant::now();
+        let pruning = std::thread::spawn(move || {
+            let pruned = prune(&engine);
+            (pruned, letting_go.elapsed())
+        });
         while letting_go.elapsed() < held {
             std::thread::yield_now();
         }

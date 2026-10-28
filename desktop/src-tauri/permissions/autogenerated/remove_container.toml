@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remove-container"
+description = "Enables the remove_container command without any pre-configured scope."
+commands.allow = ["remove_container"]
+
+[[permission]]
+identifier = "deny-remove-container"
+description = "Denies the remove_container command without any pre-configured scope."
+commands.deny = ["remove_container"]

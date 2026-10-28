@@ -7,7 +7,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 echo "== shipyard, static (musl)"
-command -v musl-gcc >/dev/null || { apt-get update -qq && apt-get install -y -qq musl-tools >/dev/null; }
+# (apt over IPv4 alone: the mirror answers on IPv6 first, and Docker's VM
+# may have no IPv6 route; its tries there time out.)
+apt=(apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=30 -o Acquire::http::Timeout=5)
+command -v musl-gcc >/dev/null || { "${apt[@]}" update -qq && "${apt[@]}" install -y -qq musl-tools >/dev/null; }
 rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1
 CC_aarch64_unknown_linux_musl=musl-gcc cargo build --locked --release -q \
     --target aarch64-unknown-linux-musl -p shipyard-cli --bin shipyard

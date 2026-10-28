@@ -284,15 +284,13 @@ fn operating_system() -> String {
 /// The host's memory in bytes (`/proc/meminfo`'s `MemTotal`), 0 if it
 /// can't be read.
 pub(crate) fn mem_total() -> u64 {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                let kib = line.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?;
-                kib.trim().parse::<u64>().ok()?.checked_mul(1024)
-            })
-        })
-        .unwrap_or(0)
+    shipyard_sys::fs::read_bounded(
+        std::path::Path::new("/proc/meminfo"),
+        crate::containers::usage::PROC_MAX,
+    )
+    .map_or(0, |bytes| {
+        crate::containers::usage::meminfo(&String::from_utf8_lossy(&bytes)).total
+    })
 }
 
 #[cfg(test)]
