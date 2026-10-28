@@ -17,4 +17,4 @@ PACKAGES="e2fsprogs=1.47.4-r0"
 # version's: 6.12.114 crashed as 6.18.58 does, with several VMs at once
 # (step 11.5a).
 KERNEL_BRANCH=$ALPINE_BRANCH
-KERNEL_PACKAGE="linux-virt=6.18.58-r0"
+KERNEL_PACKAGE="linux-virt=6.18.59-r0"

@@ -381,7 +381,7 @@ fn host_word(digits: &str) -> Result<[u8; 4], &'static str> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{listening, sockets};
+pub use linux::{listening, namespace, own_namespace, sockets, sockets_where};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -405,12 +405,46 @@ mod linux {
     /// namespaces' tables; and a process that's gone by the end of the read
     /// is [`Gone`](ObserveError::Gone), never an empty or partial answer.
     pub fn sockets(pid: i32) -> Result<Vec<Socket>, ObserveError> {
-        let mut sockets = read_all(pid, |_| true)?;
+        sockets_where(pid, |_| true)
+    }
+
+    /// [`sockets`], those `keep` keeps alone, as the tables are read (a
+    /// namespace with many sockets costs only what's kept).
+    pub fn sockets_where(
+        pid: i32,
+        keep: impl Fn(&Socket) -> bool + Copy,
+    ) -> Result<Vec<Socket>, ObserveError> {
+        let mut sockets = read_all(pid, keep)?;
         // A table changing as it's read can list a socket twice. (Those
         // without a socket file, inode 0, can't be told apart: kept.)
         let mut seen = HashSet::new();
         sockets.retain(|socket| socket.inode == 0 || seen.insert((socket.protocol, socket.inode)));
         Ok(sockets)
+    }
+
+    /// The network namespace process `pid` is in, by its inode
+    /// (`/proc/<pid>/ns/net`): two processes in one have the same. The PID
+    /// isn't held: a caller that must know it's still the same process
+    /// checks after (its start time).
+    pub fn namespace(pid: i32) -> Result<u64, ObserveError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = format!("/proc/{pid}/ns/net");
+        std::fs::metadata(&path)
+            .map(|metadata| metadata.ino())
+            .map_err(|error| {
+                let errno = Errno::from_raw(error.raw_os_error().unwrap_or(libc::EIO));
+                missing(pid, &path, errno)
+            })
+    }
+
+    /// This process's own network namespace, as [`namespace`] says it.
+    ///
+    /// # Errors
+    ///
+    /// `/proc/self/ns/net` can't be read.
+    pub fn own_namespace() -> std::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata("/proc/self/ns/net").map(|metadata| metadata.ino())
     }
 
     /// The sockets of process `pid`'s network namespace that wait for

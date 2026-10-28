@@ -4,9 +4,10 @@ A volume is persistent storage a container mounts. Unlike the container's own
 writable layer — which is thrown away when the container is removed — a volume's
 contents outlive the container.
 
-> **Status:** named volumes and the `--volume` flag work on Linux (mounting into
-> a container needs a root filesystem, so use them with an image or `--rootfs`).
-> The `volume` commands manage directories and work on macOS and Linux.
+> **Status:** named volumes and the `--volume` flag work on Linux and, through
+> Shipyard's Linux VM, on a Mac, where a bind's source must be in a place the VM
+> shares ([macOS](macos.md)). Mounting into a container needs a root filesystem, so
+> use them with an image or `--rootfs`.
 
 ## Named volumes
 
@@ -185,8 +186,9 @@ and left in the container's own layer; an image declaring more than 128 is
 refused. The container keeps the same volumes across its starts; `inspect`
 shows them in `Binds` and `Mounts`.
 
-A plain `rm` keeps them, as Docker's: `volume prune` takes them later (it takes
-only anonymous volumes unless `--all`). `rm -v` removes the anonymous volumes the
+A plain `rm` keeps them, as Docker's: `volume prune` takes them later (`shipyard
+volume prune` takes every volume no container names, as older Docker did; the API's
+`docker volume prune` takes only anonymous ones unless `--all`, as Docker's since 1.42). `rm -v` removes the anonymous volumes the
 container's create made, each that no other container names. A volume it was
 given by name (`-v NAME:/path`), a named one or another's anonymous one, is
 never removed with it, as Docker keeps it. A container run with `--rm` takes its
@@ -195,5 +197,5 @@ anonymous volumes when it goes. A create that fails removes the ones it made.
 ## Not yet
 
 - Volume drivers and options.
-- `--volume` on macOS (it needs the Linux VM a later version manages): it's refused
-  there.
+- A bind outside the places the Mac's VM shares (the home, `/Volumes`, `/tmp`,
+  `/var/folders`): refused there ([macOS](macos.md)).

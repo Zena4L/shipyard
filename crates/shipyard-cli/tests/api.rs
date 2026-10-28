@@ -46,9 +46,26 @@ impl Stores {
     /// image pulled (the API's create never pulls), and a Docker config
     /// directory of its own.
     fn new() -> Option<Self> {
-        let stores = shipyard_test_support::stores::Stores::new(SHIPYARD)?;
+        Some(Self::wrapping(shipyard_test_support::stores::Stores::new(
+            SHIPYARD,
+        )?))
+    }
+
+    /// [`new`](Self::new), the fixture image's config's `config` object
+    /// `runtime` (JSON: its `Cmd`).
+    fn with_config(runtime: &str) -> Option<Self> {
+        Some(Self::wrapping(
+            shipyard_test_support::stores::Stores::serving(
+                SHIPYARD,
+                shipyard_test_support::registry::fixture_with_config(runtime),
+            )?,
+        ))
+    }
+
+    /// `stores`, with a Docker config directory of its own.
+    fn wrapping(stores: shipyard_test_support::stores::Stores) -> Self {
         std::fs::create_dir_all(stores.scratch.0.join("docker")).unwrap();
-        Some(Self(stores))
+        Self(stores)
     }
 
     /// The service's socket.
@@ -3793,6 +3810,7 @@ fn shipyard_s_views_and_inspect_s_layers() {
         let network = api::get(&socket, "/shipyard/networks/bridge").unwrap();
         assert_eq!(network.status, 200, "{}", network.text());
         assert_eq!(network.json()["Name"], "bridge");
+        assert_eq!(network.json()["version"], 1);
     } else {
         assert_eq!(network.status, 403, "{}", network.text());
     }
@@ -3946,4 +3964,1226 @@ fn stdin_once_outlives_the_service_that_made_it() {
         .json();
     assert_eq!(inspected["Config"]["StdinOnce"], true);
     assert_eq!(inspected["State"]["ExitCode"], 0);
+}
+
+/// The map's data (step 14.1a): `/shipyard/links` has every container, the
+/// links compose declares (its `depends_on` label, as compose writes it),
+/// refused once the target stops; and, as root, the connections between
+/// containers, counted once from the client's side, the control first (no
+/// connection, no observed link), a container sharing another's network
+/// namespace said and never counted twice; a published port's connections
+/// are its host clients' alone. Rootless, observed links are said
+/// unavailable, the rest stands. `/shipyard/containers/{id}/sockets`
+/// names a connection's peer.
+#[test]
+fn the_map_s_links_and_sockets_are_served() {
+    let Some(stores) = Stores::new() else { return };
+    let service = stores.serve(60);
+    let socket = stores.socket();
+    let labels = |service: &str| {
+        vec![
+            "--label".to_owned(),
+            "com.docker.compose.project=p".to_owned(),
+            "--label".to_owned(),
+            format!("com.docker.compose.service={service}"),
+        ]
+    };
+    let run = |name: &str, extra: &[String]| {
+        let mut args = vec!["run", "-d", "--name", name];
+        args.extend(extra.iter().map(String::as_str));
+        args.extend([stores.image.as_str(), "sleep", "300"]);
+        stores.docker_ok(&args)
+    };
+    let b = run(
+        "b",
+        &[labels("b"), vec!["-p".to_owned(), "18081:8081".to_owned()]].concat(),
+    );
+    let mut with_depends = labels("a");
+    with_depends.extend([
+        "--label".to_owned(),
+        "com.docker.compose.depends_on=b:service_started:false".to_owned(),
+    ]);
+    let a = run("a", &with_depends);
+    let links = || {
+        let got = api::get(&socket, "/shipyard/links").unwrap();
+        assert_eq!(got.status, 200, "{}", got.text());
+        got.json()
+    };
+    let of_kind = |answer: &serde_json::Value, kind: &str| -> Vec<serde_json::Value> {
+        answer["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|link| link["kind"] == kind)
+            .cloned()
+            .collect()
+    };
+    let first = links();
+    assert_eq!(first["version"], 1);
+    let declared = of_kind(&first, "declared");
+    assert_eq!(declared.len(), 1, "{first}");
+    assert_eq!(declared[0]["from"], a.as_str());
+    assert_eq!(declared[0]["to"], b.as_str());
+    assert_eq!(declared[0]["refused"], false);
+    // The control: nothing connected, nothing observed.
+    assert!(of_kind(&first, "observed").is_empty(), "{first}");
+    if is_root() {
+        assert_eq!(first["observed"]["available"], true, "{first}");
+        // The containers' host is the service's network namespace.
+        let host = std::fs::File::open(format!("/proc/{}/ns/net", service.0.id())).unwrap();
+        observed_between(&stores, (&a, &b), &host, &links, &of_kind);
+    } else {
+        assert_eq!(first["observed"]["available"], false, "{first}");
+        assert_eq!(first["observed"]["cause"], "rootless", "{first}");
+        // A container's own sockets are still its own to read.
+        let sockets = api::get(&socket, "/shipyard/containers/a/sockets").unwrap();
+        assert_eq!(sockets.status, 200, "{}", sockets.text());
+        assert_eq!(sockets.json()["version"], 1);
+    }
+    stores.docker_ok(&["stop", "-t", "0", "b"]);
+    eventually(Duration::from_secs(10), "the declared link refused", || {
+        of_kind(&links(), "declared")[0]["refused"] == true
+    });
+}
+
+/// An inspected container's first network's `key` (`IPAddress`,
+/// `Gateway`), as an address.
+fn network_address(inspected: &serde_json::Value, key: &str) -> std::net::IpAddr {
+    inspected["NetworkSettings"]["Networks"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()[key]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// The root half of [`the_map_s_links_and_sockets_are_served`]: `a`
+/// connects to a listener in `b`'s network namespace (each socket made by
+/// a thread joined to its container's), a third container joins `b`'s, and
+/// a client in `host` (the service's namespace) connects through `b`'s
+/// published port.
+fn observed_between(
+    stores: &Stores,
+    (a, b): (&str, &str),
+    host: &std::fs::File,
+    links: &dyn Fn() -> serde_json::Value,
+    of_kind: &dyn Fn(&serde_json::Value, &str) -> Vec<serde_json::Value>,
+) {
+    use shipyard_test_support::net::in_netns;
+    let inspect = |name: &str| {
+        api::get(&stores.socket(), &format!("/containers/{name}/json"))
+            .unwrap()
+            .json()
+    };
+    let netns = |name: &str| {
+        let pid = inspect(name)["State"]["Pid"].as_i64().unwrap();
+        std::fs::File::open(format!("/proc/{pid}/ns/net")).unwrap()
+    };
+    let b_ip = network_address(&inspect("b"), "IPAddress");
+    let gateway = network_address(&inspect("a"), "Gateway");
+    // An idle third container: the control that a link needs a connection.
+    stores.docker_ok(&["run", "-d", "--name", "c", &stores.image, "sleep", "300"]);
+    let listener = in_netns(&netns("b"), || {
+        std::net::TcpListener::bind("0.0.0.0:8080").unwrap()
+    });
+    let published = in_netns(&netns("b"), || {
+        std::net::TcpListener::bind("0.0.0.0:8081").unwrap()
+    });
+    let client = in_netns(&netns("a"), || {
+        std::net::TcpStream::connect((b_ip, 8080)).unwrap()
+    });
+    let (_accepted, _) = listener.accept().unwrap();
+    // Through the port b publishes on the host, by the network's gateway:
+    // the host's NAT masquerades it on its way to b.
+    let through_host = in_netns(&netns("a"), || {
+        std::net::TcpStream::connect((gateway, 18081)).unwrap()
+    });
+    let (_accepted_through, _) = published.accept().unwrap();
+    // A container in b's network namespace: one table, read once.
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "y",
+        "--network",
+        "container:b",
+        &stores.image,
+        "sleep",
+        "300",
+    ]);
+    let mut seen = serde_json::Value::Null;
+    eventually(Duration::from_secs(10), "the connections observed", || {
+        let began = Instant::now();
+        seen = links();
+        // H7: one read of a handful of containers, well within a poll.
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        of_kind(&seen, "observed").len() >= 2
+            && seen["containers"].as_array().unwrap().iter().any(|node| {
+                node["shares_network_with"]
+                    .as_array()
+                    .is_some_and(|ids| ids.len() == 2)
+            })
+    });
+    let observed = of_kind(&seen, "observed");
+    assert_eq!(
+        observed.len(),
+        2,
+        "each counted once, from the client: {seen}"
+    );
+    let direct = observed.iter().find(|link| link["port"] == 8080).unwrap();
+    assert_eq!(
+        (&direct["from"], &direct["to"]),
+        (&json!(a), &json!(b)),
+        "{seen}"
+    );
+    assert_eq!(direct["connections"], 1);
+    assert_eq!(direct["via_host_port"], false);
+    let through = observed.iter().find(|link| link["port"] == 8081).unwrap();
+    assert_eq!(
+        (&through["from"], &through["to"]),
+        (&json!(a), &json!(b)),
+        "{seen}"
+    );
+    assert_eq!(through["via_host_port"], true, "{seen}");
+    host_client_counted(b, &seen, (host, gateway), &published, links);
+    let c = inspect("c")["Id"].as_str().unwrap().to_owned();
+    assert!(
+        observed
+            .iter()
+            .all(|link| link["from"] != c.as_str() && link["to"] != c.as_str()),
+        "the idle container has no link: {seen}"
+    );
+    let sockets = api::get(&stores.socket(), "/shipyard/containers/a/sockets")
+        .unwrap()
+        .json();
+    assert_eq!(sockets["version"], 1);
+    assert!(
+        sockets["sockets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sock| sock["state"] == "ESTAB" && sock["peer"] == "b"),
+        "{sockets}"
+    );
+    drop((client, through_host));
+    stores.docker_ok(&["rm", "-f", "y", "c"]);
+}
+
+/// The inspector's and the Volumes section's data (step 14.1b): a running
+/// container's isolation as the kernel has it (its own namespaces, its
+/// cgroup, its command the init's child, rootless its user mapping), a
+/// container not running refused (the control: the running one answers);
+/// every volume's size and top level, a long one's listing capped.
+#[test]
+fn a_container_s_isolation_and_the_volumes_are_served() {
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let socket = stores.socket();
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "iso",
+        "-v",
+        "kept:/data",
+        &stores.image,
+        "sh",
+        "-c",
+        "head -c 5000 /dev/zero > /data/five; mkdir /data/dir; exec sleep 300",
+    ]);
+    let isolation = api::get(&socket, "/shipyard/containers/iso/isolation").unwrap();
+    assert_eq!(isolation.status, 200, "{}", isolation.text());
+    let isolation = isolation.json();
+    assert_eq!(isolation["version"], 1);
+    let own = |kind: &str| {
+        isolation["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ns| ns["kind"] == kind)
+            .unwrap()["own"]
+            .clone()
+    };
+    for kind in ["mnt", "pid", "uts", "ipc", "net"] {
+        assert_eq!(own(kind), true, "{kind}: {isolation}");
+    }
+    assert!(
+        isolation["cgroup"]
+            .as_str()
+            .is_some_and(|path| path.starts_with('/')),
+        "{isolation}"
+    );
+    eventually(
+        Duration::from_secs(10),
+        "its command is the init's child",
+        || {
+            let now = api::get(&socket, "/shipyard/containers/iso/isolation")
+                .unwrap()
+                .json();
+            now["command"]["args"] == json!(["sleep", "300"])
+                && now["command"]["pid"] != now["init_pid"]
+        },
+    );
+    if is_root() {
+        assert_eq!(
+            own("user"),
+            false,
+            "root's has the host's users: {isolation}"
+        );
+    } else {
+        assert_eq!(isolation["user"]["inside"], 0, "{isolation}");
+        assert_ne!(isolation["user"]["outside"], 0, "{isolation}");
+    }
+    stores.docker_ok(&["create", "--name", "idle", &stores.image, "sleep", "300"]);
+    let refused = api::get(&socket, "/shipyard/containers/idle/isolation").unwrap();
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    joined_namespaces_are_said(&stores);
+    volumes_are_served(&stores);
+}
+
+/// A container that joins `iso`'s network (`--network container:`) has
+/// the same `net` namespace ID, and its own `uts` (the control).
+fn joined_namespaces_are_said(stores: &Stores) {
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "joiner",
+        "--network",
+        "container:iso",
+        &stores.image,
+        "sleep",
+        "300",
+    ]);
+    let id = |name: &str, kind: &str| {
+        let got = api::get(
+            &stores.socket(),
+            &format!("/shipyard/containers/{name}/isolation"),
+        )
+        .unwrap()
+        .json();
+        got["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ns| ns["kind"] == kind)
+            .unwrap()["id"]
+            .clone()
+    };
+    assert!(id("iso", "net").is_u64());
+    assert_eq!(id("joiner", "net"), id("iso", "net"));
+    assert_ne!(id("joiner", "uts"), id("iso", "uts"));
+}
+
+/// The second half of [`a_container_s_isolation_and_the_volumes_are_served`]:
+/// `kept` (its container wrote 5,000 bytes and a directory) and a volume
+/// of 250 files, through `/shipyard/volumes`.
+fn volumes_are_served(stores: &Stores) {
+    let socket = stores.socket();
+    // The volumes: kept's two entries and its bytes; many's listing capped.
+    stores.docker_ok(&[
+        "run",
+        "--rm",
+        "-v",
+        "many:/v",
+        &stores.image,
+        "sh",
+        "-c",
+        "i=0; while [ $i -lt 250 ]; do : > /v/f$i; i=$((i+1)); done",
+    ]);
+    let mut answer = serde_json::Value::Null;
+    let volume = |answer: &serde_json::Value, name: &str| {
+        answer["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == name)
+            .cloned()
+    };
+    // Shared for 5 s: a read before the files were written may be kept.
+    eventually(Duration::from_secs(15), "the volumes read", || {
+        answer = api::get(&socket, "/shipyard/volumes").unwrap().json();
+        volume(&answer, "kept").is_some_and(|kept| kept["size"].as_u64() >= Some(5000))
+            && volume(&answer, "many").is_some()
+    });
+    assert_eq!(answer["version"], 1);
+    let kept = volume(&answer, "kept").unwrap();
+    assert_eq!(kept["complete"], true, "{kept}");
+    let files: Vec<(&str, &str)> = kept["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["name"].as_str().unwrap(),
+                file["kind"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(files, [("dir", "directory"), ("five", "file")], "{kept}");
+    let many = volume(&answer, "many").unwrap();
+    assert_eq!(many["files"].as_array().unwrap().len(), 200, "{many}");
+    assert_eq!(many["more"], 50, "{many}");
+}
+
+/// A published port's own count (step 14.3), `seen` before the host's
+/// client: `a`'s connection through it is a container's, never the host's
+/// (the control); a client in `host` (the containers' host here: the
+/// service's network namespace), through the port on `gateway` (one of its
+/// own addresses: the `output` chain's DNAT), is.
+fn host_client_counted(
+    b: &str,
+    seen: &serde_json::Value,
+    (host, gateway): (&std::fs::File, std::net::IpAddr),
+    published: &std::net::TcpListener,
+    links: &dyn Fn() -> serde_json::Value,
+) {
+    let entry = |answer: &serde_json::Value| {
+        answer["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["container"] == b && entry["container_port"] == 8081)
+            .unwrap()["connections"]
+            .clone()
+    };
+    assert_eq!(entry(seen), 0, "a container's through the host: {seen}");
+    let from_host = shipyard_test_support::net::in_netns(host, || {
+        std::net::TcpStream::connect((gateway, 18081)).unwrap()
+    });
+    let (_accepted, _) = published.accept().unwrap();
+    eventually(Duration::from_secs(10), "the host's client counted", || {
+        entry(&links()) == 1
+    });
+    drop(from_host);
+}
+
+/// The rail's facts, as the desktop client reads them: `info`, the
+/// networks (a compose network by its short name, root's: rootless has no
+/// shared networks, its list the built-ins alone) and the volumes' count.
+fn rail_facts(
+    stores: &Stores,
+    runtime: &tokio::runtime::Runtime,
+    client: &shipyard_client::api::Client,
+) {
+    let info = runtime.block_on(client.info()).unwrap();
+    assert!(info.kernel_version.is_some_and(|kernel| !kernel.is_empty()));
+    let images = usize::try_from(info.images.unwrap()).unwrap();
+    assert!(images >= 1, "the fixture image");
+    stores.docker_ok(&["volume", "create", "counted"]);
+    // A compose network by its short name (root's: rootless has no shared
+    // networks, its list the built-ins alone).
+    if is_root() {
+        stores.docker_ok(&[
+            "network",
+            "create",
+            "--label",
+            "com.docker.compose.network=front",
+            "p_front",
+        ]);
+    }
+    let networks = runtime.block_on(client.networks()).unwrap();
+    if is_root() {
+        let front = networks
+            .iter()
+            .find(|network| network.name == "p_front")
+            .unwrap();
+        assert_eq!(front.short, "front", "compose's own name for it");
+        assert!(front.subnet.is_some(), "{front:?}");
+    }
+    assert!(!networks.is_empty(), "the built-ins");
+    assert_eq!(runtime.block_on(client.volume_count()).unwrap(), 1);
+}
+
+/// The live numbers (step 14.8a2), with `listed` and `made` running: the
+/// host's memory and CPU time; with a cgroup to read (root, or delegated),
+/// each running container's memory and its own monitor's, never a
+/// container that only exists (`idle`, created) or has stopped (`ended`,
+/// its monitor's cgroup left behind); the host's CPU time moves on.
+fn usage_facts(
+    stores: &Stores,
+    runtime: &tokio::runtime::Runtime,
+    client: &shipyard_client::api::Client,
+) {
+    stores.docker_ok(&["create", "--name", "idle", &stores.image, "sleep", "300"]);
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "ended",
+        &stores.image,
+        "sleep",
+        "300",
+    ]);
+    stores.docker_ok(&["stop", "-t", "0", "ended"]);
+    let id = |name: &str| {
+        api::get(&stores.socket(), &format!("/containers/{name}/json"))
+            .unwrap()
+            .json()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let first = runtime
+        .block_on(shipyard_client::usage::usage(client))
+        .unwrap();
+    assert!(first.memory.total > 0, "{first:?}");
+    assert!(
+        first.memory.available > 0 && first.memory.available <= first.memory.total,
+        "{first:?}"
+    );
+    assert!(first.cpu.cpus >= 1 && first.cpu.time > 0, "{first:?}");
+    let ids: Vec<&str> = first.containers.iter().map(|one| one.id.as_str()).collect();
+    for absent in ["idle", "ended"] {
+        assert!(!ids.contains(&id(absent).as_str()), "{absent}: {ids:?}");
+    }
+    if is_root() || shipyard_test_support::delegated_cgroup().is_some() {
+        let listed = first
+            .containers
+            .iter()
+            .find(|one| one.id == id("listed"))
+            .unwrap_or_else(|| panic!("listed, running: {first:?}"));
+        assert!(listed.memory > 0 && listed.cpu_time > 0, "{listed:?}");
+        assert!(
+            listed.monitor_memory.is_some_and(|memory| memory > 0),
+            "its own monitor: {listed:?}"
+        );
+        assert!(ids.contains(&id("made").as_str()), "{ids:?}");
+    }
+    // Once the API's shared second is past: a read of its own, the host's
+    // time on.
+    eventually(
+        Duration::from_secs(10),
+        "the host's CPU time moves on",
+        || {
+            runtime
+                .block_on(shipyard_client::usage::usage(client))
+                .unwrap()
+                .cpu
+                .time
+                > first.cpu.time
+        },
+    );
+}
+
+/// The inspector's facts (step 14.4a) of `made`, running: its inspect,
+/// its image's layers, and a stats sample (its memory in use, under its
+/// limit; rootless, with a delegated cgroup); a stats stream asked of no
+/// container ends at once.
+fn inspector_facts(
+    stores: &Stores,
+    runtime: &tokio::runtime::Runtime,
+    client: &shipyard_client::api::Client,
+) {
+    let inspected = runtime.block_on(client.inspect("made")).unwrap();
+    assert_eq!(inspected["State"]["OOMKilled"], false, "{inspected}");
+    let image = runtime.block_on(client.image(&stores.image)).unwrap();
+    assert!(
+        image["RootFS"]["Layers"]
+            .as_array()
+            .is_some_and(|layers| !layers.is_empty()),
+        "{image}"
+    );
+    // The first sample, or none within 5 s.
+    let (sender, mut samples) = tokio::sync::mpsc::unbounded_channel();
+    let first = runtime.block_on(async {
+        let follow = shipyard_client::stats::follow(client, "made", move |sample| {
+            let _ = sender.send(sample);
+        });
+        tokio::select! {
+            sample = samples.recv() => sample,
+            _ = follow => None,
+            () = tokio::time::sleep(Duration::from_secs(5)) => None,
+        }
+    });
+    // Rootless, a container's numbers are its delegated cgroup's (as the
+    // stats tests above: none without one).
+    if is_root() || shipyard_test_support::delegated_cgroup().is_some() {
+        let sample = first.unwrap();
+        assert!(sample.mem > 0 && sample.mem <= sample.limit, "{sample:?}");
+    }
+    // No such container: the API's refusal, not a stream that ended.
+    let gone = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shipyard_client::stats::follow(client, "no-such", |_| {}),
+        )
+        .await
+    });
+    assert!(
+        matches!(&gone, Ok(Err(error)) if error.kind() == shipyard_client::ErrorKind::Api),
+        "{gone:?}"
+    );
+}
+
+/// A fixture whose command keeps running, as a run by spec needs (the
+/// sheet gives no command: the image's own runs).
+const SLEEPS: &str = r#"{"Cmd":["sleep","300"]}"#;
+
+/// The inspector's actions and the Run sheet's run (step 14.4b), through
+/// the client: a run by spec (its memory and its port set, nothing else),
+/// paused, resumed, stopped, restarted, removed while it runs. Rootless, a
+/// memory limit needs a delegated cgroup: without one, none of it runs.
+#[test]
+fn the_desktop_client_acts_on_containers() {
+    if !is_root() && shipyard_test_support::delegated_cgroup().is_none() {
+        return;
+    }
+    let Some(stores) = Stores::with_config(SLEEPS) else {
+        return;
+    };
+    let _service = stores.serve(60);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    let spec = shipyard_client::run::RunSpec {
+        image: stores.image.clone(),
+        name: Some("ran".to_owned()),
+        memory_mib: 256,
+        // Not 18081: rootless, the links test's `b` publishes that on the
+        // same loopback, beside this one.
+        port: Some("18091:80".to_owned()),
+    };
+    let id = runtime
+        .block_on(shipyard_client::run::run(&client, &spec, |_| {}))
+        .unwrap();
+    let inspect = || {
+        api::get(&stores.socket(), "/containers/ran/json")
+            .unwrap()
+            .json()
+    };
+    let state = |key: &str| inspect()["State"][key].clone();
+    let inspected = inspect();
+    assert!(
+        id.starts_with(inspected["Id"].as_str().unwrap()),
+        "{id} {inspected}"
+    );
+    assert_eq!(
+        inspected["HostConfig"]["Memory"], 268_435_456,
+        "{inspected}"
+    );
+    assert_eq!(
+        inspected["HostConfig"]["PortBindings"]["80/tcp"][0]["HostPort"], "18091",
+        "{inspected}"
+    );
+    assert_eq!(state("Running"), true);
+    // Its port held: a second run's start fails, and leaves nothing behind
+    // (the name free for a run again).
+    let clash = shipyard_client::run::RunSpec {
+        name: Some("clash".to_owned()),
+        ..spec.clone()
+    };
+    let refused = runtime.block_on(shipyard_client::run::run(&client, &clash, |_| {}));
+    assert!(refused.is_err(), "{refused:?}");
+    let left = api::get(&stores.socket(), "/containers/clash/json").unwrap();
+    assert_eq!(left.status, 404, "{}", left.json());
+    runtime.block_on(client.pause("ran")).unwrap();
+    assert_eq!(state("Paused"), true);
+    runtime.block_on(client.unpause("ran")).unwrap();
+    assert_eq!(state("Paused"), false);
+    runtime.block_on(client.stop("ran")).unwrap();
+    assert_eq!(state("Running"), false);
+    runtime.block_on(client.restart("ran")).unwrap();
+    assert_eq!(state("Running"), true);
+    // Running: a plain remove refused, a forced one stops it first.
+    let refused = runtime.block_on(client.remove("ran", false));
+    assert!(
+        matches!(&refused, Err(error) if error.kind() == shipyard_client::ErrorKind::Api),
+        "{refused:?}"
+    );
+    runtime.block_on(client.remove("ran", true)).unwrap();
+    let gone = api::get(&stores.socket(), "/containers/ran/json").unwrap();
+    assert_eq!(gone.status, 404);
+}
+
+/// The console (step 14.5), through the client: a container's logs (its
+/// last lines, then a new one as it comes), and a shell in it on a
+/// terminal: it answers, takes a resize, outlives a flood, and ends.
+#[test]
+fn the_desktop_client_shows_the_console() {
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let script = "echo one; echo two; echo three; sleep 1; echo four; sleep 300";
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "said",
+        &stores.image,
+        "sh",
+        "-c",
+        script,
+    ]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    // Followed: the first three, then the fourth as it comes.
+    let (sender, mut said) = tokio::sync::mpsc::unbounded_channel();
+    let followed = runtime.block_on(async {
+        let follow = shipyard_client::console::logs(&client, "said", true, move |line| {
+            let _ = sender.send(line);
+        });
+        let read = async {
+            let mut lines = Vec::new();
+            while lines.len() < 4 {
+                lines.push(said.recv().await.unwrap());
+            }
+            lines
+        };
+        tokio::select! {
+            lines = read => lines,
+            _ = follow => Vec::new(),
+            () = tokio::time::sleep(Duration::from_secs(20)) => Vec::new(),
+        }
+    });
+    assert_eq!(followed, ["one", "two", "three", "four"]);
+    // Not followed: its lines so far, and the read ends.
+    let mut read = Vec::new();
+    runtime
+        .block_on(shipyard_client::console::logs(
+            &client,
+            "said",
+            false,
+            |line| {
+                read.push(line);
+            },
+        ))
+        .unwrap();
+    assert_eq!(read, ["one", "two", "three", "four"]);
+    console_shell(&runtime, &client);
+    dropped_shell(&stores, &runtime, &client);
+}
+
+/// A shell dropped while a command runs in it: the API hangs it up, and
+/// its exec ends (nothing left running to hold the service awake).
+fn dropped_shell(
+    stores: &Stores,
+    runtime: &tokio::runtime::Runtime,
+    client: &shipyard_client::api::Client,
+) {
+    use shipyard_client::console::Shell;
+    let exec = runtime.block_on(async {
+        let (mut shell, output) = Shell::open(client, "said", 80, 24).await.unwrap();
+        shell.write(b"sleep 300\n").await.unwrap();
+        let exec = shell.exec_id().to_owned();
+        drop((shell, output));
+        exec
+    });
+    let path = format!("/exec/{exec}/json");
+    shipyard_test_support::eventually(
+        Duration::from_secs(30),
+        "the dropped shell's exec to end",
+        || api::get(&stores.socket(), &path).unwrap().json()["Running"] == false,
+    );
+}
+
+/// A shell in `said`: it answers, takes a resize, outlives a flood, ends.
+fn console_shell(runtime: &tokio::runtime::Runtime, client: &shipyard_client::api::Client) {
+    use futures_util::StreamExt as _;
+    use shipyard_client::console::Shell;
+    runtime.block_on(async {
+        let (mut shell, mut output) = Shell::open(client, "said", 80, 24).await.unwrap();
+        let mut seen = String::new();
+        let mut until = async |output: &mut shipyard_client::console::ShellOutput, wanted: &str| {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !seen.contains(wanted) {
+                let next = tokio::time::timeout_at(deadline, output.next()).await;
+                let Ok(Some(Ok(bytes))) = next else {
+                    panic!(
+                        "no {wanted:?} in {:?}",
+                        seen.chars().rev().take(300).collect::<String>()
+                    );
+                };
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+                if seen.len() > 1 << 16 {
+                    seen.drain(..seen.len() - (1 << 15));
+                }
+            }
+        };
+        shell.write(b"echo $((6*7))\n").await.unwrap();
+        until(&mut output, "42").await;
+        shell.resize(101, 31).await.unwrap();
+        shell.write(b"stty size\n").await.unwrap();
+        until(&mut output, "31 101").await;
+        shell
+            .write(b"dd if=/dev/zero bs=1M count=10 2>/dev/null; echo; echo flood-$((1+1))\n")
+            .await
+            .unwrap();
+        until(&mut output, "flood-2").await;
+        shell.write(b"echo after-$((3*3))\n").await.unwrap();
+        until(&mut output, "after-9").await;
+        // Docker's detach keys typed: no detach (the shell's are none's).
+        shell.write(b"\x10\x11\n").await.unwrap();
+        shell.write(b"echo $((5*5))\n").await.unwrap();
+        until(&mut output, "25").await;
+        shell.write(b"exit\n").await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(Ok(_)) = output.next().await {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the shell didn't end");
+    });
+}
+
+/// The Images section (step 14.6a), through the client: two images of one
+/// base read with their layers (the base's one digest in both: stored
+/// once, its size known), an image a container uses refused (never `-f`),
+/// and removed once unused, tag by tag.
+#[test]
+fn the_desktop_client_reads_the_images() {
+    use shipyard_test_support::registry::{LayerEntry, built_layer, fixture_layers, layer_tar};
+    // One base layer, built once (a tar of the same tree built twice can
+    // differ by its times), in both images.
+    let base = layer_tar(shipyard_test_support::rootfs::RootFs::minimal().path());
+    let Some(stores) = shipyard_test_support::stores::Stores::serving(
+        SHIPYARD,
+        fixture_layers(vec![base.clone()]),
+    )
+    .map(Stores::wrapping) else {
+        return;
+    };
+    let layer = built_layer(&[LayerEntry::File {
+        path: "added",
+        owner: (0, 0),
+        mode: 0o644,
+        content: b"one more layer",
+    }]);
+    let (_registry, derived) = fixture_layers(vec![base, layer]);
+    let pulled = stores.shipyard(&["pull", &derived]);
+    assert!(
+        pulled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pulled.stderr)
+    );
+    let _service = stores.serve(60);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    let images = runtime
+        .block_on(shipyard_client::images::images(&client))
+        .unwrap();
+    let of = |name: &str| {
+        images
+            .iter()
+            .find(|image| {
+                image
+                    .tags
+                    .iter()
+                    .any(|tag| tag == name || *tag == format!("{name}:latest"))
+            })
+            .unwrap_or_else(|| panic!("no {name} in {images:?}"))
+            .clone()
+    };
+    let (base, derived_image) = (of(&stores.image), of(&derived));
+    assert_eq!(base.layers.len(), 1, "{base:?}");
+    assert_eq!(derived_image.layers.len(), 2, "{derived_image:?}");
+    assert_eq!(
+        base.layers[0].diff, derived_image.layers[0].diff,
+        "the base's layer, once"
+    );
+    assert!(
+        derived_image.layers.iter().all(|layer| layer.size > 0),
+        "{derived_image:?}"
+    );
+    // In use: its tag's removal refused (never forced: the engine's check).
+    stores.docker_ok(&["create", "--name", "holds", &derived, "sh"]);
+    let refused = runtime.block_on(shipyard_client::images::remove(&client, &derived, false));
+    assert!(
+        matches!(&refused, Err(error) if error.kind() == shipyard_client::ErrorKind::Api),
+        "{refused:?}"
+    );
+    // Unused, under two tags in two repositories: each tag in turn, as the
+    // page removes it (by its ID unforced, the engine would refuse the two
+    // repositories).
+    stores.docker_ok(&["rm", "holds"]);
+    stores.docker_ok(&["tag", &derived, "second:1"]);
+    for reference in [derived.as_str(), "second:1", &stores.image] {
+        runtime
+            .block_on(shipyard_client::images::remove(&client, reference, false))
+            .unwrap();
+    }
+    let left = runtime
+        .block_on(shipyard_client::images::images(&client))
+        .unwrap();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// `shipyard system service --ensure` (step 14.7, what the desktop app runs
+/// on Linux): with nothing answering, it starts the service in the
+/// background and returns once it answers; with one answering, it starts
+/// none; a socket in a directory others may write is refused, nothing
+/// started there. The service it started ends once idle.
+#[test]
+fn system_service_ensure_starts_one_service() {
+    let Some(stores) = Stores::new() else { return };
+    let socket = stores.socket();
+    // The services serving `socket`: each `system service --socket SOCKET`.
+    let services = |socket: &std::path::Path| {
+        let wanted = socket.as_os_str().as_encoded_bytes();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|entry| std::fs::read(entry.ok()?.path().join("cmdline")).ok())
+            .filter(|line| {
+                let args: Vec<&[u8]> = line.split(|byte| *byte == 0).collect();
+                args.contains(&b"service".as_slice())
+                    && !args.contains(&b"--ensure".as_slice())
+                    && args.contains(&wanted)
+            })
+            .count()
+    };
+    let ensure = |socket: &std::path::Path| {
+        stores
+            .command(&["system", "service", "--ensure", "--socket"])
+            .arg(socket)
+            .env("SHIPYARD_API_IDLE", "3")
+            .output()
+            .unwrap()
+    };
+    // The control: nothing serves it yet.
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+    let first = ensure(&socket);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stdout.is_empty());
+    assert_eq!(api::get(&socket, "/_ping").unwrap().status, 200);
+    assert_eq!(services(&socket), 1);
+    let second = ensure(&socket);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(services(&socket), 1, "a second service started");
+    // A directory anyone may write: refused, nothing there.
+    let shared = stores.scratch.0.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let refused = ensure(&shared.join("api.sock"));
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("isn't yours alone"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!shared.join("api.sock").exists());
+    eventually(
+        Duration::from_secs(30),
+        "the service ends once idle",
+        || services(&socket) == 0,
+    );
+}
+
+/// The Volumes section (step 14.6b), through the client: a volume's size,
+/// files and place read; its deletion refused while a stopped container
+/// names it (never forced), done once it's gone; a name that would be
+/// another path refused before any request.
+#[test]
+fn the_desktop_client_reads_the_volumes() {
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    stores.docker_ok(&["volume", "create", "kept"]);
+    let image = stores.image.clone();
+    stores.docker_ok(&[
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "-v",
+        "kept:/data",
+        &image,
+        "sh",
+        "-c",
+        "echo hello > /data/note",
+    ]);
+    stores.docker_ok(&[
+        "create",
+        "--name",
+        "holds",
+        "--network",
+        "none",
+        "-v",
+        "kept:/data",
+        &image,
+        "sh",
+    ]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    let read = || {
+        runtime
+            .block_on(shipyard_client::volumes::volumes(&client))
+            .unwrap()
+    };
+    let contents = read();
+    let kept = contents["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|volume| volume["name"] == "kept")
+        .unwrap_or_else(|| panic!("no kept in {contents}"))
+        .clone();
+    assert!(kept["size"].as_u64().unwrap() >= 6, "{kept}");
+    assert_eq!(kept["files"][0]["name"], "note", "{kept}");
+    assert!(
+        kept["mountpoint"]
+            .as_str()
+            .unwrap()
+            .ends_with("/kept/_data"),
+        "{kept}"
+    );
+    let refused = runtime.block_on(shipyard_client::volumes::remove(&client, "kept"));
+    assert!(
+        matches!(&refused, Err(error) if error.kind() == shipyard_client::ErrorKind::Api),
+        "{refused:?}"
+    );
+    let bad = runtime.block_on(shipyard_client::volumes::remove(&client, ".."));
+    assert!(
+        matches!(&bad, Err(shipyard_client::ClientError::BadReference(_))),
+        "{bad:?}"
+    );
+    stores.docker_ok(&["rm", "holds"]);
+    runtime
+        .block_on(shipyard_client::volumes::remove(&client, "kept"))
+        .unwrap();
+    let left = read();
+    assert!(
+        !left["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|volume| volume["name"] == "kept"),
+        "{left}"
+    );
+}
+
+/// The Networks section (step 14.6b), through the client: as root, a bridge
+/// network's gateway, bridge and each container's veth (Shipyard's own view,
+/// its version known); rootless, no bridge, and the view said absent (403),
+/// never a failure.
+#[test]
+fn the_desktop_client_reads_the_networks() {
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let image = stores.image.clone();
+    if is_root() {
+        stores.docker_ok(&["network", "create", "--subnet", "10.250.12.0/24", "viewed"]);
+        stores.docker_ok(&[
+            "run",
+            "-d",
+            "--name",
+            "tap",
+            "--network",
+            "viewed",
+            &image,
+            "sleep",
+            "60",
+        ]);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    let networks = runtime.block_on(client.networks()).unwrap();
+    if !is_root() {
+        assert!(
+            networks.iter().all(|network| network.driver != "bridge"),
+            "{networks:?}"
+        );
+        let view = runtime
+            .block_on(shipyard_client::networks::view(&client, "pasta"))
+            .unwrap();
+        assert!(view.is_none(), "{view:?}");
+        return;
+    }
+    let viewed = networks
+        .iter()
+        .find(|network| network.name == "viewed")
+        .unwrap_or_else(|| panic!("{networks:?}"));
+    assert_eq!(
+        (viewed.driver.as_str(), viewed.gateway.as_deref()),
+        ("bridge", Some("10.250.12.1"))
+    );
+    // Read into the client's own type: every key the engine writes found.
+    let view = runtime
+        .block_on(shipyard_client::networks::view(&client, "viewed"))
+        .unwrap()
+        .expect("root's view");
+    assert!(view.bridge.starts_with("shy"), "{view:?}");
+    assert_eq!(view.gateway, "10.250.12.1");
+    // A network's DNS server starts with its first container.
+    assert!(view.dns_running, "{view:?}");
+    let tap = stores.docker_ok(&["inspect", "-f", "{{.Id}}", "tap"]);
+    let attached = &view.endpoints[0];
+    assert_eq!(attached.container.as_deref(), Some(tap.trim()), "{view:?}");
+    assert!(attached.host_veth.starts_with("shy"), "{view:?}");
+    stores.docker_ok(&["rm", "-f", "tap"]);
+}
+
+/// The Run sheet's pull (step 14.4b): an image the store lacks is pulled
+/// from its registry, each line handed on, then run. Rootless alone: the
+/// fixture registry is on the tests' own loopback, and as root a container
+/// there would take a subnet of the shared namespace's default network.
+#[test]
+fn the_desktop_client_pulls_what_it_runs() {
+    if is_root() || shipyard_test_support::delegated_cgroup().is_none() {
+        return;
+    }
+    let Some(stores) = Stores::with_config(SLEEPS) else {
+        return;
+    };
+    let _service = stores.serve_here(60);
+    stores.docker_ok(&["rmi", &stores.image]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    let spec = shipyard_client::run::RunSpec {
+        image: stores.image.clone(),
+        name: Some("pulled".to_owned()),
+        memory_mib: 128,
+        port: None,
+    };
+    let mut lines = Vec::new();
+    runtime
+        .block_on(shipyard_client::run::run(&client, &spec, |line| {
+            lines.push(line);
+        }))
+        .unwrap();
+    assert!(!lines.is_empty(), "no pull said");
+    let inspected = api::get(&stores.socket(), "/containers/pulled/json")
+        .unwrap()
+        .json();
+    assert_eq!(inspected["State"]["Running"], true, "{inspected} {lines:?}");
+    runtime.block_on(client.remove("pulled", true)).unwrap();
+}
+
+/// The desktop app's client (step 14.2) against a real service: it
+/// connects (its version negotiated down to the API's), lists a container
+/// it ran, reads the links at a version it knows, the system's info,
+/// counts and networks (a compose network by its short name), starts a
+/// created container (14.3), and gets the event of a container started
+/// while it follows.
+#[test]
+fn the_desktop_client_reads_the_api() {
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "listed",
+        &stores.image,
+        "sleep",
+        "300",
+    ]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = shipyard_client::place::Endpoint::Unix(stores.socket());
+    let client = runtime
+        .block_on(shipyard_client::api::Client::connect(&endpoint))
+        .unwrap();
+    let listed = runtime.block_on(client.containers()).unwrap();
+    assert!(
+        listed.iter().any(|container| container
+            .names
+            .iter()
+            .flatten()
+            .any(|name| name == "/listed")),
+        "{listed:?}"
+    );
+    let links = runtime.block_on(client.links()).unwrap();
+    assert_eq!(links["version"], 1);
+    rail_facts(&stores, &runtime, &client);
+    // The map's one action (step 14.3): a created container started.
+    stores.docker_ok(&["create", "--name", "made", &stores.image, "sleep", "300"]);
+    runtime.block_on(client.start("made")).unwrap();
+    let inspected = api::get(&stores.socket(), "/containers/made/json")
+        .unwrap()
+        .json();
+    assert_eq!(inspected["State"]["Running"], true, "{inspected}");
+    inspector_facts(&stores, &runtime, &client);
+    usage_facts(&stores, &runtime, &client);
+    // An event for a container started as the client follows: asked from
+    // a moment before, so one that comes before the stream is up isn't lost.
+    let since = shipyard_sys::time::unix_now() - 1;
+    let (seen, heard) = std::sync::mpsc::channel();
+    let follower = client.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(shipyard_client::events::follow(
+            &follower,
+            Some(since),
+            |event| {
+                let _ = seen.send(event);
+            },
+        ));
+    });
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "heard",
+        &stores.image,
+        "sleep",
+        "300",
+    ]);
+    let began = Instant::now();
+    loop {
+        let event = heard
+            .recv_timeout(Duration::from_secs(10).saturating_sub(began.elapsed()))
+            .expect("no event for the container started");
+        let named = event
+            .actor
+            .as_ref()
+            .and_then(|actor| actor.attributes.as_ref())
+            .and_then(|attributes| attributes.get("name"))
+            .is_some_and(|name| name == "heard");
+        if named && event.action.as_deref() == Some("start") {
+            break;
+        }
+    }
 }

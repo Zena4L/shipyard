@@ -120,6 +120,14 @@ pub(crate) struct Shared {
     bound: std::sync::Mutex<Option<Bound>>,
     /// [`Service::idle_end_pause`].
     idle_end_pause: Option<std::path::PathBuf>,
+    /// The latest links answer and when it was read: one read at a time,
+    /// shared for a moment (the UI polls it: `own::links`).
+    links: own::Latest,
+    /// The latest volumes answer, as `links` (each read walks every
+    /// volume: `own::volumes`).
+    volumes: own::Latest,
+    /// The latest usage answer, as `links` (`own::usage`).
+    usage: own::Latest,
 }
 
 /// Serves the API on `listener` (systemd's, or one the caller bound) until
@@ -180,6 +188,9 @@ fn serve_blocked(listener: StdListener, service: Service, stops: SigSet) -> io::
         server,
         bound: std::sync::Mutex::new(service.bound),
         idle_end_pause: service.idle_end_pause,
+        links: tokio::sync::Mutex::new(None),
+        volumes: tokio::sync::Mutex::new(None),
+        usage: tokio::sync::Mutex::new(None),
     });
     // What execs of services gone before left (F117's PID files).
     if let Ok(root) = shared.paths.runtime_root() {
@@ -491,8 +502,7 @@ async fn answer(
             let body = body.ok_or_else(|| ApiError::internal("the archive's body"))?;
             archive::put(shared, id, &query, body).await
         }
-        Route::OwnContainer(id) => own::container(shared, id).await,
-        Route::OwnNetwork(name) => own::network(shared, name).await,
+        Route::Own(asked) => own::answer(shared, asked).await,
         Route::ListNetworks => networks::list(shared, &query).await,
         Route::CreateNetwork => {
             let body = body.ok_or_else(|| ApiError::internal("the network's body"))?;

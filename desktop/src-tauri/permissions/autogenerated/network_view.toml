@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-network-view"
+description = "Enables the network_view command without any pre-configured scope."
+commands.allow = ["network_view"]
+
+[[permission]]
+identifier = "deny-network-view"
+description = "Denies the network_view command without any pre-configured scope."
+commands.deny = ["network_view"]

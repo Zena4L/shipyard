@@ -470,9 +470,10 @@ impl From<InspectKind> for shipyard_engine::docker::Kind {
 /// `version`'s, `info`'s).
 #[derive(Debug, Args)]
 pub(crate) struct Shown {
-    /// How to show it: as Docker's command does without it (a JSON array
-    /// for `inspect`); `json`, as JSON; or a Go TEMPLATE over it
-    /// (`{{.Name}}`, `{{json .Config}}`), a line each.
+    /// How to show it: as Docker's command does without it (`inspect`: a
+    /// JSON array; `version`, `info`: Docker's text); `json`, as JSON; or a
+    /// Go TEMPLATE over it, a line each (`inspect`'s `{{.Name}}`, `{{json
+    /// .Config}}`).
     #[arg(short, long, value_name = "FORMAT")]
     pub(crate) format: Option<String>,
 }
@@ -783,8 +784,8 @@ pub(crate) enum VolumeCommand {
         #[arg(value_name = "VOLUME", required = true)]
         names: Vec<String>,
     },
-    /// Remove one or more named volumes (never one a running container
-    /// uses).
+    /// Remove one or more named volumes (never one a container names,
+    /// running or not).
     Rm {
         /// The volumes to remove.
         #[arg(value_name = "VOLUME", required = true)]
@@ -991,6 +992,12 @@ pub(crate) enum SystemCommand {
         /// root, shipyard in the user's runtime directory for anyone else).
         #[arg(long, value_name = "PATH")]
         socket: Option<std::path::PathBuf>,
+        /// Start the service in the background if nothing answers on its
+        /// socket (as `shipyard compose` does), and exit once it answers:
+        /// it runs on until it's idle. Refused for a socket in a directory
+        /// that isn't yours alone.
+        #[arg(long)]
+        ensure: bool,
     },
 }
 

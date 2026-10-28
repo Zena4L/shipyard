@@ -1,0 +1,56 @@
+# cargo-deny for the desktop app's own workspace (stage 14, D14.2-1): the
+# main workspace's rules, with what Tauri's tree brings, each argued.
+[graph]
+# The platforms the app is built for (D14-2): another's crates (Windows')
+# aren't checked.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+version = 2
+# Unmaintained, not vulnerable; each in Tauri's own tree, gone when Tauri
+# moves (none is a crate of ours, none parses untrusted input of the app's):
+ignore = [
+  # proc-macro-error: a build-time macro helper of gtk-rs's (Linux).
+  { id = "RUSTSEC-2024-0370", reason = "build-time macro helper in Tauri's Linux tree" },
+  # zbus's D-Bus helpers (Linux): Tauri's notification and tray plumbing.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant, in Tauri's Linux D-Bus tree" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names, in Tauri's Linux D-Bus tree" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, in Tauri's Linux D-Bus tree" },
+]
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unicode-3.0",
+  "ISC",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+]
+# Tauri's tree, each one argued:
+exceptions = [
+  # MPL-2.0 (file-level copyleft: these files stay MPL, our code isn't
+  # touched): Servo's CSS parsing that tauri-utils builds HTML with, and a
+  # tiny `Option` helper of `dirs`.
+  { allow = ["MPL-2.0"], crate = "cssparser" },
+  { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+  { allow = ["MPL-2.0"], crate = "dtoa-short" },
+  { allow = ["MPL-2.0"], crate = "selectors" },
+  { allow = ["MPL-2.0"], crate = "option-ext" },
+  # Zlib, permissive: hashbrown's hasher.
+  { allow = ["Zlib"], crate = "foldhash" },
+  # Apache-2.0 with LLVM's exception (more permissive than Apache-2.0):
+  # the build's target triples.
+  { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "target-lexicon" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [{ crate = "shipyard-engine" }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

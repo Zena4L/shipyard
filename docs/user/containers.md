@@ -7,7 +7,7 @@ its own writable layer, and, while it runs, its processes. Containers outlive th
 `shipyard` command that started them: there's no daemon, each one has a small
 monitor of its own.
 
-(Linux only. A foreground `shipyard run` of an image or `--rootfs` is a container
+(On Linux, and in a Mac's Linux VM. A foreground `shipyard run` of an image or `--rootfs` is a container
 too, attached until it ends, or until you detach from one made with `-it`: see
 [Running commands](run.md#a-container-in-the-foreground). `--no-image`, `--bundle`
 and `--no-isolation` runs, and in this version `--preserve-fds` ones, make no

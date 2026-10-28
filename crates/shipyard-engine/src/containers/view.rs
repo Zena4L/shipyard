@@ -244,10 +244,16 @@ pub struct Sock {
     pub peer: Option<String>,
 }
 
+/// The format of [`Sockets`] as the API serves it: a newer one is the
+/// client's to refuse.
+pub const SOCKETS_VERSION: u32 = 1;
+
 /// A container's sockets, as `port --sockets` shows them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct Sockets {
+    /// [`SOCKETS_VERSION`].
+    pub version: u32,
     /// The container's name.
     pub name: String,
     /// Its sockets: those it listens on first, then by their own port.
@@ -279,17 +285,8 @@ pub fn sockets(engine: &Engine, reference: &str) -> Result<Sockets> {
                 format!("container {} has ended: it has no sockets", record.name),
             )
         };
-        let (pid, started) = engine
-            .paths
-            .runtime_root()
-            .ok()
-            .and_then(|root| {
-                shipyard_runtime::container::peek_init(root, record.id.as_str())
-                    .ok()
-                    .flatten()
-            })
-            .ok_or_else(ended)?;
-        let read = shipyard_network::observe::sockets(pid).map_err(|error| {
+        let (pid, started) = init_of(engine, record.id.as_str()).ok_or_else(ended)?;
+        let read = init_sockets(pid, started, |_| true).map_err(|error| {
             let kind = match error {
                 ObserveError::Gone(_) => return ended(),
                 // hidepid: whose /proc is it is the host's to say.
@@ -301,18 +298,14 @@ pub fn sockets(engine: &Engine, reference: &str) -> Result<Sockets> {
                 format!("container {}'s sockets: {error}", record.name),
             )
         })?;
-        // The read held the process at `pid` (a pidfd), but that may have
-        // been another one's, its PID reused after the init ended: still
-        // the init, after the read, or the read was of nothing of ours.
-        if !shipyard_runtime::container::is_process(pid, started) {
-            return Err(ended());
-        }
         let names: BTreeMap<String, String> = super::list(engine)
             .unwrap_or_default()
             .into_iter()
             .map(|other| (other.id.as_str().to_owned(), other.name.as_str().to_owned()))
             .collect();
-        let peers: BTreeMap<std::net::IpAddr, String> = crate::network::container_addresses(engine)
+        let peers: BTreeMap<std::net::IpAddr, String> = crate::network::lease_owners(engine)
+            .map(|found| found.owners)
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|(ip, id)| Some((ip, names.get(&id)?.clone())))
             .collect();
@@ -339,6 +332,7 @@ pub fn sockets(engine: &Engine, reference: &str) -> Result<Sockets> {
                 .then(a.remote.cmp(&b.remote))
         });
         Ok(Sockets {
+            version: SOCKETS_VERSION,
             name: record.name.as_str().to_owned(),
             sockets: sockets.into_iter().map(|(_, sock)| sock).collect(),
         })
@@ -469,6 +463,38 @@ pub(super) fn inspected(
         restart_count,
         log_dir,
         config: StoredConfig::from(&config),
+    }
+}
+
+/// Container `id`'s init, by its PID and start time, from its runtime
+/// state, read without its lock (a view never waits behind a command).
+#[cfg(target_os = "linux")]
+pub(crate) fn init_of(engine: &Engine, id: &str) -> Option<(i32, u64)> {
+    let root = engine.paths.runtime_root().ok()?;
+    shipyard_runtime::container::peek_init(root, id)
+        .ok()
+        .flatten()
+}
+
+/// The sockets `keep` keeps of the network namespace the init `(pid,
+/// started)` is in: read holding the process (a pidfd), then its start time
+/// checked again: a PID reused after the init ended is
+/// [`Gone`](shipyard_network::observe::ObserveError::Gone), never another
+/// process's table.
+#[cfg(target_os = "linux")]
+pub(crate) fn init_sockets(
+    pid: i32,
+    started: u64,
+    keep: impl Fn(&shipyard_network::observe::Socket) -> bool + Copy,
+) -> std::result::Result<
+    Vec<shipyard_network::observe::Socket>,
+    shipyard_network::observe::ObserveError,
+> {
+    let read = shipyard_network::observe::sockets_where(pid, keep)?;
+    if shipyard_runtime::container::is_process(pid, started) {
+        Ok(read)
+    } else {
+        Err(shipyard_network::observe::ObserveError::Gone(pid))
     }
 }
 

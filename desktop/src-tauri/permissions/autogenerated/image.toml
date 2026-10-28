@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-image"
+description = "Enables the image command without any pre-configured scope."
+commands.allow = ["image"]
+
+[[permission]]
+identifier = "deny-image"
+description = "Denies the image command without any pre-configured scope."
+commands.deny = ["image"]

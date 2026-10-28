@@ -432,6 +432,68 @@ SHIPYARD_TEST_VM=required cargo test -p shipyard-cli --test vm --test vm_termina
 .claude/skills/shipyard-verify/scripts/verify.sh --vm   # the guest built first, then both
 ```
 
+## The desktop app (stage 14)
+
+`desktop/` is the Tauri 2 app: `desktop/src-tauri/` its Rust shell (a Cargo workspace
+of its own, so the main one never needs WebKitGTK), `desktop/ui/` its page (Svelte 5,
+TypeScript, Vite). Its logic is the main workspace's `crates/shipyard-client`, which the
+Linux tests reach (`the_desktop_client_reads_the_api`) and the VM tests too
+(`the_desktop_client_reaches_the_vm`).
+
+It needs Node.js 26 (`desktop/ui/.nvmrc`; `npm` refuses another, `engine-strict`, and
+runs no package's install scripts, `.npmrc`).
+
+```sh
+cd desktop/ui
+npm ci                                    # exact versions, no install scripts
+SHIPYARD_BIN="$PWD/../../target/debug/shipyard" npm run tauri dev   # the app, its page live
+npm run check                             # svelte-check, warnings fail it
+npm test                                  # vitest (the store, the Manifest)
+npx playwright install webkit             # once
+npm run visual                            # WebKit: the page against the design's mock,
+                                          # pixel for pixel (light, dark), and the built
+                                          # page under the release CSP
+npm run design-css                        # src/lib/design.css again from the mock
+```
+
+`npm run visual`'s pictures (the mock's, the app's, their difference) are in
+`desktop/ui/test-results/`. The page is the mock's markup and its stylesheet whole
+(`design.css` is extracted from `docs/design/shipyard-ui.html`, never edited); the
+app's own differences are in `src/app.css`. Two things the comparison taught: the mock
+file has no doctype, and quirks mode gives its tables another line height, so the test
+renders it in standards mode, as its published artifact is; and no markup carries a
+`style` attribute (the release CSP refuses one: a value set at run time is a Svelte
+`style:` directive). `verify.sh --mac` runs all of it, and the shell's fmt, clippy,
+tests and `cargo deny` (`desktop/deny.toml`), and checks that both lock files build the
+client crate from the same versions (`.claude/skills/shipyard-verify/scripts/client-versions.py`:
+after a `cargo update` in either, pin the other).
+
+`shipyard` must be signed to start the VM (`scripts/macos/sign.sh target/debug/shipyard`
+after each build); the app says so if it isn't.
+
+**On Linux** (step 14.7): `scripts/desktop-linux.sh` builds `shipyard` and the app in the
+desktop image (`scripts/desktop-image/Dockerfile`: Debian trixie, WebKitGTK 4.1, Xvfb,
+`tauri-driver`; built on first use, tagged by its Dockerfile's hash), then opens the real
+app as a rootless user with nothing serving its API, under a virtual display, and drives it
+with Tauri's WebDriver (`desktop/ui/tests-linux/drive.mjs`, plain W3C WebDriver): the app
+must start the service, draw the user's containers, and open every section. Its
+screenshots are in `target/desktop-linux/`; `--shell` opens the image instead, and
+`--build-only` leaves the two binaries in `target/desktop-linux/bin/`. Its volumes are
+`shipyard-desktop-target` and `shipyard-desktop-registry` (rebuildable). `verify.sh` runs it
+after the Linux passes.
+
+To try it by hand, `scripts/macos/desktop-vm.sh up` makes a Lima VM (Debian 13) with a GNOME desktop in
+a window (`scripts/macos/desktop-vm.yaml`; once, a few GB), copies the two binaries in, and
+opens it; in its terminal, `shipyard-desktop`. `desktop-vm.sh install` copies a new build
+in, `down` stops it. Its desktop logs Lima's user in with no password, and that user has
+passwordless `sudo`: anyone at the VM's window is root in it (nothing of the Mac is
+mounted there).
+
+The Mac's `.app` (`npm run tauri -- build --bundles app`, `scripts/macos/sign.sh
+--bundle`) opened from Finder or `open` gets launchd's environment: no `SHIPYARD_BIN`, a
+short `PATH`, so it finds `target/debug/shipyard` only once it's chosen in Settings. Its
+folder prompts (the VM's shares) are asked of "Shipyard": with the local identity, once.
+
 ## Running Linux-only stages on macOS: Lima VM
 
 Eventually Shipyard manages its own VM (a minimal path in roadmap stage 10, production-grade in stage 13). Until then,

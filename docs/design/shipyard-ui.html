@@ -354,6 +354,8 @@
   .vchip em { font-style: normal; color: var(--faint); }
   .vchip.lit { border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink); }
   .vchip svg, .ico { flex: none; }
+  /* not the map's edge layer (.mapcanvas svg), as the host chips' icons aren't */
+  .vchip svg { position: static; width: 11px; height: 12px; }
   [data-layer].lit { transform: scaleY(1.5); }
   [data-layer].dim { opacity: .18; }
 
@@ -625,7 +627,7 @@
             <div class="field"><label for="rPort">Publish port</label><input id="rPort" placeholder="8081:80"></div>
             <button class="btn primary" type="submit">Run</button>
           </form>
-          <p class="hint">Same as <code id="cliEcho">shipyard run --memory 256m alpine:3.20</code></p>
+          <p class="hint">Same as <code id="cliEcho">shipyard run -d --memory 256m alpine:3.20</code></p>
         </div>
 
         <div class="viewport" id="viewport">
@@ -852,7 +854,7 @@
       const meta = s === "standalone" ? `${cs.length} containers` : `compose stack · ${up}/${cs.length} running`;
       const bnets = [...new Set(cs.flatMap(netsOf))];
       const nk = bnets.map(n => `<button class="netkey" type="button" data-hl="net:${n}" data-goto-net="${n}"><i class="swatch" style="background:${netColor(n)}"></i>${n}</button>`).join("");
-      return `<section class="bay"><div class="bayhead"><h2>${s}</h2><p>${meta}</p><span class="spacer"></span>${nk}</div><div class="berths">${cs.map(boxHTML).join("")}</div></section>`;
+      return `<section class="bay"><div class="bayhead"><h2>${s}</h2><p>${meta}</p><span class="spacer"></span>${nk}</div><div class="berths">${cs.map(c => boxHTML(c)).join("")}</div></section>`;
     }).join("");
     requestAnimationFrame(moveCrane);
   }
@@ -1566,7 +1568,7 @@
   function nextName(img) { const base = slug(img); let n = base, i = 2; while (byName(n)) n = `${base}-${i++}`; return n; }
   function updateEcho() {
     const m = +$("rMem").value; const p = $("rPort").value.trim(); const nm = $("rName").value.trim();
-    $("cliEcho").textContent = `shipyard run${nm ? " --name " + nm : ""} --memory ${m >= 1024 ? m / 1024 + "g" : m + "m"}${p ? " -p " + p : ""} ${$("rImage").value.trim() || "IMAGE"}`;
+    $("cliEcho").textContent = `shipyard run -d${nm ? " --name " + nm : ""} --memory ${m >= 1024 ? m / 1024 + "g" : m + "m"}${p ? " -p " + p : ""} ${$("rImage").value.trim() || "IMAGE"}`;
   }
   ["rImage", "rName", "rMem", "rPort"].forEach(id => $(id).addEventListener("input", updateEcho));
   $("runform").addEventListener("submit", e => {

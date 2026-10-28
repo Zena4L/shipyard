@@ -87,6 +87,13 @@ impl ContainerState {
             Self::Running { .. } | Self::Paused | Self::Stopping | Self::Restarting { .. }
         )
     }
+
+    /// Whether it has a process to measure: running or paused (`stats`
+    /// and the UI's live numbers).
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Paused)
+    }
 }
 
 /// The state of the container `record` is, its runtime saying `runtime`

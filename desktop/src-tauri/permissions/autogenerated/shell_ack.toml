@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shell-ack"
+description = "Enables the shell_ack command without any pre-configured scope."
+commands.allow = ["shell_ack"]
+
+[[permission]]
+identifier = "deny-shell-ack"
+description = "Denies the shell_ack command without any pre-configured scope."
+commands.deny = ["shell_ack"]

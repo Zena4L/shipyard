@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shell-input"
+description = "Enables the shell_input command without any pre-configured scope."
+commands.allow = ["shell_input"]
+
+[[permission]]
+identifier = "deny-shell-input"
+description = "Denies the shell_input command without any pre-configured scope."
+commands.deny = ["shell_input"]

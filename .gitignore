@@ -26,3 +26,11 @@
 
 # Python bytecode (skills' scripts)
 __pycache__/
+
+# The desktop app's builds and packages (desktop/, stage 14)
+/desktop/target/
+/desktop/ui/node_modules/
+/desktop/ui/dist/
+/desktop/src-tauri/gen/
+/desktop/ui/test-results/
+/desktop/ui/dist-fixture/

@@ -1,0 +1,30 @@
+[package]
+name = "shipyard-client"
+description = "Shipyard's desktop app's client of the API (step 14.2): where the API is, Docker's endpoints and Shipyard's own, events, the VM's start, the app's settings."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bollard.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shipyard-sys.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "macros"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The VM's places and its host's phase (asked on host.sock, never starting it).
+shipyard-vm.workspace = true
+
+[lints]
+workspace = true

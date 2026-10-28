@@ -53,6 +53,28 @@ pub(crate) fn stop() -> Result<ExitCode> {
     Ok(code)
 }
 
+/// `shipyard system service --ensure`: the service started in the
+/// background if nothing answers on `socket` (the engine's default if
+/// none), as `shipyard compose` starts it; returns once it answers. What
+/// the desktop app runs on Linux when the user's socket is silent.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ensure_service(socket: Option<&std::path::Path>) -> Result<ExitCode> {
+    let socket = match socket {
+        Some(path) => path.to_owned(),
+        None => engine().paths().api_socket()?,
+    };
+    crate::compose::ensure_served(&socket)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// On a Mac the API is the VM's (`shipyard vm start` serves it). Reached
+/// only without the VM (`SHIPYARD_VM=off`): with it, the command is refused
+/// before it's run here, as every `system service` is (`forward`).
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_service(_socket: Option<&std::path::Path>) -> Result<ExitCode> {
+    anyhow::bail!("on a Mac, Docker's API is the VM's: `shipyard vm start` serves it")
+}
+
 /// `shipyard system service`: Docker's API served on systemd's socket, or
 /// on `socket` (the engine's default if none), until it's idle.
 pub(crate) fn service(socket: Option<&std::path::Path>, revision: &str) -> Result<ExitCode> {

@@ -13,8 +13,8 @@ environment and exactly the user, working directory and limits you ask for.
 > [Image](#image)) or `--rootfs` (see [Root filesystem](#root-filesystem)) it gets
 > a root filesystem of its own; with `--no-image`, it sees the host's files. It
 > has a network of its own with a way out and published ports (`-p`): the default
-> bridge network as root, pasta without (see [Network](#network)). On macOS the
-> command isn't isolated yet, and running an image needs Linux.
+> bridge network as root, pasta without (see [Network](#network)). On a Mac the
+> command runs in Shipyard's Linux VM, isolated there as on Linux ([macOS](macos.md)).
 
 ## A container, in the foreground
 
@@ -219,11 +219,12 @@ sees the host's network.
 - If `/` isn't a mount point (for example inside a plain `chroot`), isolation
   fails with "making the container's mounts private: Invalid argument"; use
   `--no-isolation` there.
-- **macOS:** commands aren't isolated yet (as with `--no-isolation`), and an
-  image needs Linux, so a run there needs `--no-image` or `--no-isolation`;
-  `--hostname`, `--domainname`, `--sysctl`, `--rootfs`, the network flags
-  (`--network`, `--name`, `--network-alias`, `--ip6`, `-p`, `--add-host`, the `--dns`
-  flags) and the other isolation flags are errors there.
+- **macOS without its VM** (`SHIPYARD_VM=off`, [macOS](macos.md)): commands aren't
+  isolated (as with `--no-isolation`), and an image needs Linux, so a run there needs
+  `--no-image` or `--no-isolation`; `--hostname`, `--domainname`, `--sysctl`,
+  `--rootfs`, the network flags (`--network`, `--name`, `--network-alias`, `--ip6`,
+  `-p`, `--add-host`, the `--dns` flags) and the other isolation flags are errors
+  there. With the VM (the default), a run is the Linux one.
 
 ### Network
 

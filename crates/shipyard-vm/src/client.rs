@@ -38,8 +38,9 @@ const MAX_HOST_ANSWER: usize = 256;
 /// The most `vm stop` waits in all, its host's phases' waits included.
 const STOP_MOST: Duration = Duration::from_mins(20);
 
-/// The most a start waits in all, its host's phases' waits included.
-const START_MOST: Duration = Duration::from_mins(20);
+/// The most a start waits in all, its host's phases' waits included (the
+/// desktop app's bound on `vm start` too).
+pub const START_MOST: Duration = Duration::from_mins(20);
 
 /// The start's failure (`in_time`: it was given up on, not failed), with
 /// the host's last lines.
@@ -67,6 +68,15 @@ pub enum Status {
     Running(Option<u32>),
     /// It doesn't.
     Stopped,
+}
+
+/// The host's phase now, asked on its own socket (`host.sock`): asking
+/// never starts anything, as a connection to `docker.sock` may (launchd's,
+/// with `vm install`: the desktop app's way to know, step 14.2). `None` if
+/// no host runs, or one older than 0.5 (no `host.sock`), or it didn't answer.
+#[must_use]
+pub fn phase(paths: &VmPaths) -> Option<crate::phase::PhaseAnswer> {
+    ask_host(paths, forward::HOST_PHASE_REQUEST)
 }
 
 /// Whether the host runs: its lock held is the only sign (a PID alone
@@ -169,7 +179,7 @@ fn connect_watching(paths: &VmPaths, watch: Option<&SignalWatch>) -> Result<Unix
         if now > deadline {
             // By the host's own phase (F100): a healthy one is waited for,
             // never stopped by a CLI that gave up; and never signalled.
-            let answer = ask_host(paths, forward::HOST_PHASE_REQUEST);
+            let answer = phase(paths);
             // No host yet (launchd's throttle on its kick): looked at again.
             let no_host_yet = answer.is_none()
                 && matches!(status(paths)?, Status::Stopped | Status::Running(None));
@@ -341,7 +351,7 @@ pub(super) fn gone_or_replaced(status: Status, pid: Option<u32>) -> bool {
 fn waited_on(paths: &VmPaths, began: Instant, deadline: Instant) -> Instant {
     if Instant::now() > deadline
         && began.elapsed() < STOP_MOST
-        && let Some(answer) = ask_host(paths, forward::HOST_PHASE_REQUEST)
+        && let Some(answer) = phase(paths)
         && answer.left > Duration::ZERO
     {
         Instant::now() + answer.left + crate::phase::MARGIN

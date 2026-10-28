@@ -69,6 +69,11 @@ shipyard-test-support.workspace = true
 flate2.workspace = true
 # `cp`'s tar streams (tests/runtime.rs).
 tar.workspace = true
+# The desktop app's client against a real service (tests/api.rs, step 14.2).
+shipyard-client.workspace = true
+# The console's shell output, a stream (tests/api.rs, step 14.5).
+futures-util.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 # Terminal (pseudo-terminal) tests. Not on libtest: the harness forks a fake
 # shell that keeps running Rust code, which is only sound in a single-threaded

@@ -190,9 +190,14 @@ fn dispatch(
         Command::System(SystemCommand::Df { format }) => system::df(format.as_deref()),
         Command::System(SystemCommand::Recover) => system::recover(),
         Command::System(SystemCommand::Stop) => system::stop(),
-        Command::System(SystemCommand::Service { socket }) => {
-            system::service(socket.as_deref(), REVISION)
-        }
+        Command::System(SystemCommand::Service {
+            socket,
+            ensure: false,
+        }) => system::service(socket.as_deref(), REVISION),
+        Command::System(SystemCommand::Service {
+            socket,
+            ensure: true,
+        }) => system::ensure_service(socket.as_deref()),
         Command::Vm(command) => vm::command(&command),
         Command::Compose(args) => compose::compose(&args),
         Command::Doctor => doctor::run(),

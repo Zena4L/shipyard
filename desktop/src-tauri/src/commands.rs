@@ -1,0 +1,38 @@
+// The app's commands, by name: `build.rs` declares them in the app's
+// manifest (in Tauri 2 a command the manifest doesn't list is allowed to
+// every window), `capabilities/default.json` allows each, and `lib.rs`'s
+// test checks both and its handler list against this one list.
+const COMMANDS: &[&str] = &[
+    "status",
+    "start_vm",
+    "snapshot",
+    "links",
+    "usage",
+    "start_container",
+    "stop_container",
+    "restart_container",
+    "pause_container",
+    "unpause_container",
+    "remove_container",
+    "run_image",
+    "images",
+    "remove_image",
+    "volumes",
+    "remove_volume",
+    "network_view",
+    "isolation",
+    "inspect",
+    "watch_stats",
+    "unwatch_stats",
+    "logs_follow",
+    "logs_stop",
+    "shell_open",
+    "shell_input",
+    "shell_resize",
+    "shell_ack",
+    "shell_close",
+    "follow",
+    "release",
+    "set_start_vm_on_open",
+    "choose_shipyard",
+];
