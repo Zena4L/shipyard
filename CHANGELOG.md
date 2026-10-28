@@ -86,6 +86,14 @@ behaviour; each change is listed here).
 
 - **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
   the old one can no longer be installed).
+- **The desktop app's colours and motion:** the Cobalt Yard palette (navy containers on
+  blue-tinted greys, a cobalt crane and selection; status colours a set of their own, no
+  orange), a new app icon, and lighter motion: one easing and three speeds, views fading
+  in, the map's dots moved by CSS along their links instead of a script every frame. A
+  button in the title bar switches between light and dark (the system's until you choose;
+  your choice is kept).
+  The inspector's CPU graph scales to its own peak (a 2 % floor, so a light load moves)
+  and slides with each second's sample.
 
 ### Fixed
 

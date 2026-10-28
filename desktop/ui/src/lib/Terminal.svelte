@@ -12,6 +12,7 @@
   import { Terminal } from "@xterm/xterm";
   import { onMount } from "svelte";
   import type { Backend } from "./backend";
+  import { onThemeChange } from "./theme";
   import { keepStylesToTheCsp } from "./sheets";
   import { failureOf } from "./store";
 
@@ -121,10 +122,20 @@
     });
     const watch = typeof ResizeObserver === "function" ? new ResizeObserver(() => fit.fit()) : null;
     watch?.observe(host);
+    // Its colours are the theme's: read again when the theme changes.
+    const offTheme = onThemeChange(() => {
+      if (!host) return;
+      const now = getComputedStyle(host);
+      term.options.theme = {
+        background: now.getPropertyValue("--term").trim(),
+        foreground: now.getPropertyValue("--term-ink").trim(),
+      };
+    });
     void open();
     term.focus();
     return () => {
       gone = true;
+      offTheme();
       watch?.disconnect();
       typed.dispose();
       resized.dispose();

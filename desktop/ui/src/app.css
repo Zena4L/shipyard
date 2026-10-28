@@ -50,24 +50,24 @@ body {
 /* Network colours past the design's three (a fourth network and on), light
    and dark. */
 :root {
-  --net-d: #2a9d8f;
-  --net-e: #c2577a;
-  --net-f: #8a7a2e;
-  --net-g: #5b6ee1;
+  --net-d: #0891b2;
+  --net-e: #db2777;
+  --net-f: #65a30d;
+  --net-g: #64748b;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --net-d: #4cc0b2;
-    --net-e: #e07b9c;
-    --net-f: #c7b45a;
-    --net-g: #8a99f0;
+    --net-d: #22d3ee;
+    --net-e: #f472b6;
+    --net-f: #a3e635;
+    --net-g: #94a3b8;
   }
 }
 :root[data-theme="dark"] {
-  --net-d: #4cc0b2;
-  --net-e: #e07b9c;
-  --net-f: #c7b45a;
-  --net-g: #8a99f0;
+  --net-d: #22d3ee;
+  --net-e: #f472b6;
+  --net-f: #a3e635;
+  --net-g: #94a3b8;
 }
 
 /* The console's shell (14.5): a real terminal where the mock draws its
@@ -78,11 +78,11 @@ body {
 
 /* Layer families past the mock's three (14.6a), in the order families
    first appear. */
-:root { --lay-d: #7a6fb0; --lay-e: #b0627a; --lay-f: #5f8f5a; }
+:root { --lay-d: #6366f1; --lay-e: #14b8a6; --lay-f: #a855f7; }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) { --lay-d: #9d93d6; --lay-e: #d6849c; --lay-f: #82b47c; }
+  :root:not([data-theme="light"]) { --lay-d: #818cf8; --lay-e: #2dd4bf; --lay-f: #c084fc; }
 }
-:root[data-theme="dark"] { --lay-d: #9d93d6; --lay-e: #d6849c; --lay-f: #82b47c; }
+:root[data-theme="dark"] { --lay-d: #818cf8; --lay-e: #2dd4bf; --lay-f: #c084fc; }
 
 /* The Images section's caption (14.7): one height whatever the layer under
    the pointer says (a real image's step can run to hundreds of characters),

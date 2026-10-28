@@ -14,6 +14,10 @@ test("a long step under the pointer moves nothing", async ({ page }) => {
   await row.waitFor();
   const at = () => row.evaluate((element) => element.getBoundingClientRect().y);
   const caption = () => page.locator("#layercap").evaluate((element) => element.getBoundingClientRect().height);
+  // The section's entrance (a fade and a 4 px rise) over first.
+  await page.evaluate(() =>
+    Promise.allSettled(document.getAnimations().filter((one) => one.effect?.getTiming().iterations !== Infinity).map((one) => one.finished)),
+  );
   const before = [await at(), await caption()];
   await row.locator("[data-layer]").first().hover();
   await expect(page.locator("#layercap code")).toBeVisible();
