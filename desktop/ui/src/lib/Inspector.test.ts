@@ -87,6 +87,30 @@ function props() {
 }
 
 describe("the inspector", () => {
+  it("follows the CPU live: each sample moves the number and the graph, scaled so a light load shows", async () => {
+    const base = props();
+    const sample = (cpu: number) => ({ id: "worker", cpu, mem: 64 * 1024 * 1024, limit: 256 * 1024 * 1024 });
+    const at = (samples: ReturnType<typeof sample>[]) => ({ ...base, focus: { ...base.focus, samples } });
+    const { container, rerender } = render(Inspector, { props: at([sample(0.4), sample(0.6)]) });
+    const cpu = () => container.querySelector(".metric .val")?.textContent;
+    const line = () => container.querySelector(".spark polyline")?.getAttribute("points");
+    const peak = () => Math.min(...(line() ?? "").split(" ").map((point) => Number(point.split(",")[1])));
+    expect(cpu()).toBe("0.6%");
+    // Under 1 %, the line still rises off the floor: 0.6 % peaks at y 30 of 44 (a
+    // 10 % floor drew it at 39, flat along the bottom).
+    expect(peak()).toBeLessThan(32);
+    const before = line();
+    const roll = container.querySelector(".spark .sparkroll");
+    await rerender(at([sample(0.4), sample(0.6), sample(1.8)]));
+    expect(cpu()).toBe("1.8%");
+    expect(line()).not.toBe(before);
+    // Each sample's line slides in: a new roll element (its animation starts
+    // again), keyed by the sample.
+    const next = container.querySelector(".spark .sparkroll");
+    expect(next).not.toBeNull();
+    expect(next).not.toBe(roll);
+  });
+
   it("says what a container says as text, never as markup, and offers the lines to copy", async () => {
     const { container, getByRole } = render(Inspector, { props: props() });
     expect(container.querySelector("img")).toBeNull();

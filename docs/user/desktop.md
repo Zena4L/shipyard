@@ -57,7 +57,7 @@ It isn't packaged yet: you run it from the source tree (below).
   can't be seen (each has a network of its own), so the map draws declared
   dependencies alone and says so.
 - **The Yard** shows each compose project as a bay of containers (standalone ones in a
-  bay of their own), with the networks each project uses; the yellow crane hangs over the
+  bay of their own), with the networks each project uses; the blue crane hangs over the
   container you select.
 - **The inspector** (on the right) says everything about the container you select: its
   code, state and image (and, after an out-of-memory kill, the limit it hit); what it
@@ -142,6 +142,9 @@ It isn't packaged yet: you run it from the source tree (below).
   in use is what the kernel can't give back without swapping). **The status bar**
   says how many monitors run and the memory they use (each one's cgroup), and how
   Shipyard runs (rootless or root, cgroup v2, overlayfs, its version).
+- **Light or dark:** the app follows your system's appearance until you press the sun/moon
+  button in the title bar; it then keeps your choice from then on (it no longer
+  follows the system).
 - **Settings** (⌘,): start the VM when the app opens, and which `shipyard` to run.
   They're kept in `~/Library/Application Support/Shipyard/desktop.json`, readable
   by you alone. A settings file from a newer app is left as it is (the app uses

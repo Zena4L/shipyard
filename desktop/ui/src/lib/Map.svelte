@@ -10,7 +10,7 @@
   // from a container: text, never markup; positions by `style:`.
   import Box from "./Box.svelte";
   import { mapStatus, startOrders, walk, type MapModel, type MapNode, type Section } from "./graph";
-  import { HOSTW, MAX_DOTS, MINGAP, dotRate, layout } from "./layout";
+  import { DOT_SPEED, HOSTW, MAX_DOTS, MAX_EDGE_DOTS, MINGAP, dotRate, layout } from "./layout";
   import type { ImagesModel } from "./layers";
   import { STATE_LABEL, fmtSize } from "./model";
   import Strata from "./Strata.svelte";
@@ -110,23 +110,29 @@
   // a path could still be the last layout's).
   let paths: SVGPathElement[] = $state([]);
   let middles: ({ x: number; y: number } | null)[] = $state([]);
+  // Each edge's length, by its key: a poll that adds or reorders edges never
+  // hands a kept edge's dots another's length for a frame.
+  let lengths: globalThis.Map<string, number> = $state(new globalThis.Map());
   $effect(() => {
     void laid;
     const measure = requestAnimationFrame(() => {
-      middles = paths.map((path) => {
-        if (!path || typeof path.getTotalLength !== "function") return null;
-        const point = path.getPointAtLength(path.getTotalLength() / 2);
+      const measurable = (path: SVGPathElement | undefined) => path && typeof path.getTotalLength === "function";
+      const measured = paths.map((path) => (measurable(path) ? path.getTotalLength() : 0));
+      lengths = new globalThis.Map(laid.edges.map((edge, i) => [edge.key, measured[i] ?? 0]));
+      middles = paths.map((path, i) => {
+        if (!measurable(path)) return null;
+        const point = path.getPointAtLength((measured[i] ?? 0) / 2);
         return { x: point.x, y: point.y };
       });
     });
     return () => cancelAnimationFrame(measure);
   });
 
-  // The dots: on each active edge with open connections, at a rate that
-  // grows with them; none when the system asks for less motion. One loop
-  // for the map's life, reading the edges as they are now: a poll's new
-  // layout keeps its paths (keyed), so the dots in flight go on.
-  let packets: SVGGElement | undefined = $state();
+  // The dots: on each active edge with open connections, a few that loop
+  // along it at 140 px a second, more the more connections it has; none when
+  // the system asks for less motion. CSS moves them (each its edge's path as
+  // its offset path), so nothing runs a frame at a time; keyed by edge, a
+  // poll's new layout keeps the ones in flight.
   // Followed as it changes: asked for while the map is open, the dots stop.
   const motion = typeof matchMedia === "function" ? matchMedia("(prefers-reduced-motion: reduce)") : null;
   let reduceMotion = $state(motion?.matches ?? false);
@@ -135,57 +141,25 @@
     motion?.addEventListener("change", changed);
     return () => motion?.removeEventListener("change", changed);
   });
-  let flows: { path: SVGPathElement; rate: number; acc: number }[] = [];
-  $effect(() => {
-    const before = new globalThis.Map(flows.map((flow) => [flow.path, flow.acc]));
-    flows = laid.edges.flatMap((edge, i) => {
-      const path = paths[i];
-      const rate = dotRate(edge);
-      return path && rate > 0 && typeof path.getTotalLength === "function"
-        ? [{ path, rate, acc: before.get(path) ?? 0.5 }]
-        : [];
-    });
-  });
-  let frame = 0;
-  $effect(() => {
-    const group = packets;
-    if (!group || reduceMotion) return;
-    let dots: { path: SVGPathElement; len: number; t: number; el: SVGCircleElement }[] = [];
-    let last = performance.now();
-    const tick = (now: number) => {
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
-      for (const flow of flows) {
-        flow.acc += dt * flow.rate;
-        if (flow.acc >= 1 && dots.length < MAX_DOTS) {
-          flow.acc -= 1;
-          const el = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-          el.setAttribute("r", "2.4");
-          el.setAttribute("class", "packet");
-          group.appendChild(el);
-          dots.push({ path: flow.path, len: flow.path.getTotalLength(), t: 0, el });
-        }
-      }
-      dots = dots.filter((dot) => {
-        dot.t += dt * (140 / dot.len);
-        if (dot.t >= 1 || !dot.path.isConnected) {
-          dot.el.remove();
-          return false;
-        }
-        const point = dot.path.getPointAtLength(dot.t * dot.len);
-        dot.el.setAttribute("cx", String(point.x));
-        dot.el.setAttribute("cy", String(point.y));
-        dot.el.style.opacity = dot.path.classList.contains("dimmed") ? ".1" : "";
-        return true;
-      });
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => {
-      cancelAnimationFrame(frame);
-      group.replaceChildren();
-    };
-  });
+  const dots = $derived(
+    reduceMotion
+      ? []
+      : laid.edges
+          .flatMap((edge) => {
+            const rate = dotRate(edge);
+            const length = lengths.get(edge.key) ?? 0;
+            if (rate <= 0 || length <= 0) return [];
+            const period = length / DOT_SPEED;
+            const count = Math.max(1, Math.min(MAX_EDGE_DOTS, Math.round(rate * period)));
+            return Array.from({ length: count }, (_, k) => ({
+              key: `${edge.key}:${k}`,
+              edge,
+              period,
+              delay: -(k * period) / count,
+            }));
+          })
+          .slice(0, MAX_DOTS),
+  );
 
   const edgeClass = (edge: (typeof laid.edges)[number]) =>
     `edge ${edge.edge?.kind === "observed" ? "observed" : ""} ${edge.state === "active" ? "" : edge.state}${
@@ -305,7 +279,18 @@
             {/if}
           {/each}
         </g>
-        <g bind:this={packets}></g>
+        <g>
+          {#each dots as dot (dot.key)}
+            <circle
+              class="packet"
+              r="2.4"
+              class:dimmed={dimEdge(dot.edge.from, dot.edge.to)}
+              style:offset-path={`path("${dot.edge.d}")`}
+              style:animation-duration="{dot.period}s"
+              style:animation-delay="{dot.delay}s"
+            />
+          {/each}
+        </g>
       </svg>
       <span class="colhead" style:left="0">Host</span>
       <span class="colhead" style:left="{HOSTW + MINGAP}px">Depends on →</span>
@@ -378,7 +363,7 @@
     {/each}
     <span class="spacer"></span>
     <span
-      ><svg width="26" height="8" aria-hidden="true"><line x1="1" y1="4" x2="25" y2="4" style:stroke="var(--steel)" stroke-width="1.8" /></svg>
+      ><svg width="26" height="8" aria-hidden="true"><line x1="1" y1="4" x2="25" y2="4" style:stroke="var(--link)" stroke-width="1.8" /></svg>
       declared</span
     >
     <span

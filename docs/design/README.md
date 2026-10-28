@@ -19,7 +19,7 @@ carries real information:
 |---|---|
 | Containers drawn as shipping containers | 20′ box = `memory.max` ≤ 512 MiB, 40′ box = > 512 MiB |
 | ISO 6346 container IDs (`SHPU 304812 2`) | Real freight-container format; the boxed digit is a real check digit |
-| Yellow gantry crane over the yard | Follows the current selection |
+| Cobalt gantry crane over the yard | Follows the current selection |
 | Bays (rows) in the yard | Compose stacks |
 | Drums | Volumes; fill = size relative to the largest |
 | Colored layer strips | Image layers; shared base layers share a color |
@@ -91,16 +91,35 @@ memory, plus the backend (rootless, cgroup v2, overlayfs).
 
 ## Visual tokens
 
+The palette is **Cobalt Yard** (chosen 2026-10-28): navy containers on blue-tinted greys,
+one cobalt signal. Blue is Shipyard acting for you: what you selected, the primary
+action, a restart under way. Status colours are their own set (green, yellow, red,
+slate-blue, each tuned for light and dark), never the brand's.
+
 | Token | Light | Dark | Use |
 |---|---|---|---|
-| `--ground` | `#dfe4e1` | `#080d11` | page background |
-| `--window` | `#f7f8f6` | `#10181e` | app surface |
-| `--ink` | `#13202a` | `#e3eae7` | text |
-| `--steel` | `#2c4a5e` | `#2f536b` | container bodies, charts |
-| `--accent` | `#f5b800` | `#f5b800` | crane yellow: selection and primary action only |
-| `--ok` / `--bad` / `--warn` | `#1d9a60` / `#d2453c` / `#d9661a` | — | running / failed / degraded |
-| `--net-a` / `--net-b` | `#2f86d6` / `#8a5cd1` | `#5aa5ea` / `#a685e8` | network colors |
-| `--lay-*` | alpine `#2f9e9e`, bookworm `#c0673f`, distroless `#8c9a3b` | lighter | base-layer families |
+| `--ground` | `#e3e8f0` | `#05080f` | page background |
+| `--window` / `--panel` | `#ffffff` / `#f4f6fa` | `#0f1526` / `#0b101e` | app surface / rail, title and status bars |
+| `--ink` / `--muted` | `#0b1530` / `#4e5b76` | `#e6ebf5` / `#8994ab` | text |
+| `--steel` | `#182b57` | `#24396e` | container bodies, charts |
+| `--link` | steel and ink mixed | the same mix | a link between boxes |
+| `--accent` | `#2f54ff` | `#5b7bff` | cobalt: the crane, the selection and the primary action only |
+| `--ok` / `--warn` / `--bad` / `--pause` | `#16a34a` / `#c29400` / `#d92d3a` / `#6b7a99` | `#2bd47a` / `#f5c518` / `#f25563` / `#8f9bb8` | running / degraded and undeclared / failed and refused / paused |
+| `--warn-ink` | `#8a6a00` | `#f5c518` | the yellow as text (the light theme's fill is too faint to read) |
+| `--net-a` / `--net-b` | `#0e9f9f` / `#8b5cf6` | `#2dd4bf` / `#a78bfa` | network colors (teal, violet: never blue) |
+| `--lay-*` | alpine `#0ea5e9`, bookworm `#db2777`, distroless `#65a30d` | lighter | base-layer families |
+
+**Motion.** One curve (`--ease`) and three speeds (`--t-fast` 120 ms, `--t-base`
+180 ms, `--t-slow` 420 ms for the crane and bars). What moves in a loop or on a view's
+entrance is transform, opacity or a motion path; colour and width changes are short
+transitions on a state change. A view or section comes in with a short fade and a 4 px
+rise; the CPU graph slides one step with each second's sample; the map's dots are CSS
+motion paths along their links (no frame loop); all of it stops under reduced motion.
+
+**Theme.** The title bar's sun/moon button ("Dark mode", a toggle) flips between light
+and dark over the system's choice (`data-theme` on the root, which every token block
+honours), and is remembered for good; until it's first pressed, the system's setting
+rules.
 
 Type: **Big Shoulders Stencil** (IDs and headings only, like container stencils),
 **Hanken Grotesk** (UI), **IBM Plex Mono** (paths, IPs, logs).

@@ -1,7 +1,8 @@
-// The map's dots (step 14.3): they move along the edges with open
-// connections, and a poll's new layout (every 2 s) never wipes the ones in
-// flight. The fixture's edges carry about ten at a time once going: a count
-// that falls to none means they were cleared.
+// The map's dots (step 14.3; CSS motion paths since the Cobalt Yard
+// rework): they move along the edges with open connections, and a poll's new
+// layout (every 2 s) never wipes the ones in flight. The fixture's edges
+// carry about ten at a time once going: a count that falls to none means they
+// were cleared.
 import { expect, test } from "@playwright/test";
 
 test("the dots flow on, poll after poll", async ({ page }) => {
@@ -19,4 +20,11 @@ test("the dots flow on, poll after poll", async ({ page }) => {
     return seen;
   });
   expect(Math.min(...counts), `${counts}`).toBeGreaterThan(0);
+  // CSS moves them (each on its edge's path): a dot is elsewhere a moment later.
+  const at = () => page.locator("circle.packet").first().evaluate((dot) => {
+    const box = dot.getBoundingClientRect();
+    return `${Math.round(box.x)},${Math.round(box.y)}`;
+  });
+  const before = await at();
+  await expect.poll(at, { timeout: 2_000 }).not.toBe(before);
 });

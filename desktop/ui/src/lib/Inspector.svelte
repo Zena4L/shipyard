@@ -126,14 +126,20 @@
   const memMax = $derived(row.memMax ?? (last ? last.limit / MIB : null));
   const mem = $derived(last ? last.mem / MIB : null);
   const pct = $derived(mem !== null && memMax ? Math.min(100, (mem / memMax) * 100) : 0);
+  // The mock's `sparkSVG`: scaled to its own peak (headroom above, a 2 %
+  // floor, so a light load still moves), and at each sample the line slides
+  // one step left over the second while the newest point pulses (CSS: a
+  // transform, keyed by the sample).
   const spark = $derived.by(() => {
     const W = 320;
     const H = 44;
     const n = series.length;
-    const top = Math.max(10, ...series) || 1;
-    const pts = series.map((v, i) => [(i / (n - 1)) * W, H - 3 - (v / top) * (H - 8)] as const);
-    const line = pts.map((p) => p.map((v) => v.toFixed(1)).join(",")).join(" ");
-    return { W, H, line, last: pts[n - 1] ?? [0, 0] };
+    const step = W / (n - 1);
+    const top = Math.max(2, Math.max(...series) * 1.15);
+    const y = (v: number) => H - 3 - (v / top) * (H - 8);
+    const pts = series.map((v, i) => [i * step, y(v)] as const);
+    const line = [[-step, pts[0]?.[1] ?? H] as const, ...pts].map((p) => p.map((v) => v.toFixed(1)).join(",")).join(" ");
+    return { W, H, step, line, last: pts[n - 1] ?? [0, 0] };
   });
 
   const isolation = $derived(focus?.isolation ?? null);
@@ -324,9 +330,13 @@
           aria-hidden="true"
         >
           <line x1="0" x2={spark.W} y1={spark.H / 2} y2={spark.H / 2} stroke="var(--line)" stroke-dasharray="2 4" />
-          <polygon points="0,{spark.H} {spark.line} {spark.W},{spark.H}" fill="var(--steel)" fill-opacity=".14" />
-          <polyline points={spark.line} fill="none" stroke="var(--steel)" stroke-width="1.6" vector-effect="non-scaling-stroke" />
-          <circle cx={spark.last[0]} cy={spark.last[1]} r="3" fill="var(--accent)" stroke="var(--window)" stroke-width="1.5" />
+          {#key last}
+            <g class="sparkroll" style:--step="{spark.step.toFixed(2)}px">
+              <polygon points="{-spark.step},{spark.H} {spark.line} {spark.W},{spark.H}" fill="var(--steel)" fill-opacity=".14" />
+              <polyline points={spark.line} fill="none" stroke="var(--steel)" stroke-width="1.6" vector-effect="non-scaling-stroke" />
+            </g>
+            <circle class="sparknow" cx={spark.last[0]} cy={spark.last[1]} r="3" fill="var(--accent)" stroke="var(--window)" stroke-width="1.5" />
+          {/key}
         </svg>
       </div>
       <div class="metric" style:padding-bottom="12px">

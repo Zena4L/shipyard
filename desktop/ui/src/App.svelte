@@ -7,6 +7,7 @@
   // Networks sections (14.6). Settings (⌘,) open in the inspector's place.
   import { onDestroy, onMount } from "svelte";
   import type { Act } from "./lib/actions";
+  import { currentTheme, onThemeChange, toggleTheme } from "./lib/theme";
   import type { Backend, RunSpec } from "./lib/backend";
   import { FAILURE_HEAD, createStore } from "./lib/store";
   import { monitorsMemory } from "./lib/usage";
@@ -43,6 +44,9 @@
   let view: "yard" | "map" | "list" = $state("map");
   let selected: string | null = $state(null);
   let settings = $state(false);
+  // The theme shown, for the toggle's pressed state (a system change too).
+  let theme = $state(currentTheme());
+  onMount(() => onThemeChange(() => (theme = currentTheme())));
 
   const nodes = $derived(listed(($store.links?.containers ?? []) as LinkNode[], $store.containers));
   const rows = $derived(
@@ -250,7 +254,20 @@
   <div class="titlebar" data-tauri-drag-region>
     <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
     <div class="wintitle" data-tauri-drag-region>Shipyard</div>
-    <button class="cmd" type="button" onclick={() => (runOpen = true)}><span class="long">Run an image…</span><kbd>⌘K</kbd></button>
+    <div class="tbtools">
+      <button class="themebtn" type="button" aria-label="Dark mode" aria-pressed={theme === "dark"} title="Dark mode" onclick={() => (theme = toggleTheme())}
+        ><svg class="moon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 10.2A6 6 0 0 1 5.8 2.5a6 6 0 1 0 7.7 7.7z" fill="currentColor" /></svg
+        ><svg class="sun" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"
+          ><circle cx="8" cy="8" r="3.2" fill="currentColor" /><path
+            d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.4 1.4M11.6 11.6 13 13M3 13l1.4-1.4M11.6 4.4 13 3"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          /></svg
+        ></button
+      >
+      <button class="cmd" type="button" onclick={() => (runOpen = true)}><span class="long">Run an image…</span><kbd>⌘K</kbd></button>
+    </div>
   </div>
 
   <div class="body">

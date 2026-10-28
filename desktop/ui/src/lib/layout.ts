@@ -228,6 +228,12 @@ export function layout(model: MapModel, overlays: Overlays, avail: number): Layo
 /** The most dots on the map at once. */
 export const MAX_DOTS = 200;
 
+/** The most dots looping along one edge. */
+export const MAX_EDGE_DOTS = 4;
+
+/** How fast a dot travels, px a second. */
+export const DOT_SPEED = 140;
+
 /** Dots a second on `edge`: none unless it's active with open connections,
  * more with more (by their logarithm), at most 2.4. */
 export function dotRate(edge: Pick<LaidEdge, "state" | "connections">): number {
