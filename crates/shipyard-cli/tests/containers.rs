@@ -2367,6 +2367,61 @@ fn logs_end_as_their_readers_do_by_name() {
     );
 }
 
+/// An `exec` run with a lower hard limit than the container started with
+/// (14.7: the desktop app's service, started under a desktop session's
+/// RTTIME, failed every shell): rootless, its command keeps to its own
+/// lower limit (a hard limit can't be raised without root), never fails;
+/// as root, it has the container's.
+#[test]
+fn an_exec_under_a_stricter_limit_still_runs() {
+    use std::os::unix::process::CommandExt as _;
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "strict",
+        "--network",
+        "none",
+        &stores.image,
+        "sleep",
+        "300",
+    ]);
+    let mut exec = stores.command(&["exec", "strict", "cat", "/proc/self/limits"]);
+    // SAFETY: `setrlimit` is a system call, async-signal-safe; nothing else
+    // runs between the fork and the exec.
+    unsafe {
+        exec.pre_exec(|| {
+            nix::sys::resource::setrlimit(
+                nix::sys::resource::Resource::RLIMIT_RTTIME,
+                200_000,
+                200_000,
+            )
+            .map_err(std::io::Error::from)
+        });
+    }
+    let ran = exec.output().unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let limits = String::from_utf8_lossy(&ran.stdout).into_owned();
+    let rttime = limits
+        .lines()
+        .find(|line| line.starts_with("Max realtime timeout"))
+        .unwrap_or_else(|| panic!("{limits}"))
+        .to_owned();
+    if shipyard_test_support::is_root() {
+        assert!(rttime.contains("unlimited"), "{rttime}");
+    } else {
+        assert!(rttime.contains("200000"), "{rttime}");
+    }
+    stores.ok(&["rm", "-f", "strict"]);
+}
+
 /// `logs`, `exec`, `cp` and `attach` by name: a stopped container's logs,
 /// and its files copied out and in; exec's exit codes (the command's, 127
 /// for one that isn't there); a running container's file copied out;

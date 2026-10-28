@@ -148,3 +148,10 @@ path = "fuzz_targets/import_change.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "compose_labels"
+path = "fuzz_targets/compose_labels.rs"
+test = false
+doc = false
+bench = false

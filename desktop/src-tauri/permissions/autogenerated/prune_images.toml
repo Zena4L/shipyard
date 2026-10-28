@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prune-images"
+description = "Enables the prune_images command without any pre-configured scope."
+commands.allow = ["prune_images"]
+
+[[permission]]
+identifier = "deny-prune-images"
+description = "Denies the prune_images command without any pre-configured scope."
+commands.deny = ["prune_images"]

@@ -1,0 +1,30 @@
+[package]
+name = "shipyard-desktop"
+description = "Shipyard's desktop app (stage 14): the window around shipyard-client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The console's shell output, a stream read as it comes.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shipyard-client = { path = "../../crates/shipyard-client" }
+tauri = { version = "2", features = [] }
+# The `shipyard` binary chosen by the core's own file dialog (never a path
+# from the page: D14.2's review).
+tauri-plugin-dialog = "2"
+# One app at a time: two would write each other's settings.
+tauri-plugin-single-instance = "2"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+
+[lints]
+workspace = true

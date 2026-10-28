@@ -349,16 +349,11 @@ fn unlink_or_fix(dir: &OwnedFd, name: &OsStr) -> nix::Result<()> {
 ///
 /// The errno of opening or reading it.
 pub(crate) fn list(dir: &OwnedFd) -> nix::Result<Vec<OsString>> {
-    let fresh = open_dir_at(dir, OsStr::new("."))?;
-    let mut listing = nix::dir::Dir::from_fd(fresh)?;
     let mut names = Vec::new();
-    for entry in listing.iter() {
-        let entry = entry?;
-        let name = entry.file_name().to_bytes();
-        if name != b"." && name != b".." {
-            names.push(<OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name).to_owned());
-        }
-    }
+    let _: std::ops::ControlFlow<()> = for_each_name(dir, |name| {
+        names.push(name.to_owned());
+        std::ops::ControlFlow::Continue(())
+    })?;
     Ok(names)
 }
 
@@ -367,7 +362,8 @@ pub(crate) fn list(dir: &OwnedFd) -> nix::Result<Vec<OsString>> {
 pub struct TreeUsage {
     /// The bytes of its files (a file linked more than once counted once).
     pub bytes: u64,
-    /// Whether every directory in it could be read: `false`, there's more.
+    /// Whether all of it was walked: `false`, there's more (a directory
+    /// that couldn't be read, past a [`Budget`], or a mount inside).
     pub complete: bool,
 }
 
@@ -376,6 +372,42 @@ pub struct TreeUsage {
 /// be read (another user's) is left out, and the usage marked incomplete.
 #[must_use]
 pub fn tree_usage(dir: &OwnedFd, name: &OsStr) -> TreeUsage {
+    tree_usage_within(dir, name, &Budget::UNLIMITED)
+}
+
+/// How far a [`tree_usage_within`] may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// The most entries looked at (each a `fstatat`).
+    pub entries: u64,
+    /// The most levels below `name` walked (each holds a descriptor while
+    /// its subtree is walked).
+    pub depth: u32,
+    /// The most directories waiting their turn (each a name held).
+    pub waiting: usize,
+    /// Whether to stay on `name`'s own mount (one inside it, a btrfs
+    /// subvolume too, is neither walked nor counted).
+    pub one_filesystem: bool,
+    /// When to stop, whatever is left.
+    pub until: Option<std::time::Instant>,
+}
+
+impl Budget {
+    /// No bound, every mount: [`tree_usage`]'s.
+    pub const UNLIMITED: Self = Self {
+        entries: u64::MAX,
+        depth: u32::MAX,
+        waiting: usize::MAX,
+        one_filesystem: false,
+        until: None,
+    };
+}
+
+/// [`tree_usage`] within `budget`: past it, what's left is left out and the
+/// usage marked incomplete (a tree someone else fills, a container's
+/// volume, can't hold the walker, its memory or its descriptors).
+#[must_use]
+pub fn tree_usage_within(dir: &OwnedFd, name: &OsStr, budget: &Budget) -> TreeUsage {
     let mut walk = TreeWalk {
         usage: TreeUsage {
             bytes: 0,
@@ -383,47 +415,81 @@ pub fn tree_usage(dir: &OwnedFd, name: &OsStr) -> TreeUsage {
         },
         linked: std::collections::HashSet::new(),
         pending: Vec::new(),
+        budget: *budget,
+        seen: 0,
+        mount: None,
     };
-    match dir.try_clone() {
-        Ok(dir) => walk.visit(&std::rc::Rc::new(dir), name),
-        Err(_) => walk.usage.complete = false,
+    let Ok(dir) = dir.try_clone() else {
+        walk.usage.complete = false;
+        return walk.usage;
+    };
+    if walk.visit(&std::rc::Rc::new(dir), name, 0).is_break() {
+        return walk.usage;
     }
     // A directory is opened when its turn comes, its parent kept open
-    // meanwhile: the descriptors open grow with the tree's depth, never its
-    // width (a container can make a directory of thousands).
-    while let Some((parent, name)) = walk.pending.pop() {
+    // meanwhile: the descriptors open grow with the tree's depth, and the
+    // names waiting with its width, up to the budget's.
+    while let Some((parent, name, depth)) = walk.pending.pop() {
         let Ok(directory) = open_dir_at(&*parent, &name) else {
             walk.usage.complete = false;
             continue;
         };
         drop(parent);
-        let Ok(names) = list(&directory) else {
-            walk.usage.complete = false;
+        if !walk.on_its_mount(&directory) {
             continue;
-        };
+        }
         let directory = std::rc::Rc::new(directory);
-        for child in names {
-            walk.visit(&directory, &child);
+        let read = for_each_name(&directory, |child| walk.visit(&directory, child, depth + 1));
+        match read {
+            Ok(std::ops::ControlFlow::Break(())) => return walk.usage,
+            Ok(std::ops::ControlFlow::Continue(())) => {}
+            Err(_) => walk.usage.complete = false,
         }
     }
     walk.usage
 }
 
-/// A [`tree_usage`] under way.
+/// A [`tree_usage_within`] under way.
 struct TreeWalk {
     usage: TreeUsage,
     /// The files seen with more than one link.
     linked: std::collections::HashSet<(u64, u64)>,
-    /// The directories still to walk: each by its parent and name.
-    pending: Vec<(std::rc::Rc<OwnedFd>, OsString)>,
+    /// The directories still to walk: each by its parent, name and depth.
+    pending: Vec<(std::rc::Rc<OwnedFd>, OsString, u32)>,
+    budget: Budget,
+    /// The entries looked at.
+    seen: u64,
+    /// The first directory's mount, where the walk stays if asked to.
+    mount: Option<u64>,
 }
 
 impl TreeWalk {
-    /// Counts `name` in `parent`, or leaves it to walk later.
-    fn visit(&mut self, parent: &std::rc::Rc<OwnedFd>, name: &OsStr) {
+    /// Counts `name` in `parent` (`depth` levels below the first), or
+    /// leaves it to walk later; past the budget's entries or time, the
+    /// walk's end.
+    fn visit(
+        &mut self,
+        parent: &std::rc::Rc<OwnedFd>,
+        name: &OsStr,
+        depth: u32,
+    ) -> std::ops::ControlFlow<()> {
+        let late = self.seen.is_multiple_of(1024)
+            && self
+                .budget
+                .until
+                .is_some_and(|until| std::time::Instant::now() >= until);
+        if self.seen >= self.budget.entries || late {
+            self.usage.complete = false;
+            return std::ops::ControlFlow::Break(());
+        }
+        self.seen += 1;
         match stat_at(&**parent, name) {
             Ok(Some(stat)) if kind(&stat) == SFlag::S_IFDIR => {
-                self.pending.push((parent.clone(), name.to_owned()));
+                if depth >= self.budget.depth || self.pending.len() >= self.budget.waiting {
+                    self.usage.complete = false;
+                } else {
+                    self.pending.push((parent.clone(), name.to_owned(), depth));
+                }
             }
             Ok(Some(stat)) => {
                 if stat.st_nlink <= 1 || self.linked.insert(identity(&stat)) {
@@ -435,7 +501,155 @@ impl TreeWalk {
             Ok(None) => {}
             Err(_) => self.usage.complete = false,
         }
+        std::ops::ControlFlow::Continue(())
     }
+
+    /// Whether `directory` is on the walk's first mount (always, unless
+    /// asked to stay on one): a mount inside is said, never walked.
+    fn on_its_mount(&mut self, directory: &OwnedFd) -> bool {
+        if !self.budget.one_filesystem {
+            return true;
+        }
+        let Some(mount) = mount_of(directory) else {
+            self.usage.complete = false;
+            return false;
+        };
+        if *self.mount.get_or_insert(mount) == mount {
+            true
+        } else {
+            self.usage.complete = false;
+            false
+        }
+    }
+}
+
+/// The mount `directory` is on: its mount ID on Linux (a btrfs subvolume
+/// has a device of its own but is no mount: `statx`'s `STX_MNT_ID` tells),
+/// its device elsewhere.
+fn mount_of(directory: &OwnedFd) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        shipyard_sys::fs::mount_id(directory).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fstat(directory).ok().map(|stat| identity(&stat).0)
+    }
+}
+
+/// Each name in `directory` but `.` and `..`, handed to `each` as it's read
+/// (a fresh open, so from the beginning), until `each` breaks.
+///
+/// # Errors
+///
+/// The errno of opening or reading it.
+fn for_each_name(
+    directory: &OwnedFd,
+    mut each: impl FnMut(&OsStr) -> std::ops::ControlFlow<()>,
+) -> nix::Result<std::ops::ControlFlow<()>> {
+    let fresh = open_dir_at(directory, OsStr::new("."))?;
+    let mut read = nix::dir::Dir::from_fd(fresh)?;
+    for entry in read.iter() {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if each(<OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name)).is_break() {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+    }
+    Ok(std::ops::ControlFlow::Continue(()))
+}
+
+/// What an entry of a [`listing`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link (never followed).
+    Link,
+    /// Anything else (a FIFO, a socket, a device).
+    Other,
+}
+
+/// One entry of a directory, as a [`listing`] says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// Its name, as the directory holds it.
+    pub name: OsString,
+    /// What it is (`Other` too for one that couldn't be looked at).
+    pub kind: EntryKind,
+    /// Its own size (a directory's own, not its tree's).
+    pub size: u64,
+}
+
+/// The entries of directory `name` in `dir`, by name, at most `max`, the
+/// rest counted; opened without following a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// The first `max` entries, by name (of those read).
+    pub entries: Vec<Listed>,
+    /// How many more there are (of those read).
+    pub more: usize,
+    /// Whether every name was read: `false`, the directory holds more than
+    /// `scan` names, and both are of the first `scan` read.
+    pub complete: bool,
+}
+
+/// Lists directory `name` in `dir`, reading at most `scan` of its names
+/// (a directory of millions costs `scan` names' time, `max` names' memory):
+/// see [`Listing`].
+///
+/// # Errors
+///
+/// The errno of opening or reading it (a link or a non-directory refused).
+pub fn listing(dir: &impl AsFd, name: &OsStr, max: usize, scan: usize) -> nix::Result<Listing> {
+    let directory = open_dir_at(dir, name)?;
+    // The first `max` names in order, kept as they're read (the largest out
+    // when another comes).
+    let mut first: std::collections::BinaryHeap<OsString> = std::collections::BinaryHeap::new();
+    let mut more = 0;
+    let mut read = 0;
+    let complete = for_each_name(&directory, |name| {
+        if read >= scan {
+            return std::ops::ControlFlow::Break(());
+        }
+        read += 1;
+        first.push(name.to_owned());
+        if first.len() > max {
+            first.pop();
+            more += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    })?
+    .is_continue();
+    let entries = first
+        .into_sorted_vec()
+        .into_iter()
+        .map(|name| {
+            let stat = stat_at(&directory, &name).ok().flatten();
+            let kind = match stat.as_ref().map(kind) {
+                Some(SFlag::S_IFREG) => EntryKind::File,
+                Some(SFlag::S_IFDIR) => EntryKind::Directory,
+                Some(SFlag::S_IFLNK) => EntryKind::Link,
+                _ => EntryKind::Other,
+            };
+            Listed {
+                name,
+                kind,
+                size: stat.map_or(0, |stat| u64::try_from(stat.st_size).unwrap_or(0)),
+            }
+        })
+        .collect();
+    Ok(Listing {
+        entries,
+        more,
+        complete,
+    })
 }
 
 /// A file's identity: its device and inode.
@@ -640,6 +854,157 @@ mod tests {
         // A file on its own is its size; nothing at all, nothing.
         assert_eq!(tree_usage(&scratch.fd(), OsStr::new("outside")).bytes, 5000);
         assert_eq!(tree_usage(&scratch.fd(), OsStr::new("none")).bytes, 0);
+    }
+
+    /// A walk within a budget stops past its entries or its depth and says
+    /// so; within it, the same as an unbounded one.
+    #[test]
+    fn a_walk_within_a_budget_stops_and_says_so() {
+        let scratch = Scratch::new("budget");
+        let tree = scratch.0.join("tree");
+        // 300 levels deep, a 10-byte file at the bottom; 50 files of 1 byte.
+        let mut deep = tree.clone();
+        for _ in 0..300 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("bottom"), [0u8; 10]).unwrap();
+        for i in 0..50 {
+            std::fs::write(tree.join(format!("f{i}")), [0u8; 1]).unwrap();
+        }
+        let within = |entries, depth, waiting, until| {
+            tree_usage_within(
+                &scratch.fd(),
+                OsStr::new("tree"),
+                &Budget {
+                    entries,
+                    depth,
+                    waiting,
+                    one_filesystem: true,
+                    until,
+                },
+            )
+        };
+        let all = within(10_000, 1000, 1000, None);
+        assert_eq!(
+            all,
+            TreeUsage {
+                bytes: 60,
+                complete: true
+            }
+        );
+        let shallow = within(10_000, 256, 1000, None);
+        assert!(!shallow.complete, "past its depth");
+        assert_eq!(shallow.bytes, 50, "the bottom file left out");
+        // 20 entries: `tree` itself, then at most 19 files of a byte.
+        let few = within(20, 1000, 1000, None);
+        assert!(!few.complete, "past its entries");
+        assert!(few.bytes <= 19, "{few:?}");
+        let late = within(10_000, 1000, 1000, Some(std::time::Instant::now()));
+        assert_eq!(
+            late,
+            TreeUsage {
+                bytes: 0,
+                complete: false
+            },
+            "past its time"
+        );
+        // No directory may wait: the first level's walked, nothing below.
+        let narrow = within(10_000, 1000, 0, None);
+        assert!(!narrow.complete, "past its waiting");
+    }
+
+    /// A mount inside a tree walked on its own filesystem is neither walked
+    /// nor counted, and the usage said incomplete; walked across, it is
+    /// (the control).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root"]
+    fn a_walk_on_one_filesystem_never_crosses_a_mount() {
+        use nix::mount::{MntFlags, MsFlags, mount, umount2};
+        let scratch = Scratch::new("mount");
+        let inside = scratch.0.join("tree/m");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(scratch.0.join("tree/own"), [0u8; 3]).unwrap();
+        mount(
+            Some("tmpfs"),
+            &inside,
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+        std::fs::write(inside.join("other"), [0u8; 1000]).unwrap();
+        let walk = |one_filesystem| {
+            tree_usage_within(
+                &scratch.fd(),
+                OsStr::new("tree"),
+                &Budget {
+                    one_filesystem,
+                    ..Budget::UNLIMITED
+                },
+            )
+        };
+        let (on_one, across) = (walk(true), walk(false));
+        umount2(&inside, MntFlags::MNT_DETACH).unwrap();
+        assert_eq!(
+            on_one,
+            TreeUsage {
+                bytes: 3,
+                complete: false
+            }
+        );
+        assert_eq!(
+            across,
+            TreeUsage {
+                bytes: 1003,
+                complete: true
+            }
+        );
+    }
+
+    /// A directory's listing: its entries by name, each what it is (a link
+    /// never followed), at most `max`, the rest counted; a link refused as
+    /// the directory itself.
+    #[test]
+    fn a_listing_is_bounded_and_follows_nothing() {
+        let scratch = Scratch::new("listing");
+        let outside = Scratch::new("listing-outside");
+        std::fs::write(outside.0.join("secret"), "x").unwrap();
+        let dir = scratch.0.join("vol");
+        std::fs::create_dir_all(dir.join("b-dir")).unwrap();
+        std::fs::write(dir.join("a-file"), [0u8; 7]).unwrap();
+        std::os::unix::fs::symlink(&outside.0, dir.join("c-link")).unwrap();
+        std::fs::write(dir.join("d-more"), "").unwrap();
+        let listed = listing(&scratch.fd(), OsStr::new("vol"), 3, 100).unwrap();
+        let seen: Vec<(&OsStr, EntryKind)> = listed
+            .entries
+            .iter()
+            .map(|entry| (entry.name.as_os_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (OsStr::new("a-file"), EntryKind::File),
+                (OsStr::new("b-dir"), EntryKind::Directory),
+                (OsStr::new("c-link"), EntryKind::Link),
+            ]
+        );
+        assert_eq!(listed.entries[0].size, 7);
+        assert_eq!(listed.more, 1);
+        assert!(listed.complete);
+        // Two names read of four: what's said is of those two.
+        let scanned = listing(&scratch.fd(), OsStr::new("vol"), 3, 2).unwrap();
+        assert_eq!(
+            (scanned.entries.len(), scanned.more, scanned.complete),
+            (2, 0, false)
+        );
+        std::os::unix::fs::symlink(&outside.0, scratch.0.join("linked")).unwrap();
+        // Refused (Linux says `ELOOP`, macOS `ENOTDIR`), never listed.
+        assert!(matches!(
+            listing(&scratch.fd(), OsStr::new("linked"), 10, 100),
+            Err(Errno::ELOOP | Errno::ENOTDIR)
+        ));
     }
 
     #[test]

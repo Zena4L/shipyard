@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remove-volume"
+description = "Enables the remove_volume command without any pre-configured scope."
+commands.allow = ["remove_volume"]
+
+[[permission]]
+identifier = "deny-remove-volume"
+description = "Denies the remove_volume command without any pre-configured scope."
+commands.deny = ["remove_volume"]

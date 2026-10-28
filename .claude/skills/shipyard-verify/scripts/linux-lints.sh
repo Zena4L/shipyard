@@ -31,7 +31,10 @@ check "clippy glibc" cargo clippy --locked --workspace --all-targets -- -D warni
 check "rustdoc" env RUSTDOCFLAGS="-D warnings" \
     cargo doc --locked --workspace --no-deps --document-private-items
 # The image keeps no package lists (its Dockerfile removes them): fetched first.
-command -v musl-gcc >/dev/null || { apt-get update >/dev/null 2>&1 && apt-get install -y musl-tools >/dev/null 2>&1; } \
+# (apt over IPv4 alone: the mirror answers on IPv6 first, and Docker's VM
+# may have no IPv6 route.)
+apt=(apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=30 -o Acquire::http::Timeout=5)
+command -v musl-gcc >/dev/null || { "${apt[@]}" update >/dev/null 2>&1 && "${apt[@]}" install -y musl-tools >/dev/null 2>&1; } \
     || echo "musl-tools couldn't be installed (no network?): clippy musl will fail" >&2
 rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1
 check "clippy musl" env CC_aarch64_unknown_linux_musl=musl-gcc \

@@ -30,6 +30,8 @@ shipyard-engine = { path = "crates/shipyard-engine" }
 shipyard-sys = { path = "crates/shipyard-sys" }
 # Step 10.3: the macOS VM (D29).
 shipyard-vm = { path = "crates/shipyard-vm" }
+# Step 14.2: the desktop app's client of the API (D14.2-1).
+shipyard-client = { path = "crates/shipyard-client" }
 
 # External crates — versions are pinned here once and inherited by members.
 anyhow = "1"
@@ -138,6 +140,10 @@ tokio = { version = "1", default-features = false, features = [
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = "0.1"
+# Step 14.2: the desktop app's client of Docker's API (D14-6: a maintained
+# client, not one of our own), over a UNIX socket alone.
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 # `%XX` in the API's paths and queries (step 11.2a).
 percent-encoding = "2"

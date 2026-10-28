@@ -96,30 +96,52 @@ fn lease_name<'a>(leases: &[(String, Lease)], record: &'a Record) -> Option<&'a 
         .then_some(record.name.as_str())
 }
 
-/// Every container's address on the networks now, with its ID (from the
-/// networks' live leases): whose a peer's address is. Root's networks only:
-/// none otherwise.
-pub(crate) fn container_addresses(engine: &Engine) -> Vec<(std::net::IpAddr, String)> {
-    let Ok(networks) = networks(engine) else {
-        return Vec::new();
-    };
-    networks
-        .list()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|config| networks.live_leases(&config.name).ok())
-        .flatten()
-        .filter_map(|lease| {
-            let container = lease.container.clone()?;
-            Some(
-                lease
-                    .addresses()
-                    .map(move |ip| (ip, container.clone()))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .flatten()
-        .collect()
+/// Whose each address on the networks is now (their live leases: a
+/// container's ID), the networks' gateways (the host's own addresses on
+/// them), and the networks whose leases couldn't be read (their addresses
+/// unknown, said).
+#[derive(Debug, Default)]
+pub(crate) struct LeaseOwners {
+    pub(crate) owners: std::collections::BTreeMap<std::net::IpAddr, String>,
+    pub(crate) gateways: std::collections::BTreeSet<std::net::IpAddr>,
+    pub(crate) left_out: Vec<String>,
+}
+
+/// [`LeaseOwners`] of root's networks, every address as its IPv4 one
+/// where it's IPv4-mapped.
+///
+/// # Errors
+///
+/// As [`networks`] (not root: [`ErrorKind::NeedsRoot`]);
+/// the networks' list can't be read.
+pub(crate) fn lease_owners(engine: &Engine) -> Result<LeaseOwners> {
+    let networks = networks(engine)?;
+    let mut found = LeaseOwners::default();
+    for config in networks.list()? {
+        found.gateways.insert(config.gateway.to_canonical());
+        if let Some(gateway6) = config.gateway6 {
+            found.gateways.insert(std::net::IpAddr::V6(gateway6));
+        }
+        let leases = match networks.live_leases(&config.name) {
+            Ok(leases) => leases,
+            Err(error) => {
+                found.left_out.push(format!(
+                    "network {}'s leases can't be read: {error}",
+                    config.name
+                ));
+                continue;
+            }
+        };
+        for lease in leases {
+            let Some(container) = lease.container.clone() else {
+                continue;
+            };
+            for ip in lease.addresses() {
+                found.owners.insert(ip.to_canonical(), container.clone());
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The first interface number not in `leases`' (their `eth{n}`), below

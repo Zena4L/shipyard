@@ -63,7 +63,10 @@ pub struct ImageInspect {
     pub parent: String,
     /// A comment: always empty (Shipyard reads no build history).
     pub comment: String,
-    /// When it was built (RFC 3339), or empty.
+    /// When it was built (RFC 3339); left out when the image doesn't say,
+    /// as Docker does (an empty date is no date to a client that parses it:
+    /// `bollard`'s refuses the whole answer).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub created: String,
     /// The container it was committed from: always empty.
     pub container: String,

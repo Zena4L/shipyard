@@ -348,3 +348,194 @@ fn docker_compose_runs_on_the_mac() {
     let left = docker.run(&["ps", "-aq"]);
     assert_eq!(text(&left.stdout), "", "{left:?}");
 }
+
+/// The map's data from the guest (step 14.1a): a compose project's links
+/// through the Mac's `docker.sock`: the one compose declares (`api`
+/// depends on `db` being healthy, so `db` listens first), met; and the
+/// connection `api` holds to `db`, seen in
+/// the guest's socket tables (root's there, so its peer is named), counted
+/// once, on `db`'s port.
+#[test]
+fn the_map_s_links_come_from_the_guest() {
+    let Some(vm) = Vm::new("links") else {
+        return;
+    };
+    let Some(docker) = Docker::new(&vm) else {
+        return;
+    };
+    assert!(vm.shipyard(&["vm", "start"]).status.success());
+    let project = Scratch::in_home("links");
+    std::fs::write(
+        project.0.join("compose.yaml"),
+        format!(
+            "services:\n  db:\n    image: {IMAGE}\n    command: sh -c \"nc -lk -p 5432 -e cat\"\n    \
+             ports: [\"15432:5432\"]\n    \
+             healthcheck:\n      test: [\"CMD-SHELL\", \"netstat -ltn | grep -q :5432\"]\n      \
+             interval: 1s\n  api:\n    image: {IMAGE}\n    command: sh -c \"sleep 600 | nc db \
+             5432\"\n    depends_on:\n      db:\n        condition: service_healthy\n"
+        ),
+    )
+    .unwrap();
+    let in_project = |args: &[&str]| {
+        let mut command = docker.command(args);
+        command.current_dir(&project.0);
+        bounded(command, DOCKER_LIMIT)
+    };
+    let up = in_project(&["compose", "up", "-d"]);
+    assert!(up.status.success(), "{up:?}");
+    let id = |service: &str| {
+        let shown = in_project(&["compose", "ps", "-q", service]);
+        text(&shown.stdout).trim().to_owned()
+    };
+    let (api, db) = (id("api"), id("db"));
+    let began = Instant::now();
+    let (answer, observed) = loop {
+        let got = shipyard_test_support::api::get(&vm.docker_socket(), "/shipyard/links").unwrap();
+        assert_eq!(got.status, 200, "{}", got.text());
+        let answer = got.json();
+        let observed: Vec<serde_json::Value> = answer["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|link| link["kind"] == "observed")
+            .cloned()
+            .collect();
+        if !observed.is_empty() {
+            break (answer, observed);
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "{answer}");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(answer["version"], 1);
+    assert_eq!(answer["observed"]["available"], true, "{answer}");
+    let declared: Vec<&serde_json::Value> = answer["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|link| link["kind"] == "declared")
+        .collect();
+    assert_eq!(declared.len(), 1, "{answer}");
+    assert_eq!(
+        (declared[0]["from"].as_str(), declared[0]["to"].as_str()),
+        (Some(api.as_str()), Some(db.as_str()))
+    );
+    assert_eq!(declared[0]["refused"], false);
+    assert_eq!(observed.len(), 1, "counted once: {answer}");
+    assert_eq!(observed[0]["from"], api.as_str(), "{answer}");
+    assert_eq!(observed[0]["to"], db.as_str(), "{answer}");
+    assert_eq!(observed[0]["port"], 5432);
+    // The published port's own count (step 14.3): api's connection is a
+    // container's, never the host's; a client on the Mac, through the
+    // forwarded port, is.
+    let entry = |answer: &serde_json::Value| {
+        answer["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["container"] == db.as_str() && entry["container_port"] == 5432)
+            .map(|entry| entry["connections"].as_u64().unwrap())
+    };
+    assert_eq!(entry(&answer), Some(0), "{answer}");
+    let _mac_client = std::net::TcpStream::connect(("127.0.0.1", 15432)).unwrap();
+    let began = Instant::now();
+    loop {
+        let got = shipyard_test_support::api::get(&vm.docker_socket(), "/shipyard/links").unwrap();
+        let answer = got.json();
+        if entry(&answer) == Some(1) {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "{answer}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let down = in_project(&["compose", "down", "-t", "1"]);
+    assert!(down.status.success(), "{down:?}");
+}
+
+/// The desktop app's client against the Mac's VM (step 14.2): the VM's
+/// state asked of its host (stopped, then up and serving, then stopped),
+/// the binary's signature, and through `docker.sock` the containers, the
+/// system's info and counts, the links answer, a container's isolation and
+/// the volumes.
+#[test]
+fn the_desktop_client_reaches_the_vm() {
+    use shipyard_client::{api, place, settings, vm};
+    let Some(vm) = Vm::new("client") else {
+        return;
+    };
+    let settings = settings::Settings {
+        vm_dir: Some(vm.dir.clone()),
+        ..settings::Settings::default()
+    };
+    assert_eq!(vm::state(&settings).unwrap(), vm::VmState::Stopped);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(vm::check_signed(std::path::Path::new(vm_support::SHIPYARD)))
+        .unwrap();
+    let started = vm.shipyard(&["vm", "start"]);
+    assert!(started.status.success(), "{started:?}");
+    // As the app does after a start: its host says it serves a moment later.
+    runtime
+        .block_on(vm::wait_serving(&settings, vm::SERVING_WAIT))
+        .unwrap();
+    assert_eq!(
+        vm::state(&settings).unwrap(),
+        vm::VmState::Running {
+            phase: "up",
+            serving: true
+        }
+    );
+    let endpoint = place::api_endpoint(&settings).unwrap();
+    assert_eq!(endpoint.path(), vm.docker_socket());
+    let ran = vm.shipyard(&["run", "-d", "--name", "seen", IMAGE, "sleep", "120"]);
+    assert!(ran.status.success(), "{ran:?}");
+    let client = runtime.block_on(api::Client::connect(&endpoint)).unwrap();
+    let listed = runtime.block_on(client.containers()).unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|container| container.names.iter().flatten().any(|name| name == "/seen")),
+        "{listed:?}"
+    );
+    let info = runtime.block_on(client.info()).unwrap();
+    assert!(info.kernel_version.is_some_and(|kernel| !kernel.is_empty()));
+    let images = usize::try_from(info.images.unwrap()).unwrap();
+    assert!(images >= 1, "{IMAGE}");
+    let networks = runtime.block_on(client.networks()).unwrap();
+    assert!(!networks.is_empty(), "the built-ins");
+    runtime.block_on(client.volume_count()).unwrap();
+    assert_eq!(runtime.block_on(client.links()).unwrap()["version"], 1);
+    // The inspector's and the Volumes section's (step 14.1b), the guest's.
+    let isolation = runtime.block_on(client.isolation("seen")).unwrap();
+    assert_eq!(isolation["version"], 1, "{isolation}");
+    assert!(isolation["cgroup"].is_string(), "{isolation}");
+    assert_eq!(runtime.block_on(client.volumes()).unwrap()["version"], 1);
+    // The live numbers (step 14.8a2): the guest counts a container's memory
+    // and its monitor's (its root hands the controllers down: 14.8b).
+    let usage = runtime
+        .block_on(shipyard_client::usage::usage(&client))
+        .unwrap();
+    let seen_id = listed
+        .iter()
+        .find(|container| container.names.iter().flatten().any(|name| name == "/seen"))
+        .and_then(|container| container.id.clone())
+        .unwrap();
+    let seen = usage
+        .containers
+        .iter()
+        .find(|one| one.id == seen_id)
+        .unwrap_or_else(|| panic!("seen, running: {usage:?}"));
+    assert!(seen.memory > 0, "its memory: {usage:?}");
+    assert!(
+        seen.monitor_memory.is_some_and(|memory| memory > 0),
+        "its monitor's: {usage:?}"
+    );
+    assert!(
+        usage.memory.total > 0 && usage.memory.available > 0,
+        "{usage:?}"
+    );
+    assert!(vm.shipyard(&["vm", "stop"]).status.success());
+    assert_eq!(vm::state(&settings).unwrap(), vm::VmState::Stopped);
+}

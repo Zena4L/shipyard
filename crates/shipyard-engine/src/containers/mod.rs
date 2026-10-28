@@ -44,7 +44,9 @@
 mod config;
 mod created;
 mod id;
+pub mod isolation;
 mod labels;
+pub mod links;
 #[cfg(target_os = "linux")]
 mod locks;
 mod lookup;
@@ -53,6 +55,7 @@ mod record;
 mod starts;
 mod state;
 mod store;
+pub mod usage;
 mod view;
 
 use std::time::Duration;
@@ -139,9 +142,11 @@ use store::{Store, create_drawing};
 pub(crate) use view::shown_command;
 pub(crate) use view::{Gathered, gathered, shown_entrypoint_and_cmd};
 pub use view::{
-    Inspected, InspectedState, Ports, Sock, Sockets, Summary, inspect, ports, published, sockets,
-    summaries,
+    Inspected, InspectedState, Ports, SOCKETS_VERSION, Sock, Sockets, Summary, inspect, ports,
+    published, sockets, summaries,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use view::{init_of, init_sockets};
 
 /// A record's file in its container's directory.
 const RECORD: &str = "record.json";

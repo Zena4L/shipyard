@@ -17,6 +17,10 @@
 # SHIPYARD_SIGN_VERBOSE=1 says which identity signed.
 #
 # usage: scripts/macos/sign.sh [FILE…]
+#        scripts/macos/sign.sh --bundle APP…
+#   --bundle: the desktop app's bundles (step 14.7), signed whole, by the same
+#   identity rule but with no entitlements (the app runs `shipyard`; it
+#   never boots the VM itself).
 #   with no FILE: `shipyard` and `shipyard-runtime` in target/debug and
 #   target/release (and their aarch64-apple-darwin twins), and the test
 #   binaries cargo made beside them (deps/shipyard*): only Mach-O files.
@@ -24,7 +28,12 @@ set -euo pipefail
 # The repository by this script's place, not git: a copy without .git (a
 # mutant's) still signs.
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-entitlements=$repo/contrib/macos/shipyard.entitlements
+entitled=(--entitlements "$repo/contrib/macos/shipyard.entitlements")
+if [ "${1:-}" = --bundle ]; then
+  shift
+  entitled=(--deep)
+  [ "$#" -gt 0 ] || { echo "sign.sh: --bundle needs an app" >&2; exit 2; }
+fi
 if [ "$#" -eq 0 ]; then
   set --
   for dir in "$repo"/target/{debug,release} "$repo"/target/aarch64-apple-darwin/{debug,release}; do
@@ -48,7 +57,7 @@ if [ -z "$identity" ]; then
   [ -n "$identity" ] && found_here=1
 fi
 sign() {
-  codesign --force "$@" --entitlements "$entitlements" "$file" 2>&1
+  codesign --force "$@" "${entitled[@]}" "$file" 2>&1
 }
 [ "${SHIPYARD_SIGN_VERBOSE:-}" = 1 ] && echo "sign.sh: signing with ${identity:-an ad-hoc signature}" >&2
 for file in "$@"; do

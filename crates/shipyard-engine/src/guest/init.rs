@@ -193,6 +193,7 @@ fn boot() -> Result<Child, String> {
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&waited_for()), None)
         .map_err(|e| format!("blocking signals: {e}"))?;
     mount_kernel_file_systems()?;
+    controllers();
     let _ = nix::unistd::sethostname("shipyard");
     load_modules()?;
     network();
@@ -283,6 +284,35 @@ fn mount_kernel_file_systems() -> Result<(), String> {
             std::fs::set_permissions(super::GUEST_TMP, std::fs::Permissions::from_mode(0o1777))
         })
         .map_err(|e| format!("making {}: {e}", super::GUEST_TMP))
+}
+
+/// The cgroup controllers a host's systemd turns on at the root, turned on
+/// here (there's no systemd in the guest): each cgroup Shipyard makes below
+/// is handed what its parent has, so without them a container's and a
+/// monitor's memory and CPU were never counted (`stats`, the desktop app's
+/// live numbers: 14.8b). Said, never fatal: containers run without them.
+fn controllers() {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let available = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
+    let line = root_controllers(&available);
+    if !line.is_empty()
+        && let Err(e) = std::fs::write(root.join("cgroup.subtree_control"), &line)
+    {
+        say(&format!("enabling the cgroup controllers ({line}): {e}"));
+    }
+}
+
+/// The `cgroup.subtree_control` line that turns on, of the kernel's
+/// `available` controllers, those a host's systemd does: CPU, I/O, memory,
+/// processes.
+pub(super) fn root_controllers(available: &str) -> String {
+    const WANTED: [&str; 4] = ["cpu", "io", "memory", "pids"];
+    available
+        .split_whitespace()
+        .filter(|name| WANTED.contains(name))
+        .map(|name| format!("+{name}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The modules, by the image's `modprobe` (the same the kernel runs for
@@ -936,6 +966,18 @@ mod tests {
     /// (`M`) at offset 0, the x86-64 ELF header and its mask (20 bytes each,
     /// `e_machine` 0x3e at byte 18), the interpreter in the share, `C` and
     /// `F` (the interpreter opened at registration: containers run it).
+    /// The root hands down CPU, I/O, memory and processes (a host's
+    /// systemd's), never what the kernel lacks, nor the others it has.
+    #[test]
+    fn the_root_turns_on_systemd_s_controllers() {
+        assert_eq!(
+            root_controllers("cpuset cpu io memory hugetlb pids dmem"),
+            "+cpu +io +memory +pids"
+        );
+        assert_eq!(root_controllers("memory pids"), "+memory +pids");
+        assert_eq!(root_controllers(""), "");
+    }
+
     #[test]
     fn rosetta_s_registration_is_apple_s() {
         let fields: Vec<&str> = ROSETTA_REGISTRATION.split(':').collect();

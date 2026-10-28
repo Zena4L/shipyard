@@ -1,0 +1,45 @@
+# The desktop VM (step 14.7, D14.7-2): Debian 13 (the desktop image's own
+# Debian, so the app built there runs here) with a GNOME desktop in a
+# window of its own (Virtualization.framework's display), to try Shipyard's
+# app on Linux by hand. Made and filled by scripts/macos/desktop-vm.sh: read
+# it before running it. Nothing of the Mac is mounted: the app and
+# `shipyard` are copied in.
+base: template://debian-13
+vmType: vz
+cpus: 4
+memory: 6GiB
+disk: 40GiB
+mounts: []
+video:
+  display: vz
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    # Each fetch given up after 5 s and tried again (a network that drops a
+    # share of new connections: AGENTS.md section 10).
+    # (HTTPS too: this Debian's mirror is HTTPS; and no growing delay
+    # between tries, which made a drop cost minutes.)
+    printf '%s\n' 'Acquire::ForceIPv4 "true";' 'Acquire::Retries "30";' \
+      'Acquire::Retries::Delay "false";' \
+      'Acquire::http::Timeout "5";' 'Acquire::https::Timeout "5";' > /etc/apt/apt.conf.d/99flaky
+    apt-get update
+    # A desktop, the app's libraries (WebKitGTK 4.1), and rootless
+    # Shipyard's tools.
+    apt-get install -y --no-install-recommends gnome-core gdm3 \
+      libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-common \
+      uidmap passt busybox-static
+    # The Lima user logs in to the desktop at boot (it has no password).
+    mkdir -p /etc/gdm3
+    cat > /etc/gdm3/custom.conf <<CONF
+    [daemon]
+    AutomaticLoginEnable=true
+    AutomaticLogin={{.User}}
+    WaylandEnable=false
+    CONF
+    # Rootless Shipyard: the user's subordinate IDs, if the image's user
+    # was made without them.
+    grep -q "^{{.User}}:" /etc/subuid || usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "{{.User}}"
+    systemctl set-default graphical.target

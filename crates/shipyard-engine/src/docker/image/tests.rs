@@ -174,3 +174,16 @@ fn an_image_s_created_time_is_in_seconds() {
     unsaid.config.about.created = None;
     assert_eq!(created_seconds(&unsaid), 0);
 }
+
+/// An image whose config says no time (a test fixture, a reproducible
+/// build) has no `Created` at all, as Docker's: an empty date is one a
+/// client that parses it refuses (the desktop app's `bollard` did).
+#[test]
+fn an_image_with_no_time_says_none() {
+    let mut undated = read(r#"{"Cmd":["sh"]}"#);
+    undated.pulled.config.about.created = None;
+    let shown = serde_json::to_value(inspected(&undated)).unwrap();
+    assert!(shown.get("Created").is_none(), "{shown}");
+    let dated = serde_json::to_value(inspected(&read(r#"{"Cmd":["sh"]}"#))).unwrap();
+    assert_eq!(dated["Created"], "2026-10-06T04:47:34.795670471Z");
+}

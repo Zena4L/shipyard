@@ -268,7 +268,7 @@ mod linux {
         ThrottlingData, host_cpu, net_dev,
     };
     use crate::Engine;
-    use crate::containers::{self, ContainerState};
+    use crate::containers;
     use crate::error::Result;
 
     pub(super) fn stats(
@@ -368,10 +368,7 @@ mod linux {
 
     /// Whether `record`'s container is running or paused now.
     fn is_up(engine: &Engine, record: &containers::Record) -> Result<bool> {
-        Ok(matches!(
-            containers::state(engine, record)?,
-            ContainerState::Running { .. } | ContainerState::Paused
-        ))
+        Ok(containers::state(engine, record)?.is_up())
     }
 
     /// The most of `/proc/PID/net/dev` read: a line an interface, and a

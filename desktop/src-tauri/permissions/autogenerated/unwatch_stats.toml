@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unwatch-stats"
+description = "Enables the unwatch_stats command without any pre-configured scope."
+commands.allow = ["unwatch_stats"]
+
+[[permission]]
+identifier = "deny-unwatch-stats"
+description = "Denies the unwatch_stats command without any pre-configured scope."
+commands.deny = ["unwatch_stats"]

@@ -172,6 +172,21 @@ pub fn stats(_root: &Path, _id: &str) -> Result<(crate::cgroup::Stats, u64)> {
     Err(ContainerError::LinuxOnly)
 }
 
+/// Monitors' cgroups are Linux's: none.
+#[must_use]
+pub fn monitor_memory(_id: &str) -> Option<u64> {
+    None
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
+pub fn peek_stats(_root: &Path, _id: &str) -> Result<Option<crate::cgroup::Stats>> {
+    Err(ContainerError::LinuxOnly)
+}
+
 /// Containers need Linux.
 ///
 /// # Errors

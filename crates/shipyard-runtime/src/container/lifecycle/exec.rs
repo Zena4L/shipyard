@@ -324,6 +324,15 @@ fn narrowed(
     } else {
         let mut spec = base.clone();
         spec.args.clone_from(&options.args);
+        // The container's limits, each no higher than this process's own
+        // where it can't raise one: rootless, a hard limit is lowered,
+        // never raised, and a service started under a stricter session
+        // (a desktop's, 14.7) would otherwise fail every exec.
+        within_own(
+            &mut spec.rlimits,
+            &crate::process::current_rlimits(),
+            nix::unistd::geteuid().is_root(),
+        );
         (spec, None, base_security.no_new_privileges, None)
     };
     if let Some(cwd) = &options.cwd {
@@ -424,6 +433,26 @@ fn beyond(
 }
 
 /// Whether limit `ours` is above `theirs` (unlimited is the most).
+/// `limits` (the container's, an exec takes them) each lowered to `own`'s
+/// hard limit of its kind when it's above it and this process can't raise
+/// a hard limit (`root`: it can). Never above the container's: only lower.
+fn within_own(limits: &mut [crate::process::Rlimit], own: &[crate::process::Rlimit], root: bool) {
+    if root {
+        return;
+    }
+    for limit in limits {
+        let Some(ours) = own.iter().find(|ours| ours.kind == limit.kind) else {
+            continue;
+        };
+        if above(limit.hard, ours.hard) {
+            limit.hard = ours.hard;
+        }
+        if above(limit.soft, limit.hard) {
+            limit.soft = limit.hard;
+        }
+    }
+}
+
 fn above(ours: RlimitValue, theirs: RlimitValue) -> bool {
     match (ours, theirs) {
         (_, RlimitValue::Unlimited) => false,
@@ -728,6 +757,49 @@ mod tests {
         assert!(!above(RlimitValue::Unlimited, RlimitValue::Unlimited));
         assert!(above(finite(6), finite(5)));
         assert!(!above(finite(5), finite(5)));
+    }
+
+    /// An exec takes the container's limits, each lowered to its own hard
+    /// one when it can't raise it (rootless): a service started under a
+    /// stricter session (a desktop's RTTIME) must still exec. Never raised,
+    /// and root keeps the container's.
+    #[test]
+    fn an_exec_keeps_to_its_own_hard_limits_rootless() {
+        use crate::process::{Rlimit, RlimitKind};
+        let finite = RlimitValue::Finite;
+        let limit = |kind, soft, hard| Rlimit { kind, soft, hard };
+        let container = vec![
+            limit(
+                RlimitKind::Rttime,
+                RlimitValue::Unlimited,
+                RlimitValue::Unlimited,
+            ),
+            limit(RlimitKind::Nofile, finite(1024), finite(4096)),
+            limit(RlimitKind::Core, finite(0), finite(0)),
+        ];
+        let own = vec![
+            limit(RlimitKind::Rttime, finite(200_000), finite(200_000)),
+            limit(RlimitKind::Nofile, finite(1024), finite(524_288)),
+            limit(
+                RlimitKind::Core,
+                RlimitValue::Unlimited,
+                RlimitValue::Unlimited,
+            ),
+        ];
+        let mut rootless = container.clone();
+        within_own(&mut rootless, &own, false);
+        assert_eq!(
+            rootless,
+            vec![
+                limit(RlimitKind::Rttime, finite(200_000), finite(200_000)),
+                // Lower than its own already: the container's, never raised.
+                limit(RlimitKind::Nofile, finite(1024), finite(4096)),
+                limit(RlimitKind::Core, finite(0), finite(0)),
+            ]
+        );
+        let mut root = container.clone();
+        within_own(&mut root, &own, true);
+        assert_eq!(root, container);
     }
 
     fn state_dir() -> (std::path::PathBuf, OwnedFd) {

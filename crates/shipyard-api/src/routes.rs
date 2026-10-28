@@ -12,6 +12,27 @@ pub use shipyard_engine::docker::{API_VERSION, MIN_API_VERSION};
 const NEWEST: (u32, u32) = (1, 43);
 const OLDEST: (u32, u32) = (1, 24);
 
+/// Shipyard's own endpoints (`/shipyard/…`: `own.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Own {
+    /// `GET /shipyard/containers/{id}`: Shipyard's view of a container.
+    Container(String),
+    /// `GET /shipyard/networks/{name}`: Shipyard's view of a network.
+    Network(String),
+    /// `GET /shipyard/containers/{id}/sockets`: a container's sockets.
+    Sockets(String),
+    /// `GET /shipyard/links`: every container's links, for the UI's map.
+    Links,
+    /// `GET /shipyard/containers/{id}/isolation`: a running container's
+    /// namespaces, cgroup, command and user mapping.
+    Isolation(String),
+    /// `GET /shipyard/volumes`: every volume's size and top level.
+    Volumes,
+    /// `GET /shipyard/usage`: what the host, the containers and the
+    /// monitors use now.
+    Usage,
+}
+
 /// An endpoint, with the object (container, exec, image) its path names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Route {
@@ -107,10 +128,8 @@ pub(crate) enum Route {
     ArchiveHead(String),
     /// `PUT /containers/{id}/archive`.
     ArchivePut(String),
-    /// `GET /shipyard/containers/{id}`: Shipyard's own view.
-    OwnContainer(String),
-    /// `GET /shipyard/networks/{name}`: Shipyard's own view.
-    OwnNetwork(String),
+    /// `GET /shipyard/…`: Shipyard's own views.
+    Own(Own),
     /// `GET /networks`.
     ListNetworks,
     /// `POST /networks/create`.
@@ -255,8 +274,7 @@ pub(crate) fn route(method: &Method, path: &str) -> Result<Route, ApiError> {
         (&Method::POST, ["volumes", "prune"]) => Route::Prune(Prune::Volumes),
         (&Method::GET, ["volumes", name]) => Route::InspectVolume(decoded(name)?),
         (&Method::DELETE, ["volumes", name]) => Route::RemoveVolume(decoded(name)?),
-        (&Method::GET, ["shipyard", "containers", id]) => Route::OwnContainer(decoded(id)?),
-        (&Method::GET, ["shipyard", "networks", name]) => Route::OwnNetwork(decoded(name)?),
+        (&Method::GET, ["shipyard", rest @ ..]) => Route::Own(own(rest, &decoded)?),
         (&Method::GET, ["networks"]) => Route::ListNetworks,
         (&Method::POST, ["networks", "create"]) => Route::CreateNetwork,
         (&Method::POST, ["networks", "prune"]) => Route::Prune(Prune::Networks),
@@ -267,6 +285,24 @@ pub(crate) fn route(method: &Method, path: &str) -> Result<Route, ApiError> {
         _ => return Err(not_found()),
     };
     Ok(route)
+}
+
+/// One of Shipyard's own views, by the parts of its path after
+/// `/shipyard` (a `GET`), each name `decoded`.
+fn own(
+    parts: &[&str],
+    decoded: &dyn Fn(&str) -> Result<String, ApiError>,
+) -> Result<Own, ApiError> {
+    Ok(match parts {
+        ["containers", id] => Own::Container(decoded(id)?),
+        ["networks", name] => Own::Network(decoded(name)?),
+        ["containers", id, "sockets"] => Own::Sockets(decoded(id)?),
+        ["containers", id, "isolation"] => Own::Isolation(decoded(id)?),
+        ["links"] => Own::Links,
+        ["volumes"] => Own::Volumes,
+        ["usage"] => Own::Usage,
+        _ => return Err(not_found()),
+    })
 }
 
 /// Docker's answer for a path it doesn't serve.
@@ -420,6 +456,55 @@ mod tests {
         ));
     }
 
+    /// Shipyard's own views, under `/shipyard`, versioned or not; another
+    /// method, or a path it doesn't serve, is Docker's `page not found`.
+    #[test]
+    fn shipyard_s_own_views_are_found() {
+        let cases = [
+            (
+                Method::GET,
+                "/shipyard/containers/web",
+                Route::Own(Own::Container("web".to_owned())),
+            ),
+            (
+                Method::GET,
+                "/v1.43/shipyard/networks/app",
+                Route::Own(Own::Network("app".to_owned())),
+            ),
+            (
+                Method::GET,
+                "/shipyard/containers/web/sockets",
+                Route::Own(Own::Sockets("web".to_owned())),
+            ),
+            (Method::GET, "/shipyard/links", Route::Own(Own::Links)),
+            (
+                Method::GET,
+                "/shipyard/containers/web/isolation",
+                Route::Own(Own::Isolation("web".to_owned())),
+            ),
+            (Method::GET, "/shipyard/volumes", Route::Own(Own::Volumes)),
+            (Method::GET, "/shipyard/usage", Route::Own(Own::Usage)),
+        ];
+        for (method, path, route) in cases {
+            assert_eq!(
+                super::route(&method, path).unwrap(),
+                route,
+                "{method} {path}"
+            );
+        }
+        for (method, path) in [
+            (Method::POST, "/shipyard/links"),
+            (Method::GET, "/shipyard/containers/web/nothing"),
+        ] {
+            let refused = super::route(&method, path).unwrap_err();
+            assert_eq!(
+                refused.status,
+                hyper::StatusCode::NOT_FOUND,
+                "{method} {path}"
+            );
+        }
+    }
+
     /// The image, volume and archive endpoints: an image's name keeps its `/`s.
     #[test]
     fn image_volume_and_archive_endpoints_are_found() {
@@ -441,16 +526,6 @@ mod tests {
                 Method::PUT,
                 "/containers/web/archive",
                 Route::ArchivePut("web".to_owned()),
-            ),
-            (
-                Method::GET,
-                "/shipyard/containers/web",
-                Route::OwnContainer("web".to_owned()),
-            ),
-            (
-                Method::GET,
-                "/v1.43/shipyard/networks/app",
-                Route::OwnNetwork("app".to_owned()),
             ),
             (Method::GET, "/networks", Route::ListNetworks),
             (Method::POST, "/networks/create", Route::CreateNetwork),
