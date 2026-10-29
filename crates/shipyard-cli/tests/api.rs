@@ -2599,11 +2599,15 @@ fn a_finished_exec_s_session_ends_both_ways() {
 
 /// An exec's command gets its container's descriptor limit (the runtime's
 /// snapshot of it), never the one the service raised for itself (F151's
-/// premise, checked: the container here was started with this test's own
-/// soft limit). The control: the service's own soft limit is its hard one.
+/// premise, checked: the container here is given a limit of its own, below
+/// the service's, which a host whose soft and hard limits are equal (GitHub's
+/// runners: 65536 both) would otherwise make the same). The control: the
+/// service's own soft limit is its hard one.
 #[test]
 fn an_exec_gets_its_container_s_descriptor_limit() {
     use std::io::Read as _;
+    /// The container's own limit, soft and hard: below any service's.
+    const CONTAINER_NOFILE: u64 = 512;
     let Some(stores) = Stores::new() else { return };
     assert!(
         stores
@@ -2612,6 +2616,8 @@ fn an_exec_gets_its_container_s_descriptor_limit() {
                 "-d",
                 "--network",
                 "none",
+                "--ulimit",
+                &format!("nofile={CONTAINER_NOFILE}"),
                 "--name",
                 "box",
                 &stores.image,
@@ -2623,8 +2629,8 @@ fn an_exec_gets_its_container_s_descriptor_limit() {
     );
     let (_, hard) =
         nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
-    if hard <= 1024 {
-        eprintln!("skipping: the hard descriptor limit is 1024 here");
+    if hard <= CONTAINER_NOFILE {
+        eprintln!("skipping: the hard descriptor limit is {hard} here");
         return;
     }
     let service = stores.serve_limited(60, (1024, hard));
@@ -2652,11 +2658,9 @@ fn an_exec_gets_its_container_s_descriptor_limit() {
     assert_eq!(status, 101);
     let mut out = Vec::new();
     session.read_to_end(&mut out).unwrap();
-    let (soft, _) =
-        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
     let said = String::from_utf8_lossy(&out);
     assert!(
-        said.contains(&format!("{soft}\n")),
+        said.contains(&format!("{CONTAINER_NOFILE}\n")),
         "the container's: {said:?}"
     );
     assert!(

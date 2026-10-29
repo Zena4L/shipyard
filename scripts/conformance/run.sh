@@ -190,7 +190,8 @@ for name in "${selected[@]}"; do
         deviations=$((deviations + 1))
         printf '%-32s %-6s %-8s DEVIATION %s\n' "$name" "$status" "$got" "${note:0:120}"
         [ "$got" != pass ] && {
-            echo "---- $name: the end of its TAP and stderr"
+            echo "---- $name: its failures, then the end of its TAP and stderr"
+            grep -A8 '^not ok' "$logs/$name.tap" | head -60
             tail -25 "$logs/$name.tap"
             tail -10 "$logs/$name.err"
             echo "----"

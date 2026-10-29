@@ -218,13 +218,29 @@ mod tests {
         }
     }
 
+    /// A test's own place, below a directory this process trusts: its
+    /// temporary directory, unless that's another user's (the tests run as
+    /// root with a user's `TMPDIR`, as GitHub's macOS root job does: rightly
+    /// untrusted), then `/tmp` (root's, sticky).
+    fn scratch(name: &str) -> PathBuf {
+        use std::os::unix::fs::MetadataExt as _;
+        let mine = std::env::temp_dir();
+        let owner = std::fs::metadata(&mine).map(|meta| meta.uid()).ok();
+        let me = nix::unistd::geteuid().as_raw();
+        let base = if owner == Some(me) || owner == Some(0) {
+            mine
+        } else {
+            PathBuf::from("/tmp")
+        };
+        base.join(format!("{name}-{}", std::process::id()))
+    }
+
     /// The settings' choice first (refused, never replaced, when it can't
     /// be run), then `SHIPYARD_BIN`, then beside the app, then `PATH`; a
     /// relative `PATH` entry never searched, even one that leads to one.
     #[test]
     fn shipyard_is_found_in_its_order() {
-        let dir =
-            std::env::temp_dir().join(format!("shipyard-client-place-{}", std::process::id()));
+        let dir = scratch("shipyard-client-place");
         let _ = std::fs::remove_dir_all(&dir);
         programs(&dir, &["chosen", "env", "beside", "path"]);
         let at = |name: &str| dir.join(name).join("shipyard");
@@ -271,8 +287,7 @@ mod tests {
     #[test]
     fn a_program_others_could_change_is_never_trusted() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir =
-            std::env::temp_dir().join(format!("shipyard-client-trust-{}", std::process::id()));
+        let dir = scratch("shipyard-client-trust");
         let _ = std::fs::remove_dir_all(&dir);
         programs(&dir, &["mine"]);
         let program = dir.join("mine/shipyard");
