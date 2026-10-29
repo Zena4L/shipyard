@@ -347,6 +347,10 @@ fn a_ready_host_is_ready_as_root() {
                 return;
             }
         }
+        // Bridged frames meet the chain as Docker makes them (`br_netfilter`,
+        // where it's loaded: not on Fedora), and only then is a rule between
+        // the containers asked for.
+        let bridged = std::fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "1").is_ok();
         let report = doctor(|command| {
             command.env("SHIPYARD_IMAGE_STORE", scratch.0.join("store"));
         });
@@ -356,8 +360,13 @@ fn a_ready_host_is_ready_as_root() {
             text.starts_with("Docker's firewall drops forwarded traffic"),
             "{text}"
         );
-        assert!(
+        assert_eq!(
             text.contains("sudo iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT"),
+            bridged,
+            "{text}"
+        );
+        assert!(
+            text.contains("sudo iptables -I DOCKER-USER -o shipyard0 -m conntrack"),
             "{text}"
         );
         assert_eq!(report.code, Some(0), "a warning only: {}", report.stdout);

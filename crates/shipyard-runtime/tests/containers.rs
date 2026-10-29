@@ -927,7 +927,11 @@ impl PlanTest {
                 .push(shipyard_runtime::isolation::Namespace::User);
             isolation.id_maps = Some(shipyard_runtime::process::rootless_id_maps().maps);
         }
-        let spec = ProcessSpec::new(vec!["sh".into(), "-c".into(), script.into()]);
+        let mut spec = ProcessSpec::new(vec!["sh".into(), "-c".into(), script.into()]);
+        // A PATH, as an image's config gives one: a shell's own default may
+        // not name `/bin`, where the test root keeps its programs (Fedora's
+        // bash: `/usr/local/bin:/usr/bin`).
+        spec.env.fill_default_path();
         shipyard_runtime::container::Plan::new(spec, isolation)
     }
 

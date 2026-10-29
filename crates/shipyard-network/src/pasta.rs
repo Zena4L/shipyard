@@ -591,6 +591,23 @@ fn start_time(pid: i32) -> Option<u64> {
     shipyard_sys::proc::start_time(pid)
 }
 
+/// What a silent failure of root's pasta may come from, where SELinux
+/// enforces: Fedora confines pasta (`pasta_t`), whose policy grants
+/// `sys_admin` only within a user namespace, so as root it can't join a
+/// network namespace root owns. Empty anywhere else.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "pasta's launcher is Linux's")
+)]
+fn silence_hint(root: bool, selinux_enforcing: bool) -> &'static str {
+    if root && selinux_enforcing {
+        ": as root with SELinux enforcing, pasta's policy may keep it from joining the \
+         container's network (give root's containers a bridge network, their default)"
+    } else {
+        ""
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs::File;
@@ -1021,12 +1038,16 @@ mod linux {
         command
     }
 
-    /// What pasta's log says (or that it said nothing).
+    /// What pasta's log says (or that it said nothing, and, where SELinux
+    /// may be why, that too).
     fn said_in(log: &Path) -> String {
         let text = std::fs::read_to_string(log).unwrap_or_default();
         let text = text.trim();
         if text.is_empty() {
-            "it said nothing".to_owned()
+            let enforcing = std::fs::read_to_string("/sys/fs/selinux/enforce")
+                .is_ok_and(|value| value.trim() == "1");
+            let root = nix::unistd::geteuid().is_root();
+            format!("it said nothing{}", super::silence_hint(root, enforcing))
         } else {
             text.to_owned()
         }
@@ -1573,6 +1594,13 @@ fn detached_arguments(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn a_silent_failure_says_selinux_only_for_root_where_it_enforces() {
+        assert!(silence_hint(true, true).contains("SELinux enforcing"));
+        assert_eq!(silence_hint(true, false), "");
+        assert_eq!(silence_hint(false, true), "");
+    }
 
     /// What pasta can do is asked once per binary (F50): a fake pasta that
     /// counts its runs is run once for two asks, again once it's another

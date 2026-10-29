@@ -501,16 +501,22 @@ impl Pass {
 }
 
 /// What lets `view`'s forwarded traffic through a chain of `family` that
-/// drops it: between its containers; out by the host's ways out (only
-/// those: never into another program's bridges, Docker's, whose containers
-/// its own rules keep apart); and replies and published ports coming in.
+/// drops it: between its containers (where bridged frames meet it); out by
+/// the host's ways out (only those: never into another program's bridges,
+/// Docker's, whose containers its own rules keep apart); and replies and
+/// published ports coming in.
 fn passes(view: &NetworkView<'_>, family: u8) -> Vec<Pass> {
     let bridge = view.bridge.to_owned();
-    let mut passes = vec![Pass {
-        input: Some(bridge.clone()),
-        output: bridge.clone(),
-        replies: false,
-    }];
+    let mut passes = Vec::new();
+    // Containers on one bridge meet a forward chain only where bridged
+    // frames meet the IP hooks: nothing to let through between them else.
+    if view.bridged {
+        passes.push(Pass {
+            input: Some(bridge.clone()),
+            output: bridge.clone(),
+            replies: false,
+        });
+    }
     if view.outward {
         // With no way out known, there's nothing to let out.
         for uplink in uplinks(view, family) {
@@ -1089,6 +1095,22 @@ mod tests {
         assert_eq!(
             assess(&docker(), &[], &bridged)[0].fix,
             ["sudo iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT"]
+        );
+        // A network with a way out there: the way out's rules alone, as the
+        // warning says only what it keeps (Fedora, without br_netfilter).
+        let outward = NetworkView {
+            bridged: false,
+            ..view()
+        };
+        let conflict = &assess(&docker(), &[], &outward)[0];
+        assert!(!conflict.blocks.each_other);
+        assert_eq!(
+            conflict.fix,
+            [
+                "sudo iptables -I DOCKER-USER -i shipyard0 -o eth0 -j ACCEPT",
+                "sudo iptables -I DOCKER-USER -o shipyard0 -m conntrack --ctstate \
+                 RELATED,ESTABLISHED,DNAT -j ACCEPT"
+            ]
         );
     }
 

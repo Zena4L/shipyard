@@ -2740,7 +2740,7 @@ fn poststart_runs_once_the_program_has_started() {
     let mut config = bundle.config();
     config["process"]["args"] = json!(["sleep", "30"]);
     config["hooks"] = json!({
-        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "sleep 1"]}],
+        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "/bin/sleep 1"]}],
         "poststart": [{"path": "/bin/sh", "args": ["sh", "-c", format!(
             "pid=$(sed -n 's/.*\"pid\":\\([0-9]*\\).*/\\1/p'); \
              for child in $(cat /proc/$pid/task/$pid/children); do \
@@ -2777,7 +2777,7 @@ fn a_hooks_leftover_doesnt_hold_poststart_back() {
     let mut config = bundle.config();
     config["process"]["args"] = json!(["sleep", "30"]);
     config["hooks"] = json!({
-        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "sleep 30 >/dev/null 2>&1 &"]}],
+        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "/bin/sleep 30 >/dev/null 2>&1 &"]}],
         "poststart": [{"path": "/bin/true"}],
     });
     bundle.write(&config);
