@@ -1,0 +1,33 @@
+name: Bug report
+description: Something Shipyard does wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The commands you ran, as you typed them, and their output.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Where
+      description: The output of `shipyard version` and `shipyard doctor`, and your OS (Linux distribution and kernel, or macOS version).
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Running as
+      options: [rootless (your own user), root, on a Mac (Shipyard's VM)]
+    validations:
+      required: true

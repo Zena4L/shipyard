@@ -5,7 +5,7 @@ Fill in the brackets, then give it to a fresh background agent.
 ---
 
 You are reviewing [step N of stage M: what it built] in Shipyard, a daemonless container
-engine in Rust (/Users/clementbogyah/Desktop/shipyard). Read `AGENTS.md` first: its code
+engine in Rust (this repository). Read `AGENTS.md` first: its code
 rules (section 5), architecture (section 4) and map (section 3) are the standard you
 review against.
 

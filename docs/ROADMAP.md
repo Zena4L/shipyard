@@ -27,7 +27,7 @@ namespaces and cgroups, so those stages also use the man pages (`namespaces(7)`,
 | 12 | **Build & images** | `shipyard build` driving BuildKit started on demand (D28; in a user-namespaced container per build, D12-2); `push`, `tag`, `login`/`logout` (Docker's config, the Mac's hand-over), image `inspect` / `history` / `save` / `load`, `import`/`export` | BuildKit, OCI image & distribution specs | done ([notes](stages/12-build-images.md)) |
 | 13 | **macOS production** | The Mac path made production-grade: Rosetta, the VM's size from the Mac (the balloon tried, not kept: D13.2-2, F168), clock sync after sleep, file sharing beyond the home (virtiofs as it is: D13.4-2), UDP ports and the guest's guard, start on use and stop when idle (an opt-in start at login), the forwarded CLI's wire fixed (D13-1), a stable local signing identity (notarization scripted for stage 15: D13-3); Apple Silicon only (D29) | Virtualization.framework, vsock, virtiofs | **done** ([notes](stages/13-macos.md)) |
 | 14 | **Desktop UI** | The [design](design/README.md), built on the stage 11 API; the observed-traffic map first; macOS first, then Linux (D14-1..6) | Tauri 2, Svelte | **done** ([notes](stages/14-ui.md)) |
-| 15 | **Hardening & v1.0** | OCI conformance as expected (it runs since stage 8), fuzzing and mutation checks on every parser and state machine, benchmarks, signed reproducible releases, packages (Homebrew, `.deb`, `.rpm`), a docs site; green CI; **the first public release** (D21, D30) | [FEATURES.md §16](FEATURES.md#16-production-quality--ongoing-from-stage-1-finalized-in-stage-15) | |
+| 15 | **Hardening & v1.0** | OCI conformance as expected (it runs since stage 8), fuzzing and mutation checks on every parser and state machine, benchmarks, signed reproducible releases, packages (Homebrew, `.deb`, `.rpm`), a docs site; green CI; **the first public release** (D21, D30) | [FEATURES.md §16](FEATURES.md#16-production-quality--ongoing-from-stage-1-finalized-in-stage-15) | in progress |
 
 Each finished stage gets **stage notes** in [`stages/`](stages/): what was built and why,
 macOS and Linux differences, the failure modes and how they're handled, known limitations,
@@ -162,7 +162,7 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
 | F186 | low | 13.8c's readiness review (guest): the clock follows any stamped request back without bound after the agent's first minute (a buggy Mac caller sets it back days); `fold` lowercases rather than case-folds (APFS takes `ſ` for `s`: the mount-ID check still holds); a failed agent spawn at boot powers the VM off (`init.rs`'s `start_agent()?`); `musl-tools` and the `rust:1-trixie` base of the guest's build aren't pinned | bound a step back (or two polls agreeing); Unicode case folding; the agent's spawn retried; pin the build image by digest | 15 |
 | F187 | low | 13.8c's readiness review (platforms, tests): a variant asked of another platform is dropped (`--platform linux/amd64/v3` read as `linux/amd64`); an image stored for another platform is pulled again under `missing` and its pull's failure says nothing of it; `comes_back` counts an `on-failure` container up as one that ends 143; the Rosetta VM test skips unless `SHIPYARD_TEST_ROSETTA=required`, by `doctor`'s wording; `an_accepted_connection_is_blocking` has no control | keep the asked variant; the other-platform error kept and said with a failed pull; the recorded exit; `verify.sh --vm` sets the variable on a Mac with Rosetta; a control that a plain accept is non-blocking | 15 |
 | F188 | low | 13.8c (2026-10-27): a host killed, or the Mac's power lost, within the second between the guest's ready mark and the host's next ask, after a command made something on a first boot's disk, loses what it made (the disk is made anew at the next start) | the guest says it's ready on its own (a frame to the host), not asked for | 15 |
-| F189 | low | 14.2's Murphy review (desktop app): the app reads only the default VM directory (a GUI app has launchd's environment, not `SHIPYARD_VM_DIR`); `desktop.json` keeps a `vm_dir`, but nothing in the window sets it, so a VM run from another directory looks stopped and the app may start a second one in the default place | a VM directory chosen in Settings (the core's own folder dialog), or the app reading the CLI's choice | 14 |
+| F189 | low | 14.2's Murphy review (desktop app): the app reads only the default VM directory (a GUI app has launchd's environment, not `SHIPYARD_VM_DIR`); `desktop.json` keeps a `vm_dir`, but nothing in the window sets it, so a VM run from another directory looks stopped and the app may start a second one in the default place | a VM directory chosen in Settings (the core's own folder dialog), or the app reading the CLI's choice | 15 (moved from 14: not done by its close) |
 | F191 | low | 14.2's verify (2026-10-27), the first VM run on the guest's Linux 6.18.59: `a_build_in_the_home_runs` ended 139 (a SIGSEGV) once, right after BuildKit's layers were pulled, two VMs running at once; 3/3 alone after. Which process crashed isn't known (the test's VM directory, its console, is removed) | keep the consoles while the suite runs (§10's loop) and measure a rate with `guest-crash-rate.sh` and a build in each, on 6.18.59 and 6.18.58 | 15 |
 | F192 | low | 14.4b's Murphy review (desktop app): the API's pull says a layer once it's fetched and nothing while a big layer downloads or unpacks, so the Run sheet's progress stands still for minutes on a large image, and its client gives up after 10 quiet minutes (`run::PULL_QUIET`) while the engine's pull may go on | the engine's pull reports each layer's bytes as they come (Docker's `progressDetail`), the API passes them on; then the quiet bound can shrink | 15 |
 | F193 | low | The terminal tests failed under a full Linux pass's load, never alone (14.5, 14.6a, 14.6b's verifies). 14.8a: `a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request` slept a fixed 3 s after its XOFF: it now waits for its conditions (the small output's `sh` gone; the large one's `tr` there, its `wchar` still), 10/10 as root and 5/5 as tester under every CPU busy. Left: `a_terminal_container_run_is_raw_and_detaches` (root: Ctrl-C sent right after `stty size`'s answer, `caught-int` never seen in 20 s), not reproduced: 12/12 under every CPU busy, 16/16 alone; 14.7's full verify passed both. Its cause unknown: a full pass's load is I/O and hundreds of containers, not CPU alone | reproduce under a full pass's own load (a second test binary beside it), the transcript and the shell's `/proc/PID/status` (SigCgt, SigBlk) kept at the failure; fix the cause | 15 |
@@ -246,9 +246,25 @@ architecture, tests, Rust craft), decided in a grilling session, round by round.
   CI, OCI conformance as expected, fuzzing and mutation checks on every parser and state
   machine, signed reproducible releases, every F-row fixed or explicitly accepted. The
   performance targets (FEATURES §16) are measured and reported, not blocking.
-- **D31 — CI stays off for now** (GitHub billing). It must run again before v1.0 (D30);
+- **D31 — CI stays off for now** (superseded by D15-1, 2026-10-29: the repository goes public and CI runs on GitHub's free runners) (GitHub billing). It must run again before v1.0 (D30);
   until then local verification is the check of record. Accepted trade-off: with no
   outside users either (D21), every check before v1.0 runs on the author's machines.
+
+**Stage 15 decisions (2026-10-29), hardening and v1.0:**
+- **D15-1 — The repository goes public early, for CI** (supersedes D31): GitHub's standard
+  runners are free for public repositories, so `ci.yml` runs on every push to `main` and
+  every pull request, and `quality.yml` nightly. The history was scanned first (no secrets,
+  keys or private files; the macOS username taken out of the tree; the commit email kept, the
+  user's choice). Nothing is released or announced until stage 15's last step: D21 is about
+  users, not visibility.
+- **D15-2 — No Apple Developer ID:** the Mac binaries and `Shipyard.app` ship signed with the
+  local identity (or ad hoc), not notarized; the docs say how to allow them once. FEATURES
+  §16's "notarized" is an accepted limitation of v1.0; `scripts/macos/notarize.sh` stays for
+  later.
+- **D15-3 — Open findings: the real ones fixed, the rest accepted.** F134 and every low a
+  user or a hostile container can hit are fixed; the others go in an "Accepted at v1.0"
+  table, each with its reason. The triage goes to the user before any fixing.
+- **D15-4 — The docs site is mdBook on GitHub Pages,** built from `docs/user/` as it is.
 
 **Stage 14 decisions (2026-10-27), the desktop UI:**
 - **D14-1 — Tauri 2:** a Rust core and the UI in the system's web view, so the design's

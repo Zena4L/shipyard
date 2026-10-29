@@ -84,6 +84,8 @@ behaviour; each change is listed here).
   monitor's, as counters.
 ### Changed
 
+- **Shipyard is licensed under Apache-2.0 alone** (it was MIT or Apache-2.0, at your
+  option): one `LICENSE`, a `NOTICE`, and a detailed contribution guide (`CONTRIBUTING.md`).
 - **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
   the old one can no longer be installed).
 - **The desktop app's colours and motion:** the Cobalt Yard palette (navy containers on

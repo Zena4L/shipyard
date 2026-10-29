@@ -80,11 +80,13 @@ container's inspector (isolation from the kernel, live numbers, actions with the
 twins), its logs and a real shell, Images, Volumes and Networks; on a Mac (the VM started
 for it) and on Linux (the user's own service started for it).
 
-Stage 9's, 13's and 14's book chapters were skipped (the user's choice). Next: 15
-hardening and v1.0 (defined in D30). Open findings with severity and home stage: the ROADMAP's
-[Open findings](docs/ROADMAP.md#open-findings). CI is off (D31: GitHub
-billing) until before v1.0, so **local verification is the check of record**
-(section 7).
+Stage 9's, 13's and 14's book chapters were skipped (the user's choice). Stage 15,
+hardening and v1.0 (defined in D30), is under way (D15-1..4): the repository goes public
+for CI (D15-1), the Mac app ships locally signed, not notarized (D15-2), the open findings
+are triaged (D15-3), the docs become an mdBook site (D15-4). Open findings with severity and
+home stage: the ROADMAP's [Open findings](docs/ROADMAP.md#open-findings). Once CI runs
+again (15.0), a pull request's checks are its first gate; **local verification stays the
+check of record** (section 7: CI has no VM, no Mac and no real distributions).
 
 ---
 

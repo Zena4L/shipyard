@@ -1,12 +1,10 @@
 name: Quality
 
 # The slow quality tools (H5): every fuzz target for a while, and cargo-mutants
-# on what a branch changed. Manual only for now, as CI is: the repository's
-# Actions billing is off, so a schedule would start nothing. Run it by hand
-# (`gh workflow run Quality --ref BRANCH`, optionally `-f fuzz_seconds=600
-# -f base=main`); once billing is back, uncomment the schedule. Until then the
-# same tools run locally: `scripts/test-linux.sh --fuzz [SECONDS]` and
-# `scripts/test-linux.sh --mutants [BASE]`.
+# on what a branch changed. Nightly on main (the repository is public from stage
+# 15, D15-1), and by hand (`gh workflow run Quality --ref BRANCH`, optionally
+# `-f fuzz_seconds=600 -f base=main`). The same tools run locally:
+# `scripts/test-linux.sh --fuzz [SECONDS]` and `scripts/test-linux.sh --mutants [BASE]`.
 on:
   workflow_dispatch:
     inputs:
@@ -16,10 +14,10 @@ on:
       base:
         description: The branch mutants compare against (its changes are mutated)
         default: main
-  # Nightly, once billing is back: the fuzz targets on main, and mutants of
-  # main's last commit (a scheduled run has no branch to compare).
-  # schedule:
-  #   - cron: "17 3 * * *"
+  # Nightly: the fuzz targets on main, and mutants of main's last commit (a
+  # scheduled run has no branch to compare).
+  schedule:
+    - cron: "17 3 * * *"
 
 # Read-only token: these jobs never write to the repository.
 permissions:

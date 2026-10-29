@@ -1,15 +1,13 @@
 name: CI
 
-# Manual only for now: the repository's Actions billing is off, so GitHub starts
-# no job ("recent account payments have failed or your spending limit needs to
-# be increased"), and every push would show a red run. Run it by hand
-# (`gh workflow run CI --ref BRANCH`) once billing is back; until then the checks
-# run locally (`scripts/test-linux.sh`, and the commands in CLAUDE.md).
+# On every push to main and every pull request (the repository is public from
+# stage 15, D15-1: GitHub's standard runners are free), and by hand
+# (`gh workflow run CI --ref BRANCH`).
 on:
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  # pull_request:
+  push:
+    branches: [main]
+  pull_request:
 
 # Read-only token: CI never needs to write to the repository.
 permissions:

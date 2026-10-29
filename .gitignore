@@ -34,3 +34,6 @@ __pycache__/
 /desktop/src-tauri/gen/
 /desktop/ui/test-results/
 /desktop/ui/dist-fixture/
+
+# The maintainer's own manual test checklist: kept locally, never committed.
+/MANUAL-TESTING.md

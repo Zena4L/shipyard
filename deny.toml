@@ -8,7 +8,7 @@ version = 2
 # entries, and a short list is easier to review when a new one appears.
 # ISC, BSD-3-Clause and CDLA-Permissive-2.0 arrive with the stage-6 TLS stack
 # (ring, untrusted, rustls-webpki; subtle; webpki-roots' certificate bundle):
-# all permissive and compatible with MIT/Apache-2.0.
+# all permissive and compatible with Shipyard's own Apache-2.0.
 allow = [
   "MIT",
   "Apache-2.0",
