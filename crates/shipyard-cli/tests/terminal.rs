@@ -2863,7 +2863,13 @@ fn a_flood_through_the_terminal_ends_promptly() {
         "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo do\"\"ne"
     ));
     session.job();
-    session.expect("done");
+    // 3 MB through two terminals: longer than `expect`'s 20 s on a slow
+    // host (CI's Fedora VM showed 2.7 MB of it), within the test's alarm.
+    assert!(
+        session.saw_within("done", std::time::Duration::from_secs(75)),
+        "never saw \"done\"\n{}",
+        session.transcript()
+    );
     assert_eq!(session.status(), Status::Exited(0));
     session.finish();
 }
