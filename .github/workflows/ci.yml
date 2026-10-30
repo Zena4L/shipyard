@@ -199,6 +199,10 @@ jobs:
       # step's own time limit fails it before the job's, so its log is kept.
       - name: terminal tests, on their own, against the installed binaries
         continue-on-error: true
+        # A step's own limit keeps its log (a job cancelled at its limit
+        # keeps none): run-logged.sh's timeout stops cargo, but a test it
+        # leaves behind can keep the step from ending (F193).
+        timeout-minutes: 6
         run: |
           cargo test --locked -p shipyard-cli --test terminal --no-run
           scripts/ci/run-logged.sh 240 terminal \
@@ -208,6 +212,7 @@ jobs:
           SHIPYARD_TEST_ROOTLESS: required
           SHIPYARD_TEST_DELEGATED: required
       - name: cargo test, against the installed binaries
+        timeout-minutes: 12
         run: |
           cargo test --locked -p shipyard-cli --no-run
           scripts/ci/run-logged.sh 600 tests \
