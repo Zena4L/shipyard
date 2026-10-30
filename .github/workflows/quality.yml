@@ -1,7 +1,7 @@
 name: Quality
 
-# The slow quality tools (H5): every fuzz target for a while, and cargo-mutants
-# on what a branch changed. Nightly on main (the repository is public from stage
+# The slow jobs: every fuzz target for a while, cargo-mutants on what a branch
+# changed (H5), and the Fedora VM (H4, D15-5). Nightly on main (the repository is public from stage
 # 15, D15-1), and by hand (`gh workflow run Quality --ref BRANCH`, optionally
 # `-f fuzz_seconds=600 -f base=main`). The same tools run locally:
 # `scripts/test-linux.sh --fuzz [SECONDS]` and `scripts/test-linux.sh --mutants [BASE]`.
@@ -134,3 +134,27 @@ jobs:
           name: mutants-${{ matrix.os }}
           path: mutants.out/
           if-no-files-found: ignore
+
+  # Another real host (H4): Fedora, SELinux enforcing, in a QEMU/KVM VM on
+  # the runner. Both passes (rootless, then root), from executables built
+  # here. firewalld runs, as Fedora has it.
+  # Here, not in ci.yml: it takes one to two and a half hours (asked,
+  # 2026-10-30), so it runs nightly and by hand, not on every pull request.
+  fedora:
+    name: Fedora VM (SELinux enforcing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/shipyard-vm
+          # The image is pinned in the script: a new pin, a new cache.
+          key: fedora-cloud-${{ hashFiles('scripts/ci/fedora-vm.sh') }}
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
+      # Ended by its own timeout before the job's: a job cancelled at its
+      # limit keeps no log, and the log is what says which test hung.
+      - run: timeout --signal=TERM --kill-after=60 8400 scripts/ci/fedora-vm.sh

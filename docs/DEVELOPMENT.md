@@ -276,11 +276,11 @@ finds inside with the config.
 
 ### What CI runs
 
-`.github/workflows/ci.yml`. **Manual only for now** (`gh workflow run CI --ref
-BRANCH`): the repository's Actions billing is off, so a push would start nothing. Its
-push and pull-request triggers are written, commented out. `check` and `root` run on
-macOS only for now (their Ubuntu runs took too long); the Linux tests run in the
-`apparmor` and `fedora` jobs, and locally in `scripts/test-linux.sh`.
+`.github/workflows/ci.yml`, on every pull request and every push to `main` (the
+repository is public from stage 15, D15-1), and by hand (`gh workflow run CI --ref
+BRANCH`). `check` and `root` run on macOS only for now (their Ubuntu runs took too
+long); the Linux tests run in the `apparmor` job, nightly in Quality's `fedora` job,
+and locally in `scripts/test-linux.sh`.
 
 | Job | What it covers |
 |---|---|
@@ -289,15 +289,14 @@ macOS only for now (their Ubuntu runs took too long); the Linux tests run in the
 | `root` (macOS; Ubuntu off) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
 | `apparmor` | **A real Ubuntu host** (H4): the restriction left on, `shipyard` and `shipyard-runtime` installed in `/usr/local/bin` with the profile (`contrib/apparmor/shipyard`), as users install them. `scripts/ci/apparmor-control.sh` first proves the profile is what lets them make user namespaces (unloaded, `shipyard doctor` fails); then `shipyard-cli`'s tests run the installed binaries (the runtime's in-process tests make user namespaces from their own test binary, which no profile covers: they run in `check`) |
 | `conformance` | the OCI conformance suite, as `expected.txt` expects (amd64; recorded on arm64) |
-| `fedora` | **A real Fedora host** (H4): `scripts/ci/fedora-vm.sh` boots Fedora Cloud (pinned by SHA-256) in QEMU/KVM, SELinux enforcing, firewalld running, and runs the test executables built on the runner in both passes (`scripts/ci/run-test-binaries.sh`), plus the terminal probe |
 
-`.github/workflows/quality.yml` (`Quality`), the slow tools (H5), manual too (`gh
-workflow run Quality --ref BRANCH [-f fuzz_seconds=600] [-f base=main]`), its nightly
-schedule written, commented out, for when billing is back:
+`.github/workflows/quality.yml` (`Quality`), the slow jobs, nightly on `main` and by
+hand (`gh workflow run Quality --ref BRANCH [-f fuzz_seconds=600] [-f base=main]`):
 
 | Job | What it covers |
 |---|---|
 | `fuzz` | every target in `scripts/fuzz-targets.sh` for `fuzz_seconds` (300), from `fuzz-seeds.py`'s corpora; a crash fails it, its input uploaded |
+| `fedora` | **A real Fedora host** (H4), one to two and a half hours, so not on every pull request: `scripts/ci/fedora-vm.sh` boots Fedora Cloud (pinned by SHA-256) in QEMU/KVM, SELinux enforcing, firewalld running, Docker's CLI and compose plugin pinned as the test image's, and runs the test executables built on the runner in both passes, then the build tests (`scripts/ci/run-test-binaries.sh`), plus the terminal probe |
 | `mutants` (Ubuntu, macOS) | cargo-mutants on the branch's changes against `base` (`.cargo/mutants.toml`); caught, missed and timed out in the run's summary, `mutants.out` uploaded. A report, never a failure |
 
 **Required, not skipped.** CI and `test-linux.sh` set `SHIPYARD_TEST_ROOTLESS`,

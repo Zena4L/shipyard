@@ -282,8 +282,9 @@ required.
 
 - Fill in the template: what changes, why, and the checks you ran.
 - **CI runs on every pull request** (fmt, clippy and tests on Linux and macOS, the root
-  tests, rootless, AppArmor and Fedora jobs, the conformance suite, musl, rustdoc,
-  `cargo deny`). It must be green. CI can't run Shipyard's macOS VM or the desktop app's
+  tests, the rootless AppArmor job, the conformance suite, musl, rustdoc, `cargo deny`).
+  It must be green. The slow jobs (fuzzing, mutants, a Fedora VM with SELinux) run
+  nightly on `main`. CI can't run Shipyard's macOS VM or the desktop app's
   pixel tests, so say in the PR if you ran `verify.sh --mac` or the VM tests yourself.
 - Keep your branch up to date with `main` by rebasing.
 - **Review** checks the change against [AGENTS.md](AGENTS.md)'s rules, and asks what could
