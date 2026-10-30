@@ -12,7 +12,10 @@
 #      the tests use, firewalld running (as Fedora has it: the root tests
 #      run in network namespaces of their own, out of its reach);
 #   3. copies the workspace and the executables to the same absolute path
-#      in the VM (the test executables hold compile-time paths);
+#      in the VM (the test executables hold compile-time paths), with
+#      Docker's CLI and its compose plugin, pinned as the test image pins
+#      them (scripts/test-image/Dockerfile: keep the two in step), which the
+#      API's and compose's tests drive Shipyard with;
 #   4. runs scripts/ci/run-test-binaries.sh there: both passes, as
 #      test-linux.sh runs them.
 #
@@ -98,6 +101,21 @@ echo "$count test executables"
 mkdir -p "$repo/target/probes"
 gcc -O2 -o "$repo/target/probes/terminal" scripts/probes/terminal.c
 
+# Docker's CLI (24.0.9: API 1.43, the one served) and Compose v5.6.0, x86-64,
+# as the test image has them.
+fetch_pinned() {
+    local url=$1 sum=$2 to=$3
+    curl -fsSL --retry 3 --retry-delay 5 -o "$to.part" "$url"
+    echo "$sum  $to.part" | sha256sum -c --quiet -
+    mv "$to.part" "$to"
+}
+mkdir -p "$repo/target/tools"
+fetch_pinned https://download.docker.com/linux/static/stable/x86_64/docker-24.0.9.tgz \
+    692ecfc28333485d184f628b74c25b2894cee9495a51a5418ba60ef95bf733ca "$repo/target/tools/docker.tgz"
+tar -xzf "$repo/target/tools/docker.tgz" -C "$repo/target/tools" --strip-components=1 docker/docker
+fetch_pinned https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64 \
+    40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a "$repo/target/tools/docker-compose"
+
 # --- 2. The image, verified, and a VM from it.
 mkdir -p "$cache"
 if ! echo "$SHA256  $cache/$IMAGE" | sha256sum -c --quiet - 2>/dev/null; then
@@ -163,9 +181,17 @@ interruptible rsync -a --exclude /target --exclude /.git --exclude /fuzz/target 
     echo target/debug/shipyard-runtime
     echo target/test-binaries.txt
     echo target/probes/terminal
+    echo target/tools/docker
+    echo target/tools/docker-compose
     cut -f2 "$repo/target/test-binaries.txt" | sed "s|^$repo/||"
 } > "$work/files"
 interruptible rsync -a --files-from="$work/files" "$repo/" "tester@127.0.0.1:$repo/"
+# The tools where the test image has them; and cargo's scratch directory for
+# the tests (CARGO_TARGET_TMPDIR, compiled in), for both passes' users.
+vm "sudo install -m 0755 '$repo/target/tools/docker' /usr/local/bin/docker \
+    && sudo install -D -m 0755 '$repo/target/tools/docker-compose' \
+        /usr/local/lib/docker/cli-plugins/docker-compose \
+    && mkdir -p '$repo/target/tmp' && chmod 1777 '$repo/target/tmp'"
 
 # --- 4. Both passes, in the VM.
 interruptible vm "sudo '$repo/scripts/ci/run-test-binaries.sh' '$repo'"

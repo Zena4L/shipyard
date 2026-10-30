@@ -638,7 +638,9 @@ sudo iptables -I DOCKER-USER -o shipyard0 -m conntrack --ctstate RELATED,ESTABLI
 ```
 
 - The first is for containers on the network reaching each other. Docker makes
-  the kernel filter bridged traffic too (`br_netfilter`).
+  the kernel filter bridged traffic too (`br_netfilter`); on a host where it
+  doesn't, containers on one bridge never meet the chain, and the warning leaves
+  this line out.
 - The second is for their way out. `eth0` is the host's way out (its default
   route's interface), as the warning names it: only out to the world, never into
   Docker's own bridges.

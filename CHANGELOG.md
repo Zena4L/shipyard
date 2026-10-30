@@ -84,6 +84,8 @@ behaviour; each change is listed here).
   monitor's, as counters.
 ### Changed
 
+- **Shipyard is licensed under Apache-2.0 alone** (it was MIT or Apache-2.0, at your
+  option): one `LICENSE`, a `NOTICE`, and a detailed contribution guide (`CONTRIBUTING.md`).
 - **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
   the old one can no longer be installed).
 - **The desktop app's colours and motion:** the Cobalt Yard palette (navy containers on
@@ -122,6 +124,15 @@ behaviour; each change is listed here).
 - **The API's image inspect leaves `Created` out when an image doesn't say when it was
   built**, as Docker's does: it said `""`, and a client that parses the date (the desktop
   app's) refused the whole answer.
+- **A firewall's printed fix asked for a rule between a network's containers where none
+  was needed:** on a host that doesn't filter bridged traffic (no `br_netfilter`, as
+  Fedora), containers on one bridge never meet a forward chain, and the warning (and
+  `doctor`) no longer prints that line, as it no longer says they couldn't reach each
+  other. Found by CI's Fedora job (stage 15.0).
+- **Root's `--network pasta` under SELinux failed saying only that pasta "said nothing"**:
+  Fedora's policy for pasta (`pasta_t`) grants it `sys_admin` only within a user
+  namespace, so as root it can't join the container's network. The error now says that
+  SELinux may be why, and that root's containers have bridge networks (their default).
 
 ## 0.5.0 - unreleased
 

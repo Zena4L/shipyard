@@ -59,7 +59,7 @@ process pass
 process_capabilities pass
 process_capabilities_fail pass
 process_oom_score_adj pass
-process_rlimits pass
+process_rlimits fail /has expected soft RLIMIT_NOFILE/ the suite's own: its runtimetest is Go (1.19 and later), which raises its own soft RLIMIT_NOFILE towards the hard one as it starts (3000 set, 3999 read back), so it never sees the soft limit the runtime set
 process_rlimits@arm64 skip the suite's own: its runtimetest (Go) prints nothing under the test's 1 GiB soft RLIMIT_AS on arm64 (`ulimit -v 1048576; runtimetest --help` is silent too)
 process_rlimits_fail pass
 process_user pass

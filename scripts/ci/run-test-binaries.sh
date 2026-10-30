@@ -2,7 +2,9 @@
 # Runs the workspace's test executables without cargo, both passes as
 # scripts/test-linux.sh runs them: as `tester` (rootless, in its delegated
 # cgroup, rootless tests required), then as root (`--include-ignored`, each
-# executable in a network namespace of its own: scripts/ci-netns.sh).
+# executable in a network namespace of its own: scripts/ci-netns.sh); then
+# the build tests on their own, as tester and as root, with the network
+# (a builder pulls by name), as test-linux.sh runs them.
 #
 # In the Fedora VM (scripts/ci/fedora-vm.sh), as root through sudo from
 # `tester` (so SUDO_UID names tester, whom the root tests run rootless
@@ -25,9 +27,10 @@ uid=$(id -u "$user")
 fail() { echo "$*" >&2; exit 1; }
 [ "$(getenforce)" = Enforcing ] || fail "SELinux isn't enforcing here"
 systemctl is-active --quiet firewalld || fail "firewalld isn't running here"
-for tool in ip nft iptables dig pasta newuidmap newgidmap script perl; do
+for tool in ip nft iptables dig pasta newuidmap newgidmap script perl docker; do
     command -v "$tool" >/dev/null || fail "no $tool here"
 done
+docker compose version >/dev/null 2>&1 || fail "no docker compose here"
 [ -s "$list" ] || fail "no test executables listed in $list"
 cat /etc/fedora-release
 uname -r
@@ -52,6 +55,31 @@ export TMPDIR=/var/tmp
 export SHIPYARD_TEST_TOOLS=required
 failed=()
 ran=0
+# One test executable: as tester (in its delegated scope) or as root (in a
+# network namespace of its own, unless "network" asks for the VM's), its
+# extra arguments after.
+run_one() {
+    local pass=$1 package=$2 test=$3
+    shift 3
+    if [ "$pass" = tester ]; then
+        (cd "$package" && timeout 1200 runuser -u "$user" -- env \
+            HOME="/home/$user" PATH="$PATH" TMPDIR="$TMPDIR" CARGO_MANIFEST_DIR="$package" \
+            XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            SHIPYARD_TEST_ROOTLESS=required SHIPYARD_TEST_DELEGATED=required \
+            SHIPYARD_TEST_TOOLS=required SHIPYARD_TEST_BUILD="${SHIPYARD_TEST_BUILD:-}" \
+            systemd-run --user --scope --quiet "$test" "$@" </dev/null 3<&-)
+    elif [ "$pass" = root ]; then
+        # The root tests run rootless commands as `tester` (a sudo from
+        # root would name root as the caller).
+        (cd "$package" && CARGO_MANIFEST_DIR="$package" SHIPYARD_TEST_USER="$user" \
+            timeout 1200 "$repo/scripts/ci-netns.sh" "$test" --include-ignored "$@" </dev/null 3<&-)
+    else
+        (cd "$package" && CARGO_MANIFEST_DIR="$package" SHIPYARD_TEST_USER="$user" \
+            SHIPYARD_TEST_NETWORK=required \
+            timeout 1200 "$test" --include-ignored "$@" </dev/null 3<&-)
+    fi
+}
 run_pass() {
     local pass=$1
     # The list on its own descriptor, each test's stdin /dev/null: a test
@@ -60,26 +88,26 @@ run_pass() {
     while IFS=$'\t' read -r -u 3 package test; do
         echo "=== $pass: ${test##*/}"
         ran=$((ran + 1))
-        if [ "$pass" = tester ]; then
-            (cd "$package" && timeout 1200 runuser -u "$user" -- env \
-                HOME="/home/$user" PATH="$PATH" TMPDIR="$TMPDIR" CARGO_MANIFEST_DIR="$package" \
-                XDG_RUNTIME_DIR="/run/user/$uid" \
-                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-                SHIPYARD_TEST_ROOTLESS=required SHIPYARD_TEST_DELEGATED=required \
-                SHIPYARD_TEST_TOOLS=required \
-                systemd-run --user --scope --quiet "$test" </dev/null 3<&-)
-        else
-            # The root tests run rootless commands as `tester` (a sudo from
-            # root would name root as the caller).
-            (cd "$package" && CARGO_MANIFEST_DIR="$package" SHIPYARD_TEST_USER="$user" \
-                timeout 1200 "$repo/scripts/ci-netns.sh" "$test" --include-ignored </dev/null 3<&-)
-        fi || failed+=("$pass: ${test##*/}")
+        run_one "$pass" "$package" "$test" || failed+=("$pass: ${test##*/}")
     done 3< "$list"
 }
+# The build tests (12.3) skip themselves in the passes and run after them.
+export SHIPYARD_TEST_BUILD=later
 run_pass tester
 run_pass root
 expected=$(($(wc -l < "$list") * 2))
 [ "$ran" = "$expected" ] || failed+=("ran $ran test executables of $expected")
+unset SHIPYARD_TEST_BUILD
+build=$(awk -F'\t' '$1 ~ /\/shipyard-cli$/ && $2 ~ /\/build-[0-9a-f]+$/' "$list")
+if [ -z "$build" ]; then
+    failed+=("no build test executable listed")
+else
+    IFS=$'\t' read -r package test <<<"$build"
+    echo "=== build tests, as tester"
+    run_one tester "$package" "$test" --test-threads 4 || failed+=("build: tester")
+    echo "=== build tests, as root"
+    run_one network "$package" "$test" --test-threads 4 || failed+=("build: root")
+fi
 
 # What SELinux denied meanwhile, passing or not: a denial a test tolerated
 # is still worth seeing.

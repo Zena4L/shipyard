@@ -801,6 +801,21 @@ fn another_firewalls_drop_policies_are_warned_about_with_their_fixes() {
             .unwrap()
             .to_owned();
         let gateway = networks.gateway("app");
+        // Containers on one bridge meet FORWARD only where bridged frames
+        // meet the IP hooks (`br_netfilter`, which Docker loads; Fedora
+        // doesn't): the warning says what this host's chain keeps.
+        let (kept, each_other) = if bridged_frames_filtered() {
+            (
+                "would have no way out, wouldn't be reached on their published ports, and \
+                 couldn't reach each other",
+                format!("sudo iptables -I FORWARD -i {bridge} -o {bridge} -j ACCEPT; "),
+            )
+        } else {
+            (
+                "would have no way out, and wouldn't be reached on their published ports",
+                String::new(),
+            )
+        };
         let theirs = nft(&["list", "table", "ip", "filter"]).unwrap();
         let warned = networks.run(&["run", "--no-image", "--network", "app", "true"]);
         assert_eq!(warned.code, Some(0), "{}", warned.stderr);
@@ -809,11 +824,9 @@ fn another_firewalls_drop_policies_are_warned_about_with_their_fixes() {
             "the firewall's chain ip filter INPUT drops what comes in to the host by default";
         assert!(
             warned.stderr.contains(&format!(
-                "{forward}: containers on {bridge} would have no way out, wouldn't be reached \
-                 on their published ports, and couldn't reach each other; to let them through: \
-                 sudo iptables -I FORWARD -i {bridge} -o {bridge} -j ACCEPT; sudo iptables -I \
-                 FORWARD -i {bridge} -o up0 -j ACCEPT; sudo iptables -I FORWARD -o {bridge} -m \
-                 conntrack --ctstate RELATED,ESTABLISHED,DNAT -j ACCEPT"
+                "{forward}: containers on {bridge} {kept}; to let them through: {each_other}\
+                 sudo iptables -I FORWARD -i {bridge} -o up0 -j ACCEPT; sudo iptables -I FORWARD \
+                 -o {bridge} -m conntrack --ctstate RELATED,ESTABLISHED,DNAT -j ACCEPT"
             )),
             "{}",
             warned.stderr
@@ -967,13 +980,19 @@ fn dockers_firewall_is_warned_about_and_its_printed_fix_works() {
         let warned = networks.run(&["run", "--no-image", "true"]);
         assert_eq!(warned.code, Some(0), "{}", warned.stderr);
         let opening = "Docker's firewall drops forwarded traffic by default";
+        // Between its containers only where bridged frames meet the chain.
+        let each_other = if bridged {
+            "sudo iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT; "
+        } else {
+            ""
+        };
         assert!(
-            warned.stderr.contains(
-                "to let them through (in DOCKER-USER, the chain Docker keeps for this): sudo \
-                 iptables -I DOCKER-USER -i shipyard0 -o shipyard0 -j ACCEPT; sudo iptables -I \
-                 DOCKER-USER -i shipyard0 -o up0 -j ACCEPT; sudo iptables -I DOCKER-USER -o \
-                 shipyard0 -m conntrack --ctstate RELATED,ESTABLISHED,DNAT -j ACCEPT"
-            ),
+            warned.stderr.contains(&format!(
+                "to let them through (in DOCKER-USER, the chain Docker keeps for this): \
+                 {each_other}sudo iptables -I DOCKER-USER -i shipyard0 -o up0 -j ACCEPT; sudo \
+                 iptables -I DOCKER-USER -o shipyard0 -m conntrack --ctstate \
+                 RELATED,ESTABLISHED,DNAT -j ACCEPT"
+            )),
             "{}",
             warned.stderr
         );

@@ -583,6 +583,10 @@ mod linux {
         ),
         ("a_dead_pasta_is_said", a_dead_pasta_is_said),
         (
+            "root_s_pasta_under_selinux_says_why",
+            root_s_pasta_under_selinux_says_why,
+        ),
+        (
             "a_pasta_ending_with_its_init_isnt_a_loss",
             a_pasta_ending_with_its_init_isnt_a_loss,
         ),
@@ -1482,15 +1486,36 @@ mod linux {
     /// where it hasn't; with `SHIPYARD_TEST_TOOLS=required`, where it's
     /// installed, it fails instead: a skip would hide that it never ran).
     fn pasta_here() -> bool {
-        let here = shipyard_network::pasta::find(std::env::var_os("PATH").as_deref()).is_some();
-        if !here {
+        let found = shipyard_network::pasta::find(std::env::var_os("PATH").as_deref());
+        let Some(pasta) = found else {
             assert!(
                 std::env::var("SHIPYARD_TEST_TOOLS").as_deref() != Ok("required"),
                 "pasta is required here (SHIPYARD_TEST_TOOLS), but isn't on the PATH"
             );
             eprintln!("(no pasta here: skipped)");
+            return false;
+        };
+        if is_root() && confined_by_selinux(&pasta) {
+            // Fedora's `pasta_t` has `sys_admin` only in a user namespace:
+            // root's pasta can't join a network namespace root owns there
+            // (the error says so: `silence_hint`).
+            eprintln!("(SELinux confines root's pasta here: skipped)");
+            return false;
         }
-        here
+        true
+    }
+
+    /// Whether SELinux enforces here and runs `pasta` in its own domain
+    /// (its file labelled `pasta_exec_t`).
+    fn confined_by_selinux(pasta: &std::path::Path) -> bool {
+        let enforcing = std::fs::read_to_string("/sys/fs/selinux/enforce")
+            .is_ok_and(|value| value.trim() == "1");
+        enforcing
+            && std::process::Command::new("stat")
+                .args(["-L", "-c", "%C"])
+                .arg(pasta)
+                .output()
+                .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("pasta_exec_t"))
     }
 
     /// How many sockets process `pid` has open (its descriptors').
@@ -3516,16 +3541,21 @@ mod linux {
             // Clients served (pasta takes each, finds nothing listening
             // inside, and closes first, or resets it): until one has left
             // the host's side in TIME_WAIT on the port, which the next start
-            // must hold anyway (F42).
+            // must hold anyway (F42). In either table: a pasta that listens
+            // on both families at once (Fedora 44's) has IPv4 clients as
+            // IPv6's mapped addresses.
             let time_wait = || {
-                let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
-                shipyard_network::observe::parse(&table, shipyard_network::observe::Table::Tcp)
-                    .unwrap()
-                    .iter()
-                    .any(|socket| {
-                        socket.local.port() == port
-                            && socket.state == shipyard_network::observe::State::TimeWait
-                    })
+                use shipyard_network::observe::{State, Table};
+                [Table::Tcp, Table::Tcp6].into_iter().any(|kind| {
+                    let table =
+                        std::fs::read_to_string(format!("/proc/net/{}", kind.name())).unwrap();
+                    shipyard_network::observe::parse(&table, kind)
+                        .unwrap()
+                        .iter()
+                        .any(|socket| {
+                            socket.local.port() == port && socket.state == State::TimeWait
+                        })
+                })
             };
             for _ in 0..10 {
                 let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -7064,6 +7094,35 @@ mod linux {
             health_of(&shelled, &id).is_some_and(|health| health.status == Status::Healthy)
         });
         shipyard_engine::run::remove(&shelled.engine(), id.as_str(), true).unwrap();
+    }
+
+    /// Where SELinux confines root's pasta (Fedora's `pasta_t`), root's
+    /// `--network pasta` can't be set up, and the failure says why rather
+    /// than only that pasta said nothing. Runs only there (CI's Fedora).
+    fn root_s_pasta_under_selinux_says_why() {
+        let found = shipyard_network::pasta::find(std::env::var_os("PATH").as_deref());
+        let Some(pasta) = found.filter(|pasta| is_root() && confined_by_selinux(pasta)) else {
+            eprintln!("(not root under SELinux's pasta policy: skipped)");
+            return;
+        };
+        let stores = Stores::new();
+        let _upstream = {
+            let upstream = shipyard_test_support::net::Upstream::new();
+            upstream.route_default();
+            upstream
+        };
+        let output = stores.launch(&["--network", "pasta", stores.image.as_str(), "true"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stdout.contains(
+                "as root with SELinux enforcing, pasta's policy may keep it from \
+                 joining the container's network"
+            ),
+            "{} ({})",
+            stdout,
+            pasta.display()
+        );
     }
 
     /// A container's pasta killed while it runs: the container runs on,

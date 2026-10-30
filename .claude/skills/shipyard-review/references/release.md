@@ -7,7 +7,7 @@ justification, and a report under 1,200 words.
 ## Common header (paste into each)
 
 > You are doing a fresh, skeptical production-readiness review of [AREA] in Shipyard
-> (/Users/clementbogyah/Desktop/shipyard), a daemonless container engine in Rust, at
+> (this repository), a daemonless container engine in Rust, at
 > [version / milestone]. Read `AGENTS.md` first. The project claims [what the milestone
 > claims] is production ready.
 >

@@ -368,7 +368,9 @@ fn the_oom_killer_is_reported() {
 #[ignore = "needs root"]
 fn the_process_limit_holds() {
     require_cgroup_v2();
-    // The shell gives up at the first fork refused ("Cannot fork").
+    // The shell gives up at a fork refused: dash at the first ("Cannot
+    // fork"), bash after retrying for about 15 s ("fork: retry"), so each
+    // sleep outlasts bash's retries, or the first to end would let it on.
     let capped = run(SHIPYARD.command(&[
         "run",
         "--no-image",
@@ -376,7 +378,7 @@ fn the_process_limit_holds() {
         "10",
         "sh",
         "-c",
-        "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 2 & done; wait",
+        "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 30 & done; wait",
     ]));
     assert_ne!(capped.code, Some(0), "all 12 started");
     assert!(capped.stderr.contains("fork"), "{}", capped.stderr);
@@ -491,11 +493,19 @@ fn without_delegation_a_limit_is_refused_with_the_fix() {
             .into_encoded_bytes(),
     )
     .unwrap();
+    // nobody's state (its runtime root under TMPDIR, with no
+    // XDG_RUNTIME_DIR) in a directory of this test's own: never one another
+    // test or an earlier run left in the shared temporary directory.
+    let state = std::env::temp_dir().join(format!("shipyard-nobody-{}", std::process::id()));
+    std::fs::create_dir_all(&state).unwrap();
+    std::os::unix::fs::chown(&state, Some(65534), Some(65534)).unwrap();
     let mut command = std::process::Command::new("setpriv");
     command
         .args(["--reuid", "65534", "--regid", "65534", "--clear-groups"])
         .arg(SHIPYARD.path())
-        .args(["run", "--no-image", "--memory", "64m", "true"]);
+        .args(["run", "--no-image", "--memory", "64m", "true"])
+        .env("TMPDIR", &state)
+        .env_remove("XDG_RUNTIME_DIR");
     // SAFETY: open, write and close are async-signal-safe; this moves the
     // child itself ("0") into the root-owned cgroup before it drops root.
     unsafe {
@@ -512,6 +522,7 @@ fn without_delegation_a_limit_is_refused_with_the_fix() {
     }
     let refused = run(command);
     let _ = std::fs::remove_dir(&scratch);
+    let _ = std::fs::remove_dir_all(&state);
     assert_eq!(refused.code, Some(125), "{}", refused.stderr);
     assert!(
         refused.stderr.contains("isn't delegated")

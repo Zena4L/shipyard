@@ -1685,10 +1685,12 @@ fn a_bundle_without_a_pid_namespace_cant_reach_shipyards_descriptors() {
 /// terminal, but a stop request (SIGTERM) throws that away. Twice: output
 /// that fits in the pipe and the relay (the command ends; SIGTERM reaches
 /// shipyard as it waits on the terminal), and output that doesn't (the
-/// command is blocked; SIGTERM stops it first).
+/// command is blocked; SIGTERM stops it first). The first is less than a
+/// page: a user past `fs.pipe-user-pages-soft` gets smaller pipes (100000
+/// bytes didn't fit on GitHub's rootless runner, F193).
 fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
     for (bytes, ends) in [
-        ("100000", Status::Exited(0)),
+        ("4000", Status::Exited(0)),
         ("400000", Status::Exited(killed_by(libc::SIGTERM))),
     ] {
         // SAFETY: this test binary is single-threaded (see the module docs).
@@ -1733,6 +1735,44 @@ fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
         // (The shell is done and its terminal closed: nothing to resume.)
         session.finish();
     }
+}
+
+/// Each process whose command line holds `marker`: its state, signal
+/// masks, and its terminal's foreground process group against its own (a
+/// failure's diagnosis).
+fn processes_running(marker: &str) -> String {
+    use std::fmt::Write as _;
+    let mut said = String::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let dir = entry.path();
+        let command = std::fs::read(dir.join("cmdline")).unwrap_or_default();
+        if !String::from_utf8_lossy(&command).contains(marker) {
+            continue;
+        }
+        let status = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
+        let wanted = [
+            "Pid:", "PPid:", "State:", "SigPnd:", "ShdPnd:", "SigBlk:", "SigIgn:", "SigCgt:",
+        ];
+        let lines: Vec<&str> = status
+            .lines()
+            .filter(|line| wanted.iter().any(|key| line.starts_with(key)))
+            .collect();
+        let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
+        // After the name's last `)`: state, ppid, pgrp, session, tty, tpgid.
+        let fields: Vec<&str> = stat
+            .rsplit_once(')')
+            .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+        let groups = format!(
+            "pgrp {} tpgid {}",
+            fields.get(2).unwrap_or(&"?"),
+            fields.get(5).unwrap_or(&"?")
+        );
+        let _ = writeln!(said, "{} {groups}", lines.join(" "));
+    }
+    if said.is_empty() {
+        said.push_str("(no process runs it)\n");
+    }
+    said
 }
 
 /// Polls `done` every 300 ms until it holds, failing past 60 s with `what`.
@@ -2823,7 +2863,13 @@ fn a_flood_through_the_terminal_ends_promptly() {
         "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo do\"\"ne"
     ));
     session.job();
-    session.expect("done");
+    // 3 MB through two terminals: longer than `expect`'s 20 s on a slow
+    // host (CI's Fedora VM showed 2.7 MB of it), within the test's alarm.
+    assert!(
+        session.saw_within("done", std::time::Duration::from_secs(75)),
+        "never saw \"done\"\n{}",
+        session.transcript()
+    );
     assert_eq!(session.status(), Status::Exited(0));
     session.finish();
 }
@@ -3084,7 +3130,14 @@ fn a_terminal_container_run_is_raw_and_detaches() {
     session.expect("got-two");
     session.expect("33 99");
     session.type_keys(CTRL_C);
-    session.expect("caught-int");
+    // F193: lost now and then on a loaded host, its cause unknown: what the
+    // shell had blocked, ignored and caught, and whose the terminal was.
+    assert!(
+        session.saw_within("caught-int", std::time::Duration::from_secs(20)),
+        "never saw \"caught-int\"\n{}\n{}",
+        processes_running("caught-int"),
+        session.transcript()
+    );
     session.type_keys(b"\x10\x11");
     assert_eq!(
         session.status(),

@@ -33,7 +33,7 @@ carries real information:
 - **Map** (default): dependency graph laid out left→right by dependency depth, starting
   from published host ports.
   - Solid edge = declared (`depends_on`).
-  - Dotted orange = *observed but undeclared* (seen in the container's `/proc/net/tcp`).
+  - Dotted yellow = *observed but undeclared* (seen in the container's `/proc/net/tcp`).
   - Red dashed = refused (target down).
   - Moving dots = live traffic.
   - Overlays (toggle): network color stripes on top of each node, volume chips below, image

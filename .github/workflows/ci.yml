@@ -1,15 +1,13 @@
 name: CI
 
-# Manual only for now: the repository's Actions billing is off, so GitHub starts
-# no job ("recent account payments have failed or your spending limit needs to
-# be increased"), and every push would show a red run. Run it by hand
-# (`gh workflow run CI --ref BRANCH`) once billing is back; until then the checks
-# run locally (`scripts/test-linux.sh`, and the commands in CLAUDE.md).
+# On every push to main and every pull request (the repository is public from
+# stage 15, D15-1: GitHub's standard runners are free), and by hand
+# (`gh workflow run CI --ref BRANCH`).
 on:
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  # pull_request:
+  push:
+    branches: [main]
+  pull_request:
 
 # Read-only token: CI never needs to write to the repository.
 permissions:
@@ -201,6 +199,10 @@ jobs:
       # step's own time limit fails it before the job's, so its log is kept.
       - name: terminal tests, on their own, against the installed binaries
         continue-on-error: true
+        # A step's own limit keeps its log (a job cancelled at its limit
+        # keeps none): run-logged.sh's timeout stops cargo, but a test it
+        # leaves behind can keep the step from ending (F193).
+        timeout-minutes: 6
         run: |
           cargo test --locked -p shipyard-cli --test terminal --no-run
           scripts/ci/run-logged.sh 240 terminal \
@@ -210,6 +212,7 @@ jobs:
           SHIPYARD_TEST_ROOTLESS: required
           SHIPYARD_TEST_DELEGATED: required
       - name: cargo test, against the installed binaries
+        timeout-minutes: 12
         run: |
           cargo test --locked -p shipyard-cli --no-run
           scripts/ci/run-logged.sh 600 tests \
@@ -228,26 +231,6 @@ jobs:
           ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
           sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
           sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true
-
-  # Another real host (H4): Fedora, SELinux enforcing, in a QEMU/KVM VM on
-  # the runner. Both passes (rootless, then root), from executables built
-  # here. firewalld runs, as Fedora has it.
-  fedora:
-    name: Fedora VM (SELinux enforcing)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/shipyard-vm
-          # The image is pinned in the script: a new pin, a new cache.
-          key: fedora-cloud-${{ hashFiles('scripts/ci/fedora-vm.sh') }}
-      - run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
-      - run: scripts/ci/fedora-vm.sh
 
   # The OCI runtime conformance suite (runtime-tools, pinned in
   # scripts/conformance/Dockerfile) against shipyard-runtime, in the same

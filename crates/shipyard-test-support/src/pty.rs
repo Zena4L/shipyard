@@ -540,6 +540,23 @@ impl Session {
         }
     }
 
+    /// Whether `text` appears after the previous match within `wait` (as
+    /// [`expect`](Self::expect), past it if so): for a test that says more
+    /// than the transcript when it doesn't.
+    pub fn saw_within(&mut self, text: &str, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(at) = find(&self.output[self.cursor..], text.as_bytes()) {
+                self.cursor += at + text.len();
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(deadline);
+        }
+    }
+
     /// Waits for a line starting with `prefix`; returns the rest of it.
     pub fn expect_line_starting(&mut self, prefix: &str) -> String {
         self.expect(prefix);
@@ -659,13 +676,24 @@ impl Session {
         }
     }
 
-    /// Everything the terminal showed, for failure messages.
+    /// What the terminal showed, for failure messages: all of it, or past
+    /// 4 KiB its first and last 2 KiB (a flood's megabytes once ended CI's
+    /// log at the panic, and with it what followed).
     #[must_use]
     pub fn transcript(&self) -> String {
-        format!(
-            "--- terminal output ---\n{}\n-----------------------",
-            String::from_utf8_lossy(&self.output)
-        )
+        const HALF: usize = 2048;
+        let output = &self.output;
+        let shown = if output.len() <= 2 * HALF {
+            String::from_utf8_lossy(output).into_owned()
+        } else {
+            format!(
+                "{}\n[... {} bytes ...]\n{}",
+                String::from_utf8_lossy(&output[..HALF]),
+                output.len() - 2 * HALF,
+                String::from_utf8_lossy(&output[output.len() - HALF..])
+            )
+        };
+        format!("--- terminal output ---\n{shown}\n-----------------------")
     }
 
     /// The next line from the shell, reading terminal output meanwhile (a

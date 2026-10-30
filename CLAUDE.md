@@ -13,7 +13,7 @@ every coding agent. They are binding here too:
   `review` reviews a branch or a PR on two axes (standards, spec); `guideline` is the bias
   toward caution, simplicity and surgical changes.
 - **Plans** live in `~/.claude/plans/`, with a "built and reviewed" section per step.
-  **Memory** (`~/.claude/projects/-Users-clementbogyah-Desktop-shipyard/memory/`) holds the
+  **Memory** (`~/.claude/projects/<this project>/memory/`) holds the
   progress line: update both at the end of each step. A lesson that every agent needs
   goes into `AGENTS.md` (section 10), not only into memory.
 - **Decisions** go to the user with `AskUserQuestion`: 2–4 options, the recommended one

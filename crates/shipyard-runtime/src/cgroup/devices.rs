@@ -211,7 +211,7 @@ pub(crate) fn is_host_root() -> bool {
 /// Loads `program` as a cgroup device program. On a refusal, the errno and
 /// the verifier's log (from a second try that asks for it).
 fn load(program: &[crate::devices::Instruction]) -> Result<OwnedFd, (Errno, String)> {
-    let license = c"MIT OR Apache-2.0";
+    let license = c"Apache-2.0";
     let mut name = [0_u8; 16];
     name[..12].copy_from_slice(b"shipyard_dev");
     let mut attr = ProgramLoad {

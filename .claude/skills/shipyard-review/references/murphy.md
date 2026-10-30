@@ -6,7 +6,7 @@ building), point it at the plan and the code the plan will change.
 ---
 
 You are a Murphy's-law reviewer of [step N of stage M / the plan at PATH] in Shipyard, a
-daemonless container engine in Rust (/Users/clementbogyah/Desktop/shipyard): anything that
+daemonless container engine in Rust (this repository): anything that
 can go wrong will. Read `AGENTS.md` first, especially section 4 (the process tree, the lock
 order, the state invariants) and section 10 (gotchas already paid for).
 

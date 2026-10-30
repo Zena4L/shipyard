@@ -78,39 +78,50 @@ impl Stores {
     /// containers get go with it, where they'd pile up in the tests' shared
     /// one (the default network has twelve subnets to choose from).
     fn serve(&self, idle_seconds: u32) -> Service {
-        self.serve_in(idle_seconds, is_root(), None)
+        self.serve_in(idle_seconds, is_root(), None, None)
+    }
+
+    /// [`serve`](Self::serve), its log (`service.log`) at `debug` for
+    /// shipyard's API: what a rare failure leaves to read.
+    fn serve_debug(&self, idle_seconds: u32) -> Service {
+        self.serve_in(idle_seconds, is_root(), None, Some("shipyard_api=debug"))
     }
 
     /// [`serve`](Self::serve) in the tests' own network namespace: where
     /// the fixture registry on loopback can be reached (a pull), for a test
     /// that starts no container on a network.
     fn serve_here(&self, idle_seconds: u32) -> Service {
-        self.serve_in(idle_seconds, false, None)
+        self.serve_in(idle_seconds, false, None, None)
     }
 
     /// [`serve`](Self::serve), started with the descriptor limit `nofile`
     /// (soft, hard), as systemd starts it with its own.
     fn serve_limited(&self, idle_seconds: u32, nofile: (u64, u64)) -> Service {
-        self.serve_in(idle_seconds, is_root(), Some(nofile))
+        self.serve_in(idle_seconds, is_root(), Some(nofile), None)
     }
 
     /// The service, in a network namespace of its own if `own_network`,
-    /// with the descriptor limit `nofile` if one is given.
+    /// with the descriptor limit `nofile` if one is given, and `RUST_LOG`
+    /// if `log` is.
     fn serve_in(
         &self,
         idle_seconds: u32,
         own_network: bool,
         nofile: Option<(u64, u64)>,
+        log: Option<&str>,
     ) -> Service {
         use std::os::unix::process::CommandExt as _;
         let mut command = self.command(&["system", "service", "--socket"]);
         // Its log kept in the stores, where a test can read it.
-        let log = std::fs::File::create(self.scratch.0.join("service.log")).unwrap();
+        let log_file = std::fs::File::create(self.scratch.0.join("service.log")).unwrap();
         command
             .arg(self.socket())
             .env("SHIPYARD_API_IDLE", idle_seconds.to_string())
             .stdout(Stdio::null())
-            .stderr(log);
+            .stderr(log_file);
+        if let Some(log) = log {
+            command.env("RUST_LOG", log);
+        }
         if own_network {
             // SAFETY: `unshare` is a system call, async-signal-safe;
             // nothing else runs between the fork and the exec.
@@ -1789,7 +1800,8 @@ fn start_attached_and_attach_are_docker_s() {
         return;
     }
     let Some(stores) = Stores::new() else { return };
-    let _service = stores.serve(60);
+    // At debug: why a start's handover to a waiting attach failed (F200).
+    let _service = stores.serve_debug(60);
     stores.docker_ok(&[
         "create",
         "--name",
@@ -1834,10 +1846,12 @@ fn start_attached_and_attach_are_docker_s() {
         attached.0.try_wait().unwrap().is_some()
     });
     // An ended container: `start -a` attaches first, then starts it.
+    let again = stores.docker_ok(&["start", "-a", "made"]);
     assert_eq!(
-        stores.docker_ok(&["start", "-a", "made"]),
+        again,
         "made then started",
-        "again"
+        "again; the service said:\n{}",
+        std::fs::read_to_string(stores.scratch.0.join("service.log")).unwrap_or_default()
     );
     stores.docker_ok(&["rm", "made", "attached"]);
 }
@@ -2599,11 +2613,15 @@ fn a_finished_exec_s_session_ends_both_ways() {
 
 /// An exec's command gets its container's descriptor limit (the runtime's
 /// snapshot of it), never the one the service raised for itself (F151's
-/// premise, checked: the container here was started with this test's own
-/// soft limit). The control: the service's own soft limit is its hard one.
+/// premise, checked: the container here is given a limit of its own, below
+/// the service's, which a host whose soft and hard limits are equal (GitHub's
+/// runners: 65536 both) would otherwise make the same). The control: the
+/// service's own soft limit is its hard one.
 #[test]
 fn an_exec_gets_its_container_s_descriptor_limit() {
     use std::io::Read as _;
+    /// The container's own limit, soft and hard: below any service's.
+    const CONTAINER_NOFILE: u64 = 512;
     let Some(stores) = Stores::new() else { return };
     assert!(
         stores
@@ -2612,6 +2630,8 @@ fn an_exec_gets_its_container_s_descriptor_limit() {
                 "-d",
                 "--network",
                 "none",
+                "--ulimit",
+                &format!("nofile={CONTAINER_NOFILE}"),
                 "--name",
                 "box",
                 &stores.image,
@@ -2623,8 +2643,8 @@ fn an_exec_gets_its_container_s_descriptor_limit() {
     );
     let (_, hard) =
         nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
-    if hard <= 1024 {
-        eprintln!("skipping: the hard descriptor limit is 1024 here");
+    if hard <= CONTAINER_NOFILE {
+        eprintln!("skipping: the hard descriptor limit is {hard} here");
         return;
     }
     let service = stores.serve_limited(60, (1024, hard));
@@ -2652,11 +2672,9 @@ fn an_exec_gets_its_container_s_descriptor_limit() {
     assert_eq!(status, 101);
     let mut out = Vec::new();
     session.read_to_end(&mut out).unwrap();
-    let (soft, _) =
-        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
     let said = String::from_utf8_lossy(&out);
     assert!(
-        said.contains(&format!("{soft}\n")),
+        said.contains(&format!("{CONTAINER_NOFILE}\n")),
         "the container's: {said:?}"
     );
     assert!(

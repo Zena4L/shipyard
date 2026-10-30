@@ -1,7 +1,7 @@
 # The desktop app
 
-Shipyard's desktop app shows your containers in a window. It's being built in
-stage 14, one step at a time; this page says what works today. It runs on a Mac
+Shipyard's desktop app shows your containers in a window; this page says what it
+does. It runs on a Mac
 (Apple Silicon, macOS 13 or later) and on Linux, built there from source (it needs
 WebKitGTK 4.1: Debian 13, Ubuntu 24.04 and Fedora 40 have it; it's tested on Debian 13).
 
@@ -35,7 +35,7 @@ It isn't packaged yet: you run it from the source tree (below).
   what depends on what, starting from the ports they publish on your Mac (or
   Linux host):
   - a **solid** line is a dependency compose declares (`depends_on`);
-  - a **dotted orange** line is traffic seen between two containers that no
+  - a **dotted yellow** line is traffic seen between two containers that no
     `depends_on` declares ("undeclared");
   - a **red dashed** line is a declared dependency that's refused: the
     container it needs isn't running, or isn't healthy when compose waits for
