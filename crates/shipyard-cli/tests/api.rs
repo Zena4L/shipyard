@@ -78,39 +78,50 @@ impl Stores {
     /// containers get go with it, where they'd pile up in the tests' shared
     /// one (the default network has twelve subnets to choose from).
     fn serve(&self, idle_seconds: u32) -> Service {
-        self.serve_in(idle_seconds, is_root(), None)
+        self.serve_in(idle_seconds, is_root(), None, None)
+    }
+
+    /// [`serve`](Self::serve), its log (`service.log`) at `debug` for
+    /// shipyard's API: what a rare failure leaves to read.
+    fn serve_debug(&self, idle_seconds: u32) -> Service {
+        self.serve_in(idle_seconds, is_root(), None, Some("shipyard_api=debug"))
     }
 
     /// [`serve`](Self::serve) in the tests' own network namespace: where
     /// the fixture registry on loopback can be reached (a pull), for a test
     /// that starts no container on a network.
     fn serve_here(&self, idle_seconds: u32) -> Service {
-        self.serve_in(idle_seconds, false, None)
+        self.serve_in(idle_seconds, false, None, None)
     }
 
     /// [`serve`](Self::serve), started with the descriptor limit `nofile`
     /// (soft, hard), as systemd starts it with its own.
     fn serve_limited(&self, idle_seconds: u32, nofile: (u64, u64)) -> Service {
-        self.serve_in(idle_seconds, is_root(), Some(nofile))
+        self.serve_in(idle_seconds, is_root(), Some(nofile), None)
     }
 
     /// The service, in a network namespace of its own if `own_network`,
-    /// with the descriptor limit `nofile` if one is given.
+    /// with the descriptor limit `nofile` if one is given, and `RUST_LOG`
+    /// if `log` is.
     fn serve_in(
         &self,
         idle_seconds: u32,
         own_network: bool,
         nofile: Option<(u64, u64)>,
+        log: Option<&str>,
     ) -> Service {
         use std::os::unix::process::CommandExt as _;
         let mut command = self.command(&["system", "service", "--socket"]);
         // Its log kept in the stores, where a test can read it.
-        let log = std::fs::File::create(self.scratch.0.join("service.log")).unwrap();
+        let log_file = std::fs::File::create(self.scratch.0.join("service.log")).unwrap();
         command
             .arg(self.socket())
             .env("SHIPYARD_API_IDLE", idle_seconds.to_string())
             .stdout(Stdio::null())
-            .stderr(log);
+            .stderr(log_file);
+        if let Some(log) = log {
+            command.env("RUST_LOG", log);
+        }
         if own_network {
             // SAFETY: `unshare` is a system call, async-signal-safe;
             // nothing else runs between the fork and the exec.
@@ -1789,7 +1800,8 @@ fn start_attached_and_attach_are_docker_s() {
         return;
     }
     let Some(stores) = Stores::new() else { return };
-    let _service = stores.serve(60);
+    // At debug: why a start's handover to a waiting attach failed (F200).
+    let _service = stores.serve_debug(60);
     stores.docker_ok(&[
         "create",
         "--name",
@@ -1834,10 +1846,12 @@ fn start_attached_and_attach_are_docker_s() {
         attached.0.try_wait().unwrap().is_some()
     });
     // An ended container: `start -a` attaches first, then starts it.
+    let again = stores.docker_ok(&["start", "-a", "made"]);
     assert_eq!(
-        stores.docker_ok(&["start", "-a", "made"]),
+        again,
         "made then started",
-        "again"
+        "again; the service said:\n{}",
+        std::fs::read_to_string(stores.scratch.0.join("service.log")).unwrap_or_default()
     );
     stores.docker_ok(&["rm", "made", "attached"]);
 }
