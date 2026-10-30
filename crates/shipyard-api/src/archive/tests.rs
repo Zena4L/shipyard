@@ -36,14 +36,17 @@ fn quiet() -> Arc<reply::Progress> {
 
 /// A body whose frames come one at a time is read as each comes, not a
 /// look's wait later: 400 frames, each sent 2 ms after the last (so the
-/// reader finds the body empty and waits for each one), take well under
-/// the 20 s that a 50 ms look a frame cost (11.7's measure: a PUT read 16
-/// frames a look).
+/// reader finds the body empty and waits for each one), are read within a
+/// moment of the last one's sending, not the 20 s that a 50 ms look a frame
+/// cost (11.7's measure: a PUT read 16 frames a look). Measured against the
+/// pump's own time: a loaded host's sleeps last longer (a CI runner's 400
+/// took 6 s).
 #[test]
 fn a_body_is_read_as_each_frame_comes() {
     let (frames, receiver) = mpsc::channel(1);
     let progress = quiet();
     let pumped = Arc::clone(&progress);
+    let began = Instant::now();
     let pump = std::thread::spawn(move || {
         let _ended = reply::BumpOnDrop(Arc::clone(&pumped));
         for _ in 0..400 {
@@ -55,23 +58,26 @@ fn a_body_is_read_as_each_frame_comes() {
                         frame = back;
                         std::thread::yield_now();
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(mpsc::error::TrySendError::Closed(_)) => return began.elapsed(),
                 }
             }
             pumped.bump();
             // Paced: the reader waits for the next frame, every time.
             std::thread::sleep(Duration::from_millis(2));
         }
+        began.elapsed()
     });
-    let began = Instant::now();
     let mut read = Vec::new();
     BodyReader::new(receiver, progress, never())
         .read_to_end(&mut read)
         .unwrap();
     let took = began.elapsed();
-    pump.join().unwrap();
+    let pumped_for = pump.join().unwrap();
     assert_eq!(read.len(), 400);
-    assert!(took < Duration::from_secs(5), "took {took:?}");
+    assert!(
+        took < pumped_for + Duration::from_secs(2),
+        "took {took:?}, the frames {pumped_for:?}"
+    );
 }
 
 /// A body's frames read in order; its end, the reader's; an error in it,
