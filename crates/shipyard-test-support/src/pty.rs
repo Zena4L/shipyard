@@ -540,6 +540,23 @@ impl Session {
         }
     }
 
+    /// Whether `text` appears after the previous match within `wait` (as
+    /// [`expect`](Self::expect), past it if so): for a test that says more
+    /// than the transcript when it doesn't.
+    pub fn saw_within(&mut self, text: &str, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(at) = find(&self.output[self.cursor..], text.as_bytes()) {
+                self.cursor += at + text.len();
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(deadline);
+        }
+    }
+
     /// Waits for a line starting with `prefix`; returns the rest of it.
     pub fn expect_line_starting(&mut self, prefix: &str) -> String {
         self.expect(prefix);
