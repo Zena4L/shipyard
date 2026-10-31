@@ -261,3 +261,111 @@ fn a_config_keeps_its_owner() {
         "written"
     );
 }
+
+/// F162: as root with a user's `HOME` (`sudo -E`), a config that's a link
+/// of that user's to a file of root's is refused, `keep` and `forget` alike,
+/// and the file is untouched. The control: the same user's link to a file
+/// of their own is written (a dotfiles link), its owner kept.
+#[test]
+fn root_refuses_a_user_s_link_to_root_s_config() {
+    use std::os::unix::fs::MetadataExt as _;
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(scratch.config_path().parent().unwrap()).unwrap();
+    let victim = scratch.0.join("victim.json");
+    std::fs::write(&victim, "{}").unwrap();
+    std::os::unix::fs::symlink(&victim, scratch.config_path()).unwrap();
+    std::os::unix::fs::lchown(scratch.config_path(), Some(65534), Some(65534)).unwrap();
+    let credentials = Credentials::at(scratch.config_path()).with_helper_dir(&scratch.0);
+    let refused = credentials.keep("ghcr.io", &basic("pw")).unwrap_err();
+    assert!(
+        matches!(refused, CredentialError::ForeignLink { .. }),
+        "{refused:?}"
+    );
+    let refused = credentials.forget("ghcr.io").unwrap_err();
+    assert!(
+        matches!(refused, CredentialError::ForeignLink { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "{}");
+    assert_eq!(std::fs::metadata(&victim).unwrap().uid(), 0);
+    // The control: the link leads to a file of its owner's, in a directory
+    // of theirs (a dotfiles link).
+    let dotfiles = scratch.0.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let theirs = dotfiles.join("docker.json");
+    std::fs::write(&theirs, "{}").unwrap();
+    for place in [&dotfiles, &theirs] {
+        std::os::unix::fs::chown(place, Some(65534), Some(65534)).unwrap();
+    }
+    std::fs::remove_file(scratch.config_path()).unwrap();
+    std::os::unix::fs::symlink(&theirs, scratch.config_path()).unwrap();
+    std::os::unix::fs::lchown(scratch.config_path(), Some(65534), Some(65534)).unwrap();
+    credentials.keep("ghcr.io", &basic("pw")).unwrap();
+    let written = std::fs::metadata(&theirs).unwrap();
+    assert_eq!((written.uid(), written.gid()), (65534, 65534));
+    assert!(
+        std::fs::read_to_string(&theirs)
+            .unwrap()
+            .contains("ghcr.io")
+    );
+}
+
+/// F162: the same through the config's directory: a user's `.docker` that
+/// links to a directory of root's is refused, and nothing is made there;
+/// the control: one leading to a directory of the user's own is written.
+#[test]
+fn root_refuses_a_user_s_linked_config_directory() {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let roots = scratch.0.join("roots");
+    std::fs::create_dir_all(&roots).unwrap();
+    let docker = scratch.config_path().parent().unwrap().to_owned();
+    std::os::unix::fs::symlink(&roots, &docker).unwrap();
+    std::os::unix::fs::lchown(&docker, Some(65534), Some(65534)).unwrap();
+    let credentials = Credentials::at(scratch.config_path()).with_helper_dir(&scratch.0);
+    let refused = credentials.keep("ghcr.io", &basic("pw")).unwrap_err();
+    assert!(
+        matches!(refused, CredentialError::ForeignLink { .. }),
+        "{refused:?}"
+    );
+    assert!(!roots.join("config.json").exists());
+    // The control: the link's owner owns the directory it leads to.
+    std::os::unix::fs::chown(&roots, Some(65534), Some(65534)).unwrap();
+    credentials.keep("ghcr.io", &basic("pw")).unwrap();
+    assert!(roots.join("config.json").exists());
+}
+
+/// F162's race: as root, a user's `.docker` swapped for a link to a
+/// directory of root's after the check (renamed away, the link put in its
+/// place) is never written through: the write goes to the directory that
+/// was checked, held open, and root's directory is untouched.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_config_directory_swapped_after_its_check_is_never_written_through() {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let credentials = scratch.credentials(Some("{}"));
+    let docker = scratch.config_path().parent().unwrap().to_owned();
+    std::os::unix::fs::chown(&docker, Some(65534), Some(65534)).unwrap();
+    std::os::unix::fs::chown(scratch.config_path(), Some(65534), Some(65534)).unwrap();
+    let place = config_to_write(&scratch.config_path()).unwrap();
+    // The swap, after the check.
+    let moved = scratch.0.join("moved");
+    std::fs::rename(&docker, &moved).unwrap();
+    let roots = scratch.0.join("roots");
+    std::fs::create_dir_all(&roots).unwrap();
+    std::os::unix::fs::symlink(&roots, &docker).unwrap();
+    credentials
+        .keep_at(&place.path, "ghcr.io", &basic("pw"))
+        .unwrap();
+    assert!(!roots.join("config.json").exists(), "root's untouched");
+    let written = std::fs::read_to_string(moved.join("config.json")).unwrap();
+    assert!(written.contains("ghcr.io"), "{written}");
+}

@@ -133,6 +133,37 @@ behaviour; each change is listed here).
   Fedora's policy for pasta (`pasta_t`) grants it `sys_admin` only within a user
   namespace, so as root it can't join the container's network. The error now says that
   SELinux may be why, and that root's containers have bridge networks (their default).
+- **`docker run --rm` whose start failed printed a second error** ("Error waiting for
+  container"): the API's wait answered a container that never ran with an error of its
+  own. It answers 0 and no error, as Docker's daemon does (F139).
+- **`shipyard-runtime update --cpu-period` alone cleared the CPU quota** (`cpu.max` written
+  as `max PERIOD`): the quota now stays, as its help says and runc does (F31).
+- **A pause cut short left a container frozen but reading as running:** `unpause`
+  refused it and an `exec` into it hung. A freeze asked and not reached now reads as
+  paused, and `pause` holds off Ctrl-C until its freeze is reached or undone (F126).
+- **A volume's two lock files were never removed** (`volumes/.locks`, `.fill-locks`: two
+  files for every volume ever made, `--rm`'s anonymous ones too). They go with the volume;
+  every lock taken is checked to still be the file at its path, so a run that opened one
+  before it went never holds a lock that guards nothing (F150). While an older
+  `shipyard` still runs beside this one (an upgrade under way), its runs don't check:
+  remove volumes once it's gone.
+- **A network removed after a reboot, before the boot's recovery, stranded the containers
+  it would start** (restart policies): they came back without it. They keep their
+  networks until the recovery has run, noted in `recovered-boot.json` in the store (F130).
+- **A stop through the API whose client went held the service up for as long as the stop
+  took** (`t=-1`: for good): its wait is given up, the stop left to the container's
+  monitor (as Docker's daemon finishes it), and the service ends once idle (F123).
+- **The login password prompt left the terminal without echo** when `shipyard` was killed
+  meanwhile (SIGTERM, SIGHUP) or panicked: it uses the runtime's raw mode, which puts the
+  terminal back in either case (F201).
+
+### Security
+
+- **As root, `login` and `logout` followed a user's link** (`~/.docker/config.json`, or
+  `.docker` itself, under `sudo -E`) and rewrote or made a file of root's (or anyone's)
+  wherever it led. A link to what its owner doesn't own is refused as root, and the
+  config's directory is opened once and checked as it's held open, so one swapped for a
+  link after the check is never written through (F162).
 
 ## 0.5.0 - unreleased
 

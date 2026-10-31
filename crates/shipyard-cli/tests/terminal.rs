@@ -62,6 +62,7 @@ macro_rules! tests {
 
 /// Every test, by name.
 const TESTS: &[(&str, fn())] = tests![
+    a_stopped_password_prompt_puts_the_terminal_back,
     ctrl_c_reaches_the_command_exactly_once,
     ctrl_c_ends_shipyard_by_sigint,
     ctrl_backslash_quits_the_command,
@@ -1677,6 +1678,38 @@ fn a_bundle_without_a_pid_namespace_cant_reach_shipyards_descriptors() {
         session.transcript()
     );
     assert_eq!(session.count("reached"), 0, "{}", session.transcript());
+    session.finish();
+}
+
+/// `login`'s password prompt stopped by SIGTERM (no key typed: a kill
+/// from elsewhere) puts the terminal back as it was, echo and all (F201: it
+/// left it without echo; a panic there, release builds aborting, did too).
+fn a_stopped_password_prompt_puts_the_terminal_back() {
+    let mut session = session(|shell| {
+        let before = shell.terminal_settings();
+        let job = shell.spawn(
+            Mode::Foreground,
+            &["login", "--username", "me", "127.0.0.1:9"],
+        );
+        shell.wait(job);
+        shell.report_settings(&before);
+    });
+    let shipyard = session.job();
+    session.expect("Password:");
+    // Typed, never echoed: the control that the prompt was quiet (else a
+    // terminal never changed would come back "unchanged" too).
+    session.type_keys(b"hunter2");
+    session.settle(std::time::Duration::from_millis(300));
+    // SAFETY: `kill` has no memory-safety conditions; `shipyard` is the job.
+    assert_eq!(unsafe { libc::kill(shipyard, libc::SIGTERM) }, 0);
+    assert_eq!(
+        session.status(),
+        Status::Signaled(libc::SIGTERM),
+        "{}",
+        session.transcript()
+    );
+    session.expect("settings unchanged");
+    assert_eq!(session.count("hunter2"), 0, "{}", session.transcript());
     session.finish();
 }
 

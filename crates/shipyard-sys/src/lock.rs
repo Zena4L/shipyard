@@ -113,6 +113,25 @@ pub fn try_lock_until(
     }
 }
 
+/// Whether `file`, locked, is still the file at `path`: linked
+/// (`st_nlink` above 0) and the same one there (device and inode). A lock
+/// file that's removed (unlinked under its lock, so it doesn't outlive what
+/// it guards) can still be locked by whoever opened it before: that lock
+/// guards nothing any more, and its holder opens the path again (TLPI
+/// §55.2: a lock belongs to the open file description, not the name).
+///
+/// # Errors
+///
+/// `fstat`'s error. The path gone, or another file there, is `false`.
+pub fn still_linked(file: impl AsFd, path: &std::path::Path) -> io::Result<bool> {
+    let held = nix::sys::stat::fstat(file.as_fd()).map_err(io::Error::from)?;
+    if held.st_nlink == 0 {
+        return Ok(false);
+    }
+    Ok(nix::sys::stat::lstat(path)
+        .is_ok_and(|there| (there.st_dev, there.st_ino) == (held.st_dev, held.st_ino)))
+}
+
 /// A locked file a value holds, to hand over: let go (`LOCK_UN`) when it
 /// drops, so a copy another thread's child holds until it execs doesn't keep
 /// it, unless it was [given up](Self::give_up): then it's only closed, and

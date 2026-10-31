@@ -80,13 +80,34 @@ pub(super) enum WhenUp {
 /// is `created` only while it does): it's deleted, its monitor with it, so
 /// its holds go.
 pub(super) fn take(engine: &Engine, reference: &str, when_up: WhenUp) -> Result<Took> {
-    take_with(engine, reference, IfUp::Do(when_up))
+    take_with(engine, reference, IfUp::Do(when_up), &|| false)
+}
+
+/// [`take`], its wait for the end given up once `gone` says its caller
+/// has (F123: the API's stop whose client went): the stop goes on in the
+/// container's monitor, which sends SIGKILL at its timeout, unwaited for.
+///
+/// # Errors
+///
+/// As [`take`]'s, and [`ErrorKind::Busy`] once given up.
+pub(super) fn take_until(
+    engine: &Engine,
+    reference: &str,
+    when_up: WhenUp,
+    gone: &dyn Fn() -> bool,
+) -> Result<Took> {
+    take_with(engine, reference, IfUp::Do(when_up), gone)
 }
 
 /// Container `reference`, taken as [`take`] does to start it (or copy its
 /// files while it's stopped); one that's up is left so, [`Took::Up`].
 pub(super) fn take_or_leave(engine: &Engine, reference: &str) -> Result<Took<Record>> {
-    take_with(engine, reference, IfUp::Leave(std::convert::identity))
+    take_with(
+        engine,
+        reference,
+        IfUp::Leave(std::convert::identity),
+        &|| false,
+    )
 }
 
 /// What [`take_with`] does with a container that's up.
@@ -109,7 +130,12 @@ impl<Up> Clone for IfUp<Up> {
 impl<Up> Copy for IfUp<Up> {}
 
 /// [`take`] and [`take_or_leave`].
-fn take_with<Up>(engine: &Engine, reference: &str, if_up: IfUp<Up>) -> Result<Took<Up>> {
+fn take_with<Up>(
+    engine: &Engine,
+    reference: &str,
+    if_up: IfUp<Up>,
+    gone: &dyn Fn() -> bool,
+) -> Result<Took<Up>> {
     let when_up = match if_up {
         IfUp::Do(when_up) => Some(when_up),
         IfUp::Leave(_) => None,
@@ -169,8 +195,13 @@ fn take_with<Up>(engine: &Engine, reference: &str, if_up: IfUp<Up>) -> Result<To
         }
         _ => {}
     }
-    let running = match containers::running_lock(engine, &id, running_wait) {
+    let running = match containers::running_lock_until(engine, &id, running_wait, gone) {
         Ok(Some(running)) => running,
+        Ok(None) if gone() => bail!(
+            Busy,
+            "container {} is still stopping, left to its monitor: its caller went",
+            record.name
+        ),
         Ok(None) => bail!(
             Busy,
             "container {} is still ending (its clean-up holds it): try again",

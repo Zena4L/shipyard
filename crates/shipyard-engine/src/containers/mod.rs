@@ -76,7 +76,7 @@ pub use labels::Labels;
 #[cfg(target_os = "linux")]
 pub(crate) use locks::{
     Locked, OP_WAIT, SETTLE_WAIT, lock_again, lock_found, operation_lock, restart_pending,
-    restarting_lock, running_lock, settled, wait_settled,
+    restarting_lock, running_lock, running_lock_until, settled, wait_settled,
 };
 pub(crate) use lookup::exists;
 #[cfg_attr(

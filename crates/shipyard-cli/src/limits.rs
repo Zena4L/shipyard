@@ -227,6 +227,13 @@ impl LimitArgs {
         self.docker().swap_without_memory()
     }
 
+    /// Whether `--cpu-period` is given without a quota (`--cpu-quota` or
+    /// `--cpus`): for an update, the container's own quota then stays.
+    #[must_use]
+    pub fn period_without_quota(&self) -> bool {
+        self.cpu_period.is_some() && self.cpu_quota.is_none() && self.cpus.is_none()
+    }
+
     /// The flags as Docker's limits, for the runtime's one mapping of them
     /// (the API's too: `DockerLimits`).
     fn docker(&self) -> DockerLimits {

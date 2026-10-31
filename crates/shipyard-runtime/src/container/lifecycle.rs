@@ -2126,6 +2126,18 @@ pub fn memory_limit(root: &Path, id: &str) -> Result<Option<u64>> {
     })
 }
 
+/// Container `id`'s CPU quota (`cpu.max`), if it has one: what `update
+/// --cpu-period` alone keeps (runc's rule).
+///
+/// # Errors
+///
+/// As [`update`].
+pub fn cpu_quota(root: &Path, id: &str) -> Result<Option<u64>> {
+    with_cgroup(root, id, "update", &LIVE, LIVE_WANTED, |cgroup| {
+        Ok(cgroup.cpu_quota()?)
+    })
+}
+
 /// The processes in container `id`'s cgroup, by host PID.
 ///
 /// # Errors
@@ -2482,7 +2494,10 @@ fn status_of(dir: &Path) -> Result<Status> {
     if record
         .container_cgroup()
         .and_then(std::result::Result::ok)
-        .is_some_and(|cgroup| cgroup.frozen())
+        // A freeze asked and not reached is a pause too: one whose wait was
+        // cut leaves it so, and the container must read as what `resume`
+        // undoes, never as running (F126).
+        .is_some_and(|cgroup| cgroup.paused())
     {
         return Ok(Status::Paused);
     }

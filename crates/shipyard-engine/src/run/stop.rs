@@ -116,13 +116,32 @@ impl StopOptions {
 /// another command holds it, or its end takes longer than its timeout and a
 /// minute ([`ErrorKind::Busy`]).
 pub fn stop(engine: &Engine, reference: &str, options: StopOptions) -> Result<Record> {
+    stop_until(engine, reference, options, &|| false)
+}
+
+/// [`stop`], its wait for the end given up once `gone` says its caller
+/// has (F123: the API's stop whose client went, which would otherwise keep
+/// the service up for as long as the stop takes). The stop itself goes on:
+/// the container's monitor sends SIGKILL at its timeout, and it ends as a
+/// user's stop (its restart policy leaves it so). Given up, it says no
+/// `stop` event; its `die` comes as any end's.
+///
+/// # Errors
+///
+/// As [`stop`]'s, and [`ErrorKind::Busy`] once given up.
+pub fn stop_until(
+    engine: &Engine,
+    reference: &str,
+    options: StopOptions,
+    gone: &dyn Fn() -> bool,
+) -> Result<Record> {
     #[cfg(target_os = "linux")]
-    return linux::stop(engine, reference, options).inspect(|record| {
+    return linux::stop(engine, reference, options, gone).inspect(|record| {
         super::joined::warn_joiners(engine, record, "stopped");
     });
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (engine, reference, options);
+        let _ = (engine, reference, options, gone);
         Err(crate::error::linux_only("containers"))
     }
 }
@@ -223,11 +242,16 @@ mod linux {
     use crate::error::{Error, ErrorKind, Result, bail};
     use crate::run::start::Input;
     use crate::run::start::start_taken;
-    use crate::run::take::{Taken, Took, WhenUp, take};
+    use crate::run::take::{Taken, Took, WhenUp, take, take_until};
 
-    pub(super) fn stop(engine: &Engine, reference: &str, options: StopOptions) -> Result<Record> {
+    pub(super) fn stop(
+        engine: &Engine,
+        reference: &str,
+        options: StopOptions,
+        gone: &dyn Fn() -> bool,
+    ) -> Result<Record> {
         options.check()?;
-        match take(engine, reference, WhenUp::Stop(options))? {
+        match take_until(engine, reference, WhenUp::Stop(options), gone)? {
             Took::Taken(Taken { record, .. }) | Took::Gone(record) => {
                 crate::events::emit(engine, &crate::events::container(&record, "stop"));
                 Ok(record)

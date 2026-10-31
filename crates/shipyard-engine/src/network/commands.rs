@@ -414,39 +414,60 @@ pub fn remove(engine: &Engine, name: &str) -> Result<()> {
 
 /// [`ErrorKind::InUse`](crate::ErrorKind::InUse) naming the containers
 /// on the network `name` that are up: running, paused, stopping, waiting
-/// to restart, or about to be restarted (their restart held). A stopped
-/// one doesn't keep it (Docker's rule, D11.4a-2): its next start fails,
-/// the network not found. Records that can't be read refuse it, and so
-/// does a state that can't be read: a container up can't be ruled out.
+/// to restart, about to be restarted (their restart held), or waiting for
+/// the host's boot to start them again (F130, said, with how to clear it).
+/// A stopped one doesn't keep it (Docker's rule, D11.4a-2): its next start
+/// fails, the network not found. Records that can't be read refuse it, and
+/// so does a state that can't be read: a container up can't be ruled out.
 #[cfg(target_os = "linux")]
 fn ensure_no_container_up_on(engine: &Engine, name: &str) -> Result<()> {
     use shipyard_network::store::DEFAULT_NETWORK;
     let records = crate::containers::list_every(engine)
         .with_context(|| format!("the network {name} is kept: its containers can't be listed"))?;
-    let mut users: Vec<String> = records
+    let on_it: Vec<_> = records
         .iter()
         .filter(|record| record.config.joins(name, DEFAULT_NETWORK) && is_up(engine, record))
-        .map(|record| record.name.to_string())
         .collect();
-    if users.is_empty() {
+    if on_it.is_empty() {
         return Ok(());
     }
+    let mut users: Vec<String> = on_it.iter().map(|record| record.name.to_string()).collect();
     users.sort();
+    let mut awaiting: Vec<String> = on_it
+        .iter()
+        .filter(|record| {
+            !crate::containers::state(engine, record).is_ok_and(|state| state.is_active())
+                && crate::run::awaits_boot(engine, record)
+        })
+        .map(|record| record.name.to_string())
+        .collect();
+    awaiting.sort();
+    let why = if awaiting.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} the host's boot starts again: `shipyard system recover` does, or start or \
+             remove them)",
+            shipyard_network::store::users_text(&awaiting)
+        )
+    };
     bail!(
         InUse,
-        "the network {name} is in use by {}",
+        "the network {name} is in use by {}{why}",
         shipyard_network::store::users_text(&users)
     );
 }
 
 /// Whether container `record` keeps its networks in use: up (running,
-/// paused, stopping, waiting to restart) or about to be restarted (its
-/// restart held). A state that can't be read counts as up: a container up
-/// can't be ruled out.
+/// paused, stopping, waiting to restart), about to be restarted (its
+/// restart held), or waiting for the host's boot to start it again (F130:
+/// [`awaits_boot`](crate::run::awaits_boot)). A state that can't be
+/// read counts as up: a container up can't be ruled out.
 #[cfg(target_os = "linux")]
 fn is_up(engine: &Engine, record: &crate::containers::Record) -> bool {
     crate::containers::state(engine, record).map_or(true, |state| state.is_active())
         || crate::containers::restart_pending(engine, &record.id)
+        || crate::run::awaits_boot(engine, record)
 }
 
 /// The bridge networks some container that's up joins, by name (F120:

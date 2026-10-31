@@ -1,10 +1,12 @@
 //! `shipyard push`, `login` and `logout` (step 12.4): Docker's flags and
 //! words, the engine's work.
 //!
-//! `login`'s password is never echoed: on a terminal it's read with the
-//! terminal's echo off, and its signal keys off too (`ISIG`), so a Ctrl-C
-//! or Ctrl-Z comes as a byte that cancels the prompt (the terminal put back
-//! first), never a signal that would leave it without echo.
+//! `login`'s password is never echoed: on a terminal it's read in raw mode
+//! (the runtime's `RawMode`: no echo, and its signal keys as bytes, so a
+//! Ctrl-C or Ctrl-Z cancels the prompt, the terminal put back first). A
+//! SIGTERM or SIGHUP meanwhile, or a panic (release builds abort, so no
+//! `Drop` runs), puts it back too, by `RawMode`'s own handlers and hook
+//! (F201): never a terminal left without echo.
 
 use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::process::ExitCode;
@@ -220,22 +222,29 @@ fn ask(prompt: &str, echo: bool) -> Result<String> {
         bail!("there's no terminal to ask on: give --username and --password-stdin");
     }
     let mut err = std::io::stderr().lock();
-    write!(err, "{prompt}")?;
-    err.flush()?;
     if echo {
+        write!(err, "{prompt}")?;
+        err.flush()?;
         let mut line = String::new();
         stdin.lock().read_line(&mut line)?;
         return Ok(line.trim_end_matches(['\n', '\r']).to_owned());
     }
     let line = {
-        let _quiet = Quiet::on(&stdin)?;
+        use std::os::fd::AsRawFd as _;
+        // Raw before the prompt is shown: what's typed once it's there is
+        // never echoed (and a stop from then on finds it raw, to put back).
+        let _raw = shipyard_runtime::terminal::RawMode::set_in_foreground(stdin.as_raw_fd())
+            .context("setting the terminal's echo")?
+            .context("the terminal is another job's: bring this one to the foreground")?;
+        write!(err, "{prompt}")?;
+        err.flush()?;
         hidden_line(&mut stdin.lock())
     };
     writeln!(err)?;
     line
 }
 
-/// A line read a byte at a time from a terminal in [`Quiet`]'s mode: Enter
+/// A line read a byte at a time from a terminal in raw mode: Enter
 /// ends it, Backspace and Ctrl-U edit it; Ctrl-C, Ctrl-Z, Ctrl-\ (signals
 /// off: bytes) or Ctrl-D on an empty line cancel it at once.
 fn hidden_line(input: &mut impl std::io::Read) -> Result<String> {
@@ -263,40 +272,6 @@ fn hidden_line(input: &mut impl std::io::Read) -> Result<String> {
         }
     }
     String::from_utf8(line).context("the password isn't UTF-8")
-}
-
-/// The terminal's settings while the password is read: no echo, no line
-/// editing of its own (bytes as they're typed, one at a time), its signal
-/// keys read as bytes; put back when dropped.
-struct Quiet<'a> {
-    fd: std::os::fd::BorrowedFd<'a>,
-    before: nix::sys::termios::Termios,
-}
-
-impl<'a> Quiet<'a> {
-    fn on(stdin: &'a std::io::Stdin) -> Result<Self> {
-        use nix::sys::termios::{
-            LocalFlags, SetArg, SpecialCharacterIndices, tcgetattr, tcsetattr,
-        };
-        use std::os::fd::AsFd as _;
-        let fd = stdin.as_fd();
-        let before = tcgetattr(fd).context("reading the terminal's settings")?;
-        let mut quiet = before.clone();
-        quiet
-            .local_flags
-            .remove(LocalFlags::ISIG | LocalFlags::ECHO | LocalFlags::ICANON);
-        quiet.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-        quiet.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-        tcsetattr(fd, SetArg::TCSAFLUSH, &quiet).context("setting the terminal's echo")?;
-        Ok(Self { fd, before })
-    }
-}
-
-impl Drop for Quiet<'_> {
-    fn drop(&mut self) {
-        use nix::sys::termios::{SetArg, tcsetattr};
-        let _ = tcsetattr(self.fd, SetArg::TCSAFLUSH, &self.before);
-    }
 }
 
 #[cfg(test)]

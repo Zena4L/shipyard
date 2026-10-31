@@ -2351,6 +2351,10 @@ fn update_changes_limits_live() {
     let call = runtime.call(&["update", "--cpu-quota", "40000", "growing"]);
     assert_eq!(call.code, Some(0), "{}", call.stderr);
     assert_eq!(read("cpu.max"), "40000 50000\n");
+    // And a period alone keeps the quota (F31: it was cleared to `max`).
+    let call = runtime.call(&["update", "--cpu-period", "80000", "growing"]);
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(read("cpu.max"), "40000 80000\n");
     assert_eq!(
         runtime.call(&["update", "growing"]).code,
         Some(1),

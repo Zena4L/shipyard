@@ -124,7 +124,7 @@ pub(crate) fn update(
     file: Option<&Path>,
     flags: &LimitArgs,
 ) -> Result<Vec<String>> {
-    let resources = match file {
+    let mut resources = match file {
         Some(file) => resources_from(file)?,
         // `--memory-swap` alone is memory plus swap over the container's
         // memory limit now, as runc takes it.
@@ -133,6 +133,14 @@ pub(crate) fn update(
         }
         None => flags.resources_as_given(None)?,
     };
+    // `--cpu-period` alone keeps the container's quota (F31, runc's rule):
+    // `cpu.max` is written whole, so the quota there now goes with it.
+    if file.is_none()
+        && flags.period_without_quota()
+        && let Some(cpu) = resources.cpu_max.as_mut()
+    {
+        cpu.quota = container::cpu_quota(root, id)?;
+    }
     if resources.is_empty() {
         bail!("no limits given: --resources FILE, or flags such as --memory");
     }

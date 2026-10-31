@@ -626,11 +626,11 @@ impl Cgroup {
     /// without `cgroup.kill`): one by one, a process forking faster than the
     /// kills come could outrun them, but a frozen one can't fork, and still
     /// dies of SIGKILL. Thawed after, for what's left to go. (Not freezable,
-    /// before Linux 5.2: one by one all the same.) One frozen already (a
-    /// paused container) is left frozen: whatever outlived the kill stays
-    /// paused.
+    /// before Linux 5.2: one by one all the same.) One paused already (its
+    /// freeze asked, reached or not) is left so: whatever outlived the kill
+    /// stays paused.
     fn kill_frozen(&self) {
-        let thaw = !self.frozen() && self.freeze(true, FREEZE_FOR_KILL).is_ok();
+        let thaw = !self.paused() && self.freeze(true, FREEZE_FOR_KILL).is_ok();
         self.signal_each(libc::SIGKILL);
         if thaw {
             let _ = self.freeze(false, FREEZE_FOR_KILL);
@@ -744,6 +744,43 @@ impl Cgroup {
     pub fn thaw(&self) -> Result<(), CgroupError> {
         write_file(&self.path.join("cgroup.freeze"), "0")
             .map_err(|err| self.error("thawing", io_errno(&err)))
+    }
+
+    /// Its CPU quota (`cpu.max`'s first field), microseconds a period;
+    /// `None` for no quota (`max`).
+    ///
+    /// # Errors
+    ///
+    /// `cpu.max` can't be read, or isn't a quota and a period: never taken
+    /// for no quota (an update would then clear it, F31).
+    pub fn cpu_quota(&self) -> Result<Option<u64>, CgroupError> {
+        let text = std::fs::read_to_string(self.path.join("cpu.max"))
+            .map_err(|err| self.error("reading cpu.max", io_errno(&err)))?;
+        match text.split_whitespace().next() {
+            Some("max") => Ok(None),
+            Some(quota) => quota
+                .parse()
+                .map(Some)
+                .map_err(|_| self.error("reading cpu.max", Errno::EINVAL)),
+            None => Err(self.error("reading cpu.max", Errno::EINVAL)),
+        }
+    }
+
+    /// Whether a freeze is asked of it (`cgroup.freeze` 1), reached or
+    /// not: a pause whose wait was cut (its caller killed) leaves one asked
+    /// that a process in the kernel keeps from being reached (F126). False
+    /// where `cgroup.freeze` can't be read (before Linux 5.2).
+    #[must_use]
+    pub fn freeze_asked(&self) -> bool {
+        std::fs::read_to_string(self.path.join("cgroup.freeze"))
+            .is_ok_and(|text| text.trim() == "1")
+    }
+
+    /// Whether it's paused: a freeze asked, or reached (an ancestor's freeze
+    /// reaches it without one asked of it).
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.freeze_asked() || self.frozen()
     }
 
     /// Whether it's frozen (`cgroup.events`' `frozen`).
@@ -1073,6 +1110,32 @@ mod tests {
             put_back_value("io.weight", "default 300", "default 100\n8:0 50\n"),
             "default 100"
         );
+    }
+
+    /// A freeze asked but not reached (a pause's wait cut while a process
+    /// is in the kernel) is a pause, as one reached is (F126); the control,
+    /// neither, isn't.
+    #[test]
+    fn a_freeze_asked_is_a_pause_reached_or_not() {
+        let dir = std::env::temp_dir().join(format!("shipyard-freeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cgroup = Cgroup::at(dir.clone(), dir.clone());
+        let set = |asked: &str, frozen: &str| {
+            std::fs::write(dir.join("cgroup.freeze"), format!("{asked}\n")).unwrap();
+            let events = format!("populated 1\nfrozen {frozen}\n");
+            std::fs::write(dir.join("cgroup.events"), events).unwrap();
+        };
+        set("0", "0");
+        assert!(!cgroup.paused(), "the control");
+        set("1", "0");
+        assert!(cgroup.freeze_asked() && !cgroup.frozen());
+        assert!(cgroup.paused(), "asked");
+        set("1", "1");
+        assert!(cgroup.paused(), "reached");
+        set("0", "1");
+        assert!(cgroup.paused(), "an ancestor's freeze");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An update refused part way (no swap accounting: `memory.swap.max`

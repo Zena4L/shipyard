@@ -15,11 +15,15 @@
 //! volume's lock file (`volumes/.locks/<name>`) for as long as it lives
 //! ([`Volumes::hold`]); removing takes it exclusive, and gives up if anyone
 //! holds it. A lock goes with its process, however that ends, so a killed
-//! run leaves nothing to clean up. Lock files are never removed (a name's
-//! lock is the same file across the volume's lives), so a lock always names
-//! what it guards. A volume is removed by renaming it aside (`.trash-…`)
-//! under the lock, then deleting that: what a rootless container wrote as
-//! its other users needs the storage helper, which the caller runs.
+//! run leaves nothing to clean up. A volume is removed by renaming it aside
+//! (`.trash-…`) under the lock, then deleting that: what a rootless
+//! container wrote as its other users needs the storage helper, which the
+//! caller runs. Its lock files go with it, unlinked under its lock (F150:
+//! they piled up, two a volume ever made). A lock is on an open file, not a
+//! name, so whoever opened one before it went can still lock it, and would
+//! hold a lock that guards nothing: every lock taken here is checked, once
+//! held, to still be the file at its path (`still_linked`), and taken again
+//! on the new one if not.
 //!
 //! A volume made with labels (Docker's API, step 11.2c2a) keeps them in
 //! `volumes/<name>/labels.json` (versioned from its first write, H2),
@@ -218,20 +222,26 @@ impl Volumes {
         if data.is_dir() {
             return Err(VolumeError::Exists(name.to_owned()));
         }
-        let file = self.lock_file(name)?;
         let deadline = std::time::Instant::now() + CREATE_WAIT;
-        let _lock = shipyard_sys::lock::lock_until(
-            file,
-            shipyard_sys::lock::Mode::Exclusive,
-            deadline,
-            std::time::Duration::from_millis(20),
-        )
-        .map_err(|errno| match errno {
-            // Held by a run that made it meanwhile: it exists.
-            nix::errno::Errno::EWOULDBLOCK if data.is_dir() => VolumeError::Exists(name.to_owned()),
-            nix::errno::Errno::EWOULDBLOCK => VolumeError::Busy(name.to_owned()),
-            errno => Self::locking(name, errno),
-        })?;
+        let _lock = loop {
+            let lock = shipyard_sys::lock::lock_until(
+                self.lock_file(name)?,
+                shipyard_sys::lock::Mode::Exclusive,
+                deadline,
+                std::time::Duration::from_millis(20),
+            )
+            .map_err(|errno| match errno {
+                // Held by a run that made it meanwhile: it exists.
+                nix::errno::Errno::EWOULDBLOCK if data.is_dir() => {
+                    VolumeError::Exists(name.to_owned())
+                }
+                nix::errno::Errno::EWOULDBLOCK => VolumeError::Busy(name.to_owned()),
+                errno => Self::locking(name, errno),
+            })?;
+            if self.still_its_lock(name, &lock)? {
+                break lock;
+            }
+        };
         if data.is_dir() {
             return Err(VolumeError::Exists(name.to_owned()));
         }
@@ -507,11 +517,8 @@ impl Volumes {
     /// [`VolumeError::InvalidName`] or [`VolumeError::Io`].
     pub fn hold(&self, name: &str) -> Result<VolumeHold, VolumeError> {
         validate_name(name)?;
-        let lock = self.lock_file(name)?;
-        lock.lock_shared()
-            .map_err(|source| Self::locking(name, source))?;
         // Let go even if what follows fails.
-        let lock = shipyard_sys::lock::HeldFile::new(lock);
+        let lock = shipyard_sys::lock::HeldFile::new(self.held_shared(name)?);
         let (volume, created) = self.get_or_create(name)?;
         Ok(VolumeHold {
             volume,
@@ -530,11 +537,8 @@ impl Volumes {
     /// [`VolumeError::InvalidName`] or [`VolumeError::Io`].
     pub fn hold_existing(&self, name: &str) -> Result<VolumeHold, VolumeError> {
         validate_name(name)?;
-        let lock = self.lock_file(name)?;
-        lock.lock_shared()
-            .map_err(|source| Self::locking(name, source))?;
         // Let go even if what follows fails.
-        let lock = shipyard_sys::lock::HeldFile::new(lock);
+        let lock = shipyard_sys::lock::HeldFile::new(self.held_shared(name)?);
         let data = self.root.join(name).join(DATA_DIR);
         if !data.is_dir() {
             return Err(VolumeError::NotFound(name.to_owned()));
@@ -573,7 +577,15 @@ impl Volumes {
         for _ in 0..TRASH_TRIES {
             let trash = trash_name(name);
             match std::fs::rename(&dir, self.trash_dir().join(&trash)) {
-                Ok(()) => return Ok(trash),
+                Ok(()) => {
+                    // Its lock files go with it, still under its lock (no
+                    // fill runs: one needs it held). Whoever opened one
+                    // before finds it unlinked once locked, and opens the
+                    // path again (`still_its_lock`).
+                    let _ = std::fs::remove_file(self.fill_lock_path(name));
+                    let _ = std::fs::remove_file(self.lock_path(name));
+                    return Ok(trash);
+                }
                 // A leftover by that name (a reused PID): another name.
                 Err(err)
                     if matches!(
@@ -660,16 +672,15 @@ impl Volumes {
         give_up: &dyn Fn() -> bool,
     ) -> Result<Filling, VolumeError> {
         validate_name(name)?;
-        let path = self.root.join(FILL_LOCKS_DIR).join(name);
-        let mut file =
-            shipyard_sys::fs::open_lock_file(&path).map_err(|source| VolumeError::Io {
-                context: format!("opening {}", path.display()),
-                source,
-            })?;
+        let path = self.fill_lock_path(name);
+        let open = || open_lock(&path);
+        let mut file = open()?;
         let deadline = std::time::Instant::now() + wait;
         let lock = loop {
             match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(lock) => break lock,
+                Ok(lock) if Self::held_is_at(name, &lock, &path)? => break lock,
+                // Removed with its volume while this opened it: the path's.
+                Ok(_) => file = open()?,
                 Err((unlocked, nix::errno::Errno::EWOULDBLOCK)) => {
                     if give_up() || std::time::Instant::now() >= deadline {
                         return Err(VolumeError::Busy(name.to_owned()));
@@ -701,7 +712,9 @@ impl Volumes {
         let mut file = self.lock_file(name)?;
         for _ in 0..LOCK_TRIES {
             match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(lock) => return Ok(Some(lock)),
+                Ok(lock) if self.still_its_lock(name, &lock)? => return Ok(Some(lock)),
+                // Removed with its volume while this opened it: the path's.
+                Ok(_) => file = self.lock_file(name)?,
                 Err((unlocked, nix::errno::Errno::EWOULDBLOCK)) => {
                     file = unlocked;
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -712,15 +725,55 @@ impl Volumes {
         Ok(None)
     }
 
-    /// The lock file of volume `name` (in `.locks/`, apart from anything a
-    /// volume can be named), made if needed: never through a symlink, and
-    /// closed in any program this one runs.
+    /// Volume `name`'s lock, held shared (a run's hold: waited for without
+    /// a deadline, as a removal under way ends at once), on the file at its
+    /// path.
+    fn held_shared(&self, name: &str) -> Result<File, VolumeError> {
+        self.held_shared_from(name, self.lock_file(name)?)
+    }
+
+    /// [`held_shared`](Self::held_shared), from `first`, the lock file as
+    /// it was opened (perhaps before a removal took it away).
+    fn held_shared_from(&self, name: &str, first: File) -> Result<File, VolumeError> {
+        let mut lock = first;
+        loop {
+            lock.lock_shared()
+                .map_err(|source| Self::locking(name, source))?;
+            if self.still_its_lock(name, &lock)? {
+                return Ok(lock);
+            }
+            // Removed with its volume while this waited: the new file's.
+            lock = self.lock_file(name)?;
+        }
+    }
+
+    /// Whether `held`, locked, is still volume `name`'s lock file.
+    fn still_its_lock(&self, name: &str, held: &File) -> Result<bool, VolumeError> {
+        Self::held_is_at(name, held, &self.lock_path(name))
+    }
+
+    /// Whether `held`, locked, is still the file at `path` (see the
+    /// module's doc).
+    fn held_is_at(name: &str, held: &File, path: &Path) -> Result<bool, VolumeError> {
+        shipyard_sys::lock::still_linked(held, path).map_err(|source| Self::locking(name, source))
+    }
+
+    /// Where volume `name`'s lock file is (in `.locks/`, apart from
+    /// anything a volume can be named).
+    fn lock_path(&self, name: &str) -> PathBuf {
+        self.root.join(LOCKS_DIR).join(name)
+    }
+
+    /// Where volume `name`'s fill lock is.
+    fn fill_lock_path(&self, name: &str) -> PathBuf {
+        self.root.join(FILL_LOCKS_DIR).join(name)
+    }
+
+    /// The lock file of volume `name` ([`lock_path`](Self::lock_path)),
+    /// made if needed: never through a symlink, and closed in any program
+    /// this one runs.
     fn lock_file(&self, name: &str) -> Result<File, VolumeError> {
-        let path = self.root.join(LOCKS_DIR).join(name);
-        shipyard_sys::fs::open_lock_file(&path).map_err(|source| VolumeError::Io {
-            context: format!("opening {}", path.display()),
-            source,
-        })
+        open_lock(&self.lock_path(name))
     }
 
     fn locking(name: &str, source: impl Into<std::io::Error>) -> VolumeError {
@@ -729,6 +782,15 @@ impl Volumes {
             source: source.into(),
         }
     }
+}
+
+/// The lock file at `path`, made if needed: never through a symlink, and
+/// closed in any program this one runs.
+fn open_lock(path: &Path) -> Result<File, VolumeError> {
+    shipyard_sys::fs::open_lock_file(path).map_err(|source| VolumeError::Io {
+        context: format!("opening {}", path.display()),
+        source,
+    })
 }
 
 /// The errno values `rename` gives for a target that exists.
@@ -1319,6 +1381,49 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// F150: a removed volume's lock files go with it (they piled up, two
+    /// a volume ever made); the control: they're there while it is.
+    #[test]
+    fn a_removed_volume_leaves_no_lock_files() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        let held = volumes.hold("gone").unwrap();
+        drop(
+            volumes
+                .lock_fill("gone", std::time::Duration::ZERO, &|| false)
+                .unwrap(),
+        );
+        drop(held);
+        let locks = volumes.root().join(".locks").join("gone");
+        let fill = volumes.root().join(".fill-locks").join("gone");
+        assert!(locks.exists() && fill.exists(), "the control");
+        volumes.trash("gone").unwrap();
+        assert!(!locks.exists(), "its lock file");
+        assert!(!fill.exists(), "its fill lock");
+    }
+
+    /// F150's race: a run that opened a volume's lock file before a removal
+    /// took it away, and locks it after (as a blocked `hold` does), holds
+    /// the new file at the path, so the volume made again under that name
+    /// is held: removing it is refused. (Holding the old one, the removal
+    /// would find the new file free and take the volume from the run.)
+    #[test]
+    fn a_hold_on_a_removed_lock_file_holds_the_new_one() {
+        let scratch = Scratch::new();
+        let volumes = Volumes::open(&scratch.0).unwrap();
+        volumes.create("again").unwrap();
+        let opened_before = volumes.lock_file("again").unwrap();
+        volumes.trash("again").unwrap();
+        volumes.create("again").unwrap();
+        let held = volumes.held_shared_from("again", opened_before).unwrap();
+        assert!(
+            matches!(volumes.trash("again"), Err(VolumeError::InUse(_))),
+            "held, so never removed"
+        );
+        drop(held);
+        volumes.trash("again").unwrap();
     }
 
     #[test]
