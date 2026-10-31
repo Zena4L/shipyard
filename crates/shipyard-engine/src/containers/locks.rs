@@ -88,6 +88,25 @@ pub(crate) fn running_lock(
     id: &ContainerId,
     wait: Duration,
 ) -> Result<Option<shipyard_sys::lock::HeldFile>> {
+    running_lock_until(engine, id, wait, &|| false)
+}
+
+/// [`running_lock`], waited for in slices, and given up (`Ok(None)`) at the
+/// first that ends with `gone` true: the API's stop whose client went
+/// (F123), which mustn't hold the container's lock (and the service) for
+/// as long as a stop takes.
+///
+/// # Errors
+///
+/// As [`running_lock`].
+pub(crate) fn running_lock_until(
+    engine: &Engine,
+    id: &ContainerId,
+    wait: Duration,
+    gone: &dyn Fn() -> bool,
+) -> Result<Option<shipyard_sys::lock::HeldFile>> {
+    /// How often `gone` is asked.
+    const SLICE: Duration = Duration::from_millis(250);
     let dir = record_dir(engine, id)?;
     let path = dir.join(RUNNING);
     let file = crate::fs::open_lock_file(&path).map_err(|err| {
@@ -100,17 +119,23 @@ pub(crate) fn running_lock(
     })?;
     let deadline = std::time::Instant::now() + wait;
     let poll = Duration::from_millis(20);
-    match shipyard_sys::lock::try_lock_until(
-        &file,
-        shipyard_sys::lock::Mode::Exclusive,
-        deadline,
-        poll,
-    ) {
-        Ok(true) => Ok(Some(shipyard_sys::lock::HeldFile::new(file))),
-        Ok(false) => Ok(None),
-        Err(err) => Err(Error::from(err)
-            .context(format!("locking {}", path.display()))
-            .io_as(ErrorKind::Storage)),
+    loop {
+        let slice = deadline.min(std::time::Instant::now() + SLICE);
+        match shipyard_sys::lock::try_lock_until(
+            &file,
+            shipyard_sys::lock::Mode::Exclusive,
+            slice,
+            poll,
+        ) {
+            Ok(true) => return Ok(Some(shipyard_sys::lock::HeldFile::new(file))),
+            Ok(false) if std::time::Instant::now() >= deadline || gone() => return Ok(None),
+            Ok(false) => {}
+            Err(err) => {
+                return Err(Error::from(err)
+                    .context(format!("locking {}", path.display()))
+                    .io_as(ErrorKind::Storage));
+            }
+        }
     }
 }
 

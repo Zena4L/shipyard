@@ -81,6 +81,8 @@ pub use prepare::ImageDefaults;
 #[cfg(target_os = "linux")]
 pub(crate) use prepare::{prepare_image, prepare_owned_image};
 #[cfg(target_os = "linux")]
+pub(crate) use recover::awaits_boot;
+#[cfg(target_os = "linux")]
 pub(crate) use recover::boot_time;
 #[cfg(target_os = "linux")]
 pub(crate) use recover::restarts_held_off;
@@ -91,6 +93,6 @@ pub use request::{
     CapabilityArg, DEFAULT_PIDS_MAX, IpcMode, Limits, RunRequest, RunStreams, SecurityOpt,
     Supervision,
 };
-pub use stop::{StopOptions, kill, restart, stop, wait};
+pub use stop::{StopOptions, kill, restart, stop, stop_until, wait};
 pub use update::{UpdateRequest, update};
 pub use volumes::{MadeSource, bind_source, covers, make_bind_source};

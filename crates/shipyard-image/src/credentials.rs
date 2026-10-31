@@ -119,6 +119,16 @@ pub enum CredentialError {
         /// The error.
         source: std::io::Error,
     },
+    /// As root, the config (or its directory) is a link to what its owner
+    /// doesn't own, which root doesn't write to (F162: `sudo -E`).
+    #[error(
+        "{path} links to what another user owns, which root doesn't write to (sudo -E keeps \
+         your HOME: sign in as yourself, or with sudo's own HOME)"
+    )]
+    ForeignLink {
+        /// The config file.
+        path: String,
+    },
     /// A credential helper failed, or can't be run.
     #[error("the credential helper docker-credential-{helper}: {reason}")]
     Helper {

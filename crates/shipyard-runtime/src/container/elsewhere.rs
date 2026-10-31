@@ -201,6 +201,15 @@ pub fn memory_limit(_root: &Path, _id: &str) -> Result<Option<u64>> {
 /// # Errors
 ///
 /// Always [`ContainerError::LinuxOnly`].
+pub fn cpu_quota(_root: &Path, _id: &str) -> Result<Option<u64>> {
+    Err(ContainerError::LinuxOnly)
+}
+
+/// Containers need Linux.
+///
+/// # Errors
+///
+/// Always [`ContainerError::LinuxOnly`].
 pub fn attach_stream(_root: &Path, _id: &str) -> Result<std::os::unix::net::UnixStream> {
     Err(ContainerError::LinuxOnly)
 }

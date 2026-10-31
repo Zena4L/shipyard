@@ -185,6 +185,80 @@ pub(crate) fn starts_at_boot(record: &crate::containers::Record, up: bool) -> bo
         && policy_restarts(record, record.exit.as_ref().and_then(|exit| exit.code))
 }
 
+/// Beside the containers' records: the boot whose recovery pass ran
+/// ([`boot`] writes it at its end), v1 `{"version":1,"boot_id":…}`. In
+/// the store, never the runtime root (`/run`, a tmpfs): a reboot must not
+/// take it (F130).
+#[cfg(target_os = "linux")]
+const RECOVERED_BOOT: &str = "recovered-boot.json";
+
+/// The newest [`RECOVERED_BOOT`] this Shipyard reads and writes.
+#[cfg(target_os = "linux")]
+const RECOVERED_BOOT_VERSION: u32 = 1;
+
+/// The most a [`RECOVERED_BOOT`] holds: read no further.
+#[cfg(target_os = "linux")]
+const RECOVERED_BOOT_MAX: u64 = 4096;
+
+/// [`RECOVERED_BOOT`], as it's written.
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveredBoot {
+    version: u32,
+    boot_id: String,
+}
+
+/// Notes that this boot's recovery pass ran (see [`RECOVERED_BOOT`]).
+#[cfg(target_os = "linux")]
+fn note_recovered(engine: &Engine) -> Result<()> {
+    let Some(boot_id) = boot_id() else {
+        return Ok(());
+    };
+    let json = serde_json::to_vec(&RecoveredBoot {
+        version: RECOVERED_BOOT_VERSION,
+        boot_id,
+    })?;
+    crate::fs::write_atomically(engine.paths.containers()?, RECOVERED_BOOT, &json, 0o600)
+        .map_err(|err| err.io_as(crate::ErrorKind::Storage))
+        .map(|placed| placed.said(engine))
+}
+
+/// The boot whose recovery pass ran, as [`RECOVERED_BOOT`] says: `None` if
+/// none did, or it can't be read, or a newer Shipyard wrote it (never
+/// guessed at, H2): then this boot's pass counts as not run, the side that
+/// keeps a network for what it would start.
+#[cfg(target_os = "linux")]
+fn recovered_boot(engine: &Engine) -> Option<String> {
+    let path = engine.paths.containers().ok()?.join(RECOVERED_BOOT);
+    let bytes = shipyard_sys::fs::read_bounded(&path, RECOVERED_BOOT_MAX).ok()?;
+    shipyard_sys::versioned::read::<RecoveredBoot>(&bytes, RECOVERED_BOOT_VERSION)
+        .ok()
+        .map(|recovered| recovered.boot_id)
+}
+
+/// Whether container `record`, not up, waits for the host's boot to start
+/// it again (F130): its restart policy does ([`starts_at_boot`]), and the
+/// host's stop holds restarts off (`system stop`, no boot since), or it
+/// last started in an earlier boot whose recovery pass hasn't run in this
+/// one. Its networks are then kept for it: removed meanwhile, it would come
+/// back without them.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub(crate) fn awaits_boot(engine: &Engine, record: &crate::containers::Record) -> bool {
+    if !starts_at_boot(record, false) {
+        return false;
+    }
+    if restarts_held_off(engine) {
+        return true;
+    }
+    let Some(now) = boot_id() else {
+        return false;
+    };
+    record.boot_id.as_deref().is_some_and(|then| then != now)
+        && recovered_boot(engine).as_deref() != Some(now.as_str())
+}
+
 /// Whether container `record` (`up`: it runs now) would come back if the
 /// host restarted (step 13.6b2: what a Mac's login start goes by): one up,
 /// as the host's stop leaves it ([`HOST_STOP_EXIT`], not stopped by its
@@ -256,6 +330,9 @@ mod linux {
                 Err(error) => booted.failed.push((record.name, error)),
             }
         }
+        // This boot's pass ran: what it couldn't start no longer keeps its
+        // networks (F130). Not noted, they stay kept: the safe side.
+        let _ = super::note_recovered(engine);
         Ok(booted)
     }
 
@@ -586,6 +663,56 @@ mod tests {
     use super::linux::stopped_for_the_host;
     use super::starts_at_boot;
     use crate::containers::{Exit, Record, RestartPolicy};
+
+    /// F130: a container its policy starts at the boot, last started in an
+    /// earlier boot, keeps its networks until this boot's pass has run;
+    /// one that pass couldn't start then doesn't. A newer Shipyard's mark
+    /// is never guessed at: the pass counts as not run (networks kept). The
+    /// controls: a policy that doesn't restart, and a start in this boot.
+    #[test]
+    fn what_the_boot_will_start_keeps_its_networks_until_its_pass() {
+        let (engine, _collect, parent) = crate::testing::engine_on_a_new_store("awaits-boot");
+        let containers = parent.join("containers");
+        std::fs::create_dir_all(&containers).unwrap();
+        let engine = crate::Engine::new(
+            engine
+                .paths()
+                .clone()
+                .with_containers(&containers)
+                .with_runtime_root(parent.join("run")),
+            std::sync::Arc::clone(engine.reporter()),
+        );
+        let now = super::boot_id().unwrap();
+        let mut earlier = record(RestartPolicy::Always, Some(143), false);
+        earlier.boot_id = Some("an-earlier-boot".to_owned());
+        assert!(
+            super::awaits_boot(&engine, &earlier),
+            "kept before the pass"
+        );
+        let mut never = earlier.clone();
+        never.config.restart = RestartPolicy::No;
+        assert!(
+            !super::awaits_boot(&engine, &never),
+            "no restart: the control"
+        );
+        let mut this_boot = earlier.clone();
+        this_boot.boot_id = Some(now.clone());
+        assert!(
+            !super::awaits_boot(&engine, &this_boot),
+            "started this boot"
+        );
+        super::note_recovered(&engine).unwrap();
+        assert!(!super::awaits_boot(&engine, &earlier), "the pass has run");
+        let newer = format!(r#"{{"version":2,"boot_id":"{now}"}}"#);
+        std::fs::write(containers.join(super::RECOVERED_BOOT), newer).unwrap();
+        assert!(super::awaits_boot(&engine, &earlier), "a newer mark: kept");
+        std::fs::write(containers.join(super::RECOVERED_BOOT), "garbage").unwrap();
+        assert!(
+            super::awaits_boot(&engine, &earlier),
+            "an unreadable mark: kept"
+        );
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
 
     /// A record of `policy`, started and ended with `code` (none: an end
     /// nothing recorded), stopped by its user or not.

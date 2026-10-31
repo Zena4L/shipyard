@@ -65,7 +65,21 @@ impl Credentials {
     /// Docker's; a helper that fails; the file not written; a registry's
     /// own token, which isn't something a sign-in keeps.
     pub fn keep(&self, registry: &str, credential: &Credential) -> Result<Kept, CredentialError> {
-        let path = real_path(self.config_path()?);
+        let place = config_to_write(self.config_path()?)?;
+        match self.keep_at(&place.path, registry, credential) {
+            Ok(Kept::File(_)) => Ok(Kept::File(place.shown.clone())),
+            kept => kept.map_err(|err| place.said(err)),
+        }
+    }
+
+    /// [`keep`](Self::keep), at the config file `path` (see [`Place`]).
+    fn keep_at(
+        &self,
+        path: &Path,
+        registry: &str,
+        credential: &Credential,
+    ) -> Result<Kept, CredentialError> {
+        let path = path.to_owned();
         let mut config = read_value(&path)?.unwrap_or_else(|| Value::Object(Map::new()));
         let registry = registry_key(registry);
         let server = server_url(&registry);
@@ -111,7 +125,14 @@ impl Credentials {
     ///
     /// As [`keep`](Self::keep)'s; a helper's failure is said, not an error.
     pub fn forget(&self, registry: &str) -> Result<Forgotten, CredentialError> {
-        let path = real_path(self.config_path()?);
+        let place = config_to_write(self.config_path()?)?;
+        self.forget_at(&place.path, registry)
+            .map_err(|err| place.said(err))
+    }
+
+    /// [`forget`](Self::forget), at the config file `path` (see [`Place`]).
+    fn forget_at(&self, path: &Path, registry: &str) -> Result<Forgotten, CredentialError> {
+        let path = path.to_owned();
         let Some(mut config) = read_value(&path)? else {
             return Ok(Forgotten::default());
         };
@@ -145,6 +166,173 @@ impl Credentials {
                     .to_owned(),
             })
     }
+}
+
+/// Where a sign-in reads and writes its config.
+struct Place {
+    /// The path its reads and writes go through.
+    path: PathBuf,
+    /// The path said to its user (the real file's).
+    shown: PathBuf,
+    /// As root on Linux, its directory, open: `path` is through it
+    /// (`/proc/self/fd/N/NAME`), so a directory swapped for a link
+    /// meanwhile is never written through (F162).
+    _dir: Option<std::fs::File>,
+}
+
+impl Place {
+    /// `err`, naming the file as its user knows it.
+    fn said(&self, err: CredentialError) -> CredentialError {
+        let io = self.path.display().to_string();
+        let shown = self.shown.display().to_string();
+        let fix = |path: String| if path == io { shown.clone() } else { path };
+        match err {
+            CredentialError::Read { path, source } => CredentialError::Read {
+                path: fix(path),
+                source,
+            },
+            CredentialError::Config { path, reason } => CredentialError::Config {
+                path: fix(path),
+                reason,
+            },
+            CredentialError::Write { path, source } => CredentialError::Write {
+                path: fix(path),
+                source,
+            },
+            other => other,
+        }
+    }
+}
+
+/// The file a sign-in reads and writes for the config at `path`: what it
+/// links to, if it's a link. As root, a link (the file's, or its
+/// directory's) that leads to what its owner doesn't own is refused: root
+/// running with another user's `HOME` (`sudo -E`) would otherwise rewrite,
+/// or make, a file of root's (or anyone's) wherever that user's link points
+/// (F162). Docker's CLI follows such a link; nothing else changes.
+fn config_to_write(path: &Path) -> Result<Place, CredentialError> {
+    let real = real_path(path);
+    if !nix::unistd::geteuid().is_root() {
+        return Ok(Place {
+            path: real.clone(),
+            shown: real,
+            _dir: None,
+        });
+    }
+    refuse_a_foreign_link(path, &real)?;
+    pinned(path, real)
+}
+
+/// As root on Linux, [`config_to_write`]'s place through its directory,
+/// opened once without following a last link and owned by whom the config
+/// is (the link's owner, else the directory entry's; root, for one made
+/// here): checked on the open directory, so a swap after the check (the
+/// directory renamed away, a link put in its place) can't redirect the
+/// write.
+#[cfg(target_os = "linux")]
+fn pinned(path: &Path, real: PathBuf) -> Result<Place, CredentialError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let refused = || CredentialError::ForeignLink {
+        path: path.display().to_string(),
+    };
+    let write_error = |source: std::io::Error| CredentialError::Write {
+        path: real.display().to_string(),
+        source,
+    };
+    let (Some(dir), Some(name)) = (real.parent(), real.file_name()) else {
+        return Ok(Place {
+            path: real.clone(),
+            shown: real,
+            _dir: None,
+        });
+    };
+    let lstat_owner = |place: &Path| std::fs::symlink_metadata(place).ok().map(|meta| meta.uid());
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    let named_dir = path.parent().unwrap_or(dir);
+    let mut expected = if is_link {
+        lstat_owner(path)
+    } else {
+        lstat_owner(named_dir)
+    };
+    let open = |at: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(at)
+    };
+    let opened = match std::fs::canonicalize(dir) {
+        Ok(canonical) => open(&canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Made here, alone (never through a link: `mkdir` refuses what's
+            // there), so root's.
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .map_err(write_error)?;
+            expected = Some(0);
+            open(dir)
+        }
+        Err(error) => Err(error),
+    };
+    let dir_file = opened.map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            refused()
+        } else {
+            write_error(error)
+        }
+    })?;
+    let owner = dir_file.metadata().map_err(write_error)?.uid();
+    if expected.is_some_and(|expected| expected != owner) {
+        return Err(refused());
+    }
+    let through = Path::new("/proc/self/fd")
+        .join(std::os::fd::AsRawFd::as_raw_fd(&dir_file).to_string())
+        .join(name);
+    Ok(Place {
+        path: through,
+        shown: real,
+        _dir: Some(dir_file),
+    })
+}
+
+/// Elsewhere (no `/proc`), [`config_to_write`]'s place by its path alone.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, reason = "the Linux one's signature")]
+fn pinned(_path: &Path, real: PathBuf) -> Result<Place, CredentialError> {
+    Ok(Place {
+        path: real.clone(),
+        shown: real,
+        _dir: None,
+    })
+}
+
+/// [`config_to_write`]'s rule, for root: `path`'s own link, else its
+/// directory's, and what it leads to must have one owner.
+fn refuse_a_foreign_link(path: &Path, real: &Path) -> Result<(), CredentialError> {
+    let link_owner = |place: &Path| {
+        std::fs::symlink_metadata(place)
+            .ok()
+            .filter(|meta| meta.file_type().is_symlink())
+            .map(|meta| meta.uid())
+    };
+    let owner_of = |place: &Path| std::fs::metadata(place).ok().map(|meta| meta.uid());
+    let (owner, target) = if let Some(owner) = link_owner(path) {
+        // The file it leads to, or (none yet) the directory it'd be made in.
+        let target = owner_of(real).or_else(|| real.parent().and_then(owner_of));
+        (owner, target)
+    } else if let Some(dir) = path.parent()
+        && let Some(owner) = link_owner(dir)
+    {
+        (owner, owner_of(dir))
+    } else {
+        return Ok(());
+    };
+    if target.is_some_and(|target| target != owner) {
+        return Err(CredentialError::ForeignLink {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn config_error(path: &Path, reason: &str) -> CredentialError {

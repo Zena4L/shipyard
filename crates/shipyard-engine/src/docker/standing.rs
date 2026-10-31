@@ -67,34 +67,50 @@ impl Standing {
     }
 }
 
-/// The exit code the events journal gives container `id`'s last end
-/// (`die`'s `exitCode`) since `since`: for a wait whose container was
-/// removed (`--rm`) before its end was seen. `None` if it has none there.
+/// What the events journal says of container `id` since some time: for a
+/// wait whose container was removed (`--rm`) before its end was seen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LastEnd {
+    /// Its last end's exit code (`die`'s `exitCode`); `None` if it has none.
+    pub code: Option<i32>,
+    /// Whether it started (a `start`): one that didn't never ran, so it has
+    /// no end to say (F139), where one that did and has none lost it.
+    pub started: bool,
+}
+
+/// [`LastEnd`] of container `id`, from the events journal since `since`.
 ///
 /// # Errors
 ///
 /// The journal can't be read.
-pub fn last_exit(engine: &Engine, id: &ContainerId, since: SystemTime) -> Result<Option<i32>> {
+pub fn last_end(engine: &Engine, id: &ContainerId, since: SystemTime) -> Result<LastEnd> {
     let options = crate::events::EventsOptions {
         since: Some(since),
         until: Some(SystemTime::now()),
         filters: crate::events::Filters::parse(&[
             format!("container={id}"),
             "event=die".to_owned(),
+            "event=start".to_owned(),
         ])?,
         ..crate::events::EventsOptions::default()
     };
-    let mut code = None;
+    let mut last = LastEnd::default();
     crate::events::read(engine, &options, |event| {
         if event.id == id.as_str() {
-            code = event
-                .attributes
-                .get("exitCode")
-                .and_then(|code| code.parse().ok());
+            match event.action.as_str() {
+                "start" => last.started = true,
+                _ => {
+                    last.code = event
+                        .attributes
+                        .get("exitCode")
+                        .and_then(|code| code.parse().ok());
+                }
+            }
         }
         Ok(())
     })?;
-    Ok(code)
+    Ok(last)
 }
 
 /// Where the container `reference` names stands now.

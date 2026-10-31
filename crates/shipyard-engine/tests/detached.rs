@@ -181,6 +181,10 @@ mod linux {
             a_reboot_is_told_by_the_boot_id,
         ),
         (
+            "a_network_waits_for_what_the_boot_will_start",
+            a_network_waits_for_what_the_boot_will_start,
+        ),
+        (
             "recovery_leaves_a_busy_container_alone",
             recovery_leaves_a_busy_container_alone,
         ),
@@ -2301,6 +2305,52 @@ mod linux {
         let engine = stores.engine();
         shipyard_engine::run::remove(&engine, other.id.as_str(), false).unwrap();
         shipyard_engine::run::remove(&engine, id.as_str(), false).unwrap();
+    }
+
+    /// F130: after a reboot, before the boot's recovery pass, a container
+    /// its restart policy brings back keeps its network: `network rm` is
+    /// refused (it came back without one). The control: the same container
+    /// with no restart policy doesn't keep it (Docker's rule). Root (bridge
+    /// networks).
+    fn a_network_waits_for_what_the_boot_will_start() {
+        use shipyard_engine::containers::RestartPolicy;
+        if !is_root() {
+            return;
+        }
+        let stores = Stores::new();
+        let engine = stores.engine();
+        let spec = shipyard_network::store::NetworkSpec {
+            name: "boot-net".to_owned(),
+            ..Default::default()
+        };
+        shipyard_engine::network::create(&engine, &spec).unwrap();
+        let mut request = stores.request(&["sleep", "300"]);
+        request.network = vec![NetworkMode::bridge("boot-net")];
+        request.restart = RestartPolicy::Always;
+        let id = shipyard_engine::run::create(&engine, request, false)
+            .unwrap()
+            .id;
+        shipyard_engine::run::start(&engine, id.as_str()).unwrap();
+        stores.kill_monitor(&id);
+        // What a reboot leaves: no runtime state, a start of another boot.
+        runtime::delete(&stores.runtime_root(), id.as_str(), true).unwrap();
+        containers::testing::update(&engine, &id, |record| {
+            record.boot_id = Some("an-earlier-boot".to_owned());
+        })
+        .unwrap();
+        let kept = shipyard_engine::network::remove(&engine, "boot-net").unwrap_err();
+        assert_eq!(kept.kind(), ErrorKind::InUse, "{kept:#}");
+        assert!(
+            format!("{kept:#}").contains("the host's boot starts again"),
+            "{kept:#}"
+        );
+        // The control: one its policy doesn't bring back keeps nothing.
+        containers::testing::update(&engine, &id, |record| {
+            record.config.restart = RestartPolicy::No;
+        })
+        .unwrap();
+        shipyard_engine::network::remove(&engine, "boot-net").unwrap();
+        shipyard_engine::run::remove(&engine, id.as_str(), true).unwrap();
     }
 
     /// A container another command works on (its operation lock held), or

@@ -308,14 +308,23 @@ impl Shell {
     /// `before`, "settings changed" if not.
     pub fn report_settings(&self, before: &libc::termios) {
         let now = self.terminal_settings();
-        let same = (now.c_iflag, now.c_oflag, now.c_cflag, now.c_lflag, now.c_cc)
-            == (
-                before.c_iflag,
-                before.c_oflag,
-                before.c_cflag,
-                before.c_lflag,
-                before.c_cc,
-            );
+        // `PENDIN` is the kernel's note that typed input waits to be
+        // reprocessed (BSD's, macOS: set as canonical mode comes back with
+        // input queued), not a setting anyone changed.
+        let lflag = |flags: libc::tcflag_t| flags & !libc::PENDIN;
+        let same = (
+            now.c_iflag,
+            now.c_oflag,
+            now.c_cflag,
+            lflag(now.c_lflag),
+            now.c_cc,
+        ) == (
+            before.c_iflag,
+            before.c_oflag,
+            before.c_cflag,
+            lflag(before.c_lflag),
+            before.c_cc,
+        );
         say(if same {
             "settings unchanged\n"
         } else {

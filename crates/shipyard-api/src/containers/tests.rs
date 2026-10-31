@@ -18,6 +18,11 @@ fn standing(state: ContainerState) -> Standing {
     }
 }
 
+/// Made, or a start that never ran (`mark_never_started`: no end).
+fn created() -> Standing {
+    standing(ContainerState::Created)
+}
+
 fn running() -> Standing {
     standing(ContainerState::Running { since: None })
 }
@@ -170,7 +175,17 @@ fn removed_waits_for_it_to_go() {
     ] {
         assert_eq!(
             watch(condition, &[Some(running()), None]),
-            Next::GoneUnseen,
+            Next::GoneUnseen { ran: true },
+            "{condition:?}"
+        );
+    }
+    // Never seen running nor ended (a start that failed, then `--rm`): no
+    // end to say, so no error either (F139). (`not-running` holds at once
+    // for a container never started.)
+    for condition in [Condition::NextExit, Condition::Removed] {
+        assert_eq!(
+            watch(condition, &[Some(created()), None]),
+            Next::GoneUnseen { ran: false },
             "{condition:?}"
         );
     }

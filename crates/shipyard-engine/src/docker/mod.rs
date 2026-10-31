@@ -45,7 +45,7 @@ pub use network::{
     create_network, endpoint_id, find_network, inspect_network, is_predefined, list_networks,
     list_networks_where, network_id,
 };
-pub use standing::{End, Standing, last_exit, standing};
+pub use standing::{End, LastEnd, Standing, last_end, standing};
 pub use stats::{
     BlkioEntry, BlkioStats, ContainerStats, CpuStats, CpuUsage, MemoryStats, NetworkStats,
     PidsStats, ThrottlingData, stats,

@@ -190,14 +190,25 @@ pub(crate) async fn start(shared: &Arc<Shared>, id: String) -> Reply {
 }
 
 /// `POST /containers/{id}/stop` (`t`, `signal`): 304 if it isn't running.
+/// Its wait for the end is given up once its client goes, or the service
+/// stops (F123): the stop goes on in the container's monitor (SIGKILL at
+/// its timeout), as Docker's daemon finishes it, and the service can end.
 pub(crate) async fn stop(shared: &Arc<Shared>, id: String, query: &Query) -> Reply {
     let options = stop_options(query)?;
+    // Set as this request's future is dropped: hyper drops it when its
+    // client goes, while the engine's call goes on on its own thread.
+    let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _goes = SetOnDrop(Arc::clone(&client_gone));
+    let service = Arc::clone(shared);
     let (stopped, _) = shared
         .call(move |engine| {
             if !docker::standing(engine, &id)?.running() {
                 return Ok(false);
             }
-            run::stop(engine, &id, options).map(|_| true)
+            let gone = || {
+                client_gone.load(std::sync::atomic::Ordering::Acquire) || service.idle.is_stopping()
+            };
+            run::stop_until(engine, &id, options, &gone).map(|_| true)
         })
         .await?;
     Ok(reply::empty(if stopped {
@@ -448,14 +459,24 @@ async fn watch_until(
     loop {
         match watch.look(standing.as_ref()) {
             Next::Answer(answer) => return Some(answer),
-            Next::GoneUnseen => {
+            Next::GoneUnseen { ran } => {
                 let id = id.clone();
                 let read = shared
-                    .call(move |engine| docker::last_exit(engine, &id, began))
+                    .call(move |engine| docker::last_end(engine, &id, began))
                     .await;
                 return Some(match read {
-                    Ok((Some(code), _)) => WaitAnswer::code(Some(code)),
-                    Ok((None, _)) => WaitAnswer::unseen(),
+                    Ok((
+                        docker::LastEnd {
+                            code: Some(code), ..
+                        },
+                        _,
+                    )) => WaitAnswer::code(Some(code)),
+                    // Never seen running, and no start in the journal: it
+                    // never ran (a start that failed, then `--rm`), so it has
+                    // no end to say, as Docker answers it (F139). One that
+                    // ran and whose end is lost keeps the error.
+                    Ok((last, _)) if !ran && !last.started => WaitAnswer::code(None),
+                    Ok(_) => WaitAnswer::unseen(),
                     Err(error) => WaitAnswer::failed(error.message),
                 });
             }
@@ -477,6 +498,16 @@ async fn watch_until(
             Ok((standing, _)) => standing,
             Err(error) => return Some(WaitAnswer::failed(error.message)),
         };
+    }
+}
+
+/// Sets its flag when it's dropped: an async request's way to tell the
+/// blocking work it started that the request is over.
+struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -517,8 +548,9 @@ impl WaitAnswer {
 enum Next {
     /// Answers.
     Answer(WaitAnswer),
-    /// The container is gone, its end unseen: the journal is asked.
-    GoneUnseen,
+    /// The container is gone, its end unseen: the journal is asked;
+    /// `ran` says whether it was ever seen running or ended.
+    GoneUnseen { ran: bool },
     /// Looks again.
     Again,
 }
@@ -534,6 +566,8 @@ struct Watch {
     first: Option<End>,
     /// The last end seen.
     seen: Option<End>,
+    /// Whether it was ever seen running or ended.
+    ran: bool,
 }
 
 impl Watch {
@@ -543,6 +577,7 @@ impl Watch {
             looked: false,
             first: None,
             seen: None,
+            ran: false,
         }
     }
 
@@ -554,10 +589,11 @@ impl Watch {
             // Gone: the end last seen is its last.
             return match self.seen {
                 Some(end) => Next::Answer(WaitAnswer::code(end.code)),
-                None => Next::GoneUnseen,
+                None => Next::GoneUnseen { ran: self.ran },
             };
         };
         let ended = standing.ended();
+        self.ran |= standing.running() || ended.is_some();
         if !self.looked {
             self.looked = true;
             self.first = ended;

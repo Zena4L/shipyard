@@ -487,6 +487,9 @@ freezer (`cgroup.freeze`): none of them is told, none can run, until `unpause`.
 it's paused, `exec` is refused; `stop` and `kill` still work (a stop thaws it first,
 so its stop signal is seen at once). Pausing one that's paused, or unpausing one
 that isn't, fails (exit 1, as Docker's), as does either on one that isn't running.
+A pause holds off Ctrl-C until its freeze is reached (or undone, after 5 seconds if a
+process is stuck in the kernel). One whose freeze was asked and not reached (its
+`shipyard` killed meanwhile) reads as paused, never running: `unpause` undoes it.
 Each is said as a `pause` or `unpause` event. It needs the container's own cgroup:
 root, or a delegated one rootless (`shipyard doctor` says whether you have one).
 

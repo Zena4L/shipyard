@@ -43,7 +43,7 @@ mod versions;
 
 #[cfg(not(target_os = "linux"))]
 pub use elsewhere::{
-    attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
+    attach_stream, cpu_quota, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
     monitor_entry_point, monitor_memory, network_namespace, network_namespace_live, pause,
     peek_init, peek_monitor, peek_stats, peek_status, process_started, ps, release,
@@ -54,7 +54,7 @@ pub use elsewhere::{
 pub use lifecycle::{Waiter, waiter};
 #[cfg(target_os = "linux")]
 pub use lifecycle::{
-    attach_stream, create, create_planned, delete, exec, exit_code, exit_record,
+    attach_stream, cpu_quota, create, create_planned, delete, exec, exit_code, exit_record,
     helper_entry_point, hold, init_process, is_process, kill, kill_all, logs_of, memory_limit,
     monitor_entry_point, monitor_memory, network_namespace, network_namespace_live, pause,
     peek_init, peek_monitor, peek_stats, peek_status, process_started, ps,

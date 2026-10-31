@@ -176,7 +176,9 @@ web, db": up to five, by name; a run with no record, such as `--no-image`, by it
 run ID): stop it, disconnect it (`shipyard network disconnect`), or remove it. A
 stopped container doesn't keep its networks, as Docker's don't: the network goes,
 and the container's next start fails ("there's no network named app") until it's
-connected elsewhere or removed. `bridge` is refused too. It
+connected elsewhere or removed. One the host's boot will start again (its restart
+policy, after a reboot or a `system stop`) keeps them until the boot's recovery has
+run (`shipyard system recover`): removed before, it would come back without them. `bridge` is refused too. It
 carries on past a network it can't remove, and exits with 1 if any failed.
 
 ### `shipyard network prune [-f]`

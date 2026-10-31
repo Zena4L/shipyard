@@ -73,6 +73,9 @@ mod linux {
             (_, _) => bail!(NotRunning, "container {name} is not running"),
         }
         let root = engine.paths.runtime_root()?;
+        // Ctrl-C and its kin wait until the freeze is reached or undone:
+        // cut between the two, it would be left asked (F126).
+        let _held = crate::run::HeldOff::new();
         if freeze {
             shipyard_runtime::container::pause(root, record.id.as_str())?;
         } else {

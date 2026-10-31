@@ -1587,6 +1587,40 @@ fn bulk_streams_keep_their_budget() {
     stores.docker_ok(&["rm", "-f", "bulk"]);
 }
 
+/// F123: a stop whose client goes no longer holds the service up for as
+/// long as the stop takes (600 s here): its wait is given up, the stop left
+/// to the container's monitor, and the service ends once idle. The stop is
+/// seen to have reached the container (its SIGTERM caught) before the
+/// client goes.
+#[test]
+fn a_stop_whose_client_goes_lets_the_service_end() {
+    use std::io::Write as _;
+    let Some(stores) = Stores::new() else { return };
+    let mut service = stores.serve(2);
+    let script = "trap 'echo got-term' TERM; echo ready; while :; do sleep 1; done";
+    stores.docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        "stubborn",
+        &stores.image,
+        "sh",
+        "-c",
+        script,
+    ]);
+    let mut stop = std::os::unix::net::UnixStream::connect(stores.socket()).unwrap();
+    stop.write_all(b"POST /containers/stubborn/stop?t=600 HTTP/1.1\r\nHost: d\r\n\r\n")
+        .unwrap();
+    eventually(Duration::from_secs(20), "the stop's SIGTERM caught", || {
+        stores.docker_ok(&["logs", "stubborn"]).contains("got-term")
+    });
+    drop(stop);
+    eventually(Duration::from_secs(15), "the service ends", || {
+        service.0.try_wait().unwrap().is_some()
+    });
+    assert!(stores.shipyard(&["rm", "-f", "stubborn"]).status.success());
+}
+
 /// The service's stop ends a follow it serves (it would hold the stop up
 /// for good), and the stop is prompt.
 #[test]
@@ -1733,6 +1767,65 @@ fn events_are_docker_s() {
     .unwrap();
     assert_eq!(refused.status, 400, "a filter not read: {}", refused.text());
     stores.docker_ok(&["rm", "-f", "evented"]);
+}
+
+/// F139: a container whose start fails before it runs, removed then
+/// (`--rm`), is waited for (`condition=removed`, as Docker's clients wait)
+/// with status 0 and no error of the wait's own, as Docker's daemon
+/// answers: it never ran, so it has no end to say. (Docker's CLI cancels
+/// its own wait when the start fails, so the answer is read here.) The
+/// control: the start does fail.
+#[test]
+fn a_wait_for_a_container_that_never_ran_has_no_error() {
+    use std::io::{Read as _, Write as _};
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let socket = stores.socket();
+    // A start that fails before the container runs: the network it joins
+    // is a container's that isn't running (made, never started), as root
+    // and rootless alike.
+    let host = json!({"Image": stores.image, "Cmd": ["sleep", "300"]});
+    let made = api::post(&socket, "/containers/create?name=host", Some(&host)).unwrap();
+    assert_eq!(made.status, 201, "{}", made.text());
+    let body = json!({
+        "Image": stores.image,
+        "Cmd": ["true"],
+        "HostConfig": {"AutoRemove": true, "NetworkMode": "container:host"},
+    });
+    let created = api::post(&socket, "/containers/create?name=never", Some(&body)).unwrap();
+    assert_eq!(created.status, 201, "{}", created.text());
+    // The wait first, its headers read: in before the start, as Docker's.
+    let mut wait = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    wait.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    wait.write_all(
+        b"POST /containers/never/wait?condition=removed HTTP/1.1\r\nHost: d\r\n\
+          Content-Length: 0\r\n\r\n",
+    )
+    .unwrap();
+    let mut read = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !read.ends_with(b"\r\n\r\n") {
+        wait.read_exact(&mut byte).expect("the wait's headers");
+        read.push(byte[0]);
+    }
+    assert!(read.starts_with(b"HTTP/1.1 200"), "{read:?}");
+    let started = api::post(&socket, "/containers/never/start", None).unwrap();
+    assert!(
+        started.status >= 400,
+        "the start failed: {}",
+        started.text()
+    );
+    read.clear();
+    while !read.windows(1).any(|window| window == b"}") {
+        wait.read_exact(&mut byte).expect("the wait's answer");
+        read.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&read);
+    assert!(answer.contains("\"StatusCode\":0"), "{answer}");
+    assert!(!answer.contains("Error"), "{answer}");
+    let removed = api::request(&socket, "DELETE", "/containers/host", None).unwrap();
+    assert_eq!(removed.status, 204, "{}", removed.text());
 }
 
 /// `docker run` attached: the output, each stream on its own, the exit
@@ -3929,6 +4022,31 @@ fn the_service_raises_its_own_descriptor_limit_only() {
     let execed = stores.docker_ok(&["exec", "limited", "sh", "-c", "ulimit -n"]);
     assert_eq!(execed.trim(), "1024");
     stores.docker_ok(&["rm", "-f", "limited"]);
+}
+
+/// F164: a `docker save` through the API has the service's raised
+/// descriptor limit. Started with a soft limit of 72 (and a hard one of
+/// 4096), where a save keeping its 64 descriptors in reserve has room for
+/// no blob at all (the CLI's own save there is refused:
+/// `a_save_past_the_descriptor_limit_is_refused_up_front`), the service's
+/// save is whole.
+#[test]
+fn an_api_save_has_the_service_s_raised_limit() {
+    if !reference_tool("docker") {
+        return;
+    }
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve_limited(60, (72, 4096));
+    let file = stores.scratch.0.join("saved.tar");
+    stores.docker_ok(&["save", "-o", file.to_str().unwrap(), &stores.image]);
+    let listed = std::process::Command::new("tar")
+        .arg("-tf")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let names = String::from_utf8_lossy(&listed.stdout);
+    assert!(names.lines().any(|name| name == "manifest.json"), "{names}");
 }
 
 /// F116: `StdinOnce` is kept with the container, not in the service's

@@ -125,13 +125,16 @@ shipyard logout ghcr.io
 the registry's credential helper (below) if the config names one, else in
 `config.json` itself, base64 and **not encrypted** (said, as Docker says it). The
 password is asked on the terminal without echo (a Ctrl-C cancels it, the terminal put
-back); `--password-stdin` reads it from standard input (a trailing newline dropped);
+back, as it is if `shipyard` is stopped or killed meanwhile); `--password-stdin` reads it from standard input (a trailing newline dropped);
 `-p` works but is warned of (anyone listing processes sees it). `logout` removes the
 sign-in from the helper and every spelling of the registry in the file (`ghcr.io`,
 `https://ghcr.io`), and says "Not logged in to …" when there was none. The rest of the
 file (its other keys, `currentContext`, `proxies`…) is kept as it was, its mode and
 owner too; a config that's a link (dotfiles) stays one; a file that isn't Docker's JSON
-is refused, never overwritten. A `docker login` at the same moment as a `shipyard login`
+is refused, never overwritten. As root, a config (or its `.docker` directory) that's a
+link to something its owner doesn't own is refused: `sudo -E shipyard login` keeps your
+`HOME`, and root would otherwise write wherever your link leads. A `DOCKER_CONFIG`
+that `sudo -E` passes on is root's to write, link or not: sign in as yourself. A `docker login` at the same moment as a `shipyard login`
 can lose one of the two (each rewrites the file whole), as two `docker login`s can.
 
 It reads `$DOCKER_CONFIG/config.json` (or `~/.docker/config.json`), as Docker

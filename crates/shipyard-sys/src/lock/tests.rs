@@ -201,3 +201,20 @@ fn a_range_lock_keeps_another_description_out_until_let_go() {
     byte_range(&writer, ByteRange::Off).unwrap();
     try_read(&reader).unwrap();
 }
+
+/// A lock file removed (or replaced) under its holder is no longer the file
+/// at its path; the control: one left in place is.
+#[test]
+fn a_removed_lock_file_is_no_longer_the_one_at_its_path() {
+    let dir = std::env::temp_dir().join(format!("shipyard-linked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v");
+    let file = File::create(&path).unwrap();
+    assert!(still_linked(&file, &path).unwrap(), "the control");
+    std::fs::remove_file(&path).unwrap();
+    assert!(!still_linked(&file, &path).unwrap(), "unlinked");
+    let _again = File::create(&path).unwrap();
+    assert!(!still_linked(&file, &path).unwrap(), "another file there");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
