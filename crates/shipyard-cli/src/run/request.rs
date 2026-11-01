@@ -142,6 +142,7 @@ impl RunArgs {
         request.sysctl = self.sysctl;
         request.network = self.network;
         request.ipc = self.ipc.unwrap_or_default();
+        request.pid = self.pid.unwrap_or_default();
         request.name = self.name;
         request.network_alias = self.network_alias;
         request.ip = self.ip;

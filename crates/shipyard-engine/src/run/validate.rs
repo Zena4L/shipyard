@@ -66,6 +66,7 @@ impl RunRequest {
             container: _,
             joined: _,
             ipc: _,
+            pid: _,
             streams: _,
             // A process's: `asked_of_its_process`.
             env: _,

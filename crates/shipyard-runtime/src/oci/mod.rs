@@ -890,7 +890,7 @@ impl Reader<'_> {
     }
 
     /// The namespaces listed, and those joined by their `path` instead of
-    /// made: a network one (kept as `network_path`), an IPC or a UTS one
+    /// made: a network one (kept as `network_path`), an IPC, UTS or PID one
     /// (joins). One the spec knows but Shipyard can't make yet, or a path to
     /// another kind, is refused; an unknown type is an error (the spec says
     /// so).
@@ -906,8 +906,9 @@ impl Reader<'_> {
                     "network" => network_path = Some(path),
                     "ipc" => joins.push(NamespaceJoin::new(Namespace::Ipc, JoinSource::Path(path))),
                     "uts" => joins.push(NamespaceJoin::new(Namespace::Uts, JoinSource::Path(path))),
-                    // A PID namespace joined: F134. A user, mount or cgroup
-                    // namespace: a new root is always its own.
+                    "pid" => joins.push(NamespaceJoin::new(Namespace::Pid, JoinSource::Path(path))),
+                    // A user, mount or cgroup namespace: a new root is
+                    // always its own.
                     _ => {
                         self.refuse(
                             &format!("linux.namespaces ({}, path)", namespace.kind),
@@ -1627,14 +1628,14 @@ mod tests {
         );
     }
 
-    /// An IPC or UTS namespace's path is joined (step 11.4b2); a PID, user,
-    /// mount or cgroup namespace's stays refused.
+    /// An IPC or UTS namespace's path is joined (step 11.4b2), a PID one's
+    /// too (15.2b1, F134); a user, mount or cgroup namespace's stays refused.
     #[test]
-    fn ipc_and_uts_namespaces_are_joined_by_path() {
+    fn ipc_uts_and_pid_namespaces_are_joined_by_path() {
         let joined = TestBundle::new(&config(&json!({
             "linux": {
                 "namespaces": [
-                    {"type": "pid"}, {"type": "mount"},
+                    {"type": "pid", "path": "/proc/1/ns/pid"}, {"type": "mount"},
                     {"type": "ipc", "path": "/proc/1/ns/ipc"},
                     {"type": "uts", "path": "/proc/1/ns/uts"}
                 ]
@@ -1645,12 +1646,14 @@ mod tests {
         assert_eq!(
             joined.isolation.joins,
             [
+                NamespaceJoin::new(Namespace::Pid, JoinSource::Path("/proc/1/ns/pid".into())),
                 NamespaceJoin::new(Namespace::Ipc, JoinSource::Path("/proc/1/ns/ipc".into())),
                 NamespaceJoin::new(Namespace::Uts, JoinSource::Path("/proc/1/ns/uts".into())),
             ]
         );
         assert!(joined.isolation.has(Namespace::Ipc) && !joined.isolation.makes(Namespace::Ipc));
-        for kind in ["pid", "mount", "user", "cgroup"] {
+        assert!(joined.isolation.has(Namespace::Pid) && !joined.isolation.makes(Namespace::Pid));
+        for kind in ["mount", "user", "cgroup"] {
             let fields = refused(&config(&json!({
                 "linux": {"namespaces": [
                     {"type": "mount"}, {"type": kind, "path": format!("/proc/1/ns/{kind}")}

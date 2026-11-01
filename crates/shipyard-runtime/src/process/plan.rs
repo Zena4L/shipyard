@@ -192,6 +192,10 @@ pub(crate) struct Reexec {
     /// before the exec, or the exec would leave the clean image without
     /// capabilities (see `child.rs`).
     pub(crate) namespace_root: bool,
+    /// The clean image joins another's PID namespace itself, and clones
+    /// the init there (see `init.rs`): this child is only its start, in
+    /// shipyard's namespaces. It waits for no go (the init does).
+    pub(crate) joins_pid: bool,
 }
 
 /// The descriptors an isolated spawn opens for the re-exec (see `Reexec`).
@@ -222,6 +226,9 @@ pub(crate) struct ReexecFds {
     /// Descriptors passed on to the command (see `passed.rs`): passed on
     /// too, for the init to place.
     pub(crate) passing: Vec<RawFd>,
+    /// A PID join's (`setup::PidJoinSetup`): passed on too. Some: the clean
+    /// image is a joiner.
+    pub(crate) pid_join: Vec<RawFd>,
 }
 
 /// The user and groups to switch to.
@@ -395,6 +402,19 @@ impl CStringArray {
 }
 
 impl ChildPlan {
+    /// Whether it starts a PID join's clean image (`Reexec::joins_pid`),
+    /// which waits for no go. Never off Linux.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::unused_self, reason = "only Linux isolates")
+    )]
+    pub(crate) fn joins_pid(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.reexec.as_ref().is_some_and(|reexec| reexec.joins_pid);
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Builds the plan, plus what the parent needs to explain a failure.
     ///
     /// Build it right before `fork`: it lists the descriptors open *now*.
@@ -783,6 +803,7 @@ fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
             fds.shm_mount_ns,
             fds.terminal,
             &fds.passing,
+            &fds.pid_join,
         ))
         .collect();
     let kept: Vec<u32> = inherited
@@ -808,7 +829,10 @@ fn reexec_plan(fds: &ReexecFds, namespace_root: bool) -> Result<Reexec> {
         env: CStringArray::new(Vec::new()),
         inherited,
         close_ranges: ranges_excluding(&kept),
-        namespace_root,
+        // A joiner enters the user namespace after its exec: it isn't in
+        // one yet.
+        namespace_root: namespace_root && fds.pid_join.is_empty(),
+        joins_pid: !fds.pid_join.is_empty(),
     })
 }
 

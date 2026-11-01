@@ -596,8 +596,9 @@ pub enum ContainerError {
     /// cgroup either (the reason given): then nothing can find, signal or
     /// clean up all its processes.
     #[error(
-        "the bundle has no pid namespace, and without one its processes can only all be found \
-         and stopped through a cgroup of its own, which it can't have here: {0}"
+        "the bundle has no pid namespace of its own (none, or another's joined), and without \
+         one its processes can only all be found and stopped through a cgroup of its own, which \
+         it can't have here: {0}"
     )]
     NoPidNamespace(String),
     /// The bundle asks for limits, and the container can't have a cgroup to
@@ -726,7 +727,7 @@ pub enum ContainerError {
     #[error("container {0}'s monitor is gone: nothing can be attached to")]
     MonitorGone(String),
     /// `exec` can't run in this container (the reason): made by a Shipyard
-    /// before `exec`, or without PID and mount namespaces of its own.
+    /// before `exec`, or without a mount namespace of its own.
     #[error("container {id} can't be exec'd into: {why}")]
     NotExecutable {
         /// Its ID.

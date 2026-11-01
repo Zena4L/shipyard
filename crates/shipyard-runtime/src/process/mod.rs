@@ -97,6 +97,11 @@ pub use user_namespace::{
 #[cfg(target_os = "linux")]
 pub(crate) const INIT_ENTRY_ARG: &std::ffi::CStr = c"__shipyard-init";
 
+/// The init's argument when it's a joined PID namespace's, exec'd again by
+/// itself inside the namespaces it joined (`init.rs`'s `join_then_clone`).
+#[cfg(target_os = "linux")]
+pub(crate) const INIT_JOINED_ARG: &std::ffi::CStr = c"joined";
+
 /// The init's last argument when a SIGPIPE was pending at its re-exec: the
 /// clean image's Rust startup sets SIGPIPE to "ignore", which discards a
 /// pending one, so it's raised again from this (see `init::run`).

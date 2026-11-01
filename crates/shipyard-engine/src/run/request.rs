@@ -84,6 +84,8 @@ pub struct RunRequest {
     pub network: Vec<NetworkMode>,
     /// Its IPC namespace (`--ipc`): its own, or another container's.
     pub ipc: IpcMode,
+    /// Its PID namespace (`--pid`, the API's `PidMode`).
+    pub pid: PidMode,
     /// The container's name on its networks.
     pub name: Option<String>,
     /// Its labels (the API's `Labels`): checked as the record keeps them
@@ -254,6 +256,8 @@ pub(crate) struct Joined {
     pub(crate) network: Option<crate::network::JoinedNetwork>,
     /// Its IPC namespace's (`--ipc container:NAME`).
     pub(crate) ipc: Option<crate::network::JoinedProcess>,
+    /// Its PID namespace's (`--pid container:NAME`).
+    pub(crate) pid: Option<crate::network::JoinedProcess>,
 }
 
 /// A container's IPC namespace (`--ipc`, the API's `IpcMode`).
@@ -299,6 +303,51 @@ impl IpcMode {
     }
 }
 
+/// A container's PID namespace (`--pid`, the API's `PidMode`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PidMode {
+    /// Its own: its init is PID 1 there.
+    #[default]
+    Private,
+    /// The host's (Docker's `host`): it sees and can signal every process
+    /// of the host. Root only.
+    Host,
+    /// Another container's (Docker's `container:NAME`, compose's `pid:
+    /// service:`): as given, then by its ID once a create has found it.
+    Container(String),
+}
+
+impl PidMode {
+    /// Docker's words: `host`, `container:NAME`; none is its own.
+    ///
+    /// # Errors
+    ///
+    /// Another word, or `container:` with no name.
+    pub fn parse(text: &str) -> std::result::Result<PidMode, String> {
+        match text {
+            "" => Ok(PidMode::Private),
+            "host" => Ok(PidMode::Host),
+            other => match other.strip_prefix("container:") {
+                Some("") => Err("container: needs the container's name or ID".to_owned()),
+                Some(name) => Ok(PidMode::Container(name.to_owned())),
+                None => Err(format!(
+                    "{other:?}: give host or container:NAME (a container has a PID namespace \
+                     of its own unless asked)"
+                )),
+            },
+        }
+    }
+
+    /// The container whose PID namespace it joins, if it's another's.
+    #[must_use]
+    pub fn joined_container(&self) -> Option<&str> {
+        match self {
+            PidMode::Container(container) => Some(container),
+            PidMode::Private | PidMode::Host => None,
+        }
+    }
+}
+
 impl RunRequest {
     /// The container whose network it asks to join (`--network
     /// container:NAME`), as given.
@@ -334,6 +383,7 @@ impl Default for RunRequest {
             sysctl: Vec::new(),
             network: Vec::new(),
             ipc: IpcMode::Private,
+            pid: PidMode::Private,
             name: None,
             labels: std::collections::BTreeMap::new(),
             network_alias: Vec::new(),

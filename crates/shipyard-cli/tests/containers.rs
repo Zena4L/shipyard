@@ -4177,6 +4177,263 @@ fn a_container_joins_another_s_ipc() {
     }
 }
 
+/// A container joins another's PID namespace (`--pid container:`, F134):
+/// it sees the other's processes (its PID 1 is the other's init), Docker's
+/// inspect says so, and `exec` reaches it (rootless too: its init is its
+/// owner's to open). The control: the other's PID namespace isn't this
+/// process's. Its refusals and its end follow.
+#[test]
+fn a_container_joins_another_s_pid_namespace() {
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    let image = stores.image.as_str();
+    let first = stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "pfirst",
+        "--network",
+        "none",
+        image,
+        "sleep",
+        "300",
+    ]);
+    let first = first.trim().to_owned();
+    let pid = stores.ok(&["inspect", "-f", "{{.State.Pid}}", "pfirst"]);
+    let theirs = std::fs::read_link(format!("/proc/{}/ns/pid", pid.trim())).unwrap();
+    assert_ne!(theirs, std::fs::read_link("/proc/self/ns/pid").unwrap());
+    let seen = stores.ok(&[
+        "run",
+        "--rm",
+        "--pid",
+        "container:pfirst",
+        image,
+        "sh",
+        "-c",
+        "readlink /proc/self/ns/pid; cat /proc/1/comm",
+    ]);
+    assert_eq!(
+        seen,
+        format!("{}\nshipyard-init\n", theirs.display()),
+        "the first's PID namespace, its init PID 1"
+    );
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "pjoined",
+        "--pid",
+        "container:pfirst",
+        image,
+        "sleep",
+        "300",
+    ]);
+    assert_eq!(
+        stores
+            .ok(&["inspect", "-f", "{{.HostConfig.PidMode}}", "pjoined"])
+            .trim(),
+        format!("container:{first}")
+    );
+    assert_eq!(
+        stores
+            .ok(&["exec", "pjoined", "readlink", "/proc/self/ns/pid"])
+            .trim(),
+        theirs.display().to_string(),
+        "exec joins it there"
+    );
+    // Its own, unless asked: Docker's empty word.
+    assert_eq!(
+        stores
+            .ok(&["inspect", "-f", "{{.HostConfig.PidMode}}", "pfirst"])
+            .trim(),
+        ""
+    );
+    pid_joins_refused(&stores);
+    stores.ok(&[
+        "create",
+        "--name",
+        "psecond",
+        "--pid",
+        "container:pfirst",
+        image,
+        "true",
+    ]);
+    stores.ok(&["rm", "-f", "pjoined"]);
+    stores.ok(&["stop", "-t", "1", "pfirst"]);
+    let started = stores.shipyard(&["start", "psecond"]);
+    assert_eq!(started.status.code(), Some(1), "{started:?}");
+    assert!(
+        String::from_utf8_lossy(&started.stderr)
+            .contains("cannot join PID of a non running container: pfirst"),
+        "{started:?}"
+    );
+    stores.ok(&["rm", "pfirst"]);
+    let started = stores.shipyard(&["start", "psecond"]);
+    assert!(
+        String::from_utf8_lossy(&started.stderr)
+            .contains("the container whose PID namespace it joins ("),
+        "{started:?}"
+    );
+    stores.ok(&["rm", "psecond"]);
+}
+
+/// [`a_container_joins_another_s_pid_namespace`]'s refusals: a join of
+/// `pjoined` (which joins `pfirst`'s); `--uidmap` with it; `--pid host`
+/// without root. As root, `--pid host` runs in the host's, said, and `exec`
+/// reaches it.
+fn pid_joins_refused(stores: &Stores) {
+    let image = stores.image.as_str();
+    let mut refused = vec![
+        (
+            vec!["--pid", "container:pjoined"],
+            "pjoined joins another container's PID namespace itself: join that one",
+        ),
+        (
+            vec!["--uidmap", "0:100000:65536", "--pid", "container:pfirst"],
+            "--uidmap can't go with --pid container:pfirst",
+        ),
+    ];
+    // A container that may give its processes CAP_SYS_PTRACE: never one to
+    // join.
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "ptracer",
+        "--network",
+        "none",
+        "--cap-add",
+        "SYS_PTRACE",
+        image,
+        "sleep",
+        "300",
+    ]);
+    refused.push((
+        vec!["--pid", "container:ptracer"],
+        "ptracer may hold CAP_SYS_PTRACE (--cap-add)",
+    ));
+    a_debugger_holds_the_namespace(stores);
+    if is_root() {
+        refused.push((
+            vec!["--uidmap", "0:100000:65536", "--pid", "host"],
+            "--uidmap can't go with --pid host",
+        ));
+    } else {
+        refused.push((vec!["--pid", "host"], "--pid host needs root"));
+        refused.push((
+            vec![
+                "--network",
+                "container:ptracer",
+                "--pid",
+                "container:pfirst",
+            ],
+            "--network, --ipc and --pid container: name more than one container",
+        ));
+    }
+    for (flags, said) in refused {
+        let mut args = vec!["run", "--rm"];
+        args.extend(&flags);
+        args.extend([image, "true"]);
+        let output = stores.shipyard(&args);
+        assert_eq!(output.status.code(), Some(125), "{flags:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(said),
+            "{flags:?}: {output:?}"
+        );
+    }
+    if is_root() {
+        host_pid_runs_as_root(stores);
+    }
+    stores.ok(&["rm", "-f", "ptracer"]);
+}
+
+/// [`pid_joins_refused`]'s end, as root: `--pid host` runs in the host's PID
+/// namespace, said, `exec` reaches it, `inspect` says so, and it's no
+/// container's to join (`--pid host` is given instead).
+fn host_pid_runs_as_root(stores: &Stores) {
+    let image = stores.image.as_str();
+    let ran = stores.shipyard(&[
+        "run", "-d", "--name", "phost", "--pid", "host", image, "sleep", "300",
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    assert!(
+        String::from_utf8_lossy(&ran.stderr)
+            .contains("--pid host: the container sees and can signal every process of the host"),
+        "{ran:?}"
+    );
+    assert_eq!(
+        stores
+            .ok(&["exec", "phost", "readlink", "/proc/self/ns/pid"])
+            .trim(),
+        std::fs::read_link("/proc/self/ns/pid")
+            .unwrap()
+            .display()
+            .to_string(),
+        "the host's"
+    );
+    assert_eq!(
+        stores
+            .ok(&["inspect", "-f", "{{.HostConfig.PidMode}}", "phost"])
+            .trim(),
+        "host"
+    );
+    let joined = stores.shipyard(&[
+        "run",
+        "--rm",
+        "--pid",
+        "container:phost",
+        image,
+        "sh",
+        "-c",
+        ":",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&joined.stderr)
+            .contains("phost shares the host's PID namespace: give --pid host"),
+        "{joined:?}"
+    );
+    stores.ok(&["rm", "-f", "phost"]);
+}
+
+/// [`pid_joins_refused`]'s debugger: one that joins `pfirst` may hold
+/// `CAP_SYS_PTRACE`; then nothing else joins there while it runs (it could
+/// trace that one's set-up). The control: once it's gone, one does.
+fn a_debugger_holds_the_namespace(stores: &Stores) {
+    let image = stores.image.as_str();
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "pdebug",
+        "--cap-add",
+        "SYS_PTRACE",
+        "--pid",
+        "container:pfirst",
+        image,
+        "sleep",
+        "300",
+    ]);
+    let joins = [
+        "run",
+        "--rm",
+        "--pid",
+        "container:pfirst",
+        image,
+        "sh",
+        "-c",
+        ":",
+    ];
+    let late = stores.shipyard(&joins);
+    assert_eq!(late.status.code(), Some(125), "{late:?}");
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("pdebug may hold CAP_SYS_PTRACE"),
+        "{late:?}"
+    );
+    stores.ok(&["rm", "-f", "pdebug"]);
+    stores.ok(&joins);
+}
+
 /// As root: a container that joins `first`'s IPC namespace keeps nothing
 /// of `first`'s mount namespace once it runs (its init's descriptors name
 /// no mount namespace), so `first`'s mounts go when it ends.
@@ -4302,7 +4559,7 @@ fn ipc_joins_refused(stores: &Stores) {
         ]);
         refused.push((
             vec!["--network", "container:other", "--ipc", "container:first"],
-            "--network container: and --ipc container: name two containers",
+            "--network, --ipc and --pid container: name more than one container",
         ));
     }
     for (flags, said) in refused {

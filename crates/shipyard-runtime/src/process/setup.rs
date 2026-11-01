@@ -92,6 +92,44 @@ pub(crate) struct Setup {
     /// Descriptors passed on to the command (see `passed.rs`), inherited.
     #[serde(default)]
     pub(crate) passing: Option<super::passed::PassedPlan>,
+    /// Another's PID namespace, joined by this image before it clones the
+    /// container's init (see `init.rs`'s `join_then_clone`).
+    #[serde(default)]
+    pub(crate) pid_join: Option<PidJoinSetup>,
+}
+
+/// What the clean image needs to join another's PID namespace itself (F134):
+/// exec'd outside every joined namespace and non-dumpable, it enters them
+/// and clones the container's init there, which execs the clean image again
+/// inside them (its memory then the joined user namespace's: its owner's to
+/// reach, the other container's not, being non-dumpable and refused as a
+/// target if it may hold `CAP_SYS_PTRACE`). Every descriptor is inherited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PidJoinSetup {
+    /// The other's user namespace, entered first, if it's joined.
+    pub(crate) user: Option<RawFd>,
+    /// Every other namespace joined, in order: the PID namespace's last.
+    pub(crate) namespaces: Vec<(Namespace, RawFd)>,
+    /// The clone's `CLONE_NEW*` flags: the namespaces made.
+    pub(crate) flags: libc::c_int,
+    /// Where the init's PID goes (`exec.rs`'s record).
+    pub(crate) record: RawFd,
+    /// The go pipe's read end: the init waits there, as a cloned child
+    /// does (`child.rs`).
+    pub(crate) go: RawFd,
+    /// Become root of the joined user namespace before the clone.
+    pub(crate) namespace_root: bool,
+}
+
+impl PidJoinSetup {
+    /// Its descriptors.
+    pub(crate) fn fds(&self) -> Vec<RawFd> {
+        self.user
+            .into_iter()
+            .chain(self.namespaces.iter().map(|&(_, fd)| fd))
+            .chain([self.record, self.go])
+            .collect()
+    }
 }
 
 /// The command's pseudo-terminal, made inside the container (see `init.rs`).
@@ -520,7 +558,7 @@ impl SpecSetup {
 /// The descriptors the clean image inherits besides its own three (setup,
 /// status, report): the gate's FIFOs, the hooks pipe, an overlay to attach,
 /// the mount namespace whose `/dev/shm` is shared, the terminal's socket,
-/// and what's passed on to the command. The one
+/// what's passed on to the command, and a PID join's. The one
 /// list: the parent clears their close-on-exec flag for the re-exec
 /// (`plan.rs`), and the clean image sets it again (`init.rs`).
 pub(crate) fn inherited_fds(
@@ -530,6 +568,7 @@ pub(crate) fn inherited_fds(
     shm_mount_ns: Option<RawFd>,
     terminal: Option<RawFd>,
     passed: &[RawFd],
+    pid_join: &[RawFd],
 ) -> Vec<RawFd> {
     gate.into_iter()
         .flat_map(super::spawn::Gate::fds)
@@ -538,6 +577,7 @@ pub(crate) fn inherited_fds(
         .chain(shm_mount_ns)
         .chain(terminal)
         .chain(passed.iter().copied())
+        .chain(pid_join.iter().copied())
         .collect()
 }
 
@@ -557,6 +597,11 @@ impl Setup {
             self.root.as_ref().and_then(|root| root.shm_mount_ns),
             self.terminal.as_ref().map(|terminal| terminal.socket),
             &passed,
+            &self
+                .pid_join
+                .as_ref()
+                .map(PidJoinSetup::fds)
+                .unwrap_or_default(),
         )
     }
 
@@ -626,6 +671,7 @@ impl Setup {
             },
             terminal: None,
             passing: None,
+            pid_join: None,
             hooks: hooks_pipe.map(|pipe| {
                 let hooks = isolation
                     .hooks

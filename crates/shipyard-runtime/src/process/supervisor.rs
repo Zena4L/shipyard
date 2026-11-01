@@ -1325,12 +1325,14 @@ fn check_stdio(placement: &Placement, stdio: super::Stdio) -> Result<()> {
 }
 
 /// Linux: kills and reaps every process left behind. As a subreaper,
-/// shipyard has inherited them all (even ones that escaped with `setsid`).
+/// shipyard has inherited them all (even ones that escaped with `setsid`);
+/// so has the init of a joined PID namespace, which calls it too
+/// (`init.rs`'s `end_what_is_left`).
 /// Children it had before supervising (`inherited`) are left running.
 /// Repeats until none are left, since dying ones re-parent their own
 /// children to shipyard; gives up after a short deadline and says so.
 #[cfg(target_os = "linux")]
-fn kill_leftovers(inherited: &mut Vec<libc::pid_t>) {
+pub(super) fn kill_leftovers(inherited: &mut Vec<libc::pid_t>) {
     const DEADLINE: Duration = Duration::from_secs(2);
     let started = Instant::now();
     loop {

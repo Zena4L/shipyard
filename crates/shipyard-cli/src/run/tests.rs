@@ -699,6 +699,31 @@ fn capability_flags_are_checked() {
     }
 }
 
+/// `--pid`: the host's, or another container's (its own when not given),
+/// in Docker's words.
+#[test]
+fn pid_modes_are_docker_s() {
+    for (given, pid) in [
+        ("host", shipyard_engine::run::PidMode::Host),
+        (
+            "container:db",
+            shipyard_engine::run::PidMode::Container("db".to_owned()),
+        ),
+    ] {
+        assert_eq!(
+            shipyard_engine::run::PidMode::parse(given),
+            Ok(pid),
+            "{given}"
+        );
+    }
+    for refused in ["private", "none", "container:"] {
+        assert!(
+            shipyard_engine::run::PidMode::parse(refused).is_err(),
+            "{refused}"
+        );
+    }
+}
+
 /// `--network container:NAME`: another container's network, alone, with
 /// nothing of this one's in it.
 #[test]

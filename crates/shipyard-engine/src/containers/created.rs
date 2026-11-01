@@ -63,9 +63,15 @@ pub struct Created {
     /// Which of `make_sources` the create made, and below what (v6, step
     /// 11.7): each start makes and binds them again by descriptor.
     pub made_sources: Vec<crate::run::MadeSource>,
+    /// The container whose PID namespace it joins at each start (`--pid
+    /// container:NAME`, v7, step 15.2b2), by ID.
+    pub pid_from: Option<ContainerId>,
+    /// It has no PID namespace of its own: the host's (`--pid host`, v7).
+    pub pid_host: bool,
 }
 
-/// The file's form (v6:
+/// The file's form (v7 adds `"pid_from":"<64 hex>"` or `"pid_host":true`;
+/// v6:
 /// `{"version":6,"exposed":["80/tcp"],"default_pids":true,"tmpfs":[{"destination":"/run","options":["size=64m"]}],"anonymous":["<64 hex>"],"make_sources":["/srv/data"],"network_from":"<64 hex>","ipc_from":"<64 hex>","stdin_once":true,"made_sources":[{"source":"/srv/data","dir":"/srv","below":"data"}]}`;
 /// v5 has no `made_sources`, v4 no `stdin_once`, v3 no `network_from` or `ipc_from`, v2 no
 /// `anonymous` or `make_sources`, v1 no `tmpfs` either: none). Each written at the
@@ -91,6 +97,10 @@ struct CreatedFile {
     stdin_once: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     made_sources: Vec<MadeFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pid_host: bool,
 }
 
 /// A made bind source, as the file keeps it.
@@ -112,7 +122,7 @@ struct TmpfsFile {
 
 impl CreatedFile {
     /// The version written.
-    const VERSION: u32 = 6;
+    const VERSION: u32 = 7;
     /// The most read: [`MAX_EXPOSED`] keys of at most `65535/udp`'s
     /// length, quoted, with room.
     const MAX_FILE: u64 = 64 * 1024;
@@ -170,9 +180,12 @@ pub(crate) fn write_created(dir: &Path, created: &Created) -> Result<()> {
         // process limit only, v2 (11.3e2's) with tmpfs too, v3 (11.4a2's)
         // with anonymous volumes and bind sources, v4 (11.4b2b's) with
         // another container's namespaces joined, v5 (11.6a1's) with its
-        // input closed once, v6 (11.7's) with the bind sources it made.
-        version: if !created.made_sources.is_empty() {
+        // input closed once, v6 (11.7's) with the bind sources it made, v7
+        // (15.2b2's) with its PID namespace.
+        version: if created.pid_from.is_some() || created.pid_host {
             CreatedFile::VERSION
+        } else if !created.made_sources.is_empty() {
+            6
         } else if created.stdin_once {
             5
         } else if created.network_from.is_some() || created.ipc_from.is_some() {
@@ -194,6 +207,8 @@ pub(crate) fn write_created(dir: &Path, created: &Created) -> Result<()> {
             .as_ref()
             .map(|id| id.as_str().to_owned()),
         ipc_from: created.ipc_from.as_ref().map(|id| id.as_str().to_owned()),
+        pid_from: created.pid_from.as_ref().map(|id| id.as_str().to_owned()),
+        pid_host: created.pid_host,
         stdin_once: created.stdin_once,
         made_sources: created
             .made_sources
@@ -318,6 +333,8 @@ fn read_created(dir: &Path) -> Result<Created> {
             },
             network_from: container_id(file.network_from)?,
             ipc_from: container_id(file.ipc_from)?,
+            pid_from: container_id(file.pid_from)?,
+            pid_host: file.pid_host,
             stdin_once: file.stdin_once,
             // Checked again: an edited file never makes, nor binds, a path
             // a create wouldn't have.
@@ -383,6 +400,8 @@ mod tests {
             ipc_from: None,
             stdin_once: false,
             made_sources: Vec::new(),
+            pid_from: None,
+            pid_host: false,
         };
         write_created(&dir, &made).unwrap();
         let written = std::fs::read_to_string(dir.join(CREATED)).unwrap();
@@ -543,6 +562,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Another's PID namespace, or the host's, is v7's (15.2b2); a v6
+    /// file, written before, is read as before (H2's previous version).
+    #[test]
+    fn a_pid_namespace_is_v7() {
+        let dir = std::env::temp_dir().join(format!("created-pid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for created in [
+            Created {
+                pid_from: ContainerId::parse(&"d".repeat(64)).ok(),
+                ..Created::default()
+            },
+            Created {
+                pid_host: true,
+                ..Created::default()
+            },
+        ] {
+            write_created(&dir, &created).unwrap();
+            let written = std::fs::read_to_string(dir.join(CREATED)).unwrap();
+            assert!(written.starts_with(r#"{"version":7,"#), "{written}");
+            assert_eq!(read_created(&dir).unwrap(), created);
+        }
+        // Without one, an older version, as before.
+        write_created(
+            &dir,
+            &Created {
+                exposed: vec!["80/tcp".to_owned()],
+                ..Created::default()
+            },
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(dir.join(CREATED)).unwrap();
+        assert!(written.starts_with(r#"{"version":1,"#), "{written}");
+        std::fs::write(
+            dir.join(CREATED),
+            r#"{"version":6,"exposed":[],"default_pids":false,"made_sources":[{"source":"/srv/x","dir":"/srv","below":"x"}],"make_sources":["/srv/x"]}"#,
+        )
+        .unwrap();
+        let read = read_created(&dir).unwrap();
+        assert_eq!((read.pid_from, read.pid_host), (None, false), "v6: its own");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A newer version, a field it doesn't know, a tmpfs option a create
     /// would refuse, a volume's name or a container's ID that isn't one
     /// (an edited file): refused, never guessed at (H2).
@@ -552,7 +613,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let write = |text: &str| std::fs::write(dir.join(CREATED), text).unwrap();
         for refused in [
-            r#"{"version":7,"exposed":[],"default_pids":false}"#,
+            r#"{"version":8,"exposed":[],"default_pids":false}"#,
+            r#"{"version":7,"exposed":[],"default_pids":false,"pid_from":"../x"}"#,
             r#"{"version":4,"exposed":[],"default_pids":false,"network_from":"../x"}"#,
             r#"{"version":4,"exposed":[],"default_pids":false,"ipc_from":"x"}"#,
             r#"{"version":3,"exposed":[],"default_pids":false,"anonymous":["../x"]}"#,

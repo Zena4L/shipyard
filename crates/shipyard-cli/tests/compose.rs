@@ -226,6 +226,7 @@ fn compose_runs_a_rootless_project() {
     command: [\"sleep\", \"300\"]
     network_mode: \"service:app\"
     ipc: \"service:app\"
+    pid: \"service:app\"
     depends_on: [app]
 volumes:
   data: {{}}
@@ -316,6 +317,7 @@ fn root_project(image: &str) -> String {
     command: [\"sleep\", \"300\"]
     network_mode: \"service:web\"
     ipc: \"service:web\"
+    pid: \"service:web\"
     depends_on: [web]
   once:
     image: {image}
@@ -327,8 +329,9 @@ volumes:
     )
 }
 
-/// `joiner` is in `joined`'s network and IPC namespaces (`network_mode: service:`),
-/// and in a mount namespace of its own (the control).
+/// `joiner` is in `joined`'s network, IPC and PID namespaces (`network_mode:`,
+/// `ipc:` and `pid: service:`), and in a mount namespace of its own (the
+/// control).
 fn shares_its_namespaces(project: &Project, joiner: &str, joined: &str) {
     let links = |service: &str| {
         project.compose(&[
@@ -337,7 +340,8 @@ fn shares_its_namespaces(project: &Project, joiner: &str, joined: &str) {
             service,
             "sh",
             "-c",
-            "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; readlink /proc/self/ns/ipc",
+            "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; readlink /proc/self/ns/ipc; \
+             readlink /proc/self/ns/pid",
         ])
     };
     let (joiner, joined) = (links(joiner), links(joined));
@@ -355,6 +359,18 @@ fn shares_its_namespaces(project: &Project, joiner: &str, joined: &str) {
         joiner.lines().nth(2),
         joined.lines().nth(2),
         "IPC: {joiner} / {joined}"
+    );
+    assert_eq!(
+        joiner.lines().nth(3),
+        joined.lines().nth(3),
+        "PID: {joiner} / {joined}"
+    );
+    assert!(
+        joiner
+            .lines()
+            .nth(3)
+            .is_some_and(|line| line.starts_with("pid:[")),
+        "{joiner}"
     );
     assert!(joiner.starts_with("net:["), "{joiner}");
 }

@@ -1,5 +1,6 @@
 //! The container's clean image: it sets the container up, then becomes its
-//! init, PID 1 of a new PID namespace (Linux; `pid_namespaces(7)`).
+//! init, PID 1 of a new PID namespace (Linux; `pid_namespaces(7)`), or, in
+//! another's it joins, an init that isn't PID 1 (see [`join_then_clone`]).
 //!
 //! **Re-exec first** (runc-style). The cloned child re-execs the shipyard
 //! binary at once, through the hidden [`entry_point`], while it still sees
@@ -24,7 +25,8 @@
 //! - **when the command exits,** hands its exact wait status to shipyard
 //!   over the status pipe (PID 1 can't die "by" a signal, so its own exit
 //!   status couldn't say "killed by SIGINT") and exits. The kernel then kills
-//!   whatever is left in the namespace.
+//!   whatever is left in the namespace (in a joined one, the init does, as
+//!   its processes' subreaper: [`end_what_is_left`]).
 //!
 //! Without a PID namespace there's no init: after the setup, this process
 //! becomes the command itself.
@@ -48,7 +50,7 @@ use super::child::{
 use super::failure::UnmappedId;
 use super::failure::{ChildFailure, ChildStep, FailureContext, describe};
 use super::plan::ChildPlan;
-use super::setup::{HooksSetup, NetworkSetup, is_sealed_setup, read_setup};
+use super::setup::{HooksSetup, NetworkSetup, PidJoinSetup, is_sealed_setup, read_setup};
 use super::status::ExitStatus;
 use super::{identity, rootfs, sysctl};
 use crate::container::{State, Status};
@@ -83,9 +85,14 @@ pub(crate) fn entry_point() {
     if let (Some(setup), Some(status), Some(report)) = (fd(), fd(), fd())
         && is_sealed_setup(setup)
     {
-        let sigpipe = std::ffi::OsStr::from_bytes(super::SIGPIPE_PENDING_ARG.to_bytes());
-        let sigpipe_was_pending = args.next().as_deref() == Some(sigpipe);
-        run(setup, status, report, sigpipe_was_pending);
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        let given =
+            |arg: &std::ffi::CStr| rest.iter().any(|each| each.as_bytes() == arg.to_bytes());
+        run(
+            (setup, status, report),
+            given(super::SIGPIPE_PENDING_ARG),
+            given(super::INIT_JOINED_ARG),
+        );
     }
     // Started by hand, or by a broken caller.
     let _ = std::io::Write::write_all(
@@ -93,6 +100,205 @@ pub(crate) fn entry_point() {
         b"shipyard: this is the container init's internal entry point\n",
     );
     std::process::exit(125);
+}
+
+/// Joins another container's PID namespace, and every namespace joined with
+/// it, then clones the container's init there (F134), which, once shipyard
+/// says go, execs this image again with the `setup` (as a memfd of its
+/// own), `status` and `report` pipes and [`INIT_JOINED_ARG`]: in the joined
+/// user namespace, so its memory is that namespace's (D15.2b-12). Then its
+/// rootless owner reaches it (pasta, `exec`, the views), and the other
+/// container's root doesn't: it's non-dumpable from its first line, and a
+/// container whose processes may hold `CAP_SYS_PTRACE` is no PID namespace
+/// to join (`joins.rs`). Before its pivot, it still sees the host's files:
+/// the binary's libraries load. Never returns but with a failure: the
+/// joiner exits once it has said the init's PID, and the init is a new
+/// image.
+///
+/// [`INIT_JOINED_ARG`]: super::INIT_JOINED_ARG
+///
+/// `sigpipe`: a SIGPIPE was pending at this image's start (raised again
+/// here, it's gone from the clone: a fork leaves pending signals behind).
+fn join_then_clone(
+    setup: &super::setup::Setup,
+    join: &PidJoinSetup,
+    (status, report): (RawFd, RawFd),
+    sigpipe: bool,
+) -> Failure {
+    match clone_into(join, status) {
+        Ok(()) => exec_joined(setup, (status, report), sigpipe),
+        Err(failure) => failure,
+    }
+}
+
+/// [`join_then_clone`]'s join and clone: returns in the init, once
+/// shipyard says go, its subreaper and parent-death signal set.
+fn clone_into(join: &PidJoinSetup, status: RawFd) -> Result<(), Failure> {
+    use super::clone::{Cloned, clone_process};
+    use crate::isolation::Namespace;
+    // `run` made it non-dumpable already, best effort; here it must be.
+    super::child::make_undumpable()?;
+    let enter = |fd: RawFd, kind: Namespace| {
+        let entered = super::internal::join(fd, kind);
+        let _ = nix::unistd::close(fd);
+        entered
+    };
+    if let Some(user) = join.user {
+        enter(user, Namespace::User)?;
+        if join.namespace_root {
+            super::child::become_namespace_root(super::user_namespace::setgroups_allowed())?;
+        }
+        // A credential change makes a process dumpable again.
+        super::child::make_undumpable()?;
+    }
+    for &(kind, fd) in &join.namespaces {
+        enter(fd, kind)?;
+    }
+    // SAFETY: a fresh exec, single-threaded: the child goes on as this
+    // process, in ordinary Rust.
+    match unsafe { clone_process(join.flags | libc::CLONE_PARENT, None) } {
+        Ok(Cloned::Child) => {}
+        Ok(Cloned::Parent { pid, .. }) => {
+            // (Born where the joiner is: its cgroup's placement is shipyard's
+            // to know.)
+            if super::exec::write_joiner_record(join.record, pid, false).is_err() {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                return Err(Failure::at(ChildStep::PidJoinRecord, Errno::EPIPE));
+            }
+            std::process::exit(0);
+        }
+        Err(errno) => return Err(Failure::at(ChildStep::PidJoinClone, errno)),
+    }
+    // The init, in the joined PID namespace, shipyard's child.
+    let _ = nix::unistd::close(join.record);
+    super::child::wait_for_go(join.go)?;
+    let _ = nix::unistd::close(join.go);
+    // Not PID 1: its orphans would be the other container's init's, and
+    // nothing kills its processes when it ends. So they come back to it,
+    // and when shipyard dies, a signal it can catch says so.
+    let init = |errno| Failure::at(ChildStep::PidJoinInit, errno);
+    nix::sys::prctl::set_child_subreaper(true).map_err(init)?;
+    // SAFETY: plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, parent_gone_signal()) } == -1 {
+        return Err(init(Errno::last()));
+    }
+    // Shipyard may have died before: then the signal never comes.
+    if shipyard_gone(status) {
+        // SAFETY: ends the process at once; nobody is left to report to.
+        unsafe { libc::_exit(SETUP_FAILED) }
+    }
+    Ok(())
+}
+
+/// The parent-death signal of a joined PID namespace's init: one it can
+/// catch (SIGKILL can't be), so that it ends its processes before it goes
+/// when shipyard dies. Told from the same signal sent by anyone else by
+/// [`shipyard_gone`].
+fn parent_gone_signal() -> libc::c_int {
+    libc::SIGRTMIN() + 2
+}
+
+/// [`join_then_clone`]'s exec of this image again, in the joined
+/// namespaces: its setup in a memfd of its own (the first was read, and
+/// closed), it and the two pipes passed on. Returns only the failure.
+fn exec_joined(
+    setup: &super::setup::Setup,
+    (status, report): (RawFd, RawFd),
+    sigpipe: bool,
+) -> Failure {
+    let failed = |errno| Failure::at(ChildStep::PidJoinExec, errno);
+    let Ok(memfd) = setup.to_memfd() else {
+        return failed(Errno::EIO);
+    };
+    // Through the host's `/proc` still (no pivot yet): this image.
+    let exe = match nix::fcntl::open(
+        "/proc/self/exe",
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    ) {
+        Ok(exe) => exe,
+        Err(errno) => return failed(errno),
+    };
+    let fds = [memfd.as_raw_fd(), status, report];
+    for fd in fds {
+        // SAFETY: plain integers: passed on across the exec.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
+            return failed(Errno::last());
+        }
+    }
+    // Numbers: never a NUL.
+    let text = |number: RawFd| std::ffi::CString::new(number.to_string()).unwrap_or_default();
+    let mut argv = vec![
+        c"shipyard-init".to_owned(),
+        super::INIT_ENTRY_ARG.to_owned(),
+        text(fds[0]),
+        text(fds[1]),
+        text(fds[2]),
+        super::INIT_JOINED_ARG.to_owned(),
+    ];
+    if sigpipe || super::child::sigpipe_pending() {
+        argv.push(super::SIGPIPE_PENDING_ARG.to_owned());
+    }
+    let mut pointers: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
+    pointers.push(std::ptr::null());
+    let environment = [std::ptr::null::<libc::c_char>()];
+    // SAFETY: `pointers` and `environment` are null-ended arrays of
+    // NUL-ended strings, alive across the call; it returns only on failure.
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            exe.as_raw_fd(),
+            c"".as_ptr(),
+            pointers.as_ptr(),
+            environment.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        );
+    }
+    failed(Errno::last())
+}
+
+/// Whether shipyard (its monitor, or the runtime that started it) is gone:
+/// its status pipe, `status` (the init's write end), has no reader left,
+/// which `poll` says as `POLLERR` on Linux. Not by its parent: shipyard is
+/// outside the namespace, and so is whatever the kernel gives it once
+/// shipyard dies (its PID here is 0 either way).
+fn shipyard_gone(status: RawFd) -> bool {
+    let mut pipe = libc::pollfd {
+        fd: status,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd; a zero timeout never blocks.
+    let ready = unsafe { libc::poll(&raw mut pipe, 1, 0) };
+    ready == 1 && pipe.revents & libc::POLLERR != 0
+}
+
+/// Whether this process is an init that isn't its PID namespace's first
+/// (it joined another's): then what it leaves isn't ended by the kernel.
+fn joined_init() -> bool {
+    nix::unistd::getpid().as_raw() != 1
+}
+
+/// `run`'s part for another's PID namespace: the joiner joins it and
+/// clones the init there, which execs this image again (`joined`); in that
+/// one, shipyard is looked for once more (its parent-death signal is kept
+/// across the exec). The join's part of `setup` is taken out: the setup the
+/// init execs with names no descriptor of the joiner's. Returns only a
+/// failure to report (the joiner never returns otherwise).
+fn pid_join(
+    setup: &mut super::setup::Setup,
+    (status, report): (RawFd, RawFd),
+    sigpipe: bool,
+    joined: bool,
+) -> Option<Failure> {
+    if let Some(join) = setup.pid_join.take().filter(|_| !joined) {
+        return Some(join_then_clone(setup, &join, (status, report), sigpipe));
+    }
+    if joined && shipyard_gone(status) {
+        // SAFETY: ends the process at once; nobody is left to report to.
+        unsafe { libc::_exit(SETUP_FAILED) }
+    }
+    None
 }
 
 /// Marks close-on-exec again the descriptors the setup names that were
@@ -120,8 +326,16 @@ fn held(setup: &super::setup::Setup) -> Result<super::passed::Held, Failure> {
 }
 
 /// Sets the container up, then runs the command: as the init's child (PID
-/// 2), or as this very process without a PID namespace.
-fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool) -> ! {
+/// 2, or another PID in a PID namespace it joined), or as this very process
+/// without a PID namespace.
+///
+/// `joined`: this image is a joined PID namespace's init, exec'd again by
+/// [`join_then_clone`] (its namespaces joined, its PID said, go given).
+fn run(
+    (setup_fd, status, report): (RawFd, RawFd, RawFd),
+    sigpipe_was_pending: bool,
+    joined: bool,
+) -> ! {
     // Not dumpable, from the start: `/proc/1` (its descriptors, among them
     // the pipes to shipyard, and its memory) is then only for processes
     // with CAP_SYS_PTRACE, as runc does for its init, and that's true
@@ -148,8 +362,12 @@ fn run(setup_fd: RawFd, status: RawFd, report: RawFd, sigpipe_was_pending: bool)
         report_failure(report, &failure);
         std::process::exit(SETUP_FAILED);
     };
-    let setup =
+    let mut setup =
         read_setup(setup_fd).unwrap_or_else(|errno| fail(Failure::at(ChildStep::ReadSetup, errno)));
+    // Another's PID namespace: joined here (see `pid_join`).
+    if let Some(failure) = pid_join(&mut setup, (status, report), sigpipe_was_pending, joined) {
+        fail(failure);
+    }
     close_on_exec_again(&setup);
     // Before anything is opened here (see `held`).
     let held = held(&setup).unwrap_or_else(|failure| fail(failure));
@@ -1071,6 +1289,14 @@ fn wait_and_forward(command: libc::pid_t, status_pipe: RawFd, exec_failure: Opti
             // impossible with a valid set. Spinning on it would burn a CPU
             // forever; ending the container is the lesser evil.
             -1 => give_up(status_pipe),
+            // A joined init's own parent-death signal: if shipyard is gone,
+            // its processes end with it; else nothing (never passed on: a
+            // command that dies of it isn't the init's to kill so).
+            other if other == parent_gone_signal() && joined_init() => {
+                if shipyard_gone(status_pipe) {
+                    give_up(status_pipe);
+                }
+            }
             // A forwarded signal: on to the command. (Never re-raised here:
             // PID 1 would drop it.) It can't fail but for a seccomp profile
             // refusing `kill` (the init keeps `CAP_KILL`, and an unreaped
@@ -1089,10 +1315,23 @@ fn wait_and_forward(command: libc::pid_t, status_pipe: RawFd, exec_failure: Opti
 /// Ends the container when the init can't supervise its command, saying so
 /// on the status pipe: its stderr is /dev/null by now, and its exit code
 /// alone would pass for the command's. The kernel kills whatever is left in
-/// the namespace.
+/// the namespace; in another's (joined), the init does.
 fn give_up(status_pipe: RawFd) -> ! {
     write_record(status_pipe, &[GAVE_UP_MARK]);
+    end_what_is_left();
     std::process::exit(SETUP_FAILED);
+}
+
+/// In a joined PID namespace, kills and reaps every process the init has
+/// (the command's, all of them come back to it: it's their subreaper), as
+/// the kernel does for a namespace's first. Elsewhere, nothing. (Where its
+/// `/proc` isn't this namespace's, nothing either, unsaid: the init has no
+/// stderr by now. The container's cgroup, which a joined one must have,
+/// goes with it anyway.)
+fn end_what_is_left() {
+    if joined_init() {
+        super::supervisor::kill_leftovers(&mut Vec::new());
+    }
 }
 
 /// Reaps every child that has exited (signals coalesce: one SIGCHLD can
@@ -1114,8 +1353,10 @@ fn reap(command: libc::pid_t, status_pipe: RawFd, exec_failure: Option<u8>) {
             // only exits and deaths, which always decode; 1 just makes the
             // impossible case a failure.
             let code = ExitStatus::from_wait_status(raw).map_or(1, ExitStatus::code);
+            end_what_is_left();
             // `_exit`: nothing to flush, and the kernel then kills
-            // everything left in the namespace.
+            // everything left in the namespace (in a joined one, what's
+            // left was just killed).
             // SAFETY: ends the process at once.
             unsafe { libc::_exit(libc::c_int::from(code)) }
         }
@@ -1129,7 +1370,8 @@ fn reap(command: libc::pid_t, status_pipe: RawFd, exec_failure: Option<u8>) {
             // could never be reaped, and the container would hang. Ending
             // it is the lesser evil.
             -1 => give_up(status_pipe),
-            // An orphan that ended up with PID 1: reaped, nothing else.
+            // An orphan that ended up with the init (PID 1, or a joined
+            // namespace's subreaper): reaped, nothing else.
             _ => {}
         }
     }

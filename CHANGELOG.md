@@ -9,6 +9,18 @@ behaviour; each change is listed here).
 
 ### Added
 
+- **`--pid container:NAME` and `--pid host`** (step 15.2b, F134,
+  [containers](docs/user/containers.md#sharing-anothers-processes---pid-containername---pid-host)):
+  a container shares another running container's processes (each sees and can signal
+  the other's), or, as root, the host's; the API's `PidMode` and compose's `pid:
+  service:` too, rootless as well, `inspect` saying which. The joining container's
+  set-up is never the other's to read or trace: it's entered by a copy of Shipyard,
+  non-dumpable, and a PID namespace where a process may hold `CAP_SYS_PTRACE` (its
+  container's, or a debugger's that joined it) can't be joined. Its init gathers its own processes' orphans and ends them all with it, or
+  when its monitor dies. A container that joined another's PID namespace is none to
+  join, and one whose init has exited is said to be ending. The OCI runtime joins a
+  bundle's `pid` namespace by `path`, and `exec` reaches a container in the host's.
+
 - **The data of the desktop UI's map, in the API** (step 14.1a): `GET /shipyard/links`,
   every container with the links compose declares (`depends_on`, and whether its
   condition is met) and the connections seen between containers (root's networks; said

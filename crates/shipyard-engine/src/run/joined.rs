@@ -1,8 +1,9 @@
 //! Another container's namespaces, joined: its network (`--network
-//! container:NAME`, step 11.4b2b1) and its IPC namespace with its
-//! `/dev/shm` (`--ipc container:NAME`, 11.4b2b2). A create finds the other
-//! container and keeps its ID beside the record (`created.json`'s
-//! `network_from`, `ipc_from`); each start finds its init by PID and start
+//! container:NAME`, step 11.4b2b1), its IPC namespace with its `/dev/shm`
+//! (`--ipc container:NAME`, 11.4b2b2) and its PID namespace (`--pid
+//! container:NAME`, 15.2b2, F134). A create finds the other container and
+//! keeps its ID beside the record (`created.json`'s `network_from`,
+//! `ipc_from`, `pid_from`); each start finds its init by PID and start
 //! time ([`resolve_joins`]), and, for a network, what the other's `/etc`
 //! files are made of (D11.4b2b-2). Nothing of this container's is made in
 //! those namespaces: no address, no port, no name, no setting.
@@ -36,11 +37,22 @@ pub(crate) fn ipc_target(engine: &Engine, reference: &str) -> Result<Record> {
     target(engine, reference, Joins::Ipc)
 }
 
+/// The container `reference` names, for another to join its PID namespace,
+/// as [`network_target`].
+///
+/// # Errors
+///
+/// As [`network_target`]'s, for its PID namespace.
+pub(crate) fn pid_target(engine: &Engine, reference: &str) -> Result<Record> {
+    target(engine, reference, Joins::Pid)
+}
+
 /// What's joined of another container.
 #[derive(Debug, Clone, Copy)]
 enum Joins {
     Network,
     Ipc,
+    Pid,
 }
 
 impl Joins {
@@ -49,6 +61,7 @@ impl Joins {
         match self {
             Joins::Network => "--network",
             Joins::Ipc => "--ipc",
+            Joins::Pid => "--pid",
         }
     }
 
@@ -57,18 +70,25 @@ impl Joins {
         match self {
             Joins::Network => "network",
             Joins::Ipc => "IPC namespace",
+            Joins::Pid => "PID namespace",
         }
     }
 }
 
 /// The container `reference` names, for another to join its `what`: there,
-/// and not joining another's itself.
+/// and not joining another's itself. A PID namespace, also not the host's,
+/// and not one where a process may hold `CAP_SYS_PTRACE` (`--cap-add`):
+/// its container's, or another's that joined it (a debugger's): with it,
+/// they could trace the joining container's set-up (D15.2b-10). (The
+/// runtime looks at every live process there too; this is what bounds them
+/// all, `exec`s' included.)
 fn target(engine: &Engine, reference: &str, what: Joins) -> Result<Record> {
     let record = containers::find(engine, reference)?;
     let created = containers::created(engine, &record.id)?;
     let joins_another = match what {
         Joins::Network => created.network_from.is_some(),
         Joins::Ipc => created.ipc_from.is_some(),
+        Joins::Pid => created.pid_from.is_some(),
     };
     if joins_another {
         bail!(
@@ -79,16 +99,87 @@ fn target(engine: &Engine, reference: &str, what: Joins) -> Result<Record> {
             what.word()
         );
     }
+    if let Joins::Pid = what {
+        if created.pid_host {
+            bail!(
+                InvalidRequest,
+                "--pid container:{reference}: {} shares the host's PID namespace: give --pid \
+                 host",
+                record.name
+            );
+        }
+        if let Some(tracer) = tracer_in(engine, &record) {
+            bail!(
+                InvalidRequest,
+                "--pid container:{reference}: {tracer} may hold CAP_SYS_PTRACE (--cap-add) in \
+                 that PID namespace, with which it could trace this container as it's set up: \
+                 join it once {tracer} has ended, or without that capability there"
+            );
+        }
+    }
     Ok(record)
 }
 
+/// The container that may hold `CAP_SYS_PTRACE` in `record`'s PID
+/// namespace, if any: `record`'s, or one up that joined it.
+fn tracer_in(engine: &Engine, record: &Record) -> Option<String> {
+    if may_trace(record) {
+        return Some(record.name.as_str().to_owned());
+    }
+    containers::list(engine)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|other| {
+            may_trace(other)
+                && containers::created(engine, &other.id)
+                    .is_ok_and(|created| created.pid_from.as_ref() == Some(&record.id))
+                && containers::state(engine, other).is_ok_and(|state| state.is_active())
+        })
+        .map(|other| other.name.as_str().to_owned())
+}
+
+/// Whether `record`'s container may give its processes `CAP_SYS_PTRACE`:
+/// `--cap-add ALL` or `SYS_PTRACE`, unless `--cap-drop` takes it (or all)
+/// away again. (A name a record can't hold is none.)
+fn may_trace(record: &Record) -> bool {
+    use shipyard_runtime::security::Capability;
+    let names = |names: &[String]| {
+        names
+            .iter()
+            .any(|name| match name.parse::<super::CapabilityArg>() {
+                Ok(super::CapabilityArg::All) => true,
+                Ok(super::CapabilityArg::One(one)) => one == Capability::SYS_PTRACE,
+                Err(_) => false,
+            })
+    };
+    names(&record.config.cap_add) && !names(&record.config.cap_drop)
+}
+
 impl RunRequest {
-    /// Asks for the network and IPC namespace of the containers `network`
-    /// and `ipc` (by ID), where given.
+    /// Asks for the namespaces `created` says it joins: other containers'
+    /// (by ID), the host's PID namespace.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "containers are started on Linux")
+    )]
+    pub(crate) fn join_as_created(&mut self, created: &containers::Created) {
+        self.join_by_ids(
+            created.network_from.as_ref(),
+            created.ipc_from.as_ref(),
+            created.pid_from.as_ref(),
+        );
+        if created.pid_host {
+            self.pid = super::PidMode::Host;
+        }
+    }
+
+    /// Asks for the network, IPC and PID namespaces of the containers
+    /// `network`, `ipc` and `pid` (by ID), where given.
     pub(crate) fn join_by_ids(
         &mut self,
         network: Option<&containers::ContainerId>,
         ipc: Option<&containers::ContainerId>,
+        pid: Option<&containers::ContainerId>,
     ) {
         if let Some(network) = network {
             self.network = vec![crate::network::NetworkMode::Container(
@@ -97,6 +188,9 @@ impl RunRequest {
         }
         if let Some(ipc) = ipc {
             self.ipc = super::IpcMode::Container(ipc.as_str().to_owned());
+        }
+        if let Some(pid) = pid {
+            self.pid = super::PidMode::Container(pid.as_str().to_owned());
         }
     }
 }
@@ -137,16 +231,29 @@ pub(crate) fn name_the_joined(engine: &Engine, request: &mut RunRequest) -> Resu
         }
         None => None,
     };
-    if let (Some(network), Some(ipc)) = (&network, &ipc)
-        && network != ipc
-        && !crate::network::host_root()
-    {
+    let pid = match request.pid.joined_container().map(str::to_owned) {
+        Some(reference) => {
+            if !request.uidmap.is_empty() {
+                bail!(
+                    InvalidRequest,
+                    "--uidmap can't go with --pid container:{reference}: only root of the user \
+                     namespace that owns that PID namespace may mount its /proc"
+                );
+            }
+            Some(pid_target(engine, &reference)?.id)
+        }
+        None => None,
+    };
+    let named: Vec<&containers::ContainerId> =
+        [&network, &ipc, &pid].into_iter().flatten().collect();
+    if named.windows(2).any(|pair| pair[0] != pair[1]) && !crate::network::host_root() {
         bail!(
             InvalidRequest,
-            "--network container: and --ipc container: name two containers: without root, a \
-             container joins one other's namespaces (its user namespace owns them)"
+            "--network, --ipc and --pid container: name more than one container: without root, \
+             a container joins one other's namespaces (its user namespace owns them)"
         );
     }
+    check_host_pid(engine, request)?;
     // Its `/dev/shm` is cloned in the other's mount namespace, where a user
     // namespace of this one's own has no privileges.
     if let Some(reference) = request.ipc.joined_container()
@@ -159,11 +266,67 @@ pub(crate) fn name_the_joined(engine: &Engine, request: &mut RunRequest) -> Resu
              is in its mount namespace, where this one's user namespace has no privileges"
         );
     }
-    request.join_by_ids(network.as_ref(), ipc.as_ref());
+    request.join_by_ids(network.as_ref(), ipc.as_ref(), pid.as_ref());
+    Ok(())
+}
+
+/// `--pid host`, at a create: root's alone (rootless, no `/proc` of the
+/// host's PID namespace can be mounted in a user namespace), never with
+/// `--uidmap` (the same), and said: the container sees and can signal the
+/// host's processes.
+fn check_host_pid(engine: &Engine, request: &RunRequest) -> Result<()> {
+    if request.pid != super::PidMode::Host {
+        return Ok(());
+    }
+    if !crate::network::host_root() {
+        bail!(
+            InvalidRequest,
+            "--pid host needs root: a container's /proc for the host's PID namespace can't be \
+             mounted in a user namespace"
+        );
+    }
+    if !request.uidmap.is_empty() {
+        bail!(
+            InvalidRequest,
+            "--uidmap can't go with --pid host: a user namespace of the container's own can't \
+             mount the host's PID namespace's /proc"
+        );
+    }
+    engine.warn(
+        crate::report::WarningKind::HostPids,
+        "--pid host: the container sees and can signal every process of the host",
+    );
     Ok(())
 }
 
 impl RunRequest {
+    /// Gives `isolation` its PID namespace as asked: its own (as made), the
+    /// host's (none of its own: the runtime then needs its cgroup), or
+    /// another container's, whose init is found for each start.
+    pub(super) fn add_pid(
+        &self,
+        isolation: &mut shipyard_runtime::isolation::Isolation,
+    ) -> Result<()> {
+        use shipyard_runtime::isolation::Namespace;
+        match &self.pid {
+            super::PidMode::Private => {}
+            super::PidMode::Host => isolation.namespaces.retain(|&kind| kind != Namespace::Pid),
+            super::PidMode::Container(_) => match &self.joined.pid {
+                Some(process) => {
+                    super::network::join_namespace(isolation, Namespace::Pid, process);
+                }
+                // A start always finds it first.
+                None if self.container.is_some() => bail!(
+                    Runtime,
+                    "the container whose PID namespace it joins wasn't found for this start"
+                ),
+                // A create's check: nothing is started.
+                None => {}
+            },
+        }
+        Ok(())
+    }
+
     /// Gives `isolation` another container's IPC namespace, if it joins one
     /// (its `/dev/shm` comes with it: the runtime's). Its settings are that
     /// one's: IPC `--sysctl` keys are refused.
@@ -208,37 +371,53 @@ impl RunRequest {
 }
 
 /// The other containers' namespaces `request` joins (a network, an IPC
-/// namespace), found for this start: their inits (running or paused), and
-/// what a network's `/etc` files are made of. Nothing for a request that
-/// joins none.
+/// namespace, a PID namespace), found for this start: their inits (running
+/// or paused), and what a network's `/etc` files are made of. Nothing for a
+/// request that joins none.
 ///
 /// # Errors
 ///
-/// As [`network_target`] and [`ipc_target`]; another container not running
-/// ([`NotRunning`](crate::ErrorKind::NotRunning), Docker's "cannot join
-/// network (IPC) of a non running container"); its maps unreadable.
+/// As [`network_target`], [`ipc_target`] and [`pid_target`]; another
+/// container not running ([`NotRunning`](crate::ErrorKind::NotRunning),
+/// Docker's "cannot join network (IPC, PID) of a non running container");
+/// its maps unreadable.
 pub(crate) fn resolve_joins(engine: &Engine, request: &mut RunRequest) -> Result<()> {
     if let Some(reference) = request.network_container().map(str::to_owned) {
         let other = network_target(engine, &reference)?;
         request.joined.network = Some(joined(engine, &other)?);
     }
     if let Some(reference) = request.ipc.joined_container().map(str::to_owned) {
-        // The same container's as the network: its init read once (it
-        // could restart between two reads).
-        let same = request
-            .joined
-            .network
-            .as_ref()
-            .filter(|_| request.network_container() == Some(reference.as_str()))
-            .map(|network| network.init.clone());
         // (Found again either way: a join of a join is refused.)
         let other = ipc_target(engine, &reference)?;
-        request.joined.ipc = Some(match same {
+        request.joined.ipc = Some(match found_already(request, &reference) {
             Some(init) => init,
             None => init_of(engine, &other, Joins::Ipc)?,
         });
     }
+    if let Some(reference) = request.pid.joined_container().map(str::to_owned) {
+        let other = pid_target(engine, &reference)?;
+        request.joined.pid = Some(match found_already(request, &reference) {
+            Some(init) => init,
+            None => init_of(engine, &other, Joins::Pid)?,
+        });
+    }
     Ok(())
+}
+
+/// The init of `reference`'s container, if this start found it already
+/// for another of its namespaces: read once (it could restart between two
+/// reads).
+fn found_already(request: &RunRequest, reference: &str) -> Option<crate::network::JoinedProcess> {
+    [
+        (
+            request.network_container(),
+            request.joined.network.as_ref().map(|net| &net.init),
+        ),
+        (request.ipc.joined_container(), request.joined.ipc.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(named, init)| init.filter(|_| named == Some(reference)))
+    .cloned()
 }
 
 /// `other`'s init, for a start to join its `what`: running or paused, with
@@ -256,6 +435,7 @@ fn init_of(engine: &Engine, other: &Record, what: Joins) -> Result<crate::networ
                     other.name
                 ),
                 Joins::Ipc => format!("cannot join IPC of a non running container: {}", other.name),
+                Joins::Pid => format!("cannot join PID of a non running container: {}", other.name),
             },
         )
     };
@@ -423,7 +603,7 @@ fn bridge_addresses(
     Ok((addresses, crate::network::resolver(&configs)))
 }
 
-/// The containers up that join `record`'s network or IPC namespace (their
+/// The containers up that join `record`'s network, IPC or PID namespace (their
 /// `created.json` names it), by name: none if they can't be listed.
 #[cfg_attr(
     not(target_os = "linux"),
@@ -442,11 +622,12 @@ pub(crate) fn joiners(engine: &Engine, record: &Record) -> Vec<String> {
 }
 
 /// Whether `joiner` joins any of `joined`'s namespaces (its network, its
-/// IPC namespace).
+/// IPC or PID namespace).
 fn joins_any_of(engine: &Engine, joiner: &Record, joined: &Record) -> bool {
     containers::created(engine, &joiner.id).is_ok_and(|created| {
         created.network_from.as_ref() == Some(&joined.id)
             || created.ipc_from.as_ref() == Some(&joined.id)
+            || created.pid_from.as_ref() == Some(&joined.id)
     })
 }
 

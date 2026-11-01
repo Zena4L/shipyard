@@ -65,6 +65,11 @@ pub(crate) fn request(body: &CreateBody, name: Option<&str>) -> Result<Create, A
     request.ipc =
         shipyard_engine::run::IpcMode::parse(host.ipc_mode.as_deref().unwrap_or_default())
             .map_err(|why| field("IpcMode", &why))?;
+    // Its own, the host's, or another container's (compose's `pid:
+    // service:`, sent as `container:ID`).
+    request.pid =
+        shipyard_engine::run::PidMode::parse(host.pid_mode.as_deref().unwrap_or_default())
+            .map_err(|why| field("PidMode", &why))?;
     request.limits = the_limits(&host)?;
     request.health = body.healthcheck.as_ref().map(health_check).transpose()?;
     Ok(Create {
@@ -134,7 +139,6 @@ fn refuse_what_is_not_supported(host: &HostConfig) -> Result<(), ApiError> {
         )));
     }
     let namespaces = [
-        ("PidMode", mode(&host.pid_mode, &[])),
         ("UTSMode", mode(&host.uts_mode, &[])),
         ("UsernsMode", mode(&host.userns_mode, &[])),
         ("CgroupnsMode", mode(&host.cgroupns_mode, &["private"])),

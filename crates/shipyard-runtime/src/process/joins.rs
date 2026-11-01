@@ -10,9 +10,11 @@
 //! namespace the host's user namespace owns (`setns(2)` needs
 //! `CAP_SYS_ADMIN` over the namespace's owner). Network, IPC and UTS
 //! namespaces are a thread's own, so a multithreaded parent can enter and
-//! leave them (`setns(2)`); a user or mount namespace it couldn't, and a
-//! PID namespace's `setns` only places the next children: none is joined
-//! here.
+//! leave them (`setns(2)`); a user or mount namespace it couldn't. A PID
+//! namespace's `setns` only places the next children, and what's cloned
+//! there is the other container's to see: the clean image joins it, and
+//! every other with it, before it clones the container's init (`init.rs`'s
+//! `join_then_clone`, F134).
 //!
 //! If the parent can't go back (a kernel that refuses the way back after
 //! allowing the way there), it aborts (SIGABRT): every socket, segment and
@@ -31,7 +33,7 @@
 //! given (`Isolation::id_maps`), checked here: the setup goes by them.
 
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -151,6 +153,27 @@ impl NamespaceJoins {
         self.user.is_some()
     }
 
+    /// Whether a PID namespace is joined: then the clean image enters them
+    /// all, before the clone (`init.rs`'s `join_then_clone`).
+    pub(crate) fn joins_pid(&self) -> bool {
+        self.joined
+            .iter()
+            .any(|joined| joined.kind == Namespace::Pid)
+    }
+
+    /// The descriptors the clean image enters, for a PID join: the user
+    /// namespace's, then each other one's in order, the PID namespace's
+    /// last (it places only the clone).
+    pub(crate) fn for_the_clean_image(&self) -> (Option<RawFd>, Vec<(Namespace, RawFd)>) {
+        let mut joined: Vec<(Namespace, RawFd)> = self
+            .joined
+            .iter()
+            .map(|joined| (joined.kind, joined.target.as_raw_fd()))
+            .collect();
+        joined.sort_by_key(|&(kind, _)| kind == Namespace::Pid);
+        (self.user.as_ref().map(AsRawFd::as_raw_fd), joined)
+    }
+
     /// Enters the user namespace, then each other one, for good: in a
     /// process forked to start the child, that exits right after.
     /// Async-signal-safe (`setns` only, no allocation), as it runs after
@@ -257,6 +280,7 @@ impl Joined {
             Mode::empty(),
         )
         .map_err(|errno| Error::sys(opening(), errno))?;
+        refuse_a_tracer(kind, &target, &whose)?;
         Ok(Self {
             kind,
             own: own(kind)?,
@@ -265,14 +289,25 @@ impl Joined {
         })
     }
 
-    /// The process `pid`'s, if it started at `start_time`.
+    /// The process `pid`'s, if it started at `start_time`. A PID namespace
+    /// only as its first process's (a container's init): another that
+    /// joined it (a chained join) would land this one there unseen. And
+    /// only where no process may trace (`refuse_a_tracer`).
     fn of_process(kind: Namespace, pid: u32, start_time: u64) -> Result<Self> {
         let directory = super::join::process_directory(pid, Some(start_time))?;
+        if kind == Namespace::Pid && !first_in_its_pid_namespace(&directory, pid)? {
+            return Err(Error::Namespace(format!(
+                "joining process {pid}'s PID namespace: it isn't that namespace's first process \
+                 (it joined another's): join that one's"
+            )));
+        }
         let target = super::join::namespace_at(&directory, pid, kind)?;
+        let whose = format!("process {pid}'s");
+        refuse_a_tracer(kind, &target, &whose)?;
         Ok(Self {
             kind,
             own: own(kind)?,
-            whose: format!("process {pid}'s"),
+            whose,
             target,
         })
     }
@@ -347,6 +382,96 @@ fn user_namespace(pid: u32, start_time: u64, maps: Option<&IdMaps>) -> Result<Ow
 /// The most of a map file read: the kernel takes at most 340 lines.
 const MAPS_MAX: u64 = 64 * 1024;
 
+/// Whether the process whose `/proc` directory is open at `directory` is
+/// PID 1 of its own PID namespace: its `NSpid` line's last number (its PID
+/// in its innermost namespace, Linux 4.1) is 1.
+fn first_in_its_pid_namespace(directory: &OwnedFd, pid: u32) -> Result<bool> {
+    let bytes =
+        shipyard_sys::fs::read_bounded_at(directory, "status", STATUS_MAX).map_err(|error| {
+            Error::sys(
+                format!("reading process {pid}'s status"),
+                super::io_errno(&error),
+            )
+        })?;
+    first_by_status(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
+        Error::Namespace(format!(
+            "joining process {pid}'s PID namespace: its status says no NSpid (Linux 4.1)"
+        ))
+    })
+}
+
+/// [`first_in_its_pid_namespace`] from a `/proc/PID/status`'s text: its
+/// `NSpid` line's last number is 1. `None` without that line.
+fn first_by_status(status: &str) -> Option<bool> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .and_then(|numbers| numbers.split_whitespace().next_back())
+        .map(|innermost| innermost == "1")
+}
+
+/// A PID namespace (`target`, whose it is `whose`) is joined only where no
+/// process may hold `CAP_SYS_PTRACE` (in its bounding set; one whose set
+/// can't be read is taken to): the joining container's set-up is in that
+/// namespace, kept out of its processes' reach by being non-dumpable alone,
+/// which that capability (in the user namespace its memory belongs to: the
+/// host's as root, the other's rootless) overrides (D15.2b-10, D15.2b-12).
+/// Every process there: its container's, its `exec`s (cloned by another),
+/// other containers' that joined it, a set-up still under way (its init,
+/// unconfined at its start gate). Another kind: nothing to check.
+fn refuse_a_tracer(kind: Namespace, target: &OwnedFd, whose: &str) -> Result<()> {
+    if kind != Namespace::Pid {
+        return Ok(());
+    }
+    match tracer_in(target) {
+        Some(pid) => Err(Error::Namespace(format!(
+            "joining a PID namespace ({whose}): its process {pid} may hold CAP_SYS_PTRACE, with \
+             which it could trace this container as it's set up: join it once that one has \
+             ended, or without that capability there"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// A process in the PID namespace open at `namespace` that may hold
+/// `CAP_SYS_PTRACE`, if any: every process this one can see is looked at
+/// (by its `ns/pid`, the namespace's device and inode); one it may not look
+/// at, or gone meanwhile, is none (it's no process of a container of this
+/// user's then).
+fn tracer_in(namespace: &OwnedFd) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    let theirs = nix::sys::stat::fstat(namespace).ok()?;
+    let ptrace = 1_u64 << crate::security::Capability::SYS_PTRACE.number();
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::metadata(format!("/proc/{pid}/ns/pid"))
+                .is_ok_and(|ns| ns.dev() == theirs.st_dev && ns.ino() == theirs.st_ino)
+        })
+        .find(|pid| {
+            shipyard_sys::fs::read_bounded(
+                std::path::Path::new(&format!("/proc/{pid}/status")),
+                STATUS_MAX,
+            )
+            .is_ok_and(|status| {
+                bounding_set(&String::from_utf8_lossy(&status)).is_none_or(|set| set & ptrace != 0)
+            })
+        })
+}
+
+/// A `/proc/PID/status`'s `CapBnd`, if it says one.
+fn bounding_set(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapBnd:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+}
+
+/// The most of `/proc/PID/status` read (a few KiB).
+const STATUS_MAX: u64 = 64 * 1024;
+
 /// This thread's own namespace of `kind`.
 fn own(kind: Namespace) -> Result<File> {
     File::open(format!("/proc/thread-self/ns/{}", kind.proc_name())).map_err(|error| {
@@ -377,5 +502,49 @@ fn refused(kind: Namespace, message: String) -> Error {
         Error::Network(message)
     } else {
         Error::Namespace(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PID namespace is joined only through its first process: the last
+    /// number of its `NSpid`, its PID in its innermost namespace, is 1.
+    #[test]
+    fn a_pid_namespace_is_joined_through_its_first_process() {
+        let status = |nspid: &str| format!("Name:\tsh\nPid:\t4021\n{nspid}\nPPid:\t1\n");
+        assert_eq!(first_by_status(&status("NSpid:\t4021\t1")), Some(true));
+        assert_eq!(first_by_status(&status("NSpid:\t4021\t7\t1")), Some(true));
+        assert_eq!(
+            first_by_status(&status("NSpid:\t4021\t12")),
+            Some(false),
+            "chained"
+        );
+        assert_eq!(
+            first_by_status(&status("NSpid:\t1")),
+            Some(true),
+            "the host's init"
+        );
+        assert_eq!(
+            first_by_status(&status("NSpid:\t4021")),
+            Some(false),
+            "the host's"
+        );
+        assert_eq!(first_by_status("Name:\tsh\nPid:\t4021\n"), None, "no NSpid");
+    }
+
+    /// A status's bounding set, read as the kernel writes it.
+    #[test]
+    fn a_bounding_set_is_read_from_its_status() {
+        assert_eq!(
+            bounding_set("Name:\tsleep\nCapBnd:\t00000000a80425fb\nCapAmb:\t0\n"),
+            Some(0xa804_25fb)
+        );
+        assert_eq!(bounding_set("Name:\tsleep\n"), None);
+        // Docker's default set lacks CAP_SYS_PTRACE (19); with it, bit 19.
+        let ptrace = 1_u64 << crate::security::Capability::SYS_PTRACE.number();
+        assert_eq!(0xa804_25fb & ptrace, 0);
+        assert_ne!((0xa804_25fb | 0x8_0000) & ptrace, 0);
     }
 }

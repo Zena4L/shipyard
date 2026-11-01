@@ -88,10 +88,41 @@ fn tests() -> Vec<(&'static str, fn())> {
     if cfg!(target_os = "linux") {
         tests.extend_from_slice(PLANNED);
         #[cfg(target_os = "linux")]
-        tests.push((
-            "a_new_container_joins_another_s_namespaces",
-            a_new_container_joins_another_s_namespaces,
-        ));
+        tests.extend_from_slice(&[
+            (
+                "a_new_container_joins_another_s_namespaces",
+                a_new_container_joins_another_s_namespaces as fn(),
+            ),
+            (
+                "a_container_joins_another_s_pid_namespace",
+                a_container_joins_another_s_pid_namespace,
+            ),
+            (
+                "a_joined_pid_namespace_is_none_to_join",
+                a_joined_pid_namespace_is_none_to_join,
+            ),
+            (
+                "a_joined_init_is_no_more_open_than_its_command",
+                a_joined_init_is_no_more_open_than_its_command,
+            ),
+            (
+                "a_tracing_container_s_pid_namespace_is_refused",
+                a_tracing_container_s_pid_namespace_is_refused,
+            ),
+        ]);
+        #[cfg(target_os = "linux")]
+        if is_root() {
+            tests.extend_from_slice(&[
+                (
+                    "an_ending_pid_namespace_is_said_so",
+                    an_ending_pid_namespace_is_said_so as fn(),
+                ),
+                (
+                    "exec_reaches_a_container_in_the_host_s_pid_namespace",
+                    exec_reaches_a_container_in_the_host_s_pid_namespace,
+                ),
+            ]);
+        }
     }
     tests
 }
@@ -1643,6 +1674,426 @@ fn a_gone_process_is_never_joined(test: &PlanTest, rootfs: &RootFs, (pid, start_
         "{err}"
     );
     container::delete(&root, "first", true).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+/// A new container joins a running one's PID namespace (F134): it sees the
+/// first's processes, the first sees its, and its init isn't PID 1 there.
+/// Its init is non-dumpable: the first can't follow its links, while it's
+/// set up (held at its start gate) or after; it can its command's (the
+/// control). Its init's memory is the joined user namespace's (exec'd
+/// there), so its rootless owner opens its namespaces. Its init
+/// is its processes' subreaper (an orphan comes back to it, not to the
+/// first's init), and when its monitor dies, it ends them before it goes
+/// (the kernel won't: the namespace is the first's), its command too though
+/// it ignores the signal that says so.
+fn a_container_joins_another_s_pid_namespace() {
+    use shipyard_runtime::container;
+    let test = PlanTest::new("pid-join");
+    let rootfs = RootFs::minimal();
+    let root = test.state_root();
+    let out = |name: &str| test.dir.join("out").join(name);
+    let (pid, from) = start_pid_join_target(&test, &rootfs, false);
+    let second = pid_join_plan(
+        &test,
+        &rootfs,
+        &from,
+        &format!(
+            "trap '' {}; echo $$ > /out/cmd; readlink /proc/self/ns/pid > /out/pid; \
+             cat /proc/1/comm > /out/one; echo $PPID > /out/init; \
+             sh -c 'sleep 301 & exit'; touch /out/started; exec sleep 302",
+            libc::SIGRTMIN() + 2
+        ),
+    );
+    // Set up, held at its gate: the first looks.
+    let options = container::CreateOptions::default();
+    container::create_planned(&root, "second", &second, &options).unwrap();
+    std::fs::write(out("go"), "").unwrap();
+    wait_for(&out("peeked"));
+    container::start(&root, "second").unwrap();
+    wait_for(&out("started"));
+    std::fs::write(out("go2"), "").unwrap();
+    wait_for(&out("peeked2"));
+    let looked = test.out("peek-setup");
+    assert_eq!(looked.lines().count(), 1, "one init seen: {looked:?}");
+    assert_ne!(
+        looked.trim(),
+        "0",
+        "the second's init followed while it's set up"
+    );
+    assert_eq!(
+        test.out("peek-cmd").trim(),
+        "0",
+        "the second's command, followed"
+    );
+    let running = test.out("peek-running");
+    assert_ne!(running.trim(), "0", "the second's running init followed");
+    let (init, _) = container::running_init(&root, "second").unwrap();
+    // Running, its init is its owner's to reach, rootless too (`exec`, the
+    // container's views): its namespaces open.
+    std::fs::File::open(format!("/proc/{init}/ns/pid")).expect("the second's init's namespace");
+    assert_eq!(
+        test.out("pid").trim(),
+        namespace_of(pid, "pid"),
+        "the first's"
+    );
+    assert_eq!(
+        test.out("one"),
+        "shipyard-init\n",
+        "PID 1 is the first's init"
+    );
+    assert_ne!(
+        test.out("init").trim(),
+        "1",
+        "the second's init isn't PID 1 there"
+    );
+    // Its orphan came back to its init.
+    let orphan = processes_running("sleep\x00301\x00");
+    assert_eq!(orphan.len(), 1, "{orphan:?}");
+    assert_eq!(
+        parent_of(orphan[0]),
+        init,
+        "the orphan's parent is the second's init"
+    );
+    assert_eq!(
+        processes_running("sleep\x00302\x00").len(),
+        1,
+        "its command runs"
+    );
+    // Its monitor dies: its init ends what it has, then itself.
+    let (monitor, _) = container::peek_monitor(&root, "second").unwrap().unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(monitor),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    shipyard_test_support::eventually(Duration::from_secs(10), "the second's end", || {
+        processes_running("sleep\x00301\x00").is_empty()
+            && processes_running("sleep\x00302\x00").is_empty()
+            && !std::path::Path::new(&format!("/proc/{init}")).exists()
+    });
+    // The first runs on.
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let _ = container::delete(&root, "second", true);
+    container::delete(&root, "first", true).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+/// A container that joined another's PID namespace is no PID namespace to
+/// join: its init isn't that namespace's first process (a chained join
+/// would land in the first's unseen). Refused, nothing left.
+fn a_joined_pid_namespace_is_none_to_join() {
+    use shipyard_runtime::container;
+    use shipyard_runtime::isolation::JoinSource;
+    let test = PlanTest::new("pid-chain");
+    let rootfs = RootFs::minimal();
+    let root = test.state_root();
+    let options = container::CreateOptions::default();
+    let (_, from) = start_pid_join_target(&test, &rootfs, false);
+    std::fs::write(test.dir.join("out/go"), "").unwrap();
+    std::fs::write(test.dir.join("out/go2"), "").unwrap();
+    let held = pid_join_plan(&test, &rootfs, &from, "exec sleep 60");
+    container::create_planned(&root, "held", &held, &options).unwrap();
+    container::start(&root, "held").unwrap();
+    let (pid, start_time) = container::running_init(&root, "held").unwrap();
+    let chained = pid_join_plan(
+        &test,
+        &rootfs,
+        &JoinSource::Process { pid, start_time },
+        "true",
+    );
+    let err = container::create_planned(&root, "chained", &chained, &options).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("it isn't that namespace's first process"),
+        "{err}"
+    );
+    assert!(!root.join("chained").exists());
+    // The control: the first's own init is joined.
+    let direct = pid_join_plan(&test, &rootfs, &from, "true");
+    container::create_planned(&root, "direct", &direct, &options).unwrap();
+    for id in ["direct", "held", "first"] {
+        container::delete(&root, id, true).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Starts `first`, a container whose init others' PID joins name: its
+/// script follows the links of every other init it sees once `/out/go`
+/// exists (`/out/peek-setup`: 0 for each it may), then those of the
+/// command named in `/out/cmd` once `/out/go2` does (`/out/peek-cmd`).
+/// With `as_root`, its command is root there (rootless, it's the caller's
+/// user otherwise). Its init's PID, and it as a source.
+fn start_pid_join_target(
+    test: &PlanTest,
+    rootfs: &RootFs,
+    as_root: bool,
+) -> (u32, shipyard_runtime::isolation::JoinSource) {
+    use shipyard_runtime::container;
+    let mut first = test.plan(
+        Root::new(rootfs.path()),
+        "peek() { for p in /proc/[0-9]*; do \
+           if [ $p != /proc/1 ] && [ \"$(cat $p/comm 2>/dev/null)\" = shipyard-init ]; then \
+             readlink $p/cwd > /dev/null 2>&1; echo $?; fi; done; }; \
+         while [ ! -e /out/go ]; do sleep 1; done; peek > /out/peek-setup; touch /out/peeked; \
+         while [ ! -e /out/go2 ]; do sleep 1; done; peek > /out/peek-running; \
+         readlink /proc/$(cat /out/cmd 2>/dev/null)/cwd > /dev/null 2>&1; echo $? > /out/peek-cmd; \
+         touch /out/peeked2; exec sleep 60",
+    );
+    if as_root {
+        first.spec.user.uid = 0;
+        first.spec.user.gid = 0;
+    }
+    let root = test.state_root();
+    container::create_planned(&root, "first", &first, &container::CreateOptions::default())
+        .unwrap();
+    container::start(&root, "first").unwrap();
+    let (pid, start_time) = container::running_init(&root, "first").unwrap();
+    (
+        pid,
+        shipyard_runtime::isolation::JoinSource::Process { pid, start_time },
+    )
+}
+
+#[cfg(target_os = "linux")]
+/// `script` in a container that joins `from`'s PID namespace (rootless, its
+/// user namespace too: the one that owns it).
+fn pid_join_plan(
+    test: &PlanTest,
+    rootfs: &RootFs,
+    from: &shipyard_runtime::isolation::JoinSource,
+    script: &str,
+) -> shipyard_runtime::container::Plan {
+    use shipyard_runtime::isolation::NamespaceJoin;
+    let mut plan = test.plan(Root::new(rootfs.path()), script);
+    plan.isolation.joins = vec![NamespaceJoin::new(Namespace::Pid, from.clone())];
+    if !is_root() {
+        plan.isolation
+            .joins
+            .push(NamespaceJoin::new(Namespace::User, from.clone()));
+    }
+    plan
+}
+
+#[cfg(target_os = "linux")]
+/// Waits until `path` exists (the container's word), 20 s at most.
+fn wait_for(path: &std::path::Path) {
+    shipyard_test_support::eventually(Duration::from_secs(20), &path.display().to_string(), || {
+        path.exists()
+    });
+}
+
+#[cfg(target_os = "linux")]
+/// Rootless, a joined PID namespace's init, its owner's to reach, is no
+/// more open to the other container than its command (D15.2b-12):
+/// its command another user than root in the first, which (without
+/// `CAP_SYS_PTRACE`) then follows neither; its owner opens the init's
+/// namespaces (the control: it isn't that nothing can).
+fn a_joined_init_is_no_more_open_than_its_command() {
+    use shipyard_runtime::container;
+    if is_root() {
+        return;
+    }
+    let test = PlanTest::new("pid-user");
+    let rootfs = RootFs::minimal();
+    let root = test.state_root();
+    let out = |name: &str| test.dir.join("out").join(name);
+    // Root in the first: the same user as the second's init (root there
+    // too), kept out by its being non-dumpable alone.
+    let (_, from) = start_pid_join_target(&test, &rootfs, true);
+    std::fs::write(out("go"), "").unwrap();
+    wait_for(&out("peeked"));
+    let mut second = pid_join_plan(
+        &test,
+        &rootfs,
+        &from,
+        "echo $$ > /out/cmd; touch /out/started; exec sleep 60",
+    );
+    // Another user than the first's root.
+    second.spec.user.uid = 2000;
+    second.spec.user.gid = 2000;
+    let options = container::CreateOptions::default();
+    container::create_planned(&root, "second", &second, &options).unwrap();
+    container::start(&root, "second").unwrap();
+    wait_for(&out("started"));
+    std::fs::write(out("go2"), "").unwrap();
+    wait_for(&out("peeked2"));
+    assert_ne!(
+        test.out("peek-running").trim(),
+        "0",
+        "the second's init followed"
+    );
+    assert_ne!(
+        test.out("peek-cmd").trim(),
+        "0",
+        "the second's command followed"
+    );
+    let (init, _) = container::running_init(&root, "second").unwrap();
+    std::fs::File::open(format!("/proc/{init}/ns/pid")).expect("the second's init's namespace");
+    for id in ["second", "first"] {
+        container::delete(&root, id, true).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// A container's set-up in another's PID namespace is kept out of that
+/// one's reach by being non-dumpable alone, which `CAP_SYS_PTRACE` (in the
+/// user namespace its memory belongs to) overrides: so a container whose
+/// processes may hold it is no PID namespace to join (D15.2b-10, -12),
+/// rootless too. The control: one without it is.
+fn a_tracing_container_s_pid_namespace_is_refused() {
+    use shipyard_runtime::container;
+    use shipyard_runtime::isolation::JoinSource;
+    use shipyard_runtime::security::Capabilities;
+    let test = PlanTest::new("pid-trace");
+    let rootfs = RootFs::minimal();
+    let root = test.state_root();
+    let options = container::CreateOptions::default();
+    let mut tracing = test.plan(Root::new(rootfs.path()), "exec sleep 60");
+    if let Capabilities::Default { added, .. } = &mut tracing.isolation.security.capabilities {
+        added.insert("CAP_SYS_PTRACE".parse().unwrap());
+    }
+    let plain = test.plan(Root::new(rootfs.path()), "exec sleep 60");
+    for (id, plan) in [("tracing", &tracing), ("plain", &plain)] {
+        container::create_planned(&root, id, plan, &options).unwrap();
+        container::start(&root, id).unwrap();
+    }
+    let source = |id: &str| {
+        let (pid, start_time) = container::running_init(&root, id).unwrap();
+        JoinSource::Process { pid, start_time }
+    };
+    let refused = pid_join_plan(&test, &rootfs, &source("tracing"), "true");
+    let err = container::create_planned(&root, "refused", &refused, &options).unwrap_err();
+    assert!(err.to_string().contains("may hold CAP_SYS_PTRACE"), "{err}");
+    assert!(!root.join("refused").exists());
+    // A debugger that joined it with the capability: nothing else joins
+    // there while it runs.
+    let mut debugger = pid_join_plan(&test, &rootfs, &source("plain"), "exec sleep 60");
+    if let Capabilities::Default { added, .. } = &mut debugger.isolation.security.capabilities {
+        added.insert("CAP_SYS_PTRACE".parse().unwrap());
+    }
+    container::create_planned(&root, "debugger", &debugger, &options).unwrap();
+    container::start(&root, "debugger").unwrap();
+    let late = pid_join_plan(&test, &rootfs, &source("plain"), "true");
+    let err = container::create_planned(&root, "late", &late, &options).unwrap_err();
+    assert!(err.to_string().contains("may hold CAP_SYS_PTRACE"), "{err}");
+    container::delete(&root, "debugger", true).unwrap();
+    // The control: once it's gone, one joins.
+    let joined = pid_join_plan(&test, &rootfs, &source("plain"), "true");
+    container::create_planned(&root, "joined", &joined, &options).unwrap();
+    for id in ["joined", "plain", "tracing"] {
+        container::delete(&root, id, true).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// A PID namespace whose init has ended can't take a new process: the
+/// kernel says `ENOMEM`, said as the container it joins ending. Root: its
+/// namespace kept by a bind mount of its `/proc` file, joined by path.
+fn an_ending_pid_namespace_is_said_so() {
+    /// The bind mount that keeps the namespace, undone however it ends.
+    struct Unmount<'a>(&'a std::path::Path);
+    impl Drop for Unmount<'_> {
+        fn drop(&mut self) {
+            let _ = nix::mount::umount2(self.0, nix::mount::MntFlags::MNT_DETACH);
+        }
+    }
+    use shipyard_runtime::container;
+    use shipyard_runtime::isolation::{JoinSource, NamespaceJoin};
+    let test = PlanTest::new("pid-ending");
+    let rootfs = RootFs::minimal();
+    let root = test.state_root();
+    let options = container::CreateOptions::default();
+    let first = test.plan(Root::new(rootfs.path()), "exec sleep 60");
+    container::create_planned(&root, "first", &first, &options).unwrap();
+    container::start(&root, "first").unwrap();
+    let (pid, _) = container::running_init(&root, "first").unwrap();
+    let kept = test.dir.join("kept-pid");
+    std::fs::write(&kept, "").unwrap();
+    nix::mount::mount(
+        Some(format!("/proc/{pid}/ns/pid").as_str()),
+        &kept,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .unwrap();
+    let _unmount = Unmount(&kept);
+    let mut second = test.plan(Root::new(rootfs.path()), "touch /out/second");
+    second.isolation.joins = vec![NamespaceJoin::new(
+        Namespace::Pid,
+        JoinSource::Path(kept.clone()),
+    )];
+    // The control: while the first runs, it's joined.
+    test.run("second", &second);
+    assert!(test.dir.join("out/second").exists(), "the control ran");
+    container::delete(&root, "second", true).unwrap();
+    container::kill(&root, "first", process::Signal::KILL).unwrap();
+    shipyard_test_support::eventually(Duration::from_secs(10), "the first's end", || {
+        container::exit_record(&root, "first").unwrap().is_some()
+    });
+    let err = container::create_planned(&root, "late", &second, &options).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the container it joins is ending (its init has exited)"),
+        "{err}"
+    );
+    container::delete(&root, "first", true).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+/// `exec` reaches a container without a PID namespace of its own (`--pid
+/// host`, root): its command runs beside the container's, in the host's.
+fn exec_reaches_a_container_in_the_host_s_pid_namespace() {
+    use shipyard_runtime::container::{self, ExecOptions, ExecOutcome};
+    let test = PlanTest::new("pid-host");
+    let rootfs = RootFs::minimal();
+    let mut plan = test.plan(
+        Root::new(rootfs.path()),
+        "touch /out/started; while [ ! -e /out/exec ]; do sleep 1; done",
+    );
+    plan.isolation
+        .namespaces
+        .retain(|&kind| kind != Namespace::Pid);
+    test.run_watching("host-pid", &plan, |root| {
+        let options = ExecOptions::new(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo ran > /out/exec".into(),
+        ]);
+        let outcome = container::exec(root, "host-pid", &options, None).unwrap();
+        assert!(
+            matches!(outcome, ExecOutcome::Exited(process::ExitStatus::Exited(0))),
+            "{outcome:?}"
+        );
+    });
+    assert_eq!(test.out("exec"), "ran\n");
+}
+
+#[cfg(target_os = "linux")]
+/// The host's processes whose command line is `cmdline` (its arguments, each
+/// ended by a NUL).
+fn processes_running(cmdline: &str) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|line| line == cmdline.as_bytes())
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+/// Process `pid`'s parent, as the host numbers it.
+fn parent_of(pid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|ppid| ppid.trim().parse().ok())
+        .unwrap()
 }
 
 #[cfg(target_os = "linux")]

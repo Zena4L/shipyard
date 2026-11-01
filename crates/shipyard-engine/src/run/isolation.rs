@@ -100,6 +100,7 @@ impl RunRequest {
         }
         self.add_network(&mut isolation, &mode)?;
         self.add_ipc(&mut isolation)?;
+        self.add_pid(&mut isolation)?;
         // An image's root comes once it's pulled (`Planned::finish`).
         if let Some(dir) = &self.rootfs {
             isolation.root = Some(self.rootfs_root(dir)?);

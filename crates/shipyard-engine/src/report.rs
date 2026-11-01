@@ -129,6 +129,9 @@ pub enum WarningKind {
     /// A container others share the network or IPC namespace of stopped or
     /// went: they lose them until they're started again (D11.4b2-4).
     SharedNamespacesLost,
+    /// A container shares the host's PID namespace (`--pid host`): it sees
+    /// and can signal the host's processes (step 15.2b2).
+    HostPids,
     /// An export of a running container whose root couldn't be cloned
     /// alone: what its volumes cover was exported empty (step 12.2b).
     ExportPartial,

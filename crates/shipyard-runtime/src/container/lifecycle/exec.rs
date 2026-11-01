@@ -550,8 +550,9 @@ fn resolve_names_in(spec: &mut ProcessSpec, pid: u32, started: u64) -> Result<()
 }
 
 /// The namespaces of process `target` that aren't this process's own (one
-/// it shares with the host is joined already). The PID and mount ones must
-/// be among them: a container always has them.
+/// it shares with the host is joined already). The mount one must be among
+/// them: a container always has it. A PID namespace may not be (`--pid
+/// host`): the command then runs in the host's, as the container's do.
 fn namespaces_of(target: u32, id: &str) -> Result<Vec<Namespace>> {
     let namespaces = super::unshared(
         target,
@@ -566,10 +567,10 @@ fn namespaces_of(target: u32, id: &str) -> Result<Vec<Namespace>> {
         ],
     )
     .map_err(|err| ContainerError::Exec(Box::new(err)))?;
-    if !namespaces.contains(&Namespace::Pid) || !namespaces.contains(&Namespace::Mount) {
+    if !namespaces.contains(&Namespace::Mount) {
         return Err(ContainerError::NotExecutable {
             id: id.to_owned(),
-            why: "it has no PID and mount namespaces of its own".to_owned(),
+            why: "it has no mount namespace of its own".to_owned(),
         });
     }
     Ok(namespaces)

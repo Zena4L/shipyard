@@ -486,7 +486,7 @@ impl Isolation {
         for join in &self.joins {
             let by_path = matches!(join.from, JoinSource::Path(_));
             let joinable = match join.kind {
-                Namespace::Network | Namespace::Ipc => true,
+                Namespace::Network | Namespace::Ipc | Namespace::Pid => true,
                 Namespace::Uts => by_path,
                 Namespace::User => !by_path,
                 _ => false,
@@ -518,6 +518,11 @@ impl Isolation {
         }
         if ipc_of_a_process && !with_root {
             return Err(IsolationError::SharedMemoryNeedsARoot);
+        }
+        // A joined PID namespace's `/proc` is mounted by root of the user
+        // namespace that owns it: never one this container makes.
+        if self.is_joined(Namespace::Pid) && self.makes(Namespace::User) {
+            return Err(IsolationError::PidOfAnotherUserNamespace);
         }
         if self.is_joined(Namespace::Network) && self.network_path.is_some() {
             return Err(IsolationError::NetworkJoinedTwice);
@@ -1136,8 +1141,8 @@ fn is_plain_absolute(path: &Path) -> bool {
 /// how the command is confined there (`exec`).
 ///
 /// The target is normally a container's init (PID 1 inside, seen from the
-/// host). Start from [`Join::standard`]: like [`Isolation`], it will gain
-/// fields.
+/// host; in a PID namespace it joined, another PID there). Start from
+/// [`Join::standard`]: like [`Isolation`], it will gain fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Join {
@@ -1465,13 +1470,21 @@ pub enum IsolationError {
          /dev/shm is mounted there"
     )]
     SharedMemoryNeedsARoot,
+    /// A PID namespace joined with a user namespace of the container's own,
+    /// which can't mount that namespace's `/proc`.
+    #[error(
+        "another PID namespace can't be joined with a user namespace of this one's own (its \
+         /proc is mounted by root of the user namespace that owns it): join that container's \
+         user namespace, or none"
+    )]
+    PidOfAnotherUserNamespace,
     /// A network namespace joined both by path and as a process's.
     #[error("a network namespace is joined either by its path or as a process's, not both")]
     NetworkJoinedTwice,
     /// A namespace of a kind that can't be joined (as asked).
     #[error(
-        "the {0} namespace can't be joined that way: a network or IPC namespace (a process's or \
-         by path), a UTS namespace by path, a process's user namespace"
+        "the {0} namespace can't be joined that way: a network, IPC or PID namespace (a \
+         process's or by path), a UTS namespace by path, a process's user namespace"
     )]
     NotJoinable(Namespace),
     /// A joined namespace that isn't listed.
@@ -1620,7 +1633,7 @@ mod tests {
     /// Only what can be joined is, and each kind once, listed.
     #[test]
     fn only_some_namespaces_are_joined() {
-        for kind in [Namespace::Pid, Namespace::Mount, Namespace::Cgroup] {
+        for kind in [Namespace::Mount, Namespace::Cgroup] {
             assert_eq!(
                 joining(vec![of_process(kind)]).validate(),
                 Err(IsolationError::NotJoinable(kind)),
@@ -1633,6 +1646,9 @@ mod tests {
             Err(IsolationError::NotJoinable(Namespace::Uts))
         );
         assert_eq!(joining(vec![by_path(Namespace::Uts)]).validate(), Ok(()));
+        // A PID namespace either way (F134).
+        assert_eq!(joining(vec![of_process(Namespace::Pid)]).validate(), Ok(()));
+        assert_eq!(joining(vec![by_path(Namespace::Pid)]).validate(), Ok(()));
         assert_eq!(
             joining(vec![by_path(Namespace::User)]).validate(),
             Err(IsolationError::NotJoinable(Namespace::User))
@@ -1697,6 +1713,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A joined PID namespace's `/proc` is mounted by root of its own user
+    /// namespace: never with one this container makes (F134); with the
+    /// other's joined, or none, it can.
+    #[test]
+    fn another_s_pid_namespace_needs_its_user_namespace() {
+        let mut own_user = joining(vec![of_process(Namespace::Pid)]);
+        own_user.namespaces.push(Namespace::User);
+        own_user.id_maps = Some(IdMaps::single((1000, 1000)));
+        assert_eq!(
+            own_user.validate(),
+            Err(IsolationError::PidOfAnotherUserNamespace)
+        );
+        own_user.joins.push(of_process(Namespace::User));
+        assert_eq!(own_user.validate(), Ok(()), "its user namespace joined too");
+        assert!(!own_user.makes(Namespace::Pid));
+        #[cfg(target_os = "linux")]
+        assert_eq!(own_user.clone_flags() & libc::CLONE_NEWPID, 0);
     }
 
     /// A process's IPC namespace (its `/dev/shm` is cloned in its mount

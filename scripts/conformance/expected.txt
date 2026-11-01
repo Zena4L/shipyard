@@ -38,7 +38,7 @@ linux_masked_paths pass
 linux_mount_label fail /SELinux/ refused by design: SELinux labels (bundles.md#whats-refused)
 linux_ns_itype fail /a root filesystem needs a mount namespace/ refused by design: it removes every namespace, `mount` too, which a root filesystem needs (bundles.md); upstream it also hangs in its cleanup (https://github.com/opencontainers/runtime-tools/issues/698)
 linux_ns_nopath pass
-linux_ns_path fail /joining an existing namespace/ network, ipc and uts are joined by path (11.4b2); a mount or pid namespace by path is refused (pid: F134, stage 15), and the suite's uts case also sets a hostname, which Shipyard refuses in a joined UTS namespace (another's; runc writes it)
+linux_ns_path fail /joining an existing namespace/ network, ipc and uts are joined by path (11.4b2), pid too (15.2b1, F134); a mount namespace by path is refused by design (a new root is always its own), and the suite's uts case also sets a hostname, which Shipyard refuses in a joined UTS namespace (another's; runc writes it)
 linux_ns_path_type pass
 linux_process_apparmor_profile fail /AppArmor/ refused by design: AppArmor profiles (bundles.md#whats-refused); the test also needs a profile installed
 linux_readonly_paths pass

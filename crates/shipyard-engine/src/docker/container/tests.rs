@@ -77,6 +77,8 @@ fn a_record_is_inspected_as_docker_shows_a_container() {
     });
     // (Past `json!`'s depth there.)
     expected["HostConfig"]["IpcMode"] = "private".into();
+    // Its own PID namespace: Docker's empty word.
+    expected["HostConfig"]["PidMode"] = "".into();
     for path in ["ResolvConfPath", "HostnamePath", "HostsPath"] {
         expected[path] = "".into();
     }
@@ -288,6 +290,7 @@ fn what_s_read_besides_the_record_is_shown() {
         tmpfs: vec![crate::run::TmpfsMount::parse("/run:size=64m,ro").unwrap()],
         network_from: None,
         ipc_from: None,
+        pid_mode: String::new(),
         stdin_once: true,
         etc_dir: Some(std::path::PathBuf::from("/run/shipyard/.runs/abc")),
     };
