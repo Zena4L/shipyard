@@ -1364,10 +1364,11 @@ fn console_matches(terminal: bool, console: bool, logs: bool) -> Result<()> {
 }
 
 /// Refuses `isolation` for a container without a cgroup (for the reason
-/// `why`), if it needs one: without a PID namespace, nothing else can find
-/// all its processes; and limits need one to be written in.
+/// `why`), if it needs one: without a PID namespace of its own (none, or
+/// another's joined), nothing else can find all its processes; and limits
+/// need one to be written in.
 fn without_cgroup(isolation: &crate::isolation::Isolation, why: &str) -> Result<()> {
-    if !isolation.namespaces.contains(&Namespace::Pid) {
+    if !isolation.makes(Namespace::Pid) {
         return Err(ContainerError::NoPidNamespace(why.to_owned()));
     }
     if !isolation.resources.is_empty() {

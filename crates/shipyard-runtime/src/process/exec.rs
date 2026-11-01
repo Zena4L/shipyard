@@ -293,6 +293,28 @@ pub(crate) fn read_joiner_record(
     (pid > 0).then(|| (nix::unistd::Pid::from_raw(pid), placed == 1))
 }
 
+/// Writes a joiner's record on `pipe` (its write end, inherited: taken and
+/// closed here): the PID of what it cloned, and whether that was born in
+/// its cgroup. Read by [`read_joiner_record`]; `init.rs`'s PID join writes
+/// one too.
+pub(crate) fn write_joiner_record(
+    pipe: RawFd,
+    pid: nix::unistd::Pid,
+    placed: bool,
+) -> std::io::Result<()> {
+    let mut record = [0_u8; JOINER_RECORD_LEN];
+    if let Some(head) = record.get_mut(..4) {
+        head.copy_from_slice(&pid.as_raw().to_ne_bytes());
+    }
+    if let Some(byte) = record.get_mut(4) {
+        *byte = u8::from(placed);
+    }
+    // SAFETY: the record pipe's write end, inherited; the caller's, given
+    // up here.
+    let mut pipe = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(pipe) });
+    std::io::Write::write_all(&mut pipe, &record)
+}
+
 /// Where the shipyard binary starts as `exec`'s joiner. Does nothing unless
 /// this process was started that way (by [`start_joiner`], with the hidden
 /// first argument); otherwise it never returns.
@@ -401,16 +423,7 @@ fn run(setup_fd: RawFd) -> ! {
         Ok(Cloned::Parent { pid, in_cgroup }) => {
             // 5. Its PID, for shipyard (it can't see it otherwise: it's
             //    its child, but not one it started).
-            let mut record = [0_u8; JOINER_RECORD_LEN];
-            if let Some(head) = record.get_mut(..4) {
-                head.copy_from_slice(&pid.as_raw().to_ne_bytes());
-            }
-            if let Some(placed) = record.get_mut(4) {
-                *placed = u8::from(in_cgroup);
-            }
-            // SAFETY: the record pipe's write end, inherited; ours.
-            let mut pipe = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(setup.record) });
-            if std::io::Write::write_all(&mut pipe, &record).is_err() {
+            if write_joiner_record(setup.record, pid, in_cgroup).is_err() {
                 let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
                 fail(Failure::at(ChildStep::ExecRecord, Errno::EPIPE));
             }

@@ -221,6 +221,13 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "MODE", value_parser = shipyard_engine::run::IpcMode::parse, conflicts_with = "no_isolation")]
     ipc: Option<shipyard_engine::run::IpcMode>,
 
+    /// The container's PID namespace (Linux): its own unless given; host
+    /// (the host's: it sees and can signal every process there; root only),
+    /// or container:NAME (another running container's: each sees the
+    /// other's processes).
+    #[arg(long, value_name = "MODE", value_parser = shipyard_engine::run::PidMode::parse, conflicts_with = "no_isolation")]
+    pid: Option<shipyard_engine::run::PidMode>,
+
     /// The container's name: on each network made with `shipyard network
     /// create` that it joins, other containers find it by this name (Linux).
     /// Letters, digits, _ and -.

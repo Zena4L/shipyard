@@ -442,12 +442,13 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
             record.name
         ))
     })?;
+    // Another container's network, IPC and PID namespaces: those ones',
+    // found for this start (its record keeps none: its types are frozen);
+    // the host's PID namespace too.
+    request.join_as_created(&created);
     request.expose = created.exposed;
     request.tmpfs = created.tmpfs;
     let stdin_once = created.stdin_once;
-    // Another container's network and IPC namespace: those ones', found
-    // for this start (its record keeps neither: its types are frozen).
-    request.join_by_ids(created.network_from.as_ref(), created.ipc_from.as_ref());
     // A bind's missing host path made again (the API's, Docker's at each
     // start), before the checks resolve it: one the create made, by
     // descriptor from where it made it (11.7: a symlink put on its path is
@@ -493,6 +494,7 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
         [
             (created.network_from.as_ref(), "network"),
             (created.ipc_from.as_ref(), "IPC namespace"),
+            (created.pid_from.as_ref(), "PID namespace"),
         ],
         &mut request,
     )?;
@@ -554,7 +556,7 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
 fn joins_found(
     engine: &Engine,
     record: &Record,
-    made_to_join: [(Option<&containers::ContainerId>, &str); 2],
+    made_to_join: [(Option<&containers::ContainerId>, &str); 3],
     request: &mut crate::run::RunRequest,
 ) -> Result<()> {
     super::resolve_joins(engine, request).map_err(|error| {

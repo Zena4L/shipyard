@@ -260,6 +260,44 @@ shipyard run --rm --ipc container:db alpine:3.20 ls /dev/shm
   made with `--uidmap` can't be joined (its shared memory is its user namespace's).
 - `inspect` shows `HostConfig.IpcMode` as `container:ID` (`private` otherwise).
 
+## Sharing another's processes: `--pid container:NAME`, `--pid host`
+
+`--pid container:NAME` starts a container in another running container's PID namespace:
+each sees the other's processes (`ps`, `/proc`) and can signal them; the other's init is
+PID 1 for both. Its files, mounts and network are still its own (join the network too
+with `--network container:NAME`). Compose's `pid: "service:NAME"` is the same, and so is
+the API's `PidMode`. It's how a debugging container (`strace`, `gdb`, a profiler) looks
+at another's processes.
+
+```sh
+shipyard run -d --name app myapp
+shipyard run --rm -it --pid container:app --cap-add SYS_PTRACE alpine:3.20 ps
+```
+
+- The other must be running at each start (`cannot join PID of a non running container:
+  NAME`). It's kept by its ID: a rename changes nothing. `stop`, `restart` and `rm` of it
+  say who shares its namespaces. One that joins another's PID namespace itself can't be
+  joined: join that one.
+- Its own processes are all its own still: when it stops, they all end (its small init
+  gathers them), and none is left to the other's.
+- A PID namespace where a process may hold `CAP_SYS_PTRACE` (`--cap-add SYS_PTRACE` or
+  `ALL`) can't be joined: with it, that process could trace the joining container as
+  it's being set up. That's the container's own processes, and those of another that
+  joined it: a debugger (the example above) may have the capability, but while it runs
+  nothing else joins that namespace. Give it to the one that looks, last.
+- The joining container's small init isn't PID 1 there: the other's processes see it and
+  may signal it (root there may kill it; its processes then end with its cgroup). It
+  keeps `SIGRTMIN+2` for itself (it learns from it that Shipyard is gone): that signal,
+  sent to the container, isn't passed on.
+- Without root, a container's network, IPC and PID namespaces can be one other
+  container's, not two (its user namespace, joined with them, owns them).
+- It can't have a user namespace of its own (`--uidmap`), with `--pid container:` or with
+  `--pid host`: only root of the user namespace that owns a PID namespace may mount its
+  `/proc`. It needs a cgroup of its own (rootless, a delegated one, as for `--memory`).
+- `--pid host` gives it the host's PID namespace (root only, said when it's made): it
+  sees and can signal every process of the host. `exec` reaches it.
+- `inspect` shows `HostConfig.PidMode` as `container:ID`, `host`, or empty (its own).
+
 ## Its ports: `port`
 
 `shipyard port CONTAINER` shows the host ports a running (or paused) container

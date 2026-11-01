@@ -216,6 +216,28 @@ fn the_entrypoint_s_other_words_go_before_the_command() {
 
 /// A network by name takes its one endpoint's settings; the special modes
 /// take none; another container's network is refused.
+/// `PidMode`: another container's PID namespace (compose's `pid:
+/// service:`), the host's, or its own; a word Docker doesn't know refused.
+#[test]
+fn pid_modes_are_read() {
+    // Another container's PID namespace (compose's `pid: service:`), the
+    // host's, or its own (empty).
+    for (given, wanted) in [
+        (
+            "container:db",
+            shipyard_engine::run::PidMode::Container("db".to_owned()),
+        ),
+        ("host", shipyard_engine::run::PidMode::Host),
+        ("", shipyard_engine::run::PidMode::Private),
+    ] {
+        let pid = with(&json!({"HostConfig": {"PidMode": given}}));
+        assert_eq!(create(&pid, None).unwrap().request.pid, wanted, "{given:?}");
+    }
+    // A word Docker doesn't know either.
+    let unknown = with(&json!({"HostConfig": {"PidMode": "private"}}));
+    assert!(create(&unknown, None).is_err());
+}
+
 #[test]
 fn networks_are_read_with_their_endpoint() {
     let body = with(&json!({
@@ -336,7 +358,6 @@ fn what_shipyard_can_t_do_is_refused() {
             json!({"HostConfig": {"LogConfig": {"Type": "syslog"}}}),
             "LogConfig",
         ),
-        (json!({"HostConfig": {"PidMode": "host"}}), "PidMode"),
         (json!({"HostConfig": {"IpcMode": "host"}}), "IpcMode"),
         (json!({"HostConfig": {"UTSMode": "host"}}), "UTSMode"),
         (json!({"HostConfig": {"UsernsMode": "host"}}), "UsernsMode"),

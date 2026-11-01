@@ -139,6 +139,9 @@ pub struct HostConfig {
     pub network_mode: String,
     /// `private`, or `container:ID` for another container's IPC namespace.
     pub ipc_mode: String,
+    /// Empty for its own, `host`, or `container:ID` for another container's
+    /// PID namespace (Docker's words).
+    pub pid_mode: String,
     /// Capabilities added.
     pub cap_add: Option<Vec<String>>,
     /// Capabilities dropped.
@@ -320,6 +323,7 @@ pub(super) fn host_config(record: &Record) -> HostConfig {
         auto_remove: record.auto_remove,
         network_mode: network_mode(config, None),
         ipc_mode: "private".to_owned(),
+        pid_mode: String::new(),
         cap_add: nil_if_empty(config.cap_add.clone()),
         cap_drop: nil_if_empty(config.cap_drop.clone()),
         // (Docker writes these three as lists, empty or not.)

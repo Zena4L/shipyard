@@ -135,6 +135,17 @@ pub(crate) enum ChildStep {
     /// The started FIFO (for `poststart` hooks: see `Gate::started`)
     /// couldn't be opened.
     StartedFifo = 75,
+    /// The clean image couldn't clone the container's init into the PID
+    /// namespace it joins (`init.rs`'s `join_then_clone`).
+    PidJoinClone = 76,
+    /// The clean image couldn't tell shipyard the init's PID, there.
+    PidJoinRecord = 77,
+    /// The init of a joined PID namespace couldn't become its processes'
+    /// subreaper (`PR_SET_CHILD_SUBREAPER`) or set its parent-death signal.
+    PidJoinInit = 78,
+    /// The init of a joined PID namespace couldn't exec the clean image
+    /// again inside it (`init.rs`'s `exec_joined`).
+    PidJoinExec = 79,
 }
 
 impl ChildStep {
@@ -218,6 +229,10 @@ impl ChildStep {
             73 => Self::ExecRecord,
             74 => Self::PassFds,
             75 => Self::StartedFifo,
+            76 => Self::PidJoinClone,
+            77 => Self::PidJoinRecord,
+            78 => Self::PidJoinInit,
+            79 => Self::PidJoinExec,
             _ => return None,
         })
     }
@@ -418,6 +433,9 @@ pub enum SpawnErrorKind {
     /// user may not move processes there from the cgroup it runs in (a
     /// rootless `exec` from a login whose cgroup isn't delegated) (exit 125).
     CgroupDenied,
+    /// A container that joins another's PID namespace couldn't start there:
+    /// that container is ending (exit 125).
+    JoinedEnding,
 }
 
 /// A command that was started but never ran, with a message saying why.
@@ -471,7 +489,8 @@ impl SpawnError {
             SpawnErrorKind::Setup
             | SpawnErrorKind::Isolation
             | SpawnErrorKind::CgroupBusy
-            | SpawnErrorKind::CgroupDenied => EXIT_ENGINE_ERROR,
+            | SpawnErrorKind::CgroupDenied
+            | SpawnErrorKind::JoinedEnding => EXIT_ENGINE_ERROR,
         }
     }
 }
@@ -602,6 +621,10 @@ fn describe_step(failure: ChildFailure, ctx: &FailureContext) -> SpawnError {
         | ChildStep::OomScoreAdj
         | ChildStep::ExecClone
         | ChildStep::ExecRecord => exec_step(step, errno, ctx),
+        ChildStep::PidJoinClone
+        | ChildStep::PidJoinRecord
+        | ChildStep::PidJoinInit
+        | ChildStep::PidJoinExec => pid_join_step(step, errno, ctx),
         ChildStep::Reexec => describe_reexec(errno, ctx),
         ChildStep::ReadSetup => {
             isolation_setup("the container's init reading its setup", errno, ctx)
@@ -1209,6 +1232,47 @@ fn exec_clone(errno: Errno, ctx: &FailureContext) -> SpawnError {
     }
 }
 
+/// A step of the clean image that joins another's PID namespace failed
+/// (`init.rs`'s `join_then_clone`). Its clone's `ENOMEM` is the kernel's
+/// word for a namespace whose init has exited (`alloc_pid`): the other
+/// container ending.
+fn pid_join_step(step: ChildStep, errno: Errno, ctx: &FailureContext) -> SpawnError {
+    let doing = match step {
+        ChildStep::PidJoinRecord => {
+            "telling shipyard the init's process ID, in the PID namespace it joins"
+        }
+        ChildStep::PidJoinInit => {
+            "making the init the reaper of its processes, in the PID namespace it joins"
+        }
+        ChildStep::PidJoinExec => {
+            "starting the container's init again inside the namespaces it joins (exec)"
+        }
+        _ => "starting the container in the PID namespace it joins (clone)",
+    };
+    match (step, errno) {
+        (ChildStep::PidJoinClone, Errno::ENOMEM) => SpawnError::new(
+            SpawnErrorKind::JoinedEnding,
+            "starting the container in the PID namespace it joins: the container it joins is \
+             ending (its init has exited)",
+            errno,
+        ),
+        (ChildStep::PidJoinClone, Errno::EAGAIN) => SpawnError::new(
+            SpawnErrorKind::Isolation,
+            match ctx.pids_max {
+                Some(limit) => format!(
+                    "starting the container in the PID namespace it joins: a process limit is \
+                     reached ({limit})"
+                ),
+                None => "starting the container in the PID namespace it joins: a process limit \
+                         is reached"
+                    .to_owned(),
+            },
+            errno,
+        ),
+        _ => isolation_setup(doing, errno, ctx),
+    }
+}
+
 /// Joining one of a running container's namespaces failed; `detail` says
 /// which (its index in `Namespace::ALL`).
 fn join_setup(errno: Errno, detail: u64, ctx: &FailureContext) -> SpawnError {
@@ -1626,7 +1690,7 @@ mod tests {
         // Every number from 1 up names a step, with no gaps, until the first
         // unknown one; and each step maps back to its number.
         let known: Vec<ChildStep> = (1..).map_while(ChildStep::from_raw).collect();
-        assert_eq!(known.len(), 75, "a new step needs a number in from_raw");
+        assert_eq!(known.len(), 79, "a new step needs a number in from_raw");
         for step in known {
             assert_eq!(ChildStep::from_raw(step as u16), Some(step));
         }

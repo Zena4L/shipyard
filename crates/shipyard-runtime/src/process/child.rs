@@ -148,7 +148,11 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
         unsafe { libc::close(handshake.parent_end) };
     }
     reset_signal_dispositions(&plan.keep_ignored)?;
-    if let Some(handshake) = &plan.handshake {
+    // A PID join's start: the init it clones waits for go, once it exists
+    // (`init.rs`'s `join_then_clone`); shipyard needs its PID first.
+    if let Some(handshake) = &plan.handshake
+        && !plan.joins_pid()
+    {
         wait_for_go(handshake.read)?;
     }
     give_stdio(&plan.stdio)?;
@@ -485,7 +489,7 @@ fn exec_binary(
 #[cfg(target_os = "linux")]
 /// Whether a SIGPIPE is pending for this process (blocked, as every signal
 /// is here).
-fn sigpipe_pending() -> bool {
+pub(super) fn sigpipe_pending() -> bool {
     // SAFETY: `sigemptyset` initializes the set before `sigpending` fills
     // it and `sigismember` reads it; all three are async-signal-safe and
     // touch only this stack variable.
@@ -957,7 +961,7 @@ fn prctl(option: libc::c_int, arg2: libc::c_ulong, arg3: libc::c_ulong) -> Resul
 /// [`setgroups_allowed_here`]), the group list stays: the kernel would
 /// refuse the call.
 #[cfg(target_os = "linux")]
-fn become_namespace_root(setgroups: bool) -> Result<(), Failure> {
+pub(super) fn become_namespace_root(setgroups: bool) -> Result<(), Failure> {
     let failed = |call: NamespaceRootStep| {
         move |errno| Failure::at(ChildStep::NamespaceRoot, errno).detail(call.detail())
     };

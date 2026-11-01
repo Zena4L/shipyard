@@ -78,6 +78,9 @@ impl Capability {
     pub const KILL: Self = Self(5);
     /// `CAP_MKNOD`: make device nodes.
     pub const MKNOD: Self = Self(27);
+    /// `CAP_SYS_PTRACE`: trace any process, and read a non-dumpable one's
+    /// memory.
+    pub const SYS_PTRACE: Self = Self(19);
 
     /// The capability with kernel number `number`, if this table knows it.
     #[must_use]

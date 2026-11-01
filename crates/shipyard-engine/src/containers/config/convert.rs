@@ -119,8 +119,10 @@ impl Config {
             container: _,
             // Found at each start; the other's ID is `created.json`'s.
             joined: _,
-            // Another's IPC namespace is `created.json`'s (`ipc_from`).
+            // Another's IPC namespace is `created.json`'s (`ipc_from`), its
+            // PID namespace too (`pid_from`, `pid_host`).
             ipc: _,
+            pid: _,
             // Settled at the create: the image is kept by its manifest's
             // digest, which is the platform's own (step 13.3).
             platform: _,
@@ -217,6 +219,7 @@ impl Config {
             container: None,
             joined: crate::run::Joined::default(),
             ipc: crate::run::IpcMode::Private,
+            pid: crate::run::PidMode::Private,
             platform: None,
             streams: RunStreams {
                 interactive: self.interactive,

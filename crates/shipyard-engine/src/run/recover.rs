@@ -177,6 +177,29 @@ fn policy_restarts(record: &crate::containers::Record, code: Option<i32>) -> boo
     }
 }
 
+/// How deep `id`'s joins go: 0 for a container that joins no other's
+/// namespaces, else one more than the deepest of those it joins (a network,
+/// an IPC or a PID namespace: a chain of one kind is refused, but kinds can
+/// chain: B joins A's PID namespace, A C's network). Bounded: a loop of
+/// joins (which can't start anyway) ends.
+#[cfg(target_os = "linux")]
+fn join_depth(engine: &Engine, id: &crate::containers::ContainerId, depth: usize) -> usize {
+    /// Deeper than kinds can chain (three).
+    const MOST: usize = 4;
+    let Ok(created) = crate::containers::created(engine, id) else {
+        return 0;
+    };
+    if depth >= MOST {
+        return MOST;
+    }
+    [created.network_from, created.ipc_from, created.pid_from]
+        .iter()
+        .flatten()
+        .map(|other| 1 + join_depth(engine, other, depth + 1))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Whether the container `record` is (`up`: it's up already) is started
 /// when the host starts again, as its restart policy says (see [`boot`]).
 #[cfg(target_os = "linux")]
@@ -283,7 +306,7 @@ pub(crate) fn comes_back(record: &crate::containers::Record, up: bool) -> bool {
 mod linux {
     use std::time::{Duration, SystemTime};
 
-    use super::starts_at_boot;
+    use super::{join_depth, starts_at_boot};
 
     use shipyard_runtime::container::{self as runtime, Status};
 
@@ -313,13 +336,10 @@ mod linux {
         // host with many, a pass each would cost the square of their number).
         recover_others(engine, None);
         let mut booted = super::Booted::default();
-        // Those that join another's network after the others: theirs must
-        // be up first (a join of a join is refused, so one pass is enough).
+        // Those that join another's namespaces after the others, deepest
+        // last: theirs must be up first.
         let mut records = containers::list(engine)?;
-        records.sort_by_cached_key(|record| {
-            containers::created(engine, &record.id)
-                .is_ok_and(|created| created.network_from.is_some() || created.ipc_from.is_some())
-        });
+        records.sort_by_cached_key(|record| join_depth(engine, &record.id, 0));
         for record in records {
             let up = containers::state(engine, &record).is_ok_and(|state| state.is_active());
             if !starts_at_boot(&record, up) {

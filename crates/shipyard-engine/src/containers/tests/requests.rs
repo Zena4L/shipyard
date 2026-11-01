@@ -156,6 +156,7 @@ fn a_request_is_kept_whole() {
         container: _,
         joined: _,
         ipc: _,
+        pid: _,
         caller_env: _,
         streams: _,
         env: _,

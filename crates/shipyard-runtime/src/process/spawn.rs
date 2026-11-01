@@ -330,30 +330,25 @@ pub(crate) fn spawn(
         return spawn_joined(spec, options, join, started);
     }
     let (report_read, report_write) = report_pipe()?;
-    let report = ReportReader::new(report_read)?;
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_mut, reason = "a joiner is Linux's")
+    )]
+    let mut report = ReportReader::new(report_read)?;
     let (go_read, go_write) = go_pipe()?;
     let handshake = Handshake {
         read: go_read.as_raw_fd(),
         parent_end: go_write.as_raw_fd(),
     };
     #[cfg(target_os = "linux")]
-    let joins = match options.placement.isolation() {
-        Some(isolation) => {
-            check_proc_numbers_children(isolation, network.is_some())?;
-            // Another container's network is its own to set up, never this
-            // one's hook's.
-            if network.is_some() && isolation.is_joined(crate::isolation::Namespace::Network) {
-                return Err(Error::Network(
-                    "a container that joins another's network gets no network of its own"
-                        .to_owned(),
-                ));
-            }
-            Some(open_joins(isolation)?)
-        }
-        None => None,
-    };
+    let joins = options
+        .placement
+        .isolation()
+        .map(|isolation| joins_for(isolation, network.is_some()))
+        .transpose()?;
     #[cfg(target_os = "linux")]
-    let isolated = CleanImageFiles::for_spawn(spec, options, joins.as_ref())?;
+    let mut isolated =
+        CleanImageFiles::for_spawn(spec, options, joins.as_ref(), go_read.as_raw_fd())?;
     #[cfg(target_os = "linux")]
     let reexec_fds = isolated
         .as_ref()
@@ -396,13 +391,23 @@ pub(crate) fn spawn(
         }
         Launched::Parent { pid, in_cgroup } => (pid, in_cgroup),
     };
+    // The child has its copy: ours closed, a failure's report ends with it.
+    drop(report_write);
+    // A PID join's start was the joiner: the init is what it cloned.
+    #[cfg(target_os = "linux")]
+    let pid = match isolated
+        .as_mut()
+        .and_then(CleanImageFiles::pid_joiner_record)
+    {
+        Some(record) => init_of_pid_joiner(pid, record, &mut report, &context)?,
+        None => pid,
+    };
     #[cfg(target_os = "linux")]
     before_go(pid, spec, options, network, in_cgroup)?;
     #[cfg(not(target_os = "linux"))]
     let _ = (in_cgroup, network);
     started(pid);
     drop(mask);
-    drop(report_write);
     drop(go_read);
     #[cfg(target_os = "linux")]
     let (status, hooks) = isolated.map(|files| files.parent_ends(options)).unzip();
@@ -511,8 +516,12 @@ fn spawn_joined(
         // A command it may have started waits for go: with our end
         // closed, it gives up. What the joiner (or it) reported says why.
         drop(go_write);
-        let failure = joiner_failure(&mut report, &context);
-        reap_stray_exec();
+        let failure = joiner_failure(
+            &mut report,
+            &context,
+            "exec's joiner ended without starting the command",
+        );
+        reap_stray("shipyard-exec");
         drop(mask);
         return Err(failure);
     };
@@ -556,12 +565,47 @@ fn spawn_joined(
     })
 }
 
-/// Reaps a command the joiner cloned before it failed, which it couldn't
-/// tell us about: with `CLONE_PARENT` it's our child (named after the
-/// joiner), gone by now (its go pipe closed). Unreaped, it would hold up the
-/// end of the container's PID namespace.
+/// The init a PID join's joiner (`joiner`, our child) cloned, from its
+/// `record` (`exec.rs`'s, the placement byte unused: the init is in the
+/// joiner's cgroup), once the joiner is reaped; past [`JOINER_WAIT`] it's
+/// killed.
+///
+/// # Errors
+///
+/// What the joiner said on the `report` pipe, if it started none.
 #[cfg(target_os = "linux")]
-fn reap_stray_exec() {
+fn init_of_pid_joiner(
+    joiner: Pid,
+    record: &OwnedFd,
+    report: &mut ReportReader,
+    context: &FailureContext,
+) -> Result<Pid> {
+    let started = super::exec::read_joiner_record(record, JOINER_WAIT);
+    if started.is_none() {
+        let _ = nix::sys::signal::kill(joiner, NixSignal::SIGKILL);
+    }
+    // It has exited, or is about to. A supervisor's reaping may take it
+    // first (ECHILD).
+    let _ = nix::sys::wait::waitpid(joiner, None);
+    if started.is_none() {
+        reap_stray("shipyard-init");
+    }
+    started.map(|(init, _)| init).ok_or_else(|| {
+        joiner_failure(
+            report,
+            context,
+            "the joiner of another's PID namespace ended without starting the init",
+        )
+    })
+}
+
+/// Reaps what a joiner cloned before it failed, which it couldn't tell us
+/// about: with `CLONE_PARENT` it's our child, named `name` (`exec`'s
+/// command, gone by now: its go pipe closed; a PID join's init, killed
+/// here: it holds the report pipe as it waits for go). Unreaped, it would
+/// hold up the end of the container's PID namespace, or our read of why.
+#[cfg(target_os = "linux")]
+fn reap_stray(name: &str) {
     let me = std::process::id().to_string();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return;
@@ -581,7 +625,7 @@ fn reap_stray_exec() {
                 .find_map(|line| line.strip_prefix(name))
                 .map(str::trim)
         };
-        if field("PPid:") == Some(me.as_str()) && field("Name:") == Some("shipyard-exec") {
+        if field("PPid:") == Some(me.as_str()) && field("Name:") == Some(name) {
             let _ = nix::sys::signal::kill(Pid::from_raw(pid), NixSignal::SIGKILL);
             let _ = nix::sys::wait::waitpid(Pid::from_raw(pid), None);
         }
@@ -612,7 +656,7 @@ fn exec_terminal(
 /// Why the joiner gave up: the failure it (or the command) reported, once
 /// both are gone.
 #[cfg(target_os = "linux")]
-fn joiner_failure(report: &mut ReportReader, context: &FailureContext) -> Error {
+fn joiner_failure(report: &mut ReportReader, context: &FailureContext, ended: &str) -> Error {
     let deadline = std::time::Instant::now() + JOINER_WAIT;
     loop {
         match report.read() {
@@ -625,10 +669,7 @@ fn joiner_failure(report: &mut ReportReader, context: &FailureContext) -> Error 
                 let _ = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(100_u16));
             }
             Ok(_) => {
-                return Error::sys(
-                    "exec's joiner ended without starting the command",
-                    Errno::ECHILD,
-                );
+                return Error::sys(ended.to_owned(), Errno::ECHILD);
             }
             Err(err) => return err,
         }
@@ -646,6 +687,22 @@ fn check_proc_numbers_children(isolation: &Isolation, hooked: bool) -> Result<()
         return Err(Error::ForeignProc);
     }
     Ok(())
+}
+
+/// [`open_joins`], once the spawn is checked: our `/proc` numbers its child
+/// as we do where we write there, and a network hook (`hooked`) never sets
+/// up another's network.
+#[cfg(target_os = "linux")]
+fn joins_for(isolation: &Isolation, hooked: bool) -> Result<super::joins::NamespaceJoins> {
+    check_proc_numbers_children(isolation, hooked)?;
+    // Another container's network is its own to set up, never this one's
+    // hook's.
+    if hooked && isolation.is_joined(crate::isolation::Namespace::Network) {
+        return Err(Error::Network(
+            "a container that joins another's network gets no network of its own".to_owned(),
+        ));
+    }
+    open_joins(isolation)
 }
 
 /// The namespaces `isolation` joins, opened before anything starts. A
@@ -761,6 +818,20 @@ struct CleanImageFiles {
     terminal: Option<RawFd>,
     /// The descriptors passed on to the command (the caller holds them).
     passing: Vec<RawFd>,
+    /// A PID join's (see [`PidJoinFiles`]).
+    pid_join: Option<PidJoinFiles>,
+}
+
+/// What a PID join's clean image is handed beside the rest
+/// (`setup::PidJoinSetup`).
+#[cfg(target_os = "linux")]
+struct PidJoinFiles {
+    /// Its descriptors (the joins hold the namespaces').
+    fds: Vec<RawFd>,
+    /// The pipe the init's PID comes back on: ours to read.
+    record_read: OwnedFd,
+    /// Its write end, closed here once the joiner runs.
+    record_write: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -771,6 +842,7 @@ impl CleanImageFiles {
         spec: &ProcessSpec,
         options: &SpawnOptions,
         joins: Option<&super::joins::NamespaceJoins>,
+        go: RawFd,
     ) -> Result<Option<Self>> {
         options
             .placement
@@ -784,6 +856,9 @@ impl CleanImageFiles {
                     joins
                         .and_then(super::joins::NamespaceJoins::shm_mount_ns)
                         .filter(|_| isolation.root.is_some()),
+                    joins
+                        .filter(|joins| joins.joins_pid())
+                        .map(|joins| (joins, go)),
                 )
             })
             .transpose()
@@ -797,6 +872,7 @@ impl CleanImageFiles {
         options: &SpawnOptions,
         isolation: &Isolation,
         shm_mount_ns: Option<RawFd>,
+        pid_join: Option<(&super::joins::NamespaceJoins, RawFd)>,
     ) -> Result<Self> {
         // Already checked by the supervisor; checked again because the
         // setup trusts it (a PID namespace comes with a mount namespace, a
@@ -826,6 +902,21 @@ impl CleanImageFiles {
         let terminal = options
             .terminal
             .and_then(super::stdio::ChildTerminal::socket);
+        let pid_join = pid_join
+            .map(|(joins, go)| {
+                let (record_read, record_write) = report_pipe()?;
+                let (user, namespaces) = joins.for_the_clean_image();
+                let setup = super::setup::PidJoinSetup {
+                    user,
+                    namespaces,
+                    flags: isolation.clone_flags(),
+                    record: record_write.as_raw_fd(),
+                    go,
+                    namespace_root: isolation.id_maps.is_some(),
+                };
+                Ok::<_, Error>((setup, record_read, record_write))
+            })
+            .transpose()?;
         Ok(Self {
             status_read,
             status_write,
@@ -851,6 +942,7 @@ impl CleanImageFiles {
                 if let Some(root) = &mut setup.root {
                     root.shm_mount_ns = shm_mount_ns;
                 }
+                setup.pid_join = pid_join.as_ref().map(|(join, ..)| join.clone());
                 setup.to_memfd()?
             },
             gate: options.gate,
@@ -863,6 +955,11 @@ impl CleanImageFiles {
                 .as_ref()
                 .map(|passing| passing.sources.clone())
                 .unwrap_or_default(),
+            pid_join: pid_join.map(|(join, record_read, record_write)| PidJoinFiles {
+                fds: join.fds(),
+                record_read,
+                record_write: Some(record_write),
+            }),
         })
     }
 
@@ -903,7 +1000,20 @@ impl CleanImageFiles {
             shm_mount_ns: self.shm_mount_ns,
             terminal: self.terminal,
             passing: self.passing.clone(),
+            pid_join: self
+                .pid_join
+                .as_ref()
+                .map(|files| files.fds.clone())
+                .unwrap_or_default(),
         }
+    }
+
+    /// A PID join's record pipe, once the joiner runs: our copy of its
+    /// write end closed, so its read ends with the joiner and its clone.
+    fn pid_joiner_record(&mut self) -> Option<&OwnedFd> {
+        let files = self.pid_join.as_mut()?;
+        drop(files.record_write.take());
+        Some(&files.record_read)
     }
 }
 
@@ -1115,9 +1225,16 @@ unsafe fn launch(
     #[cfg(target_os = "linux")]
     if let Some(isolation) = options.placement.isolation() {
         use super::clone::{Cloned, clone_process};
+        // Another's PID namespace: the clean image joins every namespace
+        // itself and clones the init (`init.rs`); this child only execs it,
+        // in shipyard's own namespaces.
+        let joiner = joins.is_some_and(super::joins::NamespaceJoins::joins_pid);
         // Another container's user namespace: entered by a process of its
         // own, which starts the child.
-        let cloned = if let Some(joins) = joins.filter(|joins| joins.joins_user()) {
+        let cloned = if joiner {
+            // SAFETY: the caller's contract; no namespace flags.
+            unsafe { clone_process(0, cgroup) }
+        } else if let Some(joins) = joins.filter(|joins| joins.joins_user()) {
             use super::enterer::Started;
             // SAFETY: the caller's contract.
             match unsafe { super::enterer::start(joins, isolation.clone_flags(), cgroup) }? {
@@ -1135,7 +1252,7 @@ unsafe fn launch(
             // only (`Isolation::validate` refuses CLONE_NEWTIME).
             unsafe { clone_process(isolation.clone_flags(), cgroup) }
         };
-        if let Some(joins) = joins.filter(|joins| !joins.joins_user()) {
+        if let Some(joins) = joins.filter(|joins| !joins.joins_user() && !joiner) {
             match &cloned {
                 // The child stays: it's to start in that namespace.
                 Ok(Cloned::Child) => {}

@@ -109,6 +109,8 @@ pub(super) struct Extras {
     pub(super) network_from: Option<containers::ContainerId>,
     /// The container whose IPC namespace it joins (`--ipc container:`).
     pub(super) ipc_from: Option<containers::ContainerId>,
+    /// Its PID namespace, as Docker says it (`--pid`).
+    pub(super) pid_mode: String,
     /// Its input closed once its first client's ends (`StdinOnce`).
     pub(super) stdin_once: bool,
     /// Where its `/etc` files are, while it's up ([`containers::etc_dir`]).
@@ -132,6 +134,11 @@ fn extras(engine: &Engine, record: &Record, state: &containers::ContainerState) 
         );
         containers::Created::default()
     });
+    let pid_mode = match (&created.pid_from, created.pid_host) {
+        (Some(other), _) => format!("container:{}", other.as_str()),
+        (None, true) => "host".to_owned(),
+        (None, false) => String::new(),
+    };
     let (asked, tmpfs, network_from, ipc_from, stdin_once) = (
         created.exposed,
         created.tmpfs,
@@ -145,6 +152,7 @@ fn extras(engine: &Engine, record: &Record, state: &containers::ContainerState) 
             tmpfs,
             network_from,
             ipc_from,
+            pid_mode,
             stdin_once,
             etc_dir,
             ..Extras::default()
@@ -164,6 +172,7 @@ fn extras(engine: &Engine, record: &Record, state: &containers::ContainerState) 
         tmpfs,
         network_from,
         ipc_from,
+        pid_mode,
         stdin_once,
         etc_dir,
     }
@@ -344,6 +353,7 @@ fn docker_view(
                 || "private".to_owned(),
                 |other| format!("container:{}", other.as_str()),
             ),
+            pid_mode: extras.pid_mode.clone(),
             ..host_config(&record)
         },
         network_settings: network_settings(&record, &state, leases, extras.network_from.as_ref()),

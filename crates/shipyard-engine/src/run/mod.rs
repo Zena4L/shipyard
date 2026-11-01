@@ -90,7 +90,7 @@ pub use recover::{Booted, Stopped, boot, stop_for_the_host};
 pub use rename::rename;
 pub(crate) use request::Joined;
 pub use request::{
-    CapabilityArg, DEFAULT_PIDS_MAX, IpcMode, Limits, RunRequest, RunStreams, SecurityOpt,
+    CapabilityArg, DEFAULT_PIDS_MAX, IpcMode, Limits, PidMode, RunRequest, RunStreams, SecurityOpt,
     Supervision,
 };
 pub use stop::{StopOptions, kill, restart, stop, stop_until, wait};

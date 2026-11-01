@@ -596,6 +596,12 @@ fn settled_beside(request: &RunRequest, anonymous: &[String]) -> Result<containe
             .joined_container()
             .map(containers::ContainerId::parse)
             .transpose()?,
+        pid_from: request
+            .pid
+            .joined_container()
+            .map(containers::ContainerId::parse)
+            .transpose()?,
+        pid_host: request.pid == crate::run::PidMode::Host,
         stdin_once: request.streams.once,
     })
 }
