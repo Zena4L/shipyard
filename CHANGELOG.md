@@ -111,6 +111,15 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **On Ubuntu 26.04, every rootless run left its pasta running** (step 15.2c1): Ubuntu
+  26.04 confines pasta by an AppArmor profile that takes signals from unconfined
+  processes alone, and Shipyard's own profile isn't one, so pasta outlived each run
+  (thousands of them, each slowing the next run's end by 2 s and warning "processes left
+  behind"). pasta's launcher now leaves Shipyard's profile for `unconfined` before it
+  starts pasta (it makes no user namespace, the one thing the profile is for), and the
+  end of a run asks what's left to stop (SIGTERM) before it kills it, half a second
+  later, so the launcher stops its pasta itself (a leftover deaf to SIGTERM now costs a
+  run's end that half second).
 - **On a Mac, `stats` said 0B of memory for every container** (since stage 10): the VM's
   guest has no systemd, so nothing turned on the memory and CPU controllers at its cgroup
   root, and Shipyard's cgroups below had only `pids`. The guest's PID 1 now turns on CPU,
@@ -176,6 +185,12 @@ behaviour; each change is listed here).
   wherever it led. A link to what its owner doesn't own is refused as root, and the
   config's directory is opened once and checked as it's held open, so one swapped for a
   link after the check is never written through (F162).
+
+### Known limitations
+
+- **Docker's CLI 29 needs `DOCKER_API_VERSION=1.43`** (F207): it asks for API 1.44 at
+  least and doesn't step down to the 1.43 Shipyard serves; Docker's CLI up to 28, and
+  compose through it, negotiate as before.
 
 ## 0.5.0 - unreleased
 

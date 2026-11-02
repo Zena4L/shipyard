@@ -608,6 +608,23 @@ fn silence_hint(root: bool, selinux_enforcing: bool) -> &'static str {
     }
 }
 
+/// Whether AppArmor's `label` is Shipyard's own profile, which pasta's
+/// launcher leaves for `unconfined` before it starts pasta: it's unconfined
+/// in all but name (`contrib/apparmor/shipyard`: it lifts the restriction on
+/// making user namespaces, which the launcher never does). A site that made
+/// it enforcing has no `change_profile` rule: the change is refused, harmless.
+/// Ubuntu 26.04 confines pasta by a profile of its own that takes signals
+/// from no other profile, `unconfined` aside: under Shipyard's, the
+/// launcher's SIGKILL and its parent-death signal never reach pasta, which
+/// then outlives every run.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "pasta's launcher is Linux's")
+)]
+fn is_shipyards_profile(label: &str) -> bool {
+    label.starts_with("shipyard ")
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs::File;
@@ -1118,6 +1135,7 @@ mod linux {
                 Err(errno) => return Err(format!("forking the launcher: {errno}")),
             }
         }
+        leave_shipyards_profile();
         let parent = nix::unistd::getppid();
         let own = |fd: i32, what: &str| -> Result<OwnedFd, String> {
             use shipyard_sys::fd::{OnExec, take_inherited};
@@ -1191,6 +1209,42 @@ mod linux {
                     Following::take(*pid, *start_time, *pidfd, *ready, pid_file, *hold)?;
                 follow_init(launch, following, host_root, lost_to.as_deref(), lost)
             }
+        }
+    }
+
+    /// Leaves Shipyard's AppArmor profile for `unconfined`, where it confines
+    /// this process (see `is_shipyards_profile`): an unconfined-mode profile
+    /// may change to any. Refused (an enforcing copy, `no_new_privs`), pasta
+    /// still runs, and may outlive its run on Ubuntu 26.04 until its
+    /// namespace file goes.
+    fn leave_shipyards_profile() {
+        use std::io::Write as _;
+        let Some((path, label)) = [
+            "/proc/thread-self/attr/apparmor/current",
+            "/proc/self/attr/current",
+        ]
+        .into_iter()
+        .find_map(|path| Some((path, std::fs::read_to_string(path).ok()?))) else {
+            return;
+        };
+        if !super::is_shipyards_profile(label.trim()) {
+            return;
+        }
+        // One write: AppArmor takes the command whole. Refused, it's said in
+        // pasta's log, which Shipyard shows only when pasta fails.
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|mut file| file.write(b"changeprofile unconfined"))
+        {
+            let _ = std::io::stderr().write_all(
+                format!(
+                    "shipyard's pasta launcher: keeping AppArmor's {}: {error} \
+                     (pasta may not take its signals)\n",
+                    label.trim()
+                )
+                .as_bytes(),
+            );
         }
     }
 
@@ -1435,8 +1489,12 @@ mod linux {
     /// Kills pasta, reaps it, and ends this launcher.
     fn end(pasta: nix::unistd::Pid) -> ! {
         use nix::sys::signal::{Signal, kill};
-        let _ = kill(pasta, Signal::SIGKILL);
-        let _ = nix::sys::wait::waitpid(pasta, None);
+        // A kill refused (pasta's AppArmor profile, where this process kept
+        // Shipyard's) would leave the wait below waiting for good: pasta then
+        // ends when its namespace file goes.
+        if kill(pasta, Signal::SIGKILL).is_ok() {
+            let _ = nix::sys::wait::waitpid(pasta, None);
+        }
         std::process::exit(0);
     }
 
@@ -1530,8 +1588,9 @@ mod linux {
                     let _ = shipyard_sys::pidfd::send_signal(pidfd, signal);
                 }
                 // SAFETY: no memory involved. Before Linux 5.3 only: an
-                // unreaped child's PID isn't reused, and the supervisor
-                // only reaps it after the command (this runs before).
+                // unreaped child's PID isn't reused, and `drop` signals only
+                // while it's unreaped (the supervisor's sweep, on this same
+                // thread, may have reaped it already).
                 None => unsafe {
                     libc::kill(self.pid, signal);
                 },
@@ -1558,6 +1617,9 @@ mod linux {
         /// doesn't in time, it's killed. Bounded: one stuck in the kernel is
         /// left to the supervisor's sweep rather than hang the run's end.
         fn drop(&mut self) {
+            if self.reaped() {
+                return;
+            }
             self.signal(libc::SIGTERM);
             if !self.reaped_within(REAP_WAIT) {
                 self.signal(libc::SIGKILL);
@@ -1600,6 +1662,33 @@ mod tests {
         assert!(silence_hint(true, true).contains("SELinux enforcing"));
         assert_eq!(silence_hint(true, false), "");
         assert_eq!(silence_hint(false, true), "");
+    }
+
+    /// Only Shipyard's own profile is left; any other confinement (another
+    /// profile, a stack, none) stays as it is.
+    #[test]
+    fn only_shipyards_own_profile_is_left_for_pasta() {
+        assert!(is_shipyards_profile("shipyard (unconfined)"));
+        assert!(!is_shipyards_profile("unconfined"));
+        assert!(!is_shipyards_profile("shipyard//&podman (unconfined)"));
+        assert!(!is_shipyards_profile("shipyard-other (enforce)"));
+        assert!(!is_shipyards_profile("pasta (enforce)"));
+    }
+
+    /// The profile the launcher recognises is the one Shipyard installs: a
+    /// rename there would silently keep it under the profile pasta refuses.
+    #[test]
+    fn the_installed_profile_has_the_name_recognised() {
+        let profile = include_str!("../../../contrib/apparmor/shipyard");
+        let line = profile
+            .lines()
+            .find(|line| line.starts_with("profile "))
+            .expect("a profile line");
+        let name = line.split_whitespace().nth(1).expect("a name");
+        assert!(
+            is_shipyards_profile(&format!("{name} (unconfined)")),
+            "{line}"
+        );
     }
 
     /// What pasta can do is asked once per binary (F50): a fake pasta that

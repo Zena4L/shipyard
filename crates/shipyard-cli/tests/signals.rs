@@ -164,6 +164,40 @@ fn escaped_processes_are_cleaned_up_on_linux() {
     );
 }
 
+/// On Linux a leftover is asked to stop (SIGTERM) before it's killed, so a
+/// helper can stop what it started (pasta's launcher, where AppArmor lets it
+/// alone signal pasta); one that ignores the request is killed all the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_leftover_is_asked_to_stop_before_it_is_killed() {
+    let said = std::env::temp_dir().join(format!("shipyard-asked-{}", std::process::id()));
+    let _ = std::fs::remove_file(&said);
+    // Out of the command's group (`setsid`), as pasta's launcher is: what's
+    // left in the group is killed with it, before the sweep. The command
+    // ends once both have set their traps. The asked one waits with `wait`,
+    // so its trap runs as the signal comes (not after a `sleep`).
+    let script = format!(
+        "setsid sh -c 'trap \"echo asked >> {said}; exit 0\" TERM; echo up >> {said}; \
+           while :; do sleep 1 & wait $!; done' & echo $!; \
+         setsid sh -c 'trap \"\" TERM; echo up >> {said}; while :; do sleep 0.05; done' & \
+         echo $!; \
+         until [ \"$(grep -c up {said})\" = 2 ]; do sleep 0.01; done",
+        said = said.display()
+    );
+    let run = start(&["sh", "-c", &script]);
+    let asked: libc::pid_t = run.next_line().parse().unwrap();
+    let deaf: libc::pid_t = run.next_line().parse().unwrap();
+    assert_eq!(run.finish().0, 0);
+    let words = std::fs::read_to_string(&said).unwrap_or_default();
+    let _ = std::fs::remove_file(&said);
+    assert!(gone(asked), "{asked} outlived the command");
+    assert!(gone(deaf), "{deaf}, deaf to SIGTERM, outlived the command");
+    assert_eq!(
+        words, "up\nup\nasked\n",
+        "the leftover wasn't asked to stop first"
+    );
+}
+
 #[test]
 fn a_blocked_sigterm_still_stops_the_command() {
     // A parent that blocked SIGTERM must not make shipyard unstoppable.

@@ -140,6 +140,12 @@ which is what Shipyard is for, so for them that protection is lifted, as with Po
 profile. The alternative, `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`,
 lifts it for every program on the machine.
 
+The small process that starts and stops each container's pasta (rootless
+networking) leaves Shipyard's profile before it starts pasta, wherever the profile is
+loaded: it needs none of it, and Ubuntu 26.04 confines pasta by a profile of its own
+that takes signals only from unconfined processes, so pasta still ends with its
+container.
+
 ## Quick start
 
 Check that your machine can run containers:

@@ -8,6 +8,12 @@
 #   install -m 0644 contrib/apparmor/shipyard /etc/apparmor.d/shipyard
 #   apparmor_parser -r /etc/apparmor.d/shipyard
 # Installed elsewhere? Add the path to the profile's attachment below.
+#
+# pasta's launcher leaves this profile for "unconfined" before it starts pasta:
+# Ubuntu 26.04's pasta profile takes signals from unconfined processes alone,
+# and an unconfined-mode profile's exec rules can't change what pasta runs as.
+# The launcher recognises this profile by its name, `shipyard`: keep it, and
+# keep it unconfined-mode (an enforcing one refuses the change).
 
 abi <abi/4.0>,
 include <tunables/global>

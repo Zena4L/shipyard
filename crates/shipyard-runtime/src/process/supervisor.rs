@@ -506,7 +506,7 @@ impl Supervisor {
             })
         });
         #[cfg(target_os = "linux")]
-        kill_leftovers(&mut self.inherited);
+        kill_leftovers(&mut self.inherited, LEFTOVERS_GRACE);
         // Whichever way the run ended (an init's failure message comes this
         // way too): the last output goes out, the user's input stays theirs.
         if let Some(relay) = &mut relay {
@@ -1324,17 +1324,29 @@ fn check_stdio(placement: &Placement, stdio: super::Stdio) -> Result<()> {
     }
 }
 
+/// How long a run's leftover has, once asked to stop, before it's killed
+/// (`kill_leftovers`).
+#[cfg(target_os = "linux")]
+pub(super) const LEFTOVERS_GRACE: Duration = Duration::from_millis(500);
+
 /// Linux: kills and reaps every process left behind. As a subreaper,
 /// shipyard has inherited them all (even ones that escaped with `setsid`);
 /// so has the init of a joined PID namespace, which calls it too
 /// (`init.rs`'s `end_what_is_left`).
 /// Children it had before supervising (`inherited`) are left running.
-/// Repeats until none are left, since dying ones re-parent their own
-/// children to shipyard; gives up after a short deadline and says so.
+/// Each is asked first (SIGTERM, with SIGCONT should it be stopped), then
+/// killed once `grace` has passed since (none: at once): a helper that stops one of
+/// its own may have to, as pasta's launcher stops pasta, which takes signals
+/// from it alone where AppArmor confines pasta (Ubuntu 26.04's profile). A
+/// leftover deaf to SIGTERM costs the run's end the grace. Repeats until none
+/// are left, since dying ones re-parent their own children to shipyard;
+/// gives up at a deadline counted from the start (one that appears late gets
+/// what's left of it) and says so.
 #[cfg(target_os = "linux")]
-pub(super) fn kill_leftovers(inherited: &mut Vec<libc::pid_t>) {
+pub(super) fn kill_leftovers(inherited: &mut Vec<libc::pid_t>, grace: Duration) {
     const DEADLINE: Duration = Duration::from_secs(2);
     let started = Instant::now();
+    let mut asked: Vec<(libc::pid_t, Instant)> = Vec::new();
     loop {
         reap_exited_children(inherited);
         let Some(children) = direct_children() else {
@@ -1359,9 +1371,20 @@ pub(super) fn kill_leftovers(inherited: &mut Vec<libc::pid_t>) {
             return;
         }
         for pid in &leftovers {
-            // SAFETY: `kill` has no memory-safety preconditions. These are
-            // our unreaped children, so their PIDs can't have been reused.
-            unsafe { libc::kill(*pid, libc::SIGKILL) };
+            let signals: &[libc::c_int] = match asked.iter().find(|(asked, _)| asked == pid) {
+                None if grace.is_zero() => &[libc::SIGKILL],
+                None => {
+                    asked.push((*pid, Instant::now()));
+                    &[libc::SIGTERM, libc::SIGCONT]
+                }
+                Some((_, when)) if when.elapsed() >= grace => &[libc::SIGKILL],
+                Some(_) => continue,
+            };
+            for signal in signals {
+                // SAFETY: `kill` has no memory-safety preconditions. These are
+                // our unreaped children, so their PIDs can't have been reused.
+                unsafe { libc::kill(*pid, *signal) };
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }

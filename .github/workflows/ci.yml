@@ -174,9 +174,17 @@ jobs:
   # its profile, as docs/user/README.md says. The end-to-end tests run the
   # installed binaries (SHIPYARD_TEST_BIN_DIR). A control proves the profile
   # is what lets them through.
+  # On Ubuntu 24.04 (gating) and 26.04 (`ubuntu-latest` since 2026-11-01:
+  # its terminal hang-ups and API tests fail there, 15.2c1 fixes them; not
+  # gating until it does).
   apparmor:
-    name: rootless (Ubuntu, AppArmor on)
-    runs-on: ubuntu-latest
+    name: rootless (${{ matrix.os }}, AppArmor on)
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'ubuntu-26.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -192,6 +200,8 @@ jobs:
           sudo apparmor_parser -r /etc/apparmor.d/shipyard
       - name: the profile is what lets it make user namespaces (control)
         run: scripts/ci/apparmor-control.sh
+      - name: pasta's launcher leaves the profile, and no pasta outlives its container (control)
+        run: systemd-run --user --scope --quiet scripts/ci/pasta-control.sh
       # shipyard-cli's tests: the end-to-end ones run the installed binaries.
       # (The runtime's in-process tests make user namespaces from their own
       # test binary, which no profile covers: they run in `check`.)
@@ -228,6 +238,7 @@ jobs:
         run: |
           uname -rm
           pasta --version 2>&1 | head -1 || true
+          docker --version || true
           ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
           sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
           sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true

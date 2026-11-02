@@ -1330,7 +1330,9 @@ fn give_up(status_pipe: RawFd) -> ! {
 /// goes with it anyway.)
 fn end_what_is_left() {
     if joined_init() {
-        super::supervisor::kill_leftovers(&mut Vec::new());
+        // At once, as the kernel would: no helper of Shipyard's is among
+        // them to stop its own.
+        super::supervisor::kill_leftovers(&mut Vec::new(), std::time::Duration::ZERO);
     }
 }
 
