@@ -188,9 +188,9 @@ behaviour; each change is listed here).
 
 ### Known limitations
 
-- **Docker's CLI 29 needs `DOCKER_API_VERSION=1.43`** (F207): it asks for API 1.44 at
-  least and doesn't step down to the 1.43 Shipyard serves; Docker's CLI up to 28, and
-  compose through it, negotiate as before.
+- **Docker's CLI 29.1 needs `DOCKER_API_VERSION=1.43`** (F207; Ubuntu 26.04's own
+  `docker-cli`): it asks for API 1.44 at least and doesn't step down to the 1.43 Shipyard
+  serves; Docker's CLI up to 28, and 29.4, negotiate as before.
 
 ## 0.5.0 - unreleased
 

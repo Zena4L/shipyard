@@ -3,6 +3,7 @@
 //! no network and no real registry. Used by `tests/image.rs` and the timing
 //! budgets (`tests/budgets.rs`).
 
+use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -27,8 +28,52 @@ pub fn sha256(bytes: &[u8]) -> String {
 #[must_use]
 pub fn layer_tar(root: &std::path::Path) -> (Vec<u8>, String) {
     let mut builder = tar::Builder::new(Vec::new());
-    builder.append_dir_all(".", root).unwrap();
+    append_tree(
+        &mut builder,
+        root,
+        std::path::Path::new("."),
+        &mut HashMap::new(),
+    );
     gzipped(&builder.into_inner().unwrap())
+}
+
+/// `dir`'s tree as `name` in `builder`, as `append_dir_all` writes it (links
+/// followed), but a file found again under another name (a hard link: one
+/// multicall binary under a dozen names) is stored once, then as hard links
+/// to its first name, in name order.
+fn append_tree(
+    builder: &mut tar::Builder<Vec<u8>>,
+    dir: &std::path::Path,
+    name: &std::path::Path,
+    seen: &mut HashMap<(u64, u64), PathBuf>,
+) {
+    use std::os::unix::fs::MetadataExt as _;
+    builder.append_dir(name, dir).unwrap();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let (path, inside) = (entry.path(), name.join(entry.file_name()));
+        let meta = std::fs::metadata(&path).unwrap();
+        if meta.is_dir() {
+            append_tree(builder, &path, &inside, seen);
+            continue;
+        }
+        if meta.nlink() > 1 {
+            if let Some(first) = seen.get(&(meta.dev(), meta.ino())) {
+                let mut header = tar::Header::new_gnu();
+                header.set_metadata(&meta);
+                header.set_entry_type(tar::EntryType::Link);
+                header.set_size(0);
+                builder.append_link(&mut header, &inside, first).unwrap();
+                continue;
+            }
+            seen.insert((meta.dev(), meta.ino()), inside.clone());
+        }
+        builder.append_path_with_name(&path, &inside).unwrap();
+    }
 }
 
 /// A minimal in-process registry serving a fixed set of GET routes; stopped
