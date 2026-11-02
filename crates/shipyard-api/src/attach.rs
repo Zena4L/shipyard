@@ -124,6 +124,7 @@ pub(crate) async fn attach(
     tokio::spawn(async move {
         let _busy = busy;
         let Some((client, typed)) = crate::hijack::take_over(upgrade).await else {
+            tracing::debug!("an attach's connection couldn't be taken over");
             return;
         };
         let joined = match waiting {
@@ -179,7 +180,10 @@ async fn wait_for_start(
                     waiting = None;
                 }
                 // Dropped from the table: as it is now, by looking.
-                Ok(Err(_)) => waiting = None,
+                Ok(Err(_)) => {
+                    tracing::debug!("an attach's handover was dropped: it looks for itself");
+                    waiting = None;
+                }
                 // Timed out: looked at below.
                 Err(_) => {}
             }
@@ -201,6 +205,7 @@ async fn wait_for_start(
             return welcome(shared, id, wanted).await;
         }
         if standing.ended() != before {
+            tracing::debug!("an attach gave up: its container ended again, no start seen");
             return None;
         }
     }
@@ -242,12 +247,15 @@ async fn run(client: UnixStream, typed: Bytes, parts: WelcomedParts, wanted: &Wa
     let mut decoder = Decoder::new();
     decoder.push(&parts.unread);
     let mut buffer = vec![0_u8; CHUNK];
+    // Said at its end (F200: a `start -a` that printed nothing).
+    let (mut relayed, mut ended) = (0_usize, "the monitor's stream ended");
     'session: loop {
         loop {
             let (stream, bytes) = match decoder.next_frame() {
                 Ok(Some(Frame::Stdout(bytes))) => (Stream::Stdout, bytes),
                 Ok(Some(Frame::Stderr(bytes))) => (Stream::Stderr, bytes),
                 Ok(Some(Frame::Exited(_) | Frame::Detached | Frame::Dropped(_))) => {
+                    ended = "the container's end, or a detach";
                     break 'session;
                 }
                 // Another frame, or one of a kind this end doesn't know:
@@ -255,24 +263,33 @@ async fn run(client: UnixStream, typed: Bytes, parts: WelcomedParts, wanted: &Wa
                 Ok(Some(_)) | Err(FrameError::Kind(_)) => continue,
                 Ok(None) => break,
                 // Nothing after it can be trusted.
-                Err(_) => break 'session,
+                Err(_) => {
+                    ended = "a frame it couldn't read";
+                    break 'session;
+                }
             };
             if !wanted.streams[stream.index()] {
                 continue;
             }
             let out = streams::output(stream, bytes, parts.terminal);
             if to_client.write_all(&out).await.is_err() {
+                ended = "its client went";
                 break 'session;
             }
+            relayed += out.len();
         }
         match tokio::time::timeout(LOOK, from_monitor.read(&mut buffer)).await {
             Ok(Ok(read)) if read > 0 => decoder.push(buffer.get(..read).unwrap_or_default()),
             Ok(_) => break,
             // Quiet: still there?
-            Err(_) if crate::hijack::hung_up(to_client.as_ref().as_fd()) => break,
+            Err(_) if crate::hijack::hung_up(to_client.as_ref().as_fd()) => {
+                ended = "its client hung up";
+                break;
+            }
             Err(_) => {}
         }
     }
+    tracing::debug!(relayed, "an attach's session ended: {ended}");
     let _ = to_client.shutdown().await;
     input.abort();
 }
@@ -395,9 +412,13 @@ fn hand_over_with(
             .take(WELCOMES_AT_ONCE)
         {
             // Refused (a task limit), it's dropped with its sender.
-            let _ = std::thread::Builder::new().spawn_scoped(scope, move || {
-                let _ = one.sender.send(welcome(one.keys));
-            });
+            if let Err(error) = std::thread::Builder::new().spawn_scoped(scope, move || {
+                if one.sender.send(welcome(one.keys)).is_err() {
+                    tracing::debug!("an attach went before its handover");
+                }
+            }) {
+                tracing::debug!("an attach's handover had no thread: {error}");
+            }
         }
     });
 }
