@@ -111,6 +111,11 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **`docker start -a` of a container that had run before could print nothing** (F200,
+  step 15.2c1): the API's attach, waiting for the start, took the start's own passing
+  states (the container made again, its last end cleared) for a new end, gave up, and
+  the start's handover then skipped it. Only a real new end, one with its time, gives
+  an attach up now; every silent end of an attach is said in the service's debug log.
 - **On Ubuntu 26.04, every rootless run left its pasta running** (step 15.2c1): Ubuntu
   26.04 confines pasta by an AppArmor profile that takes signals from unconfined
   processes alone, and Shipyard's own profile isn't one, so pasta outlived each run

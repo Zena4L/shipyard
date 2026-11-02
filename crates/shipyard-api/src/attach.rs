@@ -204,11 +204,22 @@ async fn wait_for_start(
         if standing.running() {
             return welcome(shared, id, wanted).await;
         }
-        if standing.ended() != before {
+        if ended_again(standing.ended(), before) {
             tracing::debug!("an attach gave up: its container ended again, no start seen");
             return None;
         }
     }
+}
+
+/// Whether a container an attach waits for has ended again since it came
+/// (`before`: how it had ended then), so no start will let it in: only an
+/// end with its time, and not the one seen first. A start under way passes
+/// through what isn't one (made again: no end; its record's last end
+/// cleared before its runtime state is made: an end with no time), and
+/// taking those for a new end gave the attach up just before the start's
+/// handover, which then skipped it: `start -a` printed nothing (F200).
+fn ended_again(now: Option<End>, before: Option<End>) -> bool {
+    now.is_some_and(|end| end.finished.is_some() && Some(end) != before)
 }
 
 /// Welcomed by container `id`'s monitor, held, with `keys`: blocking.
