@@ -637,7 +637,8 @@ fn t_alone_with_piped_input_gives_a_terminal() {
     if !rootless(Rootless::Single) {
         return;
     }
-    let run = run_fed(&["-t"], "tty; stty size", b"");
+    // `echo "$(tty)"`: uutils' `tty` (Ubuntu 26.04's) ends no line.
+    let run = run_fed(&["-t"], "echo \"$(tty)\"; stty size", b"");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, "/dev/pts/0\r\n24 80\r\n");
 }
