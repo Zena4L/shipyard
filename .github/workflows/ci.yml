@@ -174,13 +174,11 @@ jobs:
   # its profile, as docs/user/README.md says. The end-to-end tests run the
   # installed binaries (SHIPYARD_TEST_BIN_DIR). A control proves the profile
   # is what lets them through.
-  # On Ubuntu 24.04 (gating) and 26.04 (`ubuntu-latest` since 2026-11-01:
-  # its terminal hang-ups and API tests fail there, 15.2c1 fixes them; not
-  # gating until it does).
+  # On Ubuntu 24.04 and 26.04 (`ubuntu-latest` since 2026-11-01: its own
+  # AppArmor profile for pasta, uutils' coreutils), both gating (15.2c1).
   apparmor:
     name: rootless (${{ matrix.os }}, AppArmor on)
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os == 'ubuntu-26.04' }}
     strategy:
       fail-fast: false
       matrix:
