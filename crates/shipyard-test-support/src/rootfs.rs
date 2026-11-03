@@ -78,13 +78,42 @@ impl RootFs {
         self.add_program(&host_program(program));
     }
 
-    /// Copies the host program at `host` into `/bin`, with what it loads.
+    /// Copies the host program at `host` into `/bin`, with what it loads. A
+    /// multi-call binary under many names (uutils' coreutils on Ubuntu 26.04,
+    /// 10 MB) is one host file: copied once, its other names hard links to it
+    /// (not symlinks: uutils refuses a name that isn't its file's), which
+    /// [`layer_tar`](crate::registry::layer_tar) stores once.
     fn add_program(&self, host: &Path) {
         let name = host.file_name().unwrap();
-        self.copy_file(host, &Path::new("/bin").join(name));
+        match self.copied_already(host) {
+            Some(same) => {
+                let bin = self.host_path("/bin");
+                let link = bin.join(name);
+                if !link.exists() {
+                    std::fs::hard_link(bin.join(same), &link).unwrap();
+                }
+            }
+            None => self.copy_file(host, &Path::new("/bin").join(name)),
+        }
         for library in libraries(host) {
             self.copy_file(&library, &library);
         }
+    }
+
+    /// The name in `/bin` of a program copied from the same host file as
+    /// `host`, if one was.
+    fn copied_already(&self, host: &Path) -> Option<std::ffi::OsString> {
+        use std::os::unix::fs::MetadataExt as _;
+        let id = |path: &Path| std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        let wanted = id(host)?;
+        std::fs::read_dir(self.host_path("/bin"))
+            .ok()?
+            .flatten()
+            .find_map(|entry| {
+                let name = entry.file_name();
+                let from = find_host_program(&name)?;
+                (entry.file_type().ok()?.is_file() && id(&from) == Some(wanted)).then_some(name)
+            })
     }
 
     /// Copies the host file `from` to `inside` (following symlinks).
@@ -130,11 +159,16 @@ impl Drop for RootFs {
 
 /// Where the host has `program`, from the usual directories.
 fn host_program(program: &str) -> PathBuf {
+    find_host_program(std::ffi::OsStr::new(program))
+        .unwrap_or_else(|| panic!("{program} isn't on this host"))
+}
+
+/// The host's `program`, if one of the usual directories has it.
+fn find_host_program(program: &std::ffi::OsStr) -> Option<PathBuf> {
     ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         .iter()
         .map(|dir| Path::new(dir).join(program))
         .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("{program} isn't on this host"))
 }
 
 /// The libraries and loader `program` loads, as `ldd` lists them (absolute

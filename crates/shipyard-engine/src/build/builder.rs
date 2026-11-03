@@ -801,7 +801,10 @@ impl Job<'_> {
         match code {
             0 => Ok(()),
             NOT_READY => bail!(Environment, "BuildKit didn't start in the builder:\n{said}"),
-            _ => bail!(Build, "the build failed:\n{said}"),
+            _ => bail!(
+                Build,
+                "the build failed (BuildKit's exit code {code}):\n{said}"
+            ),
         }
     }
 }

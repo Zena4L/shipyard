@@ -2376,8 +2376,9 @@ fn an_oom_kill_on_a_terminal() {
         return;
     }
     let mut session = session(|shell| {
-        // `tail` keeps the last line, and /dev/zero has no end of line: it
-        // grows until the limit.
+        // Command substitution keeps the whole output in the shell's memory:
+        // it grows until the limit. (Not `tail /dev/zero`: uutils' `tail`,
+        // Ubuntu 26.04's, writes it out instead of holding it.)
         let job = shell.spawn(
             Mode::Foreground,
             &[
@@ -2387,8 +2388,9 @@ fn an_oom_kill_on_a_terminal() {
                 "32m",
                 "--memory-swap",
                 "32m",
-                "tail",
-                "/dev/zero",
+                "sh",
+                "-c",
+                "x=$(yes)",
             ],
         );
         shell.wait(job);

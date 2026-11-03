@@ -64,3 +64,45 @@ fn waiting_attaches_are_welcomed_in_parallel_within_a_bound() {
         "the rest let go"
     );
 }
+
+/// A start under way isn't an end (F200): made again (no end), or its
+/// record's last end cleared (no time); only a real end other than the one
+/// seen first gives an attach up.
+#[test]
+fn only_a_new_real_end_gives_an_attach_up() {
+    use std::time::{Duration, SystemTime};
+    let at = |secs| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    let first = Some(End {
+        code: Some(0),
+        finished: at(5),
+    });
+    assert!(!ended_again(first, first), "the same end");
+    assert!(!ended_again(None, first), "being made again");
+    assert!(
+        !ended_again(
+            Some(End {
+                code: None,
+                finished: None
+            }),
+            first
+        ),
+        "its last end cleared by the start"
+    );
+    assert!(ended_again(
+        Some(End {
+            code: Some(0),
+            finished: at(9)
+        }),
+        first
+    ));
+    assert!(
+        ended_again(
+            Some(End {
+                code: Some(1),
+                finished: at(9)
+            }),
+            None
+        ),
+        "never ended before"
+    );
+}

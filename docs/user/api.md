@@ -137,7 +137,9 @@ A rootless socket is yours alone, in your runtime directory.
 
 Paths with a version prefix (`/v1.43/containers/json`) are taken for any version from
 1.24 to 1.43; a newer one is refused with Docker's "client version … is too new", and
-Docker's clients then use 1.43. Answers are Docker's: its JSON, its statuses (`304`
+Docker's clients then use 1.43. Docker's CLI 29.1 (Ubuntu 26.04's own package) asks for
+1.44 at least and doesn't step down: set `DOCKER_API_VERSION=1.43` where you set
+`DOCKER_HOST` (29.4 steps down again). Answers are Docker's: its JSON, its statuses (`304`
 for a start or stop with nothing to do, `404` for what isn't there, `409` for a
 conflict), and its `{"message": "…"}` for a refusal.
 

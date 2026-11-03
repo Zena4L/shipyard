@@ -96,6 +96,8 @@ behaviour; each change is listed here).
   monitor's, as counters.
 ### Changed
 
+- **A failed build says BuildKit's exit code** ("the build failed (BuildKit's exit code
+  N)"), beside its last lines.
 - **Shipyard is licensed under Apache-2.0 alone** (it was MIT or Apache-2.0, at your
   option): one `LICENSE`, a `NOTICE`, and a detailed contribution guide (`CONTRIBUTING.md`).
 - **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
@@ -111,6 +113,20 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **`docker start -a` of a container that had run before could print nothing** (F200,
+  step 15.2c1): the API's attach, waiting for the start, took the start's own passing
+  states (the container made again, its last end cleared) for a new end, gave up, and
+  the start's handover then skipped it. Only a real new end, one with its time, gives
+  an attach up now; every silent end of an attach is said in the service's debug log.
+- **On Ubuntu 26.04, every rootless run left its pasta running** (step 15.2c1): Ubuntu
+  26.04 confines pasta by an AppArmor profile that takes signals from unconfined
+  processes alone, and Shipyard's own profile isn't one, so pasta outlived each run
+  (thousands of them, each slowing the next run's end by 2 s and warning "processes left
+  behind"). pasta's launcher now leaves Shipyard's profile for `unconfined` before it
+  starts pasta (it makes no user namespace, the one thing the profile is for), and the
+  end of a run asks what's left to stop (SIGTERM) before it kills it, half a second
+  later, so the launcher stops its pasta itself (a leftover deaf to SIGTERM now costs a
+  run's end that half second).
 - **On a Mac, `stats` said 0B of memory for every container** (since stage 10): the VM's
   guest has no systemd, so nothing turned on the memory and CPU controllers at its cgroup
   root, and Shipyard's cgroups below had only `pids`. The guest's PID 1 now turns on CPU,
@@ -176,6 +192,12 @@ behaviour; each change is listed here).
   wherever it led. A link to what its owner doesn't own is refused as root, and the
   config's directory is opened once and checked as it's held open, so one swapped for a
   link after the check is never written through (F162).
+
+### Known limitations
+
+- **Docker's CLI 29.1 needs `DOCKER_API_VERSION=1.43`** (F207; Ubuntu 26.04's own
+  `docker-cli`): it asks for API 1.44 at least and doesn't step down to the 1.43 Shipyard
+  serves; Docker's CLI up to 28, and 29.4, negotiate as before.
 
 ## 0.5.0 - unreleased
 
