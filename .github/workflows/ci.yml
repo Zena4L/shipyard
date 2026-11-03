@@ -239,6 +239,8 @@ jobs:
           uname -rm
           pasta --version 2>&1 | head -1 || true
           docker --version || true
+          findmnt -no SOURCE,FSTYPE,OPTIONS /tmp || true
+          df -h /tmp / || true
           ls -l /etc/apparmor.d/ | grep -iE 'pasta|passt|shipyard' || true
           sudo aa-status 2>/dev/null | grep -iE 'pasta|passt|shipyard' || true
           sudo journalctl -k --no-pager 2>/dev/null | grep -iE 'apparmor="DENIED"' | tail -60 || true

@@ -96,6 +96,8 @@ behaviour; each change is listed here).
   monitor's, as counters.
 ### Changed
 
+- **A failed build says BuildKit's exit code** ("the build failed (BuildKit's exit code
+  N)"), beside its last lines.
 - **Shipyard is licensed under Apache-2.0 alone** (it was MIT or Apache-2.0, at your
   option): one `LICENSE`, a `NOTICE`, and a detailed contribution guide (`CONTRIBUTING.md`).
 - **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
