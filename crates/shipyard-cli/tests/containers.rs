@@ -4058,6 +4058,99 @@ fn the_joined_one_stops(stores: &Stores) {
     stores.ok(&["rm", "-f", "third", "renamed"]);
 }
 
+/// A container that joined another's network and IPC namespace keeps them
+/// when the other starts again by its restart policy (F136(a)): it's said,
+/// in `ps` (` (no network) (no shared IPC)`), Shipyard's inspect
+/// (`joins_lost`), and the joiner's events (`network_lost`, `ipc_lost`).
+/// Before the restart, nothing's said (the control).
+#[test]
+fn a_joiner_is_told_the_container_it_joined_started_again() {
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    let image = stores.image.as_str();
+    // Ends once told (a file its exec leaves), then runs on after its
+    // restart: its writable layer keeps `/tmp/done`.
+    let script = "[ -e /tmp/done ] && exec sleep 300; \
+                  while [ ! -e /tmp/go ]; do sleep 0.1; done; touch /tmp/done; exit 3";
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "joined",
+        "--restart",
+        "always",
+        "--network",
+        "none",
+        image,
+        "sh",
+        "-c",
+        script,
+    ]);
+    stores.ok(&[
+        "run",
+        "-d",
+        "--name",
+        "joiner",
+        "--network",
+        "container:joined",
+        "--ipc",
+        "container:joined",
+        image,
+        "sleep",
+        "300",
+    ]);
+    let status = || stores.ok(&["ps", "--filter", "name=joiner", "--format", "{{.Status}}"]);
+    assert!(!status().contains("(no network)"), "{}", status());
+    assert!(
+        stores.inspect("joiner")["state"]
+            .get("joins_lost")
+            .is_none()
+    );
+
+    stores.ok(&["exec", "joined", "touch", "/tmp/go"]);
+    let told = || {
+        stores.ok(&[
+            "events",
+            "--until",
+            "0s",
+            "--filter",
+            "container=joiner",
+            "--format",
+            "{{.Action}} {{.Actor.Attributes.how}}",
+        ])
+    };
+    // Its event comes after the restart's own start: waited for too.
+    shipyard_test_support::eventually(Duration::from_secs(30), "joined restarted, said", || {
+        stores.inspect("joined")["restart_count"].as_u64() == Some(1) && told().contains("ipc_lost")
+    });
+    assert!(
+        status().contains("(no network) (no shared IPC)"),
+        "{}",
+        status()
+    );
+    let lost = &stores.inspect("joiner")["state"]["joins_lost"];
+    assert_eq!(
+        (&lost["network"], &lost["ipc"]),
+        (&"joined".into(), &"joined".into())
+    );
+    let events = told();
+    for action in ["network_lost", "ipc_lost"] {
+        let what = if action == "ipc_lost" {
+            "IPC namespace"
+        } else {
+            "network"
+        };
+        assert!(
+            events.contains(&format!(
+                "{action} container joined started again: this one keeps its old {what}"
+            )),
+            "{events}"
+        );
+    }
+    stores.ok(&["rm", "-f", "joiner", "joined"]);
+}
+
 /// [`a_container_joins_another_s_network`]'s refusals: a join of `third`
 /// (which joins another's), and one of nothing.
 fn joins_of_nothing_are_refused(stores: &Stores) {

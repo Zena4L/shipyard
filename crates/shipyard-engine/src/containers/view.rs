@@ -27,6 +27,9 @@ pub struct Summary {
     /// When and how this start lost its network, if it did (its pasta
     /// died), while it's up.
     pub network_lost: Option<crate::network::lost::NetworkLost>,
+    /// The namespaces it joined of another container that has started
+    /// again since, while it's up (F136(a)).
+    pub joins_lost: super::JoinsLost,
     /// The command it runs: its entrypoint, then its arguments, its
     /// image's where it gave none (F101: [`shown_command`]).
     pub(crate) command: Vec<String>,
@@ -99,6 +102,7 @@ pub fn summaries(engine: &Engine, all: bool) -> Result<Vec<Summary>> {
         if all || state.is_active() {
             let health = super::health(engine, &record, &state);
             let network_lost = super::network_lost(engine, &record, &state);
+            let joins_lost = super::joins_lost(engine, &record, &state);
             let command = shown_command(
                 &record,
                 images.get(record.config.image.as_deref(), record.image_id.as_deref()),
@@ -108,6 +112,7 @@ pub fn summaries(engine: &Engine, all: bool) -> Result<Vec<Summary>> {
                 state,
                 health,
                 network_lost,
+                joins_lost,
                 command,
             });
         }
@@ -181,6 +186,10 @@ pub struct InspectedState {
     /// When and how this start lost its network (its pasta died), if it
     /// did, while it's up.
     pub network_lost: Option<crate::network::lost::NetworkLost>,
+    /// The namespaces it joined of another container that has started
+    /// again since, while it's up (F136(a)): said only then.
+    #[serde(skip_serializing_if = "super::JoinsLost::is_empty")]
+    pub joins_lost: super::JoinsLost,
 }
 
 /// A container's published ports, as `port` shows them.
@@ -360,6 +369,8 @@ pub(crate) struct Gathered {
     pub(crate) health: Option<crate::health::Health>,
     /// When and how this start lost its network, if it did, while it's up.
     pub(crate) network_lost: Option<crate::network::lost::NetworkLost>,
+    /// What it joined of another container that has started again since.
+    pub(crate) joins_lost: super::JoinsLost,
 }
 
 /// The container `reference` names, gathered for a view.
@@ -380,6 +391,7 @@ pub(crate) fn gathered(engine: &Engine, reference: &str) -> Result<Gathered> {
         .flatten();
     let health = super::health(engine, &record, &state);
     let network_lost = super::network_lost(engine, &record, &state);
+    let joins_lost = super::joins_lost(engine, &record, &state);
     Ok(Gathered {
         record,
         state,
@@ -387,6 +399,7 @@ pub(crate) fn gathered(engine: &Engine, reference: &str) -> Result<Gathered> {
         log_dir,
         health,
         network_lost,
+        joins_lost,
     })
 }
 
@@ -405,6 +418,7 @@ pub fn inspect(engine: &Engine, reference: &str) -> Result<Inspected> {
         log_dir,
         health,
         network_lost,
+        joins_lost,
     } = gathered(engine, reference)?;
     let (exit_code, oom, finished) = match &state {
         ContainerState::Exited {
@@ -425,6 +439,7 @@ pub fn inspect(engine: &Engine, reference: &str) -> Result<Inspected> {
         finished_at: finished.or(record.finished).map(rfc3339),
         health,
         network_lost,
+        joins_lost,
     };
     Ok(inspected(record, state, log_dir))
 }

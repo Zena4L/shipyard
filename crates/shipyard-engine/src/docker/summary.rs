@@ -268,7 +268,9 @@ fn summarized(
 /// A container's status as Docker words it at `now`: its state, then its
 /// health while it runs (`(healthy)`, `(health: starting)`: Docker's says
 /// none paused or ended, though inspect keeps the last), then
-/// ` (no network)` if this start lost its network (Shipyard's own words).
+/// ` (no network)` if this start lost its network, or the one it joined
+/// has started again since (F136(a)), and ` (no shared IPC)` for an IPC
+/// namespace so (Shipyard's own words).
 #[must_use]
 pub fn status_text(summary: &Summary, now: SystemTime) -> String {
     let state = match summary.state {
@@ -285,7 +287,12 @@ pub fn status_text(summary: &Summary, now: SystemTime) -> String {
         .as_ref()
         .filter(|_| running)
         .map(|health| health.status);
-    with_network(with_health(state, health), summary.network_lost.is_some())
+    let joins = &summary.joins_lost;
+    let status = with_network(
+        with_health(state, health),
+        summary.network_lost.is_some() || joins.network.is_some(),
+    );
+    with_suffix(status, joins.ipc.is_some(), "no shared IPC")
 }
 
 /// A state as Docker says it: `Up 3 minutes`, `Exited (0) 2 hours ago`.
@@ -316,10 +323,16 @@ fn with_health(status: String, health: Option<crate::health::Status>) -> String 
 }
 
 /// `status` with ` (no network)` if this start lost its network (its pasta
-/// died while it ran).
+/// died while it ran, or the container whose network it joined started
+/// again).
 fn with_network(status: String, lost: bool) -> String {
-    if lost {
-        format!("{status} (no network)")
+    with_suffix(status, lost, "no network")
+}
+
+/// `status` with ` (WORDS)` if `said`.
+fn with_suffix(status: String, said: bool, words: &str) -> String {
+    if said {
+        format!("{status} ({words})")
     } else {
         status
     }

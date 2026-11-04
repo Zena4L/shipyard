@@ -114,8 +114,11 @@ pub(crate) const FAMILY: u8 = NFPROTO_INET;
 // `--isolate-host`, stage 9, step 9.7c1. 8: the connection limit, for
 // networks made with `--conntrack-limit`, step 9.7c2. 9: the `outside` set
 // and its drop of what was DNAT'd from it, the macOS guest's NAT link, step
-// 13.5b, F108.)
-pub(crate) const VERSION: &[u8] = b"shipyard ruleset 9";
+// 13.5b, F108. 10: the `same_uplink` set, by which routing closed between
+// the host's links leaves alone what's bridged on one of them (a `br0`
+// uplink's VMs, seen by the forward hook with `br_netfilter`), step 15.2c2,
+// F111.)
+pub(crate) const VERSION: &[u8] = b"shipyard ruleset 10";
 
 /// The most connections a container on a network made with
 /// `--conntrack-limit` may have open, of those it opened (counted per
@@ -149,6 +152,7 @@ pub(crate) mod set {
     pub(crate) const INTERNAL: &str = "internal";
     pub(crate) const CLOSED: &str = "closed";
     pub(crate) const UPLINKS: &str = "uplinks";
+    pub(crate) const SAME_UPLINK: &str = "same_uplink";
     pub(crate) const OUTSIDE: &str = "outside";
     pub(crate) const MASQUERADE: &str = "masquerade4";
     pub(crate) const MASQUERADE6: &str = "masquerade6";
@@ -241,7 +245,7 @@ const fn reg(n: u32) -> u32 {
     NFT_REG32_00 + n
 }
 
-pub(super) fn sets() -> [SetSpec; 17] {
+pub(super) fn sets() -> [SetSpec; 18] {
     let ifname_len = u32::try_from(IFNAMSIZ).unwrap_or(16);
     let ifname = (TYPE_IFNAME, ifname_len);
     let [isolated, dns_allow, limited, conns4, conns6] = option_sets();
@@ -271,6 +275,12 @@ pub(super) fn sets() -> [SetSpec; 17] {
             name: set::UPLINKS,
             flags: 0,
             key: ifname,
+            data: None,
+        },
+        SetSpec {
+            name: set::SAME_UPLINK,
+            flags: 0,
+            key: (concat_type(&[TYPE_IFNAME, TYPE_IFNAME]), 2 * ifname_len),
             data: None,
         },
         SetSpec {
@@ -503,6 +513,11 @@ pub(crate) fn close_routing(family: Family, interfaces: &[String]) -> Vec<BatchI
             .map(|name| Element::key(ifname_key(name)))
             .collect();
         items.push(add_elements(FAMILY, TABLE, set::UPLINKS, &uplinks, false));
+        let same: Vec<Element> = interfaces
+            .iter()
+            .map(|name| Element::key([ifname_key(name), ifname_key(name)].concat()))
+            .collect();
+        items.push(add_elements(FAMILY, TABLE, set::SAME_UPLINK, &same, false));
     }
     items.push(add_elements(
         FAMILY,

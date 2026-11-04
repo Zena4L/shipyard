@@ -241,15 +241,26 @@ printf 'caf\351\n' >&2
 echo "dir $SHIPYARD_VM_DIR" >&2
 echo "on stdout""#,
         );
+        // A test beside this one that forks while the fake is open for
+        // writing holds it so until its child execs (`ETXTBSY`): tried again.
+        let start_now = |program: &std::path::Path, lines: &mut Vec<String>| {
+            for _ in 0..100 {
+                match runtime.block_on(start(program, &settings, |line| lines.push(line))) {
+                    Err(ClientError::Io(error))
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    done => return done,
+                }
+            }
+            runtime.block_on(start(program, &settings, |line| lines.push(line)))
+        };
         let mut lines = Vec::new();
-        runtime
-            .block_on(start(&started, &settings, |line| lines.push(line)))
-            .unwrap();
+        start_now(&started, &mut lines).unwrap();
         assert_eq!(lines, ["booting", "caf\u{fffd}", "dir /somewhere/vm"]);
         let failed = fake("fails", "echo 'not enough memory' >&2; exit 1");
-        let error = runtime
-            .block_on(start(&failed, &settings, |_| {}))
-            .unwrap_err();
+        let error = start_now(&failed, &mut Vec::new()).unwrap_err();
         assert!(
             matches!(&error, ClientError::VmStart(said) if said == "not enough memory"),
             "{error:?}"

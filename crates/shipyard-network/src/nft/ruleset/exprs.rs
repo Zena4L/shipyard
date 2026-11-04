@@ -218,6 +218,29 @@ pub(super) fn on_one_bridge() -> Vec<Expr> {
     ]
 }
 
+/// `iifname . oifname != @same_uplink`: not bridged on one of the host's
+/// links (a frame between two ports of `br0`, which `br_netfilter` shows
+/// the forward hook as from `br0` to `br0`): only routing is closed.
+pub(super) fn not_on_one_uplink() -> Vec<Expr> {
+    vec![
+        Expr::Meta {
+            key: NFT_META_IIFNAME,
+            dreg: reg(0),
+        },
+        // The next 16 bytes: four registers on.
+        Expr::Meta {
+            key: NFT_META_OIFNAME,
+            dreg: reg(4),
+        },
+        Expr::Lookup {
+            set: set::SAME_UPLINK.to_owned(),
+            sreg: reg(0),
+            dreg: None,
+            invert: true,
+        },
+    ]
+}
+
 /// `meta nfproto @closed`: the host routes only for its containers.
 pub(super) fn routing_closed() -> Vec<Expr> {
     vec![

@@ -102,8 +102,9 @@ CONTAINER ID   IMAGE     COMMAND                  CREATED         STATUS        
   again soon; the code is how it last ended), or `Exited (137) 2 hours ago` (`Exited (?)` when how it ended isn't known: its
   monitor was killed, say; see [Ended unwatched](#ended-unwatched)). A container
   with a [health check](#health-checks) adds what it says: `Up 3 minutes (healthy)`,
-  `(unhealthy)`, `(health: starting)`. One whose network was lost while it ran (its pasta died:
-  see [Networking](networking.md)) adds `(no network)`.
+  `(unhealthy)`, `(health: starting)`. One whose network was lost while it ran (its pasta died, or the
+  container whose network it joined started again: see [Networking](networking.md)) adds
+  `(no network)`, and one whose joined IPC namespace was so, `(no shared IPC)`.
 - `COMMAND` is the command it runs: yours, or its image's entrypoint and command where
   you gave none (as a start resolves them).
 - `ps` never waits for another command: it reads what's there.
@@ -207,7 +208,7 @@ has no field for:
 | `id`, `serial`, `name` | Who it is |
 | `created` | When it was made (RFC 3339, UTC) |
 | `image`, `image_id` | The image as you gave it, and the digest every start runs |
-| `state` | `status` (`created`, `running`, `paused`, `stopping`, `restarting`, `exited`), `running`, `pid`, `exit_code`, `oom`, `started_at`, `finished_at`, `health` (`status`, `failing_streak`, `log`), `network_lost` (while it's up, if its pasta died: `time`, `how`) |
+| `state` | `status` (`created`, `running`, `paused`, `stopping`, `restarting`, `exited`), `running`, `pid`, `exit_code`, `oom`, `started_at`, `finished_at`, `health` (`status`, `failing_streak`, `log`), `network_lost` (while it's up, if its pasta died: `time`, `how`), `joins_lost` (while it's up, if a container whose network or IPC namespace it joined has started again since: `network`, `ipc`, that container's name; there only then) |
 | `ports` | The host ports its last start published |
 | `labels` | Its labels |
 | `auto_remove` | Whether it goes once it ends (`--rm`) |

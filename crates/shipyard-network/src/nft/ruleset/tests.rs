@@ -12,8 +12,8 @@ use super::super::consts::{
 use super::super::expr::Expr;
 use super::elements::subnet_range;
 use super::exprs::{
-    address, address6, ct_bits, interface_in, ipv6, nfproto, not_to_loopback6, on_one_bridge,
-    routing_closed,
+    address, address6, ct_bits, interface_in, ipv6, nfproto, not_on_one_uplink, not_to_loopback6,
+    on_one_bridge, routing_closed,
 };
 use super::rules::{limit_rules, link_local_refused, metadata_rules};
 use super::*;
@@ -571,11 +571,13 @@ fn only_dnated_traffic_reaches_a_bridge_and_internal_networks_are_closed() {
         .concat()
     );
     assert_eq!(forward[6].last(), Some(&Expr::Verdict(NF_DROP)));
-    // Routing closed: between the host's own interfaces only.
+    // Routing closed: between the host's own interfaces only, and never
+    // what's bridged on one of them (F111).
     assert_eq!(
         forward[7],
         [
             routing_closed(),
+            not_on_one_uplink(),
             interface_in(NFT_META_IIFNAME, set::UPLINKS, false),
             interface_in(NFT_META_OIFNAME, set::UPLINKS, false),
             vec![Expr::Verdict(NF_DROP)],
@@ -611,16 +613,18 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
     let what: Vec<&str> = items.iter().map(|item| item.what.as_str()).collect();
     assert_eq!(what[0], "adding the table shipyard");
     assert_eq!(what[1], "adding the set bridges");
-    assert_eq!(what[18], "adding the chain guard");
+    assert_eq!(what[19], "adding the chain guard");
     assert!(what.contains(&"adding rule 19 of the chain forward"));
     assert!(what.contains(&"adding rule 9 of the chain input"));
     assert_eq!(
-        what[what.len() - 6..],
+        what[what.len() - 8..],
         [
             "adding to the set ports",
             "adding to the set uplinks",
+            "adding to the set same_uplink",
             "adding to the set closed",
             "adding to the set uplinks",
+            "adding to the set same_uplink",
             "adding to the set closed",
             "adding to the set outside",
         ]
@@ -631,4 +635,29 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
         assert_eq!(message.kind >> 8, 10, "{}", item.what);
         assert_eq!(&message.payload[..4], &[FAMILY, 0, 0, 0], "{}", item.what);
     }
+}
+
+/// Routing closed between the host's links leaves alone what's bridged on
+/// one of them (F111: a `br0` uplink's VMs, which `br_netfilter` shows the
+/// forward hook as from `br0` to `br0`): an inverted lookup of the pair in
+/// `same_uplink`, which closing fills with each interface twice.
+#[test]
+fn what_s_bridged_on_an_uplink_is_left_alone() {
+    assert_eq!(
+        not_on_one_uplink().last(),
+        Some(&Expr::Lookup {
+            set: set::SAME_UPLINK.to_owned(),
+            sreg: reg(0),
+            dreg: None,
+            invert: true,
+        })
+    );
+    let what: Vec<String> = close_routing(Family::V4, &["br0".to_owned()])
+        .into_iter()
+        .map(|item| item.what)
+        .collect();
+    assert!(
+        what.contains(&"adding to the set same_uplink".to_owned()),
+        "{what:?}"
+    );
 }

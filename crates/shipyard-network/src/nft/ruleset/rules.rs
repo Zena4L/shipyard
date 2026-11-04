@@ -12,7 +12,8 @@ use super::super::consts::{
 use super::super::expr::Expr;
 use super::exprs::{
     address, address6, ct_bits, dnat_through, for_this_host, interface_in, ipv4, ipv6, loopback,
-    not_from_loopback, not_to_loopback6, on_one_bridge, protocol_and_port, routing_closed,
+    not_from_loopback, not_on_one_uplink, not_to_loopback6, on_one_bridge, protocol_and_port,
+    routing_closed,
 };
 use super::{
     CONNTRACK_LIMIT, LINK_LOCAL4, LINK_LOCAL6, METADATA4, METADATA6, ND_FIRST, ND_LAST, chain, reg,
@@ -367,6 +368,7 @@ fn forward_rules() -> [Vec<Expr>; 19] {
         .concat(),
         [
             routing_closed(),
+            not_on_one_uplink(),
             interface_in(NFT_META_IIFNAME, set::UPLINKS, false),
             interface_in(NFT_META_OIFNAME, set::UPLINKS, false),
             vec![drop()],
