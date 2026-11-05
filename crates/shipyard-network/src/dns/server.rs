@@ -833,9 +833,6 @@ fn serve_frames(
     mut answer: impl FnMut(&[u8]) -> Option<Vec<u8>>,
 ) {
     let end = Instant::now() + lifetime;
-    if stream.set_write_timeout(Some(CLIENT_TIMEOUT)).is_err() {
-        return;
-    }
     while let Some(message) = read_frame(&mut stream, end.min(Instant::now() + CLIENT_TIMEOUT)) {
         let Some(reply) = answer(&message) else {
             return;
@@ -843,10 +840,32 @@ fn serve_frames(
         let Ok(framed) = message::frame(&reply) else {
             return;
         };
-        if stream.write_all(&framed).is_err() {
+        // Whole by its deadline: a write's own timeout is per call, so a
+        // client reading a byte every few seconds kept its place (F111).
+        if write_by(&mut stream, &framed, Instant::now() + CLIENT_TIMEOUT).is_none() {
             return;
         }
     }
+}
+
+/// Writes `bytes` to `stream` whole by `deadline` (each `write` given what's
+/// left of it).
+fn write_by(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> Option<()> {
+    let mut written = 0;
+    while let Some(rest) = bytes.get(written..).filter(|rest| !rest.is_empty()) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        stream.set_write_timeout(Some(left)).ok()?;
+        match stream.write(rest) {
+            Ok(0) => return None,
+            Ok(wrote) => written += wrote,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(())
 }
 
 /// A message framed for TCP, read whole from `stream` by `deadline`
@@ -1181,6 +1200,79 @@ mod tests {
             "closed before its lifetime: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A reply is written whole within the client's time, however slowly
+    /// its client reads (F111): small buffers on both sides, the client
+    /// reading 512 bytes every 200 ms, a 60 KiB reply. The connection is let
+    /// go within [`CLIENT_TIMEOUT`] and a margin, where a write's own
+    /// timeout (per call, reset by each bit of room) kept it ~24 s; a client
+    /// that reads at once gets the whole reply (the control).
+    #[test]
+    fn a_slow_reader_doesnt_keep_its_connection() {
+        use nix::sys::socket::{setsockopt, sockopt};
+        let reply = vec![b'r'; 60 * 1024];
+        let serve = |reader: fn(TcpStream)| {
+            use nix::sys::socket::{
+                AddressFamily, SockFlag, SockType, SockaddrIn, connect, socket,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            // The client's buffer made small before it connects: the window
+            // it advertises then is small too (set after, it isn't).
+            let fd = socket(
+                AddressFamily::Inet,
+                SockType::Stream,
+                SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .unwrap();
+            setsockopt(&fd, sockopt::RcvBuf, &4096).unwrap();
+            let std::net::SocketAddr::V4(at) = listener.local_addr().unwrap() else {
+                unreachable!("bound on 127.0.0.1");
+            };
+            connect(std::os::fd::AsRawFd::as_raw_fd(&fd), &SockaddrIn::from(at)).unwrap();
+            let mut client = TcpStream::from(fd);
+            let (server, _) = listener.accept().unwrap();
+            setsockopt(&server, sockopt::SndBuf, &4096).unwrap();
+            let answer = reply.clone();
+            let serving = std::thread::spawn(move || {
+                let started = Instant::now();
+                serve_frames(server, Duration::from_secs(60), |_| Some(answer.clone()));
+                started.elapsed()
+            });
+            client.write_all(b"\x00\x02hi").unwrap();
+            let closer = client.try_clone().unwrap();
+            let reading = std::thread::spawn(move || reader(client));
+            let took = serving.join().unwrap();
+            // The slow reader would drain the buffers for minutes after the
+            // server let go: its end is now.
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+            reading.join().unwrap();
+            took
+        };
+        // 512 bytes every 200 ms: each write gets room well within the
+        // client's time (a per-call timeout never fires), the whole reply
+        // takes ~24 s.
+        let took = serve(|mut client| {
+            let mut some = [0u8; 512];
+            while client.read(&mut some).is_ok_and(|read| read > 0) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        assert!(
+            took < CLIENT_TIMEOUT + Duration::from_secs(3),
+            "a slow reader kept its connection {took:?}"
+        );
+        // The control: read at once, the reply comes whole.
+        let took = serve(|mut client| {
+            let mut framed = vec![0u8; 2 + 60 * 1024];
+            client.read_exact(&mut framed).unwrap();
+            assert_eq!(framed.get(2..), Some(&vec![b'r'; 60 * 1024][..]));
+            // Its end: the server's next read sees it at once (the test's
+            // copy of the socket would keep it open).
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(took < CLIENT_TIMEOUT, "read at once: {took:?}");
     }
 
     #[test]

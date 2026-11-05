@@ -20,6 +20,7 @@ fn gathered() -> containers::Gathered {
         log_dir: Some("/logs/1".to_owned()),
         health: None,
         network_lost: None,
+        joins_lost: crate::containers::JoinsLost::default(),
     }
 }
 

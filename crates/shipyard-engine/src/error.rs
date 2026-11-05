@@ -413,7 +413,9 @@ impl From<shipyard_network::store::StoreError> for Error {
         // `Address` is coarse: an address outside the subnet, one taken, or
         // none left all say so in its message; it's the network's answer.
         let kind = match &error {
-            StoreError::InvalidName(_) | StoreError::TooManyLabels(_) => ErrorKind::InvalidRequest,
+            StoreError::InvalidName(_)
+            | StoreError::TooManyLabels(_)
+            | StoreError::TooManyNames { .. } => ErrorKind::InvalidRequest,
             StoreError::NotFound(_) => ErrorKind::NotFound,
             StoreError::Exists(_) | StoreError::NameTaken { .. } => ErrorKind::Exists,
             StoreError::InUse { .. } => ErrorKind::InUse,

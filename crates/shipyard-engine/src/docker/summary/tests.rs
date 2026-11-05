@@ -95,6 +95,7 @@ fn a_container_is_listed_as_docker_lists_it() {
         record,
         health: None,
         network_lost: None,
+        joins_lost: crate::containers::JoinsLost::default(),
     };
     let shown = serde_json::to_value(summarized(&summary, &[], None, now)).unwrap();
     let expected = serde_json::json!({
@@ -135,6 +136,7 @@ fn a_paused_container_is_up_and_paused() {
         record,
         health: None,
         network_lost: None,
+        joins_lost: crate::containers::JoinsLost::default(),
     };
     assert_eq!(status_text(&summary, now), "Up 5 seconds (Paused)");
     let never = Summary {
@@ -164,6 +166,7 @@ fn health_is_in_the_status_while_it_runs_only() {
         record: record.clone(),
         health: Some(unhealthy.clone()),
         network_lost: None,
+        joins_lost: crate::containers::JoinsLost::default(),
     };
     let running = summary(ContainerState::Running {
         since: Some(now - Duration::from_secs(5)),
@@ -180,5 +183,47 @@ fn health_is_in_the_status_while_it_runs_only() {
         !status_text(&ended, now).contains("unhealthy"),
         "{}",
         status_text(&ended, now)
+    );
+}
+
+/// A container whose joined network's or IPC namespace's container has
+/// started again since says so (F136(a)): ` (no network)`, ` (no shared
+/// IPC)`; nothing lost, nothing said (the control).
+#[test]
+fn a_lost_join_is_said_in_the_status() {
+    let mut record =
+        crate::containers::Record::parse(crate::containers::tests::versions::V3_RECORD.as_bytes())
+            .unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_hours(488_889);
+    record.started = Some(now - Duration::from_secs(5));
+    let summary = |joins_lost: crate::containers::JoinsLost| Summary {
+        state: ContainerState::Running {
+            since: Some(now - Duration::from_secs(5)),
+        },
+        command: Vec::new(),
+        record: record.clone(),
+        health: None,
+        network_lost: None,
+        joins_lost,
+    };
+    assert_eq!(
+        status_text(&summary(crate::containers::JoinsLost::default()), now),
+        "Up 5 seconds"
+    );
+    let network = crate::containers::JoinsLost {
+        network: Some("db".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        status_text(&summary(network), now),
+        "Up 5 seconds (no network)"
+    );
+    let both = crate::containers::JoinsLost {
+        network: Some("db".into()),
+        ipc: Some("db".into()),
+    };
+    assert_eq!(
+        status_text(&summary(both), now),
+        "Up 5 seconds (no network) (no shared IPC)"
     );
 }

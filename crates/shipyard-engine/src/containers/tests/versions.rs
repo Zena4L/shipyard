@@ -521,6 +521,7 @@ fn inspect_shows_a_record_as_it_always_has() {
         finished_at: record.finished.map(crate::events::rfc3339),
         health: None,
         network_lost: None,
+        joins_lost: crate::containers::JoinsLost::default(),
     };
     let shown = view::inspected(record, state, Some("/logs/1".to_owned()));
     let shown = serde_json::to_string_pretty(&[shown]).unwrap();

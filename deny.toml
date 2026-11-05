@@ -1,6 +1,13 @@
 # cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
 [advisories]
 version = 2
+ignore = [
+  # Unmaintained (Astral ended it, 2026-11-03), not a vulnerability; no safe
+  # upgrade. It comes only through `testcontainers` 0.28 (the newest), a
+  # dev-dependency of the acceptance tests: never in what Shipyard ships.
+  # Dropped once testcontainers moves off it (ROADMAP, Accepted at v1.0).
+  { id = "RUSTSEC-2026-0440", reason = "dev-only, through testcontainers; unmaintained, not vulnerable" },
+]
 
 [licenses]
 version = 2

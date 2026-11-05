@@ -198,6 +198,7 @@ fn start_holding(
         image,
         interface_sysctls,
         stdin_once,
+        joined,
     } = prepare_start(engine, &record, held)?;
     // Made to close its input once (the API's `StdinOnce`): each start's.
     let input = if stdin_once { Input::OnceItEnds } else { input };
@@ -241,6 +242,14 @@ fn start_holding(
             return Err(error);
         }
     };
+    // The runs it joins, in its start's log directory (made by the
+    // create). Not kept, nothing's said of a restart of what it joins: a
+    // start never fails for it.
+    if let Some(logs) = &options.logs
+        && let Err(error) = joined.write(&logs.dir)
+    {
+        tracing::debug!("the runs container {id} joins weren't kept: {error}");
+    }
     // Its monitor holds them now: this process's copies are closed,
     // never unlocked, and nothing is released. `running` too: given up
     // here, the one place its copy is handed over (pasta's launcher gets
@@ -498,6 +507,9 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
         ],
         &mut request,
     )?;
+    // The runs it joins, kept in its start's log directory once it's made
+    // (F136(a): what the views compare a restarted one's with).
+    let joined = joined_runs(&request);
     let planned = checked(engine, request)?;
     // One for an interface its networks no longer make (a network left
     // since: `network disconnect`) is passed over, said: never a start
@@ -547,7 +559,28 @@ fn planned_start(engine: &Engine, record: &Record) -> Result<PlannedStart> {
         image,
         interface_sysctls,
         stdin_once,
+        joined,
     })
+}
+
+/// The other containers' runs `request` joins (by ID, as a start's joins
+/// are named: `join_as_created`): their network's and IPC namespace's
+/// inits (F136(a)).
+fn joined_runs(request: &crate::run::RunRequest) -> containers::JoinedRuns {
+    let run = |id: Option<&str>, init: Option<&crate::network::JoinedProcess>| {
+        id.zip(init).map(|(id, init)| containers::JoinedRun {
+            id: id.to_owned(),
+            pid: init.pid,
+            start_time: init.start_time,
+        })
+    };
+    containers::JoinedRuns {
+        network: run(
+            request.network_container(),
+            request.joined.network.as_ref().map(|network| &network.init),
+        ),
+        ipc: run(request.ipc.joined_container(), request.joined.ipc.as_ref()),
+    }
 }
 
 /// Another container's namespaces `request` (`record`'s) joins, found for
@@ -594,6 +627,8 @@ struct PlannedStart {
     /// Its input closed once its first client's ends (`StdinOnce`, kept
     /// in `created.json`: F116).
     stdin_once: bool,
+    /// The other containers' runs it joins (F136(a)).
+    joined: containers::JoinedRuns,
 }
 
 /// What a start's monitor is given, besides the holds: how its input
@@ -920,6 +955,8 @@ fn connect_and_start(
             None => started,
         },
     );
+    // Those that joined its last run: told they keep it (F136(a)).
+    containers::tell_joiners(engine, &record);
     Ok(record)
 }
 

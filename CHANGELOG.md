@@ -113,6 +113,17 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **A container that joined another's network or IPC namespace is told when that one
+  starts again by itself** (F136(a), step 15.2c2): it keeps the old, empty namespace, as
+  Docker's does; `ps` now says `(no network)` / `(no shared IPC)`, `inspect --shipyard`
+  says `joins_lost`, and a `network_lost` / `ipc_lost` event comes for it.
+- **A container's DNS server no longer lets a client hold a TCP connection by reading
+  its reply a byte at a time** (F111): a reply is written whole within 5 s.
+- **A container with too many `--network-alias`es is refused at its start** (F111),
+  where its lease was written past what Shipyard reads back (its names then resolved
+  for no one, its address handed out again).
+- **When Shipyard's record of the routing it closed can't be read, the host's uplink is
+  closed too even if it's a bridge** (`br0`; F111): other bridges are still left out.
 - **`docker start -a` of a container that had run before could print nothing** (F200,
   step 15.2c1): the API's attach, waiting for the start, took the start's own passing
   states (the container made again, its last end cleared) for a new end, gave up, and

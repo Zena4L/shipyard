@@ -45,6 +45,7 @@ mod config;
 mod created;
 mod id;
 pub mod isolation;
+mod joins;
 mod labels;
 pub mod links;
 #[cfg(target_os = "linux")]
@@ -72,6 +73,9 @@ pub use created::Created;
 pub(crate) use created::MAX_EXPOSED;
 pub(crate) use created::{created, exposed_ports, network_from, write_created};
 pub use id::{ContainerId, Serial};
+#[cfg(target_os = "linux")]
+pub(crate) use joins::{JoinedRun, JoinedRuns, tell_joiners};
+pub use joins::{JoinsLost, joins_lost};
 pub use labels::Labels;
 #[cfg(target_os = "linux")]
 pub(crate) use locks::{

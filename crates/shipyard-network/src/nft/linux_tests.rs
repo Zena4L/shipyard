@@ -387,7 +387,7 @@ fn nft_reads_and_rebuilds_shipyards_table() {
             "oifname @internal drop",
             "ct status dnat accept",
             "oifname @bridges drop",
-            "meta nfproto @closed iifname @uplinks oifname @uplinks drop",
+            "meta nfproto @closed iifname . oifname != @same_uplink iifname @uplinks oifname @uplinks drop",
             "ip saddr @masquerade4 oifname != @bridges masquerade",
             "ip6 saddr @masquerade6 oifname != @bridges masquerade",
             "iifname @isolated drop",

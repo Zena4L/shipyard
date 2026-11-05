@@ -447,7 +447,9 @@ doesn't start routing between the interfaces it had then (your LAN and a VPN,
 say), until it restarts. It keeps a note of that closing (in its networks'
 directory, `.routing-closed`), so the rules it rebuilds (after `nft flush ruleset`,
 say) close it again. If that note can't be read while forwarding is on, Shipyard
-closes routing between the host's interfaces as they are now, and warns, naming the
+closes routing between the host's interfaces as they are now, and its uplink (where
+its default route goes, a bridge such as `br0` included, though not what's bridged on
+it, its VMs; other bridges are left alone, another engine's), and warns, naming the
 file: if this host is meant to route, delete the file once Shipyard's forwarding is
 off, or after a reboot. Interfaces that come later (Docker's or libvirt's
 bridges, a VPN started after) are routed: their programs turned forwarding on for
@@ -706,8 +708,12 @@ shipyard run --rm --network container:web alpine:3.20 wget -qO- localhost
   settings are refused, and so is `network connect`. A container that joins one that
   joins another's is refused too: join that one.
 - When the other stops, restarts or goes, those that join it lose their network (it was
-  the other's), and `stop`, `restart` and `rm` say so. Start them again once it's up. At
-  boot, `system recover` starts them after the others.
+  the other's), and `stop`, `restart` and `rm` say so. When it starts again by itself
+  (its restart policy, after a crash), those that joined its last run keep that run's
+  network, empty: `ps` shows them `Up 3 minutes (no network)`, `inspect --shipyard`
+  names the container under `joins_lost`, and `events` has a `network_lost` for each
+  (`--ipc container:` alike: `(no shared IPC)`, `ipc_lost`). Start them again once it's
+  up. At boot, `system recover` starts them after the others.
 - Without root, the other's user namespace is joined too (it owns that network), with its
   ID maps.
 - `inspect` shows `HostConfig.NetworkMode` as `container:ID` and no networks of its own;

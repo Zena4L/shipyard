@@ -166,6 +166,20 @@ pub enum StoreError {
     /// 64 KiB).
     #[error("the labels and options of the network {0} are too many: 64 KiB at most")]
     TooManyLabels(String),
+    /// A container's names (its aliases) too many for its lease, which
+    /// would be past what a reader takes (F111).
+    #[error(
+        "the names of container {container} on the network {network} are too many: its \
+         lease would be {bytes} bytes, 64 KiB at most (give it fewer aliases)"
+    )]
+    TooManyNames {
+        /// The container.
+        container: String,
+        /// The network.
+        network: String,
+        /// The lease's size, as it would be written.
+        bytes: usize,
+    },
     /// Its `labels.json` isn't one this Shipyard reads: a newer version,
     /// or not one at all.
     #[error("the labels of the network {name}: {source}")]
@@ -1226,6 +1240,7 @@ impl LockedNetwork {
         object.insert("container".to_owned(), serde_json::Value::from(container));
         let mut written = serde_json::to_vec(&json)
             .map_err(|error| StoreError::io("writing the lease", io::Error::other(error)))?;
+        check_lease_size(&written, new, &self.config.name)?;
         if (written.len() as u64) < (text.len() as u64) {
             written.resize(text.len(), b' ');
         }
@@ -1288,6 +1303,11 @@ impl LockedNetwork {
             interface: request.interface.clone(),
             container: request.container.clone(),
         };
+        let json = serde_json::to_vec(&lease)
+            .map_err(|error| StoreError::io("writing the lease", io::Error::other(error)))?;
+        // Refused here, never written past what a reader takes (F111).
+        let named = request.name.as_deref().unwrap_or(&request.hostname);
+        check_lease_size(&json, named, &self.config.name)?;
         let path = dir.join(ip.to_string());
         let file = OpenOptions::new()
             .read(true)
@@ -1304,8 +1324,6 @@ impl LockedNetwork {
                 io::Error::from(error),
             )
         })?;
-        let json = serde_json::to_vec(&lease)
-            .map_err(|error| StoreError::io("writing the lease", io::Error::other(error)))?;
         let written = {
             use std::os::unix::fs::PermissionsExt as _;
             lock.set_permissions(fs::Permissions::from_mode(0o640))
@@ -1413,6 +1431,19 @@ impl HeldLease {
     pub fn release(self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// A lease of `bytes` (container `container`'s, on network `network`), if
+/// it's within what a reader takes ([`LEASE_MAX`]).
+fn check_lease_size(bytes: &[u8], container: &str, network: &str) -> Result<(), StoreError> {
+    if bytes.len() as u64 > LEASE_MAX {
+        return Err(StoreError::TooManyNames {
+            container: container.to_owned(),
+            network: network.to_owned(),
+            bytes: bytes.len(),
+        });
+    }
+    Ok(())
 }
 
 /// The lease files in `dir` (none if it isn't there yet).
@@ -2293,6 +2324,50 @@ mod tests {
             ip6: None,
             container: None,
         }
+    }
+
+    /// A lease past what a reader takes is refused at its write (F111),
+    /// nothing written; one just under it is written and read back (the
+    /// control).
+    #[test]
+    fn a_lease_past_what_a_reader_takes_is_refused() {
+        let scratch = Scratch::new();
+        let networks = Networks::open(&scratch.0).unwrap();
+        networks.create(&spec("app"), &[]).unwrap();
+        let network = networks.lock("app").unwrap();
+        // Each alias 100 bytes, quoted and separated: ~103 a piece.
+        let aliases =
+            |count: usize| -> Vec<String> { (0..count).map(|n| format!("{n:0>100}")).collect() };
+        let refused = network.allocate(&LeaseRequest {
+            aliases: aliases(700),
+            ..request("big")
+        });
+        assert!(
+            matches!(refused, Err(StoreError::TooManyNames { bytes, .. }) if bytes as u64 > LEASE_MAX),
+            "{refused:?}"
+        );
+        assert!(
+            network.leases().unwrap().is_empty(),
+            "nothing written for the refused one"
+        );
+        let held = network
+            .allocate(&LeaseRequest {
+                aliases: aliases(600),
+                container: Some("c-near".into()),
+                ..request("near")
+            })
+            .unwrap();
+        assert!(fs::metadata(&held.path).unwrap().len() < LEASE_MAX);
+        assert_eq!(network.leases().unwrap().len(), 1, "read back");
+        // A rename that would take it past is refused too, the lease left
+        // as it was.
+        let before = fs::read(&held.path).unwrap();
+        let renamed = network.rename("c-near", None, &"n".repeat(8 * 1024));
+        assert!(
+            matches!(renamed, Err(StoreError::TooManyNames { .. })),
+            "{renamed:?}"
+        );
+        assert_eq!(fs::read(&held.path).unwrap(), before);
     }
 
     /// A container renamed on a network: its live lease rewritten in place

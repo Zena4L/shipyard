@@ -64,9 +64,9 @@ fn outside_links() -> Result<Vec<String>> {
 /// family whose record can't be read and whose forwarding is on (whoever
 /// turned it on: a table rebuilt open would let the host route for anyone,
 /// F65), the host's own links now, bridges and their ports left out
-/// (another engine's, routed by it). Said, for each. A family whose
-/// forwarding is off needs nothing: [`open_routing`] closes routing before
-/// it turns forwarding on, and records it again.
+/// (another engine's, routed by it) but for its uplink (F111). Said, for
+/// each. A family whose forwarding is off needs nothing: [`open_routing`]
+/// closes routing before it turns forwarding on, and records it again.
 #[cfg(target_os = "linux")]
 fn closed_now(
     records: shipyard_network::store::RoutingRecords,
@@ -91,9 +91,9 @@ fn closed_now(
             WarningKind::RoutingRecordUnreadable,
             format!(
                 "the record of the host's {family} routing Shipyard closed couldn't be read \
-                 ({unread}): its routing between its own links (bridges and their ports left \
-                 out, another engine's) is closed, as if Shipyard had turned forwarding on, until \
-                 Shipyard's table is next rebuilt (a reboot); if this host is meant to route, \
+                 ({unread}): its routing between its own links and its uplink (other \
+                 bridges and their ports left out, another engine's) is closed, as if \
+                 Shipyard had turned forwarding on, until Shipyard's table is next rebuilt (a reboot); if this host is meant to route, \
                  delete Shipyard's routing records (`.routing-closed*` in its networks \
                  directory), so the next rebuild doesn't close it again"
             ),

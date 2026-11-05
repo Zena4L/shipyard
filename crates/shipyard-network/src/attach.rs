@@ -254,17 +254,42 @@ pub fn host_interfaces() -> Result<Vec<String>, AttachError> {
 /// master): what routing is closed between when Shipyard can't read its
 /// record of what it closed (F65). Another engine's bridge (Docker's,
 /// libvirt's, a CNI's) and its containers' veths are that engine's to
-/// route; the host's own links (a LAN, a VPN) are what's closed.
+/// route; the host's own links (a LAN, a VPN) are what's closed, and its
+/// uplink (where its default route goes) even when it's a bridge (`br0`:
+/// F111).
 pub fn unbridged_host_interfaces() -> Result<Vec<String>, AttachError> {
-    let mut names: Vec<String> = Rtnetlink::new()?
-        .links()?
+    let mut links = Rtnetlink::new()?;
+    let mut uplinks = Vec::new();
+    for family in [Family::V4, Family::V6] {
+        // A family whose routes can't be read (no IPv6) has no uplink to
+        // close: the rest is closed all the same.
+        uplinks.extend(
+            links
+                .routes(family)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|route| route.destination.prefix() == 0)
+                .filter_map(|route| route.index),
+        );
+    }
+    Ok(closable(links.links()?, &uplinks))
+}
+
+/// Of `links`, those F65's closing takes: not bridges or their ports
+/// (another engine's), unless one is an uplink (its index in `uplinks`);
+/// never the loopback or Shipyard's own. Sorted by name.
+fn closable(links: Vec<crate::route::Link>, uplinks: &[u32]) -> Vec<String> {
+    let mut names: Vec<String> = links
         .into_iter()
-        .filter(|link| link.kind.as_deref() != Some("bridge") && link.master.is_none())
+        .filter(|link| {
+            uplinks.contains(&link.index)
+                || (link.kind.as_deref() != Some("bridge") && link.master.is_none())
+        })
         .map(|link| link.name)
         .filter(|name| name != "lo" && !is_shipyards(name))
         .collect();
     names.sort();
-    Ok(names)
+    names
 }
 
 /// The IPv6 settings of the container's `interface` (in the calling
@@ -557,6 +582,38 @@ mod tests {
 
     use crate::linux_test::{in_new_netns, this_netns};
     use crate::store::{bridge_name, mac_for};
+
+    /// F65's closing takes the host's own links and its uplink even when
+    /// it's a bridge (F111: `br0`); another bridge and its ports, the
+    /// loopback and Shipyard's own stay out.
+    #[test]
+    fn the_uplink_is_closed_even_when_it_s_a_bridge() {
+        let link =
+            |index: u32, name: &str, kind: Option<&str>, master: Option<u32>| crate::route::Link {
+                index,
+                name: name.to_owned(),
+                kind: kind.map(str::to_owned),
+                flags: 0,
+                mtu: None,
+                master,
+                mac: None,
+            };
+        let links = || {
+            vec![
+                link(1, "lo", None, None),
+                link(2, "br0", Some("bridge"), None),
+                link(3, "eth0", None, Some(2)),
+                link(4, "docker0", Some("bridge"), None),
+                link(5, "veth1", Some("veth"), Some(4)),
+                link(6, "wg0", Some("wireguard"), None),
+                link(7, "shy-net", Some("bridge"), None),
+            ]
+        };
+        assert_eq!(closable(links(), &[2]), ["br0", "wg0"]);
+        // The control: with no default route through it, br0 is left out
+        // as another engine's would be.
+        assert_eq!(closable(links(), &[]), ["wg0"]);
+    }
 
     /// Both default routes.
     const BOTH: DefaultRoutes = DefaultRoutes {

@@ -45,7 +45,7 @@ as typed: `table` is no table here, and `\t` stays two characters.
 
 | Type | Actions | Attributes |
 |---|---|---|
-| `container` | `create`, `start`, `stop`, `kill`, `restart`, `die`, `oom`, `rename`, `update`, `pause`, `unpause`, `destroy`, `health_status`, `network_lost` | `name`, `image`; `exitCode` (`die`), `signal` (`kill`, by name: `SIGKILL`, where Docker gives its number), `oldName` (`rename`), `restartCount` (a [restart policy's](containers.md#restart-policies) `start`), `restartPolicy` (`update`), `healthStatus` (`health_status`: `healthy` or `unhealthy`), `how` (`network_lost`) |
+| `container` | `create`, `start`, `stop`, `kill`, `restart`, `die`, `oom`, `rename`, `update`, `pause`, `unpause`, `destroy`, `health_status`, `network_lost`, `ipc_lost` | `name`, `image`; `exitCode` (`die`), `signal` (`kill`, by name: `SIGKILL`, where Docker gives its number), `oldName` (`rename`), `restartCount` (a [restart policy's](containers.md#restart-policies) `start`), `restartPolicy` (`update`), `healthStatus` (`health_status`: `healthy` or `unhealthy`), `how` (`network_lost`, `ipc_lost`) |
 | `image` | `pull`, `untag`, `delete`, `prune` | `removed` (`prune`: how many blobs) |
 | `volume` | `create`, `destroy`, `prune` | `removed` (`prune`: how many volumes) |
 | `network` | `create`, `destroy`, `prune`, `connect`, `disconnect` | `removed` (`prune`: how many networks), `container` (`connect`, `disconnect`: the container's ID) |
@@ -59,7 +59,10 @@ as typed: `table` is no table here, and `\t` stays two characters.
   `oom`, then `die`.
 - `network_lost` is said when a container's pasta dies while it runs (attribute
   `how`: `pasta was killed (SIGKILL)`, `pasta ended (code 1)`): it runs on without a
-  network (see [Networking](networking.md)).
+  network (see [Networking](networking.md)). It's said too, with `ipc_lost` for an IPC
+  namespace, for a container that joined another's (`--network container:`, `--ipc
+  container:`) when that one starts again by itself: it keeps the old, empty one (`how`:
+  `container db started again: this one keeps its old network`).
 - `health_status` is said when a container's [health checks](containers.md#health-checks)
   change what they say: Docker's `health_status: healthy`, with the status as an
   attribute, so `-f event=health_status` finds them all.
