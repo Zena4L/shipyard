@@ -130,7 +130,7 @@ comes with a test that reproduces the problem first. Remove a row when its fix l
 
 ### Accepted at v1.0 (15.1, 2026-10-31)
 
-Triaged in 15.1 (D15-3): none of these lets a user or a hostile container, image, registry or local user reach a wrong result, a leak or a hang they couldn't already cause. Each keeps its finding as recorded, with why it's accepted. Two Dependabot alerts are accepted with them: `glib` 0.18 (moderate, GHSA-wrw7-89jp-8q8g: it comes through Tauri's GTK on Linux, and Shipyard never uses `VariantStrIter`; 0.20 fixes it once Tauri moves) and `deepmerge` 4.3.1 (low, GHSA-gcqx-w48m-w2h4: the page build's tool, never fed untrusted input; no fixed release yet).
+Triaged in 15.1 (D15-3): none of these lets a user or a hostile container, image, registry or local user reach a wrong result, a leak or a hang they couldn't already cause. Each keeps its finding as recorded, with why it's accepted. Two Dependabot alerts are accepted with them: `glib` 0.18 (moderate, GHSA-wrw7-89jp-8q8g: it comes through Tauri's GTK on Linux, and Shipyard never uses `VariantStrIter`; 0.20 fixes it once Tauri moves) and `deepmerge` 4.3.1 (low, GHSA-gcqx-w48m-w2h4: the page build's tool, never fed untrusted input; no fixed release yet). Since 15.2c2, one RustSec advisory too: `astral-tokio-tar` unmaintained (RUSTSEC-2026-0440, 2026-11-03; no safe upgrade), which comes only through `testcontainers` 0.28, the acceptance tests' dev-dependency, never shipped: ignored in `deny.toml` with its reason, until testcontainers moves off it.
 
 | ID | Severity | Finding | Why accepted |
 |---|---|---|---|
