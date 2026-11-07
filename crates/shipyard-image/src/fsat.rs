@@ -208,7 +208,7 @@ fn classify(dir: &OwnedFd, name: &OsStr, errno: Errno) -> WalkError {
 /// as removed. A directory it removed from under this walk reads as empty
 /// on Linux (libc's `readdir` takes the kernel's `ENOENT` for a dead
 /// directory as its end); where it's refused instead (macOS), the walk
-/// starts again from `name`, at most [`RESTARTS`] times.
+/// starts again from `name` (at most 64 times).
 ///
 /// # Errors
 ///
