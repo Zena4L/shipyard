@@ -385,7 +385,8 @@ or `RUN --mount=from=` that names an image Shipyard has (one you built, pulled, 
 or imported) uses it, and asks no registry: `shipyard build -t base .` then `FROM base`
 works offline. `--pull` asks the registry for each base image again, as Docker's flag
 does (a name only this host has then fails). BuildKit is given each image of the store
-whose name the Dockerfile or a `--build-arg` mentions (by any of its names, or its
+whose name the Dockerfile or a `--build-arg` mentions as a name of its own (`app` in
+`FROM app:1` or `registry.example/app`, never in `myapp`; by any of its names, or its
 digest; at most 256), its blobs linked from the store read-only, never copied: where they can't be linked (the
 builder's directory on another filesystem than the store), the build says so and pulls
 them, as before. A stage of the
@@ -415,7 +416,10 @@ not: as root, every file must be readable to every user (`chmod o+r`, a director
 (`o+x`: not under `/root`), since the builder is another user; rootless, every file must
 be readable to you. On a Mac, the home the VM shares is read by the builder as you
 read it, so nothing there needs opening to others. Rootless builds need a delegated
-cgroup (a login session's), as rootless containers do.
+cgroup (a login session's), as rootless containers do: without one (an SSH login on some
+hosts, no cgroup v2, a tree that can't be written), `build` warns first that its `RUN`
+steps will fail, and why, naming the fix where there is one (`systemd-run --user --scope
+shipyard …`); a Dockerfile with no `RUN` still builds.
 
 **The cache is the context's.** Each context directory has a cache of its own
 (BuildKit's state, in the store, `builder/state-…`; as root beside it, in

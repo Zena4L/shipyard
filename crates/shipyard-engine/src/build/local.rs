@@ -64,7 +64,8 @@ pub(super) fn buildkit_platform(platform: &shipyard_image::Platform) -> String {
 /// The images of `images` (the store's) that a build of `dockerfile`, with
 /// `build_args`, could name: each whose repository's last part appears in
 /// the Dockerfile or in an argument's value (a `FROM ${BASE}` is named by
-/// an `ARG` or a `--build-arg`), by every name it has; at most
+/// an `ARG` or a `--build-arg`) as a name of its own ([`names_word`]), by
+/// every name it has; at most
 /// [`MAX_IMAGES`]. A name the Dockerfile doesn't use costs nothing:
 /// BuildKit reads a context only when it's asked for. Never by a name one
 /// of the Dockerfile's own stages has (`FROM … AS base`): BuildKit puts a
@@ -79,7 +80,8 @@ pub(super) fn wanted(
     let text = String::from_utf8_lossy(dockerfile);
     let mentioned = |part: &str| {
         !part.is_empty()
-            && (text.contains(part) || build_args.iter().any(|(_, value)| value.contains(part)))
+            && (names_word(&text, part)
+                || build_args.iter().any(|(_, value)| names_word(value, part)))
     };
     let stages = stage_names(&text);
     let mut found: Vec<Local> = Vec::new();
@@ -121,6 +123,22 @@ pub(super) fn wanted(
         });
     }
     found
+}
+
+/// Whether `word` appears in `text` with no character of a name's
+/// (letters, digits, `_`, `.`, `-`) running into it on either side: `app`
+/// is in `FROM app:1` and `registry/app`, never in `myapp` (F166: a
+/// substring gave a store of short names to every build, up to the cap,
+/// and left out the one meant).
+fn names_word(text: &str, word: &str) -> bool {
+    let of_a_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    text.match_indices(word).any(|(at, _)| {
+        let before = text.get(..at).and_then(|head| head.chars().next_back());
+        let after = text
+            .get(at + word.len()..)
+            .and_then(|tail| tail.chars().next());
+        !before.is_some_and(of_a_name) && !after.is_some_and(of_a_name)
+    })
 }
 
 /// The names the Dockerfile `text` gives its stages (`FROM IMAGE AS

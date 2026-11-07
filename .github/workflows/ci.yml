@@ -183,7 +183,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-26.04]
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -219,11 +219,13 @@ jobs:
           SHIPYARD_TEST_BIN_DIR: /usr/local/bin
           SHIPYARD_TEST_ROOTLESS: required
           SHIPYARD_TEST_DELEGATED: required
+      # 900 s: on ubuntu-26.04 the suite alone came to ~550 s on a slow
+      # runner (2026-11-07), the terminal tests last cut off at 600.
       - name: cargo test, against the installed binaries
-        timeout-minutes: 12
+        timeout-minutes: 17
         run: |
           cargo test --locked -p shipyard-cli --no-run
-          scripts/ci/run-logged.sh 600 tests \
+          scripts/ci/run-logged.sh 900 tests \
             systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli
         env:
           SHIPYARD_TEST_BIN_DIR: /usr/local/bin

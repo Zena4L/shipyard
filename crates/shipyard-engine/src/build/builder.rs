@@ -40,17 +40,20 @@ const NOT_READY: i32 = 90;
 const LAST_LINES: usize = 20;
 
 /// The builder's script, the same every build: `buildkitd` started, waited
-/// for (each look bounded, 30 s in all), `buildctl` run with the arguments
+/// for by the clock (30 s, checked after each look of up to 5 s: 35 s at
+/// worst; the time since boot, `/proc/uptime`, which neither an NTP step
+/// nor a Mac's sleep moves), `buildctl` run with the arguments
 /// given (`"$@"`: argv, never read by this shell), its code kept; BuildKit's
 /// own GC kept to 10 GB (`--keep-storage` is in MB); `buildkitd` asked to
 /// end and waited for, so its state is written whole; the code.
 const SCRIPT: &str = r#"set -u
 buildkitd --oci-worker-no-process-sandbox --root /var/lib/buildkit >/out/buildkitd.log 2>&1 &
 daemon=$!
-tries=0
+now() { read -r up _ </proc/uptime; echo "${up%.*}"; }
+started=$(now)
 until timeout 5 buildctl debug workers >/dev/null 2>&1; do
-  tries=$((tries + 1))
-  if [ "$tries" -gt 300 ] || ! kill -0 "$daemon" 2>/dev/null; then
+  if [ $(( $(now) - started )) -ge 30 ] \
+    || ! kill -0 "$daemon" 2>/dev/null; then
     tail -n 20 /out/buildkitd.log >&2
     exit 90
   fi
@@ -68,6 +71,27 @@ done
 exit "$code"
 "#;
 
+/// What to warn a rootless build of, where this process has no cgroup
+/// tree of the user's own (`tree`'s answer, why there's none: an SSH
+/// login's scope, no cgroup v2, one not writable): BuildKit's `runc` runs
+/// each `RUN` in a cgroup of the builder's, so one fails, in BuildKit's own
+/// words; said first, so they're tied to the cause (F174). Never refused:
+/// a build with no `RUN` (`FROM`, `COPY`, an export) works without one.
+/// Root's builder makes its own.
+fn cgroup_warning(
+    root: bool,
+    tree: impl FnOnce() -> std::result::Result<(), shipyard_runtime::cgroup::NoTree>,
+) -> Option<String> {
+    if root {
+        return None;
+    }
+    let why = tree().err()?;
+    Some(format!(
+        "the build's RUN steps will fail here: BuildKit runs each in a cgroup, and this \
+         session has none of yours ({why})"
+    ))
+}
+
 /// See [`super::build`].
 pub(super) fn build(
     engine: &Engine,
@@ -76,6 +100,10 @@ pub(super) fn build(
     tar_out: Option<&mut dyn std::io::Write>,
 ) -> Result<Built> {
     let root = nix::unistd::geteuid().is_root();
+    if let Some(warning) = cgroup_warning(root, || shipyard_runtime::cgroup::Tree::find().map(drop))
+    {
+        engine.warn(WarningKind::Runtime, warning);
+    }
     let context = std::fs::canonicalize(&request.context)
         .map_err(|error| Error::wrap(ErrorKind::InvalidRequest, error))
         .with_context(|| format!("the build context {}", request.context.display()))?;
@@ -1020,6 +1048,83 @@ fn output_dir(dest: &Path, root: bool) -> Result<std::os::fd::OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rootless build with no cgroup of the user's own is warned of first
+    /// (F174), the warning saying why (the tree's own words, naming the
+    /// fix); root's never asks; a user with one isn't warned (the control).
+    #[test]
+    fn a_rootless_build_without_a_cgroup_is_warned_of() {
+        use shipyard_runtime::cgroup::NoTree;
+        let why = NoTree::NotDelegated("/user.slice/session-3.scope".into());
+        let warned = cgroup_warning(false, || Err(why.clone())).unwrap();
+        assert!(warned.contains(&why.to_string()), "{warned}");
+        assert!(warned.contains("RUN steps will fail"), "{warned}");
+        assert_eq!(cgroup_warning(true, || panic!("root's never asks")), None);
+        assert_eq!(cgroup_warning(false, || Ok(())), None);
+    }
+
+    /// The builder waits for `buildkitd` by the clock (F166): one that never
+    /// gets ready, still running, ends the script with its code (90) once
+    /// the wait is over (here 2 s), never sooner, where 300 counted looks of
+    /// a second each took five minutes. Fakes on `PATH`: a `buildkitd` that
+    /// never answers (its PID kept, to see it ran throughout, then end it),
+    /// a `buildctl` saying "not yet" after a second.
+    #[test]
+    fn buildkit_s_readiness_is_waited_for_by_the_clock() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("shipyard-ready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pid_file = dir.join("buildkitd.pid");
+        let daemon = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        for (name, body) in [
+            ("buildkitd", daemon.as_str()),
+            ("buildctl", "sleep 1; exit 1"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wait = "-ge 30 ]";
+        assert_eq!(SCRIPT.matches(wait).count(), 1, "the deadline, once");
+        let script = SCRIPT
+            .replace("/out/", &format!("{}/", dir.display()))
+            .replace(wait, "-ge 2 ]");
+        let started = std::time::Instant::now();
+        let ended = std::process::Command::new("sh")
+            .args(["-c", &script, "builder"])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        let took = started.elapsed();
+        let daemon = nix::unistd::Pid::from_raw(
+            std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        let alive = nix::sys::signal::kill(daemon, None).is_ok();
+        let _ = nix::sys::signal::kill(daemon, nix::sys::signal::Signal::SIGKILL);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(ended.status.code(), Some(NOT_READY), "{ended:?}");
+        assert!(
+            alive,
+            "the fake daemon died: the clock wasn't what ended it"
+        );
+        assert!(
+            took >= std::time::Duration::from_secs(2) && took < std::time::Duration::from_secs(15),
+            "the wait took {took:?}"
+        );
+    }
 
     /// A repository's Dockerfile is read only from inside the context, or
     /// `-f`'s own directory: a link inside (`Dockerfile ->
