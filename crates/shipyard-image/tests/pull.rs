@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use shipyard_image::{
-    BlobSink, Descriptor, Digest, ImageReference, Platform, PullError, Registry, RegistryError,
-    Store,
+    BlobSink, Descriptor, Digest, ImageReference, LayerProgress, Platform, PullError, Registry,
+    RegistryError, Store,
 };
 
 /// One response the fixture gives.
@@ -516,7 +516,7 @@ fn pull(
     platform: &Platform,
     store: &Store,
 ) -> Result<shipyard_image::Pulled, PullError> {
-    let quiet = |_: &Descriptor, _: bool| {};
+    let quiet = |_: &Descriptor, _: LayerProgress| {};
     shipyard_image::pull::pull_with(
         &reference(image),
         platform,
@@ -544,6 +544,65 @@ fn a_single_arch_image_pulls_verifies_and_is_stored_whole() {
     for layer in &pulled.manifest.layers {
         assert!(store.contains(&layer.digest));
     }
+}
+
+/// Each layer's bytes are said as they come, then the layer once it's
+/// stored (F192): its first `Fetching` at once, its counts rising to its
+/// size at most, then `Stored { fetched: true }`; a layer the store has
+/// already is said `Stored { fetched: false }` alone.
+#[test]
+fn a_pull_says_each_layer_s_bytes_then_the_layer() {
+    let mut fixture = FixtureRegistry::default();
+    host_image(&mut fixture, "app", "v1", "amd64", 2);
+    let serving = fixture.serve();
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let pulled_with = |said: &Mutex<Vec<(Digest, LayerProgress)>>| {
+        let tell = |layer: &Descriptor, progress: LayerProgress| {
+            said.lock().unwrap().push((layer.digest.clone(), progress));
+        };
+        shipyard_image::pull::pull_with(
+            &reference("localhost/app:v1"),
+            &amd64(),
+            &store,
+            &serving.registry(),
+            shipyard_image::PullOptions::default(),
+            &tell,
+        )
+        .unwrap()
+    };
+    let said = Mutex::new(Vec::new());
+    let pulled = pulled_with(&said);
+    let said = said.into_inner().unwrap();
+    for layer in &pulled.manifest.layers {
+        let mine: Vec<LayerProgress> = said
+            .iter()
+            .filter(|(digest, _)| *digest == layer.digest)
+            .map(|(_, progress)| *progress)
+            .collect();
+        let (last, fetching) = mine.split_last().unwrap();
+        assert_eq!(*last, LayerProgress::Stored { fetched: true }, "{mine:?}");
+        assert!(!fetching.is_empty(), "no bytes said: {mine:?}");
+        let mut before = 0;
+        for progress in fetching {
+            let LayerProgress::Fetching { have } = *progress else {
+                panic!("{mine:?}");
+            };
+            assert!(have > before && have <= layer.size, "{mine:?}");
+            before = have;
+        }
+    }
+    // Pulled again: each layer stored already, said once.
+    let again = Mutex::new(Vec::new());
+    pulled_with(&again);
+    let again = again.into_inner().unwrap();
+    assert_eq!(again.len(), pulled.manifest.layers.len(), "{again:?}");
+    assert!(
+        again
+            .iter()
+            .all(|(_, progress)| *progress == LayerProgress::Stored { fetched: false }),
+        "{again:?}"
+    );
 }
 
 #[test]
@@ -953,7 +1012,7 @@ fn an_image_is_pulled_for_the_first_platform_that_runs_here() {
     let store = scratch.store();
     let arm64 = Platform::new("linux", "arm64");
     let here = vec![arm64.clone(), amd64()];
-    let quiet = |_: &Descriptor, _: bool| {};
+    let quiet = |_: &Descriptor, _: LayerProgress| {};
     let pull_here = |image: &str, choices: &Vec<Platform>| {
         shipyard_image::pull::pull_with(
             &reference(image),
@@ -1074,7 +1133,7 @@ fn pull_signed(
         store,
         &registry,
         shipyard_image::PullOptions::default(),
-        &|_: &Descriptor, _: bool| {},
+        &|_: &Descriptor, _: LayerProgress| {},
     )
 }
 
@@ -1431,7 +1490,7 @@ fn an_explicit_pull_repairs_a_corrupt_stored_blob() {
         &store,
         &serving.registry(),
         repair,
-        &|_: &Descriptor, _: bool| {},
+        &|_: &Descriptor, _: LayerProgress| {},
     )
     .unwrap();
     assert!(store.check_blob(digest).unwrap());

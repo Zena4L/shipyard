@@ -126,9 +126,9 @@ It isn't packaged yet: you run it from the source tree (below).
   a name (or none: Shipyard picks one), a memory limit and a port to publish
   (`8081:80`, or `80`). It says the command it stands for as you type
   (`shipyard run -d --memory 256m alpine:3.20`), pulls the image if Shipyard doesn't have
-  it (its progress shown), runs it detached, and selects it in the Yard. It runs the
-  image's own command: one that exits at once (`alpine`'s shell) shows as exited. Escape
-  closes it.
+  it (its progress shown, each layer's share as it downloads; nothing while its layers
+  are unpacked), runs it detached, and selects it in the Yard. It runs the image's own
+  command: one that exits at once (`alpine`'s shell) shows as exited. Escape closes it.
 - **It shows your containers** in the **Manifest** view: each container's ID, name,
   image, state (and exit code), CPU and memory in use (against its limit), published
   ports and uptime. CPU and memory are read every 2 seconds while the window is seen:

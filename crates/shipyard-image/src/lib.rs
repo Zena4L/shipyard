@@ -53,7 +53,9 @@ pub use manifest::{
     AnyPlatform, Descriptor, ImageAbout, ImageConfig, ImageHealthcheck, ImageManifest, Index,
     ManifestError, Platform, PlatformChoice, RuntimeConfig,
 };
-pub use pull::{PullError, PullOptions, Pulled, from_store, from_store_by_digest, pull};
+pub use pull::{
+    LayerProgress, PullError, PullOptions, Pulled, from_store, from_store_by_digest, pull,
+};
 pub use push::{PushError, PushEvent, Pushed, ToPush};
 pub use reference::{ImageReference, ReferenceError};
 pub use registry::{BlobError, BlobSink, Registry, RegistryError};

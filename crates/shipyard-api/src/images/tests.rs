@@ -141,6 +141,19 @@ fn a_pull_s_progress_is_docker_s_lines() {
         }),
         serde_json::json!({"status": "Already exists", "id": "0123456789ab", "progressDetail": {}})
     );
+    // A layer's bytes as they come: Docker's bar's numbers.
+    assert_eq!(
+        line(Progress::Downloading {
+            short_digest: "0123456789ab".to_owned(),
+            have: 1024,
+            total: 4096
+        }),
+        serde_json::json!({
+            "status": "Downloading",
+            "id": "0123456789ab",
+            "progressDetail": {"current": 1024, "total": 4096}
+        })
+    );
     assert_eq!(
         serde_json::to_value(Line::error("no such image")).unwrap(),
         serde_json::json!({"errorDetail": {"message": "no such image"}, "error": "no such image"})
@@ -153,4 +166,46 @@ fn a_registry_s_words_are_made_plain() {
     assert_eq!(plain("denied\u{1b}[2J: \u{7}no\r\nway"), "denied[2J: noway");
     assert_eq!(familiar("docker.io/library/alpine:3.20"), "alpine:3.20");
     assert_eq!(familiar("not a reference"), "not a reference");
+}
+
+/// A layer's bytes are offered once and dropped while the client is behind
+/// (F192: told from inside the download, which a client that stopped
+/// reading must never hold up); a layer's own line waits for room, asking
+/// after its client.
+#[test]
+fn a_pull_s_byte_lines_never_wait_for_a_slow_client() {
+    let (sender, mut receiver) = crate::reply::bare(1);
+    let never = Gone::new(|| false);
+    let downloading = |have| Progress::Downloading {
+        short_digest: "0123456789ab".to_owned(),
+        have,
+        total: 4096,
+    };
+    write_progress(&sender, &never, &downloading(1024)).unwrap();
+    // Full now: the next is dropped, at once.
+    let (answered, answer) = std::sync::mpsc::channel();
+    let waiting = sender.clone();
+    std::thread::spawn(move || {
+        let _ = answered.send(write_progress(
+            &waiting,
+            &Gone::new(|| false),
+            &downloading(2048),
+        ));
+    });
+    answer
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a byte line waited for room")
+        .unwrap();
+    let first: serde_json::Value = serde_json::from_slice(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(first["progressDetail"]["current"], 1024);
+    assert!(receiver.try_recv().is_err(), "the dropped line was sent");
+    // A layer's own line, the channel full: it waits, until its client is
+    // said gone.
+    write_progress(&sender, &never, &downloading(3072)).unwrap();
+    let stored = Progress::Layer {
+        short_digest: "0123456789ab".to_owned(),
+        downloaded: Some(4096),
+    };
+    let refused = write_progress(&sender, &Gone::new(|| true), &stored).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::BrokenPipe);
 }

@@ -58,6 +58,8 @@ impl CliReporter {
                     short_digest,
                     sent: None,
                 } => format!("{short_digest}: already there"),
+                // A line a layer, once it's in: a terminal's output as it was.
+                Progress::Downloading { .. } => return None,
             },
             Message::Progress(_) => return None,
         })
@@ -202,6 +204,13 @@ mod tests {
             loud.line(stored.clone()).as_deref(),
             Some("0123456789ab: already here")
         );
+        // A layer's bytes as they come: not printed.
+        let downloading = Message::Progress(Progress::Downloading {
+            short_digest: "0123456789ab".to_owned(),
+            have: 1024,
+            total: 2048,
+        });
+        assert_eq!(loud.line(downloading), None);
         // `pull -q`: no progress, the rest as ever.
         let quiet = CliReporter { progress: false };
         for event in [pulling, downloaded, stored] {

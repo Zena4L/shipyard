@@ -162,6 +162,16 @@ pub enum Progress {
         /// store had it already).
         downloaded: Option<u64>,
     },
+    /// A layer's bytes are coming (F192): at most every half second while
+    /// they do (`shipyard_image::pull::PROGRESS_EVERY`).
+    Downloading {
+        /// The layer's digest, its first 12 hex digits.
+        short_digest: String,
+        /// The bytes received so far.
+        have: u64,
+        /// Its size.
+        total: u64,
+    },
     /// Pushing this image to this name starts (step 12.4).
     Pushing {
         /// The name, as its canonical reference.

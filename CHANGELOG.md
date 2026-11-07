@@ -222,6 +222,11 @@ behaviour; each change is listed here).
   manager's (`systemd-run --user`), with Shipyard's, Docker's config's, the proxies' and
   the certificates' variables; a launch that fails within 5 seconds falls back to the
   old start (F198).
+- **A pull through the API said nothing while a big layer downloaded**: the desktop app's
+  Run sheet stood still for minutes. Each layer's bytes are said as they come (Docker's
+  `Downloading` lines with `progressDetail`, at most every half second a layer: Docker's
+  CLI draws its bars); a client that stops reading drops those lines rather than holding
+  the download up (F192). Unpacking the layers still says nothing (F209).
 
 ### Security
 

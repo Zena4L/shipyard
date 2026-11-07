@@ -46,7 +46,8 @@ use std::sync::Arc;
 
 use shipyard_image::index::Index;
 use shipyard_image::{
-    Descriptor, GC_WAIT, LiveArea, LockMode, Platform, Pulled, Store, StoreLock, USE_WAIT,
+    Descriptor, GC_WAIT, LayerProgress, LiveArea, LockMode, Platform, Pulled, Store, StoreLock,
+    USE_WAIT,
 };
 #[cfg(target_os = "linux")]
 use shipyard_image::{LayerOwners, LayerSpec, RuntimeConfig};
@@ -846,10 +847,18 @@ fn download(
     engine.report(Message::Progress(Progress::Pulling {
         image: image.to_string(),
     }));
-    let progress = |layer: &Descriptor, fetched: bool| {
-        engine.report(Message::Progress(Progress::Layer {
-            short_digest: layer.digest.hex().chars().take(12).collect(),
-            downloaded: fetched.then_some(layer.size),
+    let progress = |layer: &Descriptor, step: LayerProgress| {
+        let short_digest = layer.digest.hex().chars().take(12).collect();
+        engine.report(Message::Progress(match step {
+            LayerProgress::Fetching { have } => Progress::Downloading {
+                short_digest,
+                have,
+                total: layer.size,
+            },
+            LayerProgress::Stored { fetched } => Progress::Layer {
+                short_digest,
+                downloaded: fetched.then_some(layer.size),
+            },
         }));
     };
     let pulled = shipyard_image::pull(image, platform, store, credentials, options, &progress)

@@ -2822,6 +2822,53 @@ fn an_exec_s_values_are_on_no_argv() {
     stores.docker_ok(&["rm", "-f", "box"]);
 }
 
+/// A pull through the API says each layer's bytes as they come (F192),
+/// Docker's `progressDetail` (how far, of its size), before the layer's
+/// `Pull complete`: a client's bar moves, and its quiet bound isn't met.
+#[test]
+fn a_pull_says_its_layers_bytes_as_they_come() {
+    let Some(stores) = Stores::new() else { return };
+    // In this network: the fixture registry is on its loopback.
+    let _service = stores.serve_here(60);
+    let image = &stores.image;
+    // Not in the store: the pull downloads it.
+    stores.docker_ok(&["rmi", image]);
+    let raw = api::post(
+        &stores.socket(),
+        &format!("/images/create?fromImage={image}&tag=latest"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(raw.status, 200, "{}", raw.text());
+    let lines: Vec<serde_json::Value> = raw
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let complete: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["status"] == "Pull complete")
+        .collect();
+    assert!(!complete.is_empty(), "{lines:?}");
+    for done in complete {
+        let id = &done["id"];
+        let position = |wanted: &serde_json::Value| lines.iter().position(|line| line == wanted);
+        let downloading: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["status"] == "Downloading" && line["id"] == *id)
+            .collect();
+        let first = downloading.first().expect("no bytes said for a layer");
+        assert!(position(first) < position(done), "{lines:?}");
+        for line in downloading {
+            let (current, total) = (
+                line["progressDetail"]["current"].as_u64().unwrap(),
+                line["progressDetail"]["total"].as_u64().unwrap(),
+            );
+            assert!(current > 0 && current <= total, "{line}");
+        }
+    }
+}
+
 /// Images through Docker's CLI: a pull (its progress, up to date the
 /// second time), the list, inspect (the ID a container runs), a tag,
 /// removal by tag and by ID (refused while in use, or while the ID names

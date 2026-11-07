@@ -212,9 +212,16 @@ struct PushAux {
     size: u64,
 }
 
-/// A layer's bytes in a progress line: none once it's done.
-#[derive(Debug, Serialize)]
-struct ProgressDetail {}
+/// A layer's bytes in a progress line, Docker's `JSONProgress`: how far
+/// its download got, from which Docker's CLI draws its bar; none once it's
+/// done.
+#[derive(Debug, Default, Serialize)]
+struct ProgressDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
+}
 
 /// A failure, in a stream already under way.
 #[derive(Debug, Serialize)]
@@ -290,7 +297,7 @@ impl Line {
                 id: Some(short_digest.clone()),
                 // Empty, as Docker's once a layer's done (with its bytes,
                 // its CLI would draw a bar after it).
-                progress_detail: Some(ProgressDetail {}),
+                progress_detail: Some(ProgressDetail::default()),
                 ..Line::status(
                     if downloaded.is_some() {
                         "Pull complete"
@@ -299,6 +306,18 @@ impl Line {
                     }
                     .to_owned(),
                 )
+            },
+            Progress::Downloading {
+                short_digest,
+                have,
+                total,
+            } => Line {
+                id: Some(short_digest.clone()),
+                progress_detail: Some(ProgressDetail {
+                    current: Some(*have),
+                    total: Some(*total),
+                }),
+                ..Line::status("Downloading".to_owned())
             },
             Progress::Pushing { name } => {
                 let repository = ImageReference::parse(name).map_or_else(
@@ -312,7 +331,7 @@ impl Line {
             }
             Progress::Pushed { short_digest, sent } => Line {
                 id: Some(short_digest.clone()),
-                progress_detail: Some(ProgressDetail {}),
+                progress_detail: Some(ProgressDetail::default()),
                 ..Line::status(
                     if sent.is_some() {
                         "Pushed"
@@ -337,21 +356,31 @@ impl StreamedProgress {
         let gone = streams::gone(shared, &sender);
         Self { sender, gone }
     }
-
-    /// Writes `line` to the client: from the pull's blocking thread only
-    /// (`send` sleeps while the client is behind).
-    fn write(&self, line: &Line) -> std::io::Result<()> {
-        send(&self.sender, &self.gone, line.bytes())
-    }
 }
 
 impl Reporter for StreamedProgress {
     fn report(&self, message: Message) {
         if let Message::Progress(progress) = message {
             // A client gone: the pull goes on, unwritten.
-            let _ = self.write(&Line::of(&progress));
+            let _ = write_progress(&self.sender, &self.gone, &progress);
         }
     }
+}
+
+/// Writes `progress`'s line to the client, from the pull's blocking
+/// threads only (`send` sleeps while the client is behind). A layer's bytes as they come
+/// (`Downloading`) are offered once and dropped if the client is behind:
+/// they're told from inside the download's reads (F192), which a client
+/// that stopped reading (a terminal held with Ctrl-S) must never hold up,
+/// and the next, half a second later, says more. Every other line waits
+/// for room ([`send`]).
+fn write_progress(sender: &Sender, gone: &Gone, progress: &Progress) -> std::io::Result<()> {
+    let line = Line::of(progress);
+    if matches!(progress, Progress::Downloading { .. }) {
+        let _ = sender.try_send(line.bytes().into());
+        return Ok(());
+    }
+    send(sender, gone, line.bytes())
 }
 
 /// `POST /images/{name}/push` (`tag`; none, and the name none: every tag
@@ -402,7 +431,7 @@ pub(crate) fn push(shared: &Arc<Shared>, name: &str, query: &Query, headers: &He
                             name.size
                         )),
                         Line {
-                            progress_detail: Some(ProgressDetail {}),
+                            progress_detail: Some(ProgressDetail::default()),
                             aux: Some(PushAux {
                                 tag: plain(&name.tag),
                                 digest: name.digest.clone(),
