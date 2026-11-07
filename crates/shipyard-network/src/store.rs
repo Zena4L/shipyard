@@ -2026,14 +2026,10 @@ pub fn bridge_name(name: &str) -> String {
     if name == DEFAULT_NETWORK {
         return DEFAULT_BRIDGE.to_owned();
     }
-    format!("{DEVICE_PREFIX}-{:010x}", fnv1a(name.as_bytes()) >> 24)
-}
-
-/// FNV-1a, 64 bits: a stable hash, small enough to have here.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
+    format!(
+        "{DEVICE_PREFIX}-{:010x}",
+        shipyard_sys::hash::fnv1a(name.as_bytes()) >> 24
+    )
 }
 
 /// The hardware address for `ip`: `02:42` (locally administered, unicast)

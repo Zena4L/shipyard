@@ -2,12 +2,14 @@
 //! 14.1b): its size (its drum's fill) and what's at its top. A volume is a
 //! container's to fill, so both are bounded: its size walk stops past
 //! [`WALK`]'s entries, depth or waiting directories, at a mount inside it,
-//! or once the read's [`TIME`] is up, by descriptor and never through a
+//! or once its share of the read's [`TIME`] is up (F194), by descriptor and never through a
 //! link (`fsat`), and says when it stopped (`complete: false`: "at least");
 //! its listing reads at most [`SCANNED`] names of its top level and says the
 //! first [`MAX_LISTED`]. What's measured is `_data`, what its containers
 //! see (`system df` counts the volume's whole directory, its labels and
 //! markers too: a few bytes more).
+
+use std::time::Instant;
 
 use serde::Serialize;
 use shipyard_image::fsat::{self, Budget, EntryKind};
@@ -98,15 +100,14 @@ pub fn contents(engine: &Engine) -> Result<VolumeContents> {
     let listed = crate::docker::list_volumes(engine)?;
     let store = super::open(engine)?;
     let root = fsat::open_dir(store.root()).context("opening the volume store")?;
-    let budget = Budget {
-        until: Some(std::time::Instant::now() + TIME),
-        ..WALK
-    };
+    let end = Instant::now() + TIME;
     let mut warnings = listed.warnings.unwrap_or_default();
+    let count = listed.volumes.len();
     let volumes = listed
         .volumes
         .into_iter()
-        .map(|volume| {
+        .enumerate()
+        .map(|(index, volume)| {
             let mut content = VolumeContent {
                 name: volume.name,
                 created: volume.created_at,
@@ -125,6 +126,10 @@ pub fn contents(engine: &Engine) -> Result<VolumeContents> {
                 return content;
             };
             let data = std::ffi::OsStr::new("_data");
+            let budget = Budget {
+                until: Some(share_of(Instant::now(), end, count - index)),
+                ..WALK
+            };
             let taken = fsat::tree_usage_within(&dir, data, &budget);
             content.size = taken.bytes;
             content.complete = taken.complete;
@@ -151,6 +156,15 @@ pub fn contents(engine: &Engine) -> Result<VolumeContents> {
     })
 }
 
+/// When a volume's walk stops: an equal share of what's left of the read's
+/// time among the `left` volumes still to walk (F194), so one large volume
+/// early in the list can't leave every later one unwalked at every read;
+/// one that ends early leaves its time to the rest.
+fn share_of(now: Instant, end: Instant, left: usize) -> Instant {
+    let left = u32::try_from(left.max(1)).unwrap_or(u32::MAX);
+    now + end.saturating_duration_since(now) / left
+}
+
 /// A listed entry as the answer says it.
 fn file(entry: &fsat::Listed) -> VolumeFile {
     let name = entry.name.to_string_lossy();
@@ -170,6 +184,24 @@ fn file(entry: &fsat::Listed) -> VolumeFile {
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
     use super::*;
+
+    /// Each volume left gets an equal share of what's left of the time,
+    /// the last all of it; a read past its end gives none (F194).
+    #[test]
+    fn each_volume_gets_a_share_of_the_time() {
+        let now = Instant::now();
+        let end = now + std::time::Duration::from_secs(3);
+        assert_eq!(
+            share_of(now, end, 3),
+            now + std::time::Duration::from_secs(1)
+        );
+        assert_eq!(share_of(now, end, 1), end);
+        assert_eq!(share_of(now, end, 0), end);
+        assert_eq!(
+            share_of(end + std::time::Duration::from_secs(1), end, 2),
+            end + std::time::Duration::from_secs(1)
+        );
+    }
 
     /// A name that isn't UTF-8, or that looks like markup, is said as text,
     /// a long one shortened; each kind said in its word; the answer says

@@ -18,6 +18,7 @@ compile_error!("shipyard-sys only supports UNIX platforms (Linux, macOS)");
 pub mod fd;
 pub mod fdpass;
 pub mod fs;
+pub mod hash;
 pub mod hex;
 pub mod listen;
 pub mod lock;

@@ -583,6 +583,28 @@ impl Shared {
         .await;
         Ok(joined.map_err(|error| ApiError::internal(format!("the engine failed: {error}")))??)
     }
+
+    /// Runs `call` after the answer, on a blocking thread with an engine of
+    /// its own, counted as a call (the service ends neither idle nor stopped
+    /// before it), its failure logged as `what`'s: what a client needn't
+    /// wait for. Not run once the service is stopping.
+    fn call_after(
+        &self,
+        what: &'static str,
+        call: impl FnOnce(&Engine) -> shipyard_engine::Result<()> + Send + 'static,
+    ) {
+        let Some(busy) = self.idle.call() else {
+            tracing::warn!("{what} wasn't run: the service is stopping");
+            return;
+        };
+        let engine = Engine::new(self.paths.clone(), Arc::new(Collect::default()));
+        tokio::task::spawn_blocking(move || {
+            let _busy = busy;
+            if let Err(error) = call(&engine) {
+                tracing::warn!("{what} failed: {error}");
+            }
+        });
+    }
 }
 
 /// A request's JSON body, up to [`MAX_BODY`].
