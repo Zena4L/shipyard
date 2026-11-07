@@ -252,3 +252,42 @@ fn a_platform_is_named_as_buildkit_names_it() {
         assert_eq!(buildkit_platform(&platform), named, "{platform}");
     }
 }
+
+/// A store image is mentioned by its name as a word of its own, never as a
+/// part of another (F166): `app` isn't given to a Dockerfile of `myapp`'s
+/// or `app-base`'s, and a store full of short names can't fill the cap and
+/// leave out the one meant; it is given for `FROM app:1`, `FROM
+/// registry.example/app`, and an argument naming it (the controls).
+#[test]
+fn a_store_image_is_named_as_a_word_of_its_own() {
+    let images = [image("docker.io/library/app:1", 'a', None)];
+    for dockerfile in [
+        "FROM myapp\n",
+        "FROM app-base:2\n",
+        "FROM apps\n",
+        "FROM web.app\n",
+    ] {
+        assert!(
+            wanted(&images, dockerfile.as_bytes(), &[]).is_empty(),
+            "{dockerfile}"
+        );
+    }
+    for dockerfile in [
+        "FROM app:1\n",
+        "FROM registry.example/app\n",
+        "FROM app@sha256:aa\n",
+    ] {
+        assert_eq!(
+            wanted(&images, dockerfile.as_bytes(), &[]).len(),
+            1,
+            "{dockerfile}"
+        );
+    }
+    let named = [("BASE".to_owned(), "app:1".to_owned())];
+    assert_eq!(
+        wanted(&images, b"ARG BASE\nFROM ${BASE}\n", &named).len(),
+        1
+    );
+    let unnamed = [("BASE".to_owned(), "myapp:1".to_owned())];
+    assert!(wanted(&images, b"ARG BASE\nFROM ${BASE}\n", &unnamed).is_empty());
+}

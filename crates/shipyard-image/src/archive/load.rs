@@ -651,10 +651,30 @@ fn add_named(images: &mut Images, given: Vec<String>, manifest: Digest, index: O
             names.push(name);
         }
     }
+    // One image listed twice (`manifest.json` may name it in two entries):
+    // one image, its names merged (F165). Only through the same index: one
+    // manifest two indexes share stays an image each, so each name keeps
+    // the index it came through (the push guard reads it).
+    if let Some(had) = images
+        .found
+        .iter_mut()
+        .find(|had| had.manifest_digest == manifest && had.index_digest == index)
+    {
+        for name in names {
+            if !had.names.contains(&name) {
+                had.names.push(name);
+            }
+        }
+        return;
+    }
     if names.is_empty() {
         images.refused.push(LeftOut::Unnamed(manifest));
         return;
     }
+    // Named by a later entry: not left out after all.
+    images
+        .refused
+        .retain(|left| !matches!(left, LeftOut::Unnamed(unnamed) if *unnamed == manifest));
     let mut blobs: Vec<Digest> = index.iter().cloned().collect();
     blobs.push(manifest.clone());
     images.found.push(Found {

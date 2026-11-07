@@ -307,6 +307,121 @@ fn a_legacy_archive_gets_a_manifest_of_its_own() {
     );
 }
 
+/// An archive whose `manifest.json` lists one image twice, by two names
+/// (F165): one image, both its names, loaded whole; where the second
+/// entry once failed half way, its blobs already in the store.
+#[test]
+fn an_image_listed_twice_loads_once_by_both_names() {
+    let scratch = Scratch::new("twice");
+    let store = scratch.store();
+    let tar = tar_of("hello", b"twice");
+    let config = serde_json::to_vec(&serde_json::json!({
+        "architecture": host().architecture, "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [Digest::sha256(&tar).to_string()]},
+    }))
+    .unwrap();
+    let config_name = format!("{}.json", Digest::sha256(&config).hex());
+    let manifest_json = serde_json::to_vec(&serde_json::json!([
+        {"Config": config_name, "RepoTags": ["first:1"], "Layers": ["aaa/layer.tar"]},
+        {"Config": config_name, "RepoTags": ["second:1", "first:1"], "Layers": ["aaa/layer.tar"]},
+    ]))
+    .unwrap();
+    let archive = archive_of(&[
+        ("aaa/layer.tar", &tar[..]),
+        (config_name.as_str(), &config[..]),
+        ("manifest.json", &manifest_json[..]),
+    ]);
+    let mut read = load::read(&archive[..], &store).unwrap();
+    let images = read.images(&host()).unwrap();
+    assert_eq!(images.found.len(), 1, "{:?}", images.refused);
+    let found = &images.found[0];
+    let names: Vec<String> = found.names.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        names,
+        ["docker.io/library/first:1", "docker.io/library/second:1"]
+    );
+    let blobs = read.blobs_of(found).unwrap();
+    read.promote(&store, &blobs).unwrap();
+    assert!(store.read_blob(&found.manifest_digest, 1 << 20).is_ok());
+}
+
+/// One manifest two indexes share (one platform of two multi-platform
+/// images) is two images, each keeping the index it came through (F165's
+/// review: merged, one name would name the other's index). Both load when
+/// every image's blobs are read before any is moved into the store, as
+/// `load` does; read after the first's move, the shared manifest is gone
+/// from staging (the control: F165's own failure).
+#[test]
+fn a_manifest_two_indexes_share_loads_as_two_images() {
+    let scratch = Scratch::new("shared");
+    let store = scratch.store();
+    let tar = tar_of("hello", b"shared");
+    let config = serde_json::to_vec(&serde_json::json!({
+        "architecture": host().architecture, "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [Digest::sha256(&tar).to_string()]},
+    }))
+    .unwrap();
+    let config_name = format!("{}.json", Digest::sha256(&config).hex());
+    let manifest_json = serde_json::to_vec(&serde_json::json!([
+        {"Config": config_name, "RepoTags": ["shared:1"], "Layers": ["aaa/layer.tar"]},
+    ]))
+    .unwrap();
+    let archive = archive_of(&[
+        ("aaa/layer.tar", &tar[..]),
+        (config_name.as_str(), &config[..]),
+        ("manifest.json", &manifest_json[..]),
+    ]);
+    let mut read = load::read(&archive[..], &store).unwrap();
+    let first = read.images(&host()).unwrap().found.remove(0);
+    let mut second = first.clone();
+    second.index_digest = Some(Digest::sha256(b"another index"));
+    // The control: the first moved, the second's manifest is gone.
+    let first_blobs = read.blobs_of(&first).unwrap();
+    let mut early = load::read(&archive[..], &scratch.store()).unwrap();
+    let early_first = early.images(&host()).unwrap().found.remove(0);
+    early
+        .promote(&store, &early.blobs_of(&early_first).unwrap())
+        .unwrap();
+    assert!(
+        early.blobs_of(&early_first).is_err(),
+        "read again after its move"
+    );
+    // As `load` does it: both read first, then both moved.
+    let second_blobs = read.blobs_of(&second).unwrap();
+    read.promote(&store, &first_blobs).unwrap();
+    read.promote(&store, &second_blobs).unwrap();
+    assert!(store.read_blob(&first.manifest_digest, 1 << 20).is_ok());
+}
+
+/// An image whose first entry has no name and a later one has: loaded by
+/// that name, never also said left out (F165's review).
+#[test]
+fn an_image_named_by_a_later_entry_isn_t_left_out() {
+    let scratch = Scratch::new("named-later");
+    let store = scratch.store();
+    let tar = tar_of("hello", b"later");
+    let config = serde_json::to_vec(&serde_json::json!({
+        "architecture": host().architecture, "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [Digest::sha256(&tar).to_string()]},
+    }))
+    .unwrap();
+    let config_name = format!("{}.json", Digest::sha256(&config).hex());
+    let manifest_json = serde_json::to_vec(&serde_json::json!([
+        {"Config": config_name, "RepoTags": [], "Layers": ["aaa/layer.tar"]},
+        {"Config": config_name, "RepoTags": ["later:1"], "Layers": ["aaa/layer.tar"]},
+    ]))
+    .unwrap();
+    let archive = archive_of(&[
+        ("aaa/layer.tar", &tar[..]),
+        (config_name.as_str(), &config[..]),
+        ("manifest.json", &manifest_json[..]),
+    ]);
+    let mut read = load::read(&archive[..], &store).unwrap();
+    let images = read.images(&host()).unwrap();
+    assert_eq!(images.found.len(), 1);
+    assert!(images.refused.is_empty(), "{:?}", images.refused);
+}
+
 /// A hostile archive's members are names, never paths: a symlink or a
 /// hard link out of it, and files named outside, write nothing outside
 /// the store; a path that climbs is refused (the tar reader's rule). The

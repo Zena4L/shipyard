@@ -285,8 +285,16 @@ fn load_as(engine: &Engine, input: impl Read, names: Option<&[ImageReference]>) 
     let mut records: Vec<(String, ImageRecord)> = Vec::new();
     let mut shown: Vec<String> = Vec::new();
     let now = std::time::SystemTime::now();
-    for found in &images.found {
-        archive.promote(&store, &archive.blobs_of(found)?)?;
+    // Every image's blobs read before any is moved into the store: two
+    // that share a manifest (two indexes' one platform) read it from
+    // staging, which the first's move empties (F165).
+    let blobs = images
+        .found
+        .iter()
+        .map(|found| archive.blobs_of(found))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (found, blobs) in images.found.iter().zip(&blobs) {
+        archive.promote(&store, blobs)?;
         // By the manifest the archive's reading chose (an index of Docker
         // 25's carries one platform's blobs: chosen again from the index, it
         // might name another), then the index it came through.

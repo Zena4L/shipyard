@@ -113,6 +113,17 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **A rootless `build` with no delegated cgroup warns first that its `RUN` steps will
+  fail, and why** (and the fix, `systemd-run --user --scope shipyard …`; F174, step
+  15.2d), where BuildKit's `no cgroup mount found in mountinfo` at the first `RUN` came
+  with nothing tying it to the cause. A Dockerfile with no `RUN` still builds.
+- **A build gives BuildKit a store image only when its name is mentioned as a word of its
+  own** (F166): `app` isn't given to `FROM myapp` any more, so a store of short names
+  can't fill the 256 images given and leave out the one meant.
+- **A build waits 30 s for BuildKit to be ready, as it says** (F166), where a builder
+  that never got ready held it some 25 minutes.
+- **`load` of an archive that lists one image twice loads it once, by every name**
+  (F165), where it failed half way, the image's blobs already in the store.
 - **A container that joined another's network or IPC namespace is told when that one
   starts again by itself** (F136(a), step 15.2c2): it keeps the old, empty namespace, as
   Docker's does; `ps` now says `(no network)` / `(no shared IPC)`, `inspect --shipyard`
