@@ -21,6 +21,7 @@
 use std::io::Read;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::credentials::Credentials;
 use crate::digest::Digest;
@@ -35,6 +36,28 @@ use crate::unpack::{FreeSpace, UnpackError};
 
 /// The most layers downloaded at once.
 const MAX_PARALLEL_LAYERS: usize = 4;
+
+/// The longest a layer's bytes go unsaid while they come (F192): a client
+/// waiting on a big layer hears how far it got, a few lines a second at
+/// most whatever the registry sends.
+pub const PROGRESS_EVERY: Duration = Duration::from_millis(500);
+
+/// What a pull says of a layer as it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerProgress {
+    /// Its bytes are coming: `have` of its size received (a partial an
+    /// earlier pull left counted), said at most every
+    /// [`PROGRESS_EVERY`], the first at once.
+    Fetching {
+        /// The bytes received so far.
+        have: u64,
+    },
+    /// It's in the store: fetched (`true`), or there already.
+    Stored {
+        /// Whether it was fetched.
+        fetched: bool,
+    },
+}
 
 /// A pulled (or found) image: what it is, and where its pieces are.
 #[derive(Debug, Clone)]
@@ -152,9 +175,9 @@ pub struct PullOptions {
 }
 
 /// Pulls `image` for `platform` into `store`, from its registry, signing in
-/// with `credentials` if it asks. `downloaded` is told of each layer once
-/// it's in the store (fetched, or there already: then with `false`), from
-/// the download threads.
+/// with `credentials` if it asks. `progress` is told of each layer's bytes
+/// as they come and once it's in the store ([`LayerProgress`]), from the
+/// download threads.
 ///
 /// # Errors
 ///
@@ -167,10 +190,10 @@ pub fn pull(
     store: &Store,
     credentials: Credentials,
     options: PullOptions,
-    downloaded: &(dyn Fn(&Descriptor, bool) + Sync),
+    progress: &(dyn Fn(&Descriptor, LayerProgress) + Sync),
 ) -> Result<Pulled, PullError> {
     let registry = Registry::new(image.host()).with_credentials(credentials, &image.registry);
-    pull_with(image, platform, store, &registry, options, downloaded)
+    pull_with(image, platform, store, &registry, options, progress)
 }
 
 /// The body of [`pull`], taking an already-built [`Registry`] so tests can
@@ -185,7 +208,7 @@ pub fn pull_with(
     store: &Store,
     registry: &Registry,
     options: PullOptions,
-    downloaded: &(dyn Fn(&Descriptor, bool) + Sync),
+    progress: &(dyn Fn(&Descriptor, LayerProgress) + Sync),
 ) -> Result<Pulled, PullError> {
     let limit = crate::MANIFEST_SIZE_LIMIT;
     let top = registry.get_manifest(&image.repository, &image.manifest_path(), limit)?;
@@ -233,12 +256,12 @@ pub fn pull_with(
         store,
         recheck: options.recheck,
     };
-    fetch.blob(&manifest.config, &AtomicBool::new(false))?;
+    fetch.blob(&manifest.config, &AtomicBool::new(false), &|_| {})?;
     let config = ImageConfig::parse(&store.read_blob(&manifest.config.digest, limit)?)?;
     let image_platform = check_platform(&config, platform)?;
 
     check_space(store, &manifest.layers)?;
-    fetch.layers(&manifest.layers, downloaded)?;
+    fetch.layers(&manifest.layers, progress)?;
     Ok(Pulled {
         reference: image.clone(),
         platform: image_platform,
@@ -424,8 +447,14 @@ impl Fetch<'_> {
     /// matches.
     ///
     /// Once `stop` is set (another layer failed), the transfer ends at its
-    /// next read.
-    fn blob(&self, descriptor: &Descriptor, stop: &AtomicBool) -> Result<bool, PullError> {
+    /// next read. `tell` is told the bytes received as they come
+    /// ([`Said`]).
+    fn blob(
+        &self,
+        descriptor: &Descriptor,
+        stop: &AtomicBool,
+        tell: &dyn Fn(u64),
+    ) -> Result<bool, PullError> {
         let (store, digest) = (self.store, &descriptor.digest);
         if store.contains(digest) {
             if !self.recheck || store.check_blob(digest)? {
@@ -438,6 +467,7 @@ impl Fetch<'_> {
             tracing::debug!("{digest}: going on from byte {}", writer.have());
         }
         let mut restarted = false;
+        let mut said = Said::new(tell);
         loop {
             if writer.have() < descriptor.size {
                 self.registry.read_blob(
@@ -447,6 +477,7 @@ impl Fetch<'_> {
                     &mut Fetching {
                         writer: &mut writer,
                         stop,
+                        said: &mut said,
                     },
                 )?;
             }
@@ -466,14 +497,14 @@ impl Fetch<'_> {
     }
 
     /// Fetches every layer into the store, up to [`MAX_PARALLEL_LAYERS`] at
-    /// once, telling `downloaded` of each. A failure stops the workers from
+    /// once, telling `progress` of each. A failure stops the workers from
     /// starting more, and the transfers they're in; the first is returned.
     /// The workers are joined before this returns: no thread outlives the
     /// pull (a container is forked later).
     fn layers(
         &self,
         layers: &[Descriptor],
-        downloaded: &(dyn Fn(&Descriptor, bool) + Sync),
+        progress: &(dyn Fn(&Descriptor, LayerProgress) + Sync),
     ) -> Result<(), PullError> {
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
@@ -488,8 +519,9 @@ impl Fetch<'_> {
                         let Some(layer) = layers.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             return;
                         };
-                        match self.blob(layer, &failed) {
-                            Ok(fetched) => downloaded(layer, fetched),
+                        let tell = |have| progress(layer, LayerProgress::Fetching { have });
+                        match self.blob(layer, &failed, &tell) {
+                            Ok(fetched) => progress(layer, LayerProgress::Stored { fetched }),
                             Err(error) => {
                                 let _ = first_error.set(error);
                                 failed.store(true, Ordering::Relaxed);
@@ -504,13 +536,38 @@ impl Fetch<'_> {
 }
 
 /// A blob going into the store, as the registry client sees it: appends
-/// stop once `stop` is set.
-struct Fetching<'a> {
+/// stop once `stop` is set, and what's in the store is told to `said`.
+struct Fetching<'a, 'b> {
     writer: &'a mut BlobWriter,
     stop: &'a AtomicBool,
+    said: &'a mut Said<'b>,
 }
 
-impl BlobSink for Fetching<'_> {
+/// A blob's bytes received, told as they come: at once the first time,
+/// then at most every [`PROGRESS_EVERY`].
+struct Said<'a> {
+    tell: &'a dyn Fn(u64),
+    last: Option<Instant>,
+}
+
+impl<'a> Said<'a> {
+    fn new(tell: &'a dyn Fn(u64)) -> Self {
+        Self { tell, last: None }
+    }
+
+    /// `have` bytes are in the store at `now`: told if it's time.
+    fn have(&mut self, have: u64, now: Instant) {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_EVERY)
+        {
+            (self.tell)(have);
+            self.last = Some(now);
+        }
+    }
+}
+
+impl BlobSink for Fetching<'_, '_> {
     type Error = StoreError;
 
     fn have(&self) -> u64 {
@@ -522,25 +579,36 @@ impl BlobSink for Fetching<'_> {
     }
 
     fn append(&mut self, body: &mut dyn Read) -> Result<(), StoreError> {
+        let have = self.writer.have();
         self.writer.append(&mut Stoppable {
             inner: body,
             stop: self.stop,
+            have,
+            said: self.said,
         })
     }
 }
 
-/// A reader that fails once `stop` is set.
-struct Stoppable<'a, R> {
+/// A reader that fails once `stop` is set, and tells `said` the bytes
+/// received (`have`, from where its append began) as they're read.
+struct Stoppable<'a, 'b, R> {
     inner: R,
     stop: &'a AtomicBool,
+    have: u64,
+    said: &'a mut Said<'b>,
 }
 
-impl<R: Read> Read for Stoppable<'_, R> {
+impl<R: Read> Read for Stoppable<'_, '_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.stop.load(Ordering::Relaxed) {
             return Err(std::io::Error::other("stopped: another layer failed"));
         }
-        self.inner.read(buf)
+        let read = self.inner.read(buf)?;
+        if read > 0 {
+            self.have = self.have.saturating_add(read as u64);
+            self.said.have(self.have, Instant::now());
+        }
+        Ok(read)
     }
 }
 
@@ -597,14 +665,78 @@ mod tests {
     #[test]
     fn a_stopped_transfer_reads_no_more() {
         let stop = AtomicBool::new(false);
+        let mut said = Said::new(&|_| {});
         let mut reader = Stoppable {
             inner: &b"abcdef"[..],
             stop: &stop,
+            have: 0,
+            said: &mut said,
         };
         let mut buf = [0u8; 3];
         assert_eq!(reader.read(&mut buf).unwrap(), 3);
         stop.store(true, Ordering::Relaxed);
         assert!(reader.read(&mut buf).is_err());
+    }
+
+    /// A blob's transfer, going on from a partial an earlier pull left,
+    /// counts from the partial's bytes, not from zero.
+    #[test]
+    fn a_resumed_blob_counts_from_its_partial() {
+        let root =
+            std::env::temp_dir().join(format!("shipyard-pull-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let digest = Digest::sha256(b"0123456789");
+        let mut writer = store.begin_blob(&digest).unwrap();
+        writer.append(&mut &b"0123"[..]).unwrap();
+        let told = std::sync::Mutex::new(Vec::new());
+        let tell = |have| told.lock().unwrap().push(have);
+        let mut said = Said::new(&tell);
+        let mut sink = Fetching {
+            writer: &mut writer,
+            stop: &AtomicBool::new(false),
+            said: &mut said,
+        };
+        sink.append(&mut &b"456789"[..]).unwrap();
+        assert_eq!(*told.lock().unwrap(), [10]);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A transfer's bytes are counted from where its append began (a
+    /// partial's), the first read said at once.
+    #[test]
+    fn a_transfer_counts_from_where_it_began() {
+        let told = std::sync::Mutex::new(Vec::new());
+        let tell = |have| told.lock().unwrap().push(have);
+        let mut said = Said::new(&tell);
+        let mut reader = Stoppable {
+            inner: &b"abcdef"[..],
+            stop: &AtomicBool::new(false),
+            have: 10,
+            said: &mut said,
+        };
+        let mut buf = [0u8; 3];
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(*told.lock().unwrap(), [13]);
+    }
+
+    /// A blob's bytes are said at once the first time, then not again
+    /// until [`PROGRESS_EVERY`] has passed (F192: a fast registry is a few
+    /// lines a second, not one a read).
+    #[test]
+    fn a_blob_s_bytes_are_said_at_most_every_half_second() {
+        let told = std::sync::Mutex::new(Vec::new());
+        let tell = |have| told.lock().unwrap().push(have);
+        let mut said = Said::new(&tell);
+        let start = Instant::now();
+        said.have(100, start);
+        said.have(200, start + Duration::from_millis(10));
+        said.have(300, start + Duration::from_millis(499));
+        said.have(400, start + PROGRESS_EVERY);
+        said.have(500, start + PROGRESS_EVERY + Duration::from_millis(100));
+        said.have(600, start + PROGRESS_EVERY * 2);
+        assert_eq!(*told.lock().unwrap(), [100, 400, 600]);
     }
 
     #[test]
