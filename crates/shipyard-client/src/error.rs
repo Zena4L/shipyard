@@ -129,6 +129,22 @@ pub enum ErrorKind {
 }
 
 impl ClientError {
+    /// Whether nothing serves the socket at all (no socket, or nothing
+    /// listening on it), so a service may be started for it (F196): any
+    /// other failed connect (a live service's full backlog, `EAGAIN`) is
+    /// left to say itself.
+    #[must_use]
+    pub fn nothing_serves(&self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable { source, .. }
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+        )
+    }
+
     /// Its kind.
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
@@ -150,5 +166,26 @@ impl ClientError {
             | Self::Unsupported(_)
             | Self::Io(_) => ErrorKind::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only no socket, or nothing listening, is nothing serving: a full
+    /// backlog or another failure isn't (F196), nor is a failure that's no
+    /// connect's.
+    #[test]
+    fn only_no_listener_is_nothing_serving() {
+        let unreachable = |kind| ClientError::Unreachable {
+            path: PathBuf::from("/s"),
+            source: std::io::Error::from(kind),
+        };
+        assert!(unreachable(std::io::ErrorKind::NotFound).nothing_serves());
+        assert!(unreachable(std::io::ErrorKind::ConnectionRefused).nothing_serves());
+        assert!(!unreachable(std::io::ErrorKind::WouldBlock).nothing_serves());
+        assert!(!unreachable(std::io::ErrorKind::PermissionDenied).nothing_serves());
+        assert!(!ClientError::ServiceStart("x".to_owned()).nothing_serves());
     }
 }

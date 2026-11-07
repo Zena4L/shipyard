@@ -250,13 +250,45 @@ fn in_use_by(name: &str, users: &[String]) -> Error {
 
 /// `shipyard volume rm NAME`: refused while a container's record mounts
 /// it (running or not, as Docker's), naming them, or a run with no record
-/// holds it (the store's own message).
+/// holds it (the store's own message). [`trash`], then
+/// [`Trashed::delete`].
 ///
 /// # Errors
 ///
 /// Returns an error if the volume doesn't exist ([`ErrorKind::NotFound`]),
 /// is in use ([`ErrorKind::InUse`]), or can't be removed.
 pub fn remove(engine: &Engine, name: &str) -> Result<()> {
+    trash(engine, name)?.delete(engine)
+}
+
+/// A volume moved aside: gone as a volume (its `destroy` said), its tree
+/// still to delete. One never deleted (its process killed, or its delete
+/// failed) is swept by the next [`prune`]; one a prune finds while it's
+/// being deleted is deleted by both, each taking what the other removed
+/// as removed (`remove_tree_at`).
+#[derive(Debug)]
+#[must_use = "its tree is left until it's deleted"]
+pub struct Trashed(String);
+
+impl Trashed {
+    /// Deletes the tree: as long as its files take (F195: the API answers
+    /// before it).
+    ///
+    /// # Errors
+    ///
+    /// What deleting it ran into.
+    pub fn delete(self, engine: &Engine) -> Result<()> {
+        delete(engine, &[self.0])
+    }
+}
+
+/// The first half of [`remove`]: the volume, refused as [`remove`] says,
+/// moved aside under the container store's lock, and its `destroy` said.
+///
+/// # Errors
+///
+/// As [`remove`]'s, but deleting its tree.
+pub fn trash(engine: &Engine, name: &str) -> Result<Trashed> {
     let volumes = open(engine)?;
     // The check and the move aside under the container store's lock: a
     // container made meanwhile, naming it, can't come between (F56).
@@ -274,7 +306,7 @@ pub fn remove(engine: &Engine, name: &str) -> Result<()> {
     // Gone once moved aside: what's left to delete is no volume. Deleted
     // with the store's lock let go (the image store's lock comes first).
     crate::events::emit_about(engine, crate::events::Kind::Volume, "destroy", name);
-    delete(engine, &[trash])
+    Ok(Trashed(trash))
 }
 
 /// What `volume prune` did.
@@ -381,24 +413,26 @@ pub fn prune_where(
     })
 }
 
-/// Deletes volumes moved aside, under the store's shared lock: in this
-/// process first (most files are the caller's); what's left, files a
-/// rootless container wrote as its other users (owned by subordinate IDs),
-/// through the storage helper.
+/// Deletes volumes moved aside: in this process first (most files are the
+/// caller's), with no lock held: the trash is no image's, and a tree of
+/// millions of files would hold up an image collection's exclusive lock
+/// for as long (F195: the API deletes after its answer, and a client's
+/// next `rmi` is at once); what's left, files a rootless container wrote
+/// as its other users (owned by subordinate IDs), through the storage
+/// helper, under the store's shared lock as the helper is run.
 fn delete(engine: &Engine, trash: &[String]) -> Result<()> {
     if trash.is_empty() {
         return Ok(());
     }
     let store = crate::image::open_store(engine)?;
-    let held = store.lock(shipyard_image::LockMode::Shared, shipyard_image::USE_WAIT)?;
     let in_process = remove_trash(store.root(), trash);
     #[cfg(target_os = "linux")]
     if let Err(err) = &in_process {
+        let held = store.lock(shipyard_image::LockMode::Shared, shipyard_image::USE_WAIT)?;
         return crate::image::through_helper(&store, &held, err, || {
             crate::image::Request::RemoveVolumes(trash.to_vec())
         });
     }
-    let _ = held;
     in_process
 }
 
@@ -456,6 +490,47 @@ mod tests {
         remove(&engine, "data").unwrap();
         assert!(list(&engine).unwrap().is_empty());
         assert!(collect.events().is_empty(), "{:?}", collect.events());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// `trash` leaves a volume gone but its tree in the trash, with no
+    /// image store lock held (F195: the API answers then), its `destroy`
+    /// said; `Trashed::delete` takes the tree; a leftover is the next
+    /// prune's.
+    #[test]
+    fn a_trashed_volume_is_gone_and_its_tree_deleted_after() {
+        let (engine, parent) = engine_with_records("volume-trash");
+        let volumes = open(&engine).unwrap();
+        for name in ["data", "left"] {
+            create(&engine, name).unwrap();
+            std::fs::create_dir(volumes.data_path(name).unwrap().join("a")).unwrap();
+            std::fs::write(volumes.data_path(name).unwrap().join("a/f"), "x").unwrap();
+        }
+        let in_trash = || std::fs::read_dir(volumes.trash_dir()).unwrap().count();
+        let trashed = trash(&engine, "data").unwrap();
+        assert_eq!(
+            inspect(&engine, "data").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(in_trash(), 1);
+        // Nothing holds the image store's lock meanwhile: a collection's
+        // exclusive lock is had at once.
+        let store = crate::image::open_store(&engine).unwrap();
+        drop(
+            store
+                .lock(
+                    shipyard_image::LockMode::Exclusive,
+                    std::time::Duration::ZERO,
+                )
+                .unwrap(),
+        );
+        trashed.delete(&engine).unwrap();
+        assert_eq!(in_trash(), 0);
+        // One never deleted (its process killed): the next prune's.
+        drop(trash(&engine, "left").unwrap());
+        assert_eq!(in_trash(), 1);
+        prune(&engine).unwrap();
+        assert_eq!(in_trash(), 0);
         let _ = std::fs::remove_dir_all(&parent);
     }
 

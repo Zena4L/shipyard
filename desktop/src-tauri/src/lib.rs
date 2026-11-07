@@ -182,10 +182,11 @@ impl Core {
         let settings = self.settings().await;
         let endpoint = place::api_endpoint(&settings).map_err(said)?;
         let connected = match Client::connect(&endpoint).await {
-            // Linux: nothing answers on the user's socket: the service
-            // started by `shipyard` (the CLI's own rule, F190), once, under
-            // this lock, then asked again.
-            Err(error) if cfg!(target_os = "linux") && error.kind() == ErrorKind::Unreachable => {
+            // Linux: nothing serves the user's socket: the service started
+            // by `shipyard` (the CLI's own rule, F190), once, under this
+            // lock, then asked again. A live one that didn't take the
+            // connect (its backlog full) is said, never started over (F196).
+            Err(error) if cfg!(target_os = "linux") && error.nothing_serves() => {
                 let shipyard = place::shipyard(&settings).map_err(said)?;
                 shipyard_client::service::ensure(&shipyard, endpoint.path())
                     .await

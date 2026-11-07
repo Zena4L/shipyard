@@ -31,8 +31,17 @@ compose's). If nothing serves that socket yet (systemd's `shipyard.socket` isn't
 installed: see [the API](api.md)), it starts `shipyard system service` itself; that
 service ends once nothing has asked it anything for 60 seconds, so nothing is left
 running (its output goes to `service.log` beside the socket, moved aside to
-`service.log.1` once it passes 4 MiB). With the socket units installed, systemd starts
-it instead.
+`service.log.1` once it passes 4 MiB). Rootless, run from your desktop session (where
+your systemd user manager runs, and runs it), it's started as a unit of that manager's
+(`systemd-run --user`, `shipyard-api-….service`), so it runs with the manager's
+resource limits and `PATH`, not your terminal's: a Docker credential helper or `pasta`
+must be on the manager's `PATH` (`systemctl --user show-environment`). It's given
+Shipyard's own variables (`SHIPYARD_…`), `DOCKER_CONFIG`, `XDG_DATA_HOME`,
+`XDG_CONFIG_HOME`, `RUST_LOG`, the proxies (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`,
+`ALL_PROXY`, in either case) and `SSL_CERT_FILE`/`SSL_CERT_DIR`, and no others. If the
+manager can't start it within 5 seconds, it's started as before, as your command's
+(`service.log` says why). From an SSH login or a container (a toolbox), it's started as
+before. With the socket units installed, systemd starts it instead.
 
 `docker compose` can also be run directly, with `DOCKER_HOST` set as above.
 

@@ -3176,6 +3176,43 @@ fn volumes_are_docker_s() {
     );
 }
 
+/// A volume's deletion answers once it's no volume and deletes its files
+/// after (F195): the answer says it's gone, and its moved-aside tree goes.
+#[test]
+fn a_deleted_volume_s_files_go_after_the_answer() {
+    let Some(stores) = Stores::new() else { return };
+    let socket = stores.socket();
+    let _service = stores.serve(60);
+    stores.docker_ok(&["volume", "create", "many"]);
+    let mountpoint = stores.docker_ok(&["volume", "inspect", "-f", "{{.Mountpoint}}", "many"]);
+    let ran = stores.shipyard(&[
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--volume",
+        "many:/d",
+        &stores.image,
+        "sh",
+        "-c",
+        "mkdir /d/a && for i in $(seq 1 200); do echo $i > /d/a/$i; done",
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    let trash = std::path::Path::new(&mountpoint)
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join(".trash");
+
+    let raw = api::request(&socket, "DELETE", "/volumes/many", None).unwrap();
+    assert_eq!(raw.status, 204, "{}", raw.text());
+    assert_eq!(api::get(&socket, "/volumes/many").unwrap().status, 404);
+    assert!(!std::path::Path::new(&mountpoint).exists());
+    eventually(Duration::from_secs(10), "its tree deleted", || {
+        std::fs::read_dir(&trash).is_ok_and(|mut entries| entries.next().is_none())
+    });
+}
+
 /// A volume prune takes only anonymous volumes unless asked for all, and
 /// never one a container mounts; it says the bytes it frees. What Shipyard
 /// can't make is refused.
@@ -4976,20 +5013,24 @@ fn the_desktop_client_reads_the_images() {
 fn system_service_ensure_starts_one_service() {
     let Some(stores) = Stores::new() else { return };
     let socket = stores.socket();
-    // The services serving `socket`: each `system service --socket SOCKET`.
-    let services = |socket: &std::path::Path| {
+    // The services serving `socket`: each `system service --socket SOCKET`,
+    // by its `/proc/PID`.
+    let serving = |socket: &std::path::Path| -> Vec<std::path::PathBuf> {
         let wanted = socket.as_os_str().as_encoded_bytes();
         std::fs::read_dir("/proc")
             .unwrap()
-            .filter_map(|entry| std::fs::read(entry.ok()?.path().join("cmdline")).ok())
-            .filter(|line| {
+            .filter_map(|entry| {
+                let dir = entry.ok()?.path();
+                let line = std::fs::read(dir.join("cmdline")).ok()?;
                 let args: Vec<&[u8]> = line.split(|byte| *byte == 0).collect();
-                args.contains(&b"service".as_slice())
+                (args.contains(&b"service".as_slice())
                     && !args.contains(&b"--ensure".as_slice())
-                    && args.contains(&wanted)
+                    && args.contains(&wanted))
+                .then_some(dir)
             })
-            .count()
+            .collect()
     };
+    let services = |socket: &std::path::Path| serving(socket).len();
     let ensure = |socket: &std::path::Path| {
         stores
             .command(&["system", "service", "--ensure", "--socket"])
@@ -5009,6 +5050,15 @@ fn system_service_ensure_starts_one_service() {
     assert!(first.stdout.is_empty());
     assert_eq!(api::get(&socket, "/_ping").unwrap().status, 200);
     assert_eq!(services(&socket), 1);
+    // Where the user's systemd manager runs, a unit of its own (F198):
+    // not the caller's session's limits and `PATH`.
+    let managed = !is_root()
+        && std::env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|dir| std::path::Path::new(&dir).join("systemd/private").exists())
+        && shipyard_sys::path::find_program("systemd-run", std::env::var_os("PATH").as_deref())
+            .is_some();
+    let cgroup = std::fs::read_to_string(serving(&socket)[0].join("cgroup")).unwrap();
+    assert_eq!(cgroup.contains("/shipyard-api-"), managed, "{cgroup}");
     let second = ensure(&socket);
     assert!(
         second.status.success(),

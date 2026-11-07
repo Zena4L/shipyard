@@ -203,10 +203,32 @@ fn classify(dir: &OwnedFd, name: &OsStr, errno: Errno) -> WalkError {
 /// search a directory (a layer's `0555` or `0000` ones, removed by their
 /// owner without `CAP_DAC_OVERRIDE`), it first gives the owner `rwx`.
 ///
+/// Another removal of the same tree at once (a prune's sweep beside a
+/// volume's deletion, F195) is no failure: what it removed first is taken
+/// as removed. A directory it removed from under this walk reads as empty
+/// on Linux (libc's `readdir` takes the kernel's `ENOENT` for a dead
+/// directory as its end); where it's refused instead (macOS), the walk
+/// starts again from `name`, at most [`RESTARTS`] times.
+///
 /// # Errors
 ///
 /// The errno of the step that failed.
 pub fn remove_tree_at(dir: &OwnedFd, name: &OsStr) -> nix::Result<()> {
+    let mut restarts = 0;
+    loop {
+        match remove_tree_once(dir, name) {
+            Err(Errno::ENOENT) if restarts < RESTARTS => restarts += 1,
+            removed => return removed,
+        }
+    }
+}
+
+/// How many times [`remove_tree_at`] starts again when a directory goes
+/// from under it.
+const RESTARTS: u32 = 64;
+
+/// One walk of [`remove_tree_at`]'s.
+fn remove_tree_once(dir: &OwnedFd, name: &OsStr) -> nix::Result<()> {
     let Some(stat) = stat_at(dir, name)? else {
         return Ok(());
     };
@@ -796,6 +818,41 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Two removals of one tree at once (a prune's sweep beside a volume's
+    /// deletion, F195) both succeed and leave nothing: a directory one
+    /// removes from under the other's walk reads as empty to it (Linux), or
+    /// starts that walk again (macOS, where the race is lost without it).
+    #[test]
+    fn two_removals_of_one_tree_at_once_both_succeed() {
+        let scratch = Scratch::new("twice");
+        for round in 0..150 {
+            // A deep, narrow chain: a remover behind another on the way up
+            // comes back to directories the other has removed.
+            let name = format!("tree-{round}");
+            let mut dir = scratch.0.join(&name);
+            for depth in 0..100 {
+                dir = dir.join(format!("d{depth}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("f"), "").unwrap();
+            }
+            let removers = 4;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(removers));
+            let removing: Vec<_> = (0..removers)
+                .map(|_| {
+                    let (fd, name, barrier) = (scratch.fd(), name.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        remove_tree_at(&fd, OsStr::new(&name))
+                    })
+                })
+                .collect();
+            for remover in removing {
+                assert_eq!(remover.join().unwrap(), Ok(()), "round {round}");
+            }
+            assert!(!scratch.0.join(&name).exists());
         }
     }
 

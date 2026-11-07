@@ -206,6 +206,22 @@ behaviour; each change is listed here).
 - **The login password prompt left the terminal without echo** when `shipyard` was killed
   meanwhile (SIGTERM, SIGHUP) or panicked: it uses the runtime's raw mode, which puts the
   terminal back in either case (F201).
+- **The desktop UI's Volumes section said a large volume early in the list at its full
+  size and every later one at 0** ("at least"): one walk's 3 seconds went to the first.
+  Each volume now gets a share of what's left (F194).
+- **Deleting a volume of millions of files through the API timed out in the desktop
+  app** though the volume was gone, and "Delete N unused" stopped there: the API now
+  answers once the volume is gone and deletes its files after, holding no image store
+  lock, so a `docker rmi` right after isn't kept waiting (F195).
+- **The desktop app on Linux took a busy service for none**: a live service whose
+  backlog was full got a second start, which waited until the app gave up. Only no
+  socket, or nothing listening, starts one now, and the check never waits (F196).
+- **The API service the desktop app or `shipyard compose` starts ran with its starter's
+  session** (a desktop's resource limits, its `PATH`), and so did the containers made
+  through it. Rootless, under a systemd user manager, it's started as a unit of that
+  manager's (`systemd-run --user`), with Shipyard's, Docker's config's, the proxies' and
+  the certificates' variables; a launch that fails within 5 seconds falls back to the
+  old start (F198).
 
 ### Security
 

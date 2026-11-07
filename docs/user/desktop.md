@@ -28,9 +28,11 @@ It isn't packaged yet: you run it from the source tree (below).
   (`sudo shipyard …`) aren't shown: the rail says "Shows: your own", and Settings
   says why. Rootless, the map can't see the connections between containers (each
   has a network of its own, through pasta), and the Networks section has no bridge
-  networks: both say so. The service the app starts runs with the app's session (its
-  resource limits, its `PATH` for credential helpers) until it ends, idle: a container
-  made through it meanwhile, from the app or a terminal, gets that session's limits.
+  networks: both say so. Where your systemd user manager runs, the service the app
+  starts is a unit of that manager's (as [`shipyard compose`](compose.md) starts it),
+  with its limits and `PATH`, not the app's session's; without one, it runs with the
+  app's session's until it ends, idle, and a container made through it meanwhile gets
+  those limits.
 - **The Map** (the view it opens on) draws your containers left to right by
   what depends on what, starting from the ports they publish on your Mac (or
   Linux host):

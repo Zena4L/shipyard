@@ -94,11 +94,16 @@ pub(crate) async fn inspect(shared: &Arc<Shared>, name: String) -> Reply {
 pub(crate) async fn remove(shared: &Arc<Shared>, name: String, query: &Query) -> Reply {
     let force = query.flag("force");
     let shown = name.clone();
-    let removed = shared
-        .call(move |engine| shipyard_engine::volumes::remove(engine, &name))
+    let trashed = shared
+        .call(move |engine| shipyard_engine::volumes::trash(engine, &name))
         .await;
-    match removed {
-        Ok(_) => Ok(reply::empty(StatusCode::NO_CONTENT)),
+    match trashed {
+        // Answered once it's no volume: its tree, perhaps millions of
+        // files, is deleted after (F195).
+        Ok((trashed, _)) => {
+            shared.call_after("a volume's deletion", move |engine| trashed.delete(engine));
+            Ok(reply::empty(StatusCode::NO_CONTENT))
+        }
         Err(error) if error.status == StatusCode::NOT_FOUND && force => {
             Ok(reply::empty(StatusCode::NO_CONTENT))
         }
