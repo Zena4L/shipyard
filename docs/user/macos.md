@@ -78,7 +78,8 @@ Memory takes `8g`, `6144m` and the like (Docker's `--memory` spellings); a VM ma
 keeps its size until it stops (`shipyard vm stop`); `vm status` says what the next start
 takes, the host's log (`host.log`) what this one took. The size is kept in `vm.json` in the
 VM's folder; one that can't be read is said in that log and the default used (`vm set`
-writes a new one). **The memory the VM has used isn't
+writes a new one; one a newer `shipyard` wrote it refuses, as it may hold what this one
+can't keep). **The memory the VM has used isn't
 given back to macOS while it runs:** Virtualization.framework's memory balloon was
 measured and gave nothing back, so the VM holds what its containers have touched until it
 stops (an idle stop included). Give it less with `vm set` if your Mac needs the room.
@@ -334,7 +335,9 @@ docker --context shipyard ps
   runs Shipyard once as it loads the agent, at install and at each login, only to make
   the socket). `shipyard vm uninstall` undoes it; run `vm install` again after moving
   `shipyard` (`shipyard doctor` says when the agent runs another binary). launchd starts
-  it at most every 10 seconds, so a `docker` right after a stop may wait that long.
+  it at most every 10 seconds, so a `docker` right after a stop may wait that long. A VM
+  another `shipyard` command started while `vm install` ran, without launchd, is warned
+  of: `docker` is refused until it stops (`shipyard vm stop`).
   `shipyard` must live outside the folders macOS guards (Desktop, Documents, Downloads,
   iCloud Drive), as in `/usr/local/bin`: launchd's programs read there only with your
   permission, so `vm install` refuses a `shipyard` (or a guest) there. In a VM launchd

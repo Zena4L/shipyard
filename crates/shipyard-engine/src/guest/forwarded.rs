@@ -16,9 +16,14 @@ use shipyard_runtime::attach::forward::{self, Protocol, PublishedPort};
 
 /// How often the container's address is looked up again: one that changed
 /// (the container restarted, another took its address) drops every socket,
-/// never sending to an address no longer its. A new peer's socket looks it
-/// up as it's made.
+/// never sending to an address no longer its. A new peer's socket takes
+/// the address looked up last (F185).
 const RECHECK: Duration = Duration::from_secs(2);
+
+/// How soon a new peer has the address looked up again while there's none
+/// (the container starting): its first datagrams wait no [`RECHECK`], and a
+/// spray of new peers costs ten scans a second at most.
+const RECHECK_WITHOUT: Duration = Duration::from_millis(100);
 
 /// How often the relay looks again with nothing to do (idle sockets, the
 /// address).
@@ -146,13 +151,16 @@ impl<F: FnMut() -> Option<SocketAddr>> Relay<F> {
     }
 
     /// Sends `datagram`, the Mac peer `id`'s, to the container: on its
-    /// socket, made now (the address looked up first) if it has none, the
-    /// least recently heard let go past [`forward::MAX_UDP_PEERS`]. Dropped
-    /// when there's no address or socket for it, or the send fails (UDP's
-    /// own losses: a closed port, a datagram too long).
+    /// socket, made now if it has none, to the address looked up last (F185:
+    /// a spray of new source ports costs no lease-store scan each; with
+    /// none, looked up again past [`RECHECK_WITHOUT`]), the least recently
+    /// heard let go past [`forward::MAX_UDP_PEERS`]. Dropped when there's
+    /// no address or socket for it, or the send fails (UDP's own losses: a
+    /// closed port, a datagram too long).
     fn send_on(&mut self, id: u32, datagram: &[u8]) {
         if !self.peers.contains_key(&id) {
-            self.recheck(true);
+            let soon = self.address.is_none() && self.checked.elapsed() >= RECHECK_WITHOUT;
+            self.recheck(soon);
             let Some(to) = self.address else {
                 return;
             };
@@ -210,8 +218,8 @@ fn ready(fd: &nix::poll::PollFd<'_>) -> bool {
 }
 
 /// Relays the Mac's datagrams on `stream` (`unread` first) to the
-/// container at `target` (asked again every [`RECHECK`], and for each new
-/// peer), and its answers back, until the stream ends, breaks, or leaves a
+/// container at `target` (asked again every [`RECHECK`]), and its answers
+/// back, until the stream ends, breaks, or leaves a
 /// frame unfinished past [`forward::FRAME_WAIT`]. Neither way ever waits on
 /// the stream (13.8c: a relay that waited to write while the Mac did the
 /// same stalled both); a datagram that can't be sent is dropped, as UDP
@@ -361,6 +369,59 @@ mod tests {
             port,
             protocol,
         }
+    }
+
+    /// New peers within [`RECHECK`] go to the address already looked up:
+    /// a hundred new source ports cost no lease-store scan each (F185).
+    #[test]
+    fn new_peers_take_the_address_already_looked_up() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let looked = std::cell::Cell::new(0_u32);
+        let mut relay = Relay {
+            peers: HashMap::new(),
+            address: None,
+            checked: Instant::now(),
+            target: || {
+                looked.set(looked.get() + 1);
+                Some(address)
+            },
+        };
+        relay.recheck(true);
+        for id in 0..100 {
+            relay.send_on(id, b"x");
+        }
+        assert_eq!(relay.peers.len(), 100);
+        assert_eq!(looked.get(), 1, "looked up for each new peer");
+    }
+
+    /// With no address yet (the container starting), a new peer has it
+    /// looked up again once [`RECHECK_WITHOUT`] has passed, not a whole
+    /// [`RECHECK`]; and no sooner, however many new peers come.
+    #[test]
+    fn a_new_peer_without_an_address_looks_again_soon() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let looked = std::cell::Cell::new(0_u32);
+        let mut relay = Relay {
+            peers: HashMap::new(),
+            address: None,
+            checked: Instant::now(),
+            target: || {
+                looked.set(looked.get() + 1);
+                (looked.get() > 1).then_some(address)
+            },
+        };
+        relay.recheck(true);
+        for id in 0..50 {
+            relay.send_on(id, b"x");
+        }
+        assert_eq!((looked.get(), relay.peers.len()), (1, 0), "too soon");
+        relay.checked = Instant::now()
+            .checked_sub(RECHECK_WITHOUT + Duration::from_millis(1))
+            .unwrap();
+        relay.send_on(50, b"x");
+        assert_eq!((looked.get(), relay.peers.len()), (2, 1));
     }
 
     /// A publish on every address goes to the container's IPv4 (with IPv6

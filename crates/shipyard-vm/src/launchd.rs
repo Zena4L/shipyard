@@ -181,8 +181,42 @@ fn domain() -> String {
 /// What `launchctl` did: whether it worked, what it printed, what it said.
 struct Said {
     worked: bool,
+    /// Its exit code (none: killed past its bound, or by a signal).
+    code: Option<i32>,
     out: String,
     err: String,
+}
+
+/// `launchctl print`'s exit for a service it doesn't have ("Could not find
+/// service", checked on macOS 27).
+const NOT_FOUND: i32 = 113;
+
+/// `launchctl print`'s exit for a domain it doesn't have (no `gui/UID`: a
+/// session with no one logged in at the Mac, as over SSH; macOS 27).
+const NO_DOMAIN: i32 = 112;
+
+/// Whether launchd has a job, as `launchctl print` says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    /// It has it.
+    Loaded,
+    /// It says it hasn't ([`NOT_FOUND`], [`NO_DOMAIN`]).
+    Absent,
+    /// It couldn't say: `launchctl` failed otherwise, or didn't answer.
+    Unknown,
+}
+
+impl Presence {
+    /// What `said` (`launchctl print`'s answer) says.
+    fn of(said: &Said) -> Self {
+        if said.worked {
+            Self::Loaded
+        } else if matches!(said.code, Some(NOT_FOUND | NO_DOMAIN)) {
+            Self::Absent
+        } else {
+            Self::Unknown
+        }
+    }
 }
 
 /// `launchctl ARGS`, its output kept.
@@ -202,12 +236,14 @@ fn launchctl_within(args: &[&str], limit: Duration) -> Result<Said, VmError> {
     let Some(output) = output else {
         return Ok(Said {
             worked: false,
+            code: None,
             out: String::new(),
             err: format!("launchctl didn't answer within {} s", limit.as_secs()),
         });
     };
     Ok(Said {
         worked: output.status.success(),
+        code: output.status.code(),
         out: String::from_utf8_lossy(&output.stdout).into_owned(),
         err: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
@@ -215,7 +251,56 @@ fn launchctl_within(args: &[&str], limit: Duration) -> Result<Said, VmError> {
 
 /// Whether launchd has the agent `label` loaded.
 fn has(label: &str) -> bool {
-    launchctl(&["print", &target(label)]).is_ok_and(|said| said.worked)
+    presence(label) == Presence::Loaded
+}
+
+/// [`Presence`] of the job `label`.
+fn presence(label: &str) -> Presence {
+    launchctl(&["print", &target(label)]).map_or(Presence::Unknown, |said| Presence::of(&said))
+}
+
+/// How the CLI starts the VM's host: through launchd (a kick) when its
+/// agent is loaded, or launchd can't say with the agent installed (F182: a
+/// failed or slow `print` once made the CLI spawn a host beside launchd's,
+/// whose own host then answered every `docker` 503); else spawned. One
+/// `launchctl print` says both that and the job.
+pub(crate) fn starter(paths: &VmPaths) -> Starter {
+    let said = launchctl(&["print", &target(&label_of(paths))]).ok();
+    let presence = said.as_ref().map_or(Presence::Unknown, Presence::of);
+    if !through_launchd(presence, installed(paths)) {
+        return Starter::Spawn;
+    }
+    Starter::Launchd {
+        job: said
+            .filter(|said| said.worked)
+            .and_then(|said| job_from(&said.out)),
+        sure: presence == Presence::Loaded,
+    }
+}
+
+/// [`starter`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Starter {
+    /// Through launchd: its job as it said it, and whether it said it has
+    /// it (`false`: it couldn't say, so a kick it refuses leaves the start
+    /// to the CLI).
+    Launchd {
+        /// The job, if launchd said it.
+        job: Option<Job>,
+        /// Whether launchd said it has the agent.
+        sure: bool,
+    },
+    /// The CLI spawns its own.
+    Spawn,
+}
+
+/// [`starts_the_host`]'s rule.
+fn through_launchd(presence: Presence, installed: bool) -> bool {
+    match presence {
+        Presence::Loaded => true,
+        Presence::Absent => false,
+        Presence::Unknown => installed,
+    }
 }
 
 /// Whether the agent of the VM at `paths` is installed (its plist is
@@ -237,15 +322,21 @@ pub enum AgentState {
     Loaded,
 }
 
-/// Where the agent for `paths` stands.
+/// Where the agent for `paths` stands. launchd unable to say, with the
+/// agent installed, is taken as loaded, as a start takes it ([`starter`]):
+/// never "not loaded", which would send the user to install it again.
 #[must_use]
 pub fn state(paths: &VmPaths) -> AgentState {
-    if loaded(paths) {
-        AgentState::Loaded
-    } else if installed(paths) {
-        AgentState::NotLoaded
-    } else {
-        AgentState::NotInstalled
+    agent_state(presence(&label_of(paths)), installed(paths))
+}
+
+/// [`state`]'s rule.
+fn agent_state(presence: Presence, installed: bool) -> AgentState {
+    match presence {
+        Presence::Loaded => AgentState::Loaded,
+        Presence::Unknown if installed => AgentState::Loaded,
+        _ if installed => AgentState::NotLoaded,
+        _ => AgentState::NotInstalled,
     }
 }
 
@@ -295,6 +386,11 @@ fn older(agent: &plist::Dictionary) -> bool {
 pub const OLDER_AGENT: &str = "launchd's agent was installed by an older shipyard, whose stop \
                                launchd would cut short at a logout: `shipyard vm install` again";
 
+/// What `vm install` says of a host started meanwhile, without launchd
+/// ([`Installed::held_meanwhile`]).
+pub const HELD_MEANWHILE: &str = "a VM started meanwhile, without launchd, holds this VM: \
+                                  `docker` is refused until it stops (shipyard vm stop)";
+
 /// What to do about an agent installed but not loaded (`vm status`'s and
 /// `doctor`'s words).
 pub const NOT_LOADED: &str = "launchd's agent is installed but not loaded, so nothing serves \
@@ -341,13 +437,18 @@ fn job_from(printed: &str) -> Option<Job> {
     })
 }
 
-/// What `shipyard vm install` did: the agent's label and its file.
+/// What `shipyard vm install` did: the agent's label and its file, and
+/// whether a host started meanwhile holds the VM.
 #[derive(Debug)]
 pub struct Installed {
     /// The agent's label.
     pub label: String,
     /// Its property list.
     pub plist: PathBuf,
+    /// A host launchd didn't start held the VM once it was installed (a
+    /// command started one meanwhile, F180(e)): it leaves Docker's socket to
+    /// launchd, whose own hosts are refused until it stops.
+    pub held_meanwhile: bool,
 }
 
 /// Writes the agent for `paths` and loads it (one loaded before taken out
@@ -419,7 +520,23 @@ pub fn install(paths: &VmPaths, at_login: bool) -> Result<Installed, VmError> {
             crate::client::last_lines(&paths.host_log(), 3)
         )));
     }
-    Ok(Installed { label, plist: file })
+    let held_meanwhile = held_meanwhile(
+        crate::client::status(paths).ok(),
+        job(paths).map(|job| job.running),
+    );
+    Ok(Installed {
+        label,
+        plist: file,
+        held_meanwhile,
+    })
+}
+
+/// Whether a host launchd didn't start holds the VM, as its `status` and
+/// launchd's job (whether it runs) say once the agent is loaded: launchd's
+/// own run at load ends before taking the lock, so a held lock is a host's,
+/// and launchd's if its job runs. Either unknown: not said.
+fn held_meanwhile(status: Option<crate::client::Status>, launchd_runs: Option<bool>) -> bool {
+    matches!(status, Some(crate::client::Status::Running(_))) && launchd_runs == Some(false)
 }
 
 /// `launchctl bootstrap` of `file`, tried again once a moment after a
@@ -791,5 +908,84 @@ mod tests {
         };
         assert!(matches!(socket_from(0, held(1), 1), Ok(Some(_))));
         assert!(matches!(socket_from(0, held(2), 2), Err(VmError::Host(_))));
+    }
+
+    /// `launchctl print`'s answer told apart (F182): it worked, loaded; its
+    /// "not found" exit, absent; any other failure, or none at all, unknown.
+    #[test]
+    fn launchd_s_answer_is_told_apart() {
+        let said = |worked, code| Said {
+            worked,
+            code,
+            out: String::new(),
+            err: String::new(),
+        };
+        assert_eq!(Presence::of(&said(true, Some(0))), Presence::Loaded);
+        assert_eq!(
+            Presence::of(&said(false, Some(NOT_FOUND))),
+            Presence::Absent
+        );
+        assert_eq!(
+            Presence::of(&said(false, Some(NO_DOMAIN))),
+            Presence::Absent
+        );
+        assert_eq!(Presence::of(&said(false, Some(1))), Presence::Unknown);
+        assert_eq!(Presence::of(&said(false, None)), Presence::Unknown);
+    }
+
+    /// launchd's own exits, as this Mac's `launchctl` gives them: a service
+    /// it hasn't ([`NOT_FOUND`]) and a domain it hasn't ([`NO_DOMAIN`]), so
+    /// the rule above rests on what's there, not on memory.
+    #[test]
+    fn launchctl_s_exits_are_these() {
+        let uid = nix::unistd::getuid().as_raw();
+        let exit = |what: String| launchctl(&["print", &what]).unwrap().code;
+        assert_eq!(
+            exit(format!("gui/{uid}/dev.shipyard.test.no-such-label")),
+            Some(NOT_FOUND)
+        );
+        assert_eq!(
+            exit("gui/99999/dev.shipyard.test.x".to_owned()),
+            Some(NO_DOMAIN)
+        );
+    }
+
+    /// The host is started through launchd when its agent is loaded, or
+    /// launchd can't say with the agent installed; spawned only when
+    /// launchd says it hasn't the agent, or none is installed (F182).
+    #[test]
+    fn an_unsure_launchd_with_the_agent_installed_is_kicked() {
+        assert!(through_launchd(Presence::Loaded, true));
+        assert!(through_launchd(Presence::Unknown, true));
+        assert!(!through_launchd(Presence::Unknown, false));
+        assert!(!through_launchd(Presence::Absent, true));
+    }
+
+    /// `vm status` and `doctor` say an installed agent launchd can't speak
+    /// of as loaded, never "not loaded" (which sends the user to install
+    /// it again); one launchd says it hasn't is not loaded.
+    #[test]
+    fn an_unsure_launchd_isn_t_said_not_loaded() {
+        assert_eq!(agent_state(Presence::Unknown, true), AgentState::Loaded);
+        assert_eq!(agent_state(Presence::Absent, true), AgentState::NotLoaded);
+        assert_eq!(agent_state(Presence::Loaded, true), AgentState::Loaded);
+        assert_eq!(
+            agent_state(Presence::Unknown, false),
+            AgentState::NotInstalled
+        );
+    }
+
+    /// A host holding the VM once the agent is loaded is said only when
+    /// launchd's job doesn't run (a command's host, F180(e)); launchd's own,
+    /// a stopped VM, or anything unknown isn't.
+    #[test]
+    fn a_host_started_meanwhile_is_told() {
+        use crate::client::Status;
+        let running = Some(Status::Running(Some(42)));
+        assert!(held_meanwhile(running, Some(false)));
+        assert!(!held_meanwhile(running, Some(true)));
+        assert!(!held_meanwhile(running, None));
+        assert!(!held_meanwhile(Some(Status::Stopped), Some(false)));
+        assert!(!held_meanwhile(None, Some(false)));
     }
 }
