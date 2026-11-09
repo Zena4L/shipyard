@@ -21,10 +21,13 @@ pub(super) fn the_host_config(host: &HostConfig, request: &mut RunRequest) -> Re
     request.volume = host.binds.clone().unwrap_or_default();
     // A bind's missing host path made, as Docker's daemon makes one for
     // `Binds` (compose's short syntax); the CLI's `-v` keeps refusing it.
+    // Never Docker's own socket in the macOS guest: that's given the guest's
+    // (F171).
     request.make_sources = request
         .volume
         .iter()
         .filter_map(|spec| shipyard_engine::run::bind_source(spec))
+        .filter(|source| !shipyard_engine::guest::shares::gives_docker_socket(source))
         .collect();
     for (path, options) in host.tmpfs.iter().flatten() {
         let options = options

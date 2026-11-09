@@ -373,9 +373,17 @@ docker --context shipyard ps
   upload refused so may show only "broken pipe".
 - **Paths:** a bind of a directory in a share (your home, `/Volumes`, `/tmp`,
   `/var/folders`) works as it is: the VM has it at the same path. One outside them is
-  refused, as Docker Desktop refuses it ([Your files](#your-files)), and so is a bind of
-  Docker's own socket: Testcontainers' Ryuk, which binds it, needs
-  `TESTCONTAINERS_RYUK_DISABLED=true` on a Mac for now.
+  refused, as Docker Desktop refuses it ([Your files](#your-files)).
+- **Docker's own socket in a container:** a bind of `/var/run/docker.sock` (or
+  `/run/docker.sock`, or the `docker.sock` your `DOCKER_HOST` names) gives the container
+  the VM's own Docker API, as Docker Desktop does: Testcontainers' Ryuk and a CI agent's
+  Docker-in-Docker work as on Linux. The socket is the VM's for its whole life, and the
+  API's service starts on the first connection to it (and ends when idle again), so a
+  container holding it keeps reaching the API. Only a container running as root may use
+  it, as Docker's socket is root's. A container given it controls Shipyard in the VM:
+  it can run a privileged container, and so act as root in the VM, with what the VM
+  shares from your Mac (your home, `/Volumes`, `/tmp`, `/var/folders`) read and write:
+  give it only to what you trust, as with Docker Desktop.
 - **Ports** a container publishes reach your Mac's `localhost` as with `shipyard run -p`
   ([Ports](#ports)).
 

@@ -60,6 +60,11 @@ type Stream = Arc<Mutex<std::fs::File>>;
 /// The agent's run: never returns.
 pub(super) fn run() -> ! {
     let _ = STARTED.set(std::time::Instant::now());
+    // First: nothing opened yet could be the descriptor PID 1 left.
+    if let Some(docker) = inherited_docker_socket() {
+        DOCKER_ACTIVATED.store(true, Ordering::SeqCst);
+        std::thread::spawn(move || activate(&docker));
+    }
     raise_descriptor_limit();
     std::thread::spawn(guest_firewall);
     let code = match serve() {
@@ -894,10 +899,182 @@ fn hang_up(name: &str) {
     }
 }
 
-/// A connection to the guest's Docker API, its service started first if
-/// none answers; tried twice, as an idle service may let go of its socket
-/// between the check and the connection.
+/// The guest's Docker socket PID 1 handed this agent at
+/// [`forward::DOCKER_FD`], taken over close-on-exec; none if what's there isn't
+/// that socket (a PID 1 that couldn't make it).
+fn inherited_docker_socket() -> Option<OwnedFd> {
+    let address =
+        nix::sys::socket::getsockname::<nix::sys::socket::UnixAddr>(forward::DOCKER_FD).ok()?;
+    if address.path() != Some(std::path::Path::new(forward::DOCKER_SOCKET)) {
+        return None;
+    }
+    // SAFETY: PID 1 left it for this process alone, and nothing here has
+    // opened anything yet that could be it.
+    unsafe { shipyard_sys::fd::take_inherited(forward::DOCKER_FD, shipyard_sys::fd::OnExec::Close) }
+        .ok()
+}
+
+/// Whether [`activate`] serves the guest's Docker socket: the API's
+/// connections go there ([`connect_api`]).
+static DOCKER_ACTIVATED: AtomicBool = AtomicBool::new(false);
+
+/// Socket activation of the guest's Docker API (F171), as systemd's: when a
+/// connection waits on `listener` and no service runs on it, the service is
+/// started on it ([`docker_service`]) and waited for; once it has ended
+/// (idle), the socket is watched again. Its file never changes, so a
+/// container given it keeps reaching the API across the service's ends.
+///
+/// One service at a time, across this agent's restarts too: an agent
+/// started after another died, that one's service still serving, waits for
+/// it to end before it watches ([`serving_elsewhere`]). A service that ends at once is started
+/// again after a rest that doubles each time ([`ACTIVATION_REST`] to
+/// [`ACTIVATION_REST_MOST`]); after [`QUICK_ENDS`] in a row, what waits is
+/// answered with a close, never left hanging.
+fn activate(listener: &OwnedFd) {
+    let mut quick_ends = 0_u32;
+    let mut rest = ACTIVATION_REST;
+    loop {
+        while serving_elsewhere(listener) {
+            std::thread::sleep(ACTIVATION_REST);
+        }
+        if !wait_for_connection(listener) {
+            std::thread::sleep(ACTIVATION_REST);
+            continue;
+        }
+        let started = std::time::Instant::now();
+        match docker_service(listener.as_raw_fd()).spawn() {
+            Ok(mut service) => {
+                let _ = service.wait();
+            }
+            Err(error) => say(&format!("starting the Docker API's service: {error}")),
+        }
+        if started.elapsed() < QUICK_END {
+            quick_ends += 1;
+            if quick_ends >= QUICK_ENDS {
+                say("the Docker API's service ends as it starts: refusing what waits");
+                refuse_waiting(listener);
+            }
+            std::thread::sleep(rest);
+            rest = (rest * 2).min(ACTIVATION_REST_MOST);
+        } else {
+            quick_ends = 0;
+            rest = ACTIVATION_REST;
+        }
+    }
+}
+
+/// The least time between two of [`activate`]'s starts.
+const ACTIVATION_REST: Duration = Duration::from_secs(1);
+
+/// The most, doubled from [`ACTIVATION_REST`] by quick ends.
+const ACTIVATION_REST_MOST: Duration = Duration::from_secs(30);
+
+/// A service that ends within this of its start ended at once.
+const QUICK_END: Duration = Duration::from_secs(2);
+
+/// How many quick ends in a row have what waits refused.
+const QUICK_ENDS: u32 = 3;
+
+/// Whether a process other than this agent serves `listener` already: one
+/// with it at descriptor 3 (the same socket, by its inode), as an earlier
+/// agent's service, still running after that agent died, has it.
+fn serving_elsewhere(listener: &OwnedFd) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(ours) = nix::sys::stat::fstat(listener) else {
+        return false;
+    };
+    let wanted = format!("socket:[{}]", ours.st_ino);
+    let me = std::process::id().to_string();
+    std::fs::read_dir("/proc").is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            name.to_str().is_some_and(|pid| {
+                pid.bytes().all(|byte| byte.is_ascii_digit())
+                    && pid != me
+                    && std::fs::read_link(entry.path().join("fd/3"))
+                        .is_ok_and(|target| target.as_os_str() == wanted.as_str())
+                    && std::fs::metadata(entry.path()).is_ok_and(|meta| meta.uid() == 0)
+            })
+        })
+    })
+}
+
+/// Whether a connection waits on `listener` (waited for); `false` on an
+/// error (said), for the caller to rest and look again.
+fn wait_for_connection(listener: &OwnedFd) -> bool {
+    use std::os::fd::AsFd as _;
+    loop {
+        let mut waiting = [nix::poll::PollFd::new(
+            listener.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        match nix::poll::poll(&mut waiting, nix::poll::PollTimeout::NONE) {
+            Ok(_) => return true,
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => {
+                say(&format!("the Docker socket's watch: {error}"));
+                return false;
+            }
+        }
+    }
+}
+
+/// Every connection waiting on `listener` accepted and closed at once: its
+/// client reads an end, never waits on a service that won't start.
+fn refuse_waiting(listener: &OwnedFd) {
+    use std::os::fd::AsFd as _;
+    loop {
+        let mut waiting = [nix::poll::PollFd::new(
+            listener.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        if !nix::poll::poll(&mut waiting, nix::poll::PollTimeout::ZERO).is_ok_and(|n| n > 0) {
+            return;
+        }
+        match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
+            // SAFETY: `accept4` just returned it, owned by no one else.
+            Ok(fd) => drop(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Err(_) => return,
+        }
+    }
+}
+
+/// `shipyard system service` on the guest's Docker socket, passed as
+/// systemd passes one (descriptor 3, `LISTEN_FDS=1`, `LISTEN_PID` its own:
+/// exported by a shell that then becomes it, as no variable can be set
+/// safely between `fork` and `exec`): never unlinked or bound again by it.
+fn docker_service(listener: std::os::fd::RawFd) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "export LISTEN_PID=$$ LISTEN_FDS=1; exec \"$0\" system service",
+            SHIPYARD,
+        ])
+        .current_dir("/")
+        .env_clear()
+        .env("PATH", PATH)
+        .env("HOME", "/root")
+        .env("TMPDIR", super::GUEST_TMP)
+        .stdin(std::process::Stdio::null());
+    // SAFETY: between fork and exec, `dup2` and `fcntl` only:
+    // async-signal-safe, no allocation, no lock.
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        command.pre_exec(move || at_descriptor(listener, shipyard_sys::listen::FIRST));
+    }
+    command
+}
+
+/// A connection to the guest's Docker API: on its Docker socket, whose
+/// service [`activate`] starts (F171); else (no socket from PID 1) its
+/// service started first if none answers, tried twice, as an idle service
+/// may let go of its socket between the check and the connection.
 fn connect_api() -> Result<std::os::unix::net::UnixStream, String> {
+    if DOCKER_ACTIVATED.load(Ordering::SeqCst) {
+        return std::os::unix::net::UnixStream::connect(forward::DOCKER_SOCKET)
+            .map_err(|e| e.to_string());
+    }
     let socket = api_socket();
     let service = || {
         let mut command = guest_command(&["system", "service", "--socket"], "/");
@@ -1143,6 +1320,38 @@ fn handed_pipe(auth: &str) -> Result<OwnedFd, String> {
         .map_err(|e| format!("the handed credential's pipe: {e}"))?;
     drop(write);
     Ok(OwnedFd::from(read))
+}
+
+/// The agent's listener at [`forward::AGENT_FD`] and the Docker socket (if
+/// any) at [`forward::DOCKER_FD`], close-on-exec cleared on both, between
+/// `fork` and `exec`: each first copied past both numbers, so neither is
+/// written over by the other's move (a copy at 3 or 4 already).
+pub(super) fn at_descriptors(
+    agent: std::os::fd::RawFd,
+    docker: Option<std::os::fd::RawFd>,
+) -> std::io::Result<()> {
+    let above = |fd: std::os::fd::RawFd| -> std::io::Result<std::os::fd::RawFd> {
+        // SAFETY: `fcntl(F_DUPFD)` on numbers; async-signal-safe. It returns
+        // the lowest free number from 10, which is what's used (AGENTS.md §10).
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD, 10) };
+        if copy < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(copy)
+        }
+    };
+    let agent = above(agent)?;
+    let docker = docker.map(above).transpose()?;
+    at_descriptor(agent, forward::AGENT_FD)?;
+    if let Some(docker) = docker {
+        at_descriptor(docker, forward::DOCKER_FD)?;
+    }
+    // The copies closed: the agent keeps only 3 and 4.
+    for copy in std::iter::once(agent).chain(docker) {
+        // SAFETY: a descriptor this child just made; async-signal-safe.
+        unsafe { libc::close(copy) };
+    }
+    Ok(())
 }
 
 /// After `fork`: descriptor `from` placed at `to`, open across `exec`.

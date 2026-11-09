@@ -7,16 +7,43 @@ use shipyard_engine::run::SecurityOpt;
 use super::{CreateCommand, RunArgs, RunCommand};
 use crate::forward::{HostPath, Needs};
 
+/// Whether `source` names Docker's own socket (`/var/run/docker.sock`,
+/// `/run/docker.sock`, or this Mac's `DOCKER_HOST`, `docker_host`): the VM
+/// gives a bind of it its own socket (F171), so it's never judged as one of
+/// the Mac's paths, which would refuse it (`/var/run` isn't shared).
+/// Compared by their parts, as the guest compares them (`/var/run/./docker.sock`
+/// is `/var/run/docker.sock`).
+fn names_dockers_socket(source: &str, docker_host: Option<&std::path::Path>) -> bool {
+    let same = |named: &std::path::Path| {
+        std::path::Path::new(source)
+            .components()
+            .eq(named.components())
+    };
+    shipyard_runtime::attach::forward::DOCKER_SOCKET_NAMES
+        .iter()
+        .any(|named| same(std::path::Path::new(named)))
+        || docker_host.is_some_and(same)
+}
+
+/// This Mac's `DOCKER_HOST` socket: the VM's `docker.sock`.
+fn docker_host() -> Option<std::path::PathBuf> {
+    shipyard_vm::VmPaths::from_env()
+        .ok()
+        .map(|paths| paths.docker_socket())
+}
+
 impl RunArgs {
     /// The host paths these arguments name: bind sources (`-v`'s and
     /// `--mount`'s), the root
     /// filesystem, the bundle, a seccomp profile.
     fn host_paths(&self) -> Vec<HostPath> {
         let (volumes, _) = self.mounts();
+        let docker_host = docker_host();
         let binds = volumes
             .into_iter()
             .filter_map(|spec| shipyard_storage::volume::VolumeMount::parse(&spec).ok())
             .filter(|mount| !shipyard_storage::volume::is_named_volume(&mount.source))
+            .filter(|mount| !names_dockers_socket(&mount.source, docker_host.as_deref()))
             .map(|mount| HostPath::existing(mount.source));
         let profiles = self.security_opt.iter().filter_map(|option| match option {
             SecurityOpt::SeccompProfile(path) => Some(HostPath::existing(path)),
@@ -71,5 +98,27 @@ impl CreateCommand {
             copied_env: self.args.copied_env(),
             ..Needs::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod docker_socket_tests {
+    use super::*;
+
+    /// Docker's socket by its names, and this Mac's `DOCKER_HOST`, is left
+    /// to the VM (F171); any other path is judged as the Mac's.
+    #[test]
+    fn docker_s_socket_is_left_to_the_vm() {
+        let ours =
+            std::path::Path::new("/Users/me/Library/Application Support/Shipyard/vm/docker.sock");
+        assert!(names_dockers_socket("/var/run/docker.sock", None));
+        assert!(names_dockers_socket("/var/run/./docker.sock", None));
+        assert!(names_dockers_socket("/run/docker.sock", Some(ours)));
+        assert!(names_dockers_socket(
+            "/Users/me/Library/Application Support/Shipyard/vm/docker.sock",
+            Some(ours)
+        ));
+        assert!(!names_dockers_socket("/var/run/other.sock", Some(ours)));
+        assert!(!names_dockers_socket("/Users/me/docker.sock", Some(ours)));
     }
 }

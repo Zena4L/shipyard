@@ -239,6 +239,9 @@ behaviour; each change is listed here).
   VM's own services, at the VM's address:** the VM's firewall takes nothing new there
   but its DHCP replies and IPv6 neighbour discovery, and is in place from the VM's start
   (F175).
+- **On a Mac, a bind of Docker's own socket (`-v /var/run/docker.sock:…`, Testcontainers'
+  Ryuk) was refused:** it's given the VM's Docker API, through a socket the VM holds for
+  its life, whose service starts on its first connection (F171).
 - **On a Mac, a forwarded connection whose client had half-closed was cut 10 minutes
   later, bytes still coming** (a long download after the request was sent): it's cut
   only a linger after its last byte, and a client that has gone is hung up in the VM
