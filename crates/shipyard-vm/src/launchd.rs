@@ -935,11 +935,17 @@ mod tests {
 
     /// launchd's own exits, as this Mac's `launchctl` gives them: a service
     /// it hasn't ([`NOT_FOUND`]) and a domain it hasn't ([`NO_DOMAIN`]), so
-    /// the rule above rests on what's there, not on memory.
+    /// the rule above rests on what's there, not on memory. Only where this
+    /// user has a GUI domain (a login at the Mac): as root, or with no one
+    /// logged in (CI's runner), `gui/UID` answers otherwise (125 as root),
+    /// which the rule takes as unknown, and a start falls back.
     #[test]
     fn launchctl_s_exits_are_these() {
         let uid = nix::unistd::getuid().as_raw();
         let exit = |what: String| launchctl(&["print", &what]).unwrap().code;
+        if exit(format!("gui/{uid}")) != Some(0) {
+            return;
+        }
         assert_eq!(
             exit(format!("gui/{uid}/dev.shipyard.test.no-such-label")),
             Some(NOT_FOUND)
