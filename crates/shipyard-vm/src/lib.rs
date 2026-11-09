@@ -116,6 +116,19 @@ pub enum VmError {
     /// (128 + its number).
     #[error("interrupted while waiting for the VM: the command didn't run")]
     Interrupted(i32),
+    /// A file of the VM's a newer Shipyard wrote, which this one won't
+    /// write over (H2: it may hold what this one can't keep).
+    #[error(
+        "{}: version {version}, newer than this shipyard reads: change it with the newer \
+         shipyard, or remove it to start again from the defaults",
+        path.display()
+    )]
+    Newer {
+        /// Which.
+        path: std::path::PathBuf,
+        /// Its version.
+        version: u32,
+    },
     /// A file of the VM's.
     #[error("{}: {source}", path.display())]
     Io {

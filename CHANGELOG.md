@@ -227,6 +227,16 @@ behaviour; each change is listed here).
   `Downloading` lines with `progressDetail`, at most every half second a layer: Docker's
   CLI draws its bars); a client that stops reading drops those lines rather than holding
   the download up (F192). Unpacking the layers still says nothing (F209).
+- **`shipyard vm install` said nothing of a VM another command started meanwhile**, which
+  left Docker's socket to launchd and had `docker` refused (503) until it stopped: it's
+  warned of (F180).
+- **One failed or slow `launchctl print` made a command start its own VM beside
+  launchd's**, so every `docker` was refused until it idled out: with the agent installed,
+  launchd is asked to start it unless launchd says it hasn't the agent, and a command
+  starts its own when launchd then won't (F182).
+- **`shipyard vm set` replaced a `vm.json` a newer `shipyard` wrote:** it's refused (F183).
+- **On a Mac, each new UDP peer of a published port cost the guest a scan of its leases:**
+  a new peer takes the address looked up within the last 2 seconds (F185).
 
 ### Security
 

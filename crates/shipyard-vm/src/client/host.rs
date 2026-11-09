@@ -85,27 +85,38 @@ fn ended_in_launchd(
 }
 
 /// Starts the host: through launchd if its agent for this VM is loaded
-/// (`shipyard vm install`), else [`spawn_host`].
+/// (`shipyard vm install`), or launchd can't say with it installed
+/// ([`crate::launchd::starter`]; a kick it then refuses falls back), else
+/// [`spawn_host`].
 pub(super) fn start_host(paths: &VmPaths) -> Result<Started, VmError> {
-    if crate::launchd::loaded(paths) {
-        let runs = crate::launchd::job(paths).map(|job| job.runs);
-        // A host runs already (booting): no mark, no kick, only the wait
-        // (a mark it would never take would boot the VM at the next login).
-        let marked = status(paths)? == Status::Stopped;
-        if marked {
-            // Its host boots only when asked (else it takes itself for
-            // launchd's run at load): the mark says the CLI asked.
-            let mark = paths.start_asked();
-            std::fs::write(&mark, b"").map_err(|e| VmError::io(&mark, e))?;
-            crate::launchd::kickstart(paths)?;
+    let crate::launchd::Starter::Launchd { job, sure } = crate::launchd::starter(paths) else {
+        return spawn_host(paths).map(Started::Spawned);
+    };
+    let runs = job.map(|job| job.runs);
+    // A host runs already (booting): no mark, no kick, only the wait
+    // (a mark it would never take would boot the VM at the next login).
+    let marked = status(paths)? == Status::Stopped;
+    if marked {
+        // Its host boots only when asked (else it takes itself for
+        // launchd's run at load): the mark says the CLI asked.
+        let mark = paths.start_asked();
+        std::fs::write(&mark, b"").map_err(|e| VmError::io(&mark, e))?;
+        if let Err(error) = crate::launchd::kickstart(paths) {
+            // launchd couldn't say it had the agent, and won't start it: the
+            // CLI's own host, as before F182, and no mark left to boot the
+            // VM at the next login.
+            if sure {
+                return Err(error);
+            }
+            let _ = std::fs::remove_file(&mark);
+            return spawn_host(paths).map(Started::Spawned);
         }
-        return Ok(Started::Launchd {
-            runs,
-            kicked: Instant::now(),
-            marked,
-        });
     }
-    spawn_host(paths).map(Started::Spawned)
+    Ok(Started::Launchd {
+        runs,
+        kicked: Instant::now(),
+        marked,
+    })
 }
 
 /// Starts the host here: this binary again, in a session of its own (a

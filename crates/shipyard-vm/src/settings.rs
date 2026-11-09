@@ -147,27 +147,41 @@ impl VmSettings {
             path,
             SETTINGS_CAP,
             SETTINGS_VERSION,
-            " (the default size is used: `shipyard vm set` writes a new one)",
+            " (the default size is used; `shipyard vm set` writes a new one, but over a newer \
+             shipyard's: remove it first)",
         )
     }
 
     /// Applies `memory` (in bytes) and `cpus` to `vm.json` at `path`, each
     /// checked against `mac`'s [`bounds`]: what it now holds.
     ///
-    /// A `vm.json` that can't be read (corrupt, or a newer Shipyard's) is
-    /// replaced: what's asked now is all it holds.
+    /// A `vm.json` that can't be read (corrupt, or not this format) is
+    /// replaced: what's asked now is all it holds. A newer Shipyard's is
+    /// refused, never written over (F183, H2): it may hold what this one
+    /// can't keep.
     ///
     /// # Errors
     ///
     /// [`VmError::Size`] for a size out of bounds (said with them);
-    /// [`VmError::Io`] if `vm.json` can't be written.
+    /// [`VmError::Newer`] for a newer `vm.json`; [`VmError::Io`] if it
+    /// can't be written.
     pub fn change(
         path: &Path,
         mac: Mac,
         memory: Change<u64>,
         cpus: Change<u32>,
     ) -> Result<Self, VmError> {
-        let mut settings = Self::read(path).ok().flatten().unwrap_or_default();
+        use shipyard_sys::versioned::{Error, FileError, read_file};
+        let mut settings = match read_file::<Self>(path, SETTINGS_CAP, SETTINGS_VERSION) {
+            Ok(found) => found.unwrap_or_default(),
+            Err(FileError::Versioned(Error::Newer(version))) => {
+                return Err(VmError::Newer {
+                    path: path.to_path_buf(),
+                    version,
+                });
+            }
+            Err(_) => Self::default(),
+        };
         settings.version = SETTINGS_VERSION;
         let ((least, most), (fewest, most_cpus)) = bounds(mac);
         match memory {

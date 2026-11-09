@@ -95,8 +95,17 @@ fn vm_set_keeps_what_it_is_asked() {
         assert!(matches!(refused, VmError::Size(_)), "{refused}");
     }
     assert_eq!(VmSettings::read(&path).unwrap(), Some(back), "unchanged");
-    // One that can't be read (a newer Shipyard's) is replaced by what's asked.
-    std::fs::write(&path, r#"{"version":2,"memory_mib":4096}"#).unwrap();
+    // A newer Shipyard's is refused, left as it was (F183, H2).
+    let newer = r#"{"version":2,"memory_mib":4096}"#;
+    std::fs::write(&path, newer).unwrap();
+    let refused = VmSettings::change(&path, mac, Change::Keep, Change::To(3)).unwrap_err();
+    assert!(
+        matches!(refused, VmError::Newer { version: 2, .. }),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    // One that can't be read at all is replaced by what's asked.
+    std::fs::write(&path, "not json").unwrap();
     let replaced = VmSettings::change(&path, mac, Change::Keep, Change::To(3)).unwrap();
     assert_eq!(
         (replaced.version, replaced.memory_mib, replaced.cpus),

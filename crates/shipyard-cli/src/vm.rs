@@ -66,6 +66,9 @@ mod mac {
                     installed.label,
                     printable(&installed.plist.to_string_lossy())
                 )?;
+                if installed.held_meanwhile {
+                    crate::reporter::warn(shipyard_vm::launchd::HELD_MEANWHILE)?;
+                }
                 Ok(ExitCode::SUCCESS)
             }
             VmCommand::Set(args) => set(&paths, args),

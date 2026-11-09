@@ -968,7 +968,8 @@ fn settings(paths: &VmPaths, guest: &Guest, disk: &std::path::Path) -> Result<Se
     // The size: `vm set`'s (`vm.json`), else the default for this Mac;
     // a diagnosis override above both.
     // An unreadable `vm.json` (corrupt, or a newer Shipyard's) is said and
-    // the default taken: the VM still starts (`vm set` writes a new one).
+    // the default taken: the VM still starts (`vm set` writes a new one over
+    // a corrupt one; a newer one is removed by hand first).
     let set = crate::settings::VmSettings::read(&paths.settings()).unwrap_or_else(|error| {
         log(&format!("{error}: the default size is used"));
         None
