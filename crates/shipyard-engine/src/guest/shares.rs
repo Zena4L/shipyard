@@ -107,7 +107,29 @@ impl Shared {
     /// shared; a socket (the Mac's can't be reached from the VM); or a
     /// folder macOS guards, said with the permission.
     pub fn check(&self, source: &Path) -> Result<()> {
+        if self.docker_socket_of(source).is_some() {
+            return Ok(());
+        }
         self.check_with(source, on_a_share).map(drop)
+    }
+
+    /// The guest's Docker socket ([`forward::DOCKER_SOCKET`]), if `source`
+    /// names Docker's own (F171): `/var/run/docker.sock`, `/run/docker.sock`,
+    /// or the Mac's `DOCKER_HOST` socket (`docker.sock` in the VM's own
+    /// directory, hidden). By its name as given: what Testcontainers' Ryuk
+    /// and a CI agent's Docker-in-Docker bind, which the guest gives its own
+    /// socket instead (a bind of it: [`crate::run`]'s, never by a share).
+    #[must_use]
+    pub fn docker_socket_of(&self, source: &Path) -> Option<&'static Path> {
+        let source = lexical(source);
+        let docker = forward::DOCKER_SOCKET_NAMES
+            .iter()
+            .any(|named| source == Path::new(named))
+            || self
+                .hidden
+                .iter()
+                .any(|place| source == place.join("docker.sock"));
+        docker.then(|| Path::new(forward::DOCKER_SOCKET))
     }
 
     /// Where a start reaches the bind source `given` from (13.8c, F173a):
@@ -133,6 +155,9 @@ impl Shared {
         given: &Path,
         shared: impl Fn(&Path) -> std::io::Result<bool>,
     ) -> Result<Option<(PathBuf, PathBuf)>> {
+        if self.docker_socket_of(given).is_some() {
+            return Ok(None);
+        }
         let given = lexical(given);
         if !self.places.iter().any(|place| given.starts_with(place)) {
             return Ok(None);
@@ -320,6 +345,17 @@ pub(crate) fn privacy_message(folders: &str) -> String {
     )
 }
 
+/// Whether `source`, a bind's, is given the guest's Docker socket here
+/// ([`Shared::docker_socket_of`]): never in the macOS guest's absence, nor
+/// when its command line can't be read.
+#[must_use]
+pub fn gives_docker_socket(source: &Path) -> bool {
+    Shared::here()
+        .ok()
+        .flatten()
+        .is_some_and(|shared| shared.docker_socket_of(source).is_some())
+}
+
 /// Every bind source of `specs` (`-v`'s and `Binds`' entries) checked
 /// against what this guest shares ([`Shared::check`]); nothing off the
 /// guest.
@@ -445,6 +481,45 @@ mod tests {
             forward::HIDE_KEY,
             forward::places_value(hidden)
         )
+    }
+
+    /// Docker's own socket by its names (F171): `/var/run/docker.sock`,
+    /// `/run/docker.sock` and `docker.sock` in the VM's own directory (the
+    /// Mac's `DOCKER_HOST`) are given the guest's, and taken by the check
+    /// and never split at a share; anything else (another name, another
+    /// directory's `docker.sock`, a path that climbs) is judged as before.
+    #[test]
+    fn docker_s_own_socket_is_given_the_guest_s() {
+        let shared = Shared::of_cmdline(&line(
+            "/Users/me",
+            &[],
+            &["/Users/me/Library/Application Support/Shipyard/vm"],
+        ))
+        .unwrap();
+        let given = |path: &str| shared.docker_socket_of(Path::new(path));
+        let ours = Some(Path::new(forward::DOCKER_SOCKET));
+        for docker in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/Users/me/Library/Application Support/Shipyard/vm/docker.sock",
+            "/var/run/./docker.sock",
+        ] {
+            assert_eq!(given(docker), ours, "{docker}");
+            assert!(shared.check(Path::new(docker)).is_ok(), "{docker}");
+            assert!(
+                matches!(shared.bind_of(Path::new(docker)), Ok(None)),
+                "{docker}"
+            );
+        }
+        for other in [
+            "/var/run/docker.sock.bak",
+            "/var/run/other.sock",
+            "/Users/me/docker.sock",
+            "/Users/me/Library/Application Support/Shipyard/vm/vm.sock",
+            "/var/run/docker.sock/x",
+        ] {
+            assert_eq!(given(other), None, "{other}");
+        }
     }
 
     /// The places are the home, the shares and the aliases of those

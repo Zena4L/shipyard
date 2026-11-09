@@ -291,7 +291,15 @@ impl RunRequest {
                 let mut mount = VolumeMount::parse(spec).map_err(|err| {
                     Error::new(ErrorKind::InvalidRequest, format!("--volume {spec}: {err}"))
                 })?;
-                if !shipyard_storage::volume::is_named_volume(&mount.source) {
+                if let Some(socket) = shared
+                    .as_ref()
+                    .and_then(|shared| shared.docker_socket_of(Path::new(&mount.source)))
+                {
+                    // Docker's own socket, in the macOS guest: its own (F171),
+                    // bound as it is (a socket file).
+                    mount.source =
+                        docker_socket(socket).with_context(|| format!("--volume {spec}"))?;
+                } else if !shipyard_storage::volume::is_named_volume(&mount.source) {
                     if let Some(shared) = &shared {
                         shared
                             .check_again(Path::new(&mount.source))
@@ -309,4 +317,20 @@ impl RunRequest {
             })
             .collect()
     }
+}
+
+/// The macOS guest's Docker socket, for a bind of Docker's own (F171): there,
+/// or said plainly (PID 1 couldn't make it at boot: its console says why).
+fn docker_socket(socket: &Path) -> Result<String> {
+    if !socket.exists() {
+        return Err(Error::new(
+            ErrorKind::InvalidRequest,
+            format!(
+                "Docker's socket: the VM's own ({}) isn't there; the VM's console (its \
+                 console.log) says why",
+                socket.display()
+            ),
+        ));
+    }
+    Ok(socket.display().to_string())
 }

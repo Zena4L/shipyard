@@ -1709,6 +1709,69 @@ fn said_to_the_mac(vm: &Vm, image: &str, gateway: std::net::Ipv4Addr) -> String 
     said.trim().to_owned()
 }
 
+/// Step 15.2f2b (F171): a bind of Docker's own socket (`/var/run/docker.sock`,
+/// and this Mac's `DOCKER_HOST`) gives a container the VM's API, as
+/// Testcontainers' Ryuk needs; it answers again after the API's service has
+/// ended idle (the socket never went stale: started on the next
+/// connection); a container running as another user is refused there.
+#[test]
+fn docker_s_socket_is_given_to_a_container() {
+    const CURL: &str = "curlimages/curl:8.11.1";
+    let Some(vm) = Vm::new("dockersock") else {
+        return;
+    };
+    let pulled = vm.shipyard(&["pull", CURL]);
+    assert!(pulled.status.success(), "{pulled:?}");
+    let ping = |source: &str, user: Option<&str>| -> String {
+        let bind = format!("{source}:/var/run/docker.sock");
+        let mut args = vec!["run", "--rm", "--network", "none", "-v", &bind];
+        if let Some(user) = user {
+            args.extend(["--user", user]);
+        }
+        args.extend([
+            CURL,
+            "-s",
+            "--max-time",
+            "20",
+            "--unix-socket",
+            "/var/run/docker.sock",
+            "http://docker/_ping",
+        ]);
+        text(&vm.shipyard(&args).stdout).trim().to_owned()
+    };
+    assert_eq!(ping("/var/run/docker.sock", None), "OK");
+    let docker_host = vm.docker_socket().display().to_string();
+    assert_eq!(ping(&docker_host, None), "OK", "the Mac's DOCKER_HOST");
+    // The service ends 60 s after nothing is asked (seen ended, not
+    // assumed); the socket is still the one bound, and the next connection
+    // starts it again.
+    let image = local_busybox(&vm);
+    let serving = || {
+        let listed = vm.shipyard(&["run", "--rm", "--pid", "host", image, "ps", "-o", "args"]);
+        text(&listed.stdout)
+            .lines()
+            .any(|line| line.contains("system service") && !line.contains("--socket"))
+    };
+    assert!(serving(), "the service runs once asked");
+    let quiet = Instant::now();
+    while serving() {
+        assert!(
+            quiet.elapsed() < Duration::from_secs(150),
+            "the service never ended idle"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    let began = Instant::now();
+    assert_eq!(
+        ping("/var/run/docker.sock", None),
+        "OK",
+        "after its idle end"
+    );
+    eprintln!("answered again in {:?}", began.elapsed());
+    // Root's alone, as Docker's socket is.
+    assert_ne!(ping("/var/run/docker.sock", Some("1000")), "OK");
+}
+
 /// Step 15.2f2a (F180(f)): a forwarded connection whose Mac client goes
 /// while its container streams is hung up in the guest too (Virtualization.
 /// framework says the client's end as a half-close alone): the container's

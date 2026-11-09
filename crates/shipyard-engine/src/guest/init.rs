@@ -208,6 +208,16 @@ fn boot() -> Result<Child, String> {
     if let Ok(mut held) = AGENT_LISTENER.lock() {
         *held = Some(listener);
     }
+    // The guest's Docker socket, held for its life too (F171); one that
+    // can't be made is said, and the agent starts the service its old way.
+    match make_docker_socket() {
+        Ok(listener) => {
+            if let Ok(mut held) = DOCKER_LISTENER.lock() {
+                *held = Some(listener);
+            }
+        }
+        Err(error) => say(&format!("the guest's Docker socket: {error}")),
+    }
     let agent = start_agent()?;
     data_disk()?;
     shares();
@@ -660,10 +670,40 @@ fn shipyard(args: &[&str], limit: Duration) {
 /// connections that come meanwhile wait in its backlog for the next.
 static AGENT_LISTENER: std::sync::Mutex<Option<std::os::fd::OwnedFd>> = std::sync::Mutex::new(None);
 
+/// The guest's Docker socket ([`forward::DOCKER_SOCKET`], F171), listening:
+/// made by PID 1 at boot and kept for the guest's life, handed to each agent
+/// at [`forward::DOCKER_FD`], which starts the API's service on it when a
+/// connection waits. Its file never changes, so a container given it (a
+/// bind of `/var/run/docker.sock`) never holds a stale one.
+static DOCKER_LISTENER: std::sync::Mutex<Option<std::os::fd::OwnedFd>> =
+    std::sync::Mutex::new(None);
+
+/// [`DOCKER_LISTENER`] made: its directory root's, others may enter it
+/// (`0755`), the socket root's alone to connect to (`0660`: the service
+/// takes root's peers only, as Docker's socket is root's).
+fn make_docker_socket() -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    let socket = Path::new(forward::DOCKER_SOCKET);
+    let dir = socket
+        .parent()
+        .ok_or_else(|| "a socket with no directory".to_owned())?;
+    std::fs::DirBuilder::new()
+        .mode(0o755)
+        .recursive(true)
+        .create(dir)
+        .map_err(|e| format!("making {}: {e}", dir.display()))?;
+    let listener = std::os::unix::net::UnixListener::bind(socket)
+        .map_err(|e| format!("binding {}: {e}", socket.display()))?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    Ok(listener.into())
+}
+
 /// Starts the agent, in a process group of its own: a group it signals
 /// by mistake (0: its own) is never PID 1's, which would take a SIGTERM or
 /// SIGINT for the VM's stop. It's given [`AGENT_LISTENER`] at
-/// [`forward::AGENT_FD`].
+/// [`forward::AGENT_FD`], and [`DOCKER_LISTENER`] at [`forward::DOCKER_FD`]
+/// (none: the descriptor left closed).
 fn start_agent() -> Result<Child, String> {
     use std::os::fd::AsRawFd as _;
     let listener = AGENT_LISTENER
@@ -672,6 +712,11 @@ fn start_agent() -> Result<Child, String> {
         .as_ref()
         .ok_or_else(|| "the agent's socket isn't made".to_owned())?
         .as_raw_fd();
+    let docker = DOCKER_LISTENER
+        .lock()
+        .map_err(|_| "the Docker socket's lock, poisoned".to_owned())?
+        .as_ref()
+        .map(std::os::fd::AsRawFd::as_raw_fd);
     let mut command = Command::new(SHIPYARD);
     command
         .arg(super::AGENT_ARG)
@@ -680,7 +725,7 @@ fn start_agent() -> Result<Child, String> {
     // SAFETY: between fork and exec, `dup2` and `fcntl` only:
     // async-signal-safe, no allocation, no lock.
     unsafe {
-        command.pre_exec(move || super::agent::at_descriptor(listener, forward::AGENT_FD));
+        command.pre_exec(move || super::agent::at_descriptors(listener, docker));
     }
     command
         .spawn_unblocked()

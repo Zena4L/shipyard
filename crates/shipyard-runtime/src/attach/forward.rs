@@ -546,6 +546,22 @@ impl PortsAnswer {
 /// free for a container to take while the agent restarts.
 pub const AGENT_FD: i32 = 3;
 
+/// The descriptor the macOS guest's PID 1 hands its agent the guest's
+/// Docker socket at ([`DOCKER_SOCKET`], step 15.2f2b, F171), listening: bound
+/// at boot and kept for the guest's life, so a container given it never
+/// holds a socket gone stale when the API's service ends idle.
+pub const DOCKER_FD: i32 = 4;
+
+/// The macOS guest's Docker socket: the API's service, started on a
+/// connection to it (socket activation, by the agent), and what a
+/// container's bind of Docker's own socket (`/var/run/docker.sock`, the Mac's
+/// `DOCKER_HOST`) is given (F171).
+pub const DOCKER_SOCKET: &str = "/run/shipyard-docker/docker.sock";
+
+/// The names of Docker's own socket a container's bind gives
+/// [`DOCKER_SOCKET`] in the macOS guest (F171), with the Mac's `DOCKER_HOST`.
+pub const DOCKER_SOCKET_NAMES: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
+
 /// The macOS guest's link to the Mac's NAT (Apple's DHCP gives it its
 /// address): what no published port is reached from (step 13.5b, F108: only
 /// the Mac reaches them, over vsock, never another VM on that network).
