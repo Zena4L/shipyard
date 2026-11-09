@@ -60,7 +60,13 @@ fn coded(payload: &[u8]) -> Option<(u8, String)> {
 }
 
 /// The protocol's version: what [`Frame::Hello`] and [`Frame::Welcome`] carry.
-pub const VERSION: u32 = SESSION_VERSION;
+pub const VERSION: u32 = PORT_SESSION_VERSION;
+
+/// The first version whose forwarded port connections are given a session
+/// token too ([`Frame::Session`] after their welcome, step 15.2f2a,
+/// F180(f)): the Mac hangs one up by it once its own relay has ended, never
+/// by its vsock port, which another connection may have taken by then.
+pub const PORT_SESSION_VERSION: u32 = 7;
 
 /// The first version whose forwarded commands are given a session token
 /// ([`Frame::Session`], step 13.6a, F94): a control connection of their

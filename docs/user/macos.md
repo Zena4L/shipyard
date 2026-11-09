@@ -275,8 +275,11 @@ shipyard run -d -p 8080:80 nginx:alpine     # http://localhost:8080
   `127.0.0.1` only. Nothing on your Mac's network (your Wi-Fi's other devices) can
   reach a container. Other users of your Mac can, as they can any program's port on
   `localhost`. The VM's own address on the Mac's private virtual network
-  (`192.168.64.x`, which other VMs on your Mac reach) doesn't answer a published port:
-  the VM's firewall refuses it there.
+  (`192.168.64.x`, which other VMs on your Mac reach) answers nothing new: the VM's
+  firewall refuses there a published port, a `--network host` container's port and the
+  VM's own services alike, and takes only what the VM opened (its DHCP lease, its IPv6
+  neighbours, the replies to its own connections): a `ping` of that address goes
+  unanswered too.
 - **A port another program on your Mac already has** (Postgres on 5432, say) is left to
   it: `shipyard vm status` says `not forwarded: 127.0.0.1:5432 (in use on this Mac)`, and
   it's forwarded as soon as that program lets it go. `localhost:5432` keeps reaching

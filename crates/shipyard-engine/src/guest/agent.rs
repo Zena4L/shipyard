@@ -61,6 +61,7 @@ type Stream = Arc<Mutex<std::fs::File>>;
 pub(super) fn run() -> ! {
     let _ = STARTED.set(std::time::Instant::now());
     raise_descriptor_limit();
+    std::thread::spawn(guest_firewall);
     let code = match serve() {
         Ok(()) => 0,
         Err(error) => {
@@ -70,6 +71,37 @@ pub(super) fn run() -> ! {
     };
     std::process::exit(code)
 }
+
+/// The guest's own firewall (F175), on a thread of its own (a run holding
+/// the networks' lock never holds up the agent's first answers), once the
+/// guest is ready: its data disk, where the networks' store is, mounted,
+/// and before any container runs (nothing runs before then). Tried a few
+/// times; one never made is said, and the agent serves on.
+fn guest_firewall() {
+    let began = std::time::Instant::now();
+    while !std::path::Path::new(super::READY).exists() {
+        if began.elapsed() > FIREWALL_WAIT {
+            say("the guest's firewall: the guest never got ready");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let engine = crate::Engine::new(crate::Paths::from_env(), Arc::new(crate::report::Quiet));
+    for tried in 1..=FIREWALL_TRIES {
+        match crate::network::ensure_guest_firewall(&engine) {
+            Ok(()) => return,
+            Err(error) => say(&format!("the guest's firewall ({tried}): {error:#}")),
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// How long [`guest_firewall`] waits for the guest to be ready (a data
+/// disk's check may take this long).
+const FIREWALL_WAIT: Duration = Duration::from_mins(30);
+
+/// How many times [`guest_firewall`] tries.
+const FIREWALL_TRIES: u32 = 3;
 
 /// The most descriptors the agent may hold: about four per forwarded
 /// connection and per command, many at once (a browser's).
@@ -242,8 +274,8 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
         return send(&writer, &forward::Refusal::NotReady.frame(agreed));
     }
     match connection_asked(&request.args) {
-        Some(Asked::Port(ip, port)) => {
-            return forward_port((&writer, agreed), connection, ip, port);
+        Some(Asked::Port(ip, published)) => {
+            return forward_port((&writer, agreed), connection, (ip, published), port);
         }
         Some(Asked::Udp(ip, port)) => {
             return forward_udp((&writer, agreed), connection, ip, port);
@@ -251,7 +283,7 @@ fn handle(stream: std::fs::File, port: u32) -> Result<(), String> {
         Some(Asked::Control(token)) => return control((&writer, agreed), connection, token),
         Some(Asked::Api) => return forward_api((&writer, agreed), connection, port),
         Some(Asked::HangUp(theirs)) => {
-            hang_up_api(theirs);
+            hang_up(theirs);
             return Ok(());
         }
         None => {}
@@ -556,12 +588,15 @@ fn published_or_refuse(
 /// [`forward::FORWARD_REQUEST`] `IP PORT`: a connection to the port a
 /// running container publishes on `IP` (never the guest's own services),
 /// dialled at the container's own address ([`super::forwarded::find_target`],
-/// F97); then the bytes both ways, raw, until both have ended.
+/// F97); then the bytes both ways, raw, until both have ended, or the host
+/// hangs it up by its token, or its vsock port `host_port` from an older
+/// host (F180(f): a Mac client that died reaches here as a half-close
+/// alone).
 fn forward_port(
     (writer, agreed): (&Stream, u32),
     connection: Connection<std::fs::File>,
-    ip: &str,
-    port: &str,
+    (ip, port): (&str, &str),
+    host_port: u32,
 ) -> Result<(), String> {
     let Some((wanted, engine)) = published_or_refuse(writer, (ip, port), forward::Protocol::Tcp)?
     else {
@@ -584,15 +619,26 @@ fn forward_port(
         Err(error) => return refuse(writer, &format!("{address} in the guest: {error}")),
     };
     keep_alive(&tcp);
+    // Kept by the host's port and a token of its own, as an API connection
+    // is (a port can be another's by the hang-up).
+    let token = super::control::new_token();
+    let _kept = Kept::keep(host_port, token, &tcp);
     let lingers = shipyard_sys::relay::Lingers {
         after_one: LINGER,
         after_other: LINGER,
+        bound: Some(PORT_BOUND),
     };
     welcome_and_relay(
         (writer, agreed),
         connection,
         tcp.into(),
-        (lingers, Named::NotNamed),
+        (
+            lingers,
+            Named::ByToken {
+                token,
+                from: shipyard_runtime::attach::PORT_SESSION_VERSION,
+            },
+        ),
     )
     .map_err(|e| format!("the forwarded connection: {e}"))
 }
@@ -694,11 +740,19 @@ fn connection_asked(args: &[String]) -> Option<Asked<'_>> {
 /// client of version 6 or later ([`Frame::Session`]).
 #[derive(Debug, Clone, Copy)]
 enum Named {
-    /// None: a port's connection, which nothing hangs up.
-    NotNamed,
-    /// An API connection's, named by its token for a hang-up (`None`: none
-    /// could be made, said as 0, so its client names it by its port).
-    ByToken(Option<u128>),
+    /// Named by its token for a hang-up (`None`: none could be made, said as
+    /// 0, so its client names it by its port), said from the version `from`:
+    /// an API connection's from [`SESSION_VERSION`], a forwarded port's from
+    /// [`PORT_SESSION_VERSION`] (F180(f)); to an older client, nothing.
+    ///
+    /// [`SESSION_VERSION`]: shipyard_runtime::attach::SESSION_VERSION
+    /// [`PORT_SESSION_VERSION`]: shipyard_runtime::attach::PORT_SESSION_VERSION
+    ByToken {
+        /// The token.
+        token: Option<u128>,
+        /// The first version that's told it.
+        from: u32,
+    },
 }
 
 /// Welcomes the host's connection, then relays its bytes (those read
@@ -718,9 +772,8 @@ fn welcome_and_relay(
             stdin: true,
         },
     )?;
-    if let Named::ByToken(token) = named
-        && agreed >= shipyard_runtime::attach::SESSION_VERSION
-    {
+    let Named::ByToken { token, from } = named;
+    if agreed >= from {
         send(writer, &Frame::Session(token.unwrap_or(0)))?;
     }
     let (vsock, unread) = connection.into_parts();
@@ -756,43 +809,50 @@ fn forward_api(
     // relayed: a hang-up names it by either (F155: a port can be another's
     // by then, a token never is).
     let token = super::control::new_token();
-    let _kept = KeptApiConnection::keep(port, token, &api);
+    let _kept = Kept::keep(port, token, &api);
     welcome_and_relay(
         (writer, agreed),
         connection,
         api.into(),
-        (forward::API_LINGERS, Named::ByToken(token)),
+        (
+            forward::API_LINGERS,
+            Named::ByToken {
+                token,
+                from: shipyard_runtime::attach::SESSION_VERSION,
+            },
+        ),
     )
     .map_err(|e| format!("the Docker API's connection: {e}"))
 }
 
-/// The API connections being relayed, each under its names (the host's
-/// port, in decimal; its token, 32 hex digits), with an identity of its
-/// own: what a hang-up ([`forward::API_HANG_UP`]) reaches.
-static API_CONNECTIONS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<String, (u64, std::os::unix::net::UnixStream)>>,
+/// The connections being relayed that a hang-up ([`forward::API_HANG_UP`])
+/// reaches: the API's, and a forwarded port's (F180(f)), each under its
+/// names (the host's port, in decimal; an API connection's token, 32 hex
+/// digits), with an identity of its own, by their guest-side socket.
+static KEPT: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, (u64, std::os::fd::OwnedFd)>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// One of [`API_CONNECTIONS`], let go when dropped (its relay's end): each
-/// name only while it's still this one's (a new connection that took the
-/// port since is its own).
-struct KeptApiConnection {
+/// One of [`KEPT`], let go when dropped (its relay's end): each name only
+/// while it's still this one's (a new connection that took the port since
+/// is its own).
+struct Kept {
     names: Vec<String>,
     identity: u64,
 }
 
-impl KeptApiConnection {
-    fn keep(port: u32, token: Option<u128>, api: &std::os::unix::net::UnixStream) -> Self {
+impl Kept {
+    fn keep(port: u32, token: Option<u128>, peer: &impl std::os::fd::AsFd) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let identity = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let names: Vec<String> = std::iter::once(port.to_string())
             .chain(token.map(forward::session_token_text))
             .collect();
-        let mut kept = API_CONNECTIONS
+        let mut kept = KEPT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for name in &names {
-            if let Ok(copy) = api.try_clone() {
+            if let Ok(copy) = peer.as_fd().try_clone_to_owned() {
                 kept.insert(name.clone(), (identity, copy));
             }
         }
@@ -800,9 +860,9 @@ impl KeptApiConnection {
     }
 }
 
-impl Drop for KeptApiConnection {
+impl Drop for Kept {
     fn drop(&mut self) {
-        let mut kept = API_CONNECTIONS
+        let mut kept = KEPT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for name in &self.names {
@@ -816,17 +876,21 @@ impl Drop for KeptApiConnection {
     }
 }
 
-/// The API connection `name` names (the host's port from an older host,
-/// else its token) shut both ways: the service sees its client hang up
-/// (`POLLHUP`), as a client's on Linux is seen, and its relay here ends.
-/// One not kept (ended already): nothing.
-fn hang_up_api(name: &str) {
-    if let Some((_, api)) = API_CONNECTIONS
+/// The connection `name` names (an API connection's token, or the host's
+/// port: a forwarded port's, or an API connection's from an older host)
+/// shut both ways on its guest side: the API's service sees its client
+/// hang up (`POLLHUP`), a port's container its peer gone, and its relay
+/// here ends. One not kept (ended already): nothing.
+fn hang_up(name: &str) {
+    if let Some((_, peer)) = KEPT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(name)
     {
-        let _ = api.shutdown(std::net::Shutdown::Both);
+        let _ = nix::sys::socket::shutdown(
+            std::os::fd::AsRawFd::as_raw_fd(peer),
+            nix::sys::socket::Shutdown::Both,
+        );
     }
 }
 
@@ -860,6 +924,12 @@ fn connect_api() -> Result<std::os::unix::net::UnixStream, String> {
 /// How long a forwarded connection one side has ended waits for the
 /// other's end before it's cut (`shipyard_sys::relay::both_ways`).
 const LINGER: Duration = Duration::from_secs(60);
+
+/// The longest a forwarded port's relay is held past one side's end by
+/// bytes still coming the other way: a backstop for a Mac client that died
+/// whose hang-up never came (a lost request, an older host); the hang-up
+/// ends one at once (F180(f)).
+const PORT_BOUND: Duration = Duration::from_hours(1);
 
 /// The address a port published on `ip` is reached at from the guest
 /// itself: its loopback's for every address (DNAT'd in `output`), else
@@ -1286,13 +1356,13 @@ mod tests {
         use std::io::Read as _;
         let (first, mut first_peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let (second, mut second_peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let named = |name: &str| API_CONNECTIONS.lock().unwrap().contains_key(name);
+        let named = |name: &str| KEPT.lock().unwrap().contains_key(name);
         // (Ports past any real vsock one's: no test beside this shares them.)
         let (port, token) = (4_000_000_001, 0x5eed_u128);
         let token_name = forward::session_token_text(token);
-        let kept_first = KeptApiConnection::keep(port, Some(token), &first);
+        let kept_first = Kept::keep(port, Some(token), &first);
         assert!(named(&port.to_string()) && named(&token_name));
-        hang_up_api(&token_name);
+        hang_up(&token_name);
         first_peer
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -1301,11 +1371,11 @@ mod tests {
             0,
             "shut by its token"
         );
-        let kept_second = KeptApiConnection::keep(port, None, &second);
+        let kept_second = Kept::keep(port, None, &second);
         drop(kept_first);
         assert!(named(&port.to_string()), "the second's port kept");
         assert!(!named(&token_name), "the first's token gone");
-        hang_up_api(&port.to_string());
+        hang_up(&port.to_string());
         second_peer
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -1316,6 +1386,25 @@ mod tests {
         );
         drop(kept_second);
         assert!(!named(&port.to_string()));
+    }
+
+    /// A forwarded port's connection is kept under the host's port, which
+    /// hangs it up (F180(f)): the container's side sees its peer gone.
+    #[test]
+    fn a_port_s_connection_is_hung_up_by_the_host_s_port() {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut container, _) = listener.accept().unwrap();
+        let port = 4_000_000_002;
+        let kept = Kept::keep(port, None, &ours);
+        hang_up(&port.to_string());
+        container
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(container.read(&mut [0_u8; 8]).unwrap(), 0, "hung up");
+        drop(kept);
+        assert!(!KEPT.lock().unwrap().contains_key(&port.to_string()));
     }
 
     /// A client that says nothing is given up on within its wait; with none

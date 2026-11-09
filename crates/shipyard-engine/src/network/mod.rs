@@ -39,7 +39,7 @@ pub use commands::{
 pub use dns_server::entry_point as dns_entry_point;
 pub(crate) use dns_server::{IDLE_ENV as DNS_IDLE_ENV, UPSTREAM_ENV as DNS_UPSTREAM_ENV};
 #[cfg(target_os = "linux")]
-pub(crate) use firewall::describe_conflict;
+pub(crate) use firewall::{describe_conflict, ensure_guest_firewall};
 #[cfg(target_os = "linux")]
 pub(crate) use live::{
     Joining, check_bridge, connect_live, container_leases, disconnect_live, lease_owners,

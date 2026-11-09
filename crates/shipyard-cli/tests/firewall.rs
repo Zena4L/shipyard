@@ -183,6 +183,55 @@ fn a_link_outside_reaches_no_published_port() {
     });
 }
 
+/// F175: a link in the `outside` set opens nothing new on the host itself
+/// (the macOS guest's own services, a `--network host` container's), the
+/// control first and after it's taken out of the set; the host reaching out
+/// over it still gets its replies.
+#[test]
+#[ignore = "needs root"]
+fn a_link_outside_opens_nothing_new_on_the_host() {
+    in_new_netns(|| {
+        let networks = NetworkDir::new(SHIPYARD);
+        let upstream = Upstream::new();
+        // A run, so Shipyard's table is there.
+        let (running, _netns) = networks.sleeping(&[]);
+        let listener = std::net::TcpListener::bind("0.0.0.0:8091").unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let _ = std::io::Write::write_all(&mut stream, b"host");
+            }
+        });
+        let host = SocketAddr::from((Upstream::HOST, 8091));
+        assert_eq!(
+            fetch_from(upstream.netns(), host).as_deref(),
+            Some("host"),
+            "the control"
+        );
+        let Some(_) = nft(&["add", "element", "inet", "shipyard", "outside", "{ up0 }"]) else {
+            running.stop();
+            return;
+        };
+        assert_eq!(fetch_from(upstream.netns(), host), None, "new, from up0");
+        let _out = Server::start(upstream.netns(), 8092, "upstream");
+        let theirs = SocketAddr::from((Upstream::ADDRESS, 8092));
+        assert_eq!(
+            fetch(theirs).as_deref(),
+            Some("upstream"),
+            "the host's own connection out, its replies taken"
+        );
+        nft(&[
+            "delete", "element", "inet", "shipyard", "outside", "{ up0 }",
+        ]);
+        assert_eq!(
+            fetch_from(upstream.netns(), host).as_deref(),
+            Some("host"),
+            "out of the set"
+        );
+        running.stop();
+    });
+}
+
 #[test]
 #[ignore = "needs root"]
 fn a_published_port_is_held_while_its_run_lives() {

@@ -57,7 +57,11 @@ const READY_WAIT: Duration = Duration::from_secs(150);
 fn joined_once_ready(machine: &Machine) -> Result<(UnixStream, Vec<u8>, String), Unanswered> {
     let began = std::time::Instant::now();
     loop {
-        match crate::forwarding::joined_from(machine, &[API_REQUEST], true) {
+        match crate::forwarding::joined_from(
+            machine,
+            &[API_REQUEST],
+            Some(shipyard_runtime::attach::SESSION_VERSION),
+        ) {
             Err(Unanswered::Refused(Refusal::NotReady)) if began.elapsed() < READY_WAIT => {
                 std::thread::sleep(Duration::from_millis(250));
             }

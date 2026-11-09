@@ -1553,45 +1553,19 @@ fn a_tcp_port_is_reached_at_the_containers_own_address() {
     assert!(vm.shipyard(&["rm", "-f", "echo-tcp"]).status.success());
 }
 
-/// Step 13.5b (F108): a published port doesn't answer on the VM's own
-/// address on the Mac's virtual network (`eth0`'s, which the Mac and other
-/// VMs on it reach), while `localhost` reaches it, and a host-network
-/// container is reached on that address (the controls).
+/// Step 13.5b (F108) and 15.2f2a (F175): on the VM's own address on the
+/// Mac's virtual network (`eth0`'s, which other VMs on it reach) nothing new
+/// is answered: neither a published port (`localhost` reaches it: the
+/// control) nor a host-network container's. The link itself carries what
+/// the guest opens: a container reaching the Mac at its gateway address
+/// (the control that the address is no dead one).
 #[test]
-fn a_published_port_doesnt_answer_on_the_vms_own_address() {
+fn the_vms_own_address_answers_nothing_new() {
     use std::io::{Read as _, Write as _};
     let Some(vm) = Vm::new("outside") else {
         return;
     };
     let image = local_busybox(&vm);
-    let port = free_port();
-    let publish = format!("{port}:80");
-    let ran = vm.shipyard(&[
-        "run", "-d", "--name", "echo-out", "-p", &publish, image, "nc", "-lk", "-p", "80", "-e",
-        "/bin/cat",
-    ]);
-    assert!(ran.status.success(), "{ran:?}");
-    // The VM's own address, as a container on its network sees it.
-    let shown = vm.shipyard(&[
-        "run",
-        "--rm",
-        "--network",
-        "host",
-        image,
-        "ip",
-        "-4",
-        "-o",
-        "addr",
-        "show",
-        "eth0",
-    ]);
-    assert!(shown.status.success(), "{shown:?}");
-    let ip: std::net::Ipv4Addr = text(&shown.stdout)
-        .split_whitespace()
-        .skip_while(|word| *word != "inet")
-        .nth(1)
-        .and_then(|cidr| cidr.split('/').next()?.parse().ok())
-        .unwrap_or_else(|| panic!("{shown:?}"));
     let echoed = |address: std::net::SocketAddr| -> bool {
         let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3))
         else {
@@ -1603,16 +1577,9 @@ fn a_published_port_doesnt_answer_on_the_vms_own_address() {
             && stream.read_exact(&mut echoed).is_ok()
             && &echoed == b"hi\n"
     };
-    // The control: forwarded within the poll.
-    let local = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let began = Instant::now();
-    while !echoed(local) {
-        assert!(began.elapsed() < Duration::from_secs(20), "never forwarded");
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    // The control on that address: a container on the VM's own network
-    // (`--network host`, not a published port: F175) is reached there, so
-    // the Mac does reach the address.
+    // First, no container on a bridge network yet (whose run would make the
+    // firewall itself): the guest's own start made it (F175).
+    let (ip, gateway) = guest_addresses(&vm, image);
     let other = free_port();
     let listened = vm.shipyard(&[
         "run",
@@ -1630,23 +1597,184 @@ fn a_published_port_doesnt_answer_on_the_vms_own_address() {
         "/bin/cat",
     ]);
     assert!(listened.status.success(), "{listened:?}");
+    // The controls: the host-network container answers in the guest; the
+    // link carries what the guest opens: it reaches the Mac.
+    let inside = vm.shipyard(&[
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        image,
+        "sh",
+        "-c",
+        &format!("echo hi | nc -w 3 127.0.0.1 {other}"),
+    ]);
+    assert_eq!(text(&inside.stdout).trim(), "hi", "{inside:?}");
+    assert_eq!(said_to_the_mac(&vm, image, gateway), "out");
+    assert!(
+        !echoed(std::net::SocketAddr::from((ip, other))),
+        "the VM's own address {ip} answers the host-network container's {other}"
+    );
+    // A published port: forwarded to `localhost` (the control), never
+    // answered on the VM's own address (F108).
+    let port = free_port();
+    let publish = format!("{port}:80");
+    let ran = vm.shipyard(&[
+        "run", "-d", "--name", "echo-out", "-p", &publish, image, "nc", "-lk", "-p", "80", "-e",
+        "/bin/cat",
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    let local = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let began = Instant::now();
-    while !echoed(std::net::SocketAddr::from((ip, other))) {
-        assert!(
-            began.elapsed() < Duration::from_secs(20),
-            "the VM's address {ip} is unreachable from the Mac: no proof"
-        );
+    while !echoed(local) {
+        assert!(began.elapsed() < Duration::from_secs(20), "never forwarded");
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
         !echoed(std::net::SocketAddr::from((ip, port))),
-        "the VM's own address {ip} answers port {port}"
+        "the VM's own address {ip} answers the published port {port}"
     );
     assert!(
         vm.shipyard(&["rm", "-f", "echo-out", "echo-host"])
             .status
             .success()
     );
+}
+
+/// The VM's own address on the Mac's network (`eth0`'s) and its gateway
+/// (the Mac), as a host-network container sees them.
+fn guest_addresses(vm: &Vm, image: &str) -> (std::net::Ipv4Addr, std::net::Ipv4Addr) {
+    let shown = vm.shipyard(&[
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        image,
+        "sh",
+        "-c",
+        "ip -4 -o addr show eth0; ip -4 route show default",
+    ]);
+    assert!(shown.status.success(), "{shown:?}");
+    let shown = text(&shown.stdout);
+    let after = |word: &str| -> std::net::Ipv4Addr {
+        shown
+            .split_whitespace()
+            .skip_while(|said| *said != word)
+            .nth(1)
+            .and_then(|value| value.split('/').next()?.parse().ok())
+            .unwrap_or_else(|| panic!("no {word} in {shown}"))
+    };
+    (after("inet"), after("via"))
+}
+
+/// What a host-network container sends the Mac at `gateway`, over a
+/// connection the guest opens: "out".
+fn said_to_the_mac(vm: &Vm, image: &str, gateway: std::net::Ipv4Addr) -> String {
+    use std::io::Read as _;
+    let mac = std::net::TcpListener::bind((gateway, 0)).unwrap();
+    let port = mac.local_addr().unwrap().port();
+    let reached = vm.shipyard(&[
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        image,
+        "sh",
+        "-c",
+        &format!("echo out | nc -w 3 {gateway} {port}"),
+    ]);
+    assert!(reached.status.success(), "{reached:?}");
+    // Accepted within a bound: a guest that never came fails, never hangs.
+    mac.set_nonblocking(true).unwrap();
+    let began = Instant::now();
+    let mut from_guest = loop {
+        match mac.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    began.elapsed() < Duration::from_secs(20),
+                    "the guest never reached the Mac at {gateway}: {reached:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("accepting the guest: {error}"),
+        }
+    };
+    from_guest.set_nonblocking(false).unwrap();
+    from_guest
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut said = String::new();
+    from_guest.read_to_string(&mut said).unwrap();
+    said.trim().to_owned()
+}
+
+/// Step 15.2f2a (F180(f)): a forwarded connection whose Mac client goes
+/// while its container streams is hung up in the guest too (Virtualization.
+/// framework says the client's end as a half-close alone): the container's
+/// side of it ends within seconds, its next write failing.
+#[test]
+fn a_gone_client_of_a_streaming_port_is_hung_up() {
+    use std::io::Read as _;
+    let Some(vm) = Vm::new("stream") else {
+        return;
+    };
+    let image = local_busybox(&vm);
+    let port = free_port();
+    let publish = format!("{port}:80");
+    let ran = vm.shipyard(&[
+        "run",
+        "-d",
+        "--name",
+        "streams",
+        "-p",
+        &publish,
+        image,
+        "nc",
+        "-lk",
+        "-p",
+        "80",
+        "-e",
+        "sh",
+        "-c",
+        "while echo tick; do sleep 0.2; done",
+    ]);
+    assert!(ran.status.success(), "{ran:?}");
+    let ticking = || {
+        let listed = vm.shipyard(&["exec", "streams", "ps", "-o", "args"]);
+        text(&listed.stdout)
+            .lines()
+            .any(|line| line.contains("sleep 0.2") || line.contains("while echo"))
+    };
+    let local = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let began = Instant::now();
+    let mut client = loop {
+        if let Ok(mut client) = std::net::TcpStream::connect_timeout(&local, Duration::from_secs(3))
+        {
+            let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut tick = [0u8; 5];
+            if client.read_exact(&mut tick).is_ok() && &tick == b"tick\n" {
+                break client;
+            }
+        }
+        assert!(began.elapsed() < Duration::from_secs(20), "never streamed");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // The control: streaming while the client is there.
+    let mut more = [0u8; 5];
+    client.read_exact(&mut more).unwrap();
+    assert!(ticking(), "the stream's shell runs");
+    drop(client);
+    let gone = Instant::now();
+    while ticking() {
+        assert!(
+            gone.elapsed() < Duration::from_secs(20),
+            "the container still streams to a client that went"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!("hung up within {:?}", gone.elapsed());
+    assert!(vm.shipyard(&["rm", "-f", "streams"]).status.success());
 }
 
 /// Step 13.5b (F98): a Mac program that binds every address of a port the

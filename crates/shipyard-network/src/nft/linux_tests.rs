@@ -391,6 +391,8 @@ fn nft_reads_and_rebuilds_shipyards_table() {
             "ip saddr @masquerade4 oifname != @bridges masquerade",
             "ip6 saddr @masquerade6 oifname != @bridges masquerade",
             "iifname @isolated drop",
+            // F175: nothing new from an outside link.
+            "iifname @outside ct state invalid,new drop",
             "iifname . ip daddr . meta l4proto . th dport @dns_allow accept",
             "iifname @isolated ip daddr 169.254.0.0/16 drop",
             "ip daddr 100.100.100.200 drop",
