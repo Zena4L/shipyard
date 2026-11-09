@@ -175,6 +175,10 @@ pub(crate) const IPPROTO_ICMPV6: u8 = 58;
 pub(crate) const CT_STATE_INVALID: u32 = 1;
 pub(crate) const CT_STATE_ESTABLISHED: u32 = 1 << 1;
 pub(crate) const CT_STATE_RELATED: u32 = 1 << 2;
+/// `ct state new` (`NF_CT_STATE_BIT(IP_CT_NEW)`).
+pub(crate) const CT_STATE_NEW: u32 = 1 << 3;
+/// UDP's protocol number (`IPPROTO_UDP`).
+pub(crate) const IPPROTO_UDP: u8 = 17;
 /// `ct status` bit: the connection is in the table (`IPS_CONFIRMED`): its
 /// first packet has been through, past `postrouting` or `input`. Not in
 /// libc.

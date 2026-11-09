@@ -861,13 +861,45 @@ impl std::fmt::Display for Unanswered {
 /// One connection, `tcp`, joined to `guest`'s port through the agent: the
 /// forward asked, its welcome waited for, then the bytes both ways. (An
 /// older guest would welcome it as a command: never asked, since it can't
-/// answer for its ports and nothing is listened on.)
+/// answer for its ports and nothing is listened on.) Once the relay here
+/// has ended without all of the guest's bytes reaching the client (a write
+/// to a client that died failed, or a cut), the guest's is hung up by its
+/// token (F180(f)): a client that died reaches it only as a half-close,
+/// which a container that streams would hold for good. After a clean end
+/// it's left to end by itself, as it does: a hang-up then could cut the
+/// last of an upload still on its way to the container. Never by its port,
+/// which another connection may have taken by then (an older guest's).
 fn forward_one(machine: &Machine, guest: PublishedPort, mut tcp: TcpStream) -> Result<(), String> {
     let (ip, port) = (guest.ip.to_string(), guest.port.to_string());
-    let (agent, unread) =
-        joined(machine, &[FORWARD_REQUEST, &ip, &port]).map_err(|refusal| refusal.to_string())?;
-    tcp.write_all(&unread).map_err(|e| e.to_string())?;
-    shipyard_sys::relay::both_ways(tcp.into(), agent.into(), LINGER).map_err(|e| e.to_string())
+    let (agent, unread, name) = joined_from(
+        machine,
+        &[FORWARD_REQUEST, &ip, &port],
+        Some(shipyard_runtime::attach::PORT_SESSION_VERSION),
+    )
+    .map_err(|refusal| refusal.to_string())?;
+    let relayed = tcp
+        .write_all(&unread)
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            let lingers = shipyard_sys::relay::Lingers {
+                after_one: LINGER,
+                after_other: LINGER,
+                bound: None,
+            };
+            shipyard_sys::relay::both_ways_lingering(tcp.into(), agent.into(), lingers)
+                .map_err(|e| e.to_string())
+        });
+    if hangs_up(relayed.as_ref().ok(), &name) {
+        hang_up(machine, &name);
+    }
+    relayed.map(drop)
+}
+
+/// Whether a forwarded port's relay that `ended` so (`None`: it failed) is
+/// hung up in the guest by `name` ([`forward_one`]): not after a clean end,
+/// and only by a token.
+fn hangs_up(ended: Option<&shipyard_sys::relay::Ended>, name: &str) -> bool {
+    !ended.is_some_and(|ended| ended.other_clean) && forward::session_token_of(name).is_some()
 }
 
 /// A connection the agent is asked for (`args`: a port's, the API's), its
@@ -879,17 +911,18 @@ pub(crate) fn joined(
     machine: &Machine,
     args: &[&str],
 ) -> Result<(UnixStream, Vec<u8>), Unanswered> {
-    joined_from(machine, args, false).map(|(agent, unread, _)| (agent, unread))
+    joined_from(machine, args, None).map(|(agent, unread, _)| (agent, unread))
 }
 
 /// [`joined`], with what names the connection to the guest ([`hang_up`]):
-/// its session's token, if `with_session` and the guest gave one after
-/// its welcome (F155, version 6), else the connection's port on this side
-/// (an older guest's way: a port can be another connection's by then).
+/// its session's token, if the guest gives one after its welcome from the
+/// version `session_from` (an API connection's from 6, F155; a forwarded
+/// port's from 7, F180(f)), else the connection's port on this side (an
+/// older guest's way: a port can be another connection's by then).
 pub(crate) fn joined_from(
     machine: &Machine,
     args: &[&str],
-    with_session: bool,
+    session_from: Option<u32>,
 ) -> Result<(UnixStream, Vec<u8>, String), Unanswered> {
     let other = Unanswered::Broken;
     let (mut connection, port) = request_from(machine, args).map_err(other)?;
@@ -912,7 +945,7 @@ pub(crate) fn joined_from(
         _ => return Err(other("the guest didn't take it".to_owned())),
     };
     let mut name = port.to_string();
-    if with_session && version >= shipyard_runtime::attach::SESSION_VERSION {
+    if session_from.is_some_and(|from| version >= from) {
         match connection.next_frame().map_err(|e| other(e.to_string()))? {
             Some(Frame::Session(0)) => {}
             Some(Frame::Session(token)) => name = forward::session_token_text(token),
@@ -926,11 +959,13 @@ pub(crate) fn joined_from(
     Ok((agent, unread, name))
 }
 
-/// Tells the guest's agent that the client of its API connection `name`
-/// names ([`joined_from`]) has gone (11.7): Virtualization.framework
-/// passes this side's close on as a half-close only, which a client that
-/// has merely finished sending also is, so the guest can't tell. Not
-/// waited for (an older guest runs it as an unknown command, and fails).
+/// Tells the guest's agent that the client of its connection `name` names
+/// ([`joined_from`]: an API connection's, 11.7, or a forwarded port's,
+/// F180(f)) has gone: Virtualization.framework passes this side's close on
+/// as a half-close only, which a client that has merely finished sending
+/// also is, so the guest can't tell. Not waited for (an older guest runs it
+/// as an unknown command, and fails; one before F180(f) finds no port's
+/// connection by its name, and does nothing).
 pub(crate) fn hang_up(machine: &Machine, name: &str) {
     let _ = request(machine, &[forward::API_HANG_UP, name]);
 }
@@ -938,6 +973,22 @@ pub(crate) fn hang_up(machine: &Machine, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A forwarded port's relay is hung up in the guest only after an
+    /// unclean end (a client gone, a cut, a failure), and only by a token,
+    /// never by a port another connection may have taken (F180(f)).
+    #[test]
+    fn a_port_s_relay_is_hung_up_after_an_unclean_end_by_its_token() {
+        let token = forward::session_token_text(0x5eed);
+        let ended = |other_clean| shipyard_sys::relay::Ended {
+            one_gone: false,
+            other_clean,
+        };
+        assert!(hangs_up(Some(&ended(false)), &token));
+        assert!(hangs_up(None, &token), "a relay that failed");
+        assert!(!hangs_up(Some(&ended(true)), &token), "a clean end");
+        assert!(!hangs_up(Some(&ended(false)), "40123"), "a port");
+    }
 
     /// A boot ID's answer: the ID; a refusal, or a guest that can't read its
     /// ID, alive; an older guest's failure unknown (never taken for a hang:

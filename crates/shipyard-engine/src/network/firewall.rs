@@ -24,6 +24,19 @@ pub(super) fn ensure_firewall(
     config: &shipyard_network::store::NetworkConfig,
     reporter: &dyn Reporter,
 ) -> Result<()> {
+    ensure_table(networks, nft, reporter)?;
+    nft.add_network(&shipyard_network::nft::NetworkRules::from(config))?;
+    Ok(())
+}
+
+/// [`ensure_firewall`]'s table alone: made current, whole, if it's missing
+/// or an older one.
+#[cfg(target_os = "linux")]
+fn ensure_table(
+    networks: &shipyard_network::store::Networks,
+    nft: &mut shipyard_network::nft::Nftables,
+    reporter: &dyn Reporter,
+) -> Result<()> {
     use shipyard_network::nft::{NetworkRules, Ruleset};
     // A newer Shipyard's table is left as it is (rebuilt by this one, it
     // would lose what that one added); its networks' elements go in it.
@@ -38,8 +51,22 @@ pub(super) fn ensure_firewall(
             nft.install(&rules, &ports, &closed, &outside_links()?)?;
         }
     }
-    nft.add_network(&NetworkRules::from(config))?;
     Ok(())
+}
+
+/// The macOS guest's firewall at its agent's start (F175), not only at a
+/// run's first bridge network: its NAT link takes nothing new from another
+/// VM on the Mac's network, a `--network host` container's ports included,
+/// before any container runs.
+///
+/// # Errors
+///
+/// The store's or the kernel's.
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_guest_firewall(engine: &crate::Engine) -> Result<()> {
+    let networks = super::networks(engine)?;
+    let mut nft = shipyard_network::nft::Nftables::new()?;
+    ensure_table(&networks, &mut nft, engine.reporter().as_ref())
 }
 
 /// The links no published port is reached from: the macOS guest's NAT

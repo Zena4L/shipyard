@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 
 use super::super::consts::{
-    CT_STATE_INVALID, IPS_CONFIRMED, IPS_DST_NAT, NF_DROP, NFT_CMP_EQ, NFT_CMP_GTE, NFT_CMP_LTE,
-    NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS, NFT_DYNSET_OP_ADD, NFT_META_IIFNAME,
+    CT_STATE_INVALID, CT_STATE_NEW, IPS_CONFIRMED, IPS_DST_NAT, NF_DROP, NFT_CMP_EQ, NFT_CMP_GTE,
+    NFT_CMP_LTE, NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS, NFT_DYNSET_OP_ADD, NFT_META_IIFNAME,
     NFT_META_OIFNAME, NFT_NAT_DNAT, NFT_REJECT_ICMPX_ADMIN_PROHIBITED, NFT_REJECT_ICMPX_UNREACH,
     NFT_REJECT_TCP_RST,
 };
@@ -429,8 +429,10 @@ fn a_limited_network_counts_each_containers_new_connections() {
 }
 
 /// `input`: from an isolated network, replies, its DNS server (IPv4),
-/// IPv6's neighbour discovery, then nothing; its elements: its bridge,
-/// and its gateway's port 53 over UDP and TCP if it has names.
+/// IPv6's neighbour discovery, then nothing; from an outside link (F175),
+/// DHCP's replies and IPv6's neighbour discovery, then nothing new; the
+/// isolated network's elements: its bridge, and its gateway's port 53 over
+/// UDP and TCP if it has names.
 #[test]
 fn an_isolated_network_reaches_the_host_only_for_its_dns() {
     let input: Vec<Vec<Expr>> = rules()
@@ -438,7 +440,7 @@ fn an_isolated_network_reaches_the_host_only_for_its_dns() {
         .filter(|(chain, _)| *chain == chain::INPUT)
         .map(|(_, exprs)| exprs)
         .collect();
-    assert_eq!(input.len(), 9);
+    assert_eq!(input.len(), 12);
     // The limit first (see the test before).
     assert_eq!(input[0], link_local_refused());
     assert_eq!(input[1..5], limit_rules());
@@ -464,6 +466,35 @@ fn an_isolated_network_reaches_the_host_only_for_its_dns() {
         input[3],
         [
             interface_in(NFT_META_IIFNAME, set::ISOLATED, false),
+            vec![Expr::Verdict(NF_DROP)]
+        ]
+        .concat()
+    );
+    // From an outside link (F175): DHCP's replies (UDP 67 to 68) and IPv6's
+    // neighbour discovery (133 to 137) taken, then nothing new.
+    let outside = interface_in(NFT_META_IIFNAME, set::OUTSIDE, false);
+    assert!(input[4].starts_with(&outside));
+    for port in [67_u16, 68] {
+        assert!(input[4].contains(&Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: port.to_be_bytes().to_vec(),
+        }));
+    }
+    assert_eq!(input[4].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+    for (op, kind) in [(NFT_CMP_GTE, 133), (NFT_CMP_LTE, 137)] {
+        assert!(input[5].contains(&Expr::Cmp {
+            sreg: reg(0),
+            op,
+            data: vec![kind],
+        }));
+    }
+    assert_eq!(input[5].last(), Some(&Expr::Verdict(NF_ACCEPT)));
+    assert_eq!(
+        input[6],
+        [
+            outside,
+            ct_bits(NFT_CT_STATE, CT_STATE_NEW | CT_STATE_INVALID, true),
             vec![Expr::Verdict(NF_DROP)]
         ]
         .concat()
@@ -615,7 +646,7 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
     assert_eq!(what[1], "adding the set bridges");
     assert_eq!(what[19], "adding the chain guard");
     assert!(what.contains(&"adding rule 19 of the chain forward"));
-    assert!(what.contains(&"adding rule 9 of the chain input"));
+    assert!(what.contains(&"adding rule 12 of the chain input"));
     assert_eq!(
         what[what.len() - 8..],
         [

@@ -117,8 +117,9 @@ pub(crate) const FAMILY: u8 = NFPROTO_INET;
 // 13.5b, F108. 10: the `same_uplink` set, by which routing closed between
 // the host's links leaves alone what's bridged on one of them (a `br0`
 // uplink's VMs, seen by the forward hook with `br_netfilter`), step 15.2c2,
-// F111.)
-pub(crate) const VERSION: &[u8] = b"shipyard ruleset 10";
+// F111. 11: `input`'s drop of what's new or invalid from an `outside` link
+// but DHCP's replies and IPv6's neighbour discovery, step 15.2f2a, F175.)
+pub(crate) const VERSION: &[u8] = b"shipyard ruleset 11";
 
 /// The most connections a container on a network made with
 /// `--conntrack-limit` may have open, of those it opened (counted per
@@ -229,6 +230,17 @@ const METADATA6: [Ipv6Addr; 3] = [
 const ND_FIRST: u8 = 135;
 /// See [`ND_FIRST`].
 const ND_LAST: u8 = 136;
+/// `ICMPv6`'s router solicitation to redirect (RFC 4861: 133 to 137): all
+/// the macOS guest's own IPv6 needs from its NAT link (F175), whose new
+/// traffic is otherwise dropped.
+const ND_LINK_FIRST: u8 = 133;
+/// See [`ND_LINK_FIRST`].
+const ND_LINK_LAST: u8 = 137;
+/// DHCP's server and client ports (RFC 2131): the replies the macOS guest's
+/// own lease comes by (`udhcpc` on its NAT link, F175).
+const DHCP_SERVER_PORT: u16 = 67;
+/// See [`DHCP_SERVER_PORT`].
+const DHCP_CLIENT_PORT: u16 = 68;
 
 /// A published port, and the container address it goes to (of the host
 /// address's family, for a port on one).

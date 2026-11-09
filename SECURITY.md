@@ -92,12 +92,11 @@ you trust:
   `shipyard cp` keeps its mode, as on Linux). The VM's own files (its disk, its
   socket) are hidden from a bind of your home.
 - **Ports:** a published port listens on your Mac's loopback only, never on its
-  network, and the VM's firewall refuses it on the VM's own address on the Mac's
-  private virtual network (`192.168.64.x`), so other VMs on that network don't reach
-  it. What isn't a published port isn't covered there: a container on
-  `--network host` listening in the VM answers on that address, as a port published
-  on one of the VM's addresses reaches its holder's socket (a TCP reset; UDP waits
-  unread).
+  network, and the VM's firewall takes nothing new on the VM's own address on the
+  Mac's private virtual network (`192.168.64.x`): other VMs on that network reach
+  neither a published port, a container on `--network host`, nor the VM's own
+  services (only its DHCP replies, its IPv6 neighbour discovery and the replies to
+  what it opened come in there).
 - **The Mac, from a container:** a container can reach your Mac's own services at the
   VM's gateway (`192.168.64.1`), as it can a Linux host's.
 - **The VM's agent** answers only the Mac (vsock's host, CID 2). Its port is held by

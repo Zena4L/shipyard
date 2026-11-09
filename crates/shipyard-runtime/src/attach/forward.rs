@@ -240,15 +240,17 @@ pub fn session_token_of(text: &str) -> Option<u128> {
 pub const API_REQUEST: &str = "__guest-api";
 
 /// What the host asks of the guest's agent once the client of one of its
-/// [`API_REQUEST`] connections has gone (step 11.7): `API_HANG_UP NAME`,
-/// the connection named by the token its welcome's
-/// [`Frame::Session`]
-/// gave ([`session_token_text`], F155: a port can be another's by then),
-/// or, from an older host, by the host's vsock port (the guest's peer's). Its
-/// API socket is then shut both ways, which the guest's service takes for
-/// the client's hang-up: Virtualization.framework passes the host's close
-/// of a vsock on as a half-close only, which says less. Answered with no
-/// frame; an older guest runs it as an unknown command, and fails.
+/// [`API_REQUEST`] connections has gone (step 11.7), or once its relay of a
+/// [`FORWARD_REQUEST`] connection has ended (step 15.2f2a, F180(f)):
+/// `API_HANG_UP NAME`, the connection named by the token its welcome's
+/// [`Frame::Session`] gave ([`session_token_text`], F155: a port can be
+/// another's by then), or, from an older host, by the host's vsock port (the
+/// guest's peer's). Its guest side is then shut both ways: the API's service
+/// takes it for the client's hang-up, a port's container sees its peer gone.
+/// Virtualization.framework passes the host's close of a vsock on as a
+/// half-close only, which says less. Answered with no frame; an older guest
+/// runs it as an unknown command, and fails (one before 15.2f2a finds no
+/// port's connection by it, and does nothing).
 pub const API_HANG_UP: &str = "__guest-api-hang-up";
 
 /// How long an API connection waits for its second end
@@ -261,6 +263,7 @@ pub const API_HANG_UP: &str = "__guest-api-hang-up";
 pub const API_LINGERS: shipyard_sys::relay::Lingers = shipyard_sys::relay::Lingers {
     after_one: std::time::Duration::MAX,
     after_other: std::time::Duration::from_secs(60),
+    bound: None,
 };
 
 /// What the VM's host refuses a client with while it's stopping (idle,

@@ -235,6 +235,14 @@ behaviour; each change is listed here).
   launchd is asked to start it unless launchd says it hasn't the agent, and a command
   starts its own when launchd then won't (F182).
 - **`shipyard vm set` replaced a `vm.json` a newer `shipyard` wrote:** it's refused (F183).
+- **On a Mac, another VM on the Mac's network reached a `--network host` container, or the
+  VM's own services, at the VM's address:** the VM's firewall takes nothing new there
+  but its DHCP replies and IPv6 neighbour discovery, and is in place from the VM's start
+  (F175).
+- **On a Mac, a forwarded connection whose client had half-closed was cut 10 minutes
+  later, bytes still coming** (a long download after the request was sent): it's cut
+  only a linger after its last byte, and a client that has gone is hung up in the VM
+  too, so a container that streams to it stops at once (F180).
 - **On a Mac, each new UDP peer of a published port cost the guest a scan of its leases:**
   a new peer takes the address looked up within the last 2 seconds (F185).
 

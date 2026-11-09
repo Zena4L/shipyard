@@ -3,11 +3,11 @@
 //! metadata drops).
 
 use super::super::consts::{
-    CT_STATE_ESTABLISHED, CT_STATE_INVALID, CT_STATE_RELATED, IPPROTO_ICMPV6, IPS_CONFIRMED,
-    IPS_DST_NAT, NF_ACCEPT, NF_DROP, NFT_CMP_EQ, NFT_CMP_GTE, NFT_CMP_LTE, NFT_CMP_NEQ,
-    NFT_CT_STATE, NFT_CT_STATUS, NFT_DYNSET_OP_ADD, NFT_META_IIFNAME, NFT_META_L4PROTO,
-    NFT_META_OIFNAME, NFT_PAYLOAD_TRANSPORT_HEADER, NFT_REJECT_ICMPX_ADMIN_PROHIBITED,
-    NFT_REJECT_ICMPX_UNREACH, NFT_REJECT_TCP_RST,
+    CT_STATE_ESTABLISHED, CT_STATE_INVALID, CT_STATE_NEW, CT_STATE_RELATED, IPPROTO_ICMPV6,
+    IPPROTO_UDP, IPS_CONFIRMED, IPS_DST_NAT, NF_ACCEPT, NF_DROP, NFT_CMP_EQ, NFT_CMP_GTE,
+    NFT_CMP_LTE, NFT_CMP_NEQ, NFT_CT_STATE, NFT_CT_STATUS, NFT_DYNSET_OP_ADD, NFT_META_IIFNAME,
+    NFT_META_L4PROTO, NFT_META_OIFNAME, NFT_PAYLOAD_TRANSPORT_HEADER,
+    NFT_REJECT_ICMPX_ADMIN_PROHIBITED, NFT_REJECT_ICMPX_UNREACH, NFT_REJECT_TCP_RST,
 };
 use super::super::expr::Expr;
 use super::exprs::{
@@ -16,8 +16,8 @@ use super::exprs::{
     routing_closed,
 };
 use super::{
-    CONNTRACK_LIMIT, LINK_LOCAL4, LINK_LOCAL6, METADATA4, METADATA6, ND_FIRST, ND_LAST, chain, reg,
-    set,
+    CONNTRACK_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, LINK_LOCAL4, LINK_LOCAL6, METADATA4,
+    METADATA6, ND_FIRST, ND_LAST, ND_LINK_FIRST, ND_LINK_LAST, chain, reg, set,
 };
 use crate::ipnet::Family;
 
@@ -63,8 +63,11 @@ pub(crate) fn rules() -> Vec<(&'static str, Vec<Expr>)> {
 
 /// `input`'s: from an isolated network's bridge, to the host itself, only
 /// replies (what the host opened), its DNS server on the gateway, and IPv6's
-/// neighbour discovery; nothing else.
-fn input_rules() -> [Vec<Expr>; 9] {
+/// neighbour discovery; nothing else. From an `outside` link (the macOS
+/// guest's NAT, F175), nothing new but DHCP's replies and IPv6's neighbour
+/// discovery: another VM on the Mac's network reaches neither the guest's
+/// own services nor a host-network container's.
+fn input_rules() -> [Vec<Expr>; 12] {
     let [tcp4, other4, tcp6, other6] = limit_rules();
     let [protocol, port] = protocol_and_port(5);
     let dns = vec![
@@ -83,33 +86,7 @@ fn input_rules() -> [Vec<Expr>; 9] {
             invert: false,
         },
     ];
-    let neighbours = vec![
-        Expr::Meta {
-            key: NFT_META_L4PROTO,
-            dreg: reg(0),
-        },
-        Expr::Cmp {
-            sreg: reg(0),
-            op: NFT_CMP_EQ,
-            data: vec![IPPROTO_ICMPV6],
-        },
-        Expr::Payload {
-            base: NFT_PAYLOAD_TRANSPORT_HEADER,
-            offset: 0,
-            len: 1,
-            dreg: reg(0),
-        },
-        Expr::Cmp {
-            sreg: reg(0),
-            op: NFT_CMP_GTE,
-            data: vec![ND_FIRST],
-        },
-        Expr::Cmp {
-            sreg: reg(0),
-            op: NFT_CMP_LTE,
-            data: vec![ND_LAST],
-        },
-    ];
+    let neighbours = icmpv6_types(ND_FIRST, ND_LAST);
     [
         // Counted first: what a container opens to the host counts too.
         link_local_refused(),
@@ -132,6 +109,95 @@ fn input_rules() -> [Vec<Expr>; 9] {
         ]
         .concat(),
         [from_isolated(), vec![Expr::Verdict(NF_DROP)]].concat(),
+        [from_outside(), dhcp_reply(), vec![Expr::Verdict(NF_ACCEPT)]].concat(),
+        [
+            ipv6(),
+            from_outside(),
+            icmpv6_types(ND_LINK_FIRST, ND_LINK_LAST),
+            vec![Expr::Verdict(NF_ACCEPT)],
+        ]
+        .concat(),
+        // Nothing new, and nothing invalid (no stray segment answered with
+        // a reset, by which the guest's ports could be probed).
+        [
+            from_outside(),
+            ct_bits(NFT_CT_STATE, CT_STATE_NEW | CT_STATE_INVALID, true),
+            vec![Expr::Verdict(NF_DROP)],
+        ]
+        .concat(),
+    ]
+}
+
+/// Arrived on an `outside` link (the macOS guest's NAT).
+fn from_outside() -> Vec<Expr> {
+    interface_in(NFT_META_IIFNAME, set::OUTSIDE, false)
+}
+
+/// A DHCP server's reply to its client: UDP from port 67 to port 68.
+fn dhcp_reply() -> Vec<Expr> {
+    vec![
+        Expr::Meta {
+            key: NFT_META_L4PROTO,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: vec![IPPROTO_UDP],
+        },
+        Expr::Payload {
+            base: NFT_PAYLOAD_TRANSPORT_HEADER,
+            offset: 0,
+            len: 2,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: DHCP_SERVER_PORT.to_be_bytes().to_vec(),
+        },
+        Expr::Payload {
+            base: NFT_PAYLOAD_TRANSPORT_HEADER,
+            offset: 2,
+            len: 2,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: DHCP_CLIENT_PORT.to_be_bytes().to_vec(),
+        },
+    ]
+}
+
+/// An `ICMPv6` message whose type is from `first` to `last`.
+fn icmpv6_types(first: u8, last: u8) -> Vec<Expr> {
+    vec![
+        Expr::Meta {
+            key: NFT_META_L4PROTO,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_EQ,
+            data: vec![IPPROTO_ICMPV6],
+        },
+        Expr::Payload {
+            base: NFT_PAYLOAD_TRANSPORT_HEADER,
+            offset: 0,
+            len: 1,
+            dreg: reg(0),
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_GTE,
+            data: vec![first],
+        },
+        Expr::Cmp {
+            sreg: reg(0),
+            op: NFT_CMP_LTE,
+            data: vec![last],
+        },
     ]
 }
 
@@ -355,7 +421,7 @@ fn forward_rules() -> [Vec<Expr>; 19] {
         // A published port reached from a link no one outside the host may
         // reach it from (the macOS guest's NAT link: F108), never accepted.
         [
-            interface_in(NFT_META_IIFNAME, set::OUTSIDE, false),
+            from_outside(),
             ct_bits(NFT_CT_STATUS, IPS_DST_NAT, true),
             vec![drop()],
         ]
