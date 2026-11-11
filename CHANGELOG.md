@@ -239,6 +239,14 @@ behaviour; each change is listed here).
   VM's own services, at the VM's address:** the VM's firewall takes nothing new there
   but its DHCP replies and IPv6 neighbour discovery, and is in place from the VM's start
   (F175).
+- **Docker's CLI 29.1 refused Shipyard's API** (Ubuntu 26.04's own `docker-cli`, which
+  asks for API 1.44 at least): Shipyard serves 1.44, in 1.44's shapes but for an image's
+  `VirtualSize`, kept for a client of 1.43 or older; it takes 1.44's create with several
+  networks (the `default` network alone, a container-wide hardware address the first
+  network's), a read-only bind's `ReadOnlyForceRecursive` (what its read-only binds are;
+  refused on a bind that isn't read-only, `ReadOnlyNonRecursive` refused), and says each
+  network's `DNSNames` (none on the default network, which has no DNS) and `/info`'s
+  `Runtimes` and `CDISpecDirs` (F207).
 - **On a Mac, a bind of Docker's own socket (`-v /var/run/docker.sock:…`, Testcontainers'
   Ryuk) was refused:** it's given the VM's Docker API, through a socket the VM holds for
   its life, whose service starts on its first connection (F171).
@@ -257,11 +265,6 @@ behaviour; each change is listed here).
   config's directory is opened once and checked as it's held open, so one swapped for a
   link after the check is never written through (F162).
 
-### Known limitations
-
-- **Docker's CLI 29.1 needs `DOCKER_API_VERSION=1.43`** (F207; Ubuntu 26.04's own
-  `docker-cli`): it asks for API 1.44 at least and doesn't step down to the 1.43 Shipyard
-  serves; Docker's CLI up to 28, and 29.4, negotiate as before.
 
 ## 0.5.0 - unreleased
 

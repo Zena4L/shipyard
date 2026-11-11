@@ -223,7 +223,7 @@ PID 2: the command sees only its own processes, under Shipyard's small init (PID
 ## What it is: `version` and `info`
 
 `shipyard version` says what Shipyard is, as Docker's `version` does: a `Client`
-part (its version, the API version it speaks, 1.43, its revision, its OS and
+part (its version, the API version it speaks, 1.44, its revision, its OS and
 architecture) and a `Server` part (the engine: the same, with the oldest API version
 it takes, 1.24). `shipyard info` says what it has and what its host is: its
 containers (running, paused, stopped), images, storage and logging drivers, cgroup

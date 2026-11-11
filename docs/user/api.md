@@ -1,6 +1,6 @@
 # The Docker API
 
-Shipyard serves a subset of Docker's Engine API (version 1.43, Docker 24's) on a
+Shipyard serves a subset of Docker's Engine API (version 1.44, Docker 25's) on a
 UNIX socket, so Docker's own clients can drive it: the `docker` CLI, and the tools
 built on Docker's API. On Linux it's the service's own socket; on a Mac, `docker.sock`
 relays to the same API in Shipyard's VM ([macOS](macos.md)).
@@ -103,7 +103,7 @@ A rootless socket is yours alone, in your runtime directory.
 | `GET /images/json` | `docker images` (filters `reference`, a pattern of `*` and `?`, `[…]` refused; `label`; `dangling`: an image with a name never is). An image that can't be read is left out of the list, not the list refused. `Size` is the layers' as pulled (compressed): Shipyard keeps no total of their unpacked bytes. `Containers` and `SharedSize` are `-1`, as Docker's list says them (its daemon counts them for `system df` alone) |
 | `POST /images/{name}/push` | `docker push` (`tag`; none, and a name without one: every tag of the repository, as `docker push -a`): the image pushed as it's stored (see [push](images.md#pushing-push)), signed in with `X-Registry-Auth` (what `docker login` keeps, which Docker's CLI hands in), else the service's own Docker config; its progress as Docker's lines (`The push refers to repository […]`, a line a blob, `Pushed` or `Layer already exists`), then for each tag `TAG: digest: … size: …` and Docker's `aux` (`Tag`, `Digest`, `Size`). A failure once under way comes in the stream. A client that goes doesn't cut a push short |
 | `POST /auth` | `docker login`: the credentials (a username and password, or a token) checked against the registry `serveraddress` names (Docker Hub if none) at its `/v2/`, as Docker's daemon checks them: `200 {"Status": "Login Succeeded"}`, or `401` with Docker's `unauthorized: …`. Nothing is kept: your CLI keeps them in your Docker config, as it does with Docker, and hands them in with each pull. Never logged or shown |
-| `GET /images/{name}/json` | `docker image inspect`: Docker's keys at 1.43. An image's `Id` is its manifest's digest (Docker 29's own, for an image of one platform); `RepoDigests` name it by the multi-platform index it was pulled through, if it was, as its registry knows it (one pulled by an older Shipyard: its manifest); `Metadata.LastTagTime` is when its reference was last pulled to it or tagged; a name is a reference, a repository's digest (`alpine@sha256:…`, as `RepoDigests` names it), or an ID: the manifest's digest, whole or its first 4 hex digits or more (`400` if they start more than one image's), or the config's digest, whole |
+| `GET /images/{name}/json` | `docker image inspect`: Docker's keys at 1.44 (`VirtualSize` too for a client at 1.43 or older). An image's `Id` is its manifest's digest (Docker 29's own, for an image of one platform); `RepoDigests` name it by the multi-platform index it was pulled through, if it was, as its registry knows it (one pulled by an older Shipyard: its manifest); `Metadata.LastTagTime` is when its reference was last pulled to it or tagged; a name is a reference, a repository's digest (`alpine@sha256:…`, as `RepoDigests` names it), or an ID: the manifest's digest, whole or its first 4 hex digits or more (`400` if they start more than one image's), or the config's digest, whole |
 | `POST /images/{name}/tag` | `docker tag` (`repo`, `tag`) |
 | `GET /images/{name}/history` | `docker history`: a step of the image's build a row, newest first, from its config's `history` (one with none: a row a layer). `Id` is the image's on the newest row, `<missing>` on the rest, as Docker says for an image it didn't build; `Size` the step's layer as stored (compressed); `Tags` the image's names on the newest row |
 | `GET /images/{name}/get`, `GET /images/get?names=…` | `docker save`: the images (`names` repeated for more than one; a repository alone is every tag of it) as one tar archive, Docker 25's: an OCI layout (`oci-layout`, `index.json`, `blobs/sha256/…`) with Docker's `manifest.json`. Each image's own blobs as stored, so it keeps its ID; the same images give the same bytes. One that isn't there is `404` before anything is sent; a failure once the archive is under way cuts it short |
@@ -135,11 +135,12 @@ A rootless socket is yours alone, in your runtime directory.
 | `GET /shipyard/usage` | What everything uses now (`{"version": 1, …}`), as counters a reader divides between two reads: the host's `memory` (`total`, `available`: `/proc/meminfo`'s `MemTotal` and `MemAvailable`, bytes; on a Mac, the VM's), its `cpu` (`time` since boot in all its CPUs, nanoseconds, as `docker stats`' `system_cpu_usage`; `cpus` online), each running or paused container's (`containers`: `id`, `cpu_time` in nanoseconds, `memory` in bytes less `inactive_file`, as `docker stats` says it; and its `monitor_memory`, its monitor's cgroup's in bytes, `null` without one; one whose cgroup can't be read, rootless without delegation, left out). Each cgroup is read without the container's runtime lock, so a start or an exec under way never holds the answer up. One read at a time, its answer shared for a second |
 | `GET /events` | `docker events` (`since`, `until`, `filters`: `type`, `event`, `container`, `image`, `volume`, `network`, `label`), Docker's JSON lines; followed until `until`, or for good without one |
 
-Paths with a version prefix (`/v1.43/containers/json`) are taken for any version from
-1.24 to 1.43; a newer one is refused with Docker's "client version … is too new", and
-Docker's clients then use 1.43. Docker's CLI 29.1 (Ubuntu 26.04's own package) asks for
-1.44 at least and doesn't step down: set `DOCKER_API_VERSION=1.43` where you set
-`DOCKER_HOST` (29.4 steps down again). Answers are Docker's: its JSON, its statuses (`304`
+Paths with a version prefix (`/v1.44/containers/json`) are taken for any version from
+1.24 to 1.44, and answered in 1.44's shapes, but for an image's `VirtualSize`, kept up
+to 1.43 and gone from 1.44; a newer one is refused with Docker's "client version … is too new",
+and Docker's clients then use 1.44: Docker's CLI from 24 to 29 alike. A create may name
+several networks (1.44: `docker run --network a --network b`): the first is the
+container's `eth0`. Answers are Docker's: its JSON, its statuses (`304`
 for a start or stop with nothing to do, `404` for what isn't there, `409` for a
 conflict), and its `{"message": "…"}` for a refusal.
 
@@ -191,7 +192,8 @@ Refused, with what to use instead (400):
 | a log driver other than `json-file` or `local`, a volume driver, a runtime | Shipyard keeps the logs, the volumes and runs containers itself |
 | `--shm-size`, `--gpus`, `--storage-opt`, `--cgroup-parent`, `--oom-kill-disable`, `--memory-swappiness`, `--security-opt systempaths=unconfined`, `--blkio-weight-device`, the realtime CPU settings | create the container without them |
 | `--security-opt seccomp=FILE` from Docker's CLI (it sends the profile's contents) | `seccomp=unconfined`, or Shipyard's own profile; a client that sends an absolute path has it read where the service runs |
-| more than one network at create | `docker network connect` after |
+| the `default` network named with others at create | name the networks |
+| a read-only bind whose mounts below stay writable (`BindOptions.ReadOnlyNonRecursive`; `ReadOnlyForceRecursive` is taken: a read-only bind is read-only all the way down) | a plain read-only bind |
 | an address, alias or hardware address on the default network (`--ip`, `--network-alias`, `--mac-address` without `--network`) | make a network of your own and use `--network` |
 
 Each of these is refused only when it's asked for: at Docker's defaults (what its

@@ -9,7 +9,9 @@ use crate::errors::ApiError;
 /// The Engine API versions served and taken (D11.2-3): the engine's.
 pub use shipyard_engine::docker::{API_VERSION, MIN_API_VERSION};
 
-const NEWEST: (u32, u32) = (1, 43);
+/// [`API_VERSION`] and [`MIN_API_VERSION`] as numbers (a test holds them
+/// to the strings).
+pub(crate) const NEWEST: (u32, u32) = (1, 44);
 const OLDEST: (u32, u32) = (1, 24);
 
 /// Shipyard's own endpoints (`/shipyard/…`: `own.rs`).
@@ -336,7 +338,6 @@ fn unversioned(path: &str) -> Result<&str, ApiError> {
     Ok(after)
 }
 
-/// `MAJOR.MINOR`, both numbers.
 /// The API version `path`'s prefix asks for (`/v1.41/…`: 1.41), if it has
 /// one; the newest served if not (as Docker's daemon takes a path without
 /// one).
@@ -346,6 +347,7 @@ pub(crate) fn asked_version(path: &str) -> (u32, u32) {
         .unwrap_or(NEWEST)
 }
 
+/// `MAJOR.MINOR`, both numbers.
 fn parse_version(text: &str) -> Option<(u32, u32)> {
     let (major, minor) = text.split_once('.')?;
     let number = |part: &str| {
@@ -360,11 +362,19 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
-    /// A prefix up to 1.43 and down to 1.24 is taken off; none is fine.
+    /// The numbers are the strings Docker's clients read.
+    #[test]
+    fn the_versions_agree() {
+        assert_eq!(format!("{}.{}", NEWEST.0, NEWEST.1), API_VERSION);
+        assert_eq!(format!("{}.{}", OLDEST.0, OLDEST.1), MIN_API_VERSION);
+    }
+
+    /// A prefix up to 1.44 and down to 1.24 is taken off; none is fine.
     #[test]
     fn the_version_prefix_is_checked_and_taken_off() {
         for path in [
             "/containers/json",
+            "/v1.44/containers/json",
             "/v1.43/containers/json",
             "/v1.24/containers/json",
         ] {
@@ -374,13 +384,13 @@ mod tests {
                 "{path}"
             );
         }
-        let too_new = route(&Method::GET, "/v1.44/containers/json").unwrap_err();
+        let too_new = route(&Method::GET, "/v1.45/containers/json").unwrap_err();
         assert_eq!(too_new.status, hyper::StatusCode::BAD_REQUEST);
         // Docker's daemon's own words, which its clients show: part of the
         // API's contract (D25), so pinned whole, unlike Shipyard's own.
         assert_eq!(
             too_new.message,
-            "client version 1.44 is too new. Maximum supported API version is 1.43"
+            "client version 1.45 is too new. Maximum supported API version is 1.44"
         );
         assert_eq!(
             route(&Method::GET, "/v2.0/info").unwrap_err().status,
@@ -406,9 +416,9 @@ mod tests {
     #[test]
     fn the_version_asked_is_the_prefix_s() {
         assert_eq!(asked_version("/v1.41/volumes/prune"), (1, 41));
-        assert_eq!(asked_version("/volumes/prune"), (1, 43));
+        assert_eq!(asked_version("/volumes/prune"), (1, 44));
         assert_eq!(asked_version("/v1.43"), (1, 43));
-        assert_eq!(asked_version("/volumes"), (1, 43), "a path, not a version");
+        assert_eq!(asked_version("/volumes"), (1, 44), "a path, not a version");
     }
 
     /// Each kind's prune, by its path.

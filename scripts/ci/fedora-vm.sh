@@ -101,8 +101,8 @@ echo "$count test executables"
 mkdir -p "$repo/target/probes"
 gcc -O2 -o "$repo/target/probes/terminal" scripts/probes/terminal.c
 
-# Docker's CLI (24.0.9: API 1.43, the one served) and Compose v5.6.0, x86-64,
-# as the test image has them.
+# Docker's CLI (24.0.9: API 1.43; 29.4.2 as `docker29`: 1.44, the one served)
+# and Compose v5.6.0, x86-64, as the test image has them.
 fetch_pinned() {
     local url=$1 sum=$2 to=$3
     curl -fsSL --retry 3 --retry-delay 5 -o "$to.part" "$url"
@@ -113,6 +113,11 @@ mkdir -p "$repo/target/tools"
 fetch_pinned https://download.docker.com/linux/static/stable/x86_64/docker-24.0.9.tgz \
     692ecfc28333485d184f628b74c25b2894cee9495a51a5418ba60ef95bf733ca "$repo/target/tools/docker.tgz"
 tar -xzf "$repo/target/tools/docker.tgz" -C "$repo/target/tools" --strip-components=1 docker/docker
+fetch_pinned https://download.docker.com/linux/static/stable/x86_64/docker-29.4.2.tgz \
+    e985c6dc5008b8d62d6bdf9b5894427d075b335a1391cacf24ee01a7a29a3728 "$repo/target/tools/docker29.tgz"
+mkdir -p "$repo/target/tools/29"
+tar -xzf "$repo/target/tools/docker29.tgz" -C "$repo/target/tools/29" --strip-components=1 docker/docker
+mv "$repo/target/tools/29/docker" "$repo/target/tools/docker29"
 fetch_pinned https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64 \
     40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a "$repo/target/tools/docker-compose"
 
@@ -182,6 +187,7 @@ interruptible rsync -a --exclude /target --exclude /.git --exclude /fuzz/target 
     echo target/test-binaries.txt
     echo target/probes/terminal
     echo target/tools/docker
+    echo target/tools/docker29
     echo target/tools/docker-compose
     cut -f2 "$repo/target/test-binaries.txt" | sed "s|^$repo/||"
 } > "$work/files"
@@ -189,6 +195,7 @@ interruptible rsync -a --files-from="$work/files" "$repo/" "tester@127.0.0.1:$re
 # The tools where the test image has them; and cargo's scratch directory for
 # the tests (CARGO_TARGET_TMPDIR, compiled in), for both passes' users.
 vm "sudo install -m 0755 '$repo/target/tools/docker' /usr/local/bin/docker \
+    && sudo install -m 0755 '$repo/target/tools/docker29' /usr/local/bin/docker29 \
     && sudo install -D -m 0755 '$repo/target/tools/docker-compose' \
         /usr/local/lib/docker/cli-plugins/docker-compose \
     && mkdir -p '$repo/target/tmp' && chmod 1777 '$repo/target/tmp'"

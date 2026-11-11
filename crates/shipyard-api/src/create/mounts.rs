@@ -46,6 +46,21 @@ pub(super) fn mounted(
     asked.source.clone_from(&mount.source);
     asked.read_only = mount.read_only.unwrap_or(false);
     if let Some(bind) = &mount.bind_options {
+        // A read-only bind is read-only all the way down (the runtime's
+        // `mount_setattr` with `AT_RECURSIVE`, or each mount below remounted):
+        // what `ReadOnlyForceRecursive` asks, and never `ReadOnlyNonRecursive`.
+        if bind.read_only_non_recursive == Some(true) {
+            return refuse(
+                "a read-only bind whose mounts below stay writable (ReadOnlyNonRecursive)",
+            );
+        }
+        // Docker's own rule: it asks how a read-only bind is read-only.
+        if bind.read_only_force_recursive == Some(true) && !asked.read_only {
+            return Err(field(
+                "BindOptions.ReadOnlyForceRecursive",
+                "it needs a read-only bind (ReadOnly)",
+            ));
+        }
         asked.propagation.clone_from(&bind.propagation);
         asked.non_recursive = bind.non_recursive.unwrap_or(false);
         asked.create_mountpoint = bind.create_mountpoint.unwrap_or(false);

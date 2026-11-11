@@ -25,7 +25,7 @@ fn a_version_reads_as_docker_s() {
     );
     assert!(text.contains("\nServer: Shipyard\n Engine:\n"), "{text}");
     assert!(
-        text.contains("  API version:      1.43 (minimum version 1.24)\n"),
+        text.contains("  API version:      1.44 (minimum version 1.24)\n"),
         "{text}"
     );
     // A template reads Go's names (`.APIVersion`) and the JSON's.
@@ -34,7 +34,7 @@ fn a_version_reads_as_docker_s() {
         .unwrap()
         .write(&mut out, std::slice::from_ref(&versions))
         .unwrap();
-    assert_eq!(String::from_utf8(out).unwrap(), "1.43 1.43 default\n");
+    assert_eq!(String::from_utf8(out).unwrap(), "1.44 1.44 default\n");
     // A field it hasn't is an error, as Docker's Go struct's.
     let nope = Output::strict("{{.Server.Nope}}").unwrap();
     assert!(nope.write(&mut Vec::new(), &[versions]).is_err());

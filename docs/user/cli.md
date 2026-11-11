@@ -2169,7 +2169,7 @@ System-wide information and maintenance
 * `df` — Show the store's disk usage
 * `recover` — Settle containers that ended unwatched, then start those whose restart policy brings them back when the host starts (what the boot unit runs: see contrib/systemd)
 * `stop` — Stop every container that's up, for the host's shutdown, each with its own stop signal and timeout: not as your stop (their restart policy brings them back at boot), and none restarted until `system recover` (what shipyard-stop.service runs at a shutdown)
-* `service` — Serve Docker's Engine API (a subset, version 1.43) on a UNIX socket, for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`); systemd's shipyard.socket starts it at the first connection (see contrib/systemd). It exits once nothing has been asked for 60 s (`SHIPYARD_API_IDLE`: other whole seconds)
+* `service` — Serve Docker's Engine API (a subset, version 1.44) on a UNIX socket, for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`); systemd's shipyard.socket starts it at the first connection (see contrib/systemd). It exits once nothing has been asked for 60 s (`SHIPYARD_API_IDLE`: other whole seconds)
 
 
 
@@ -2218,7 +2218,7 @@ Stop every container that's up, for the host's shutdown, each with its own stop 
 
 ## `shipyard system service`
 
-Serve Docker's Engine API (a subset, version 1.43) on a UNIX socket, for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`); systemd's shipyard.socket starts it at the first connection (see contrib/systemd). It exits once nothing has been asked for 60 s (`SHIPYARD_API_IDLE`: other whole seconds)
+Serve Docker's Engine API (a subset, version 1.44) on a UNIX socket, for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`); systemd's shipyard.socket starts it at the first connection (see contrib/systemd). It exits once nothing has been asked for 60 s (`SHIPYARD_API_IDLE`: other whole seconds)
 
 **Usage:** `shipyard system service [OPTIONS]`
 

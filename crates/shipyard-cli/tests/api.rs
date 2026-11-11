@@ -1008,7 +1008,7 @@ fn docker_drives_a_container_s_life() {
     let _service = stores.serve(60);
     assert_eq!(
         stores.docker_ok(&["version", "--format", "{{.Server.APIVersion}}"]),
-        "1.43"
+        "1.44"
     );
     let id = stores.docker_ok(&[
         "create",
@@ -1375,7 +1375,7 @@ fn another_user_is_refused() {
     }
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
     let version = ["version", "--format", "{{.Server.APIVersion}}"];
-    assert_eq!(stores.docker_ok(&version), "1.43", "root is answered");
+    assert_eq!(stores.docker_ok(&version), "1.44", "root is answered");
     let nobody = Command::new("docker")
         .args(version)
         .env("DOCKER_HOST", format!("unix://{}", socket.display()))
@@ -1387,7 +1387,7 @@ fn another_user_is_refused() {
         .unwrap();
     assert!(!nobody.status.success(), "nobody was answered: {nobody:?}");
     assert!(
-        !String::from_utf8_lossy(&nobody.stdout).contains("1.43"),
+        !String::from_utf8_lossy(&nobody.stdout).contains("1.44"),
         "{nobody:?}"
     );
     // It reached the socket (no permission refused it): the service closed
@@ -2867,6 +2867,126 @@ fn a_pull_says_its_layers_bytes_as_they_come() {
             assert!(current > 0 && current <= total, "{line}");
         }
     }
+}
+
+/// A Docker CLI of version 29 or later (API 1.44 at the least, F207):
+/// `docker29` (the test image's, beside its 24), else `docker` if it's one.
+fn docker_29() -> Option<&'static str> {
+    // The host's own `docker` when it's 29 or newer (a runner's), else the
+    // test image's `docker29`, which `SHIPYARD_TEST_TOOLS=required` requires.
+    let major = Command::new("docker")
+        .args(["version", "--format", "{{.Client.Version}}"])
+        .output()
+        .ok()
+        .and_then(|version| {
+            String::from_utf8_lossy(&version.stdout)
+                .trim()
+                .split('.')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        });
+    if major.is_some_and(|major| major >= 29) {
+        Some("docker")
+    } else {
+        reference_tool("docker29").then_some("docker29")
+    }
+}
+
+/// Step 15.2g1 (F207): Docker's CLI 29, which asks for API 1.44 at the least,
+/// is served: its `version` says 1.44; a run on two networks (1.44's create)
+/// has an interface on each, the first its `eth0`, and inspect says each
+/// network's `DNSNames`; an image's `VirtualSize` is said to a 1.43 client
+/// and left out at 1.44.
+#[test]
+#[ignore = "needs root"]
+fn docker_s_cli_29_is_served_at_1_44() {
+    if !is_root() {
+        return;
+    }
+    let Some(client) = docker_29() else { return };
+    let Some(stores) = Stores::new() else { return };
+    let _service = stores.serve(60);
+    let client_run = |args: &[&str]| -> String {
+        let output = Command::new(client)
+            .args(args)
+            .env(
+                "DOCKER_HOST",
+                format!("unix://{}", stores.socket().display()),
+            )
+            .env("DOCKER_CONFIG", stores.scratch.0.join("docker"))
+            .env_remove("DOCKER_API_VERSION")
+            .stdin(Stdio::null())
+            .output()
+            .expect("running docker 29");
+        assert!(output.status.success(), "{client} {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(
+        client_run(&["version", "--format", "{{.Server.APIVersion}}"]),
+        "1.44"
+    );
+    // An image's VirtualSize: to a 1.43 client, not at 1.44.
+    let listed = |version: &str| {
+        api::get(&stores.socket(), &format!("/v{version}/images/json"))
+            .unwrap()
+            .json()
+    };
+    assert!(listed("1.43")[0].get("VirtualSize").is_some());
+    assert!(listed("1.44")[0].get("VirtualSize").is_none());
+    assert!(!client_run(&["images", "-q"]).is_empty());
+    // Two networks at the run: eth0 on the first, eth1 on the second.
+    client_run(&["network", "create", "front"]);
+    client_run(&["network", "create", "back"]);
+    let image = &stores.image;
+    client_run(&[
+        "run",
+        "-d",
+        "--name",
+        "two",
+        "--network",
+        "front",
+        "--network",
+        "back",
+        image,
+        "sleep",
+        "300",
+    ]);
+    let networks = client_run(&[
+        "inspect",
+        "-f",
+        "{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}",
+        "two",
+    ]);
+    assert_eq!(networks, "back front");
+    let names = client_run(&[
+        "inspect",
+        "-f",
+        "{{json .NetworkSettings.Networks.front.DNSNames}}",
+        "two",
+    ]);
+    assert!(names.contains("\"two\""), "{names}");
+    // `front` (the mode's network) is eth0 and `back` eth1: their hardware
+    // addresses, as the container's own interfaces have them.
+    let macs = client_run(&[
+        "inspect",
+        "-f",
+        "{{.NetworkSettings.Networks.front.MacAddress}} {{.NetworkSettings.Networks.back.MacAddress}}",
+        "two",
+    ]);
+    let interfaces = client_run(&[
+        "exec",
+        "two",
+        "cat",
+        "/sys/class/net/eth0/address",
+        "/sys/class/net/eth1/address",
+    ]);
+    assert_eq!(
+        interfaces.split_whitespace().collect::<Vec<_>>(),
+        macs.split_whitespace().collect::<Vec<_>>()
+    );
+    client_run(&["rm", "-f", "two"]);
+    client_run(&["network", "rm", "front", "back"]);
 }
 
 /// Images through Docker's CLI: a pull (its progress, up to date the

@@ -1,6 +1,7 @@
 //! Images as Docker's Engine API shapes them (step 11.2c1): `GET
 //! /images/json`'s `ImageSummary` and `GET /images/{name}/json`'s
-//! `ImageInspect`, at API 1.43, checked against Docker 29.8's.
+//! `ImageInspect`, at API 1.44 (1.43's `VirtualSize` the API's to add or not),
+//! checked against Docker 29.8's.
 //!
 //! An image's ID is its manifest's digest (D11.2c-2): what Shipyard's
 //! containers already say they run, and what Docker 29's containerd store
@@ -39,8 +40,10 @@ pub struct ImageSummary {
     /// The bytes it shares with other images: not counted (-1, as
     /// Docker's unless asked).
     pub shared_size: i64,
-    /// As [`size`](Self::size) (Docker's older name).
-    pub virtual_size: u64,
+    /// As [`size`](Self::size) (Docker's older name; left out from API 1.44:
+    /// the API clears it for a client asking at that version or later).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_size: Option<u64>,
     /// Its labels, or `null`.
     pub labels: Option<BTreeMap<String, String>>,
     /// Its containers: not counted (-1), as Docker's list says (its daemon
@@ -87,8 +90,9 @@ pub struct ImageInspect {
     pub os: String,
     /// Its layers' bytes, as pulled.
     pub size: u64,
-    /// As [`size`](Self::size).
-    pub virtual_size: u64,
+    /// As [`size`](Self::size) (left out from API 1.44, as for the list).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_size: Option<u64>,
     /// Where its layers are kept.
     pub graph_driver: GraphDriver,
     /// Its layers, by their unpacked digests.
@@ -283,7 +287,7 @@ pub fn list_images(engine: &Engine) -> Result<Vec<ImageSummary>> {
             created: created_seconds(&read.pulled),
             size,
             shared_size: -1,
-            virtual_size: size,
+            virtual_size: Some(size),
             labels: read.labels(),
             containers: -1,
         });
@@ -376,7 +380,7 @@ fn inspected(read: &Read) -> ImageInspect {
         variant: config.about.variant.clone(),
         os: config.os.clone(),
         size,
-        virtual_size: size,
+        virtual_size: Some(size),
         graph_driver: GraphDriver {
             name: "overlayfs".to_owned(),
             data: None,
