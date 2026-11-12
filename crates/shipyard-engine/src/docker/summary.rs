@@ -47,7 +47,7 @@ pub struct ContainerSummary {
     /// Its binds and volumes.
     pub mounts: Vec<MountPoint>,
     /// Its health: `starting`, `healthy`, `unhealthy`, or `none` (Docker's
-    /// `Health.Status`, served from API 1.52 on: not by this one, 1.43).
+    /// `Health.Status`, served from API 1.52 on: not by this one, 1.44).
     #[serde(skip)]
     pub health: &'static str,
 }

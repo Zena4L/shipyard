@@ -499,7 +499,7 @@ fn version_and_info_say_docker_s() {
     assert!(version.contains("\nServer: Shipyard\n"), "{version}");
     assert_eq!(
         stores.ok(&["version", "--format", "{{.Server.APIVersion}}"]),
-        "1.43\n"
+        "1.44\n"
     );
     let info = stores.ok(&["info"]);
     assert!(info.contains("\n Containers: 1\n"), "{info}");

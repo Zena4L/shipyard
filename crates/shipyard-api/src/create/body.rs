@@ -1,6 +1,6 @@
-//! Docker's `ContainerCreateRequest` as it comes (API 1.43's names): every
-//! field optional, `null` as good as absent, the fields Shipyard doesn't
-//! read left out (serde skips them, as Docker skips the ones it doesn't
+//! Docker's `ContainerCreateRequest` as it comes (API 1.43's names, and
+//! 1.44's endpoints and bind options): every field optional, `null` as
+//! good as absent, the fields Shipyard doesn't read left out (serde skips them, as Docker skips the ones it doesn't
 //! know).
 
 use std::collections::BTreeMap;
@@ -236,6 +236,11 @@ pub(crate) struct BindOptions {
     pub(crate) propagation: Option<String>,
     pub(crate) non_recursive: Option<bool>,
     pub(crate) create_mountpoint: Option<bool>,
+    /// API 1.44: read-only on the bind alone, its mounts below writable.
+    pub(crate) read_only_non_recursive: Option<bool>,
+    /// API 1.44: read-only all the way down, or refused (what Shipyard's
+    /// read-only binds are anyway).
+    pub(crate) read_only_force_recursive: Option<bool>,
 }
 
 /// A volume mount's options.

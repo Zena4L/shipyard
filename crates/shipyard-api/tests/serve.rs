@@ -79,14 +79,14 @@ fn ping_answers_with_the_api_version() {
     let ping = api::get(&served.socket, "/_ping").unwrap();
     assert_eq!(ping.status, 200);
     assert_eq!(ping.text(), "OK");
-    assert_eq!(ping.header("Api-Version"), Some("1.43"));
+    assert_eq!(ping.header("Api-Version"), Some("1.44"));
     assert_eq!(ping.header("Ostype"), Some("linux"));
     assert_eq!(ping.header("Docker-Experimental"), Some("false"));
     assert_eq!(ping.header("Server"), Some("Shipyard/0.3.0 (linux)"));
     let head = api::request(&served.socket, "HEAD", "/_ping", None).unwrap();
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty());
-    assert_eq!(head.header("Api-Version"), Some("1.43"));
+    assert_eq!(head.header("Api-Version"), Some("1.44"));
 }
 
 /// `/version` says the API's versions and this build's.
@@ -96,27 +96,41 @@ fn version_names_the_engine_and_its_api() {
     let version = api::get(&served.socket, "/v1.43/version").unwrap();
     assert_eq!(version.status, 200);
     let json = version.json();
-    assert_eq!(json["ApiVersion"], "1.43");
+    assert_eq!(json["ApiVersion"], "1.44");
     assert_eq!(json["MinAPIVersion"], "1.24");
     assert_eq!(json["Version"], "0.3.0");
     assert_eq!(json["GitCommit"], "abc1234");
     assert_eq!(json["Os"], "linux");
     assert_eq!(json["Platform"]["Name"], "Shipyard");
     assert_eq!(json["Components"][0]["Name"], "Engine");
-    assert_eq!(json["Components"][0]["Details"]["ApiVersion"], "1.43");
+    assert_eq!(json["Components"][0]["Details"]["ApiVersion"], "1.44");
+}
+
+/// `/info` has API 1.44's keys: each runtime with its `path` and `status`
+/// (Docker's lowercase keys), and `CDISpecDirs`, empty.
+#[test]
+fn info_names_its_runtime_as_1_44_does() {
+    let served = serve(Duration::from_secs(60));
+    let info = api::get(&served.socket, "/v1.44/info").unwrap();
+    assert_eq!(info.status, 200);
+    let json = info.json();
+    let runtime = &json["Runtimes"]["shipyard-runtime"];
+    assert_eq!(runtime["path"], "shipyard-runtime");
+    assert!(runtime["status"].is_object(), "{runtime}");
+    assert_eq!(json["CDISpecDirs"], serde_json::json!([]));
 }
 
 /// Refusals are Docker's: a status and `{"message"}`, with the headers.
 #[test]
 fn refusals_are_docker_s() {
     let served = serve(Duration::from_secs(60));
-    let too_new = api::get(&served.socket, "/v1.44/version").unwrap();
+    let too_new = api::get(&served.socket, "/v1.45/version").unwrap();
     assert_eq!(too_new.status, 400);
     assert_eq!(
         too_new.json()["message"],
-        "client version 1.44 is too new. Maximum supported API version is 1.43"
+        "client version 1.45 is too new. Maximum supported API version is 1.44"
     );
-    assert_eq!(too_new.header("Api-Version"), Some("1.43"));
+    assert_eq!(too_new.header("Api-Version"), Some("1.44"));
     assert_eq!(too_new.header("Content-Type"), Some("application/json"));
     let unknown = api::get(&served.socket, "/plugins").unwrap();
     assert_eq!(unknown.status, 404);

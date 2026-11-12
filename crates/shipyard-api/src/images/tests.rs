@@ -209,3 +209,13 @@ fn a_pull_s_byte_lines_never_wait_for_a_slow_client() {
     let refused = write_progress(&sender, &Gone::new(|| true), &stored).unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::BrokenPipe);
 }
+
+/// `VirtualSize` is said to a client of 1.43 or older, and not from 1.44
+/// (Docker's own change), the version Docker's CLI 29 asks for.
+#[test]
+fn virtual_size_is_kept_for_older_clients_alone() {
+    assert!(keeps_virtual_size((1, 24)));
+    assert!(keeps_virtual_size((1, 43)));
+    assert!(!keeps_virtual_size((1, 44)));
+    assert!(!keeps_virtual_size((2, 0)));
+}

@@ -34,7 +34,7 @@ RUN set -eu; \
       x86_64) sum=692ecfc28333485d184f628b74c25b2894cee9495a51a5418ba60ef95bf733ca ;; \
       *) echo "no pinned docker CLI for $(uname -m)" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /tmp/docker.tgz "https://download.docker.com/linux/static/stable/$(uname -m)/docker-24.0.9.tgz"; \
+    curl -fsSL --connect-timeout 10 --retry 10 --retry-all-errors -o /tmp/docker.tgz "https://download.docker.com/linux/static/stable/$(uname -m)/docker-24.0.9.tgz"; \
     echo "$sum  /tmp/docker.tgz" | sha256sum -c -; \
     tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
     rm /tmp/docker.tgz; \
@@ -47,11 +47,31 @@ RUN set -eu; \
       *) echo "no pinned docker compose for $(uname -m)" >&2; exit 1 ;; \
     esac; \
     mkdir -p /usr/local/lib/docker/cli-plugins; \
-    curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    # Each try goes on from what came (a slow link is cut now and then).
+    n=0; until curl -fsSL -C - --connect-timeout 10 --speed-limit 1000 --speed-time 60 \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose \
       "https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-$(uname -m)"; \
+      do n=$((n + 1)); [ "$n" -lt 50 ] || exit 1; sleep 2; done; \
     echo "$sum  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum -c -; \
     chmod 755 /usr/local/lib/docker/cli-plugins/docker-compose; \
     docker compose version
+
+# Docker's CLI 29 beside 24 (step 15.2g1, F207): it asks for API 1.44 at
+# least, as Ubuntu 26.04's own does, so the API tests run a current client too.
+RUN set -eu; \
+    case "$(uname -m)" in \
+      aarch64) sum=ce2cea8c740707d736ab356239f858d2272470d0734b5d14f20b950d1d6b952e ;; \
+      x86_64) sum=e985c6dc5008b8d62d6bdf9b5894427d075b335a1391cacf24ee01a7a29a3728 ;; \
+      *) echo "no pinned docker 29 CLI for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    n=0; until curl -fsSL -C - --connect-timeout 10 --speed-limit 1000 --speed-time 60 \
+      -o /tmp/docker29.tgz "https://download.docker.com/linux/static/stable/$(uname -m)/docker-29.4.2.tgz"; \
+      do n=$((n + 1)); [ "$n" -lt 50 ] || exit 1; sleep 2; done; \
+    echo "$sum  /tmp/docker29.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/docker29.tgz -C /tmp docker/docker; \
+    install -m 0755 /tmp/docker/docker /usr/local/bin/docker29; \
+    rm -rf /tmp/docker29.tgz /tmp/docker; \
+    docker29 --version
 
 RUN useradd --create-home tester \
     && echo tester:100000:65536 > /etc/subuid \

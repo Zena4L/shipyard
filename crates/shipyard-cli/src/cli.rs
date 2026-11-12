@@ -981,7 +981,7 @@ pub(crate) enum SystemCommand {
     /// brings them back at boot), and none restarted until `system recover`
     /// (what shipyard-stop.service runs at a shutdown).
     Stop,
-    /// Serve Docker's Engine API (a subset, version 1.43) on a UNIX socket,
+    /// Serve Docker's Engine API (a subset, version 1.44) on a UNIX socket,
     /// for Docker's own clients (`DOCKER_HOST=unix://SOCKET docker ps`);
     /// systemd's shipyard.socket starts it at the first connection (see
     /// contrib/systemd). It exits once nothing has been asked for 60 s

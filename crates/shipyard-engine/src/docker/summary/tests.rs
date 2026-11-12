@@ -113,7 +113,8 @@ fn a_container_is_listed_as_docker_lists_it() {
         "NetworkSettings": {"Networks": {"host": {
             "Aliases": null, "MacAddress": "", "NetworkID": "", "EndpointID": "", "IPAMConfig": null,
             "Gateway": "", "IPAddress": "", "IPPrefixLen": 0, "IPv6Gateway": "",
-            "GlobalIPv6Address": "", "GlobalIPv6PrefixLen": 0
+            "GlobalIPv6Address": "", "GlobalIPv6PrefixLen": 0,
+            "DNSNames": null
         }}},
         "Mounts": []
     });

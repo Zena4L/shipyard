@@ -4,16 +4,32 @@
 //! info`). Moved from the API in step 11.3c2, so the CLI and the API say
 //! the same (H1).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::Engine;
+
 use crate::containers::{self, ContainerState};
 use crate::error::Result;
 
-/// The Engine API version served: Docker 24's (D11.2-3).
-pub const API_VERSION: &str = "1.43";
+/// The Engine API version served (D11.2-3): Docker 25's, 1.44 (F207, step
+/// 15.2g1: Docker's CLI 29.1 takes none older). A client asking for an older
+/// one (to 1.24) gets that version's shapes.
+pub const API_VERSION: &str = "1.44";
 /// The oldest version taken, as Docker 24's daemon takes it.
 pub const MIN_API_VERSION: &str = "1.24";
+
+/// One of `/info`'s `Runtimes` (Docker's `RuntimeWithStatus`, whose keys,
+/// unlike its neighbours', are lowercase: `path`, `status`).
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct Runtime {
+    /// The program.
+    pub path: &'static str,
+    /// What its probes found (API 1.44): none.
+    pub status: BTreeMap<String, String>,
+}
 
 /// What a build of Shipyard says of itself.
 #[derive(Debug, Clone)]
@@ -176,6 +192,13 @@ pub struct Info {
     pub server_version: String,
     /// `shipyard-runtime`.
     pub default_runtime: &'static str,
+    /// The runtimes a container may run under, by name: Shipyard's own, its
+    /// `status` empty (API 1.44 gives each one; Docker's says its probes').
+    pub runtimes: BTreeMap<&'static str, Runtime>,
+    /// Where Container Device Interface specs are read (API 1.44): none, as
+    /// Shipyard reads none.
+    #[serde(rename = "CDISpecDirs")]
+    pub cdi_spec_dirs: Vec<String>,
     /// `seccomp`'s profile, `cgroupns`, and `rootless` when it is.
     pub security_options: Vec<&'static str>,
     /// Always false.
@@ -242,6 +265,14 @@ pub fn system_info(engine: &Engine, build: &Build) -> Result<Info> {
             .unwrap_or_default(),
         server_version: build.version.clone(),
         default_runtime: "shipyard-runtime",
+        runtimes: BTreeMap::from([(
+            "shipyard-runtime",
+            Runtime {
+                path: "shipyard-runtime",
+                status: BTreeMap::new(),
+            },
+        )]),
+        cdi_spec_dirs: Vec::new(),
         security_options,
         experimental_build: false,
         live_restore_enabled: false,

@@ -453,30 +453,46 @@ pub(crate) fn push(shared: &Arc<Shared>, name: &str, query: &Query, headers: &He
     Ok(reply::channelled(StatusCode::OK, "application/json", body))
 }
 
-/// `GET /images/json` (`filters`: `reference`, `label`, `dangling`).
+/// `GET /images/json` (`filters`: `reference`, `label`, `dangling`), as
+/// the client's API `version` shows it ([`keeps_virtual_size`]).
 ///
 /// # Errors
 ///
 /// A filter that can't be read (400); the store's errors.
-pub(crate) async fn list(shared: &Arc<Shared>, query: &Query) -> Reply {
+pub(crate) async fn list(shared: &Arc<Shared>, query: &Query, version: (u32, u32)) -> Reply {
     let filters = ImageFilters::parse(crate::filters::given(query.get("filters"))?)?;
-    let (images, _) = shared
+    let (mut images, _) = shared
         .call(move |engine| shipyard_engine::docker::list_images_where(engine, &filters))
         .await?;
+    if !keeps_virtual_size(version) {
+        for image in &mut images {
+            image.virtual_size = None;
+        }
+    }
     Ok(reply::json(StatusCode::OK, &images))
 }
 
-/// `GET /images/{name}/json`: 404 `No such image: NAME`.
+/// Whether a client of API `version` is shown an image's `VirtualSize`:
+/// one older than 1.44, which has `Size` alone (Docker's).
+fn keeps_virtual_size(version: (u32, u32)) -> bool {
+    version < (1, 44)
+}
+
+/// `GET /images/{name}/json`: 404 `No such image: NAME`; as the client's
+/// API `version` shows it ([`keeps_virtual_size`]).
 ///
 /// # Errors
 ///
 /// As the engine's.
-pub(crate) async fn inspect(shared: &Arc<Shared>, name: String) -> Reply {
+pub(crate) async fn inspect(shared: &Arc<Shared>, name: String, version: (u32, u32)) -> Reply {
     let shown = name.clone();
     let inspected = shared
         .call(move |engine| shipyard_engine::docker::inspect_image(engine, &name))
         .await;
-    let (image, _) = inspected.map_err(no_such_image(&shown))?;
+    let (mut image, _) = inspected.map_err(no_such_image(&shown))?;
+    if !keeps_virtual_size(version) {
+        image.virtual_size = None;
+    }
     Ok(reply::json(StatusCode::OK, &image))
 }
 

@@ -60,6 +60,11 @@ pub struct EndpointSettings {
     /// The addresses it asked for there (`--ip`, `--ip6`), or `null`.
     #[serde(rename = "IPAMConfig")]
     pub ipam_config: Option<EndpointIpamConfig>,
+    /// The names the network's DNS answers for it there (API 1.44): its
+    /// name, aliases, short ID and its run's ID, while it's on it (`null`:
+    /// not, or on the default network, which has no DNS).
+    #[serde(rename = "DNSNames")]
+    pub dns_names: Option<Vec<String>>,
 }
 
 /// The addresses a container asked for on a network (Docker's
@@ -271,11 +276,48 @@ pub(in crate::docker) fn endpoints(
         endpoint.ipv6_gateway = config.gateway6.map(|ip| ip.to_string()).unwrap_or_default();
         endpoint.mac_address = shipyard_network::store::format_mac(lease.mac);
         endpoint.aliases = nil_if_empty(lease.aliases.clone());
+        endpoint.dns_names = dns_names(&config.name, lease.names());
         endpoint.network_id.clone_from(network_id);
         endpoint.endpoint_id = crate::docker::endpoint_id(network_id, record.id.as_str());
     }
     NetworkSettings {
         ports,
         networks: endpoints,
+    }
+}
+
+/// The names a container answers to on `network` (its lease's `names`, each
+/// once), or `null` where the network's DNS names none (the default one).
+fn dns_names<'a>(network: &str, names: impl Iterator<Item = &'a str>) -> Option<Vec<String>> {
+    if !shipyard_network::store::has_dns(network) {
+        return None;
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for name in names {
+        if !kept.iter().any(|known| known == name) {
+            kept.push(name.to_owned());
+        }
+    }
+    nil_if_empty(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dns_names;
+
+    /// Each name once, in the lease's order; none on the default network,
+    /// whose containers no DNS names (Docker's `null` there too).
+    #[test]
+    fn dns_names_are_said_once_and_not_on_the_default_network() {
+        let names = ["web", "app", "web", "0123456789ab", "app"];
+        assert_eq!(
+            dns_names("front", names.into_iter()),
+            Some(vec!["web".into(), "app".into(), "0123456789ab".into()])
+        );
+        assert_eq!(
+            dns_names(shipyard_network::store::DEFAULT_NETWORK, names.into_iter()),
+            None
+        );
+        assert_eq!(dns_names("front", std::iter::empty()), None);
     }
 }

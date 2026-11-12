@@ -9,8 +9,10 @@ use super::body::{CreateBody, EndpointSettings, HostConfig};
 use super::{field, parsed_all};
 
 /// The networks: `NetworkMode` (`default` or none: the engine's default),
-/// with its settings from `NetworkingConfig`'s one endpoint (API 1.43
-/// takes one at create, as Docker's does).
+/// with its settings from `NetworkingConfig`'s endpoint of that name, then
+/// every other endpoint (API 1.44: several at create, as `docker run
+/// --network a --network b` sends them), in name order, each with its own
+/// settings: the first is the container's `eth0`.
 pub(super) fn the_network(
     body: &CreateBody,
     host: &HostConfig,
@@ -22,14 +24,7 @@ pub(super) fn the_network(
         .networking_config
         .as_ref()
         .and_then(|config| config.endpoints_config.as_ref());
-    let mut endpoints: Vec<(&String, &EndpointSettings)> =
-        endpoints.into_iter().flatten().collect();
-    if endpoints.len() > 1 {
-        return Err(field(
-            "NetworkingConfig",
-            "a container joins one network at create: connect it to the others after",
-        ));
-    }
+    let endpoints: Vec<(&String, &EndpointSettings)> = endpoints.into_iter().flatten().collect();
     let mode = host.network_mode.as_deref().unwrap_or_default();
     let name = match mode {
         "host" => return only_mode(NetworkMode::Host, &endpoints),
@@ -40,7 +35,8 @@ pub(super) fn the_network(
         // sends the mode's own name) is the default network, a name Docker
         // keeps for it.
         "" | "default" => match endpoints.first() {
-            Some((name, _)) if name.as_str() != "default" => name.as_str(),
+            // Several: the first, in name order, is the container's first.
+            Some((name, _)) if endpoints.len() > 1 || name.as_str() != "default" => name.as_str(),
             // The default network takes none of an endpoint's settings
             // (Docker's: `--ip`, an alias, a hardware address need a
             // network of the user's): refused, never dropped.
@@ -83,32 +79,70 @@ pub(super) fn the_network(
         }
         name => name,
     };
-    shipyard_network::store::validate_name(name)
-        .map_err(|why| field("NetworkMode", &why.to_string()))?;
-    let settings = match endpoints.pop() {
-        Some((endpoint, settings)) if endpoint == name => Some(settings),
-        Some((endpoint, _)) => {
+    Ok(vec![NetworkMode::Bridges(bridges(
+        name, mode, &endpoints, body,
+    )?)])
+}
+
+/// The bridge networks joined: `first`, then every other endpoint's, each
+/// with its endpoint's settings; `mode` is what `NetworkMode` said, which a
+/// bad name is blamed on when it's that one.
+fn bridges(
+    first: &str,
+    mode: &str,
+    endpoints: &[(&String, &EndpointSettings)],
+    body: &CreateBody,
+) -> Result<Vec<Joined>, ApiError> {
+    let names = std::iter::once(first).chain(
+        endpoints
+            .iter()
+            .map(|(endpoint, _)| endpoint.as_str())
+            .filter(|endpoint| *endpoint != first),
+    );
+    let mut networks = Vec::new();
+    for network in names {
+        if network == "default" {
+            // The engine's default network is joined alone, as `default`
+            // names nothing else's (Docker's too: `docker run --network
+            // default --network app` is refused).
             return Err(field(
                 "NetworkingConfig",
-                &format!("its endpoint {endpoint:?} isn't the NetworkMode's network {name:?}"),
+                "the default network can't be joined with others: name the networks",
             ));
         }
-        None => None,
-    };
-    let mut joined = Joined {
-        name: name.to_owned(),
-        ..Joined::default()
-    };
-    if let Some(settings) = settings {
-        endpoint(settings, &mut joined)?;
+        shipyard_network::store::validate_name(network).map_err(|why| {
+            let given = if network == mode {
+                "NetworkMode"
+            } else {
+                "NetworkingConfig"
+            };
+            field(given, &why.to_string())
+        })?;
+        let mut joined = Joined {
+            name: network.to_owned(),
+            ..Joined::default()
+        };
+        if let Some((_, settings)) = endpoints.iter().find(|(endpoint, _)| *endpoint == network) {
+            endpoint(settings, &mut joined)?;
+        }
+        networks.push(joined);
     }
-    if joined.mac.is_none()
+    // The container-wide hardware address (deprecated in API 1.44): the
+    // first network's; another there refused, as Docker refuses it.
+    if let Some(primary) = networks.first_mut()
         && let Some(mac) = body.mac_address.as_deref().filter(|mac| !mac.is_empty())
     {
-        joined.mac =
-            Some(shipyard_network::store::parse_mac(mac).map_err(|why| field("MacAddress", &why))?);
+        let mac =
+            shipyard_network::store::parse_mac(mac).map_err(|why| field("MacAddress", &why))?;
+        if primary.mac.is_some_and(|own| own != mac) {
+            return Err(field(
+                "MacAddress",
+                "the first network's endpoint names another hardware address",
+            ));
+        }
+        primary.mac = Some(mac);
     }
-    Ok(vec![NetworkMode::Bridges(vec![joined])])
+    Ok(networks)
 }
 
 /// A network mode that takes no endpoint settings.

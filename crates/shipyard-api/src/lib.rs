@@ -1,6 +1,6 @@
 //! Shipyard's Docker Engine API (stage 11, D25): a subset of Docker's,
-//! version 1.43 (D11.2-3), served over a UNIX socket by `shipyard system
-//! service`, so that Docker's own clients (`docker`, `docker compose`,
+//! version 1.44 (D11.2-3; 1.43 until 15.2g1, F207), served over a UNIX
+//! socket by `shipyard system service`, so that Docker's own clients (`docker`, `docker compose`,
 //! Testcontainers) drive Shipyard's engine.
 //!
 //! - **One thread for the connections**, a tokio current-thread runtime
@@ -384,6 +384,7 @@ async fn images_answer(
     request: &hyper::http::request::Parts,
     imports: bool,
 ) -> Result<Response<Body>, ApiError> {
+    let version = routes::asked_version(request.uri.path());
     match route {
         Route::PullImage if imports => {
             let body = body.ok_or_else(|| ApiError::internal("the import's body"))?;
@@ -394,8 +395,8 @@ async fn images_answer(
             let body = body.ok_or_else(|| ApiError::internal("the credentials' body"))?;
             images::auth(shared, body).await
         }
-        Route::ListImages => images::list(shared, query).await,
-        Route::InspectImage(name) => images::inspect(shared, name).await,
+        Route::ListImages => images::list(shared, query, version).await,
+        Route::InspectImage(name) => images::inspect(shared, name, version).await,
         Route::ImageHistory(name) => images::history(shared, name).await,
         Route::SaveImage(name) => images::save(shared, vec![name]).await,
         Route::SaveImages => images::save(shared, query.get_all("names")).await,

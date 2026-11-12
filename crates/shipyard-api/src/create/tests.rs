@@ -325,14 +325,90 @@ fn networks_are_read_with_their_endpoint() {
                "NetworkingConfig": {"EndpointsConfig": {"db": {}}}}),
         json!({"HostConfig": {"NetworkMode": "host"},
                "NetworkingConfig": {"EndpointsConfig": {"host": {}}}}),
-        json!({"HostConfig": {"NetworkMode": "a"},
-               "NetworkingConfig": {"EndpointsConfig": {"b": {}}}}),
-        json!({"NetworkingConfig": {"EndpointsConfig": {"a": {}, "b": {}}}}),
         json!({"MacAddress": "02:42:0a:58:00:02"}),
         json!({"HostConfig": {"NetworkMode": "bad name!"}}),
     ] {
         let error = create(&with(&refused), None).unwrap_err();
         assert_eq!(error.status, hyper::StatusCode::BAD_REQUEST, "{refused}");
+    }
+}
+
+/// Several networks at create (API 1.44, `docker run --network a --network
+/// b`): the `NetworkMode`'s first (the container's `eth0`), then the others
+/// in name order, each with its own endpoint's settings; the container-wide
+/// hardware address the first's. The default network joins alone; a bad
+/// name or setting anywhere refuses the whole create.
+#[test]
+fn several_networks_are_joined_at_create() {
+    let body = with(&json!({
+        "HostConfig": {"NetworkMode": "front"},
+        "MacAddress": "02:42:0a:58:00:09",
+        "NetworkingConfig": {"EndpointsConfig": {
+            "back": {"Aliases": ["db"], "IPAMConfig": {"IPv4Address": "10.89.0.5"}},
+            "front": {},
+            "audit": {"MacAddress": "02:42:0a:58:00:07"}
+        }}
+    }));
+    let Ok(created) = create(&body, None) else {
+        panic!("refused");
+    };
+    let [NetworkMode::Bridges(networks)] = created.request.network.as_slice() else {
+        panic!("{:?}", created.request.network);
+    };
+    let names: Vec<&str> = networks.iter().map(|joined| joined.name.as_str()).collect();
+    assert_eq!(names, ["front", "audit", "back"]);
+    assert_eq!(networks[0].mac, Some([0x02, 0x42, 0x0a, 0x58, 0x00, 0x09]));
+    assert_eq!(networks[1].mac, Some([0x02, 0x42, 0x0a, 0x58, 0x00, 0x07]));
+    assert_eq!(networks[2].aliases, ["db"]);
+    assert_eq!(networks[2].ip, Some([10, 89, 0, 5].into()));
+    // No NetworkMode: the endpoints alone, in name order.
+    let body = with(&json!({"NetworkingConfig": {"EndpointsConfig": {"b": {}, "a": {}}}}));
+    assert_eq!(
+        create(&body, None).unwrap().request.network,
+        vec![NetworkMode::Bridges(vec![
+            Joined {
+                name: "a".to_owned(),
+                ..Joined::default()
+            },
+            Joined {
+                name: "b".to_owned(),
+                ..Joined::default()
+            },
+        ])]
+    );
+    for refused in [
+        json!({"NetworkingConfig": {"EndpointsConfig": {"default": {}, "app": {}}}}),
+        json!({"HostConfig": {"NetworkMode": "app"},
+               "NetworkingConfig": {"EndpointsConfig": {"bad name!": {}}}}),
+        json!({"HostConfig": {"NetworkMode": "app"},
+               "NetworkingConfig": {"EndpointsConfig": {"other": {"MacAddress": "nope"}}}}),
+        // Two hardware addresses for the first network (Docker's refusal).
+        json!({"HostConfig": {"NetworkMode": "app"}, "MacAddress": "02:42:0a:58:00:09",
+               "NetworkingConfig": {"EndpointsConfig": {"app": {"MacAddress": "02:42:0a:58:00:07"}}}}),
+    ] {
+        let error = create(&with(&refused), None).unwrap_err();
+        assert_eq!(error.status, hyper::StatusCode::BAD_REQUEST, "{refused}");
+    }
+    // The same one twice is one.
+    let same = with(
+        &json!({"HostConfig": {"NetworkMode": "app"}, "MacAddress": "02:42:0a:58:00:09",
+        "NetworkingConfig": {"EndpointsConfig": {"app": {"MacAddress": "02:42:0a:58:00:09"}}}}),
+    );
+    assert!(create(&same, None).is_ok());
+    // A bad name is blamed on the field that gave it.
+    for (body, blamed) in [
+        (
+            json!({"HostConfig": {"NetworkMode": "bad name!"}}),
+            "NetworkMode:",
+        ),
+        (
+            json!({"HostConfig": {"NetworkMode": "app"},
+                   "NetworkingConfig": {"EndpointsConfig": {"bad name!": {}}}}),
+            "NetworkingConfig:",
+        ),
+    ] {
+        let error = create(&with(&body), None).unwrap_err();
+        assert!(error.message.starts_with(blamed), "{}", error.message);
     }
 }
 
@@ -724,6 +800,16 @@ fn mounts_shipyard_can_t_do_are_refused() {
             "non-recursive",
         ),
         (
+            json!({"HostConfig": {"Mounts": [{"Type": "bind", "Source": "/srv", "Target": "/s",
+                "ReadOnly": true, "BindOptions": {"ReadOnlyNonRecursive": true}}]}}),
+            "read-only bind whose mounts below stay writable",
+        ),
+        (
+            json!({"HostConfig": {"Mounts": [{"Type": "bind", "Source": "/srv", "Target": "/s",
+                "BindOptions": {"ReadOnlyForceRecursive": true}}]}}),
+            "needs a read-only bind",
+        ),
+        (
             json!({"HostConfig": {"Mounts": [{"Type": "volume", "Source": "v", "Target": "/s",
                 "BindOptions": {"CreateMountpoint": true}}]}}),
             "missing source is a bind's",
@@ -748,6 +834,12 @@ fn mounts_shipyard_can_t_do_are_refused() {
             error.message
         );
     }
+    // What Shipyard's read-only binds are anyway (API 1.44): taken.
+    let forced = with(
+        &json!({"HostConfig": {"Mounts": [{"Type": "bind", "Source": "/srv",
+        "Target": "/s", "ReadOnly": true, "BindOptions": {"ReadOnlyForceRecursive": true}}]}}),
+    );
+    assert!(create(&forced, None).is_ok());
 }
 
 /// Docker's anonymous volumes: `Volumes` (`docker run -v /data`), a `Binds`

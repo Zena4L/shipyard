@@ -490,7 +490,7 @@ fn image_prunes_take_dangling_ones_unless_asked_for_all() {
         created: now - 7_200,
         size: 0,
         shared_size: -1,
-        virtual_size: 0,
+        virtual_size: Some(0),
         labels: Some(BTreeMap::from([("tier".to_owned(), "web".to_owned())])),
         containers: -1,
     };
