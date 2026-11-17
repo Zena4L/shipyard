@@ -48,7 +48,8 @@ mod linux {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use serde::{Deserialize, Serialize};
     use shipyard_image::{
-        IdRanges, LayerReport, LayerSpec, Limits, Ownership, Store, StoreLock, UnpackOptions,
+        IdRanges, LayerReport, LayerSpec, Limits, Ownership, Store, StoreLock, Unpack,
+        UnpackOptions,
     };
     use shipyard_runtime::isolation::{IdMap, IdMaps};
     use shipyard_sys::fd::{OnExec, take_inherited};
@@ -93,6 +94,9 @@ mod linux {
     /// The helper's answer.
     #[derive(Debug, Serialize, Deserialize)]
     enum Answer {
+        /// Before the answer, as it extracts: the request's layer at this
+        /// index starts, or is done (F209). Never the last line.
+        Layer(usize, Unpack),
         /// Done; what extracting did (nothing, for a removal).
         Done(LayerReport),
         /// The namespace was made but gives no privileges, and why.
@@ -126,6 +130,7 @@ mod linux {
         held: &StoreLock,
         maps: &IdMaps,
         request: &Request,
+        tell: &dyn Fn(usize, Unpack),
     ) -> Result<Outcome> {
         let (from_helper, helper_out) =
             nix::unistd::pipe2(OFlag::O_CLOEXEC).context("making the storage helper's pipe")?;
@@ -173,7 +178,7 @@ mod linux {
             .context("starting the storage helper")?;
         drop((store_fd, in_fd, out_fd, lock_fd, helper_in, helper_out));
 
-        let result = exchange(&mut helper, &from_helper, to_helper, maps, request);
+        let result = exchange(&mut helper, &from_helper, to_helper, maps, request, tell);
         if result.is_err() {
             let _ = helper.kill();
         }
@@ -192,6 +197,7 @@ mod linux {
         to_helper: OwnedFd,
         maps: &IdMaps,
         request: &Request,
+        tell: &dyn Fn(usize, Unpack),
     ) -> Result<Outcome> {
         let mut lines = Lines::default();
         let ready: Ready = lines.read(
@@ -212,10 +218,13 @@ mod linux {
             .write_all(&line)
             .context("sending the storage helper its request")?;
         drop(to_helper);
-        match lines.read(from_helper, helper, None, look)? {
-            Answer::Done(report) => Ok(Outcome::Done(report)),
-            Answer::Refused(reason) => Ok(Outcome::Refused(reason)),
-            Answer::Failed(message) => Err(Error::new(ErrorKind::Storage, message)),
+        loop {
+            match lines.read(from_helper, helper, None, look)? {
+                Answer::Layer(index, step) => tell(index, step),
+                Answer::Done(report) => return Ok(Outcome::Done(report)),
+                Answer::Refused(reason) => return Ok(Outcome::Refused(reason)),
+                Answer::Failed(message) => return Err(Error::new(ErrorKind::Storage, message)),
+            }
         }
     }
 
@@ -355,12 +364,12 @@ mod linux {
 
     /// The helper's work, start to end; whether it succeeded.
     fn helper(store: &OwnedFd, input: OwnedFd, output: OwnedFd) -> bool {
-        let mut output = std::fs::File::from(output);
+        let output = std::fs::File::from(output);
         if let Err(err) = shipyard_runtime::process::unshare_user_namespace() {
-            send(&mut output, &Ready::Refused(err.to_string()));
+            send(&output, &Ready::Refused(err.to_string()));
             return false;
         }
-        if !send(&mut output, &Ready::Ready) {
+        if !send(&output, &Ready::Ready) {
             return false;
         }
         let answer = match read_request(input) {
@@ -379,18 +388,18 @@ mod linux {
                 Err(err) => Answer::Failed(format!(
                     "becoming root in the storage helper's user namespace: {err}"
                 )),
-                Ok(()) => match work(store, request) {
+                Ok(()) => match work(store, request, &output) {
                     Ok(report) => Answer::Done(report),
                     Err(err) => Answer::Failed(format!("{err:#}")),
                 },
             },
         };
         let done = matches!(answer, Answer::Done(_));
-        send(&mut output, &answer) && done
+        send(&output, &answer) && done
     }
 
     /// Writes one JSON line to the caller; whether it went.
-    fn send(output: &mut std::fs::File, message: &impl Serialize) -> bool {
+    fn send(mut output: &std::fs::File, message: &impl Serialize) -> bool {
         let Ok(mut line) = serde_json::to_vec(message) else {
             return false;
         };
@@ -410,8 +419,9 @@ mod linux {
             .context("decoding the storage request")
     }
 
-    /// Does what's asked in the store, as root in the namespace.
-    fn work(store: &OwnedFd, request: Request) -> Result<LayerReport> {
+    /// Does what's asked in the store, as root in the namespace, telling
+    /// `output` each layer it extracts as it goes.
+    fn work(store: &OwnedFd, request: Request, output: &std::fs::File) -> Result<LayerReport> {
         let maps = shipyard_runtime::process::current_id_maps()?;
         // Reached through the descriptor: the path names nothing but it.
         let store = Store::open(format!("/proc/self/fd/{}", store.as_raw_fd()))
@@ -428,7 +438,16 @@ mod linux {
                     // `trusted.*` attributes need real root.
                     trusted_xattrs: false,
                 };
-                Ok(shipyard_image::extract_layers(&store, &layers, &options)?.report)
+                let tell = |layer: &LayerSpec, step| {
+                    if let Some(index) = layers.iter().position(|each| each.digest == layer.digest)
+                    {
+                        send(output, &Answer::Layer(index, step));
+                    }
+                };
+                Ok(
+                    shipyard_image::extract_layers_telling(&store, &layers, &options, &tell)?
+                        .report,
+                )
             }
             Request::RemoveLayers(names) => {
                 shipyard_image::remove_layers(&store, &names)?;

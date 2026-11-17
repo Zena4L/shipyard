@@ -388,9 +388,8 @@ pub fn prune_where(
         Err(_) => 0,
     };
     // What removals cut short left, deleted too.
-    let leftovers: Vec<String> = std::fs::read_dir(&trash_dir)
-        .with_context(|| format!("reading {}", trash_dir.display()))?
-        .filter_map(|entry| entry.ok()?.file_name().to_str().map(str::to_owned))
+    let leftovers: Vec<String> = in_trash(&trash_dir)?
+        .into_iter()
         .filter(|name| !trashed.iter().any(|(_, trash)| trash == name))
         .collect();
     let trash: Vec<String> = trashed
@@ -411,6 +410,34 @@ pub fn prune_where(
         in_use,
         failed,
     })
+}
+
+/// Deletes what's in the volume trash that this process can: removals cut
+/// short (a service stopped while it deleted a tree after its answer, F208;
+/// a killed `volume rm`). The API's service runs it at its start, so it
+/// never runs the storage helper or takes the image store's lock there:
+/// files a rootless container wrote as its other users are left for the
+/// next `volume prune` (as before), not tried again at every start. A store
+/// never made is left unmade.
+///
+/// # Errors
+///
+/// What reading the trash or deleting it ran into (the first).
+pub fn sweep_trash(engine: &Engine) -> Result<()> {
+    let store_root = engine.paths().image_store()?;
+    let trash_dir = Volumes::trash_dir_in(store_root);
+    if !trash_dir.is_dir() {
+        return Ok(());
+    }
+    remove_trash(store_root, &in_trash(&trash_dir)?)
+}
+
+/// The names in the volume trash `trash_dir`.
+fn in_trash(trash_dir: &Path) -> Result<Vec<String>> {
+    Ok(std::fs::read_dir(trash_dir)
+        .with_context(|| format!("reading {}", trash_dir.display()))?
+        .filter_map(|entry| entry.ok()?.file_name().to_str().map(str::to_owned))
+        .collect())
 }
 
 /// Deletes volumes moved aside: in this process first (most files are the
@@ -490,6 +517,44 @@ mod tests {
         remove(&engine, "data").unwrap();
         assert!(list(&engine).unwrap().is_empty());
         assert!(collect.events().is_empty(), "{:?}", collect.events());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A sweep deletes what removals cut short left in the trash (F208: a
+    /// service stopped mid-delete), half-deleted trees too, and leaves the
+    /// volumes alone; with no store made, it makes none.
+    #[test]
+    fn a_sweep_deletes_what_the_trash_holds() {
+        let (engine, parent) = engine_with_records("volume-sweep");
+        sweep_trash(&engine).unwrap();
+        assert!(
+            !engine.paths().image_store().unwrap().exists(),
+            "no store made"
+        );
+        let volumes = open(&engine).unwrap();
+        for name in ["kept", "cut", "half"] {
+            create(&engine, name).unwrap();
+            std::fs::create_dir(volumes.data_path(name).unwrap().join("a")).unwrap();
+            std::fs::write(volumes.data_path(name).unwrap().join("a/f"), "x").unwrap();
+        }
+        drop(trash(&engine, "cut").unwrap());
+        let half = trash(&engine, "half").unwrap();
+        let half_tree = volumes.trash_dir().join(&half.0);
+        // A delete cut short: part of its tree gone already.
+        std::fs::remove_dir_all(half_tree.join("_data/a")).unwrap();
+        drop(half);
+        let in_trash = || std::fs::read_dir(volumes.trash_dir()).unwrap().count();
+        assert_eq!(in_trash(), 2);
+        sweep_trash(&engine).unwrap();
+        assert_eq!(in_trash(), 0);
+        assert_eq!(
+            list(&engine)
+                .unwrap()
+                .iter()
+                .map(|volume| volume.name.as_str())
+                .collect::<Vec<_>>(),
+            ["kept"]
+        );
         let _ = std::fs::remove_dir_all(&parent);
     }
 

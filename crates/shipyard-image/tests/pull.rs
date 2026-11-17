@@ -824,6 +824,48 @@ fn a_rate_limit_is_waited_out() {
     assert_eq!(serving.requests(), 4);
 }
 
+/// A layer's wait before a try again is said (F209), with the wait the
+/// registry asked for, before its bytes and its being stored.
+#[test]
+fn a_layer_s_wait_before_a_retry_is_said() {
+    let mut fixture = FixtureRegistry::default();
+    let hosted = host_image(&mut fixture, "slow", "v1", "amd64", 1);
+    let (digest, bytes) = &hosted.layers[0];
+    fixture.routes(
+        &format!("/v2/slow/blobs/{digest}"),
+        vec![
+            Response::status(503, &[("Retry-After", "1")]),
+            Response::ok("application/octet-stream", bytes.clone()),
+        ],
+    );
+    let serving = fixture.serve();
+    let scratch = Scratch::new();
+    let said = Mutex::new(Vec::new());
+    let tell = |layer: &Descriptor, progress: LayerProgress| {
+        if layer.digest == *digest {
+            said.lock().unwrap().push(progress);
+        }
+    };
+    shipyard_image::pull::pull_with(
+        &reference("localhost/slow:v1"),
+        &amd64(),
+        &scratch.store(),
+        &serving.registry(),
+        shipyard_image::PullOptions::default(),
+        &tell,
+    )
+    .unwrap();
+    let said = said.into_inner().unwrap();
+    assert_eq!(
+        said.first(),
+        Some(&LayerProgress::Retrying {
+            after: std::time::Duration::from_secs(1)
+        }),
+        "{said:?}"
+    );
+    assert_eq!(said.last(), Some(&LayerProgress::Stored { fetched: true }));
+}
+
 #[test]
 fn an_image_too_big_for_the_disk_is_refused_before_its_layers() {
     let mut fixture = FixtureRegistry::default();

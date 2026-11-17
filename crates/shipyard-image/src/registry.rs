@@ -216,6 +216,11 @@ pub trait BlobSink {
     ///
     /// The sink's own, or `body`'s (the transfer's).
     fn append(&mut self, body: &mut dyn Read) -> Result<(), Self::Error>;
+    /// The transfer is tried again after `wait` (F209: a pull says so,
+    /// never silent for as long as a registry's `Retry-After` asks).
+    fn waiting(&mut self, wait: Duration) {
+        let _ = wait;
+    }
 }
 
 /// A client for one registry, shared by a pull's layer workers.
@@ -462,7 +467,8 @@ impl Registry {
         // (`None`: not known yet).
         let mut furthest = sink.have();
         let mut ranges: Option<bool> = None;
-        Self::retrying(|| {
+        let waiting = |sink: &mut S, wait| sink.waiting(wait);
+        Self::retrying_on(sink, waiting, |sink| {
             let fatal = |err| Attempt::Fatal(BlobError::Sink(err));
             if started.elapsed() > budget {
                 return Err(Attempt::Fatal(BlobError::Registry(RegistryError::Body {
@@ -560,11 +566,21 @@ impl Registry {
     fn retrying<T, E: From<RegistryError>>(
         mut attempt: impl FnMut() -> Result<T, Attempt<E>>,
     ) -> Result<T, E> {
+        Self::retrying_on(&mut (), |(), _| {}, |()| attempt())
+    }
+
+    /// [`retrying`](Self::retrying), each attempt given `on` (a blob's
+    /// sink), which `waiting` is told of each wait before it.
+    fn retrying_on<C: ?Sized, T, E: From<RegistryError>>(
+        on: &mut C,
+        mut waiting: impl FnMut(&mut C, Duration),
+        mut attempt: impl FnMut(&mut C) -> Result<T, Attempt<E>>,
+    ) -> Result<T, E> {
         let mut stuck = 0;
         let mut tries = 0;
         loop {
             tries += 1;
-            let (err, wait) = match attempt() {
+            let (err, wait) = match attempt(on) {
                 Ok(value) => return Ok(value),
                 Err(Attempt::Fatal(err)) => return Err(err),
                 Err(Attempt::Again(err)) => {
@@ -584,6 +600,9 @@ impl Registry {
                 return Err(err.into());
             }
             tracing::debug!("{err}; trying again in {wait:?}");
+            if !wait.is_zero() {
+                waiting(on, wait);
+            }
             std::thread::sleep(wait);
         }
     }

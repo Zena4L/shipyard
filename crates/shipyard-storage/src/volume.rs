@@ -498,6 +498,14 @@ impl Volumes {
         self.root.join(TRASH_DIR)
     }
 
+    /// The trash of the volume store under the image store `store_root`,
+    /// where [`trash_dir`](Self::trash_dir) is, without opening (or
+    /// making) anything.
+    #[must_use]
+    pub fn trash_dir_in(store_root: &Path) -> PathBuf {
+        store_root.join("volumes").join(TRASH_DIR)
+    }
+
     /// The data directory volume `name` has (or would have), made or not.
     ///
     /// # Errors
@@ -806,7 +814,8 @@ const LOCKS_DIR: &str = ".locks";
 const FILL_LOCKS_DIR: &str = ".fill-locks";
 /// The marker of a fill under way, in a volume's directory beside `_data`.
 const FILLING: &str = "filling";
-/// The directory of the volumes moved aside.
+/// The directory of the volumes moved aside, in the volume store
+/// ([`Volumes::trash_dir`]).
 const TRASH_DIR: &str = ".trash";
 /// How many names a volume moved aside is tried under.
 const TRASH_TRIES: usize = 8;

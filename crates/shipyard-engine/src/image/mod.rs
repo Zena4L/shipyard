@@ -848,7 +848,7 @@ fn download(
         image: image.to_string(),
     }));
     let progress = |layer: &Descriptor, step: LayerProgress| {
-        let short_digest = layer.digest.hex().chars().take(12).collect();
+        let short_digest = short(&layer.digest);
         engine.report(Message::Progress(match step {
             LayerProgress::Fetching { have } => Progress::Downloading {
                 short_digest,
@@ -858,6 +858,10 @@ fn download(
             LayerProgress::Stored { fetched } => Progress::Layer {
                 short_digest,
                 downloaded: fetched.then_some(layer.size),
+            },
+            LayerProgress::Retrying { after } => Progress::Retrying {
+                short_digest,
+                after_secs: after.as_secs().max(1),
             },
         }));
     };
@@ -965,7 +969,7 @@ pub fn pull_with(
     platform: Option<Platform>,
 ) -> Result<PulledImage> {
     let store = open_store(engine)?;
-    let shared = store.lock(LockMode::Shared, USE_WAIT)?;
+    let shared = lock_saying(engine, &store)?;
     let image = ImageReference::parse(reference)?;
     // What the reference named before (an index that can't be read: none).
     let before = Index::open(store.root()).ok().and_then(|index| {
@@ -991,6 +995,28 @@ pub fn pull_with(
         newer: before.as_ref() != Some(&manifest),
         digest,
     })
+}
+
+/// A layer's or blob's digest as progress says it: its first 12 hex digits
+/// (Docker's).
+pub(crate) fn short(digest: &shipyard_image::Digest) -> String {
+    digest.hex().chars().take(12).collect()
+}
+
+/// The store's shared lock, the wait said first when another command holds
+/// it the other way (a collection), so a pull isn't silent for it (F209).
+///
+/// # Errors
+///
+/// As [`Store::lock`]'s.
+fn lock_saying(engine: &Engine, store: &Store) -> Result<StoreLock> {
+    match store.lock(LockMode::Shared, std::time::Duration::ZERO) {
+        Err(shipyard_image::StoreError::Busy) => {
+            engine.report(Message::Progress(Progress::WaitingForStore));
+            Ok(store.lock(LockMode::Shared, USE_WAIT)?)
+        }
+        held => Ok(held?),
+    }
 }
 
 /// Removes a detached container's writable area `name`, as a foreground
@@ -1157,13 +1183,31 @@ fn extract(
         // All there already: nothing to start.
         return Ok(placed);
     }
+    // Each layer's extraction said as it starts and ends (F209).
+    let tell = |layer: &LayerSpec, step: shipyard_image::Unpack| {
+        let short_digest = short(&layer.digest);
+        engine.report(Message::Progress(match step {
+            shipyard_image::Unpack::Started { total } => Progress::Extracting {
+                short_digest,
+                have: 0,
+                total,
+            },
+            shipyard_image::Unpack::Read { have, total } => Progress::Extracting {
+                short_digest,
+                have,
+                total,
+            },
+            shipyard_image::Unpack::Done => Progress::Extracted { short_digest },
+        }));
+    };
     let in_process = |ownership, trusted_xattrs| {
         let options = UnpackOptions {
             ownership,
             limits: Limits::default(),
             trusted_xattrs,
         };
-        shipyard_image::extract_layers(store, layers, &options).map(|done| done.report)
+        shipyard_image::extract_layers_telling(store, layers, &options, &tell)
+            .map(|done| done.report)
     };
     let caller_owned = |why: &str| {
         engine.warn(
@@ -1188,7 +1232,18 @@ fn extract(
             (in_process(ownership, host)?, LayerOwners::Image)
         }
         Extractor::Helper(maps) => {
-            match helper(store, held, &maps, &Request::Extract(layers.to_vec()))? {
+            let told = |index: usize, step| {
+                if let Some(layer) = layers.get(index) {
+                    tell(layer, step);
+                }
+            };
+            match helper(
+                store,
+                held,
+                &maps,
+                &Request::Extract(layers.to_vec()),
+                &told,
+            )? {
                 Outcome::Done(report) => (report, LayerOwners::Image),
                 Outcome::Refused(why) => caller_owned(&why)?,
             }
@@ -1221,11 +1276,19 @@ fn extract(
     })
 }
 
-/// Runs `request` in the storage helper, on this store, under `held`.
+/// Runs `request` in the storage helper, on this store, under `held`;
+/// `tell` is told each layer an extraction starts and ends, by its index in
+/// the request.
 #[cfg(target_os = "linux")]
-fn helper(store: &Store, held: &StoreLock, maps: &IdMaps, request: &Request) -> Result<Outcome> {
+fn helper(
+    store: &Store,
+    held: &StoreLock,
+    maps: &IdMaps,
+    request: &Request,
+    tell: &dyn Fn(usize, shipyard_image::Unpack),
+) -> Result<Outcome> {
     let dir = shipyard_image::fsat::open_dir(store.root()).context("opening the image store")?;
-    helper::run(&dir, held, maps, request).map_err(|error| error.io_as(ErrorKind::Storage))
+    helper::run(&dir, held, maps, request, tell).map_err(|error| error.io_as(ErrorKind::Storage))
 }
 
 /// Trash to delete: names moved aside in `layers/` or `containers/`.
@@ -1325,7 +1388,7 @@ pub(crate) fn through_helper(
         return Err(Error::new(err.kind(), format!("{err:#}")));
     };
     tracing::debug!("deleting through the storage helper: {err:#}");
-    match helper(store, held, &maps, &request())? {
+    match helper(store, held, &maps, &request(), &|_, _| {})? {
         Outcome::Done(_) => Ok(()),
         Outcome::Refused(why) => Err(Error::new(
             err.kind(),
@@ -2002,9 +2065,39 @@ pub(crate) fn record_digests(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a panic in a test is a clear failure")]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::ErrorKind;
     use crate::testing::engine_on_a_new_store;
+
+    /// A pull's store lock, held the other way by a collection, is waited
+    /// for once said (F209); one free at once is taken saying nothing.
+    #[test]
+    fn a_wait_for_the_store_is_said() {
+        let (engine, collect, parent) = engine_on_a_new_store("lock-saying");
+        let store = open_store(&engine).unwrap();
+        let waiting = || {
+            collect
+                .events()
+                .iter()
+                .filter(|message| matches!(message, Message::Progress(Progress::WaitingForStore)))
+                .count()
+        };
+        drop(lock_saying(&engine, &store).unwrap());
+        assert_eq!(waiting(), 0, "free: nothing said");
+        let collection = store.lock(LockMode::Exclusive, Duration::ZERO).unwrap();
+        std::thread::scope(|scope| {
+            let pull = scope.spawn(|| lock_saying(&engine, &store).map(drop));
+            shipyard_test_support::eventually(Duration::from_secs(10), "the wait said", || {
+                waiting() == 1
+            });
+            drop(collection);
+            pull.join().unwrap().unwrap();
+        });
+        assert_eq!(waiting(), 1);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 
     #[test]
     fn what_the_user_types_finds_the_canonical_name() {

@@ -132,7 +132,51 @@ fn a_pull_s_progress_is_docker_s_lines() {
             short_digest: "0123456789ab".to_owned(),
             downloaded: Some(42)
         }),
-        serde_json::json!({"status": "Pull complete", "id": "0123456789ab", "progressDetail": {}})
+        serde_json::json!({"status": "Download complete", "id": "0123456789ab", "progressDetail": {}})
+    );
+    // Its extraction (F209), then a wait's words.
+    for (progress, status) in [
+        (
+            Progress::Extracted {
+                short_digest: "0123456789ab".to_owned(),
+            },
+            "Pull complete",
+        ),
+        (
+            Progress::Retrying {
+                short_digest: "0123456789ab".to_owned(),
+                after_secs: 1,
+            },
+            "Retrying in 1 second",
+        ),
+        (
+            Progress::Retrying {
+                short_digest: "0123456789ab".to_owned(),
+                after_secs: 8,
+            },
+            "Retrying in 8 seconds",
+        ),
+    ] {
+        assert_eq!(
+            line(progress),
+            serde_json::json!({"status": status, "id": "0123456789ab", "progressDetail": {}})
+        );
+    }
+    assert_eq!(
+        line(Progress::Extracting {
+            short_digest: "0123456789ab".to_owned(),
+            have: 512,
+            total: 4096
+        }),
+        serde_json::json!({
+            "status": "Extracting",
+            "id": "0123456789ab",
+            "progressDetail": {"current": 512, "total": 4096}
+        })
+    );
+    assert_eq!(
+        line(Progress::WaitingForStore),
+        serde_json::json!({"status": "Waiting for the image store (another command is collecting it)"})
     );
     assert_eq!(
         line(Progress::Layer {

@@ -153,7 +153,7 @@ fn push_one(
             PushEvent::Exists { digest } => (digest, None),
         };
         engine.report(Message::Progress(Progress::Pushed {
-            short_digest: digest.hex().chars().take(12).collect(),
+            short_digest: super::short(digest),
             sent,
         }));
     };

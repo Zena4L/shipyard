@@ -2823,8 +2823,9 @@ fn an_exec_s_values_are_on_no_argv() {
 }
 
 /// A pull through the API says each layer's bytes as they come (F192),
-/// Docker's `progressDetail` (how far, of its size), before the layer's
-/// `Pull complete`: a client's bar moves, and its quiet bound isn't met.
+/// Docker's `progressDetail` (how far, of its size), then `Download
+/// complete`, `Extracting` and `Pull complete` (F209): a client's bar moves,
+/// and its quiet bound isn't met while the layer's unpacked either.
 #[test]
 fn a_pull_says_its_layers_bytes_as_they_come() {
     let Some(stores) = Stores::new() else { return };
@@ -2858,7 +2859,16 @@ fn a_pull_says_its_layers_bytes_as_they_come() {
             .filter(|line| line["status"] == "Downloading" && line["id"] == *id)
             .collect();
         let first = downloading.first().expect("no bytes said for a layer");
-        assert!(position(first) < position(done), "{lines:?}");
+        let step = |status: &str| {
+            lines
+                .iter()
+                .position(|line| line["status"] == status && line["id"] == *id)
+        };
+        let (fetched, extracting) = (step("Download complete"), step("Extracting"));
+        assert!(
+            position(first) < fetched && fetched < extracting && extracting < position(done),
+            "{lines:?}"
+        );
         for line in downloading {
             let (current, total) = (
                 line["progressDetail"]["current"].as_u64().unwrap(),

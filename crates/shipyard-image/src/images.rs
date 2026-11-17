@@ -211,6 +211,75 @@ pub fn extract_layers(
     layers: &[LayerSpec],
     options: &UnpackOptions,
 ) -> Result<Extracted, ExtractError> {
+    extract_layers_telling(store, layers, options, &|_, _| {})
+}
+
+/// Where a layer's extraction is ([`extract_layers_telling`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Unpack {
+    /// It starts.
+    Started {
+        /// Its blob's size, in bytes.
+        total: u64,
+    },
+    /// `have` bytes of its blob are read, said at most every
+    /// [`PROGRESS_EVERY`](crate::pull::PROGRESS_EVERY): a big layer's
+    /// unpacking is never silent for long.
+    Read {
+        /// The blob's bytes read so far.
+        have: u64,
+        /// Its size.
+        total: u64,
+    },
+    /// It's on disk (placed with the others at the end).
+    Done,
+}
+
+/// A layer's blob as it's read, its bytes told to `tell` at most every
+/// [`PROGRESS_EVERY`](crate::pull::PROGRESS_EVERY).
+struct Told<'a, R> {
+    inner: R,
+    layer: &'a LayerSpec,
+    tell: &'a dyn Fn(&LayerSpec, Unpack),
+    have: u64,
+    total: u64,
+    last: std::time::Instant,
+}
+
+impl<R: std::io::Read> std::io::Read for Told<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.have = self
+            .have
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last) >= crate::pull::PROGRESS_EVERY {
+            self.last = now;
+            (self.tell)(
+                self.layer,
+                Unpack::Read {
+                    have: self.have,
+                    total: self.total,
+                },
+            );
+        }
+        Ok(read)
+    }
+}
+
+/// [`extract_layers`], telling `tell` as each layer it extracts starts and
+/// ends (F209: a pull says it, never silent for as long as a big layer
+/// takes); a layer the store has extracted already is told nothing.
+///
+/// # Errors
+///
+/// As [`extract_layers`].
+pub fn extract_layers_telling(
+    store: &Store,
+    layers: &[LayerSpec],
+    options: &UnpackOptions,
+    tell: &dyn Fn(&LayerSpec, Unpack),
+) -> Result<Extracted, ExtractError> {
     let owners = options.ownership.owners();
     let layers_dir = layers_dir(store)?;
     let mut temporaries = Temporaries {
@@ -244,6 +313,23 @@ pub fn extract_layers(
         let temporary = temporaries.create(&plain)?;
         let diff = make_diff(&layers_dir, &temporary)?;
         let blob = store.open_blob(&layer.digest)?;
+        let total = blob
+            .metadata()
+            .map_err(|source| ExtractError::Io {
+                action: "reading the size of the blob",
+                name: layer.digest.to_string(),
+                source,
+            })?
+            .len();
+        tell(layer, Unpack::Started { total });
+        let blob = Told {
+            inner: blob,
+            layer,
+            tell,
+            have: 0,
+            total,
+            last: std::time::Instant::now(),
+        };
         let layer_report =
             unpack::unpack_layer(blob, layer, &diff, &diffs, options).map_err(|source| {
                 ExtractError::Unpack {
@@ -253,6 +339,7 @@ pub fn extract_layers(
                 }
             })?;
         report.add(&layer_report);
+        tell(layer, Unpack::Done);
         let name = if layer_report.implied_dirs > 0 {
             stacked
         } else {
@@ -510,6 +597,90 @@ mod tests {
         let again = extract_layers(&store, &specs, &keep()).unwrap();
         assert_eq!(again.directories, extracted.directories);
         assert_eq!(again.report, LayerReport::default());
+    }
+
+    /// Each layer extracted is told as it starts and as it's done, in
+    /// order (F209); one the store has already is told nothing.
+    #[test]
+    fn each_extracted_layer_is_told() {
+        let scratch = Scratch::new("tell");
+        let mut base = Layer::default();
+        base.dir("etc", 0o755).file("etc/a", b"a");
+        let mut top = Layer::default();
+        top.dir("srv", 0o755).file("srv/b", b"b");
+        let (store, specs) = store_with(&scratch, &[&base, &top]);
+        extract_layers(&store, &specs[..1], &keep()).unwrap();
+        let told = std::sync::Mutex::new(Vec::new());
+        extract_layers_telling(&store, &specs, &keep(), &|layer, step| {
+            told.lock().unwrap().push((layer.digest.clone(), step));
+        })
+        .unwrap();
+        assert_eq!(
+            told.into_inner().unwrap(),
+            [
+                (
+                    specs[1].digest.clone(),
+                    Unpack::Started {
+                        total: std::fs::metadata(store.path(&specs[1].digest))
+                            .unwrap()
+                            .len()
+                    }
+                ),
+                (specs[1].digest.clone(), Unpack::Done)
+            ]
+        );
+    }
+
+    /// A layer's bytes read are told no sooner than half a second after
+    /// the last word, with how many so far (F209).
+    #[test]
+    fn a_layer_s_bytes_read_are_told_at_most_every_half_second() {
+        use std::io::Read as _;
+        struct Slow(u8);
+        impl std::io::Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                // Three reads of 10 bytes, the third after a pause.
+                self.0 += 1;
+                if self.0 == 3 {
+                    std::thread::sleep(crate::pull::PROGRESS_EVERY);
+                }
+                Ok(if self.0 <= 3 { buf.len().min(10) } else { 0 })
+            }
+        }
+        let scratch = Scratch::new("told");
+        let mut layer = Layer::default();
+        layer.file("f", b"x");
+        let (_, specs) = store_with(&scratch, &[&layer]);
+        let told = std::sync::Mutex::new(Vec::new());
+        let tell = |_: &LayerSpec, step| told.lock().unwrap().push(step);
+        let mut reader = Told {
+            inner: Slow(0),
+            layer: &specs[0],
+            tell: &tell,
+            have: 0,
+            total: 30,
+            last: std::time::Instant::now(),
+        };
+        let mut all = Vec::new();
+        reader.read_to_end(&mut all).unwrap();
+        // Not after the first two quick reads; at least after the pause
+        // (a slow host may add one more).
+        let told = told.into_inner().unwrap();
+        assert_eq!(
+            told.last(),
+            Some(&Unpack::Read {
+                have: 30,
+                total: 30
+            }),
+            "{told:?}"
+        );
+        assert!(
+            !told.contains(&Unpack::Read {
+                have: 10,
+                total: 30
+            }),
+            "told at once: {told:?}"
+        );
     }
 
     /// A layer that implies directories (`usr/local/bin/tool`, no entries

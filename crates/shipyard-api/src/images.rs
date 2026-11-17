@@ -268,6 +268,16 @@ impl Line {
         bytes
     }
 
+    /// A layer's line with `status`, its detail empty (Docker's for a
+    /// step without bytes to count).
+    fn layer(short_digest: &str, status: &str) -> Line {
+        Line {
+            id: Some(short_digest.to_owned()),
+            progress_detail: Some(ProgressDetail::default()),
+            ..Line::status(status.to_owned())
+        }
+    }
+
     /// The line the engine's `progress` makes.
     fn of(progress: &Progress) -> Line {
         match progress {
@@ -299,14 +309,41 @@ impl Line {
                 // its CLI would draw a bar after it).
                 progress_detail: Some(ProgressDetail::default()),
                 ..Line::status(
+                    // Fetched: then extracted (`Pull complete`, F209).
                     if downloaded.is_some() {
-                        "Pull complete"
+                        "Download complete"
                     } else {
                         "Already exists"
                     }
                     .to_owned(),
                 )
             },
+            Progress::Extracting {
+                short_digest,
+                have,
+                total,
+            } => Line {
+                id: Some(short_digest.clone()),
+                progress_detail: Some(ProgressDetail {
+                    current: Some(*have),
+                    total: Some(*total),
+                }),
+                ..Line::status("Extracting".to_owned())
+            },
+            Progress::Extracted { short_digest } => Line::layer(short_digest, "Pull complete"),
+            Progress::Retrying {
+                short_digest,
+                after_secs,
+            } => Line::layer(
+                short_digest,
+                &format!(
+                    "Retrying in {after_secs} second{}",
+                    if *after_secs == 1 { "" } else { "s" }
+                ),
+            ),
+            Progress::WaitingForStore => Line::status(
+                "Waiting for the image store (another command is collecting it)".to_owned(),
+            ),
             Progress::Downloading {
                 short_digest,
                 have,
@@ -368,15 +405,19 @@ impl Reporter for StreamedProgress {
 }
 
 /// Writes `progress`'s line to the client, from the pull's blocking
-/// threads only (`send` sleeps while the client is behind). A layer's bytes as they come
-/// (`Downloading`) are offered once and dropped if the client is behind:
-/// they're told from inside the download's reads (F192), which a client
-/// that stopped reading (a terminal held with Ctrl-S) must never hold up,
-/// and the next, half a second later, says more. Every other line waits
-/// for room ([`send`]).
+/// threads only (`send` sleeps while the client is behind). A layer's bytes
+/// as they come (`Downloading`) and as they're unpacked (`Extracting`) are
+/// offered once and dropped if the client is behind: they're told from
+/// inside the download's and the unpacking's reads (F192, F209), which a
+/// client that stopped reading (a terminal held with Ctrl-S) must never
+/// hold up, and the next, half a second later, says more. Every other line
+/// waits for room ([`send`]).
 fn write_progress(sender: &Sender, gone: &Gone, progress: &Progress) -> std::io::Result<()> {
     let line = Line::of(progress);
-    if matches!(progress, Progress::Downloading { .. }) {
+    if matches!(
+        progress,
+        Progress::Downloading { .. } | Progress::Extracting { .. }
+    ) {
         let _ = sender.try_send(line.bytes().into());
         return Ok(());
     }
