@@ -58,8 +58,13 @@ impl CliReporter {
                     short_digest,
                     sent: None,
                 } => format!("{short_digest}: already there"),
-                // A line a layer, once it's in: a terminal's output as it was.
-                Progress::Downloading { .. } => return None,
+                // A line a layer, once it's in: a terminal's output as it was
+                // (the API's clients get these, F192, F209).
+                Progress::Downloading { .. }
+                | Progress::Retrying { .. }
+                | Progress::Extracting { .. }
+                | Progress::Extracted { .. }
+                | Progress::WaitingForStore => return None,
             },
             Message::Progress(_) => return None,
         })

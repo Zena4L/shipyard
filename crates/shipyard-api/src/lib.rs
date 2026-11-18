@@ -210,12 +210,21 @@ fn serve_blocked(listener: StdListener, service: Service, stops: SigSet) -> io::
                 }
             })?;
     }
-    // Dropped at the end, the runtime waits for the engine calls still
-    // running (none by then: an idle or stopped service has none).
-    runtime.block_on(async move {
+    let served = runtime.block_on(async move {
         let listener = UnixListener::from_std(listener)?;
+        // What a service before it, stopped as it deleted a volume's tree,
+        // left (F208).
+        shared.call_after("sweeping the volume trash", |engine| {
+            shipyard_engine::volumes::sweep_trash(engine)
+        });
         accept(&listener, &shared, &stopped).await
-    })
+    });
+    // No engine call is running by then (an idle or stopped service has
+    // none); background work a stop let go (a volume's tree half deleted:
+    // the next service sweeps it, F208) isn't waited for, as dropping the
+    // runtime would.
+    runtime.shutdown_background();
+    served
 }
 
 /// Accepts connections until the service is idle, or stopped (`stopped`
@@ -586,15 +595,16 @@ impl Shared {
     }
 
     /// Runs `call` after the answer, on a blocking thread with an engine of
-    /// its own, counted as a call (the service ends neither idle nor stopped
-    /// before it), its failure logged as `what`'s: what a client needn't
-    /// wait for. Not run once the service is stopping.
+    /// its own, counted as background work (the service doesn't end idle
+    /// before it, but a stop lets it go: F208), its failure logged as
+    /// `what`'s: what a client needn't wait for, and what may be cut and
+    /// done again later. Not run once the service is stopping.
     fn call_after(
         &self,
         what: &'static str,
         call: impl FnOnce(&Engine) -> shipyard_engine::Result<()> + Send + 'static,
     ) {
-        let Some(busy) = self.idle.call() else {
+        let Some(busy) = self.idle.background() else {
             tracing::warn!("{what} wasn't run: the service is stopping");
             return;
         };

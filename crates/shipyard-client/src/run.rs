@@ -17,9 +17,11 @@ use crate::{ClientError, Result};
 pub const MEMORY_CHOICES: [u32; 5] = [128, 256, 512, 1024, 2048];
 
 /// How long a pull may go without a line before it's given up. The API
-/// says each layer's bytes as they come (F192), but nothing while it waits
-/// out a stalled transfer before resuming it (up to 5 minutes), a
-/// registry's `Retry-After`s, or the layers' unpacking (F209).
+/// says each layer's bytes as they come (F192) and as they're unpacked, a
+/// layer's wait before a try again, and a wait for the store (F209); what's
+/// left unsaid is a stalled attempt (connecting, an answer, a body: up to
+/// 30 s + 60 s + 5 minutes), the manifest's and config's tries, a stored
+/// blob's recheck, and the layers' last sync to disk.
 pub const PULL_QUIET: Duration = Duration::from_secs(600);
 
 /// How long a create may take: a stored image unpacked the first time it

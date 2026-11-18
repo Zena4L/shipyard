@@ -52,6 +52,12 @@ pub enum LayerProgress {
         /// The bytes received so far.
         have: u64,
     },
+    /// Its transfer broke off (or the registry asked to wait): tried again
+    /// after `after` (F209).
+    Retrying {
+        /// The wait before the next try.
+        after: Duration,
+    },
     /// It's in the store: fetched (`true`), or there already.
     Stored {
         /// Whether it was fetched.
@@ -256,7 +262,7 @@ pub fn pull_with(
         store,
         recheck: options.recheck,
     };
-    fetch.blob(&manifest.config, &AtomicBool::new(false), &|_| {})?;
+    fetch.blob(&manifest.config, &AtomicBool::new(false), &|_| {}, &|_| {})?;
     let config = ImageConfig::parse(&store.read_blob(&manifest.config.digest, limit)?)?;
     let image_platform = check_platform(&config, platform)?;
 
@@ -448,12 +454,13 @@ impl Fetch<'_> {
     ///
     /// Once `stop` is set (another layer failed), the transfer ends at its
     /// next read. `tell` is told the bytes received as they come
-    /// ([`Said`]).
+    /// ([`Said`]), `waiting` each wait before a try again.
     fn blob(
         &self,
         descriptor: &Descriptor,
         stop: &AtomicBool,
         tell: &dyn Fn(u64),
+        waiting: &dyn Fn(Duration),
     ) -> Result<bool, PullError> {
         let (store, digest) = (self.store, &descriptor.digest);
         if store.contains(digest) {
@@ -478,6 +485,7 @@ impl Fetch<'_> {
                         writer: &mut writer,
                         stop,
                         said: &mut said,
+                        waiting,
                     },
                 )?;
             }
@@ -520,7 +528,8 @@ impl Fetch<'_> {
                             return;
                         };
                         let tell = |have| progress(layer, LayerProgress::Fetching { have });
-                        match self.blob(layer, &failed, &tell) {
+                        let waiting = |after| progress(layer, LayerProgress::Retrying { after });
+                        match self.blob(layer, &failed, &tell, &waiting) {
                             Ok(fetched) => progress(layer, LayerProgress::Stored { fetched }),
                             Err(error) => {
                                 let _ = first_error.set(error);
@@ -541,6 +550,7 @@ struct Fetching<'a, 'b> {
     writer: &'a mut BlobWriter,
     stop: &'a AtomicBool,
     said: &'a mut Said<'b>,
+    waiting: &'a dyn Fn(Duration),
 }
 
 /// A blob's bytes received, told as they come: at once the first time,
@@ -586,6 +596,10 @@ impl BlobSink for Fetching<'_, '_> {
             have,
             said: self.said,
         })
+    }
+
+    fn waiting(&mut self, wait: Duration) {
+        (self.waiting)(wait);
     }
 }
 
@@ -696,6 +710,7 @@ mod tests {
             writer: &mut writer,
             stop: &AtomicBool::new(false),
             said: &mut said,
+            waiting: &|_| {},
         };
         sink.append(&mut &b"456789"[..]).unwrap();
         assert_eq!(*told.lock().unwrap(), [10]);

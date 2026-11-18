@@ -42,8 +42,8 @@ pub use containers::{
 pub use credentials::{Credential, CredentialError, Credentials, FoundCredential, login};
 pub use digest::{Digest, DigestError, Verifier, VerifyError};
 pub use images::{
-    ExtractError, Extracted, extract_layers, layer_directories, layer_specs, placed_layers,
-    remove_layers, trash_layers,
+    ExtractError, Extracted, Unpack, extract_layers, extract_layers_telling, layer_directories,
+    layer_specs, placed_layers, remove_layers, trash_layers,
 };
 // `index::Index` (the store's reference index) is reached through the module
 // path to avoid colliding with `manifest::Index` (a multi-platform image

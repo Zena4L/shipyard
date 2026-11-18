@@ -172,6 +172,32 @@ pub enum Progress {
         /// Its size.
         total: u64,
     },
+    /// A layer's transfer broke off (or the registry asked to wait): tried
+    /// again in `after_secs` (F209).
+    Retrying {
+        /// The layer's digest, its first 12 hex digits.
+        short_digest: String,
+        /// The wait, in whole seconds (at least 1).
+        after_secs: u64,
+    },
+    /// A layer's extraction into the store starts, or goes on (F209: a
+    /// big one takes a while, and is said at most every half second).
+    Extracting {
+        /// The layer's digest, its first 12 hex digits.
+        short_digest: String,
+        /// Its blob's bytes read so far (0 as it starts).
+        have: u64,
+        /// Its blob's size.
+        total: u64,
+    },
+    /// A layer is extracted.
+    Extracted {
+        /// The layer's digest, its first 12 hex digits.
+        short_digest: String,
+    },
+    /// The pull waits for the image store, which another command holds
+    /// (a collection: `image prune`, `system prune`), F209.
+    WaitingForStore,
     /// Pushing this image to this name starts (step 12.4).
     Pushing {
         /// The name, as its canonical reference.

@@ -212,7 +212,9 @@ behaviour; each change is listed here).
 - **Deleting a volume of millions of files through the API timed out in the desktop
   app** though the volume was gone, and "Delete N unused" stopped there: the API now
   answers once the volume is gone and deletes its files after, holding no image store
-  lock, so a `docker rmi` right after isn't kept waiting (F195).
+  lock, so a `docker rmi` right after isn't kept waiting (F195). A stop (a logout,
+  `systemctl --user stop`) no longer waits for such a delete: the next service sweeps
+  what's left at its start (F208).
 - **The desktop app on Linux took a busy service for none**: a live service whose
   backlog was full got a second start, which waited until the app gave up. Only no
   socket, or nothing listening, starts one now, and the check never waits (F196).
@@ -226,7 +228,13 @@ behaviour; each change is listed here).
   Run sheet stood still for minutes. Each layer's bytes are said as they come (Docker's
   `Downloading` lines with `progressDetail`, at most every half second a layer: Docker's
   CLI draws its bars); a client that stops reading drops those lines rather than holding
-  the download up (F192). Unpacking the layers still says nothing (F209).
+  the download up (F192).
+- **A pull through the API then went silent while its layers were unpacked**, while it
+  waited out a registry's `Retry-After` or a stalled transfer, and while another
+  command held the image store: each layer's unpacking is said as Docker's is
+  (`Download complete`, then `Extracting` with how far, at most every half second, then
+  `Pull complete`; rootless too, through the storage helper), each wait before a try
+  again (`Retrying in N seconds`) and a wait for the store (F209).
 - **`shipyard vm install` said nothing of a VM another command started meanwhile**, which
   left Docker's socket to launchd and had `docker` refused (503) until it stopped: it's
   warned of (F180).
@@ -259,6 +267,9 @@ behaviour; each change is listed here).
 
 ### Security
 
+- **`rustix` 1.1.6** (RUSTSEC-2026-0486: its extended-attribute reads marked bytes
+  never written as written when given an empty buffer), in the CLI's and the desktop
+  app's locks; Shipyard calls none of them itself, the `tar` crate's `xattr` does.
 - **As root, `login` and `logout` followed a user's link** (`~/.docker/config.json`, or
   `.docker` itself, under `sudo -E`) and rewrote or made a file of root's (or anyone's)
   wherever it led. A link to what its owner doesn't own is refused as root, and the
@@ -420,6 +431,10 @@ behaviour; each change is listed here).
   virtiofs to tune.
 - **No installer yet** (F178): the guest is built from the source tree, which a `shipyard`
   built there finds by itself; an installed binary needs `SHIPYARD_GUEST_DIR`.
+- **On a kernel before Linux 5.12, a read-only bind leaves a covered mount below it as it
+  was** (an automount's, under the file system stacked on it): no path reaches it to
+  remount, and only a container that could remount the bind itself could reach it
+  (F210, accepted).
 - **A bind of Docker's socket is refused on a Mac** (F171): Testcontainers' Ryuk needs
   `TESTCONTAINERS_RYUK_DISABLED=true` there for now.
 - **A build's context must be in your home on a Mac** (F181): one in `/tmp`,

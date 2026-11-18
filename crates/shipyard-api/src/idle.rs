@@ -42,6 +42,10 @@ struct State {
     connections: usize,
     /// Engine calls running.
     calls: usize,
+    /// Work after an answer (a volume's tree deleted): it holds the idle
+    /// end, but not a stop, which lets it go (F208: what's left is swept
+    /// by the next service).
+    background: usize,
     /// When the last of them ended (or the service started).
     since: Instant,
     /// Asked to stop: no call starts any more.
@@ -53,10 +57,11 @@ struct State {
 enum What {
     Connection,
     Call,
+    Background,
 }
 
-/// One thing under way: a connection, or an engine call. Dropped, it's
-/// done.
+/// One thing under way: a connection, an engine call, or work after an
+/// answer. Dropped, it's done.
 #[derive(Debug)]
 pub(crate) struct Busy(Arc<Idle>, What);
 
@@ -69,6 +74,7 @@ impl Idle {
             state: Mutex::new(State {
                 connections: 0,
                 calls: 0,
+                background: 0,
                 since: now,
                 stopping: false,
             }),
@@ -92,6 +98,17 @@ impl Idle {
         Some(Busy(Arc::clone(self), What::Call))
     }
 
+    /// Work after an answer starts: `None` once the service is stopping
+    /// (it would be let go at once).
+    pub(crate) fn background(self: &Arc<Self>) -> Option<Busy> {
+        let mut state = self.lock();
+        if state.stopping {
+            return None;
+        }
+        state.background += 1;
+        Some(Busy(Arc::clone(self), What::Background))
+    }
+
     /// Asked to stop: no call starts from now on.
     pub(crate) fn stop(&self) {
         self.lock().stopping = true;
@@ -112,7 +129,7 @@ impl Idle {
             // with the service).
             return (state.calls > 0).then_some(STOPPING_LOOK);
         }
-        if state.connections + state.calls > 0 {
+        if state.connections + state.calls + state.background > 0 {
             return Some(self.after);
         }
         let quiet = now.saturating_duration_since(state.since);
@@ -130,8 +147,9 @@ impl Drop for Busy {
         match self.1 {
             What::Connection => state.connections = state.connections.saturating_sub(1),
             What::Call => state.calls = state.calls.saturating_sub(1),
+            What::Background => state.background = state.background.saturating_sub(1),
         }
-        if state.connections + state.calls == 0 {
+        if state.connections + state.calls + state.background == 0 {
             state.since = Instant::now();
         }
     }
@@ -210,5 +228,27 @@ mod tests {
         assert!(idle.call().is_none(), "no call starts once stopping");
         drop(call);
         assert_eq!(idle.left(now), None, "an open connection doesn't hold it");
+    }
+
+    /// Work after an answer holds the idle end as a call does, but a stop
+    /// lets it go (F208), and none starts once stopping.
+    #[test]
+    fn a_stop_lets_background_work_go() {
+        let start = Instant::now().checked_sub(AFTER * 10).unwrap();
+        let idle = Idle::new(AFTER, start);
+        let work = idle.background().unwrap();
+        assert_eq!(
+            idle.left(Instant::now()),
+            Some(AFTER),
+            "it holds the idle end"
+        );
+        idle.stop();
+        assert_eq!(
+            idle.left(Instant::now()),
+            None,
+            "a stop doesn't wait for it"
+        );
+        assert!(idle.background().is_none(), "none starts once stopping");
+        drop(work);
     }
 }

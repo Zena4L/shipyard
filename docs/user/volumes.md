@@ -42,7 +42,7 @@ shipyard run --volume data:/var/lib/data alpine cat /var/lib/data/f    # hi
 |---|---|
 | `SOURCE` | a **named volume** (a bare name, no slash — created on first use) or a **host path** (absolute, and it must exist — resolved, symlinks followed, and bind-mounted) |
 | `DEST` | where it appears inside the container (an absolute path) |
-| `:ro` | mount it read-only (`:rw`, the default, is read-write) |
+| `:ro` | mount it read-only, with every mount below it (`:rw`, the default, is read-write); on a kernel before Linux 5.12, a mount below that another covers (an automount's) is left as it was: no path reaches it |
 
 Repeat `--volume` for more than one. A named volume that doesn't exist yet is
 created the first time you mount it, as Docker does.

@@ -21,7 +21,7 @@ use shipyard_test_support::api;
 struct Served {
     socket: PathBuf,
     ended: mpsc::Receiver<std::io::Result<()>>,
-    _dir: Scratch,
+    dir: Scratch,
 }
 
 /// A scratch directory, removed after.
@@ -34,16 +34,24 @@ impl Drop for Scratch {
 }
 
 fn serve(idle: Duration) -> Served {
+    serve_with(idle, |_| {})
+}
+
+/// [`serve`], its image store in its scratch directory (`store`), made
+/// ready by `before` first.
+fn serve_with(idle: Duration, before: impl FnOnce(&std::path::Path)) -> Served {
     let dir = std::env::temp_dir().join(format!(
         "shipyard-api-serve-{}-{:x}",
         std::process::id(),
         rand_word()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("store");
+    before(&store);
     let socket = dir.join("api.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let service = shipyard_api::Service {
-        paths: shipyard_engine::Paths::from_env(),
+        paths: shipyard_engine::Paths::from_env().with_image_store(store),
         idle,
         build: shipyard_api::Build {
             version: "0.3.0".to_owned(),
@@ -59,7 +67,7 @@ fn serve(idle: Duration) -> Served {
     Served {
         socket,
         ended,
-        _dir: Scratch(dir),
+        dir: Scratch(dir),
     }
 }
 
@@ -104,6 +112,29 @@ fn version_names_the_engine_and_its_api() {
     assert_eq!(json["Platform"]["Name"], "Shipyard");
     assert_eq!(json["Components"][0]["Name"], "Engine");
     assert_eq!(json["Components"][0]["Details"]["ApiVersion"], "1.44");
+}
+
+/// What a service stopped mid-delete left in the volume trash (F208) is
+/// swept by the next one at its start; the volumes themselves are kept.
+#[test]
+fn a_service_sweeps_the_volume_trash_at_its_start() {
+    let served = serve_with(Duration::from_secs(60), |store| {
+        let left = store.join("volumes/.trash/.trash-gone-1/_data/a");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("f"), "x").unwrap();
+        std::fs::create_dir_all(store.join("volumes/kept/_data")).unwrap();
+        // A store is its owner's alone (`Store::open` refuses one that isn't).
+        let private = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700);
+        std::fs::set_permissions(store, private).unwrap();
+    });
+    let store = served.dir.0.join("store");
+    shipyard_test_support::eventually(Duration::from_secs(10), "the trash swept", || {
+        std::fs::read_dir(store.join("volumes/.trash"))
+            .unwrap()
+            .next()
+            .is_none()
+    });
+    assert!(store.join("volumes/kept/_data").is_dir());
 }
 
 /// `/info` has API 1.44's keys: each runtime with its `path` and `status`
