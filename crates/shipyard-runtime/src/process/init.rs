@@ -45,7 +45,7 @@ use super::channel::{
     report_pipe,
 };
 use super::child::{
-    Failure, SETUP_FAILED, command_main, report_failure, wait_for_go, write_record,
+    Failure, SETUP_FAILED, command_attempt, command_main, report_failure, wait_for_go, write_record,
 };
 use super::failure::UnmappedId;
 use super::failure::{ChildFailure, ChildStep, FailureContext, describe};
@@ -479,8 +479,7 @@ fn run(
 
     let Some(go) = go else {
         // No PID namespace, so no init: this process becomes the command.
-        // SAFETY: a single-threaded process; `plan` is the command's.
-        unsafe { command_main(&plan, report) }
+        become_command(&plan, report, command_report, &context)
     };
     let command = start_command(&plan, report, go, last_cap)
         .unwrap_or_else(|errno| fail(Failure::at(ChildStep::InitFork, errno)));
@@ -491,6 +490,31 @@ fn run(
     // It has `execve`d (or failed to): `start` may go on.
     drop(started);
     become_init(command, status, report, exec_failure)
+}
+
+/// Without a PID namespace, this process becomes the command (`plan`). Past
+/// a start gate (`command_report`, the report pipe made there), nobody reads
+/// that pipe, as an init would: a command that can't run is said here, as an
+/// init says it, with its exit code (`--pid host`: 127 for one that isn't
+/// there, never a silent 125). This process is single-threaded, and the
+/// exec failed: what's said may allocate.
+fn become_command(
+    plan: &ChildPlan,
+    report: RawFd,
+    command_report: Option<OwnedFd>,
+    context: &FailureContext,
+) -> ! {
+    let Some(read) = command_report else {
+        // SAFETY: a single-threaded process; `plan` is the command's.
+        unsafe { command_main(plan, report) }
+    };
+    drop(read);
+    let _ = nix::unistd::close(report);
+    // SAFETY: a single-threaded process; `plan` is the command's.
+    let failure = unsafe { command_attempt(plan) };
+    let error = describe(failure.as_reported(), context);
+    let _ = writeln!(std::io::stderr(), "shipyard: {error}");
+    std::process::exit(i32::from(error.exit_code()));
 }
 
 /// Past a start gate (`command_report`, the report pipe made again there):
