@@ -4487,6 +4487,15 @@ fn host_pid_runs_as_root(stores: &Stores) {
         "{joined:?}"
     );
     stores.ok(&["rm", "-f", "phost"]);
+    // A command that can't run is said, as it is with an init, with its
+    // code (127), past the start gate no init reads a report from
+    // (found by the Mac's VM test: a silent 125 before).
+    let missing = stores.shipyard(&["run", "--rm", "--pid", "host", image, "no-such-program"]);
+    assert_eq!(missing.status.code(), Some(127), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no-such-program: command not found"),
+        "{missing:?}"
+    );
 }
 
 /// [`pid_joins_refused`]'s debugger: one that joins `pfirst` may hold

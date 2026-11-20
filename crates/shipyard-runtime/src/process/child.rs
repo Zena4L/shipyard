@@ -74,6 +74,17 @@ impl Failure {
         self.errno
     }
 
+    /// As a report reader decodes it, for a process that says it itself
+    /// (the clean image become the command past a start gate).
+    #[cfg(target_os = "linux")]
+    pub(super) fn as_reported(&self) -> super::failure::ChildFailure {
+        super::failure::ChildFailure {
+            step: self.step,
+            errno: self.errno,
+            detail: self.detail,
+        }
+    }
+
     /// The same failure, with a detail of its own encoding (a hook's: see
     /// `HookError::to_record`).
     #[cfg(target_os = "linux")]
@@ -1214,11 +1225,26 @@ fn exec_first_candidate(plan: &ChildPlan) -> Failure {
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn command_main(plan: &ChildPlan, report: RawFd) -> ! {
     let _guard = ExitOnUnwind;
-    let Err(failure) =
-        reset_signal_dispositions(&plan.keep_ignored).and_then(|()| prepare_and_exec(plan));
+    // SAFETY: as this function's.
+    let failure = unsafe { command_attempt(plan) };
     report_failure(report, &failure);
     // SAFETY: see `ExitOnUnwind::drop`.
     unsafe { libc::_exit(SETUP_FAILED) }
+}
+
+/// [`command_main`]'s attempt: returns only if the command couldn't be
+/// set up or `exec`d, with why, for a caller that says it itself (the
+/// clean image become the command past a start gate, which nobody reads a
+/// report from).
+///
+/// # Safety
+///
+/// As [`command_main`]'s.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn command_attempt(plan: &ChildPlan) -> Failure {
+    let Err(failure) =
+        reset_signal_dispositions(&plan.keep_ignored).and_then(|()| prepare_and_exec(plan));
+    failure
 }
 
 /// Writes the failure record. Best effort: if the write fails there is no one

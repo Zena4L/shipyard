@@ -100,8 +100,8 @@ behaviour; each change is listed here).
   N)"), beside its last lines.
 - **Shipyard is licensed under Apache-2.0 alone** (it was MIT or Apache-2.0, at your
   option): one `LICENSE`, a `NOTICE`, and a detailed contribution guide (`CONTRIBUTING.md`).
-- **The Mac's guest runs Linux 6.18.59** (was 6.18.58: Alpine replaced the package, and
-  the old one can no longer be installed).
+- **The Mac's guest runs Linux 6.18.64** (was 6.18.58: Alpine replaces the package, and
+  an older one can no longer be installed).
 - **The desktop app's colours and motion:** the Cobalt Yard palette (navy containers on
   blue-tinted greys, a cobalt crane and selection; status colours a set of their own, no
   orange), a new app icon, and lighter motion: one easing and three speeds, views fading
@@ -224,6 +224,9 @@ behaviour; each change is listed here).
   manager's (`systemd-run --user`), with Shipyard's, Docker's config's, the proxies' and
   the certificates' variables; a launch that fails within 5 seconds falls back to the
   old start (F198).
+- **`run --pid host` with a command that can't run exited 125 and said nothing**: with no
+  PID namespace there's no init to read why past the start, so it's said by the process
+  itself now, as any run's (`command not found`, 127).
 - **A pull through the API said nothing while a big layer downloaded**: the desktop app's
   Run sheet stood still for minutes. Each layer's bytes are said as they come (Docker's
   `Downloading` lines with `progressDetail`, at most every half second a layer: Docker's

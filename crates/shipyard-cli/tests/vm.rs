@@ -1211,7 +1211,7 @@ fn busybox_root(scratch: &vm_support::Scratch, pinned: (&str, &str)) -> PathBuf 
     )
     .unwrap();
     for applet in [
-        "sh", "cat", "cut", "ip", "ln", "ls", "nc", "rmdir", "true", "wc",
+        "sh", "cat", "cut", "ip", "ln", "ls", "nc", "ps", "rmdir", "true", "wc",
     ] {
         std::os::unix::fs::symlink("busybox", root.join("bin").join(applet)).unwrap();
     }
@@ -1737,11 +1737,18 @@ fn docker_s_socket_is_given_to_a_container() {
             "/var/run/docker.sock",
             "http://docker/_ping",
         ]);
-        text(&vm.shipyard(&args).stdout).trim().to_owned()
+        let ran = vm.shipyard(&args);
+        let said = text(&ran.stdout).trim().to_owned();
+        if said != "OK" && user == Some("0") {
+            eprintln!("{source} as {user:?}: {ran:?}");
+        }
+        said
     };
-    assert_eq!(ping("/var/run/docker.sock", None), "OK");
+    // As root: the image's own user (curl_user) isn't, and Docker's socket
+    // is root's alone (as Testcontainers' Ryuk runs).
+    assert_eq!(ping("/var/run/docker.sock", Some("0")), "OK");
     let docker_host = vm.docker_socket().display().to_string();
-    assert_eq!(ping(&docker_host, None), "OK", "the Mac's DOCKER_HOST");
+    assert_eq!(ping(&docker_host, Some("0")), "OK", "the Mac's DOCKER_HOST");
     // The service ends 60 s after nothing is asked (seen ended, not
     // assumed); the socket is still the one bound, and the next connection
     // starts it again.
@@ -1752,7 +1759,10 @@ fn docker_s_socket_is_given_to_a_container() {
             .lines()
             .any(|line| line.contains("system service") && !line.contains("--socket"))
     };
-    assert!(serving(), "the service runs once asked");
+    if !serving() {
+        let listed = vm.shipyard(&["run", "--rm", "--pid", "host", image, "ps", "-o", "args"]);
+        panic!("the service runs once asked: {listed:?}");
+    }
     let quiet = Instant::now();
     while serving() {
         assert!(
@@ -1763,7 +1773,7 @@ fn docker_s_socket_is_given_to_a_container() {
     }
     let began = Instant::now();
     assert_eq!(
-        ping("/var/run/docker.sock", None),
+        ping("/var/run/docker.sock", Some("0")),
         "OK",
         "after its idle end"
     );
@@ -1805,9 +1815,11 @@ fn a_gone_client_of_a_streaming_port_is_hung_up() {
     assert!(ran.status.success(), "{ran:?}");
     let ticking = || {
         let listed = vm.shipyard(&["exec", "streams", "ps", "-o", "args"]);
-        text(&listed.stdout)
-            .lines()
-            .any(|line| line.contains("sleep 0.2") || line.contains("while echo"))
+        // The shell `nc` runs for a connection, never `nc`'s own command
+        // line (which holds the script, and listens on after it).
+        text(&listed.stdout).lines().any(|line| {
+            !line.contains("nc -lk") && (line.contains("sleep 0.2") || line.contains("while echo"))
+        })
     };
     let local = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let began = Instant::now();
