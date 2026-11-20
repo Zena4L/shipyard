@@ -105,8 +105,16 @@ fi
 if [ "$mode" = --vm ] || { [ "$mode" = --all ] && [ "$(uname)" = Darwin ]; }; then
     run "the macOS guest, built from this tree" "$logs/guest.log" \
         timeout 3600 scripts/guest/build.sh
+    # Where this Mac has Rosetta for Linux installed (what the VM shares
+    # with its guest), the Rosetta tests are required, never skipped unseen
+    # (F187).
+    # (One exported is kept.)
+    rosetta=${SHIPYARD_TEST_ROSETTA:-}
+    if [ -d /Library/Apple/usr/libexec/oah/RosettaLinux ]; then
+        rosetta=required
+    fi
     run "macOS VM tests" "$logs/test-vm.log" \
-        env SHIPYARD_TEST_VM=required timeout 3600 \
+        env SHIPYARD_TEST_VM=required SHIPYARD_TEST_ROSETTA="$rosetta" timeout 3600 \
         cargo test -p shipyard-cli --test vm --test vm_terminal --test vm_docker --test vm_launchd --no-fail-fast
     summary+=("        tests (macOS VM): $(totals "$logs/test-vm.log")")
 fi

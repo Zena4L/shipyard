@@ -306,27 +306,40 @@ fn new_events_are_followed() {
     assert_eq!(stderr, "");
 }
 
-/// Budget (H7): `events --since 1h` over 50,000 events (5.5 MB, more than
-/// the journal ever keeps: written here directly) in under a second, the
-/// best of a few. Linear, about 0.3 s in a debug build; reading that cut
-/// each line off the front of its buffer (moving the rest each time) was
-/// quadratic: 25 times 10,000 lines' cost, over 2 s.
+/// Budget (H7): `events --since 1h` reads its journal in linear time.
+/// Reading that cut each line off the front of its buffer (moving the rest
+/// each time) was quadratic. What's measured is the shape, not the host's
+/// speed: 100,000 events (11 MB, more than the journal ever keeps: written
+/// here directly) against 10,000, the best of a few each. Linear, the
+/// ratio is under 10 (a process's start counts in both); quadratic, about
+/// 36 even with a slow start in both. An absolute bound stays, generous
+/// (5 s), which the quadratic read misses at 100,000 too (about 8 s) and a
+/// linear one keeps on a slow host (F199: CI's nested VM took 1.06 s for
+/// 50,000 in a debug build, where this machine takes 0.3 s).
 #[test]
 fn fifty_thousand_events_are_read_in_linear_time() {
     let stores = Stores::new("budget");
     stores.ok(&["volume", "create", "first"]);
     let journal = stores.0.join("events/events.log");
     let line = std::fs::read_to_string(&journal).unwrap();
-    std::fs::write(&journal, line.repeat(50_000)).unwrap();
-    let best = (0..3)
-        .map(|_| {
-            let started = Instant::now();
-            let read = stores.ok(&["events", "--since", "1h", "--until", "0s"]);
-            let took = started.elapsed();
-            assert_eq!(read.lines().count(), 50_000);
-            took
-        })
-        .min()
-        .unwrap();
-    assert!(best < Duration::from_secs(1), "{best:?}");
+    let best_of = |events: usize| {
+        std::fs::write(&journal, line.repeat(events)).unwrap();
+        (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                let read = stores.ok(&["events", "--since", "1h", "--until", "0s"]);
+                let took = started.elapsed();
+                assert_eq!(read.lines().count(), events);
+                took
+            })
+            .min()
+            .unwrap()
+    };
+    let (fewer, more) = (best_of(10_000), best_of(100_000));
+    assert!(more < Duration::from_secs(5), "{more:?}");
+    let ratio = more.as_secs_f64() / fewer.as_secs_f64();
+    assert!(
+        ratio < 20.0,
+        "100,000 events took {ratio:.1} times 10,000's ({more:?}, {fewer:?})"
+    );
 }
