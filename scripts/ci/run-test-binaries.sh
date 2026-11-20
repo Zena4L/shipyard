@@ -80,6 +80,26 @@ run_one() {
             timeout 1200 "$test" --include-ignored "$@" </dev/null 3<&-)
     fi
 }
+# Whether tester can still make a directory in TMPDIR, said after each pass
+# (F199: the tester build tests, after the root pass, once failed there with
+# EACCES); if not, what's there: what's mounted, its mode and label, and the
+# kernel's recent SELinux denials. Logged, never gating: a test that needs
+# the directory fails by itself.
+tmp_writable() {
+    local when=$1 probe
+    probe="$TMPDIR/.tester-probe-$$"
+    if runuser -u "$user" -- mkdir "$probe" 2>/dev/null; then
+        rmdir "$probe"
+        echo "--- $when: $TMPDIR is writable by $user"
+        return
+    fi
+    echo "--- $when: $TMPDIR is NOT writable by $user"
+    runuser -u "$user" -- mkdir "$probe" || true
+    findmnt -T "$TMPDIR" || true
+    findmnt -R -o TARGET,SOURCE,FSTYPE,OPTIONS "$TMPDIR" | head -40 || true
+    ls -ldZ "$TMPDIR" / /var || true
+    ausearch -m avc -ts recent 2>/dev/null | tail -20 || true
+}
 run_pass() {
     local pass=$1
     # The list on its own descriptor, each test's stdin /dev/null: a test
@@ -89,12 +109,21 @@ run_pass() {
         echo "=== $pass: ${test##*/}"
         ran=$((ran + 1))
         run_one "$pass" "$package" "$test" || failed+=("$pass: ${test##*/}")
+        # The first executable after which tester can't write TMPDIR, named.
+        if [ -z "$tmp_lost" ] && ! runuser -u "$user" -- test -w "$TMPDIR"; then
+            tmp_lost="$pass: ${test##*/}"
+            tmp_writable "just after $tmp_lost"
+        fi
     done 3< "$list"
 }
+tmp_lost=
 # The build tests (12.3) skip themselves in the passes and run after them.
 export SHIPYARD_TEST_BUILD=later
+tmp_writable "before the passes"
 run_pass tester
+tmp_writable "after the tester pass"
 run_pass root
+tmp_writable "after the root pass"
 expected=$(($(wc -l < "$list") * 2))
 [ "$ran" = "$expected" ] || failed+=("ran $ran test executables of $expected")
 unset SHIPYARD_TEST_BUILD
