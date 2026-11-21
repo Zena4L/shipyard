@@ -85,15 +85,7 @@ fn context(files: &[(&str, &str)]) -> Scratch {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = Scratch::new();
     std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut parent = dir.0.parent();
-    // Its parents enterable by the builder's ID too.
-    while let Some(up) = parent {
-        if up == Path::new("/tmp") || up == Path::new("/") {
-            break;
-        }
-        let _ = std::fs::set_permissions(up, std::fs::Permissions::from_mode(0o755));
-        parent = up.parent();
-    }
+    open_up_to(&dir.0, &std::env::temp_dir());
     for (path, contents) in files {
         let path = dir.0.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -101,6 +93,57 @@ fn context(files: &[(&str, &str)]) -> Scratch {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
     dir
+}
+
+/// `dir`'s parents made enterable by the builder's ID (0755): only those
+/// below `temporary`, the test's own. Never `temporary` or anything above
+/// it, which are the host's (F199: walked up to `/`, as root with
+/// `TMPDIR=/var/tmp` it made the host's `/var/tmp` 0755, and no other user
+/// could write there after). Today a guard more than a walk: a scratch
+/// directory is right in the temporary directory, so nothing is opened, and
+/// the temporary directory must be enterable by every user (`/tmp` and
+/// `/var/tmp` are, 1777).
+fn open_up_to(dir: &Path, temporary: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut parent = dir.parent();
+    while let Some(up) = parent.filter(|up| up.starts_with(temporary) && *up != temporary) {
+        let _ = std::fs::set_permissions(up, std::fs::Permissions::from_mode(0o755));
+        parent = up.parent();
+    }
+}
+
+/// [`open_up_to`] opens the directories between, and leaves the temporary
+/// directory as it is (a shared one's sticky, world-writable 1777), and a
+/// directory outside it too: stand-ins made here, which this test's user
+/// owns, so the old walk would have changed them as any user.
+#[test]
+fn a_context_leaves_the_temporary_directory_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new();
+    let temporary = scratch.0.join("tmp");
+    let inner = temporary.join("a/b");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    std::fs::set_permissions(temporary.join("a"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    open_up_to(&inner.join("context"), &temporary);
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode(&temporary),
+        0o1777,
+        "the temporary directory, as it was"
+    );
+    assert_eq!(mode(&temporary.join("a")), 0o755, "below it, opened");
+    assert_eq!(mode(&inner), 0o755);
+    // A directory not below it: nothing opened.
+    let outside = scratch.0.join("elsewhere/x");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+    open_up_to(&outside.join("context"), &temporary);
+    assert_eq!(
+        mode(&outside),
+        0o700,
+        "outside the temporary directory, as it was"
+    );
 }
 
 /// `build ARGS… CONTEXT` on `store`.

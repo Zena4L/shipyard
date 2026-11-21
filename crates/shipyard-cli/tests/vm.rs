@@ -1097,13 +1097,7 @@ fn an_amd64_image_runs_through_rosetta() {
     let Some(vm) = Vm::new_in_home("rosetta") else {
         return;
     };
-    let doctor = text(&vm.shipyard(&["doctor"]).stdout);
-    if !doctor.contains("ok    rosetta") {
-        assert!(
-            std::env::var("SHIPYARD_TEST_ROSETTA").as_deref() != Ok("required"),
-            "Rosetta is required here (SHIPYARD_TEST_ROSETTA): {doctor}"
-        );
-        eprintln!("skipping: this Mac has no Rosetta for Linux: {doctor}");
+    if !has_rosetta(&vm) {
         return;
     }
     let scratch = vm_support::Scratch::in_home("rosetta");
@@ -1150,6 +1144,80 @@ fn an_amd64_image_runs_through_rosetta() {
     assert!(
         guest.contains("registered: amd64 images run through it"),
         "{guest}"
+    );
+}
+
+/// Whether `vm`'s guest has Rosetta (its `doctor` says so); where it
+/// hasn't, the test is skipped, said, unless `SHIPYARD_TEST_ROSETTA` is
+/// `required` (`verify.sh --vm` sets it on a Mac with Rosetta: F187).
+fn has_rosetta(vm: &Vm) -> bool {
+    let doctor = text(&vm.shipyard(&["doctor"]).stdout);
+    if doctor.contains("ok    rosetta") {
+        return true;
+    }
+    assert!(
+        std::env::var("SHIPYARD_TEST_ROSETTA").as_deref() != Ok("required"),
+        "Rosetta is required here (SHIPYARD_TEST_ROSETTA): {doctor}"
+    );
+    eprintln!("skipping: this Mac has no Rosetta for Linux: {doctor}");
+    false
+}
+
+/// F170: a glibc amd64 image (Debian's, pinned by its index's digest)
+/// runs through Rosetta under Shipyard's default seccomp profile, as 13.3's
+/// static busybox does: its dynamic loader and `apt-get`; threads (a
+/// parallel `sort`: glibc's `clone3`, which a profile must answer `ENOSYS`,
+/// never `EPERM`, for glibc to fall back); glibc's NSS, `/etc/hosts` and a
+/// DNS lookup (`getent`); and it says it's `x86_64`. A pull that fails (the
+/// pinned digest gone from Docker Hub) says so, to be pinned again.
+#[test]
+fn a_glibc_amd64_image_runs_through_rosetta() {
+    const DEBIAN: &str = "debian:trixie-slim@sha256:\
+        a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2";
+    let Some(vm) = Vm::new_in_home("rosetta-glibc") else {
+        return;
+    };
+    if !has_rosetta(&vm) {
+        return;
+    }
+    let ran = vm.shipyard(&[
+        "run",
+        "--rm",
+        "--platform",
+        "linux/amd64",
+        DEBIAN,
+        "sh",
+        "-c",
+        "uname -m && apt-get --version | head -n 1 && getent hosts localhost \
+         && seq 200000 | sort --parallel=4 -S 64K | tail -n 1 \
+         && getent ahosts deb.debian.org | head -n 1",
+    ]);
+    assert!(
+        ran.status.success(),
+        "(a pull refused: the pinned digest may be gone from Docker Hub; pin the index \
+         again) {ran:?}"
+    );
+    let said = text(&ran.stdout);
+    let mut lines = said.lines();
+    assert_eq!(lines.next(), Some("x86_64"), "{said}");
+    assert!(
+        lines
+            .next()
+            .is_some_and(|line| line.starts_with("apt ") && line.contains("amd64")),
+        "{said}"
+    );
+    assert!(
+        lines.next().is_some_and(|line| line.contains("localhost")),
+        "{said}"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("99999"),
+        "the threaded sort's last line: {said}"
+    );
+    assert!(
+        lines.next().is_some_and(|line| line.contains("STREAM")),
+        "a DNS answer: {said}"
     );
 }
 

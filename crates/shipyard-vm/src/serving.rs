@@ -228,11 +228,19 @@ mod tests {
         let path = dir.join("s.sock");
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
+        let non_blocking = |connection: &UnixStream| {
+            let flags =
+                nix::fcntl::fcntl(connection.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
+            nix::fcntl::OFlag::from_bits_truncate(flags).contains(nix::fcntl::OFlag::O_NONBLOCK)
+        };
+        // The control (F187): a plain accept inherits the listener's flag
+        // here (BSD's `accept`; Linux's `accept4` doesn't).
+        let _first = UnixStream::connect(&path).unwrap();
+        let (plain, _) = listener.accept().unwrap();
+        assert!(non_blocking(&plain), "a plain accept is non-blocking here");
         let _client = UnixStream::connect(&path).unwrap();
         let connection = accepted(&listener).unwrap();
-        let flags = nix::fcntl::fcntl(connection.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
-        let flags = nix::fcntl::OFlag::from_bits_truncate(flags);
-        assert!(!flags.contains(nix::fcntl::OFlag::O_NONBLOCK));
+        assert!(!non_blocking(&connection));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
