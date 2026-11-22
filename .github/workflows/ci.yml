@@ -137,15 +137,6 @@ jobs:
           uname -r
           ldd --version | head -1
           findmnt -no PROPAGATION /
-      # The terminal tests first, on their own (temporary, to diagnose): a
-      # step's own time limit fails it before the job's, so its log is kept.
-      - name: terminal tests, on their own
-        if: runner.os == 'Linux'
-        continue-on-error: true
-        run: |
-          cargo test --locked -p shipyard-cli --test terminal --no-run
-          scripts/ci/run-logged.sh 240 terminal \
-            cargo test --locked -p shipyard-cli --test terminal -- --include-ignored
       - name: cargo test
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
@@ -203,22 +194,6 @@ jobs:
       # shipyard-cli's tests: the end-to-end ones run the installed binaries.
       # (The runtime's in-process tests make user namespaces from their own
       # test binary, which no profile covers: they run in `check`.)
-      # The terminal tests first, on their own (temporary, to diagnose): a
-      # step's own time limit fails it before the job's, so its log is kept.
-      - name: terminal tests, on their own, against the installed binaries
-        continue-on-error: true
-        # A step's own limit keeps its log (a job cancelled at its limit
-        # keeps none): run-logged.sh's timeout stops cargo, but a test it
-        # leaves behind can keep the step from ending (F193).
-        timeout-minutes: 6
-        run: |
-          cargo test --locked -p shipyard-cli --test terminal --no-run
-          scripts/ci/run-logged.sh 240 terminal \
-            systemd-run --user --scope --quiet cargo test --locked -p shipyard-cli --test terminal
-        env:
-          SHIPYARD_TEST_BIN_DIR: /usr/local/bin
-          SHIPYARD_TEST_ROOTLESS: required
-          SHIPYARD_TEST_DELEGATED: required
       # 900 s: on ubuntu-26.04 the suite alone came to ~550 s on a slow
       # runner (2026-11-07), the terminal tests last cut off at 600.
       - name: cargo test, against the installed binaries

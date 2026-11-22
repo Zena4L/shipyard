@@ -1036,8 +1036,7 @@ fn attach_to_a_terminal_container() {
     session.expect("33 99");
     // Ctrl-C is a byte in raw mode: it reaches the container's terminal,
     // which interrupts its shell, and `attach` goes on.
-    session.type_keys(b"\x03");
-    session.expect("caught-int");
+    interrupt_the_read(&mut session);
     session.type_keys(b"three\r");
     session.expect("got-three");
     session.type_keys(b"\x10\x11");
@@ -1157,8 +1156,7 @@ fn attach_by_name_to_a_terminal_container() {
     session.type_keys(b"two\r");
     session.expect("got-two");
     session.expect("33 99");
-    session.type_keys(b"\x03");
-    session.expect("caught-int");
+    interrupt_the_read(&mut session);
     session.type_keys(b"\x10\x11");
     assert_eq!(
         session.status(),
@@ -1212,11 +1210,7 @@ fn exec_it_by_name() {
     session.resize(33, 99);
     session.type_keys(b"two\r");
     session.expect("33 99");
-    // Back in its `read` (not still between `stty` and the loop's test),
-    // where the trap is sure to say so.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    session.type_keys(b"\x03");
-    session.expect("caught-int");
+    interrupt_the_read(&mut session);
     session.type_keys(b"bye\r");
     assert_eq!(
         session.status(),
@@ -1529,8 +1523,7 @@ fn exec_t_on_a_terminal() {
     session.type_keys(b"two\r");
     session.expect("got-two");
     session.expect("33 99");
-    session.type_keys(b"\x03");
-    session.expect("caught-int");
+    interrupt_the_read(&mut session);
     session.type_keys(b"bye\r");
     assert_eq!(
         session.status(),
@@ -1770,42 +1763,21 @@ fn a_stalled_terminal_doesnt_keep_shipyard_after_a_stop_request() {
     }
 }
 
-/// Each process whose command line holds `marker`: its state, signal
-/// masks, and its terminal's foreground process group against its own (a
-/// failure's diagnosis).
-fn processes_running(marker: &str) -> String {
-    use std::fmt::Write as _;
-    let mut said = String::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let dir = entry.path();
-        let command = std::fs::read(dir.join("cmdline")).unwrap_or_default();
-        if !String::from_utf8_lossy(&command).contains(marker) {
-            continue;
-        }
-        let status = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
-        let wanted = [
-            "Pid:", "PPid:", "State:", "SigPnd:", "ShdPnd:", "SigBlk:", "SigIgn:", "SigCgt:",
-        ];
-        let lines: Vec<&str> = status
-            .lines()
-            .filter(|line| wanted.iter().any(|key| line.starts_with(key)))
-            .collect();
-        let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
-        // After the name's last `)`: state, ppid, pgrp, session, tty, tpgid.
-        let fields: Vec<&str> = stat
-            .rsplit_once(')')
-            .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
-        let groups = format!(
-            "pgrp {} tpgid {}",
-            fields.get(2).unwrap_or(&"?"),
-            fields.get(5).unwrap_or(&"?")
-        );
-        let _ = writeln!(said, "{} {groups}", lines.join(" "));
-    }
-    if said.is_empty() {
-        said.push_str("(no process runs it)\n");
-    }
-    said
+/// Types Ctrl-C to a shell whose `INT` trap prints `caught-int` as it waits
+/// in `read`, then Enter, and waits for the trap. A shell (dash, the host's
+/// `sh` the tests' roots copy on Debian; likely others) runs its pending
+/// traps and then blocks in `read()`: a SIGINT that lands between the two,
+/// as a Ctrl-C typed right after the shell's last answer can on a loaded
+/// host, is taken at once, but its trap waits for `read` to return (F193: 4
+/// runs in about 1,330 beside full passes, the trap seen after an Enter,
+/// never lost). The terminal takes the two bytes in order (the Ctrl-C's
+/// flush empties only what came before it), so the Enter returns `read`
+/// either way: what's checked is that the byte made a SIGINT in the
+/// container's terminal.
+fn interrupt_the_read(session: &mut Session) {
+    session.type_keys(CTRL_C);
+    session.type_keys(b"\r");
+    session.expect("caught-int");
 }
 
 /// Polls `done` every 300 ms until it holds, failing past 60 s with `what`.
@@ -3164,15 +3136,7 @@ fn a_terminal_container_run_is_raw_and_detaches() {
     session.type_keys(b"two\r");
     session.expect("got-two");
     session.expect("33 99");
-    session.type_keys(CTRL_C);
-    // F193: lost now and then on a loaded host, its cause unknown: what the
-    // shell had blocked, ignored and caught, and whose the terminal was.
-    assert!(
-        session.saw_within("caught-int", std::time::Duration::from_secs(20)),
-        "never saw \"caught-int\"\n{}\n{}",
-        processes_running("caught-int"),
-        session.transcript()
-    );
+    interrupt_the_read(&mut session);
     session.type_keys(b"\x10\x11");
     assert_eq!(
         session.status(),
