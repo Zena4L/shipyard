@@ -83,9 +83,10 @@ pub(super) fn take(engine: &Engine, reference: &str, when_up: WhenUp) -> Result<
     take_with(engine, reference, IfUp::Do(when_up), &|| false)
 }
 
-/// [`take`], its wait for the end given up once `gone` says its caller
-/// has (F123: the API's stop whose client went): the stop goes on in the
-/// container's monitor, which sends SIGKILL at its timeout, unwaited for.
+/// [`take`], its waits given up once `gone` says its caller has (the
+/// API's stop whose client went): for the end (F123), the stop going on
+/// in the container's monitor, which sends SIGKILL at its timeout,
+/// unwaited for; for the operation lock (F202), nothing done.
 ///
 /// # Errors
 ///
@@ -141,21 +142,21 @@ fn take_with<Up>(
         IfUp::Leave(_) => None,
     };
     let found = containers::find(engine, reference)?;
-    // A stop (or a kill) is the user's: recorded before anything is
-    // sent, so a clean-up racing it never restarts the container.
     let stopping = matches!(when_up, Some(WhenUp::Stop(_) | WhenUp::Kill));
-    if stopping {
-        mark_stopped_by_user(engine, &found.id);
-    }
     let asked = ask_first(engine, &found, when_up)?;
     // Again, by its ID, now nothing else works on it: a removal that
     // went first (this one waited for its lock) left nothing, not even
     // the directory the `running` file below is in.
+    // Given up (its caller went, or another command held it past the
+    // bound), a stop its monitor wasn't asked for didn't happen, and left
+    // no mark (F202).
     let containers::Locked { record, operation } =
-        containers::lock_again(engine, &found.id, containers::OP_WAIT)?;
-    // Again, under the lock: a start that held it meanwhile cleared the
-    // mark as it started. (`record`, read before it, is read again below
-    // before anything reads the mark.)
+        containers::lock_again_until(engine, &found.id, containers::OP_WAIT, gone)?;
+    // The user's stop, recorded under the lock (its restart policy then
+    // leaves it so; a restart that waits gives up); and again for one
+    // marked as its monitor was asked: a start that held the lock
+    // meanwhile cleared the mark as it started. (`record`, read before it,
+    // is read again below before anything reads the mark.)
     if stopping {
         mark_stopped_by_user(engine, &found.id);
     }
@@ -265,10 +266,17 @@ fn ask_first(engine: &Engine, found: &Record, when_up: Option<WhenUp>) -> Result
     match when_up {
         Some(WhenUp::Stop(options) | WhenUp::HostStop(options)) if up => {
             let policy = options.policy(found)?;
+            // The user's stop, recorded before anything is sent, so a
+            // clean-up racing it never restarts the container (a host's
+            // stop isn't the user's).
+            if matches!(when_up, Some(WhenUp::Stop(_))) {
+                mark_stopped_by_user(engine, &found.id);
+            }
             crate::run::stop::stop_up(runtime_root, found, policy)?;
             Ok(true)
         }
         Some(WhenUp::Kill) if up => {
+            mark_stopped_by_user(engine, &found.id);
             let kill = shipyard_runtime::process::StopPolicy {
                 signal: shipyard_runtime::process::Signal::KILL,
                 timeout: Duration::ZERO,

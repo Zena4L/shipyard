@@ -163,6 +163,9 @@ pub(crate) struct HooksSetup {
 pub(crate) struct CgroupSetup {
     /// Make a cgroup namespace (the clean image is in its cgroup by then).
     pub(crate) namespace: bool,
+    /// The clean image is placed in a cgroup of the container's own (not
+    /// its caller's): a joined PID namespace's init may kill it whole.
+    pub(crate) own: bool,
     /// Mount the container's cgroup at `/sys/fs/cgroup`: only when it has a
     /// cgroup of its own, and a mount namespace to mount it in.
     pub(crate) mount: Option<CgroupMount>,
@@ -665,6 +668,7 @@ impl Setup {
                 .map(|maps| UserNamespaceSetup { maps: maps.clone() }),
             cgroup: CgroupSetup {
                 namespace: isolation.has(Namespace::Cgroup),
+                own: own_cgroup,
                 mount: isolation
                     .cgroup_mount
                     .filter(|_| own_cgroup && isolation.has(Namespace::Mount)),

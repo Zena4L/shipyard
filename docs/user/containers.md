@@ -280,12 +280,17 @@ shipyard run --rm -it --pid container:app --cap-add SYS_PTRACE alpine:3.20 ps
   say who shares its namespaces. One that joins another's PID namespace itself can't be
   joined: join that one.
 - Its own processes are all its own still: when it stops, they all end (its small init
-  gathers them), and none is left to the other's.
+  gathers them), and none is left to the other's. If Shipyard's monitor of it is killed,
+  its init ends them, and on Linux 5.14 and later its cgroup's every process too (an
+  `exec`'s among them), unless root made it join a container with a user namespace of
+  its own (`--uidmap`): its init is another user on the host then, which may not.
 - A PID namespace where a process may hold `CAP_SYS_PTRACE` (`--cap-add SYS_PTRACE` or
   `ALL`) can't be joined: with it, that process could trace the joining container as
   it's being set up. That's the container's own processes, and those of another that
   joined it: a debugger (the example above) may have the capability, but while it runs
-  nothing else joins that namespace. Give it to the one that looks, last.
+  nothing else joins that namespace. Give it to the one that looks, last. Two
+  containers that join one namespace at once are set up one after the other: the second
+  waits for the first's start (two minutes at most).
 - The joining container's small init isn't PID 1 there: the other's processes see it and
   may signal it (root there may kill it; its processes then end with its cgroup). It
   keeps `SIGRTMIN+2` for itself (it learns from it that Shipyard is gone): that signal,
@@ -295,6 +300,9 @@ shipyard run --rm -it --pid container:app --cap-add SYS_PTRACE alpine:3.20 ps
 - It can't have a user namespace of its own (`--uidmap`), with `--pid container:` or with
   `--pid host`: only root of the user namespace that owns a PID namespace may mount its
   `/proc`. It needs a cgroup of its own (rootless, a delegated one, as for `--memory`).
+- Without root, `--oom-score-adj` can't go with `--pid container:` (refused when it's
+  made): the score is set before the container's process belongs to its user namespace,
+  where the kernel refuses it. Leave it out, or run as root.
 - `--pid host` gives it the host's PID namespace (root only, said when it's made): it
   sees and can signal every process of the host. `exec` reaches it.
 - `inspect` shows `HostConfig.PidMode` as `container:ID`, `host`, or empty (its own).

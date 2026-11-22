@@ -250,6 +250,19 @@ describe("the inspector", () => {
     expect(given.onact).not.toHaveBeenCalled();
   });
 
+  it("says whose namespaces it joined: by name on the map, else by short ID", () => {
+    const base = props();
+    const ns = (kind: string, joined: string | null) => ({ kind, own: true, joined, present: true, id: 1 });
+    const other = "f".repeat(64);
+    const namespaces = [ns("ipc", other), ns("mnt", null), ns("net", "db"), ns("pid", "db")];
+    const focus = { ...base.focus, isolation: { ...base.focus.isolation!, namespaces } };
+    const { container } = render(Inspector, { props: { ...base, focus } });
+    const said = [...container.querySelectorAll(".sect .tnote")].map((p) => p.textContent);
+    expect(said).toContain("ipc shared with ffffffffffff");
+    expect(said).toContain("net, pid shared with db");
+    expect(said.filter((line) => line?.includes("shared with"))).toHaveLength(2);
+  });
+
   it("opens its network and volume in their sections, by name", async () => {
     const given = props();
     const { container } = render(Inspector, { props: given });

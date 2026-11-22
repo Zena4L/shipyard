@@ -193,6 +193,11 @@ fn start_holding(
     // that ran keeps its history (its end, its code; boot starts it
     // again), never reading as never started.
     let before = containers::PreviousStart::of(&record);
+    // Its join of another's PID namespace, checked and set up with that
+    // namespace's join lock held, to its go (or its failure): another
+    // join (a debugger's) is checked, and set up, before or after it,
+    // never beside it (F205).
+    let _join = pid_join(engine, &record)?;
     let PlannedStart {
         planned,
         image,
@@ -285,6 +290,28 @@ fn start_holding(
     };
     containers::forget_previous_start(engine, &id);
     Ok(started)
+}
+
+/// The join lock of the container whose PID namespace `record`'s joins
+/// ([`containers::pid_join_lock`]), if it joins one: held until dropped.
+///
+/// # Errors
+///
+/// Its lock's: held past [`containers::OP_WAIT`]. That container gone,
+/// none: the start's look for it says so ([`joins_found`]); and none for
+/// a `created.json` that can't be read, which [`planned_start`] refuses.
+fn pid_join(engine: &Engine, record: &Record) -> Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    let Some(joined) = containers::created(engine, &record.id)
+        .ok()
+        .and_then(|created| created.pid_from)
+    else {
+        return Ok(None);
+    };
+    match containers::pid_join_lock(engine, &joined, containers::OP_WAIT) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Container `record`'s start, planned: room made for its logs, its

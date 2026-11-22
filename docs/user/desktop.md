@@ -71,7 +71,7 @@ It isn't packaged yet: you run it from the source tree (below).
   networks and addresses, volumes and binds; its live CPU and memory against its
   `memory.max`, the last 48 seconds drawn ("not live" if its stream ended, the reason on
   hover; followed again after the window was hidden or the connection came back); its isolation as the kernel has it (its own
-  namespaces, its cgroup, its command and host PID, its user mapping), while it runs; its
+  namespaces, and whose it shares, its cgroup, its command and host PID, its user mapping), while it runs; its
   published ports and uptime.
 - **Its buttons act on it:** Stop or Start, Pause or Resume, Restart and Remove. Each
   button's tooltip is the command that does the same (`shipyard stop api`). Remove asks

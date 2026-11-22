@@ -4414,6 +4414,24 @@ fn pid_joins_refused(stores: &Stores) {
         ));
     } else {
         refused.push((vec!["--pid", "host"], "--pid host needs root"));
+        // F205: refused at the create, never an EACCES at the start.
+        refused.push((
+            vec!["--oom-score-adj", "100", "--pid", "container:pfirst"],
+            "--oom-score-adj can't go with --pid container:pfirst without root",
+        ));
+        // Its control: the score alone is taken.
+        stores.ok(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--oom-score-adj",
+            "100",
+            image,
+            "sh",
+            "-c",
+            "exit 0",
+        ]);
         refused.push((
             vec![
                 "--network",
@@ -4790,6 +4808,201 @@ fn a_container_ended_before_its_start_is_said() {
     );
     assert!(said.contains("its command never ran"), "{said}");
     let _ = stores.shipyard(&["rm", "-f", "gone"]);
+}
+
+/// F204: a container joined to another's PID namespace whose monitor dies
+/// leaves nothing in its cgroup. What its init can't reach as their
+/// subreaper (here an `exec -d`'s process, not its child) goes with the
+/// cgroup's `cgroup.kill`; without it, it stayed as the other container's.
+/// The controls: that process is in the cgroup and not the init's child,
+/// and this kernel has `cgroup.kill`.
+#[test]
+fn a_pid_joined_containers_cgroup_ends_with_its_monitor() {
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    let image = stores.image.as_str();
+    let none = ["--network", "none"];
+    stores.ok(&[
+        &["run", "-d", "--name", "pkeeper"][..],
+        &none,
+        &[image, "sleep", "300"],
+    ]
+    .concat());
+    let id = stores
+        .ok(&[
+            &[
+                "run",
+                "-d",
+                "--name",
+                "porphan",
+                "--pid",
+                "container:pkeeper",
+            ][..],
+            &none,
+            &[image, "sleep", "300"],
+        ]
+        .concat())
+        .trim()
+        .to_owned();
+    let cgroup_of = |pid: i32| -> Option<String> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        text.lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(str::to_owned)
+    };
+    let init = i32::try_from(stores.inspect("porphan")["state"]["pid"].as_i64().unwrap()).unwrap();
+    let cgroup = cgroup_of(init).unwrap();
+    if !cgroup.contains(&id) {
+        eprintln!("skipped: the container has no cgroup of its own here ({cgroup})");
+        return;
+    }
+    assert!(
+        std::path::Path::new(&format!("/sys/fs/cgroup{cgroup}/cgroup.kill")).exists(),
+        "this kernel has no cgroup.kill"
+    );
+    // Its output nowhere: the detached command keeps exec's descriptors.
+    let exec = stores
+        .command(&["exec", "-d", "porphan", "sleep", "301"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(exec.success(), "{exec:?}");
+    let mut stray = None;
+    shipyard_test_support::eventually(Duration::from_secs(10), "the exec's sleep", || {
+        stray = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .find_map(|entry| {
+                let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+                let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+                (cmdline == b"sleep\x00301\x00"
+                    && cgroup_of(pid).as_deref() == Some(cgroup.as_str()))
+                .then_some(pid)
+            });
+        stray.is_some()
+    });
+    let stray = stray.unwrap();
+    assert_ne!(
+        shipyard_sys::proc::stat(stray).unwrap().ppid,
+        init,
+        "the init's own child: its kill reaches that"
+    );
+    let monitor = shipyard_sys::proc::stat(init).unwrap().ppid;
+    let cmdline = std::fs::read(format!("/proc/{monitor}/cmdline")).unwrap();
+    assert!(
+        String::from_utf8_lossy(&cmdline).contains("__shipyard-monitor"),
+        "{monitor} isn't a monitor"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(monitor),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    shipyard_test_support::eventually(Duration::from_secs(10), "the cgroup emptied", || {
+        shipyard_sys::proc::stat(stray).is_none_or(|stat| stat.gone())
+    });
+}
+
+/// F205: a start that joins another's PID namespace holds that namespace's
+/// join lock from its checks to its go, so a second join (a debugger's)
+/// is checked and set up after it, never beside it. The first held at its
+/// test pause (made, not yet started), the second waits; a run that joins
+/// nothing goes meanwhile (the control); let go, both start.
+#[test]
+fn a_pid_join_waits_for_another_s_set_up() {
+    let Some(stores) = Stores::new() else {
+        return;
+    };
+    let image = stores.image.clone();
+    let none = ["--network", "none"];
+    stores.ok(&[
+        &["run", "-d", "--name", "ptarget"][..],
+        &none,
+        &[&image, "sleep", "300"],
+    ]
+    .concat());
+    let pause = stores.scratch.0.join("join-pause");
+    let mut first = stores.command(
+        &[
+            &[
+                "run",
+                "-d",
+                "--name",
+                "pfirstjoin",
+                "--pid",
+                "container:ptarget",
+            ][..],
+            &none,
+            &[&image, "sleep", "300"],
+        ]
+        .concat(),
+    );
+    first.env("SHIPYARD_TEST_START_PAUSE", &pause);
+    let first = first
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    shipyard_test_support::eventually(Duration::from_secs(60), "the first's pause", || {
+        pause.exists()
+    });
+    let release = Release(&pause);
+    let mut second = stores
+        .command(
+            &[
+                &[
+                    "run",
+                    "-d",
+                    "--name",
+                    "pdebugger",
+                    "--cap-add",
+                    "SYS_PTRACE",
+                ][..],
+                &["--pid", "container:ptarget"],
+                &none,
+                &[&image, "sleep", "300"],
+            ]
+            .concat(),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The control: a run that joins nothing isn't held.
+    stores.ok(&[&["run", "--rm"][..], &none, &[&image, "sh", "-c", "exit 0"]].concat());
+    // The second made, its start begun: it's held at the join lock, still
+    // made and not started, however long the first is.
+    let state = || {
+        let out = stores.shipyard(&["inspect", "-f", "{{.State.Status}}", "pdebugger"]);
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    shipyard_test_support::eventually(Duration::from_secs(30), "the second made", || {
+        state() == "created"
+    });
+    let held_since = Instant::now();
+    while held_since.elapsed() < Duration::from_secs(2) {
+        assert!(
+            second.try_wait().unwrap().is_none() && state() == "created",
+            "the second join went on beside the first's set-up"
+        );
+    }
+    drop(release);
+    let first = first.wait_with_output().unwrap();
+    assert!(first.status.success(), "{first:?}");
+    let second = second.wait_with_output().unwrap();
+    assert!(second.status.success(), "{second:?}");
+    for name in ["pfirstjoin", "pdebugger"] {
+        assert_eq!(
+            stores
+                .ok(&["inspect", "-f", "{{.State.Running}}", name])
+                .trim(),
+            "true",
+            "{name}"
+        );
+    }
 }
 
 /// A foreground `run -i` (no terminal) makes its container `StdinOnce`, as
