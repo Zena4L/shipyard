@@ -7,15 +7,18 @@
 //! ([`Record`], versioned), its starts' `logs/<N>`, `cleanup.log` (what its
 //! last `__cleanup` couldn't do), `previous-start.json` while a start is in
 //! flight (what the start before it left), `end-unsaid` from a start until
-//! its `die` is said (F88), and three lock files: `op.lock`, which
+//! its `die` is said (F88), and four lock files: `op.lock`, which
 //! `start` and `rm` take in turn; `running`, held by a start's monitor and
-//! its `__cleanup` until all of that start is let go; and `restarting`,
-//! held by the `__cleanup` that waits to start the container again. The
+//! its `__cleanup` until all of that start is let go; `restarting`,
+//! held by the `__cleanup` that waits to start the container again; and
+//! `pid-join.lock`, held by a start of another container that joins its
+//! PID namespace, from its checks to its go (F205). The
 //! store's own `store-id` names it in the image store's areas. The store is
 //! the caller's alone (checked), and a record is only theirs to read
 //! (0600: it holds the container's environment).
 //!
 //! **The locks' order:** a container's `op.lock`, then its `running`, then
+//! the `pid-join.lock` of the container whose PID namespace it joins, then
 //! networks' locks (one at a time, or in name order), then the image store's
 //! lock, then this store's (briefly). A volume's fill lock (a create's
 //! copy-up) is innermost: taken while its volume is held shared, and
@@ -79,8 +82,9 @@ pub use joins::{JoinsLost, joins_lost};
 pub use labels::Labels;
 #[cfg(target_os = "linux")]
 pub(crate) use locks::{
-    Locked, OP_WAIT, SETTLE_WAIT, lock_again, lock_found, operation_lock, restart_pending,
-    restarting_lock, running_lock, running_lock_until, settled, wait_settled,
+    Locked, OP_WAIT, SETTLE_WAIT, lock_again, lock_again_until, lock_found, operation_lock,
+    pid_join_lock, restart_pending, restarting_lock, running_lock, running_lock_until, settled,
+    wait_settled,
 };
 pub(crate) use lookup::exists;
 #[cfg_attr(
@@ -177,6 +181,11 @@ const RUNNING: &str = "running";
 /// waits.
 #[cfg(target_os = "linux")]
 const RESTARTING: &str = "restarting";
+/// The lock file in a container's directory that a start joining its PID
+/// namespace holds from its check of who may trace there to its go
+/// (F205), so one join's set-up and another's (a debugger's) never overlap.
+#[cfg(target_os = "linux")]
+const PID_JOIN: &str = "pid-join.lock";
 /// The store's identity (random, made once), written into the writable
 /// layers its containers own in an image store: an engine sweeps only its
 /// own store's (two container stores may share an image store).

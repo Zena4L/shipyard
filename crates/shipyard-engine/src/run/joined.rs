@@ -254,6 +254,22 @@ pub(crate) fn name_the_joined(engine: &Engine, request: &mut RunRequest) -> Resu
         );
     }
     check_host_pid(engine, request)?;
+    // Rootless, the joining init's memory is the host user namespace's
+    // until it execs again inside the joined one, after the start's go
+    // (F134's rule): its `/proc/PID/oom_score_adj`, written before the go,
+    // isn't the runtime's to write (EACCES at the start). Refused here,
+    // saying why (F205).
+    if let Some(reference) = request.pid.joined_container()
+        && request.oom_score_adj.is_some()
+        && !crate::network::host_root()
+    {
+        bail!(
+            InvalidRequest,
+            "--oom-score-adj can't go with --pid container:{reference} without root: the \
+             joining container's process isn't the runtime's to set until it's started in that \
+             namespace: leave the score out, or run as root"
+        );
+    }
     // Its `/dev/shm` is cloned in the other's mount namespace, where a user
     // namespace of this one's own has no privileges.
     if let Some(reference) = request.ipc.joined_container()

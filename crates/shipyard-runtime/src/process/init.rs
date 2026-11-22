@@ -26,7 +26,8 @@
 //!   over the status pipe (PID 1 can't die "by" a signal, so its own exit
 //!   status couldn't say "killed by SIGINT") and exits. The kernel then kills
 //!   whatever is left in the namespace (in a joined one, the init does, as
-//!   its processes' subreaper: [`end_what_is_left`]).
+//!   its processes' subreaper, and its cgroup's `cgroup.kill` once shipyard
+//!   is gone too: [`end_what_is_left`]).
 //!
 //! Without a PID namespace there's no init: after the setup, this process
 //! becomes the command itself.
@@ -371,6 +372,10 @@ fn run(
     close_on_exec_again(&setup);
     // Before anything is opened here (see `held`).
     let held = held(&setup).unwrap_or_else(|failure| fail(failure));
+    // Its own cgroup's alone: never its caller's (a run without one).
+    if joined && setup.cgroup.own {
+        hold_cgroup_kill();
+    }
     // The proof that this image started: without it, shipyard reports an
     // init that never ran (`Error::InitDidNotStart`).
     write_record(status, &[START_MARK]);
@@ -1342,7 +1347,7 @@ fn wait_and_forward(command: libc::pid_t, status_pipe: RawFd, exec_failure: Opti
 /// the namespace; in another's (joined), the init does.
 fn give_up(status_pipe: RawFd) -> ! {
     write_record(status_pipe, &[GAVE_UP_MARK]);
-    end_what_is_left();
+    end_what_is_left(status_pipe);
     std::process::exit(SETUP_FAILED);
 }
 
@@ -1351,12 +1356,56 @@ fn give_up(status_pipe: RawFd) -> ! {
 /// the kernel does for a namespace's first. Elsewhere, nothing. (Where its
 /// `/proc` isn't this namespace's, nothing either, unsaid: the init has no
 /// stderr by now. The container's cgroup, which a joined one must have,
-/// goes with it anyway.)
-fn end_what_is_left() {
+/// goes with it anyway.) With shipyard gone too (its monitor killed), one
+/// that outlasted that (a fork bomb, a process stuck in the kernel) would
+/// be the other container's init's for good: its cgroup is killed whole
+/// then, this process with it (F204; nobody reads its code).
+fn end_what_is_left(status_pipe: RawFd) {
     if joined_init() {
         // At once, as the kernel would: no helper of Shipyard's is among
         // them to stop its own.
         super::supervisor::kill_leftovers(&mut Vec::new(), std::time::Duration::ZERO);
+        if shipyard_gone(status_pipe) {
+            kill_the_cgroup();
+        }
+    }
+}
+
+/// A joined init's own cgroup's `cgroup.kill` (Linux 5.14), opened by
+/// [`hold_cgroup_kill`]: -1 if it has none.
+static CGROUP_KILL: AtomicI32 = AtomicI32::new(-1);
+
+/// Opens this process's cgroup's `cgroup.kill` and keeps it, for
+/// [`kill_the_cgroup`]: here, in its cgroup by now (placed before its go)
+/// and before its root and cgroup namespace hide the host's
+/// `/sys/fs/cgroup`. An open file is written without being checked again,
+/// so the init's confinement later doesn't stop it. Only for a cgroup of
+/// the container's own. Best effort: a kernel before 5.14 has no such
+/// file, and one this user can't write (root joining a container with a
+/// user namespace: its root is another user on the host) is left alone;
+/// then what outlasts the init's own kill stays, as before.
+fn hold_cgroup_kill() {
+    let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return;
+    };
+    let Some(path) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return;
+    };
+    let path = format!("/sys/fs/cgroup{}/cgroup.kill", path.trim_end_matches('/'));
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        CGROUP_KILL.store(file.into_raw_fd(), Ordering::Relaxed);
+    }
+}
+
+/// Kills every process in this init's cgroup, itself among them, by its
+/// held `cgroup.kill`; nothing if it has none.
+fn kill_the_cgroup() {
+    let fd = CGROUP_KILL.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: `fd` is this process's, held since `hold_cgroup_kill` and
+        // never closed, so it's open for the borrow.
+        let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let _ = nix::unistd::write(file, b"1");
     }
 }
 
@@ -1379,7 +1428,7 @@ fn reap(command: libc::pid_t, status_pipe: RawFd, exec_failure: Option<u8>) {
             // only exits and deaths, which always decode; 1 just makes the
             // impossible case a failure.
             let code = ExitStatus::from_wait_status(raw).map_or(1, ExitStatus::code);
-            end_what_is_left();
+            end_what_is_left(status_pipe);
             // `_exit`: nothing to flush, and the kernel then kills
             // everything left in the namespace (in a joined one, what's
             // left was just killed).

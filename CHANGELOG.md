@@ -113,6 +113,21 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **A container that joins another's PID namespace** (step 15.3c): two joins of one
+  namespace are set up one after the other, so a debugger's (`--cap-add SYS_PTRACE`)
+  never starts beside another's set-up (F205); rootless, `--oom-score-adj` with `--pid
+  container:` is refused when it's made, saying why, where the start failed with the
+  kernel's `EACCES` (F205); and when its monitor is killed, its init kills its whole cgroup
+  (`cgroup.kill`, Linux 5.14) after its own processes, so nothing of it (an `exec`'s
+  process, a fork bomb) is left to the other container (F204; not where root joins a
+  container with a user namespace of its own, whose root can't open that file).
+- **An API stop whose client went stops waiting for the container's lock too** (step
+  15.3c, F202): it waited up to two minutes behind another command. A stop of a
+  container that isn't running records "stopped by the user" only once it holds that
+  lock, so one given up leaves the container's restart policy as it was.
+- **Shipyard's isolation view says whose namespace a container shares** (step 15.3c,
+  F206): `joined`, the other container's ID, for a network, IPC or PID namespace joined
+  with `container:NAME`, and the desktop inspector says "shared with NAME".
 - **A rootless `build` with no delegated cgroup warns first that its `RUN` steps will
   fail, and why** (and the fix, `systemd-run --user --scope shipyard …`; F174, step
   15.2d), where BuildKit's `no cgroup mount found in mountinfo` at the first `RUN` came

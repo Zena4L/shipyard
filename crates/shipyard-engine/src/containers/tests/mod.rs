@@ -20,6 +20,8 @@ use crate::run::RunRequest;
 mod creating;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod locking;
 mod naming;
 mod networks;
 mod requests;

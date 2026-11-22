@@ -224,6 +224,7 @@ function isolationOf(id: string): Isolation {
     namespaces: NAMESPACE_KINDS.map((kind, i) => ({
       kind,
       own: kind !== "time" || name === "playground",
+      joined: null,
       present: true,
       id: 4026531000 + i,
     })),

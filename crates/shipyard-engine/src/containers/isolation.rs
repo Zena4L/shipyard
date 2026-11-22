@@ -2,7 +2,8 @@
 //! desktop UI's inspector shows it ("show the kernel"). Each of the eight
 //! namespace kinds, on (not the host's: the API service's own namespaces,
 //! the host's on Linux and the guest's on a Mac) or off, with its ID (two
-//! containers that share one, `--network container:`, have the same); its
+//! containers that share one, `--network container:`, have the same, and
+//! the one that joined another's says whose: `joined`, F206); its
 //! cgroup; its command (the init's child: Shipyard's init is PID 1, the
 //! command PID 2, unless there's no PID namespace) and the host PIDs of
 //! both; its user mapping. Read from `/proc` through its init, found by PID
@@ -100,13 +101,18 @@ pub struct Isolation {
 }
 
 /// One namespace kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct NamespaceUse {
     /// The kind.
     pub kind: NamespaceKind,
-    /// Whether the container's is not the host's.
+    /// Whether the container's is not the host's (another container's,
+    /// joined, is: see `joined`).
     pub own: bool,
+    /// The ID of the container whose namespace this is, when it joined
+    /// another's (`--network`, `--ipc` or `--pid container:`): `None` for
+    /// its own, or the host's.
+    pub joined: Option<String>,
     /// Whether this kernel has the kind (`time` came in Linux 5.6).
     pub present: bool,
     /// The namespace's ID (its inode): the same in containers that share
@@ -169,9 +175,15 @@ pub fn isolation(engine: &Engine, reference: &str) -> Result<Isolation> {
             )
         };
         let (pid, started) = super::init_of(engine, record.id.as_str()).ok_or_else(ended)?;
-        let read = read(pid);
+        let mut read = read(pid);
         if !shipyard_runtime::container::is_process(pid, started) {
             return Err(ended());
+        }
+        // What it was made to join, as its create kept it (an older
+        // container's file, or none: nothing said joined).
+        match super::created(engine, &record.id) {
+            Ok(created) => say_joined(&mut read.namespaces, &created),
+            Err(error) => tracing::debug!("container {}'s joins unread: {error}", record.name),
         }
         Ok(Isolation {
             version: ISOLATION_VERSION,
@@ -215,6 +227,7 @@ fn read(pid: i32) -> Read {
             NamespaceUse {
                 kind,
                 own: own(theirs.as_deref(), ours.as_deref()),
+                joined: None,
                 present: theirs.is_some(),
                 id: theirs.as_deref().and_then(namespace_id),
             }
@@ -281,6 +294,24 @@ fn child_of(pid: i32) -> Option<i32> {
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
         .filter(|&other| shipyard_sys::proc::stat(other).is_some_and(|stat| stat.ppid == pid))
         .min()
+}
+
+/// Each of `namespaces` that `created` says the container joined, its
+/// network, IPC or PID namespace, said as the other container's.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "read on Linux; tested everywhere")
+)]
+fn say_joined(namespaces: &mut [NamespaceUse], created: &super::Created) {
+    for namespace in namespaces {
+        let from = match namespace.kind {
+            NamespaceKind::Net => created.network_from.as_ref(),
+            NamespaceKind::Ipc => created.ipc_from.as_ref(),
+            NamespaceKind::Pid => created.pid_from.as_ref(),
+            _ => None,
+        };
+        namespace.joined = from.map(|id| id.as_str().to_owned());
+    }
 }
 
 /// Whether a namespace (its `/proc/PID/ns` link, `theirs`) is the
@@ -400,6 +431,49 @@ mod tests {
         assert!(arguments(b"").is_empty());
         assert_eq!(first_child("42 43 \n"), Some(42));
         assert_eq!(first_child(""), None);
+    }
+
+    /// F206: a joined network, IPC or PID namespace is said as the other
+    /// container's; its own, the host's, and the other kinds aren't.
+    #[test]
+    fn a_joined_namespace_says_whose() {
+        let other = super::super::ContainerId::parse(&"a".repeat(64)).unwrap();
+        let created = super::super::Created {
+            network_from: Some(other.clone()),
+            pid_from: Some(other.clone()),
+            ..Default::default()
+        };
+        let mut namespaces: Vec<NamespaceUse> = NamespaceKind::ALL
+            .iter()
+            .map(|&kind| NamespaceUse {
+                kind,
+                own: true,
+                joined: None,
+                present: true,
+                id: None,
+            })
+            .collect();
+        say_joined(&mut namespaces, &created);
+        let joined: Vec<(NamespaceKind, Option<&str>)> = namespaces
+            .iter()
+            .map(|ns| (ns.kind, ns.joined.as_deref()))
+            .filter(|(_, joined)| joined.is_some())
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                (NamespaceKind::Net, Some(other.as_str())),
+                (NamespaceKind::Pid, Some(other.as_str())),
+            ]
+        );
+        let json = serde_json::to_value(&namespaces[0]).unwrap();
+        assert_eq!(
+            json.get("joined"),
+            Some(&serde_json::Value::Null),
+            "its own: {json}"
+        );
+        say_joined(&mut namespaces, &super::super::Created::default());
+        assert!(namespaces.iter().all(|ns| ns.joined.is_none()));
     }
 
     /// A namespace is the container's own when it has one and it isn't the

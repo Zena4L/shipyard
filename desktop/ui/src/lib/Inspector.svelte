@@ -144,6 +144,18 @@
 
   const isolation = $derived(focus?.isolation ?? null);
   const own = $derived(new Set((isolation?.namespaces ?? []).filter((ns) => ns.own).map((ns) => ns.kind)));
+  // The namespaces it joined, by the container they're of (its name where
+  // it's on the map, else its short ID).
+  const shared = $derived.by(() => {
+    const by = new Map<string, string[]>();
+    for (const ns of isolation?.namespaces ?? []) {
+      if (ns.joined) by.set(ns.joined, [...(by.get(ns.joined) ?? []), ns.kind]);
+    }
+    return [...by].map(([id, kinds]) => ({
+      kinds,
+      name: model.containers.find((n) => n.id === id)?.name ?? id.slice(0, 12),
+    }));
+  });
 </script>
 
 <!-- A tree's branches; `under`, in a Needed by tree, the node whose
@@ -351,6 +363,7 @@
     {#if isolation}
       <h4>Isolation <span>{own.size}/{NAMESPACE_KINDS.length} namespaces</span></h4>
       <div class="ns">{#each NAMESPACE_KINDS as kind (kind)}<span class:on={own.has(kind)}>{kind}</span>{/each}</div>
+      {#each shared as joined (joined.name)}<p class="tnote">{joined.kinds.join(", ")} shared with {joined.name}</p>{/each}
       <dl class="kv">
         <dt>cgroup</dt>
         <dd>{isolation.cgroup ?? "—"}</dd>

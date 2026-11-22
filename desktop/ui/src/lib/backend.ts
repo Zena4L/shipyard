@@ -155,7 +155,9 @@ export const NAMESPACE_KINDS = ["cgroup", "ipc", "mnt", "net", "pid", "user", "u
 export interface Isolation {
   version: number;
   name: string;
-  namespaces: { kind: string; own: boolean; present: boolean; id: number | null }[];
+  /** `joined`: the ID of the container whose namespace it joined
+   * (`--network`, `--ipc` or `--pid container:`), else null. */
+  namespaces: { kind: string; own: boolean; joined: string | null; present: boolean; id: number | null }[];
   cgroup: string | null;
   init_pid: number;
   command: { pid: number; args: string[]; truncated: boolean } | null;

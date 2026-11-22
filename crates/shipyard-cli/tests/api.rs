@@ -4600,8 +4600,10 @@ fn a_container_s_isolation_and_the_volumes_are_served() {
 }
 
 /// A container that joins `iso`'s network (`--network container:`) has
-/// the same `net` namespace ID, and its own `uts` (the control).
+/// the same `net` namespace ID, and its own `uts` (the control); its `net`
+/// says it's `iso`'s (F206), its `uts`, and `iso`'s own, say none.
 fn joined_namespaces_are_said(stores: &Stores) {
+    let iso = stores.docker_ok(&["inspect", "-f", "{{.Id}}", "iso"]);
     stores.docker_ok(&[
         "run",
         "-d",
@@ -4613,7 +4615,7 @@ fn joined_namespaces_are_said(stores: &Stores) {
         "sleep",
         "300",
     ]);
-    let id = |name: &str, kind: &str| {
+    let namespace = |name: &str, kind: &str| {
         let got = api::get(
             &stores.socket(),
             &format!("/shipyard/containers/{name}/isolation"),
@@ -4625,12 +4627,16 @@ fn joined_namespaces_are_said(stores: &Stores) {
             .unwrap()
             .iter()
             .find(|ns| ns["kind"] == kind)
-            .unwrap()["id"]
+            .unwrap()
             .clone()
     };
+    let id = |name: &str, kind: &str| namespace(name, kind)["id"].clone();
     assert!(id("iso", "net").is_u64());
     assert_eq!(id("joiner", "net"), id("iso", "net"));
     assert_ne!(id("joiner", "uts"), id("iso", "uts"));
+    assert_eq!(namespace("joiner", "net")["joined"], iso.trim());
+    assert_eq!(namespace("joiner", "uts")["joined"], json!(null));
+    assert_eq!(namespace("iso", "net")["joined"], json!(null));
 }
 
 /// The second half of [`a_container_s_isolation_and_the_volumes_are_served`]:
