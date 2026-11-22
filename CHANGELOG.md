@@ -270,6 +270,9 @@ behaviour; each change is listed here).
 
 ### Security
 
+- **`url` 2.5.9** (RUSTSEC-2026-0592: `Url::origin()` overflowed its stack on nested
+  `blob:` URLs), in the CLI's and the desktop app's locks; Shipyard calls it nowhere, it
+  comes through `bollard` (the desktop app's Docker client) and the acceptance tests.
 - **`rustix` 1.1.6** (RUSTSEC-2026-0486: its extended-attribute reads marked bytes
   never written as written when given an empty buffer), in the CLI's and the desktop
   app's locks; Shipyard calls none of them itself, the `tar` crate's `xattr` does.
