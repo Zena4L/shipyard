@@ -1,0 +1,63 @@
+name: Pages
+
+# The docs site (D15-4): docs/user/ built by mdBook and published on GitHub
+# Pages, from main only, each time its pages change, and by hand
+# (`gh workflow run Pages`). CI's `docs` job checks the same build on every
+# pull request; this one builds and deploys.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - docs/user/**
+      - docs/site/**
+      - scripts/docs-site.sh
+      - .github/workflows/pages.yml
+
+# Read-only by default; the deploy job alone may publish.
+permissions:
+  contents: read
+
+# One deploy at a time; one under way finishes (a half-published site is
+# worse than a late one), the next waits.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The tools as CI's `docs` job keeps them (the same key).
+      # The runner's image (lychee links its OpenSSL): only a step sees it.
+      - id: image
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tools
+          # The pins and the runner's image.
+          key: docs-tools-${{ steps.image.outputs.image }}-${{ hashFiles('docs/site/tools.env') }}
+      # Checked as CI checks it: a broken page is never published.
+      - run: scripts/docs-site.sh
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/site
+
+  deploy:
+    needs: build
+    # From main alone, whatever branch a run by hand names (the
+    # `github-pages` environment's own rule says so too).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,0 +1,26 @@
+# The docs site (D15-4): docs/user/ as it is, built by scripts/docs-site.sh.
+# Never built into docs/book/, which is the user's own.
+
+[book]
+title = "Shipyard"
+description = "A lightweight, daemonless container engine for macOS and Linux"
+language = "en"
+src = "../user"
+
+[build]
+build-dir = "../../target/site"
+create-missing = false
+# Not the default `index` preprocessor: it renames README.md to index.html,
+# and pages link to README.md#… as GitHub shows them. mdBook writes
+# index.html from the first chapter anyway.
+use-default-preprocessors = false
+
+[preprocessor.links]
+
+[output.html]
+git-repository-url = "https://github.com/Zena4L/shipyard"
+edit-url-template = "https://github.com/Zena4L/shipyard/edit/main/docs/user/{path}"
+site-url = "/shipyard/"
+
+[output.html.search]
+enable = true
