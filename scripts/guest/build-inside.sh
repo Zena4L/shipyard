@@ -10,11 +10,18 @@ echo "== shipyard, static (musl)"
 # (apt over IPv4 alone: the mirror answers on IPv6 first, and Docker's VM
 # may have no IPv6 route; its tries there time out.)
 apt=(apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=30 -o Acquire::http::Timeout=5)
-command -v musl-gcc >/dev/null || { "${apt[@]}" update -qq && "${apt[@]}" install -y -qq musl-tools >/dev/null; }
-rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1
-CC_aarch64_unknown_linux_musl=musl-gcc cargo build --locked --release -q \
-    --target aarch64-unknown-linux-musl -p shipyard-cli --bin shipyard
-binary=/target/aarch64-unknown-linux-musl/release/shipyard
+# A release's own binary when it's given (SHIPYARD_GUEST_BINARY, mounted at
+# /binary: the guest carries exactly what's released); else built here.
+if [ -f /binary/shipyard ]; then
+  binary=/binary/shipyard
+else
+  . /src/scripts/release/build.env
+  command -v musl-gcc >/dev/null || { "${apt[@]}" update -qq && "${apt[@]}" install -y -qq "musl-tools=$MUSL_TOOLS" >/dev/null; }
+  rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1
+  CC_aarch64_unknown_linux_musl=musl-gcc cargo build --locked --release -q \
+      --target aarch64-unknown-linux-musl -p shipyard-cli --bin shipyard
+  binary=/target/aarch64-unknown-linux-musl/release/shipyard
+fi
 
 echo "== the minirootfs ($ALPINE_RELEASE)"
 tarball=/out/cache/$MINIROOTFS
@@ -50,6 +57,9 @@ for try in 1 2 3; do
 done
 chroot "$root" /sbin/apk info -v >"$work/installed"
 rm -f "$root/etc/resolv.conf"
+# apk's log of this install stamps its time: the one file that made two
+# builds of a commit differ (15.5a). The guest never reads it.
+rm -f "$root/var/log/apk.log"
 
 # Every package installed, pinned (F92): its name, its version and its
 # identity in apk's own database (`C:`, the SHA-1 of its signed control

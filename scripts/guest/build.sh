@@ -8,6 +8,9 @@
 # usage: scripts/guest/build.sh [OUT]   (default: target/guest)
 #   Every package installed is checked against scripts/guest/alpine.installed
 #   (F92); UPDATE_GUEST_LOCK=1 writes that lock from this build instead.
+#   SHIPYARD_GUEST_BINARY: a static arm64 `shipyard` to carry (a release's),
+#   instead of building one; IMAGE: the image to build in (a release's
+#   pinned one, scripts/release/build.env).
 set -euo pipefail
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 out=${1:-$repo/target/guest}
@@ -15,10 +18,21 @@ mkdir -p "$out/cache"
 out=$(cd "$out" && pwd)
 hash=$(shasum -a 256 "$repo/scripts/test-image/Dockerfile")
 image="${IMAGE:-shipyard-test:${hash:0:12}}"
-revision=$(git -C "$repo" rev-parse --short=12 HEAD)
-# (Untracked files count: new code is code the binary is built from.)
-dirty=$(git -C "$repo" status --porcelain | head -c1)
-[ -n "$dirty" ] && revision="$revision-dirty"
+# A release names its commit itself (REVISION: the carried binary's, from a
+# tree it checked clean); else this tree's, `-dirty` with changes.
+if [ -n "${REVISION:-}" ]; then
+  revision=$REVISION
+else
+  revision=$(git -C "$repo" rev-parse --short=12 HEAD)
+  # (Untracked files count: new code is code the binary is built from.)
+  dirty=$(git -C "$repo" status --porcelain | head -c1)
+  [ -n "$dirty" ] && revision="$revision-dirty"
+fi
+binary=()
+if [ -n "${SHIPYARD_GUEST_BINARY:-}" ]; then
+  given=$(cd "$(dirname "$SHIPYARD_GUEST_BINARY")" && pwd)/$(basename "$SHIPYARD_GUEST_BINARY")
+  binary=(--volume "$given:/binary/shipyard:ro")
+fi
 timeout 3600 docker run --rm --privileged \
     --volume "$repo:/src:ro" --volume "$out:/out" \
     --volume "${TARGET_VOLUME:-shipyard-linux-target}:/target" \
@@ -27,6 +41,7 @@ timeout 3600 docker run --rm --privileged \
     --env CARGO_TARGET_DIR=/target --env REVISION="$revision" \
     --env SHIPYARD_GUEST_MIRROR="${SHIPYARD_GUEST_MIRROR:-}" \
     --env UPDATE_GUEST_LOCK="${UPDATE_GUEST_LOCK:-}" \
+    ${binary[@]+"${binary[@]}"} \
     --workdir /src "$image" bash /src/scripts/guest/build-inside.sh
 # A lock this build wrote (UPDATE_GUEST_LOCK=1) into the tree.
 if [ "${UPDATE_GUEST_LOCK:-}" = 1 ]; then

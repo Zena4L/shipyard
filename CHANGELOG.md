@@ -9,6 +9,13 @@ behaviour; each change is listed here).
 
 ### Added
 
+- **Release builds** (step 15.5a): a workflow that builds a release's artifacts, static
+  Linux binaries for x86-64 and arm64 (`shipyard`, `shipyard-runtime`), the Mac's
+  binary, guest and app, CycloneDX SBOMs and `SHA256SUMS`, each attested by GitHub
+  (`gh attestation verify FILE --repo Zena4L/shipyard`). The Linux binaries and the guest
+  are reproducible, built in a Rust image pinned by digest with the compiler pinned
+  exactly, and checked so on a second runner before anything is published; a tag makes
+  a draft release. (No release is published before v1.0.)
 - **The docs as a site** (step 15.4, D15-4): `docs/user/` built by mdBook and published
   on GitHub Pages from `main` (<https://zena4l.github.io/shipyard/>), with search; every
   pull request builds it and fails on a page left out of its contents, a warning, or a
@@ -290,6 +297,9 @@ behaviour; each change is listed here).
 
 ### Security
 
+- **`cookie` 0.18.3** (RUSTSEC-2026-0594: private cookies' nonces could repeat in a
+  process that forks and then adds them), in the desktop app's lock; it comes through
+  Tauri, which neither forks so nor uses private cookies.
 - **`url` 2.5.9** (RUSTSEC-2026-0592: `Url::origin()` overflowed its stack on nested
   `blob:` URLs), in the CLI's and the desktop app's locks; Shipyard calls it nowhere, it
   comes through `bollard` (the desktop app's Docker client) and the acceptance tests.

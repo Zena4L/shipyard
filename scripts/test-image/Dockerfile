@@ -22,7 +22,10 @@
 #
 # Built once by test-linux.sh (which needs network then), and again only when
 # this file changes.
-FROM rust:1-trixie
+# Pinned by digest (an index: both architectures), as the release builds and
+# the macOS guest's build use it (F186): the same toolchain image everywhere.
+# Rust's own version is rust-toolchain.toml's either way.
+FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends uidmap passt nftables iptables iproute2 bind9-dnsutils \
