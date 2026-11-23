@@ -63,6 +63,7 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 | [The OCI runtime](runtime.md) | `shipyard-runtime`, as `runc`: a container's life one step at a time (`create`, `start`, `state`, `kill`, `delete`), its terminals, logs, `attach`, `exec`, `cp`, passing descriptors, and its cgroup (`pause`, `update`, `ps`, `events`) |
 | [Runtime reference](runtime-cli.md) | Every `shipyard-runtime` command and flag, generated from the binary itself |
 | [Exit codes](exit-codes.md) | What each exit code means, for scripts that check them |
+| [Threat model](threat-model.md) | What Shipyard protects, from whom, by which boundary; what it leaves to you; what isn't defended yet |
 | [Command reference](cli.md) | Every command and flag, generated from the CLI itself |
 
 ## Requirements

@@ -209,7 +209,7 @@ in `/tmp` and `/Volumes` is any of your Mac's users' as much as yours, and a
 container you bind it into sees it. A container sees only what you bind into it.
 Set-user-ID bits and device files mean nothing in the VM, nor in a container you bind
 them into. The VM's own files are hidden in every share by a mount over them, which a
-container given `--cap-add SYS_ADMIN` (or `--privileged`) can undo, or it can mount a
+container given `--cap-add SYS_ADMIN` can undo, or it can mount a
 share whole, binding nothing (as on Docker Desktop); a `--device` of the VM's disk
 reaches every image and volume: give those only to containers you trust with the whole
 VM and every share.
@@ -381,7 +381,7 @@ docker --context shipyard ps
   API's service starts on the first connection to it (and ends when idle again), so a
   container holding it keeps reaching the API. Only a container running as root may use
   it, as Docker's socket is root's. A container given it controls Shipyard in the VM:
-  it can run a privileged container, and so act as root in the VM, with what the VM
+  it can run a container with any capability, and so act as root in the VM, with what the VM
   shares from your Mac (your home, `/Volumes`, `/tmp`, `/var/folders`) read and write:
   give it only to what you trust, as with Docker Desktop.
 - **Ports** a container publishes reach your Mac's `localhost` as with `shipyard run -p`

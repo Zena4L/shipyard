@@ -2228,6 +2228,7 @@ dependencies = [
 name = "shipyard-acceptance"
 version = "0.5.0"
 dependencies = [
+ "serde_json",
  "shipyard-test-support",
  "testcontainers",
  "tokio",
