@@ -1,0 +1,242 @@
+name: Release
+
+# A release's artifacts (step 15.5a): static Linux binaries (x86-64, arm64),
+# the Mac's binary, guest and app, their SBOMs and SHA256SUMS, each attested
+# by this workflow (GitHub's artifact attestations). The Linux builds and the
+# guest are built twice and compared byte for byte, or nothing is published.
+#
+# On a pushed `v*` tag: a draft release the owner reads and publishes. By hand
+# (`gh workflow run Release --ref BRANCH`): a dry run, the artifacts kept on
+# the run alone (attested too, but to that branch: a release's are checked
+# against its tag, `--source-ref refs/tags/vX.Y.Z`).
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The tag's version (`v1.0.0`); none on a dry run (the scripts then name it
+  # after the workspace's version and the commit).
+  VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
+
+jobs:
+  # A tag's release checked before the long builds: its version is the
+  # workspace's, and the CHANGELOG has its dated section (its notes).
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: env.VERSION != ''
+        run: |
+          workspace=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${VERSION#v}" != "$workspace" ]; then
+              echo "the tag says ${VERSION#v}, the workspace $workspace" >&2
+              exit 1
+          fi
+          scripts/release/notes.sh "${VERSION#v}" >/dev/null
+
+  linux:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # In the pinned image (scripts/release/build.env), the commit exported
+      # clean at fixed paths.
+      - run: scripts/release/linux.sh "$RUNNER_TEMP/dist" "${VERSION#v}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  # The same build, at once, on another runner (another machine, another
+  # run): `compare` wants the same bytes.
+  reproduce:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/release/linux.sh "$RUNNER_TEMP/again" "${VERSION#v}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: again-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/again/
+          if-no-files-found: error
+
+  compare:
+    needs: [linux, reproduce]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: linux-*
+          path: ${{ runner.temp }}/first
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: again-linux-*
+          path: ${{ runner.temp }}/again
+          merge-multiple: true
+      - run: scripts/release/compare.sh "$RUNNER_TEMP/first" "$RUNNER_TEMP/again"
+
+  # The Mac's guest, carrying the release's own arm64 `shipyard` (taken
+  # outside the checkout: the tree stays clean, and the guest names the
+  # commit); built twice and compared.
+  guest:
+    needs: linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-aarch64
+          path: ${{ runner.temp }}/linux
+      - run: |
+          tarball=$(echo "$RUNNER_TEMP"/linux/*.tar.gz)
+          name=$(basename "$tarball" .tar.gz)
+          mkdir "$RUNNER_TEMP/binary"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/binary" --strip-components=1 "$name/shipyard"
+          scripts/release/guest.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/binary/shipyard" "${VERSION#v}"
+          scripts/release/guest.sh "$RUNNER_TEMP/again" "$RUNNER_TEMP/binary/shipyard" "${VERSION#v}"
+          scripts/release/compare.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/again"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  macos:
+    needs: check
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: desktop/ui/.nvmrc
+      - run: scripts/release/macos.sh "$RUNNER_TEMP/dist" "${VERSION#v}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  sbom:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: image
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tools
+          key: release-tools-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/release/build.env') }}
+      - run: scripts/release/sbom.sh "$RUNNER_TEMP/dist" "${VERSION#v}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  # Checksums and attestations over every artifact (the SBOMs too), each
+  # then checked as a user checks a release: by this workflow, from this ref
+  # and commit. Runs none of the repository's code.
+  attest:
+    needs: [compare, guest, macos, sbom]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{linux-*,guest,macos,sbom}"
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum -- * >SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for file in dist/*; do
+              gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
+                  --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                  --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" >/dev/null
+              echo "verified: $file"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  # For a pushed tag only (never a run by hand, whatever its ref): a draft
+  # release with the artifacts and the version's CHANGELOG section.
+  release:
+    needs: attest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release/notes.sh "${VERSION#v}" >notes.md
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "Shipyard ${VERSION#v}" --notes-file notes.md dist/*

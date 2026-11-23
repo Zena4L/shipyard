@@ -359,6 +359,48 @@ only when something got worse (a check that passed now fails, a fuzz crash, miss
 mutants) or when it couldn't run at all (Docker down, no network): silence means it ran
 and nothing regressed. Docker must be running at night; the Mac is kept awake for the run.
 
+## Releases (step 15.5a)
+
+`.github/workflows/release.yml` builds a release's artifacts: on a `v*` tag, into a
+**draft** GitHub release the owner reads and publishes; by hand (`gh workflow run Release
+--ref BRANCH`), a dry run whose artifacts stay on the run. What it builds, each by a script
+that runs here too:
+
+| Artifact | Script | Built |
+|---|---|---|
+| `shipyard-VERSION-linux-{x86_64,aarch64}.tar.gz`: `shipyard`, `shipyard-runtime` (static, musl), `LICENSE`, `README.md`, `contrib/systemd`, `contrib/apparmor` | `scripts/release/linux.sh OUT [VERSION]` | in the pinned image, the commit exported clean at fixed paths: reproducible, and checked so on another runner (`compare.sh`) |
+| `shipyard-VERSION-guest-arm64.tar.gz` (the Mac's guest, carrying the release's own arm64 `shipyard`), and its packages' list | `scripts/release/guest.sh OUT BINARY [VERSION]` | in the pinned image (`scripts/guest/build.sh`), twice, compared |
+| `shipyard-VERSION-macos-arm64.tar.gz`, `Shipyard-VERSION-macos-arm64.app.zip` | `scripts/release/macos.sh OUT [VERSION]` | on a Mac, signed ad hoc (not notarized: D15-2) |
+| `shipyard-VERSION-BINARY-PLATFORM.cdx.json` (CycloneDX 1.5) | `scripts/release/sbom.sh OUT [VERSION]` | `cargo-cyclonedx` |
+| `SHA256SUMS`, and an attestation of every file | the workflow's `attest` job | GitHub's artifact attestations (Sigstore, keyless) |
+
+What a release is built with is pinned in `scripts/release/build.env` (the Rust image by
+digest, an index for both architectures, which `scripts/test-image/Dockerfile`'s `FROM`
+must equal; `musl-tools`; `cargo-cyclonedx`) and `rust-toolchain.toml` (the compiler,
+exactly). `linux.sh`, `guest.sh` and `macos.sh` refuse a tree with changes: a release is a
+commit. `VERSION` is the tag's; without one, the workspace's and the commit's
+(`0.5.0-276b34b1c0de`). A tag is checked first: its version is the workspace's, and the
+CHANGELOG has its section, dated (`scripts/release/notes.sh`, the release's notes: undated
+or missing, no release). A dry run's artifacts are attested too, but to its branch: a
+release's are checked against its tag.
+
+To check a download, or a release before publishing it:
+
+```sh
+gh attestation verify FILE --repo Zena4L/shipyard \
+    --signer-workflow Zena4L/shipyard/.github/workflows/release.yml --source-ref refs/tags/v1.0.0
+sha256sum -c SHA256SUMS --ignore-missing         # an older Mac: shasum -a 256 -c …
+# Rebuilt at the tag (Docker), into `again`; then `downloaded` holding only this
+# machine's architecture's tarball:
+scripts/release/linux.sh again 1.0.0
+scripts/release/compare.sh downloaded again
+```
+
+Rebuilding later needs what the build fetched to still be there (the image by its digest,
+`musl-tools` at its version, the guest's Alpine packages): mirrors drop old versions, so
+"the same bytes" is checked at release time, on a second runner, before anything is
+published.
+
 ## Shipyard's own VM on a Mac (step 10.3)
 
 On an Apple Silicon Mac, Shipyard runs containers in one Linux VM of its own,

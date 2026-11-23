@@ -1,5 +1,7 @@
 [toolchain]
-channel = "1.98"
+# Exact, patch included: a release rebuilt from its tag must get the same
+# compiler (step 15.5a), never a later 1.98.x.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 # Linux targets so macOS hosts can `cargo check --target ...` the Linux-only code.
 targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
