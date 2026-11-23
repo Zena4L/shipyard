@@ -13,9 +13,6 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
-    # TEMPORARY (15.5a's dry run, before the workflow is on main): removed
-    # before the merge.
-    branches: [feat/stage-15-5]
 
 permissions:
   contents: read

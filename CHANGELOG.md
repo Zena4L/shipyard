@@ -297,6 +297,9 @@ behaviour; each change is listed here).
 
 ### Security
 
+- **`cookie` 0.18.3** (RUSTSEC-2026-0594: private cookies' nonces could repeat in a
+  process that forks and then adds them), in the desktop app's lock; it comes through
+  Tauri, which neither forks so nor uses private cookies.
 - **`url` 2.5.9** (RUSTSEC-2026-0592: `Url::origin()` overflowed its stack on nested
   `blob:` URLs), in the CLI's and the desktop app's locks; Shipyard calls it nowhere, it
   comes through `bollard` (the desktop app's Docker client) and the acceptance tests.
