@@ -15,6 +15,7 @@
 - [OCI bundles](bundles.md)
 - [The OCI runtime](runtime.md)
 - [Exit codes](exit-codes.md)
+- [Threat model](threat-model.md)
 
 # Reference
 

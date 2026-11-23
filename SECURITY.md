@@ -20,13 +20,16 @@ Shipyard is before 1.0: only the latest release gets fixes.
 Shipyard (0.5, an internal milestone before 1.0) confines containers, but **isn't a
 hardened security boundary yet**. Run
 only code you would run as your own user (rootless) or trust with root (as root).
+The [threat model](docs/user/threat-model.md) says what's protected, from whom, by
+which boundary, and what's left to you.
 
 What a container is kept from, and tested for:
 
 - **The host's files and processes:** its own mount, PID, UTS, IPC, network and cgroup
   namespaces, and a user namespace for rootless runs (and root's `--uidmap`);
   `pivot_root` into its root filesystem, with `/proc` and `/sys` masked and read-only
-  where Docker's are; mounts never followed through a symlink in the image.
+  where Docker's are; a mount's destination resolved inside the root (a link or `..`
+  in the image never leads it out, nor into `/proc`, `/sys` or `/dev`).
 - **Privileges:** a minimal capability set, `no_new_privs`, and a seccomp filter
   (Docker's profile); rootless, root inside is the user outside. The init runs from a
   sealed copy of the binary, so a container can't overwrite the one the host runs next.
@@ -83,12 +86,12 @@ you trust:
   (the VM's own files among them, `-v /:/host` too) is refused as Docker Desktop's
   "mounts denied", by the `shipyard` CLI and through Docker's socket on the Mac
   (`docker.sock`, `shipyard vm install`) alike. That socket reaches the VM's Docker API
-  as root in the VM. A container given `--cap-add SYS_ADMIN` (or `--privileged`, or a
-  `--device` of the VM's own) isn't held by that: it can mount a share whole, or uncover
-  the VM's own files in one, as on Docker Desktop. Give those only to containers you
-  trust with the VM and every share. It's yours alone (mode 0600, your user checked), as Docker
-  Desktop's is. Set-user-ID bits and device files in your home mean nothing in
-  the VM, nor in a container you bind them into (a file copied into a container with
+  as root in the VM; it's yours alone (mode 0600, your user checked), as Docker
+  Desktop's is. A container given `--cap-add SYS_ADMIN` (or a `--device` of the VM's
+  own) isn't held by the refusal: it can mount a share whole, or uncover the VM's own
+  files in one, as on Docker Desktop. Give those only to containers you trust with the
+  VM and every share (`--privileged` itself is refused). Set-user-ID bits and device
+  files in your home mean nothing in the VM, nor in a container you bind them into (a file copied into a container with
   `shipyard cp` keeps its mode, as on Linux). The VM's own files (its disk, its
   socket) are hidden from a bind of your home.
 - **Ports:** a published port listens on your Mac's loopback only, never on its
@@ -113,10 +116,13 @@ you trust:
 
 What isn't done yet (tracked in the [roadmap](docs/ROADMAP.md#open-findings)):
 
-- an independent security review, and the OCI runtime conformance suite;
-- testing on more distributions and security modules (SELinux; AppArmor beyond
-  Ubuntu 24.04);
-- the items in the roadmap's open findings, each with its severity and home.
+- an independent security review (the OCI runtime conformance suite runs on every
+  change, each test passing or explained in `scripts/conformance/expected.txt`; Fedora
+  with SELinux enforcing is tested nightly, and Ubuntu 24.04 and 26.04 with AppArmor's
+  restriction on, on every change);
+- the findings accepted at 1.0, each with its reason (the
+  [threat model](docs/user/threat-model.md#not-defended-yet) lists those that touch
+  security), and the few left for after 1.0.
 
 The engineering record of what was defended and how is in
 [`docs/stages/`](docs/stages/), in particular

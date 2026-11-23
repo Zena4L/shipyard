@@ -76,6 +76,36 @@ RUN set -eu; \
     rm -rf /tmp/docker29.tgz /tmp/docker; \
     docker29 --version
 
+# Node and Docker's devcontainer CLI (step 15.6a): the acceptance tests bring a
+# devcontainer up against the API (D30). Each release tarball by its SHA-256
+# (the CLI's is npm's own integrity, checked when pinned; it has no
+# dependencies), nothing fetched by npm, no install scripts.
+RUN set -eu; \
+    case "$(uname -m)" in \
+      aarch64) arch=arm64 sum=406fe3fbde1c054adff8b297c16fdb5af6659db327c1ac8acd46b56ef1af9a92 ;; \
+      x86_64) arch=x64 sum=d28a96af6c38596f6d9d97c0ee531c13d238d757742387d1928de822d959e997 ;; \
+      *) echo "no pinned Node for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    n=0; until curl -fsSL -C - --connect-timeout 10 --speed-limit 1000 --speed-time 60 \
+      -o /tmp/node.tar.xz "https://nodejs.org/dist/v26.13.0/node-v26.13.0-linux-$arch.tar.xz"; \
+      do n=$((n + 1)); [ "$n" -lt 50 ] || exit 1; sleep 2; done; \
+    echo "$sum  /tmp/node.tar.xz" | sha256sum -c -; \
+    mkdir -p /opt/node; \
+    tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1; \
+    ln -s /opt/node/bin/node /usr/local/bin/node; \
+    n=0; until curl -fsSL -C - --connect-timeout 10 -o /tmp/devcontainers-cli.tgz \
+      "https://registry.npmjs.org/@devcontainers/cli/-/cli-0.90.0.tgz"; \
+      do n=$((n + 1)); [ "$n" -lt 50 ] || exit 1; sleep 2; done; \
+    echo "b3d40fec9d274a303a29ea91a24852887cf287701bc8d340bfc1cf970542495a  /tmp/devcontainers-cli.tgz" \
+      | sha256sum -c -; \
+    mkdir -p /opt/devcontainers-cli; \
+    tar -xzf /tmp/devcontainers-cli.tgz -C /opt/devcontainers-cli --strip-components=1; \
+    printf '#!/bin/sh\nexec /usr/local/bin/node /opt/devcontainers-cli/devcontainer.js "$@"\n' \
+      >/usr/local/bin/devcontainer; \
+    chmod 755 /usr/local/bin/devcontainer; \
+    rm -f /tmp/node.tar.xz /tmp/devcontainers-cli.tgz; \
+    devcontainer --version
+
 RUN useradd --create-home tester \
     && echo tester:100000:65536 > /etc/subuid \
     && echo tester:100000:65536 > /etc/subgid

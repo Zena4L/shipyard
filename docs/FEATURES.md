@@ -467,11 +467,15 @@ stage 15.
   before v1.0, ROADMAP D31: local verification is the check of record until then).
 - Pass the OCI runtime-spec conformance suite
   ([`runtime-tools`](https://github.com/opencontainers/runtime-tools)): it runs since
-  stage 8 (H5), gated by `scripts/conformance/expected.txt`. By v1.0, every test is
-  `pass`, or a refusal by design.
+  stage 8 (H5), gated by `scripts/conformance/expected.txt`. At v1.0 (15.6a), on x86-64:
+  28 pass; each of the 14 that fail is refused by design, behaves as runc does where the
+  spec and runc agree, or fails for the suite's own bug, its reason beside it; the 16
+  skipped read cgroup v1 alone (Shipyard is cgroup v2). On arm64 one failure
+  (`process_rlimits`, the suite's own) is a skip instead.
 - Fuzzing of every parser: manifests, tar, compose, config.
 
-**Performance targets** (benchmarked; reported, not blocking v1.0)
+**Performance targets** (benchmarked; reported, not blocking v1.0: `scripts/bench/report.sh`,
+its results in stage 15's notes)
 
 - Container start in under 100 ms, excluding image pull.
 - Idle cost of zero processes besides the per-container monitors.
@@ -480,7 +484,7 @@ stage 15.
 **Security process**
 
 - `SECURITY.md` (done in v0.1, with a summary of what's defended) and a written threat
-  model.
+  model (`docs/user/threat-model.md`, 15.6a).
 - `cargo-deny` and `cargo-audit` in CI.
 - A software bill of materials (SBOM), signed releases, and reproducible builds.
 

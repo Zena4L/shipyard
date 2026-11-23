@@ -171,6 +171,7 @@ as_tester() (
         env HOME=/home/tester "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" \
         SHIPYARD_TEST_DELEGATED=required SHIPYARD_TEST_ROOTLESS=required \
         SHIPYARD_TEST_TOOLS=required SHIPYARD_TEST_NETWORK=required \
+        SHIPYARD_TEST_DEVCONTAINERS=required \
         "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" "$@"
 )
 
@@ -299,6 +300,7 @@ as_root
 echo "== tests, including the root-only ones, run as root"
 # The image has ip, nft and dig: the differential tests (H5) must run.
 SHIPYARD_TEST_TOOLS=required SHIPYARD_TEST_NETWORK=required SHIPYARD_TEST_BUILD=later \
+    SHIPYARD_TEST_DEVCONTAINERS=required \
   cargo test --locked --workspace --no-fail-fast -- --include-ignored \
   || failed="$failed root"
 # The build tests (12.3) need a registry by name: a rootless builder's DNS

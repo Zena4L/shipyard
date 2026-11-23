@@ -294,6 +294,15 @@ and locally in `scripts/test-linux.sh`.
 whenever its pages change, and by hand (`gh workflow run Pages`): the same build and
 checks as CI's `docs` job, then GitHub Pages' deploy (only that job may publish).
 
+### The performance report
+
+`scripts/bench/report.sh [IMAGE]` measures FEATURES §16's targets with the `shipyard` on
+`PATH`, as the user running it (root's or rootless): a container's start (20 runs after 3,
+the median and 90th percentile), Shipyard's processes with nothing running and beside one
+detached container, and a monitor's own (anonymous) memory. Markdown, for a stage's notes;
+use a release build. Each command is run once first where a failure stops the report: a
+timing of a failure is never reported.
+
 ### The docs site
 
 `docs/user/` is also an [mdBook](https://rust-lang.github.io/mdBook/) site

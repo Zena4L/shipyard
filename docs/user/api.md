@@ -9,7 +9,9 @@ Shipyard's own CLI doesn't use it: on Linux, `shipyard` calls the engine directl
 nothing in between. The API is for Docker's clients.
 
 Checked against: Docker's CLI 24, `docker compose` 5.6 (see [compose](compose.md)),
-and [Testcontainers for Rust](https://github.com/testcontainers/testcontainers-rs) 0.28.
+[Testcontainers for Rust](https://github.com/testcontainers/testcontainers-rs) 0.28, and
+Docker's [devcontainer CLI](https://github.com/devcontainers/cli) 0.90 (`devcontainer up`,
+its lifecycle commands, `exec`).
 With `DOCKER_HOST` set to the socket, Testcontainers' everyday calls work as they do
 with Docker's daemon: images pulled when missing; waits on a container's output, its
 health check and its exit; files copied in and out; `exec` and its exit code; mounts;

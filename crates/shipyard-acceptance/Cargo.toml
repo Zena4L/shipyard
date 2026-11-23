@@ -17,6 +17,8 @@ shipyard-test-support.workspace = true
 # features off; bollard's buildkit client and rustls come with it anyway).
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+# The devcontainer CLI's result and config (step 15.6a).
+serde_json.workspace = true
 
 [lints]
 workspace = true

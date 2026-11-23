@@ -9,6 +9,10 @@ behaviour; each change is listed here).
 
 ### Added
 
+- **A threat model** (step 15.6a, [threat model](docs/user/threat-model.md)): what
+  Shipyard protects, from whom, by which boundary, what it leaves to you, and what isn't
+  defended yet. Docker's devcontainer CLI is now tested against the API (root and
+  rootless), and the performance targets are measured (`scripts/bench/report.sh`).
 - **Packages** (step 15.5b): a release also makes `.deb` and `.rpm` packages for x86-64
   and arm64 (the binaries in `/usr/bin`, the boot and Docker API units installed but never
   enabled, the AppArmor profile placed and loaded where AppArmor 4 reads it, never over a
