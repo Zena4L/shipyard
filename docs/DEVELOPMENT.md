@@ -284,11 +284,34 @@ and locally in `scripts/test-linux.sh`.
 
 | Job | What it covers |
 |---|---|
-| `fmt`, `musl`, `docs`, `deny` | formatting; clippy for musl; rustdoc; dependencies |
+| `fmt`, `musl`, `docs`, `deny` | formatting; clippy for musl; rustdoc and the docs site (`scripts/docs-site.sh`); dependencies |
 | `check` (macOS; Ubuntu off) | clippy and every normal-user test. Rootless tests run the binaries cargo built, so the AppArmor restriction on user namespaces is turned off here |
 | `root` (macOS; Ubuntu off) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
 | `apparmor` | **A real Ubuntu host** (H4): the restriction left on, `shipyard` and `shipyard-runtime` installed in `/usr/local/bin` with the profile (`contrib/apparmor/shipyard`), as users install them. `scripts/ci/apparmor-control.sh` first proves the profile is what lets them make user namespaces (unloaded, `shipyard doctor` fails); then `shipyard-cli`'s tests run the installed binaries (the runtime's in-process tests make user namespaces from their own test binary, which no profile covers: they run in `check`) |
 | `conformance` | the OCI conformance suite, as `expected.txt` expects (amd64; recorded on arm64) |
+
+`.github/workflows/pages.yml` (`Pages`) publishes the docs site (https://zena4l.github.io/shipyard/) from `main`
+whenever its pages change, and by hand (`gh workflow run Pages`): the same build and
+checks as CI's `docs` job, then GitHub Pages' deploy (only that job may publish).
+
+### The docs site
+
+`docs/user/` is also an [mdBook](https://rust-lang.github.io/mdBook/) site
+(`docs/site/book.toml`; the order of its pages is `docs/user/SUMMARY.md`). Build and
+check it locally:
+
+```sh
+scripts/docs-site.sh       # into target/site: open target/site/index.html
+```
+
+It fails on a page in `docs/user/` that `SUMMARY.md` doesn't list (or the reverse), on
+any warning of mdBook's (a `<NAME>` outside code is raw HTML to it: put it in
+backticks), on a link that leaves the site (`../../LICENSE` resolves in a checkout and
+is a 404 once published: link to the repository by its GitHub URL), and on any broken
+link or `#anchor` between the pages (lychee, offline). Its tools, mdBook and lychee at
+the versions `docs/site/tools.env` pins, are taken from `PATH` at exactly those
+versions, else built once into `target/tools` (the first build takes some minutes),
+never installed globally. `verify.sh --mac` runs it.
 
 `.github/workflows/quality.yml` (`Quality`), the slow jobs, nightly on `main` and by
 hand (`gh workflow run Quality --ref BRANCH [-f fuzz_seconds=600] [-f base=main]`):

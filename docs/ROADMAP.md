@@ -260,6 +260,10 @@ architecture, tests, Rust craft), decided in a grilling session, round by round.
   (approved as proposed): 32 to fix (15.2; tests 15.3; packaging 15.5), 44 accepted, 4 later,
   F95 already fixed (its leftover F201).
 - **D15-4 — The docs site is mdBook on GitHub Pages,** built from `docs/user/` as it is.
+  Done in 15.4 (2026-11-23; asked: deployed from `main` now, mdBook's own theme): its
+  order `docs/user/SUMMARY.md`, built and checked by `scripts/docs-site.sh` (mdBook 0.5.4,
+  lychee 0.24.2 offline for links and anchors) in `verify.sh --mac` and CI's `docs` job,
+  deployed by `pages.yml`.
 - **D15-5 — The Fedora VM job runs nightly, not on pull requests** (2026-10-30, asked):
   it takes one to two and a half hours (a nested QEMU/KVM VM), every other job under ten
   minutes. It's Quality's `fedora` job (nightly on `main` and by hand).

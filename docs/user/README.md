@@ -42,7 +42,8 @@ Shipyard is a lightweight, daemonless container engine for macOS and Linux.
 > resource limits), supervises it (passing signals on, stopping it gracefully, cleaning up what it
 > leaves behind), and reports exactly how it ended. On an Apple Silicon Mac, commands
 > run in a Linux VM of Shipyard's own ([macOS](macos.md)). These docs describe only what works in the current version, and
-> they are updated with every release.
+> they are updated with every release. They're published as a site too, from `main`:
+> <https://zena4l.github.io/shipyard/>.
 
 ## Pages
 

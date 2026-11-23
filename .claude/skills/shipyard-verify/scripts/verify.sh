@@ -4,7 +4,8 @@
 #   verify.sh            everything: macOS, then Linux (both test passes, then
 #                        rustdoc and the clippy targets the passes don't run)
 #   verify.sh --mac      fmt, clippy, the macOS suite, cargo deny, signing,
-#                        the desktop app (page, shell, WebKit, the .app bundle)
+#                        the docs site, the desktop app (page, shell, WebKit,
+#                        the .app bundle)
 #   verify.sh --linux    the Linux half only (and the desktop app on Linux,
 #                        driven in the desktop image: scripts/desktop-linux.sh)
 #   verify.sh --vm       the macOS VM's: the guest built from this tree, then
@@ -65,6 +66,9 @@ if [ "$mode" != --linux ] && [ "$mode" != --vm ]; then
     run "fuzz-only code (--cfg fuzzing)" "$logs/cfg-fuzzing.log" \
         env RUSTFLAGS="--cfg fuzzing" CARGO_TARGET_DIR=target/cfg-fuzzing \
         cargo check --workspace
+    # The docs site (step 15.4): built from docs/user/, its pages all listed,
+    # no warning, every link and anchor between them resolved.
+    run "docs site" "$logs/docs-site.log" scripts/docs-site.sh
     # A Mac's signing (step 13.7): one identity across builds, in a throwaway
     # keychain; the minimum macOS. (Off a Mac there's nothing to sign.)
     if [ "$(uname)" = Darwin ]; then

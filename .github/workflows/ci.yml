@@ -248,7 +248,8 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The site's tools take most of it on a cold cache (lychee's build).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -256,6 +257,19 @@ jobs:
       - run: cargo doc --locked --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+      # The docs site (D15-4): docs/user/ built by mdBook, its pages all
+      # listed, every link and anchor between them resolved. Its tools, at the
+      # versions docs/site/tools.env pins, built once (`cargo install
+      # --locked`: crates.io's checksums) and kept.
+      # The runner's image (lychee links its OpenSSL): only a step sees it.
+      - id: image
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tools
+          # The pins and the runner's image.
+          key: docs-tools-${{ steps.image.outputs.image }}-${{ hashFiles('docs/site/tools.env') }}
+      - run: scripts/docs-site.sh
 
   deny:
     runs-on: ubuntu-latest

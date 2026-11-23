@@ -37,7 +37,8 @@ with a desktop app that maps which of your containers talk to which.
 > **Not yet:** packages and signed releases (stage 15). The Mac app isn't notarized:
 > you allow it once. It isn't a hardened security boundary yet: see
 > [SECURITY.md](SECURITY.md). Everything that works is in the
-> [user docs](docs/user/README.md), with its [limitations](docs/user/README.md#limitations).
+> [user docs](docs/user/README.md) (also [as a site](https://zena4l.github.io/shipyard/)), with its
+> [limitations](docs/user/README.md#limitations).
 
 The project is built step by step, from first principles, with
 [*The Linux Programming Interface*](https://man7.org/tlpi/) as the primary reference.

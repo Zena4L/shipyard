@@ -9,6 +9,11 @@ behaviour; each change is listed here).
 
 ### Added
 
+- **The docs as a site** (step 15.4, D15-4): `docs/user/` built by mdBook and published
+  on GitHub Pages from `main` (<https://zena4l.github.io/shipyard/>), with search; every
+  pull request builds it and fails on a page left out of its contents, a warning, or a
+  broken link or anchor between the pages (`scripts/docs-site.sh`).
+
 - **`--pid container:NAME` and `--pid host`** (step 15.2b, F134,
   [containers](docs/user/containers.md#sharing-anothers-processes---pid-containername---pid-host)):
   a container shares another running container's processes (each sees and can signal
