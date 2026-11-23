@@ -142,8 +142,52 @@ jobs:
           path: ${{ runner.temp }}/dist/
           if-no-files-found: error
 
+  # The .deb and .rpm of each architecture, from the release's own Linux
+  # tarballs (step 15.5b): built twice and compared.
+  packages:
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: linux-*
+          path: ${{ runner.temp }}/linux
+          merge-multiple: true
+      - run: |
+          scripts/release/packages.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP"/linux/*.tar.gz
+          scripts/release/packages.sh "$RUNNER_TEMP/again" "$RUNNER_TEMP"/linux/*.tar.gz
+          scripts/release/compare.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/again"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  # Each architecture's packages installed and run in Ubuntu and Fedora.
+  test-packages:
+    needs: packages
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: ${{ runner.temp }}/packages
+      - run: scripts/release/test-packages.sh "$RUNNER_TEMP/packages"
+
+  # The Mac's binary packed with the guest it boots (F178), and the app.
   macos:
-    needs: check
+    needs: guest
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -153,7 +197,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: desktop/ui/.nvmrc
-      - run: scripts/release/macos.sh "$RUNNER_TEMP/dist" "${VERSION#v}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: guest
+          path: ${{ runner.temp }}/guest
+      - run: |
+          scripts/release/macos.sh "$RUNNER_TEMP/dist" \
+              "$(echo "$RUNNER_TEMP"/guest/*-guest-arm64.tar.gz)" "${VERSION#v}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos
@@ -185,7 +235,7 @@ jobs:
   # then checked as a user checks a release: by this workflow, from this ref
   # and commit. Runs none of the repository's code.
   attest:
-    needs: [compare, guest, macos, sbom]
+    needs: [compare, guest, macos, sbom, test-packages]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -195,7 +245,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: "{linux-*,guest,macos,sbom}"
+          pattern: "{linux-*,guest,macos,sbom,packages}"
           path: dist
           merge-multiple: true
       - run: cd dist && sha256sum -- * >SHA256SUMS && cat SHA256SUMS

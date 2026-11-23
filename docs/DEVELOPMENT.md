@@ -370,7 +370,8 @@ that runs here too:
 |---|---|---|
 | `shipyard-VERSION-linux-{x86_64,aarch64}.tar.gz`: `shipyard`, `shipyard-runtime` (static, musl), `LICENSE`, `README.md`, `contrib/systemd`, `contrib/apparmor` | `scripts/release/linux.sh OUT [VERSION]` | in the pinned image, the commit exported clean at fixed paths: reproducible, and checked so on another runner (`compare.sh`) |
 | `shipyard-VERSION-guest-arm64.tar.gz` (the Mac's guest, carrying the release's own arm64 `shipyard`), and its packages' list | `scripts/release/guest.sh OUT BINARY [VERSION]` | in the pinned image (`scripts/guest/build.sh`), twice, compared |
-| `shipyard-VERSION-macos-arm64.tar.gz`, `Shipyard-VERSION-macos-arm64.app.zip` | `scripts/release/macos.sh OUT [VERSION]` | on a Mac, signed ad hoc (not notarized: D15-2) |
+| `shipyard-VERSION-macos-arm64.tar.gz` (`bin/shipyard` and the `guest/` it boots, found beside it: F178), `Shipyard-VERSION-macos-arm64.app.zip` | `scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]` | on a Mac, signed ad hoc (not notarized: D15-2) |
+| `shipyard_VERSION-1_{amd64,arm64}.deb`, `shipyard-VERSION-1.{x86_64,aarch64}.rpm`: the Linux tarball's binaries in `/usr/bin`, the units in `/usr/lib/systemd/{system,user}` (never enabled), the AppArmor profile (placed in `/etc/apparmor.d` and loaded where AppArmor 4 reads it, never over a copy the package didn't place; warnings for a manual install beside it) | `scripts/release/packages.sh OUT LINUX-TARBALL…` (nfpm, `package/nfpm.yaml`) | in the pinned image, from the reproduced tarballs, twice, compared; installed and run in Ubuntu 24.04 and Fedora 42 (`test-packages.sh`) |
 | `shipyard-VERSION-BINARY-PLATFORM.cdx.json` (CycloneDX 1.5) | `scripts/release/sbom.sh OUT [VERSION]` | `cargo-cyclonedx` |
 | `SHA256SUMS`, and an attestation of every file | the workflow's `attest` job | GitHub's artifact attestations (Sigstore, keyless) |
 
@@ -395,6 +396,24 @@ sha256sum -c SHA256SUMS --ignore-missing         # an older Mac: shasum -a 256 -
 scripts/release/linux.sh again 1.0.0
 scripts/release/compare.sh downloaded again
 ```
+
+**Homebrew** (`scripts/release/homebrew/`): once a release is published, `homebrew.yml`
+renders the formula from its Mac tarball (its attestation checked first) and pushes it to
+the tap, `Zena4L/homebrew-shipyard`, with the `HOMEBREW_TAP_TOKEN` secret: a fine-grained
+token the owner makes, that repository's contents (read and write) alone. Without the
+secret it says so and does nothing. The tap repository is made with v1.0. The formula
+installs `bin/shipyard` and the guest beside it in its keg, signed as released (brew
+changes neither). To try it before a release, against a dry run's Mac tarball:
+
+```sh
+brew tap-new you/shipyard-test --no-git
+scripts/release/homebrew/render-formula.sh 0.5.0-COMMIT TARBALL "file://$PWD/TARBALL" \
+    >"$(brew --repository you/shipyard-test)/Formula/shipyard.rb"
+brew install you/shipyard-test/shipyard && brew test you/shipyard-test/shipyard
+brew uninstall shipyard && brew untap you/shipyard-test
+```
+
+(Never with `HOMEBREW_NO_INSTALL_FROM_API`: it makes brew clone all of `homebrew-core`.)
 
 Rebuilding later needs what the build fetched to still be there (the image by its digest,
 `musl-tools` at its version, the guest's Alpine packages): mirrors drop old versions, so

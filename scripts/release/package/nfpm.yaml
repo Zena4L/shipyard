@@ -1,0 +1,66 @@
+# Shipyard's .deb and .rpm (step 15.5b), made by nfpm from a release's own
+# Linux tarball. The ${…} values are filled in by scripts/release/packages.sh
+# (nfpm expands none in its files list): the tarball unpacked at ${STAGE},
+# these scripts at ${SCRIPTS}, the architecture and version. Nothing
+# runs at install but what package/postinstall.sh says: no unit enabled or
+# started (D20; `shipyard doctor` says when a restart policy needs them).
+name: shipyard
+arch: ${PACKAGE_ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: "1"
+# Every time in the package the commit's (packages-inside.sh fills it in).
+mtime: "${MTIME}"
+section: admin
+priority: optional
+maintainer: Shipyard <https://github.com/Zena4L/shipyard>
+description: |-
+  A lightweight, daemonless container engine.
+  Runs containers rootless by default, serves a subset of Docker's Engine API
+  for Docker's own clients, and builds images with BuildKit.
+vendor: Shipyard
+homepage: https://github.com/Zena4L/shipyard
+license: Apache-2.0
+
+contents:
+  - src: ${STAGE}/shipyard
+    dst: /usr/bin/shipyard
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/shipyard-runtime
+    dst: /usr/bin/shipyard-runtime
+    file_info: { mode: 0755 }
+  # The boot and Docker API units, root's and a user's: in /usr/bin here
+  # (packages.sh rewrites their /usr/local/bin), never enabled. By glob, not
+  # a tree: a tree's mode is its directories' too (0644 made them a place no
+  # user's systemd could enter).
+  - src: ${STAGE}/systemd/system/*
+    dst: /usr/lib/systemd/system/
+    file_info: { mode: 0644 }
+  - src: ${STAGE}/systemd/user/*
+    dst: /usr/lib/systemd/user/
+    file_info: { mode: 0644 }
+  # The AppArmor profile (rootless on Ubuntu 23.10 and later), shipped
+  # here: postinstall.sh places it in /etc/apparmor.d only where AppArmor 4
+  # reads it, and never over a copy it didn't place (a manual install's).
+  - src: ${STAGE}/contrib/apparmor/shipyard
+    dst: /usr/share/shipyard/apparmor/shipyard
+    file_info: { mode: 0644 }
+  - src: ${STAGE}/LICENSE
+    dst: /usr/share/doc/shipyard/LICENSE
+    file_info: { mode: 0644 }
+  - src: ${STAGE}/README.md
+    dst: /usr/share/doc/shipyard/README.md
+    file_info: { mode: 0644 }
+
+scripts:
+  postinstall: ${SCRIPTS}/postinstall.sh
+  preremove: ${SCRIPTS}/preremove.sh
+  postremove: ${SCRIPTS}/postremove.sh
+
+overrides:
+  deb:
+    # Rootless containers: newuidmap/newgidmap and pasta. Root needs neither.
+    recommends: [uidmap, passt]
+  rpm:
+    recommends: [shadow-utils, passt]

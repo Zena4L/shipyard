@@ -127,7 +127,12 @@ pub fn agent(
     );
     let mut variables = Dictionary::new();
     variables.insert("SHIPYARD_VM_DIR".to_owned(), text(&paths.dir));
-    variables.insert("SHIPYARD_GUEST_DIR".to_owned(), text(&paths.guest));
+    // A guest beside the binary is found again from the binary the agent
+    // runs (its link, kept as a link): written down, it would name the keg
+    // an upgrade removes (F178).
+    if !paths.guest_beside {
+        variables.insert("SHIPYARD_GUEST_DIR".to_owned(), text(&paths.guest));
+    }
     for (name, value) in env {
         variables.insert(name.clone(), Value::String(value.clone()));
     }
@@ -807,6 +812,23 @@ mod tests {
         // The VM's places always, the guest's too: the host's are the CLI's.
         let variables = read["EnvironmentVariables"].as_dictionary().unwrap();
         assert_eq!(variables["SHIPYARD_GUEST_DIR"].as_string(), Some("/g"));
+        // But never a guest found beside the binary: an upgrade moves it.
+        let mut beside = paths.clone();
+        beside.guest_beside = true;
+        let plist = super::agent(
+            "dev.shipyard.vm.x",
+            Path::new("/bin/shipyard"),
+            &beside,
+            (&[], false),
+        );
+        let variables = plist.as_dictionary().unwrap()["EnvironmentVariables"]
+            .as_dictionary()
+            .unwrap();
+        assert!(
+            !variables.contains_key("SHIPYARD_GUEST_DIR"),
+            "{variables:?}"
+        );
+        assert!(variables.contains_key("SHIPYARD_VM_DIR"));
         // Asked to start at login (`--at-login`): run at load, its host then
         // deciding by what comes back.
         let agent = super::agent(

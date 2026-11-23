@@ -1,0 +1,44 @@
+# Shipyard's Homebrew formula (step 15.5b), filled in by
+# scripts/release/homebrew/render-formula.sh for each published release and
+# pushed to the tap (Zena4L/homebrew-shipyard) by .github/workflows/homebrew.yml.
+class Shipyard < Formula
+  desc "Lightweight, daemonless container engine, Docker-compatible"
+  homepage "https://zena4l.github.io/shipyard/"
+  url "@URL@"
+  version "@VERSION@"
+  sha256 "@SHA256@"
+  license "Apache-2.0"
+
+  # Containers run in Shipyard's own Linux VM, through Virtualization.framework
+  # on Apple Silicon (Rosetta runs amd64 images there).
+  depends_on arch: :arm64
+  depends_on macos: :ventura
+
+  def install
+    # Signed ad hoc with its virtualization entitlement: installed as it is.
+    bin.install "bin/shipyard"
+    # The guest the VM boots, beside the binary's own directory, where
+    # Shipyard looks for it (F178).
+    prefix.install "guest"
+  end
+
+  def caveats
+    <<~EOS
+      Shipyard runs containers in a Linux VM of its own, started on first use
+      and stopped when idle. Check this Mac with:
+        shipyard doctor
+      Docker's own clients, through the VM's socket at any time:
+        shipyard vm install
+      Its VM boots only a guest that's yours or root's: on a Mac whose
+      Homebrew another user installed, set SHIPYARD_GUEST_DIR to a copy of
+      #{prefix}/guest of your own.
+    EOS
+  end
+
+  test do
+    # The workspace's version (a dry run's adds its commit after a `-`).
+    assert_match "shipyard #{version.to_s.split("-").first}",
+                 shell_output("#{bin}/shipyard --version")
+    assert_path_exists prefix/"guest/manifest.json"
+  end
+end
