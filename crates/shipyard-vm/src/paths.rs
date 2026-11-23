@@ -18,16 +18,24 @@ pub struct VmPaths {
     pub dir: PathBuf,
     /// The guest's files ([`crate::Manifest`] and what it names).
     pub guest: PathBuf,
+    /// Whether [`guest`](Self::guest) was found beside this binary (a
+    /// release's or Homebrew's keg), not given nor the VM directory's: a
+    /// place that moves with the binary, never written down for later
+    /// (`vm install`'s agent finds it again from the binary it runs: F178).
+    pub guest_beside: bool,
 }
 
 /// The guest's files when `SHIPYARD_GUEST_DIR` doesn't say (13.6b2, F106):
 /// the VM directory's `guest` if a guest is there; else the `guest`
 /// directory beside the binary's own (`exe`, canonical:
-/// `target/debug/shipyard` finds `target/guest`, where `build.sh` puts it),
-/// only if it and the directory it's in are the user's alone (a `shipyard`
-/// run from `/tmp/x` mustn't boot a guest another user put in `/tmp/guest`,
-/// with the home shared: 13.6b2's review); else the VM directory's, whose
-/// absence is then said.
+/// `target/debug/shipyard` finds `target/guest`, where `build.sh` puts it;
+/// a release's `bin/shipyard` its `guest`, where its tarball and Homebrew
+/// put it: F178), only if it and the directory it's in are the user's or
+/// root's and no one else may write them (a `shipyard` run from `/tmp/x`
+/// mustn't boot a guest another user put in `/tmp/guest`, with the home
+/// shared: 13.6b2's review; root's install under `/usr/local` or `/opt` is
+/// root's, who could replace the binary as well); else the VM directory's,
+/// whose absence is then said.
 #[must_use]
 pub(crate) fn guest_dir(vm_dir: &Path, exe: Option<&Path>) -> PathBuf {
     let kept = vm_dir.join("guest");
@@ -35,14 +43,38 @@ pub(crate) fn guest_dir(vm_dir: &Path, exe: Option<&Path>) -> PathBuf {
     if has_guest(&kept) {
         return kept;
     }
-    let theirs_alone =
-        |dir: &Path| shipyard_sys::fs::unsafe_dir(dir).is_ok_and(|why| why.is_none());
+    let me = nix::unistd::geteuid().as_raw();
+    let trusted = |path: &Path, dir: bool| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            (if dir {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            }) && trusted_place(metadata.uid(), metadata.mode(), me)
+        })
+    };
+    // Its files too (no link among them): a guest's directory of root's
+    // holding another user's kernel is that user's guest.
+    let trusted_files = |dir: &Path| {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .all(|path| path.is_ok_and(|path| trusted(&path, false)))
+        })
+    };
     exe.and_then(Path::parent)
         .and_then(Path::parent)
-        .filter(|built| theirs_alone(built))
+        .filter(|built| trusted(built, true))
         .map(|built| built.join("guest"))
-        .filter(|beside| has_guest(beside) && theirs_alone(beside))
+        .filter(|beside| has_guest(beside) && trusted(beside, true) && trusted_files(beside))
         .unwrap_or(kept)
+}
+
+/// Whether a directory (or one of its files) owned by `owner`, with `mode`,
+/// may hold the guest a user `me` boots: theirs or root's, and no one else
+/// may write to it.
+fn trusted_place(owner: u32, mode: u32, me: u32) -> bool {
+    (owner == me || owner == 0) && mode & 0o022 == 0
 }
 
 impl VmPaths {
@@ -63,14 +95,18 @@ impl VmPaths {
             })?;
             Self::default_dir(Path::new(&home))
         };
-        let guest = var("SHIPYARD_GUEST_DIR").map_or_else(
+        let (guest, guest_beside) = var("SHIPYARD_GUEST_DIR").map_or_else(
             || {
                 let exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
-                guest_dir(&dir, exe.as_deref())
+                let found = guest_dir(&dir, exe.as_deref());
+                let beside = found != dir.join("guest");
+                (found, beside)
             },
-            PathBuf::from,
+            |given| (PathBuf::from(given), false),
         );
-        Self::at(dir, guest)
+        let mut paths = Self::at(dir, guest)?;
+        paths.guest_beside = guest_beside;
+        Ok(paths)
     }
 
     /// The user's VM directory when none is set: in `home`'s Application
@@ -94,7 +130,11 @@ impl VmPaths {
                 )));
             }
         }
-        Ok(Self { dir, guest })
+        Ok(Self {
+            dir,
+            guest,
+            guest_beside: false,
+        })
     }
 
     /// The host's lock: held for as long as it runs (its PID written in it).
@@ -324,6 +364,31 @@ mod tests {
             built.join("guest"),
             "theirs alone again"
         );
+        // Its files too: a link among them, or one others may write to,
+        // isn't taken (another's kernel in a directory of the user's).
+        let link = built.join("guest").join("Image");
+        std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            vm.join("guest"),
+            "a link inside"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"kernel").unwrap();
+        std::fs::set_permissions(&link, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+            .unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            vm.join("guest"),
+            "a file others write"
+        );
+        std::fs::set_permissions(&link, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert_eq!(
+            guest_dir(&vm, Some(&exe)),
+            built.join("guest"),
+            "its files theirs alone"
+        );
         std::fs::write(vm.join("guest").join(crate::MANIFEST), b"{}").unwrap();
         assert_eq!(
             guest_dir(&vm, Some(&exe)),
@@ -331,6 +396,27 @@ mod tests {
             "the VM's own first"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// F178: a release installed by root (`/usr/local`, `/opt`) keeps its
+    /// guest in root's directories: taken, as the user's own are; another
+    /// user's, or one a group or others may write to, never.
+    #[test]
+    fn a_guest_beside_is_the_user_s_or_root_s() {
+        let me = 501;
+        assert!(trusted_place(me, 0o40755, me), "the user's");
+        assert!(trusted_place(0, 0o40755, me), "root's");
+        assert!(trusted_place(me, 0o40700, me), "the user's, private");
+        assert!(!trusted_place(502, 0o40755, me), "another user's");
+        assert!(
+            !trusted_place(0, 0o40775, me),
+            "root's, its group may write"
+        );
+        assert!(!trusted_place(me, 0o40757, me), "anyone may write");
+        assert!(
+            !trusted_place(0, 0o41777, me),
+            "a sticky world-writable one"
+        );
     }
 
     /// `doctor`'s look at the directory: none yet is fine; one others may

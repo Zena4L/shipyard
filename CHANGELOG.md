@@ -9,6 +9,14 @@ behaviour; each change is listed here).
 
 ### Added
 
+- **Packages** (step 15.5b): a release also makes `.deb` and `.rpm` packages for x86-64
+  and arm64 (the binaries in `/usr/bin`, the boot and Docker API units installed but never
+  enabled, the AppArmor profile placed and loaded where AppArmor 4 reads it, never over a
+  copy of your own), reproducible and tested by
+  installing and running them in Ubuntu 24.04 and Fedora 42; and a Homebrew formula for
+  Apple Silicon Macs, its tap updated when a release is published. The Mac's tarball
+  carries its guest beside `bin/shipyard`, where Shipyard finds it, also when root
+  installed it (F178).
 - **Release builds** (step 15.5a): a workflow that builds a release's artifacts, static
   Linux binaries for x86-64 and arm64 (`shipyard`, `shipyard-runtime`), the Mac's
   binary, guest and app, CycloneDX SBOMs and `SHA256SUMS`, each attested by GitHub

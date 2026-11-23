@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # Builds the Mac's release (step 15.5a), on an Apple Silicon Mac: `shipyard`
 # for aarch64-apple-darwin (macOS 13 and later), signed ad hoc with its
-# virtualization entitlement, packed as OUT/shipyard-VERSION-macos-arm64.tar.gz;
-# and the desktop app, signed ad hoc, as OUT/Shipyard-VERSION-macos-arm64.app.zip.
+# virtualization entitlement, packed with the guest it boots as
+# OUT/shipyard-VERSION-macos-arm64.tar.gz (`bin/shipyard` and `guest/`: found
+# beside the binary wherever it's unpacked or installed, F178); and the
+# desktop app, signed ad hoc, as OUT/Shipyard-VERSION-macos-arm64.app.zip.
 # Ad hoc, never the building machine's own identity: not notarized (D15-2;
-# how to allow it once is step 15.5b's install docs). The guest it boots is a Linux build's
-# (scripts/release/guest.sh).
+# the install docs say how to allow it once). The guest is a Linux build's
+# (scripts/release/guest.sh), given as its tarball.
 #
-# usage: scripts/release/macos.sh OUT [VERSION]   (VERSION as linux.sh's)
+# usage: scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]   (VERSION as linux.sh's)
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-out=${1:?usage: scripts/release/macos.sh OUT [VERSION]}
+usage="usage: scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]"
+out=${1:?$usage}
+guest=${2:?$usage}
+[ -f "$guest" ] || { echo "no guest tarball at $guest" >&2; exit 1; }
+guest=$(cd "$(dirname "$guest")" && pwd)/$(basename "$guest")
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 cd "$repo"
@@ -19,7 +25,7 @@ if [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 commit=$(git rev-parse HEAD)
-version=${2:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-${commit:0:12}}
+version=${3:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-${commit:0:12}}
 export SOURCE_DATE_EPOCH
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 export SHIPYARD_SIGN_IDENTITY=- CARGO_INCREMENTAL=0
@@ -40,8 +46,18 @@ grep -aq "${commit:0:12}" "$binary" || {
 name=shipyard-$version-macos-arm64
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-mkdir "$stage/$name"
-cp "$binary" "$stage/$name/shipyard"
+mkdir -p "$stage/$name/bin" "$stage/$name/guest"
+cp "$binary" "$stage/$name/bin/shipyard"
+# The guest's three files, from its own tarball's one directory: the same
+# commit's, or the Mac would call its guest another build.
+tar -xzf "$guest" -C "$stage/$name/guest" --strip-components=1
+for file in Image initramfs.cpio.gz manifest.json; do
+    [ -f "$stage/$name/guest/$file" ] || { echo "the guest tarball has no $file" >&2; exit 1; }
+done
+grep -q "\"${commit:0:12}\"" "$stage/$name/guest/manifest.json" || {
+    echo "the guest names another commit than ${commit:0:12}" >&2
+    exit 1
+}
 cp LICENSE README.md "$stage/$name/"
 # bsdtar has no --mtime: every entry given the commit's time first.
 stamp=$(TZ=UTC date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)

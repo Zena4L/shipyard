@@ -1,0 +1,82 @@
+name: Homebrew
+
+# The Homebrew tap follows each release (step 15.5b): once a release is
+# published (a draft's assets aren't public), its Mac tarball's checksum goes
+# into the formula (scripts/release/homebrew/render-formula.sh), pushed to
+# Zena4L/homebrew-shipyard with HOMEBREW_TAP_TOKEN: a fine-grained token, that
+# repository's contents alone, which the owner makes. Without it, this says
+# so and does nothing.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  attestations: read
+
+concurrency:
+  group: homebrew
+  cancel-in-progress: false
+
+jobs:
+  formula:
+    # A prerelease never moves the tap.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      HAS_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - if: env.HAS_TOKEN != 'true'
+        run: |
+          echo "::notice::No HOMEBREW_TAP_TOKEN: the tap isn't updated for $TAG."
+      - if: env.HAS_TOKEN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: shipyard
+      - if: env.HAS_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${TAG#v}
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "shipyard-$version-macos-arm64.tar.gz" --dir "$RUNNER_TEMP"
+          # The published asset is the attested one.
+          gh attestation verify "$RUNNER_TEMP/shipyard-$version-macos-arm64.tar.gz" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG"
+          shipyard/scripts/release/homebrew/render-formula.sh "$version" \
+              "$RUNNER_TEMP/shipyard-$version-macos-arm64.tar.gz" >"$RUNNER_TEMP/shipyard.rb"
+      - if: env.HAS_TOKEN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Zena4L/homebrew-shipyard
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - if: env.HAS_TOKEN == 'true'
+        run: |
+          mkdir -p tap/Formula
+          # Never back: a release published after a newer one (an older
+          # line's fix) leaves the tap where it is.
+          if [ -f tap/Formula/shipyard.rb ]; then
+              tapped=$(sed -n 's/^  version "\(.*\)"$/\1/p' tap/Formula/shipyard.rb)
+              newest=$(printf '%s\n%s\n' "$tapped" "${TAG#v}" | sort -V | tail -1)
+              if [ "$newest" != "${TAG#v}" ]; then
+                  echo "The tap names $tapped, newer than ${TAG#v}: left as it is."
+                  exit 0
+              fi
+          fi
+          cp "$RUNNER_TEMP/shipyard.rb" tap/Formula/shipyard.rb
+          cd tap
+          git add Formula/shipyard.rb
+          if git diff --cached --quiet; then
+              echo "The formula already names $TAG."
+              exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "shipyard ${TAG#v}"
+          git push -q origin HEAD
