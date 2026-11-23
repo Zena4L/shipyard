@@ -13,6 +13,9 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    # TEMPORARY (15.5a's dry run, before the workflow is on main): removed
+    # before the merge.
+    branches: [feat/stage-15-5]
 
 permissions:
   contents: read
@@ -24,7 +27,7 @@ concurrency:
 env:
   # The tag's version (`v1.0.0`); none on a dry run (the scripts then name it
   # after the workspace's version and the commit).
-  VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
+  VERSION: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
 jobs:
   # A tag's release checked before the long builds: its version is the
