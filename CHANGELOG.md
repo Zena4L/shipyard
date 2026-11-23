@@ -174,6 +174,13 @@ behaviour; each change is listed here).
   for no one, its address handed out again).
 - **When Shipyard's record of the routing it closed can't be read, the host's uplink is
   closed too even if it's a bridge** (`br0`; F111): other bridges are still left out.
+- **A stop of a container waiting to restart (its policy's backoff) could leave the
+  restart to come** when another command held the container (step 15.6b's review): the
+  stop now marks it stopped by the user and cancels the waiting start before it waits
+  for the container.
+- **On a Mac, the guest's firewall was given up after three tries** (step 15.6b's
+  review): it's tried until it's made, each failure said in the console, the rest
+  between tries doubling to 5 minutes.
 - **`docker start -a` of a container that had run before could print nothing** (F200,
   step 15.2c1): the API's attach, waiting for the start, took the start's own passing
   states (the container made again, its last end cleared) for a new end, gave up, and
@@ -309,6 +316,15 @@ behaviour; each change is listed here).
 
 ### Security
 
+- **With forwarding on, the host routed between the addresses of its own LAN (or
+  VPN) link** (step 15.6b's review): the rule that lets what's bridged on a port pass
+  between its own ports took any closed link, so `eth0` to `eth0` (another machine using
+  the host as its gateway) passed too. It's now only for links that are bridges, read
+  from the kernel each time the rules are made.
+- **A proxy's password no longer shows in `ps`** when the rootless API service is
+  started through the user's systemd manager (step 15.6b's review): the variables are
+  passed by name (systemd 250 on); before 250, a proxy holding a password has the
+  service started as the command's own child.
 - **`cookie` 0.18.3** (RUSTSEC-2026-0594: private cookies' nonces could repeat in a
   process that forks and then adds them), in the desktop app's lock; it comes through
   Tauri, which neither forks so nor uses private cookies.

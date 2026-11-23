@@ -54,12 +54,24 @@ timed() {
 }
 
 # The command once, out here: a failure stops the report (never a timing
-# of a failure).
+# of a failure), with what it said.
 works() {
-    "$@" >/dev/null 2>&1 || {
+    local said
+    said=$("$@" 2>&1) || {
         echo "failed: $*" >&2
-        "$@" >/dev/null
+        echo "$said" >&2
+        exit 1
     }
+}
+
+# Waits (10 s at most) until the container NAME runs: its monitor is up.
+running() {
+    for _ in $(seq 100); do
+        [ "$(shipyard inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ] && return
+        sleep 0.1
+    done
+    echo "$1 isn't running" >&2
+    exit 1
 }
 
 whoami=$(id -un)
@@ -109,10 +121,10 @@ beside() {
 }
 echo "| Shipyard's processes, nothing running | $(ours | wc -l), $(pastas) pasta | none |"
 shipyard run -d --name "$prefix-quiet" --network none "$image" sleep 600 >/dev/null
-sleep 2
+running "$prefix-quiet"
 echo "| ... one detached container, \`--network none\` | $(beside) | its monitor alone |"
 shipyard run -d --name "$prefix-networked" "$image" sleep 600 >/dev/null
-sleep 2
+running "$prefix-networked"
 echo "| ... and one on the default network | $(beside) | the monitors (and the network's own: DNS, or pasta) |"
 
 # The monitor's own memory, the quiet container's (found by its ID, in its

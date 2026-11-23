@@ -288,6 +288,14 @@ fn ask_first(engine: &Engine, found: &Record, when_up: Option<WhenUp>) -> Result
             );
             Ok(crate::run::stop::stop_up(runtime_root, found, kill).is_ok())
         }
+        // Waiting to restart (its policy's backoff): the user's stop is what
+        // cancels that, at once, before the lock is waited for, or the
+        // restart waiter, taking the lock first, starts it once more
+        // (15.6b's review). Nothing is asked of a monitor: none runs.
+        Some(WhenUp::Stop(_) | WhenUp::Kill) if found.next_start.is_some() => {
+            mark_stopped_by_user(engine, &found.id);
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }

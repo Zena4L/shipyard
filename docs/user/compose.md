@@ -38,8 +38,10 @@ resource limits and `PATH`, not your terminal's: a Docker credential helper or `
 must be on the manager's `PATH` (`systemctl --user show-environment`). It's given
 Shipyard's own variables (`SHIPYARD_…`), `DOCKER_CONFIG`, `XDG_DATA_HOME`,
 `XDG_CONFIG_HOME`, `RUST_LOG`, the proxies (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`,
-`ALL_PROXY`, in either case) and `SSL_CERT_FILE`/`SSL_CERT_DIR`, and no others. If the
-manager can't start it within 5 seconds, it's started as before, as your command's
+`ALL_PROXY`, in either case) and `SSL_CERT_FILE`/`SSL_CERT_DIR`, and no others, by
+name, so their values (a proxy's password) never show in `ps`; with systemd before
+250, which can't take them so, a proxy holding a password has it started as your
+command's instead. If the manager can't start it within 5 seconds, it's started as before, as your command's
 (`service.log` says why). From an SSH login or a container (a toolbox), it's started as
 before. With the socket units installed, systemd starts it instead.
 

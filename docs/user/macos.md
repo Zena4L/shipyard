@@ -396,7 +396,8 @@ The VM's guest is built apart from `shipyard`, and launchd's agent keeps what th
    so).
 2. `scripts/guest/build.sh`: the guest of this build. If the VM directory has a `guest`
    of its own (`~/Library/Application Support/Shipyard/vm/guest`), it's taken before the
-   one beside `shipyard`: remove it, or build into it.
+   one beside `shipyard`: remove it, or build into it (`doctor` names both when they're
+   different builds).
 3. `shipyard vm install` again if you'd installed it: the older agent's stop is cut short
    by launchd at a logout (`doctor` warns of it).
 

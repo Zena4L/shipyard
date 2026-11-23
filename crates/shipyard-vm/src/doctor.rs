@@ -60,7 +60,7 @@ pub fn checks(paths: Result<&VmPaths, &VmError>, revision: &str) -> Vec<Finding>
     ];
     match paths {
         Ok(paths) => found.extend([
-            guest(&paths.guest, revision),
+            guest(&paths.guest, paths.shadowed.as_deref(), revision),
             vm(paths),
             ports(paths),
             docker(
@@ -376,8 +376,10 @@ fn entitled(shown: &[u8], signer: Option<&str>, exe: &Path) -> Finding {
     }
 }
 
-/// The guest at `dir`, and whether it's this build's.
-fn guest(dir: &Path, revision: &str) -> Finding {
+/// The guest at `dir`, and whether it's this build's; another build's
+/// that shadows one beside this binary (`shadowed`) says how to boot that
+/// one instead.
+fn guest(dir: &Path, shadowed: Option<&Path>, revision: &str) -> Finding {
     match Guest::find(dir) {
         Ok(guest) => {
             let what = format!(
@@ -388,6 +390,18 @@ fn guest(dir: &Path, revision: &str) -> Finding {
             );
             if guest.manifest.shipyard.revision == revision {
                 Finding::new(Level::Ok, "guest", what)
+            } else if let Some(beside) = shadowed {
+                Finding::new(
+                    Level::Warn,
+                    "guest",
+                    format!(
+                        "{what}: another build than this shipyard's ({revision}), kept in {} \
+                         from before; this install's is {}: remove the first (after `shipyard vm \
+                         stop`) to boot it",
+                        dir.display(),
+                        beside.display()
+                    ),
+                )
             } else {
                 Finding::new(
                     Level::Warn,
@@ -689,7 +703,7 @@ mod tests {
             std::env::temp_dir().join(format!("shipyard-doctor-guest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(guest(&dir, "abc").level, Level::Fail);
+        assert_eq!(guest(&dir, None, "abc").level, Level::Fail);
         std::fs::write(
             dir.join(crate::MANIFEST),
             r#"{"version": 1, "alpine": "3.24.2", "minirootfs_sha256": "9bf7",
@@ -700,8 +714,25 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("Image"), b"k").unwrap();
         std::fs::write(dir.join("initramfs.cpio.gz"), b"i").unwrap();
-        assert_eq!(guest(&dir, "abc").level, Level::Ok);
-        assert_eq!(guest(&dir, "def").level, Level::Warn);
+        assert_eq!(guest(&dir, None, "abc").level, Level::Ok);
+        let other = guest(&dir, None, "def");
+        assert_eq!(other.level, Level::Warn);
+        assert!(other.text.contains("scripts/guest/build.sh"), "{other:?}");
+        // Kept from before, shadowing this install's beside its binary:
+        // both named, and how to boot the install's.
+        let beside = Path::new("/opt/homebrew/Cellar/shipyard/1.0.0/guest");
+        let shadowing = guest(&dir, Some(beside), "def");
+        assert_eq!(shadowing.level, Level::Warn);
+        assert!(
+            shadowing.text.contains(&format!(
+                "kept in {} from before; this install's is {}",
+                dir.display(),
+                beside.display()
+            )),
+            "{shadowing:?}"
+        );
+        // This build's own: nothing to say, whatever's beside.
+        assert_eq!(guest(&dir, Some(beside), "abc").level, Level::Ok);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

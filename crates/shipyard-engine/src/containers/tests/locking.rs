@@ -80,3 +80,34 @@ fn a_stop_given_up_unasked_leaves_no_mark() {
     drop(held);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 15.6b: a container waiting to restart (its policy's backoff), stopped
+/// while another command holds its lock, has its restart cancelled at
+/// once, even when the stop then gives up: the restart waiter, taking the
+/// lock first, would otherwise start it once more.
+#[test]
+fn a_stop_cancels_a_waiting_restart_before_the_lock() {
+    let (engine, _, dir) = engine("stop-backoff");
+    let engine = Engine::new(
+        engine.paths().clone().with_runtime_root(dir.join("run")),
+        std::sync::Arc::new(Collect::default()),
+    );
+    let record = create_record(&engine, new(Some("web"))).unwrap();
+    crate::containers::update(&engine, &record.id, |record| {
+        record.next_start = Some(std::time::SystemTime::now() + Duration::from_secs(60));
+    })
+    .unwrap();
+    let held = operation_lock(&engine, &record.id, Duration::ZERO).unwrap();
+    let began = Instant::now();
+    let gone = || began.elapsed() >= Duration::from_millis(300);
+    let stopped = crate::run::stop_until(&engine, "web", crate::run::StopOptions::default(), &gone);
+    assert_eq!(
+        stopped.err().map(|error| error.kind()),
+        Some(ErrorKind::Busy)
+    );
+    let after = crate::containers::read_one(&engine, &record.id).unwrap();
+    assert!(after.stopped_by_user, "marked: the restart is cancelled");
+    assert_eq!(after.next_start, None, "no restart waits");
+    drop(held);
+    let _ = std::fs::remove_dir_all(&dir);
+}

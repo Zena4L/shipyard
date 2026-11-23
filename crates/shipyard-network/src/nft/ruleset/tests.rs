@@ -638,6 +638,7 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
         &ClosedRouting {
             families: vec![Family::V4, Family::V6],
             interfaces: vec!["eth0".into()],
+            bridges: Vec::new(),
         },
         &["eth0".to_owned()],
     );
@@ -647,15 +648,15 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
     assert_eq!(what[19], "adding the chain guard");
     assert!(what.contains(&"adding rule 19 of the chain forward"));
     assert!(what.contains(&"adding rule 12 of the chain input"));
+    // `eth0` is no bridge: nothing in `same_uplink` (its own traffic,
+    // routed back out of it, stays closed).
     assert_eq!(
-        what[what.len() - 8..],
+        what[what.len() - 6..],
         [
             "adding to the set ports",
             "adding to the set uplinks",
-            "adding to the set same_uplink",
             "adding to the set closed",
             "adding to the set uplinks",
-            "adding to the set same_uplink",
             "adding to the set closed",
             "adding to the set outside",
         ]
@@ -671,7 +672,9 @@ fn the_table_is_built_in_order_and_every_item_encodes() {
 /// Routing closed between the host's links leaves alone what's bridged on
 /// one of them (F111: a `br0` uplink's VMs, which `br_netfilter` shows the
 /// forward hook as from `br0` to `br0`): an inverted lookup of the pair in
-/// `same_uplink`, which closing fills with each interface twice.
+/// `same_uplink`, which closing fills with each closed bridge twice, and
+/// never a plain link (15.6b: `eth0` back out of `eth0` is routing for
+/// someone else).
 #[test]
 fn what_s_bridged_on_an_uplink_is_left_alone() {
     assert_eq!(
@@ -683,12 +686,22 @@ fn what_s_bridged_on_an_uplink_is_left_alone() {
             invert: true,
         })
     );
-    let what: Vec<String> = close_routing(Family::V4, &["br0".to_owned()])
-        .into_iter()
-        .map(|item| item.what)
-        .collect();
-    assert!(
-        what.contains(&"adding to the set same_uplink".to_owned()),
-        "{what:?}"
+    let same_uplink = |interfaces: &[&str], bridges: &[&str]| {
+        let owned = |names: &[&str]| {
+            names
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect::<Vec<_>>()
+        };
+        close_routing(Family::V4, &owned(interfaces), &owned(bridges))
+            .into_iter()
+            .filter(|item| item.what == "adding to the set same_uplink")
+            .count()
+    };
+    assert_eq!(
+        same_uplink(&["br0", "eth1"], &["br0"]),
+        1,
+        "the bridge's pair"
     );
+    assert_eq!(same_uplink(&["eth0", "wg0"], &[]), 0, "no plain link's");
 }

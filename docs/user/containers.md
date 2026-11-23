@@ -292,7 +292,9 @@ shipyard run --rm -it --pid container:app --cap-add SYS_PTRACE alpine:3.20 ps
   containers that join one namespace at once are set up one after the other: the second
   waits for the first's start (two minutes at most).
 - The joining container's small init isn't PID 1 there: the other's processes see it and
-  may signal it (root there may kill it; its processes then end with its cgroup). It
+  may signal it. Root there may kill it (its processes then end with its cgroup), or stop
+  it (`SIGSTOP`): it then passes nothing on, so a `stop` waits its whole timeout before
+  it kills the container. Join only a container you trust as much as the one you start. It
   keeps `SIGRTMIN+2` for itself (it learns from it that Shipyard is gone): that signal,
   sent to the container, isn't passed on.
 - Without root, a container's network, IPC and PID namespaces can be one other

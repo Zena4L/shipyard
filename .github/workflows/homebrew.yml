@@ -43,11 +43,12 @@ jobs:
           version=${TAG#v}
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
               --pattern "shipyard-$version-macos-arm64.tar.gz" --dir "$RUNNER_TEMP"
-          # The published asset is the attested one.
+          # The published asset is the attested one: by this repository's
+          # release workflow, from this tag's commit exactly.
           gh attestation verify "$RUNNER_TEMP/shipyard-$version-macos-arm64.tar.gz" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-ref "refs/tags/$TAG"
+              --source-ref "refs/tags/$TAG" --source-digest "$(git -C shipyard rev-parse HEAD)"
           shipyard/scripts/release/homebrew/render-formula.sh "$version" \
               "$RUNNER_TEMP/shipyard-$version-macos-arm64.tar.gz" >"$RUNNER_TEMP/shipyard.rb"
       - if: env.HAS_TOKEN == 'true'
@@ -63,7 +64,10 @@ jobs:
           # line's fix) leaves the tap where it is.
           if [ -f tap/Formula/shipyard.rb ]; then
               tapped=$(sed -n 's/^  version "\(.*\)"$/\1/p' tap/Formula/shipyard.rb)
-              newest=$(printf '%s\n%s\n' "$tapped" "${TAG#v}" | sort -V | tail -1)
+              # Semantic order: a prerelease (`1.0.0-rc.1`) below its release
+              # (`sort -V` sorts `~` first; it would put `-rc.1` after).
+              newest=$(printf '%s\n%s\n' "$tapped" "${TAG#v}" | sed 's/-/~/' |
+                  sort -V | tail -1 | sed 's/~/-/')
               if [ "$newest" != "${TAG#v}" ]; then
                   echo "The tap names $tapped, newer than ${TAG#v}: left as it is."
                   exit 0

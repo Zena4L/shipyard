@@ -414,11 +414,14 @@ pub fn prune_where(
 
 /// Deletes what's in the volume trash that this process can: removals cut
 /// short (a service stopped while it deleted a tree after its answer, F208;
-/// a killed `volume rm`). The API's service runs it at its start, so it
-/// never runs the storage helper or takes the image store's lock there:
-/// files a rootless container wrote as its other users are left for the
-/// next `volume prune` (as before), not tried again at every start. A store
-/// never made is left unmade.
+/// a killed `volume rm`). The API's service runs it at each start (as
+/// background work, which holds its idle end until done), so it never runs
+/// the storage helper or takes the image store's lock there: what this
+/// process can't delete, files a rootless container wrote as its other
+/// users, is walked again at each start, as far as its first refusal in
+/// each entry (`remove_tree_at` stops there), and deleted by the next
+/// `volume prune`, which uses the helper. A store never made is left
+/// unmade.
 ///
 /// # Errors
 ///

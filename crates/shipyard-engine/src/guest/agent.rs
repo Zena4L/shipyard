@@ -80,8 +80,11 @@ pub(super) fn run() -> ! {
 /// The guest's own firewall (F175), on a thread of its own (a run holding
 /// the networks' lock never holds up the agent's first answers), once the
 /// guest is ready: its data disk, where the networks' store is, mounted,
-/// and before any container runs (nothing runs before then). Tried a few
-/// times; one never made is said, and the agent serves on.
+/// and before any container runs (nothing runs before then). Tried until
+/// made, each failure said, the rest between tries doubling to
+/// [`FIREWALL_REST_MAX`]: a guest left without it would take new
+/// connections from other VMs (15.6b's review); the agent serves on
+/// meanwhile.
 fn guest_firewall() {
     let began = std::time::Instant::now();
     while !std::path::Path::new(super::READY).exists() {
@@ -92,12 +95,17 @@ fn guest_firewall() {
         std::thread::sleep(Duration::from_millis(250));
     }
     let engine = crate::Engine::new(crate::Paths::from_env(), Arc::new(crate::report::Quiet));
-    for tried in 1..=FIREWALL_TRIES {
+    let mut rest = Duration::from_secs(5);
+    for tried in 1.. {
         match crate::network::ensure_guest_firewall(&engine) {
             Ok(()) => return,
-            Err(error) => say(&format!("the guest's firewall ({tried}): {error:#}")),
+            Err(error) => say(&format!(
+                "the guest's firewall (try {tried}, again in {}s): {error:#}",
+                rest.as_secs()
+            )),
         }
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(rest);
+        rest = (rest * 2).min(FIREWALL_REST_MAX);
     }
 }
 
@@ -105,8 +113,8 @@ fn guest_firewall() {
 /// disk's check may take this long).
 const FIREWALL_WAIT: Duration = Duration::from_mins(30);
 
-/// How many times [`guest_firewall`] tries.
-const FIREWALL_TRIES: u32 = 3;
+/// The longest rest between two of [`guest_firewall`]'s tries.
+const FIREWALL_REST_MAX: Duration = Duration::from_mins(5);
 
 /// The most descriptors the agent may hold: about four per forwarded
 /// connection and per command, many at once (a browser's).

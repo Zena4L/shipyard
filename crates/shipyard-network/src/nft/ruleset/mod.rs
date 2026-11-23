@@ -465,6 +465,12 @@ pub struct ClosedRouting {
     pub families: Vec<Family>,
     /// The host's own interfaces, at the time.
     pub interfaces: Vec<String>,
+    /// Of [`interfaces`](Self::interfaces), the bridges (read from the
+    /// kernel each time the rules are made, never recorded): only what's
+    /// bridged on one of them passes between its own ports (F111), never
+    /// what's routed back out of a plain link (that would make the host a
+    /// router for its LAN or VPN: 15.6b's review).
+    pub bridges: Vec<String>,
 }
 
 /// The batch that creates the whole table, filled with `networks` and
@@ -497,7 +503,7 @@ pub(crate) fn install(
     }
     items.extend(port_items(ports, false));
     for &family in &closed.families {
-        items.extend(close_routing(family, &closed.interfaces));
+        items.extend(close_routing(family, &closed.interfaces, &closed.bridges));
     }
     if !outside.is_empty() {
         let links: Vec<Element> = outside
@@ -511,7 +517,11 @@ pub(crate) fn install(
 
 /// Closes routing in `family` to all but the containers, between the
 /// host's `interfaces` (see the module).
-pub(crate) fn close_routing(family: Family, interfaces: &[String]) -> Vec<BatchItem> {
+pub(crate) fn close_routing(
+    family: Family,
+    interfaces: &[String],
+    bridges: &[String],
+) -> Vec<BatchItem> {
     let nfproto = match family {
         Family::V4 => NFPROTO_IPV4,
         Family::V6 => NFPROTO_IPV6,
@@ -525,11 +535,17 @@ pub(crate) fn close_routing(family: Family, interfaces: &[String]) -> Vec<BatchI
             .map(|name| Element::key(ifname_key(name)))
             .collect();
         items.push(add_elements(FAMILY, TABLE, set::UPLINKS, &uplinks, false));
+        // A bridge's own pair alone: its ports' traffic, which the forward
+        // hook sees as from it to it. A plain link's isn't: a packet in
+        // and back out of `eth0` or `wg0` is routing for someone else.
         let same: Vec<Element> = interfaces
             .iter()
+            .filter(|name| bridges.contains(name))
             .map(|name| Element::key([ifname_key(name), ifname_key(name)].concat()))
             .collect();
-        items.push(add_elements(FAMILY, TABLE, set::SAME_UPLINK, &same, false));
+        if !same.is_empty() {
+            items.push(add_elements(FAMILY, TABLE, set::SAME_UPLINK, &same, false));
+        }
     }
     items.push(add_elements(
         FAMILY,

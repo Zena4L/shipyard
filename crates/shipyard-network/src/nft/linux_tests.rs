@@ -215,6 +215,7 @@ fn ipv6_ports_are_published_and_unpublished() {
             &ClosedRouting {
                 families: vec![crate::Family::V6],
                 interfaces: vec!["eth0".into()],
+                bridges: Vec::new(),
             },
             &[],
         )
@@ -261,8 +262,8 @@ fn adjacent_subnets_and_closed_routing() {
         assert_eq!(nft.elements(set::MASQUERADE).unwrap().len(), 4);
         assert!(nft.elements(set::CLOSED).unwrap().is_empty());
         let uplinks = ["eth0".to_owned(), "wlan0".to_owned()];
-        nft.close_routing(crate::Family::V4, &uplinks).unwrap();
-        nft.close_routing(crate::Family::V4, &uplinks).unwrap();
+        nft.close_routing(crate::Family::V4, &uplinks, &[]).unwrap();
+        nft.close_routing(crate::Family::V4, &uplinks, &[]).unwrap();
         assert_eq!(nft.elements(set::CLOSED).unwrap().len(), 1);
         assert_eq!(nft.elements(set::UPLINKS).unwrap().len(), 2);
         // A rebuild keeps it closed when asked.
@@ -272,6 +273,7 @@ fn adjacent_subnets_and_closed_routing() {
             &ClosedRouting {
                 families: vec![crate::Family::V4],
                 interfaces: uplinks.to_vec(),
+                bridges: Vec::new(),
             },
             &[],
         )
@@ -345,6 +347,7 @@ fn install_everything(nft: &mut Nftables) -> Vec<PortRule> {
         &ClosedRouting {
             families: vec![crate::Family::V4, crate::Family::V6],
             interfaces: vec!["eth0".to_owned()],
+            bridges: Vec::new(),
         },
         &[],
     )

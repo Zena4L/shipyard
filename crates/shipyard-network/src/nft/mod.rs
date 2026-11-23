@@ -317,16 +317,18 @@ mod linux {
         }
 
         /// Closes routing in `family` to all but the containers, between
-        /// the host's `interfaces` (see the module `ruleset`): for a host
-        /// that didn't route before Shipyard turned forwarding on.
+        /// the host's `interfaces` (see the module `ruleset`; `bridges`, those
+        /// of them that are bridges): for a host that didn't route before
+        /// Shipyard turned forwarding on.
         pub fn close_routing(
             &mut self,
             family: crate::Family,
             interfaces: &[String],
+            bridges: &[String],
         ) -> Result<(), NetlinkError> {
             self.batch(
                 "closing routing to all but containers",
-                &ruleset::close_routing(family, interfaces),
+                &ruleset::close_routing(family, interfaces, bridges),
             )
         }
 

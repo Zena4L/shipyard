@@ -126,6 +126,10 @@ fn closed_now(
             ),
         );
     }
+    // Which of them are bridges now: only theirs keeps its own traffic.
+    if !closed.families.is_empty() {
+        closed.bridges = attach::bridges_among(&closed.interfaces)?;
+    }
     Ok(closed)
 }
 
@@ -228,7 +232,7 @@ pub(super) fn open_routing(
         }
         let interfaces = attach::host_interfaces()?;
         networks.close_routing(family, &interfaces)?;
-        nft.close_routing(family, &interfaces)?;
+        nft.close_routing(family, &interfaces, &attach::bridges_among(&interfaces)?)?;
         let kept = attach::turn_forwarding_on(family)?;
         if family == Family::V4 {
             // That turned it on for every interface: internal networks'

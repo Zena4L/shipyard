@@ -275,6 +275,25 @@ pub fn unbridged_host_interfaces() -> Result<Vec<String>, AttachError> {
     Ok(closable(links.links()?, &uplinks))
 }
 
+/// Of `names`, the host's links that are bridges now: the closed
+/// interfaces whose own ports' traffic stays allowed (F111), read from the
+/// kernel each time routing's rules are made.
+pub fn bridges_among(names: &[String]) -> Result<Vec<String>, AttachError> {
+    let mut links = Rtnetlink::new()?;
+    Ok(bridges_of(links.links()?, names))
+}
+
+/// Of `links`, the bridges among `names`, sorted.
+fn bridges_of(links: Vec<crate::route::Link>, names: &[String]) -> Vec<String> {
+    let mut bridges: Vec<String> = links
+        .into_iter()
+        .filter(|link| link.kind.as_deref() == Some("bridge") && names.contains(&link.name))
+        .map(|link| link.name)
+        .collect();
+    bridges.sort();
+    bridges
+}
+
 /// Of `links`, those F65's closing takes: not bridges or their ports
 /// (another engine's), unless one is an uplink (its index in `uplinks`);
 /// never the loopback or Shipyard's own. Sorted by name.
@@ -613,6 +632,30 @@ mod tests {
         // The control: with no default route through it, br0 is left out
         // as another engine's would be.
         assert_eq!(closable(links(), &[]), ["wg0"]);
+    }
+
+    /// 15.6b: of the closed interfaces, only the bridges keep their own
+    /// pair open (what's bridged on `br0`); a plain link (`wg0`) never, or
+    /// the host would route a packet back out of it for someone else.
+    #[test]
+    fn only_a_closed_bridge_keeps_its_own_traffic() {
+        let link = |index: u32, name: &str, kind: Option<&str>| crate::route::Link {
+            index,
+            name: name.to_owned(),
+            kind: kind.map(str::to_owned),
+            flags: 0,
+            mtu: None,
+            master: None,
+            mac: None,
+        };
+        let links = vec![
+            link(2, "br0", Some("bridge")),
+            link(4, "docker0", Some("bridge")),
+            link(6, "wg0", Some("wireguard")),
+            link(8, "eth1", None),
+        ];
+        let closed = ["br0".to_owned(), "wg0".to_owned(), "eth1".to_owned()];
+        assert_eq!(bridges_of(links, &closed), ["br0"]);
     }
 
     /// Both default routes.
