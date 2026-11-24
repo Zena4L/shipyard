@@ -128,11 +128,13 @@ jobs:
 
   # The Mac's guest, carrying the release's own arm64 `shipyard` (taken
   # outside the checkout: the tree stays clean, and the guest names the
-  # commit); built twice and compared.
+  # commit); built twice and compared, and a third time from the packages
+  # the first kept (the asset that rebuilds it once Alpine drops them, F211),
+  # compared too.
   guest:
     needs: linux
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,6 +151,9 @@ jobs:
           scripts/release/guest.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/binary/shipyard" "${VERSION#v}"
           scripts/release/guest.sh "$RUNNER_TEMP/again" "$RUNNER_TEMP/binary/shipyard" "${VERSION#v}"
           scripts/release/compare.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/again"
+          SHIPYARD_GUEST_APKS=$(echo "$RUNNER_TEMP"/dist/*-guest-apks.tar.gz) \
+              scripts/release/guest.sh "$RUNNER_TEMP/kept" "$RUNNER_TEMP/binary/shipyard" "${VERSION#v}"
+          scripts/release/compare.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/kept"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: guest
@@ -250,9 +255,14 @@ jobs:
 
   # Checksums and attestations over every artifact (the SBOMs too), each
   # then checked as a user checks a release: by this workflow, from this ref
-  # and commit. Runs none of the repository's code.
+  # and commit. Runs none of the repository's code. Linux's part is enough
+  # (15.6b3a): the Mac's (guest, macos) goes in when it built, and a release
+  # without it says so (`release`).
   attest:
     needs: [compare, guest, macos, sbom, test-packages]
+    if: >-
+      !cancelled() && needs.compare.result == 'success' && needs.sbom.result == 'success'
+      && needs.test-packages.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -287,8 +297,10 @@ jobs:
   # For a pushed tag only (never a run by hand, whatever its ref): a draft
   # release with the artifacts and the version's CHANGELOG section.
   release:
-    needs: attest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [attest, guest, macos]
+    if: >-
+      !cancelled() && needs.attest.result == 'success'
+      && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -303,8 +315,22 @@ jobs:
           path: dist
       - env:
           GH_TOKEN: ${{ github.token }}
+          GUEST: ${{ needs.guest.result }}
+          MACOS: ${{ needs.macos.result }}
         run: |
-          scripts/release/notes.sh "${VERSION#v}" >notes.md
+          # A re-run of a failed job runs this again: never a second draft.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              echo "$GITHUB_REF_NAME has a release already: delete its draft to make it again" >&2
+              exit 1
+          fi
+          {
+              if [ "$MACOS" != success ]; then
+                  echo "**The Mac's part isn't in this release:** its binary and app didn't build (guest: $GUEST, Mac: $MACOS)."
+                  echo "Linux's binaries, packages and SBOMs are here; the Mac's follow in a patch release."
+                  echo
+              fi
+              scripts/release/notes.sh "${VERSION#v}"
+          } >notes.md
           # A version with a `-` (`1.0.0-rc.1`) is a prerelease: the tap,
           # which skips those, never moves to it.
           prerelease=()

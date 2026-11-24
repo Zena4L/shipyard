@@ -120,6 +120,12 @@ behaviour; each change is listed here).
   monitor's, as counters.
 ### Changed
 
+- **A release can be rebuilt after its inputs are gone** (F211, step 15.6b3a): the
+  guest's Alpine packages are kept with each release (`…-guest-apks.tar.gz`, which
+  `SHIPYARD_GUEST_APKS=` builds from, every package's signature still checked), and
+  `musl-tools` comes from Debian's archive at a fixed time on snapshot.debian.org. A
+  release whose Mac part fails to build still publishes Linux's, saying so. The guest's
+  kernel is Alpine's `linux-virt` 6.18.65 (6.18.64 was withdrawn).
 - **A failed build says BuildKit's exit code** ("the build failed (BuildKit's exit code
   N)"), beside its last lines.
 - **Shipyard is licensed under Apache-2.0 alone** (it was MIT or Apache-2.0, at your

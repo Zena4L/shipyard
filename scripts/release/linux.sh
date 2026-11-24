@@ -49,4 +49,5 @@ timeout 3600 docker run --rm \
     --env SOURCE_DATE_EPOCH="$(git -C "$repo" log -1 --format=%ct "$commit")" \
     --env SHIPYARD_REVISION_GIVEN="${commit:0:12}" \
     --env VERSION="$version" --env ARCH="$arch" --env MUSL_TOOLS="$MUSL_TOOLS" \
+    --env DEBIAN_SNAPSHOT="$DEBIAN_SNAPSHOT" \
     --workdir /build/shipyard "$BUILD_IMAGE" bash scripts/release/linux-inside.sh
