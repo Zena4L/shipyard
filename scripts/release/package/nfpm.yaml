@@ -19,6 +19,11 @@ description: |-
   A lightweight, daemonless container engine.
   Runs containers rootless by default, serves a subset of Docker's Engine API
   for Docker's own clients, and builds images with BuildKit.
+
+  Where AppArmor 4 runs (Ubuntu 23.10 and later), installing it loads an
+  AppArmor profile that lets every user of the host make unprivileged user
+  namespaces through shipyard, which rootless containers need; removing it
+  unloads the profile. No service is enabled or started.
 vendor: Shipyard
 homepage: https://github.com/Zena4L/shipyard
 license: Apache-2.0

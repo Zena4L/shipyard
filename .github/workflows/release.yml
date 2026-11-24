@@ -27,8 +27,10 @@ env:
   VERSION: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
 jobs:
-  # A tag's release checked before the long builds: its version is the
-  # workspace's, and the CHANGELOG has its dated section (its notes).
+  # A tag's release checked before the long builds: its commit is on main
+  # (never a branch's unmerged work), it has no release yet (no second
+  # draft), its version is the workspace's, and the CHANGELOG has its dated
+  # section (its notes).
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -36,8 +38,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - if: env.VERSION != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "the tag's commit isn't on main" >&2
+              exit 1
+          fi
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$VERSION has a release already (a draft too): delete it first" >&2
+              exit 1
+          fi
           workspace=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "${VERSION#v}" != "$workspace" ]; then
               echo "the tag says ${VERSION#v}, the workspace $workspace" >&2
@@ -218,9 +231,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # A tag's run builds its tools afresh: a cache other workflows can write
+      # never reaches a release's SBOMs. A dry run may use it.
       - id: image
+        if: env.VERSION == ''
         run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - if: env.VERSION == ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/tools
           key: release-tools-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/release/build.env') }}
@@ -288,5 +305,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           scripts/release/notes.sh "${VERSION#v}" >notes.md
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+          # A version with a `-` (`1.0.0-rc.1`) is a prerelease: the tap,
+          # which skips those, never moves to it.
+          prerelease=()
+          case $VERSION in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag "${prerelease[@]}" \
               --title "Shipyard ${VERSION#v}" --notes-file notes.md dist/*

@@ -3149,6 +3149,7 @@ mod tests {
                 ClosedRouting {
                     families: vec![Family::V6],
                     interfaces: names(&["eth0", "wlan0"]),
+                    bridges: Vec::new(),
                 }
             );
             // The interfaces of both closings, once each.
@@ -3160,6 +3161,7 @@ mod tests {
                 ClosedRouting {
                     families: vec![Family::V4, Family::V6],
                     interfaces: names(&["eth0", "eth1", "wlan0"]),
+                    bridges: Vec::new(),
                 }
             );
             fs::write(scratch.0.join(ROUTING_CLOSED6), "another-boot\nwlan0\n").unwrap();
@@ -3168,6 +3170,7 @@ mod tests {
                 ClosedRouting {
                     families: vec![Family::V4],
                     interfaces: names(&["eth0", "eth1"]),
+                    bridges: Vec::new(),
                 }
             );
         }

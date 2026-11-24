@@ -124,7 +124,10 @@ These are your choices, and Shipyard doesn't defend against them:
   seccomp=unconfined` or `no-new-privileges=false`, `--device` and
   `--device-cgroup-rule`, root's `--oom-score-adj` down to -1000 (the kernel's
   out-of-memory killer then picks the host's services first), a bind mount (followed as
-  Docker follows it), `--network host`, `--pid host` (root only), and joining another
+  Docker follows it; as root, its set-user-ID files and device nodes keep working, as
+  Docker's do: a container that can write one can leave a set-user-ID program or a device
+  node for the host's users, so bind read-only, or a directory no one runs from),
+  `--network host`, `--pid host` (root only), and joining another
   container's network, IPC or PID namespace (rootless, the joiner shares its user
   namespace). `--privileged` itself is refused: give the capabilities and devices it
   needs.
@@ -146,7 +149,9 @@ These are your choices, and Shipyard doesn't defend against them:
   namespace of its own: build only Dockerfiles you'd run.
 - **Shipyard's AppArmor profile** isn't a boundary for containers: it lets users who can
   run Shipyard make user namespaces where Ubuntu restricts them (what rootless needs), as
-  Podman's does. Containers get no AppArmor or SELinux label of their own.
+  Podman's does. The `.deb` and `.rpm` load it when they're installed, where AppArmor 4
+  runs: from then on, every user of the host may make them through `shipyard`. Containers
+  get no AppArmor or SELinux label of their own.
 - **Not limited by default, as with Docker:** a container's memory (`--memory`), its CPU
   and I/O (`--cpus`, `--blkio-weight`…), its disk (a writable layer or a volume has no
   quota), and the host's connection-tracking table (`--conntrack-limit` on a network);

@@ -30,6 +30,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The tools as CI's `docs` job keeps them (the same key).
       # The runner's image (lychee links its OpenSSL): only a step sees it.
       - id: image

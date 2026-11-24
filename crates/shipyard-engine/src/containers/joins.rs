@@ -52,7 +52,7 @@ pub(crate) struct JoinedRuns {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct V1 {
-    v: u32,
+    version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     network: Option<JoinedRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,16 +72,18 @@ impl JoinedRuns {
     /// As the file keeps it.
     fn to_json(&self) -> serde_json::Result<Vec<u8>> {
         serde_json::to_vec(&V1 {
-            v: VERSION,
+            version: VERSION,
             network: self.network.clone(),
             ipc: self.ipc.clone(),
         })
     }
 
-    /// What `bytes` say, if they're a file of a version this reads.
+    /// What `bytes` say, if they're a file of a version this reads (a
+    /// newer one's or an unreadable one's: nothing, as the views that ask
+    /// never fail for it).
     fn from_json(bytes: &[u8]) -> Option<Self> {
-        let read: V1 = serde_json::from_slice(bytes).ok()?;
-        (read.v == VERSION).then_some(Self {
+        let read: V1 = shipyard_sys::versioned::read(bytes, VERSION).ok()?;
+        Some(Self {
             network: read.network,
             ipc: read.ipc,
         })
@@ -263,13 +265,17 @@ mod tests {
             ipc: None,
         };
         let pinned = format!(
-            r#"{{"v":1,"network":{{"id":"{}","pid":42,"start_time":7}}}}"#,
+            r#"{{"version":1,"network":{{"id":"{}","pid":42,"start_time":7}}}}"#,
             "a".repeat(64)
         );
         assert_eq!(String::from_utf8(runs.to_json().unwrap()).unwrap(), pinned);
         assert_eq!(JoinedRuns::from_json(pinned.as_bytes()), Some(runs));
         assert_eq!(
-            JoinedRuns::from_json(pinned.replace(r#""v":1"#, r#""v":2"#).as_bytes()),
+            JoinedRuns::from_json(
+                pinned
+                    .replace(r#""version":1"#, r#""version":2"#)
+                    .as_bytes()
+            ),
             None
         );
         assert_eq!(JoinedRuns::from_json(b"[1,2]"), None);

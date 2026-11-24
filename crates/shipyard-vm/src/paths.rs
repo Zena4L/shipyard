@@ -23,6 +23,11 @@ pub struct VmPaths {
     /// place that moves with the binary, never written down for later
     /// (`vm install`'s agent finds it again from the binary it runs: F178).
     pub guest_beside: bool,
+    /// A guest beside this binary that the VM directory's (first, kept
+    /// from an install before) is booted instead of: `doctor` names both
+    /// when they're different builds, so an upgrade through Homebrew never
+    /// runs an old guest unsaid (15.6b's review).
+    pub shadowed: Option<PathBuf>,
 }
 
 /// The guest's files when `SHIPYARD_GUEST_DIR` doesn't say (13.6b2, F106):
@@ -39,10 +44,20 @@ pub struct VmPaths {
 #[must_use]
 pub(crate) fn guest_dir(vm_dir: &Path, exe: Option<&Path>) -> PathBuf {
     let kept = vm_dir.join("guest");
-    let has_guest = |dir: &Path| dir.join(crate::MANIFEST).is_file();
     if has_guest(&kept) {
         return kept;
     }
+    guest_beside(exe).unwrap_or(kept)
+}
+
+/// Whether `dir` holds a guest (its manifest).
+fn has_guest(dir: &Path) -> bool {
+    dir.join(crate::MANIFEST).is_file()
+}
+
+/// The guest beside the binary `exe` (canonical), if one is there in a
+/// place [`guest_dir`] trusts.
+fn guest_beside(exe: Option<&Path>) -> Option<PathBuf> {
     let me = nix::unistd::geteuid().as_raw();
     let trusted = |path: &Path, dir: bool| {
         std::fs::symlink_metadata(path).is_ok_and(|metadata| {
@@ -67,7 +82,6 @@ pub(crate) fn guest_dir(vm_dir: &Path, exe: Option<&Path>) -> PathBuf {
         .filter(|built| trusted(built, true))
         .map(|built| built.join("guest"))
         .filter(|beside| has_guest(beside) && trusted(beside, true) && trusted_files(beside))
-        .unwrap_or(kept)
 }
 
 /// Whether a directory (or one of its files) owned by `owner`, with `mode`,
@@ -95,17 +109,24 @@ impl VmPaths {
             })?;
             Self::default_dir(Path::new(&home))
         };
-        let (guest, guest_beside) = var("SHIPYARD_GUEST_DIR").map_or_else(
+        let guest = var("SHIPYARD_GUEST_DIR").map_or_else(
             || {
                 let exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
                 let found = guest_dir(&dir, exe.as_deref());
                 let beside = found != dir.join("guest");
-                (found, beside)
+                let shadowed = if beside {
+                    None
+                } else {
+                    guest_beside(exe.as_deref())
+                };
+                (found, beside, shadowed)
             },
-            |given| (PathBuf::from(given), false),
+            |given| (PathBuf::from(given), false, None),
         );
+        let (guest, guest_beside, shadowed) = guest;
         let mut paths = Self::at(dir, guest)?;
         paths.guest_beside = guest_beside;
+        paths.shadowed = shadowed;
         Ok(paths)
     }
 
@@ -134,6 +155,7 @@ impl VmPaths {
             dir,
             guest,
             guest_beside: false,
+            shadowed: None,
         })
     }
 
@@ -395,6 +417,9 @@ mod tests {
             vm.join("guest"),
             "the VM's own first"
         );
+        // ... and the one beside, which it shadows, still found for
+        // `doctor` to name.
+        assert_eq!(guest_beside(Some(&exe)), Some(built.join("guest")));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

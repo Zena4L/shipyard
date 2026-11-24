@@ -163,8 +163,37 @@ fn launcher(socket: &Path) -> Option<(PathBuf, Vec<OsString>)> {
     let log = socket
         .parent()?
         .join(shipyard_engine::api_service::SERVICE_LOG);
-    let args = user_unit_args(socket, &exe, &log, std::env::vars_os())?;
+    let by_name = systemd_version(&systemd_run).is_some_and(|version| version >= 250);
+    let args = user_unit_args(socket, &exe, &log, by_name, std::env::vars_os())?;
     Some((systemd_run, args))
+}
+
+/// `systemd-run --version`'s number (its first line: `systemd 255
+/// (255.4-1ubuntu8)`), if it says one.
+#[cfg(target_os = "linux")]
+fn systemd_version(systemd_run: &Path) -> Option<u32> {
+    let output = std::process::Command::new(systemd_run)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    version_said(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The number in `systemd NNN …`, the first line of `--version`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux has a user manager")
+)]
+fn version_said(text: &str) -> Option<u32> {
+    text.lines()
+        .next()?
+        .strip_prefix("systemd ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Whether `/proc/self/cgroup`'s `own` says this process is in a user
@@ -220,9 +249,14 @@ fn passed_on(name: &std::ffi::OsStr) -> bool {
 /// the engine asks the socket again), collected once it ends, which stops
 /// only its own process (the containers it started run on, as the shipped
 /// unit's `KillMode=process`), its output appended to `log`, given the
-/// caller's variables [`passed_on`] says. `None` for a path that isn't
-/// [`plain`], or a value passed on that isn't UTF-8 or holds a control
-/// character (systemd refuses it): the caller's child then.
+/// caller's variables [`passed_on`] says. `by_name` (systemd 250 on): by
+/// name alone (`--setenv=NAME`, the value read from `systemd-run`'s own
+/// environment, this process's), so a proxy's password is never on a
+/// command line another user's `ps` reads (15.6b's review); before 250
+/// with their values, and `None` for a proxy whose value holds a
+/// password (an `@`). `None` too for a path that isn't [`plain`], or a
+/// value passed on that isn't UTF-8 or holds a control character (systemd
+/// refuses it): the caller's child then.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only Linux has a user manager")
@@ -231,6 +265,7 @@ fn user_unit_args(
     socket: &Path,
     exe: &Path,
     log: &Path,
+    by_name: bool,
     environment: impl Iterator<Item = (OsString, OsString)>,
 ) -> Option<Vec<OsString>> {
     let (socket, exe, log) = (plain(socket)?, plain(exe)?, plain(log)?);
@@ -256,9 +291,19 @@ fn user_unit_args(
             return None;
         }
         let mut set = OsString::from("--setenv=");
-        set.push(name);
-        set.push("=");
-        set.push(value);
+        set.push(&name);
+        if !by_name {
+            if name
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("_proxy")
+                && value.contains('@')
+            {
+                return None;
+            }
+            set.push("=");
+            set.push(value);
+        }
         args.push(set);
     }
     args.extend(
@@ -320,15 +365,16 @@ mod tests {
 
     /// Through the user's manager (F198): a unit named by its socket,
     /// only its own process stopped, its output to the log, Shipyard's
-    /// variables and Docker's config passed on and nothing else (its
-    /// `PATH` the manager's), then the service's own command.
+    /// variables and Docker's config passed on by name and nothing else
+    /// (its `PATH` the manager's; no value, a proxy's password, in the
+    /// arguments), then the service's own command.
     #[test]
     fn the_service_is_a_unit_of_the_user_s_manager() {
         let environment = [
             ("SHIPYARD_IMAGE_STORE", "/tmp/images"),
             ("DOCKER_CONFIG", "/home/u/.docker"),
             ("PATH", "/opt/gui/bin"),
-            ("https_proxy", "http://proxy:3128"),
+            ("https_proxy", "http://user:secret@proxy:3128"),
             ("LD_PRELOAD", "/x.so"),
         ]
         .map(|(name, value)| (OsString::from(name), OsString::from(value)));
@@ -336,6 +382,7 @@ mod tests {
             Path::new("/run/user/1000/shipyard/api.sock"),
             Path::new("/usr/local/bin/shipyard"),
             Path::new("/run/user/1000/shipyard/service.log"),
+            true,
             environment.clone().into_iter(),
         )
         .unwrap();
@@ -355,9 +402,9 @@ mod tests {
                 "--property=KillMode=process",
                 "--property=StandardOutput=append:/run/user/1000/shipyard/service.log",
                 "--property=StandardError=append:/run/user/1000/shipyard/service.log",
-                "--setenv=SHIPYARD_IMAGE_STORE=/tmp/images",
-                "--setenv=DOCKER_CONFIG=/home/u/.docker",
-                "--setenv=https_proxy=http://proxy:3128",
+                "--setenv=SHIPYARD_IMAGE_STORE",
+                "--setenv=DOCKER_CONFIG",
+                "--setenv=https_proxy",
                 "--",
                 "/usr/local/bin/shipyard",
                 "system",
@@ -381,6 +428,7 @@ mod tests {
                 Path::new("/tmp/api.sock"),
                 Path::new("/usr/local/bin/shipyard"),
                 Path::new("/tmp/service.log"),
+                true,
                 control.into_iter(),
             )
             .is_none()
@@ -397,11 +445,55 @@ mod tests {
                     Path::new(odd),
                     Path::new("/usr/local/bin/shipyard"),
                     Path::new("/tmp/service.log"),
+                    true,
                     environment.clone().into_iter(),
                 )
                 .is_none(),
                 "{odd}"
             );
         }
+    }
+
+    /// Before systemd 250 (no `--setenv=NAME` from the environment): the
+    /// values in the arguments, but never a proxy's password (the caller's
+    /// child then, which no other user's `ps` reads the environment of).
+    #[test]
+    fn an_older_systemd_gets_values_but_no_password() {
+        let unit_args = |environment: &[(&str, &str)]| {
+            user_unit_args(
+                Path::new("/tmp/api.sock"),
+                Path::new("/usr/local/bin/shipyard"),
+                Path::new("/tmp/service.log"),
+                false,
+                environment
+                    .iter()
+                    .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+            )
+        };
+        let args = unit_args(&[
+            ("DOCKER_CONFIG", "/home/u/.docker"),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+        ])
+        .unwrap();
+        assert!(args.contains(&OsString::from("--setenv=DOCKER_CONFIG=/home/u/.docker")));
+        assert!(args.contains(&OsString::from("--setenv=HTTPS_PROXY=http://proxy:3128")));
+        for name in ["HTTPS_PROXY", "all_proxy"] {
+            assert!(
+                unit_args(&[(name, "http://user:secret@proxy:3128")]).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    /// `systemd-run --version`'s number, from its first line alone.
+    #[test]
+    fn systemd_s_version_is_read() {
+        assert_eq!(
+            version_said("systemd 249 (249.11-0ubuntu3.12)\n+PAM +AUDIT\n"),
+            Some(249)
+        );
+        assert_eq!(version_said("systemd 257 (257.9-1.fc42)"), Some(257));
+        assert_eq!(version_said("other 1\nsystemd 300"), None);
+        assert_eq!(version_said(""), None);
     }
 }

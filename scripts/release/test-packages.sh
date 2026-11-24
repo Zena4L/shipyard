@@ -69,7 +69,10 @@ timeout 900 docker run --rm --privileged --volume "$dir:/packages:ro" "$UBUNTU_I
     if dpkg-deb -c /packages/$deb | grep '^d' | grep -v '^drwxr-xr-x'; then
         echo 'a directory in the package is not drwxr-xr-x' >&2; exit 1
     fi
-    apt-get -o Acquire::Retries=10 update -qq
+    # Every apt-get below retries a dropped download, with short timeouts.
+    printf 'Acquire::Retries \"10\";\nAcquire::http::Timeout \"20\";\n' \
+        >/etc/apt/apt.conf.d/80retries
+    apt-get update -qq
     # AppArmor 4 (as on an Ubuntu host), so the profile is placed.
     apt-get install -y -qq apparmor >/dev/null
     apt-get install -y -qq /packages/$deb >/dev/null
