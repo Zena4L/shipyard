@@ -4,13 +4,13 @@
 # build sees is the same in every run, and the ones that would name the
 # machine are remapped, so the bytes depend on the commit alone.
 set -euo pipefail
-: "${VERSION:?}" "${ARCH:?}" "${MUSL_TOOLS:?}" "${SOURCE_DATE_EPOCH:?}" "${SHIPYARD_REVISION_GIVEN:?}"
+: "${VERSION:?}" "${ARCH:?}" "${MUSL_TOOLS:?}" "${DEBIAN_SNAPSHOT:?}" "${SOURCE_DATE_EPOCH:?}" "${SHIPYARD_REVISION_GIVEN:?}"
 target=$ARCH-unknown-linux-musl
 export CARGO_TARGET_DIR=/tmp/target CARGO_INCREMENTAL=0
 
-apt=(apt-get -o Acquire::Retries=30 -o Acquire::http::Timeout=10)
-"${apt[@]}" update -qq
-"${apt[@]}" install -y -qq --no-install-recommends "musl-tools=$MUSL_TOOLS" >/dev/null
+# musl's tools from Debian's archive as it was at DEBIAN_SNAPSHOT (F211).
+. scripts/release/snapshot-apt.sh
+apt_install "musl-tools=$MUSL_TOOLS"
 rustup target add "$target" >/dev/null
 
 # The workspace, cargo's and rustup's homes, in the binaries' panic messages

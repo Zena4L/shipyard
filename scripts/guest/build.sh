@@ -10,7 +10,10 @@
 #   (F92); UPDATE_GUEST_LOCK=1 writes that lock from this build instead.
 #   SHIPYARD_GUEST_BINARY: a static arm64 `shipyard` to carry (a release's),
 #   instead of building one; IMAGE: the image to build in (a release's
-#   pinned one, scripts/release/build.env).
+#   pinned one, scripts/release/build.env); SHIPYARD_GUEST_APKS: a release's
+#   kept packages (its `…-guest-apks.tar.gz`) to install instead of
+#   fetching them (Alpine drops old versions: F211). OUT/apks gets the
+#   packages each build installed.
 set -euo pipefail
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 out=${1:-$repo/target/guest}
@@ -28,6 +31,13 @@ else
   dirty=$(git -C "$repo" status --porcelain | head -c1)
   [ -n "$dirty" ] && revision="$revision-dirty"
 fi
+apks=()
+if [ -n "${SHIPYARD_GUEST_APKS:-}" ]; then
+  kept=$(mktemp -d)
+  trap 'rm -rf "$kept"' EXIT
+  tar -xzf "$SHIPYARD_GUEST_APKS" -C "$kept" --strip-components=1
+  apks=(--volume "$kept:/apks:ro")
+fi
 binary=()
 if [ -n "${SHIPYARD_GUEST_BINARY:-}" ]; then
   given=$(cd "$(dirname "$SHIPYARD_GUEST_BINARY")" && pwd)/$(basename "$SHIPYARD_GUEST_BINARY")
@@ -41,7 +51,7 @@ timeout 3600 docker run --rm --privileged \
     --env CARGO_TARGET_DIR=/target --env REVISION="$revision" \
     --env SHIPYARD_GUEST_MIRROR="${SHIPYARD_GUEST_MIRROR:-}" \
     --env UPDATE_GUEST_LOCK="${UPDATE_GUEST_LOCK:-}" \
-    ${binary[@]+"${binary[@]}"} \
+    ${binary[@]+"${binary[@]}"} ${apks[@]+"${apks[@]}"} \
     --workdir /src "$image" bash /src/scripts/guest/build-inside.sh
 # A lock this build wrote (UPDATE_GUEST_LOCK=1) into the tree.
 if [ "${UPDATE_GUEST_LOCK:-}" = 1 ]; then

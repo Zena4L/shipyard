@@ -4,7 +4,9 @@
 # arm64 `shipyard` (BINARY, from linux.sh's tarball), packed reproducibly as
 # OUT/shipyard-VERSION-guest-arm64.tar.gz (its kernel, initramfs and
 # manifest), with its packages' list (scripts/guest/alpine.installed) beside
-# it as OUT/shipyard-VERSION-guest-packages.txt.
+# it as OUT/shipyard-VERSION-guest-packages.txt, and the packages themselves
+# as OUT/shipyard-VERSION-guest-apks.tar.gz (15.6b3a, F211: Alpine drops old
+# versions; `SHIPYARD_GUEST_APKS=` that file rebuilds this guest from them).
 #
 # usage: scripts/release/guest.sh OUT BINARY [VERSION]   (VERSION as linux.sh's)
 set -euo pipefail
@@ -30,12 +32,16 @@ IMAGE=$BUILD_IMAGE SHIPYARD_GUEST_BINARY=$binary REVISION=${commit:0:12} \
 name=shipyard-$version-guest-arm64
 mkdir "$built/$name"
 cp "$built/guest/Image" "$built/guest/initramfs.cpio.gz" "$built/guest/manifest.json" "$built/$name/"
+apks=shipyard-$version-guest-apks
+cp -R "$built/guest/apks" "$built/$apks"
 # Packed in the pinned image too: the same tar and gzip wherever it's built.
 timeout 600 docker run --rm --volume "$built:/built:ro" --volume "$out:/out" \
-    --env NAME="$name" --env EPOCH="$epoch" "$BUILD_IMAGE" bash -c '
+    --env EPOCH="$epoch" "$BUILD_IMAGE" bash -c '
         set -euo pipefail
-        tar --create --directory=/built --sort=name --mtime="@$EPOCH" \
-            --owner=0 --group=0 --numeric-owner --mode="u=rwX,go=rX" \
-            --format=gnu "$NAME" | gzip -n -9 >"/out/$NAME.tar.gz"'
+        for name in "$@"; do
+            tar --create --directory=/built --sort=name --mtime="@$EPOCH" \
+                --owner=0 --group=0 --numeric-owner --mode="u=rwX,go=rX" \
+                --format=gnu "$name" | gzip -n -9 >"/out/$name.tar.gz"
+        done' packing "$name" "$apks"
 cp "$repo/scripts/guest/alpine.installed" "$out/shipyard-$version-guest-packages.txt"
 (cd "$out" && shasum -a 256 "$name.tar.gz")

@@ -386,8 +386,9 @@ that runs here too:
 
 What a release is built with is pinned in `scripts/release/build.env` (the Rust image by
 digest, an index for both architectures, which `scripts/test-image/Dockerfile`'s `FROM`
-must equal; `musl-tools`; `cargo-cyclonedx`) and `rust-toolchain.toml` (the compiler,
-exactly). `linux.sh`, `guest.sh` and `macos.sh` refuse a tree with changes: a release is a
+must equal; `musl-tools`, fetched from Debian's archive as it was at `DEBIAN_SNAPSHOT`
+on snapshot.debian.org, which keeps every version; `cargo-cyclonedx`) and
+`rust-toolchain.toml` (the compiler, exactly). `linux.sh`, `guest.sh` and `macos.sh` refuse a tree with changes: a release is a
 commit. `VERSION` is the tag's; without one, the workspace's and the commit's
 (`0.5.0-276b34b1c0de`). A tag is checked first: its version is the workspace's, and the
 CHANGELOG has its section, dated (`scripts/release/notes.sh`, the release's notes: undated
@@ -424,10 +425,24 @@ brew uninstall shipyard && brew untap you/shipyard-test
 
 (Never with `HOMEBREW_NO_INSTALL_FROM_API`: it makes brew clone all of `homebrew-core`.)
 
-Rebuilding later needs what the build fetched to still be there (the image by its digest,
-`musl-tools` at its version, the guest's Alpine packages): mirrors drop old versions, so
-"the same bytes" is checked at release time, on a second runner, before anything is
-published.
+Rebuilding later needs what the build fetched to still be there. The image is kept by its
+digest, `musl-tools` by the snapshot, and the guest's Alpine packages by the release
+itself: `shipyard-VERSION-guest-apks.tar.gz` holds every package the guest installed
+(Alpine drops old versions within days), and a later build installs them again instead of
+fetching them, each still checked with the pinned minirootfs's keys and against
+`alpine.installed`:
+
+```sh
+SHIPYARD_GUEST_APKS=shipyard-1.0.0-guest-apks.tar.gz SHIPYARD_GUEST_BINARY=… \
+    scripts/guest/build.sh again/guest
+```
+
+A release whose Mac part doesn't build (a guest or a Mac binary that fails) still
+publishes Linux's: the notes say the Mac's follows in a patch release, and the tap stays
+where it is. Re-running a failed job of a tag's run makes no second draft: delete the
+draft first. The release's guest job builds the guest a third time from the packages
+it kept, and compares that too. A guest built from a checkout gets `musl-tools` from the
+same snapshot (`scripts/release/snapshot-apt.sh`, shared).
 
 ## Shipyard's own VM on a Mac (step 10.3)
 
@@ -447,7 +462,9 @@ kernel's modules, `e2fsprogs` and the static `shipyard` as `/init`. What it's
 built from is pinned in `scripts/guest/alpine.lock`, and every package it installs,
 dependencies too, in `scripts/guest/alpine.installed` (each by its identity in apk's
 database: a build that installs anything else fails, saying what; after a re-pin,
-`UPDATE_GUEST_LOCK=1 scripts/guest/build.sh` writes it again); `manifest.json` beside it says
+`UPDATE_GUEST_LOCK=1 scripts/guest/build.sh` writes it again; the packages it installed are
+kept in `target/guest/apks`, and `SHIPYARD_GUEST_APKS=` a release's kept set builds from
+those instead of Alpine's CDN); `manifest.json` beside it says
 what it was made of, and the VM checks the files against it before it boots. On a
 network that breaks Alpine's TLS (one met in 13.2 drops OpenSSL 3.5's post-quantum
 hello), `SHIPYARD_GUEST_MIRROR=http://dl-cdn.alpinelinux.org/alpine scripts/guest/build.sh`

@@ -7,16 +7,18 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 echo "== shipyard, static (musl)"
-# (apt over IPv4 alone: the mirror answers on IPv6 first, and Docker's VM
-# may have no IPv6 route; its tries there time out.)
-apt=(apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=30 -o Acquire::http::Timeout=5)
 # A release's own binary when it's given (SHIPYARD_GUEST_BINARY, mounted at
 # /binary: the guest carries exactly what's released); else built here.
 if [ -f /binary/shipyard ]; then
   binary=/binary/shipyard
 else
   . /src/scripts/release/build.env
-  command -v musl-gcc >/dev/null || { "${apt[@]}" update -qq && "${apt[@]}" install -y -qq "musl-tools=$MUSL_TOOLS" >/dev/null; }
+  # musl's tools as a release gets them (F211: the snapshot, as IPv4 alone:
+  # Docker's VM may have no IPv6 route).
+  if ! command -v musl-gcc >/dev/null; then
+    . /src/scripts/release/snapshot-apt.sh
+    apt_install "musl-tools=$MUSL_TOOLS"
+  fi
   rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1
   CC_aarch64_unknown_linux_musl=musl-gcc cargo build --locked --release -q \
       --target aarch64-unknown-linux-musl -p shipyard-cli --bin shipyard
@@ -44,17 +46,60 @@ cp /etc/resolv.conf "$root/etc/resolv.conf"
 mirror=${SHIPYARD_GUEST_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}
 printf '%s\n' "$mirror/$ALPINE_BRANCH/main" "$mirror/$ALPINE_BRANCH/community" \
     >"$root/etc/apk/repositories"
-# Scripts not run: linux-virt's would make an initramfs of its own.
-# (Three tries: a mirror that drops the index fetch once makes apk say the
-# packages don't exist.)
-for try in 1 2 3; do
-  # shellcheck disable=SC2086
-  chroot "$root" /sbin/apk add --no-cache --no-scripts --quiet \
-      --repository "$mirror/$KERNEL_BRANCH/main" \
-      $PACKAGES $KERNEL_PACKAGE && break
-  [ "$try" = 3 ] && exit 1
-  echo "apk failed (try $try): again"; sleep 5
-done
+# Scripts not run: linux-virt's would make an initramfs of its own. Every
+# package it installs is kept (apk's cache, `--cache-packages`) and goes to
+# OUT/apks, out of the guest (15.6b3a, F211): a release publishes them, and a
+# later build of it installs them again (SHIPYARD_GUEST_APKS, at /apks) when
+# Alpine no longer serves them. Either way each package's signature is checked
+# with the pinned minirootfs's keys (no --allow-untrusted), and what's
+# installed against alpine.installed below.
+cache=/var/cache/apk
+mkdir -p "$root$cache"
+world=$(cat "$root/etc/apk/world")
+if [ -d /apks ]; then
+  kept=(/apks/*.apk)
+  if [ ! -e "${kept[0]}" ]; then
+    echo "SHIPYARD_GUEST_APKS holds no .apk files" >&2
+    exit 1
+  fi
+  # A lock is written from what's fetched for a re-pin, never from a kept set.
+  if [ "${UPDATE_GUEST_LOCK:-}" = 1 ]; then
+    echo "UPDATE_GUEST_LOCK=1 with SHIPYARD_GUEST_APKS: re-pin from Alpine's CDN" >&2
+    exit 1
+  fi
+  echo "   (from the kept packages: ${#kept[@]})"
+  cp "${kept[@]}" "$root$cache/"
+  # The files, and the pins by name: apk holds them to alpine.lock's too.
+  chroot "$root" sh -c "/sbin/apk add --no-network --no-scripts --quiet $cache/*.apk $PACKAGES $KERNEL_PACKAGE"
+else
+  # (Three tries: a mirror that drops the index fetch once makes apk say the
+  # packages don't exist.)
+  for try in 1 2 3; do
+    # shellcheck disable=SC2086
+    chroot "$root" /sbin/apk add --cache-dir "$cache" --cache-packages \
+        --no-scripts --quiet --repository "$mirror/$KERNEL_BRANCH/main" \
+        $PACKAGES $KERNEL_PACKAGE && break
+    [ "$try" = 3 ] && exit 1
+    echo "apk failed (try $try): again"; sleep 5
+  done
+fi
+rm -rf /out/apks
+mkdir /out/apks
+cp "$root$cache"/*.apk /out/apks/
+# The output's owner's (this runs as root): on a Linux host, a directory of
+# root's in it is one the caller can't clean up.
+chown -R --reference=/out /out/apks
+# Emptied, kept (the minirootfs has it): the guest as before.
+find "$root$cache" -mindepth 1 -delete
+# What was asked, as a fetch records it (an install of files records each
+# package by its checksum instead): the minirootfs's and the pins, sorted.
+# The same bytes from either source.
+# shellcheck disable=SC2086
+printf '%s\n' $world $PACKAGES $KERNEL_PACKAGE | LC_ALL=C sort -u >"$root/etc/apk/world"
+# And an architecture-independent package (lddtree, mdev-conf) recorded
+# under the index's architecture, as a fetch records it (its file says
+# `noarch`): informational, and the same bytes again.
+sed -i 's/^A:noarch$/A:aarch64/' "$root/lib/apk/db/installed"
 chroot "$root" /sbin/apk info -v >"$work/installed"
 rm -f "$root/etc/resolv.conf"
 # apk's log of this install stamps its time: the one file that made two

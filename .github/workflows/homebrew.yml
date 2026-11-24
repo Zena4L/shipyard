@@ -31,12 +31,25 @@ jobs:
       - if: env.HAS_TOKEN != 'true'
         run: |
           echo "::notice::No HOMEBREW_TAP_TOKEN: the tap isn't updated for $TAG."
+      # A release can come without the Mac's part (its build failed,
+      # 15.6b3a): then the tap stays where it is.
       - if: env.HAS_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=shipyard-${TAG#v}-macos-arm64.tar.gz
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -qxF "$asset"; then
+              echo "MAC_PART=true" >>"$GITHUB_ENV"
+          else
+              echo "::notice::$TAG has no $asset: the tap isn't updated."
+          fi
+      - if: env.HAS_TOKEN == 'true' && env.MAC_PART == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: shipyard
-      - if: env.HAS_TOKEN == 'true'
+      - if: env.HAS_TOKEN == 'true' && env.MAC_PART == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -51,13 +64,13 @@ jobs:
               --source-ref "refs/tags/$TAG" --source-digest "$(git -C shipyard rev-parse HEAD)"
           shipyard/scripts/release/homebrew/render-formula.sh "$version" \
               "$RUNNER_TEMP/shipyard-$version-macos-arm64.tar.gz" >"$RUNNER_TEMP/shipyard.rb"
-      - if: env.HAS_TOKEN == 'true'
+      - if: env.HAS_TOKEN == 'true' && env.MAC_PART == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Zena4L/homebrew-shipyard
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
-      - if: env.HAS_TOKEN == 'true'
+      - if: env.HAS_TOKEN == 'true' && env.MAC_PART == 'true'
         run: |
           mkdir -p tap/Formula
           # Never back: a release published after a newer one (an older
