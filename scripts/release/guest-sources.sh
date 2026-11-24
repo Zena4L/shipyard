@@ -40,19 +40,27 @@ cp "$work"/guest/*/SOURCES "$work/sources/$name/SOURCES"
 timeout 3600 docker run --rm --volume "$work/sources/$name:/out" \
     --env DISTFILES_MIRROR="https://distfiles.alpinelinux.org/distfiles/$ALPINE_BRANCH" \
     "$ALPINE_IMAGE" sh -euc '
-    apk add --quiet --no-cache abuild curl
+    apk add --quiet --no-cache abuild curl git
     grep -v "^#" /out/SOURCES | cut -f4,5 | sort -u | while IFS="	" read -r origin commit; do
         echo "== $origin ($commit)"
+        # The aports of Alpine at that commit, from their mirror on GitHub
+        # (the GitLab of Alpine refuses CI runners: 418). The commit is the
+        # one the package says it was built from, and git checks every
+        # object against it: the host does not matter. Only the files of
+        # that directory are fetched.
+        rm -rf /tmp/aports
+        git init -q /tmp/aports
+        git -C /tmp/aports remote add origin https://github.com/alpinelinux/aports.git
+        for try in 1 2 3; do
+            git -C /tmp/aports fetch -q --depth 1 --filter=blob:none origin "$commit" && break
+            [ "$try" = 3 ] && { echo "aports $commit not fetched" >&2; exit 1; }
+            sleep 10
+        done
         got=
         for branch in main community; do
-            url="https://gitlab.alpinelinux.org/alpine/aports/-/archive/$commit/aports-$commit.tar.gz?path=$branch/$origin"
-            rm -rf /tmp/aport && mkdir /tmp/aport
-            # (No --retry-all-errors: a 404, the origin in the other branch,
-            # moves on at once; a 5xx or 429 is tried again.)
-            if curl -fsSL --retry 10 --connect-timeout 20 "$url" |
-                tar -xz -C /tmp/aport 2>/dev/null &&
-                [ -f /tmp/aport/aports-$commit-$branch-$origin/$branch/$origin/APKBUILD ]; then
-                mv "/tmp/aport/aports-$commit-$branch-$origin/$branch/$origin" "/out/$origin"
+            if git -C /tmp/aports checkout -q FETCH_HEAD -- "$branch/$origin" 2>/dev/null &&
+                [ -f "/tmp/aports/$branch/$origin/APKBUILD" ]; then
+                mv "/tmp/aports/$branch/$origin" "/out/$origin"
                 got=$branch
                 break
             fi
