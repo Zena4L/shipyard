@@ -86,6 +86,9 @@ fi
 rm -rf /out/apks
 mkdir /out/apks
 cp "$root$cache"/*.apk /out/apks/
+# The output's owner's (this runs as root): on a Linux host, a directory of
+# root's in it is one the caller can't clean up.
+chown -R --reference=/out /out/apks
 # Emptied, kept (the minirootfs has it): the guest as before.
 find "$root$cache" -mindepth 1 -delete
 # What was asked, as a fetch records it (an install of files records each
