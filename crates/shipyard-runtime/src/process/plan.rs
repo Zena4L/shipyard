@@ -113,16 +113,21 @@ pub(crate) struct ExecChild {
     /// runs (-1: none). The relay starts only once the command exists, so
     /// the joiner can't wait for it.
     pub(crate) relayed: RawFd,
-    /// Above every descriptor open when the plan was made (a single-threaded
-    /// joiner opens no others): how far to close where `close_range` is
-    /// missing.
+    /// Above every descriptor open when the plan was made, and again once
+    /// the joiner has opened the terminal (`give_terminal`): how far to
+    /// close where `close_range` is missing.
     pub(crate) fd_bound: RawFd,
     /// Detached (`exec -d`): no parent-death signal, it outlives `exec`.
     pub(crate) detach: bool,
+    /// Its joiner already changed to its working directory, with its
+    /// capabilities still (15.6b2): the command, born there, doesn't try
+    /// again before its switch with only its own (root without
+    /// `DAC_OVERRIDE` can't enter another user's 0700 directory).
+    pub(crate) in_cwd: bool,
     /// Tests only (`SHIPYARD_TEST_EXEC_PAUSE`): wait this many milliseconds
-    /// once inside the container, before the credential switch (the most
-    /// it's exposed: still with every capability), so a test can look at
-    /// the process from inside the container.
+    /// once go has come, before its own descriptor sweep and its credential
+    /// switch (the most it's exposed: what its joiner left it, 15.6b2), so a
+    /// test can look at the process from inside the container.
     pub(crate) pause_ms: u32,
 }
 

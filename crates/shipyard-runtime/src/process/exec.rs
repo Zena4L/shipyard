@@ -15,11 +15,29 @@
 //!   3. non-dumpable; the user namespace (non-dumpable again); the PID one
 //!   4. with -t: the command's terminal, from the container's devpts
 //!      (through the init's root), its master sent on
-//!   5. clone3(CLONE_PARENT | CLONE_INTO_CGROUP) ──► the command
+//!   5. into the container's cgroup itself; a keyring of its own
+//!   6. the rest of the container's namespaces, mount last (no path is
+//!      resolved after: the container's mounts would lead it)
+//!   7. every descriptor of the host's closed, but the command's own
+//!   8. its capabilities lowered to the command's own sets, and what its
+//!      switch of user and bounding drops need
+//!   9. clone(CLONE_PARENT) ──► the command
 //!        shipyard's own child (CLONE_PARENT), PID n inside the container,
-//!        born in its cgroup; it joins the rest itself (child.rs), mount last
-//!   6. says the command's PID, and exits
+//!        born in its cgroup and every namespace of the container's; it
+//!        confines itself the rest of the way (child.rs)
+//!  10. says the command's PID, and exits (shipyard checks it's its child)
 //! ```
+//!
+//! **Nothing of the host's from its birth** (15.6b2). The command is a
+//! process of the container's PID namespace from its clone, waiting for
+//! shipyard's go and confining itself after: rootful, a process there with
+//! `CAP_SYS_PTRACE` overrides its non-dumpable state and can trace it. So
+//! steps 5 to 8 happen in the joiner, which is in the host's PID namespace
+//! and no process of the container's can see: what a tracer of the command
+//! finds is root inside the container with the command's own capabilities
+//! (and `SETUID`, `SETGID`, `SETPCAP` until its switch), no seccomp filter
+//! yet, and nothing outside. Rootless, the container can't trace it at all:
+//! its memory belongs to the host's user namespace.
 //!
 //! **The joiner runs the sealed copy** of shipyard's binary (as the
 //! container's init does, `spawn.rs`), never the file on disk: the command
@@ -76,8 +94,8 @@ pub(crate) struct JoinerSetup {
     security: Security,
     keep_ignored: Vec<libc::c_int>,
     /// Namespaces to join before the user namespace (owned outside it),
-    /// then the user and PID namespaces, then the rest (the command's, mount
-    /// last): `(index in Namespace::ALL, descriptor)`.
+    /// then the user and PID namespaces, then the rest (mount last, all
+    /// before the clone): `(index in Namespace::ALL, descriptor)`.
     early: Vec<(u64, RawFd)>,
     user: Option<RawFd>,
     pid: Option<RawFd>,
@@ -85,7 +103,8 @@ pub(crate) struct JoinerSetup {
     /// The container's user namespace allows `setgroups` (or, without one,
     /// shipyard's own does).
     setgroups_allowed: bool,
-    /// The container's cgroup, open, for `CLONE_INTO_CGROUP`.
+    /// The container's cgroup, open: the joiner moves itself there
+    /// (`move_into`), so the command is born in it.
     cgroup: Option<RawFd>,
     /// The report pipe's write end: the joiner's failures and the command's.
     report: RawFd,
@@ -373,6 +392,7 @@ fn run(setup_fd: RawFd) -> ! {
         relayed: -1,
         fd_bound: fd_bound(),
         detach: setup.detach,
+        in_cwd: false,
         pause_ms: setup.pause_ms,
     };
     let (mut plan, _) = ChildPlan::for_exec(
@@ -385,7 +405,9 @@ fn run(setup_fd: RawFd) -> ! {
         },
         confinement,
         setup.setgroups_allowed,
-        (super::join::join_setup(&namespaces(&setup.late)), exec),
+        // The joiner joins every namespace itself (step 6): none left to
+        // the command, which still takes the exec steps (`child.rs`).
+        (super::join::join_setup(&[]), exec),
         setup.passing.as_ref(),
     )
     .unwrap_or_else(|_| fail(Failure::at(ChildStep::ReadSetup, Errno::EINVAL)));
@@ -410,20 +432,22 @@ fn run(setup_fd: RawFd) -> ! {
     //    (ordinary code; the command may not allocate), now that this
     //    process may reach the container's init and give the slave away.
     let _slave = give_terminal(&setup, &mut plan, &spec).unwrap_or_else(|failure| fail(failure));
-    // 5. The command: shipyard's child, inside, in the container's cgroup.
+    // 5 to 8: everything the command is born with made the container's own.
+    let placed = born_inside(&setup, &mut plan).unwrap_or_else(|failure| fail(failure));
+    // 9. The command: shipyard's child, inside.
     // SAFETY: this process is single-threaded; the child runs only
     // `child_main`, which follows `child.rs`'s rules, with every signal
     // blocked.
-    match unsafe { clone_process(libc::CLONE_PARENT, setup.cgroup) } {
+    match unsafe { clone_process(libc::CLONE_PARENT, None) } {
         Ok(Cloned::Child) => {
             // SAFETY: the clone, with every signal blocked; `plan` and the
             // pipes were prepared above.
             unsafe { child_main(&plan, report) }
         }
-        Ok(Cloned::Parent { pid, in_cgroup }) => {
-            // 5. Its PID, for shipyard (it can't see it otherwise: it's
+        Ok(Cloned::Parent { pid, .. }) => {
+            // 10. Its PID, for shipyard (it can't see it otherwise: it's
             //    its child, but not one it started).
-            if write_joiner_record(setup.record, pid, in_cgroup).is_err() {
+            if write_joiner_record(setup.record, pid, placed).is_err() {
                 let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
                 fail(Failure::at(ChildStep::ExecRecord, Errno::EPIPE));
             }
@@ -431,6 +455,107 @@ fn run(setup_fd: RawFd) -> ! {
         }
         Err(errno) => fail(Failure::at(ChildStep::ExecClone, errno)),
     }
+}
+
+/// From here to the clone, everything the command will be born with is
+/// made the container's own (15.6b2): once it exists, a process of the
+/// container's that may trace it (`CAP_SYS_PTRACE`, rootful) finds it
+/// inside every namespace, holding nothing of the host's, with no
+/// capability beyond its own sets and its own steps' needs. Whether this
+/// process got into the container's cgroup (else shipyard adds the command).
+fn born_inside(setup: &JoinerSetup, plan: &mut ChildPlan) -> std::result::Result<bool, Failure> {
+    let sweep = Sweep::of(plan, setup.record);
+    // 5. The container's cgroup, by moving this process there (the clone
+    //    is born where its parent is): the command holds no descriptor of
+    //    the host's cgroups. Before the cgroup namespace's join, and after
+    //    the terminal's `ptmx` (the container's device rules apply there).
+    let placed = setup.cgroup.is_some_and(move_into);
+    //    A keyring of its own, not the caller's (as the container's init).
+    super::init::join_session_keyring()
+        .map_err(|errno| Failure::at(ChildStep::SessionKeyring, errno))?;
+    // 6. The rest of the container's namespaces, mount last. Nothing after
+    //    resolves a path of the host's: its root is the container's now (and
+    //    the container's `/proc` hasn't this process). One of the
+    //    container's: its working directory, entered as runc's exec does,
+    //    with this process's capabilities still (the command, born there,
+    //    then needn't; refused, it tries itself as before).
+    for (kind, fd) in decode_namespaces(&setup.late) {
+        join(fd, kind)?;
+    }
+    if let Some(exec) = &mut plan.exec {
+        exec.in_cwd = nix::unistd::chdir(plan.cwd.as_c_str()).is_ok();
+    }
+    // 7. Nothing of the host's kept (the namespaces', the cgroup's, the
+    //    init's `/proc` directory): the command's own descriptors alone.
+    sweep.close()?;
+    // 8. Only what the command will hold: its bounding set, and what its
+    //    own steps need (`Confinement::joiner_lowering`).
+    lower(plan)?;
+    Ok(placed)
+}
+
+/// Moves this process into the cgroup open at `cgroup` (its
+/// `cgroup.procs`, "0": the writer itself). Whether it did: refused (no
+/// common ancestor it may write, rootless, as `CLONE_INTO_CGROUP` would be),
+/// shipyard adds the command from outside.
+fn move_into(cgroup: RawFd) -> bool {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    // SAFETY: inherited across the exec; borrowed only for this call.
+    let cgroup = unsafe { BorrowedFd::borrow_raw(cgroup) };
+    openat(
+        cgroup,
+        "cgroup.procs",
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .is_ok_and(|procs| nix::unistd::write(&procs, b"0").is_ok())
+}
+
+/// What the joiner closes before its clone: every descriptor from 3 up but
+/// the command's own (its pipes, terminal and passed descriptors) and the
+/// record pipe, up to `bound` where `close_range` is missing (found before
+/// the mount namespace's join: the container's `/proc` hasn't this
+/// process).
+struct Sweep {
+    kept: Vec<u32>,
+    bound: RawFd,
+}
+
+impl Sweep {
+    fn of(plan: &ChildPlan, record: RawFd) -> Self {
+        let exec_kept = plan.exec.as_ref().map_or([-1; 4], |exec| exec.keep);
+        let mut kept: Vec<u32> = exec_kept
+            .into_iter()
+            .chain([record])
+            .chain(plan.passed.iter().copied())
+            .filter_map(|fd| u32::try_from(fd).ok())
+            .collect();
+        kept.sort_unstable();
+        kept.dedup();
+        Self {
+            kept,
+            bound: fd_bound(),
+        }
+    }
+
+    fn close(&self) -> std::result::Result<(), Failure> {
+        super::child::close_all_but(self.kept.iter().copied(), self.bound)
+    }
+}
+
+/// Lowers this process's capabilities to what the command will hold
+/// (`Confinement::joiner_lowering`): its bounding set, then its effective
+/// and permitted sets; then non-dumpable again, belt and braces (a `capset`
+/// that only lowers doesn't reset it, but the command must never be
+/// dumpable inside).
+fn lower(plan: &ChildPlan) -> std::result::Result<(), Failure> {
+    let Some(confinement) = &plan.confinement else {
+        return Ok(());
+    };
+    super::child::drop_bounding(&confinement.bounding_drop)?;
+    super::child::set_capabilities(&confinement.joiner_lowering())?;
+    make_undumpable()
 }
 
 /// The command's terminal (`-t`), into `plan`: its slave (returned: open

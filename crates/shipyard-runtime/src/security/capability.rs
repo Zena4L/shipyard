@@ -76,6 +76,15 @@ pub enum CapabilityError {
 impl Capability {
     /// `CAP_KILL`: signal processes of other users.
     pub const KILL: Self = Self(5);
+    /// `CAP_SETGID`: change group IDs.
+    pub const SETGID: Self = Self(6);
+    /// `CAP_SETUID`: change user IDs.
+    pub const SETUID: Self = Self(7);
+    /// `CAP_SETPCAP`: drop from the bounding set, raise inheritable ones.
+    pub const SETPCAP: Self = Self(8);
+    /// `CAP_SYS_ADMIN`: among much else, install a seccomp filter without
+    /// `no_new_privs`.
+    pub const SYS_ADMIN: Self = Self(21);
     /// `CAP_MKNOD`: make device nodes.
     pub const MKNOD: Self = Self(27);
     /// `CAP_SYS_PTRACE`: trace any process, and read a non-dumpable one's

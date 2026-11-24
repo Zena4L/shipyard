@@ -844,6 +844,22 @@ variables as `run --env-file` does (before `-e`, which wins). `--detach-keys` an
 `--privileged` are refused: an exec's command ends with your session, so there's
 nothing to detach from yet (`-d` runs it in the background).
 
+The command is set up inside the container from the moment it exists there: it's
+born in the container's namespaces and cgroup, with a keyring of its own, holding
+nothing of the host's, and with no capability beyond its own (and, until it switches
+to its user, the three that switch takes: `SETUID`, `SETGID`, `SETPCAP`; with
+`--security-opt no-new-privileges=false`, `SYS_ADMIN` too, which installing its
+seccomp filter then takes). Until it starts, though, it's root in the container and
+not yet under the seccomp profile: a process of the container's with
+`CAP_SYS_PTRACE` (root's containers given `--cap-add SYS_PTRACE` or `ALL`) can trace
+it then, and reach what root in the container with the command's capabilities
+reaches, with every system call. Nothing outside the container.
+Without root, the container can't trace it at all. Being set up inside, it counts
+there from the start: a container one process short of its `--pids-limit` can't
+`exec` (the set-up takes that slot a moment), and its set-up's memory is the
+container's. Each `exec` running holds a keyring of its own, which counts towards
+your user's keys (`/proc/sys/kernel/keys/maxkeys`, 200 by default).
+
 ## Copying files: `cp`
 
 ```sh

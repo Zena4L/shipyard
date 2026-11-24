@@ -316,6 +316,16 @@ behaviour; each change is listed here).
 
 ### Security
 
+- **An `exec`'s command was set up with the host's powers inside the container**
+  (step 15.6b's runtime review): from its clone it was a process of the container's
+  PID namespace, still in the host's mount namespace with every capability and a
+  descriptor of the host's cgroups, until it confined itself; root's container with
+  `CAP_SYS_PTRACE` could trace it then (runc's exec has the same window). Its joiner,
+  which no process of the container's can see, now does all of it before the clone:
+  the cgroup, a keyring of its own, every namespace, the host's descriptors closed, its
+  capabilities lowered to the command's own (and what its switch of user takes). And
+  the PID it reports is checked to be
+  the command (shipyard's own child) before shipyard signals or places it.
 - **With forwarding on, the host routed between the addresses of its own LAN (or
   VPN) link** (step 15.6b's review): the rule that lets what's bridged on a port pass
   between its own ports took any closed link, so `eth0` to `eth0` (another machine using

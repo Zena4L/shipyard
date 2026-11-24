@@ -49,7 +49,9 @@ It's confined, whoever runs it ([Isolation](run.md#isolation)):
   copy). It can't use a device it isn't given: an eBPF device program checks every open
   (it may make a node with `mknod`, and can't open it); where there's no such program,
   `CAP_MKNOD` is dropped. It can't join a PID namespace where any process may trace it as
-  it's set up.
+  it's set up, and an `exec` into it is born inside it already, holding nothing of the
+  host's and only its own capabilities: a process there that traces one before it starts
+  reaches the container alone ([`exec`](containers.md#running-a-command-in-it-exec)).
 - Its network traffic goes out only as itself (an anti-spoofing table on every bridge),
   and nothing outside the host reaches it but through a port it publishes
   ([The way out](networking.md#the-way-out-and-what-gets-in)).
