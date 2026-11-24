@@ -15,7 +15,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 out=${1:?usage: NOTICES=DIR scripts/release/linux.sh OUT [VERSION]}
-notices=${NOTICES:?NOTICES: the release's notices (scripts/release/notices.sh)}/THIRD-PARTY-LICENSES.html
+notices=${NOTICES:?NOTICES: the notices of the release, scripts/release/notices.sh}/THIRD-PARTY-LICENSES.html
 [ -f "$notices" ] || { echo "no notices at $notices" >&2; exit 1; }
 notices=$(cd "$(dirname "$notices")" && pwd)/$(basename "$notices")
 mkdir -p "$out"

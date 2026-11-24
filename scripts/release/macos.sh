@@ -19,7 +19,7 @@ out=${1:?$usage}
 guest=${2:?$usage}
 [ -f "$guest" ] || { echo "no guest tarball at $guest" >&2; exit 1; }
 guest=$(cd "$(dirname "$guest")" && pwd)/$(basename "$guest")
-notices=$(cd "${NOTICES:?NOTICES: the release's notices (scripts/release/notices.sh)}" && pwd)
+notices=$(cd "${NOTICES:?NOTICES: the notices of the release, scripts/release/notices.sh}" && pwd)
 for file in THIRD-PARTY-LICENSES.html THIRD-PARTY-LICENSES-APP.html; do
     [ -f "$notices/$file" ] || { echo "no $file in $notices" >&2; exit 1; }
 done
