@@ -1185,7 +1185,7 @@ fn check_mapped(user: &super::spec::User, maps: &IdMaps) -> Result<(), Failure> 
 ///
 /// Any other: EDQUOT when the user already has as many keys as the kernel
 /// allows (K5).
-fn join_session_keyring() -> Result<(), Errno> {
+pub(super) fn join_session_keyring() -> Result<(), Errno> {
     // SAFETY: `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`: a NULL name asks
     // for a new anonymous keyring; the kernel reads nothing through it.
     let rc = unsafe {

@@ -169,25 +169,29 @@ fn set_up_and_exec(plan: &ChildPlan) -> Result<std::convert::Infallible, Failure
     give_stdio(&plan.stdio)?;
     #[cfg(target_os = "linux")]
     if let Some(join) = &plan.join {
+        // Tests only: what exec's joiner left it is looked at here, before
+        // anything of its own (a join, its sweep, its switch).
+        if let Some(exec) = &plan.exec
+            && exec.pause_ms > 0
+        {
+            pause_for_tests(exec.pause_ms);
+        }
         // Already in the container's PID namespace (see `join.rs`).
         join_namespaces(join)?;
         if let Some(exec) = &plan.exec {
             // Nothing of the host's stays open inside, not even until the
-            // exec (CVE-2016-9962): the namespace descriptors, the cgroup's,
-            // anything shipyard had open.
+            // exec (CVE-2016-9962): its joiner closed it all already
+            // (15.6b2); again here, in case.
             close_host_fds(exec, &plan.passed)?;
         }
         // A session of its own, as an isolated command has: out of the
         // user's process group before it waits for anything (keys typed
         // meanwhile aren't its).
         start_session()?;
-        if let Some(exec) = &plan.exec {
-            if exec.pause_ms > 0 {
-                pause_for_tests(exec.pause_ms);
-            }
-            if exec.relayed >= 0 {
-                wait_for_relay(exec.relayed)?;
-            }
+        if let Some(exec) = &plan.exec
+            && exec.relayed >= 0
+        {
+            wait_for_relay(exec.relayed)?;
         }
         return prepare_and_exec(plan);
     }
@@ -288,7 +292,11 @@ pub(super) fn prepare_and_exec(plan: &ChildPlan) -> Result<std::convert::Infalli
     // to change, try again afterwards, when the new user's permissions apply.
     // Only a permission error is worth retrying (runc does the same): any
     // other error, like a missing directory, won't change with the user.
-    let chdir_error = chdir(plan).err();
+    #[cfg(target_os = "linux")]
+    let in_cwd = plan.exec.as_ref().is_some_and(|exec| exec.in_cwd);
+    #[cfg(not(target_os = "linux"))]
+    let in_cwd = false;
+    let chdir_error = if in_cwd { None } else { chdir(plan).err() };
     #[cfg(target_os = "linux")]
     if let Some(confinement) = &plan.confinement {
         if let Some(filter) = confinement.filter_before_setup() {
@@ -871,7 +879,14 @@ pub(super) fn confine_before_switch(confinement: &Confinement) -> Result<(), Fai
         prctl(libc::PR_SET_KEEPCAPS, 1, 0)
             .map_err(|errno| Failure::at(ChildStep::KeepCaps, errno))?;
     }
-    for &capability in &confinement.bounding_drop {
+    drop_bounding(&confinement.bounding_drop)
+}
+
+/// Drops `capabilities` from the bounding set (`CAP_SETPCAP`): the
+/// command's, and `exec`'s joiner's before its clone. Raw `prctl`.
+#[cfg(target_os = "linux")]
+pub(super) fn drop_bounding(capabilities: &[u8]) -> Result<(), Failure> {
+    for &capability in capabilities {
         prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(capability), 0).map_err(|errno| {
             Failure::at(ChildStep::BoundingDrop, errno).detail(usize::from(capability))
         })?;
@@ -884,19 +899,7 @@ pub(super) fn confine_before_switch(confinement: &Confinement) -> Result<(), Fai
 /// `no_new_privs` (N1). Raw system calls, from data prepared before the fork.
 #[cfg(target_os = "linux")]
 pub(super) fn confine_after_switch(confinement: &Confinement) -> Result<(), Failure> {
-    // `__user_cap_header_struct`: the version, and this process (0).
-    let header: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
-    // SAFETY: `header` and `capset_data` are the kernel's
-    // `__user_cap_header_struct` and two `__user_cap_data_struct`s (three
-    // `u32`s each), which it only reads.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            header.as_ptr(),
-            confinement.capset_data.as_ptr(),
-        )
-    };
-    raw_result(rc).map_err(|errno| Failure::at(ChildStep::Capset, errno))?;
+    set_capabilities(&confinement.capset_data)?;
     for &capability in &confinement.ambient {
         prctl(
             libc::PR_CAP_AMBIENT,
@@ -912,6 +915,20 @@ pub(super) fn confine_after_switch(confinement: &Confinement) -> Result<(), Fail
             .map_err(|errno| Failure::at(ChildStep::NoNewPrivs, errno))?;
     }
     Ok(())
+}
+
+/// Sets this process's effective, permitted and inheritable sets to `data`
+/// (`capset`, as [`Confinement::capset_data`] has them): the command's, and
+/// `exec`'s joiner's before its clone. A raw system call.
+#[cfg(target_os = "linux")]
+pub(super) fn set_capabilities(data: &[u32; 6]) -> Result<(), Failure> {
+    // `__user_cap_header_struct`: the version, and this process (0).
+    let header: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    // SAFETY: `header` and `data` are the kernel's
+    // `__user_cap_header_struct` and two `__user_cap_data_struct`s (three
+    // `u32`s each), which it only reads.
+    let rc = unsafe { libc::syscall(libc::SYS_capset, header.as_ptr(), data.as_ptr()) };
+    raw_result(rc).map_err(|errno| Failure::at(ChildStep::Capset, errno))
 }
 
 /// Installs a seccomp filter on this process (`seccomp(2)`,

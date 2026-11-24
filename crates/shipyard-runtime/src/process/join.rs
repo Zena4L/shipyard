@@ -12,9 +12,9 @@
 //! **Who joins them.** Not shipyard's own thread: entering a user namespace
 //! can't be undone, and a PID namespace's `setns` only decides where the
 //! *next children* are born. So a short-lived process does it, the joiner
-//! (`exec.rs`): it joins the user and PID namespaces, then clones the
-//! command into the container (with `CLONE_PARENT`: shipyard's own child,
-//! which joins the rest itself, in `child.rs`).
+//! (`exec.rs`): it joins the user and PID namespaces, then the rest itself
+//! (15.6b2: the command is born in all of them), then clones the command
+//! into the container (with `CLONE_PARENT`: shipyard's own child).
 
 use std::os::fd::OwnedFd;
 

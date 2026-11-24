@@ -694,7 +694,7 @@ impl Cgroup {
     }
 
     /// Whether process `pid` is in it or below (`/proc/PID/cgroup`).
-    fn holds(&self, pid: Pid) -> bool {
+    pub(crate) fn holds(&self, pid: Pid) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
             .ok()
             .and_then(|text| super::parse_own_cgroup(&text))

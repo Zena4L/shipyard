@@ -1159,8 +1159,9 @@ pub struct Join {
     /// container's (default: [`Security::standard`](crate::security::Security::standard),
     /// Docker's).
     pub security: crate::security::Security,
-    /// The cgroup it's started in (`clone3`'s `CLONE_INTO_CGROUP`): the
-    /// container's, if it has one (Linux).
+    /// The cgroup it's started in (its joiner moves itself there before the
+    /// clone, else shipyard adds it): the container's, if it has one
+    /// (Linux).
     #[cfg(target_os = "linux")]
     pub cgroup: Option<crate::cgroup::Cgroup>,
     /// The cgroup's inode, as recorded when it was made: the directory

@@ -339,6 +339,32 @@ impl Confinement {
         self.seccomp.as_ref().filter(|_| self.no_new_privileges)
     }
 
+    /// What `exec`'s joiner lowers itself to before it clones the command
+    /// (15.6b2), as `capset`'s data (see [`capset_data`](Self::capset_data)):
+    /// effective and permitted the command's own effective and permitted
+    /// ones, plus what its own steps take: `SETUID` and `SETGID` for the
+    /// switch, `SETPCAP` for its bounding drops, and `SYS_ADMIN` where its
+    /// seccomp filter goes in before the switch (without `no_new_privs`);
+    /// inheritable its own inheritable ones exactly (its `capset` after a
+    /// switch of user, without `SETPCAP` effective, may set only what's
+    /// inheritable or permitted then). So the command holds, from its birth,
+    /// nothing beyond its own sets and those steps' needs.
+    pub(crate) fn joiner_lowering(&self) -> [u32; 6] {
+        let [eff, perm, inh, eff_high, perm_high, inh_high] = self.capset_data;
+        let mut held = u64::from(eff | perm) | (u64::from(eff_high | perm_high) << 32);
+        // (Ambient ones are always permitted and inheritable: in already.)
+        let early_filter = self.filter_before_setup().map(|_| Capability::SYS_ADMIN);
+        for capability in [Capability::SETUID, Capability::SETGID, Capability::SETPCAP]
+            .into_iter()
+            .chain(early_filter)
+        {
+            held |= 1 << capability.number();
+        }
+        let low = u32::try_from(held & u64::from(u32::MAX)).unwrap_or_default();
+        let high = u32::try_from(held >> 32).unwrap_or_default();
+        [low, low, inh, high, high, inh_high]
+    }
+
     /// The init's own confinement once its command runs: only `CAP_KILL`, to
     /// signal a command running as another user (TLPI §20.5), and
     /// `no_new_privs`.
@@ -685,6 +711,83 @@ mod tests {
             Confinement::new(&high, 0, 40, KERNEL).unwrap().capset_data,
             [0, 0, 0, 1 << (39 - 32), 0, 0]
         );
+    }
+
+    /// What exec's joiner keeps before its clone (15.6b2): the command's own
+    /// effective and permitted capabilities, with `SETUID`, `SETGID` and
+    /// `SETPCAP` for its own steps, `SYS_ADMIN` only where its seccomp
+    /// filter goes in before the switch; its inheritable ones exactly (its
+    /// own `capset` after the switch needs them there), never permitted;
+    /// never the rest of what the joiner had.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_s_joiner_keeps_only_what_the_command_needs() {
+        let bits = |data: [u32; 6]| -> (u64, u64) {
+            (
+                u64::from(data[1]) | (u64::from(data[4]) << 32),
+                u64::from(data[2]) | (u64::from(data[5]) << 32),
+            )
+        };
+        let bit = |capability: Capability| 1_u64 << capability.number();
+        let steps = bit(Capability::SETUID) | bit(Capability::SETGID) | bit(Capability::SETPCAP);
+        let standard = Confinement::new(&Security::standard(), 0, 40, KERNEL).unwrap();
+        let (kept, inheritable) = bits(standard.joiner_lowering());
+        assert_eq!(kept, CapabilitySet::DOCKER_DEFAULT.bits() | steps);
+        assert_eq!(inheritable, 0);
+        assert_eq!(standard.joiner_lowering()[0], standard.joiner_lowering()[1]);
+        assert_eq!(
+            kept & bit(Capability::SYS_ADMIN),
+            0,
+            "no SYS_ADMIN with no_new_privs"
+        );
+        // --cap-drop SETUID: still kept for the switch (the command drops it).
+        let mut without_setuid = CapabilitySet::DOCKER_DEFAULT;
+        without_setuid.remove(Capability::SETUID);
+        let rule = Capabilities::Default {
+            kept: without_setuid,
+            added: CapabilitySet::EMPTY,
+        };
+        let dropped = Security {
+            capabilities: rule,
+            ..Security::standard()
+        };
+        let (kept, _) = bits(
+            Confinement::new(&dropped, 0, 40, KERNEL)
+                .unwrap()
+                .joiner_lowering(),
+        );
+        assert_ne!(kept & bit(Capability::SETUID), 0);
+        // An exact set whose inheritable isn't inside its permitted, as a
+        // user who isn't root: inheritable, never permitted.
+        let exact = Security {
+            capabilities: Capabilities::Exact(CapabilitySets {
+                bounding: set(&["CHOWN", "NET_RAW"]),
+                permitted: set(&["CHOWN"]),
+                effective: set(&["CHOWN"]),
+                inheritable: set(&["NET_RAW"]),
+                ambient: CapabilitySet::EMPTY,
+            }),
+            ..Security::standard()
+        };
+        let (kept, inheritable) = bits(
+            Confinement::new(&exact, 1000, 40, KERNEL)
+                .unwrap()
+                .joiner_lowering(),
+        );
+        assert_eq!(kept, 1 | steps, "CHOWN and the steps'");
+        assert_eq!(inheritable, 1 << 13, "NET_RAW");
+        // Without no_new_privs, the filter goes in before the switch:
+        // SYS_ADMIN kept for it.
+        let early_filter = Security {
+            no_new_privileges: false,
+            ..Security::standard()
+        };
+        let (kept, _) = bits(
+            Confinement::new(&early_filter, 0, 40, KERNEL)
+                .unwrap()
+                .joiner_lowering(),
+        );
+        assert_ne!(kept & bit(Capability::SYS_ADMIN), 0);
     }
 
     #[cfg(target_os = "linux")]

@@ -5742,6 +5742,103 @@ fn exec_never_runs_the_binary_on_disk() {
     );
 }
 
+/// exec's command exists, in the container's PID namespace, only once its
+/// joiner has lowered what it inherits (15.6b2): a rootful container's
+/// process with `CAP_SYS_PTRACE` that traces it meanwhile finds the
+/// command's own bounding set, and, permitted, its own capabilities plus
+/// `SETUID`, `SETGID` and `SETPCAP` for its switch, never the joiner's
+/// full set (all of the host's). Paused by the test hook before it
+/// confines itself or sweeps its own descriptors: the most it's exposed.
+/// Its mount namespace is the container's, and it holds no descriptor but
+/// its standard three and its two pipes to shipyard (the joiner closed the
+/// rest: the namespaces', the cgroup's, its setup).
+#[test]
+#[ignore = "needs root"]
+fn exec_s_command_is_born_with_only_its_own_powers() {
+    let runtime = Runtime::new();
+    let _bundle = exec_target(&runtime, "exec-born", "exec sleep 60", |config| {
+        let caps = json!(["CAP_SYS_PTRACE", "CAP_KILL", "CAP_CHOWN"]);
+        config["process"]["capabilities"] =
+            json!({"bounding": caps, "effective": caps, "permitted": caps});
+    });
+    let mut paused = exec_started(
+        &runtime,
+        &["exec-born", "sh", "-c", ":"],
+        &[("SHIPYARD_TEST_EXEC_PAUSE", "3000")],
+    );
+    let pid = exec_child(&paused);
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let mount = std::fs::read_link(format!("/proc/{pid}/ns/mnt")).unwrap();
+    let fds: Vec<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .flatten()
+        .map(|entry| {
+            let target = std::fs::read_link(entry.path()).unwrap_or_default();
+            format!(
+                "{}: {}",
+                entry.file_name().to_string_lossy(),
+                target.display()
+            )
+        })
+        .collect();
+    let _ = paused.wait();
+    let set = |name: &str| {
+        let hex = status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name} in {status}"));
+        u64::from_str_radix(hex.trim(), 16).unwrap()
+    };
+    // SYS_PTRACE, KILL, CHOWN; and SETGID, SETUID, SETPCAP for the switch.
+    let own: u64 = (1 << 19) | (1 << 5) | 1;
+    let switch: u64 = (1 << 6) | (1 << 7) | (1 << 8);
+    assert_eq!(set("CapBnd:"), own, "{status}");
+    assert_eq!(set("CapPrm:"), own | switch, "{status}");
+    assert_eq!(set("CapEff:") & !(own | switch), 0, "{status}");
+    // The container's mount namespace (its init's), not the host's.
+    let init = runtime.state("exec-born").unwrap()["pid"].as_i64().unwrap();
+    assert_eq!(
+        mount,
+        std::fs::read_link(format!("/proc/{init}/ns/mnt")).unwrap()
+    );
+    assert_ne!(mount, std::fs::read_link("/proc/self/ns/mnt").unwrap());
+    assert_eq!(fds.len(), 5, "{fds:#?}");
+}
+
+/// exec's command enters its working directory as its joiner (15.6b2),
+/// with the joiner's capabilities, as runc's exec does: root with none of
+/// its own (`--cap-drop ALL`) still starts in another user's 0700
+/// directory, which it couldn't enter itself.
+#[test]
+#[ignore = "needs root"]
+fn exec_as_root_without_capabilities_starts_in_its_directory() {
+    let runtime = Runtime::new();
+    let bundle = exec_target(&runtime, "exec-cwd", "exec sleep 60", |config| {
+        config["process"]["capabilities"] =
+            json!({"bounding": [], "effective": [], "permitted": []});
+    });
+    let private = bundle.root.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(
+        &private,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    std::os::unix::fs::chown(&private, Some(1000), Some(1000)).unwrap();
+    let call = exec(
+        &runtime,
+        &["--cwd", "/private", "exec-cwd", "sh", "-c", "pwd"],
+    );
+    assert_eq!(call.code, Some(0), "{}", call.stderr);
+    assert_eq!(call.stdout, "/private\n");
+    // The control: the directory is closed to it once it runs.
+    let call = exec(
+        &runtime,
+        &["exec-cwd", "sh", "-c", "cd /private && echo in"],
+    );
+    assert_ne!(call.stdout, "in\n", "{}", call.stderr);
+}
+
 /// Nothing of the host's reaches exec's process: a host directory exec had
 /// open (60, inherited) isn't there, so it can't serve as its working
 /// directory either (CVE-2016-9962, CVE-2024-21626): only 0, 1 and 2 are

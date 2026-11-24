@@ -324,6 +324,14 @@ pub enum Error {
     #[error("{0}")]
     Namespace(String),
 
+    /// `exec`'s joiner named a process that isn't the command it started
+    /// (not this process's child): never signalled or placed (15.6b2).
+    #[error("exec's joiner named process {pid}, which isn't the command it started")]
+    StrangerRecord {
+        /// The PID it named.
+        pid: i32,
+    },
+
     /// Another container's user namespace, to be joined, has other ID maps
     /// than the container was given (its setup goes by them).
     #[error("process {pid}'s user namespace has other ID maps than the container was given")]

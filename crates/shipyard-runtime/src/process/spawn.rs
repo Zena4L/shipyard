@@ -525,24 +525,16 @@ fn spawn_joined(
         drop(mask);
         return Err(failure);
     };
-    let placed = match &join.cgroup {
-        Some(cgroup) if !in_cgroup => cgroup.add(pid).map_err(|err| match err {
-            crate::cgroup::CgroupError::Io {
-                errno: errno @ (Errno::EBUSY | Errno::EACCES | Errno::ENOENT),
-                ..
-            } => describe(
-                super::failure::ChildFailure {
-                    step: super::failure::ChildStep::ExecClone,
-                    errno,
-                    detail: 0,
-                },
-                &context,
-            )
-            .into(),
-            _ => Error::from(err),
-        }),
-        _ => Ok(()),
-    };
+    // The record came through a pipe the command held a moment too: a PID
+    // that isn't this process's child (the command, born `CLONE_PARENT`) is
+    // never signalled or placed (15.6b2).
+    if !own_child(pid) {
+        drop(go_write);
+        reap_stray("shipyard-exec");
+        drop(mask);
+        return Err(Error::StrangerRecord { pid: pid.as_raw() });
+    }
+    let placed = place_command(join, pid, in_cgroup, &context);
     if let Err(err) = placed {
         let _ = nix::sys::signal::kill(pid, NixSignal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
@@ -597,6 +589,47 @@ fn init_of_pid_joiner(
             "the joiner of another's PID namespace ended without starting the init",
         )
     })
+}
+
+/// `exec`'s command, `pid`, into the container's cgroup (`join`'s), unless
+/// its joiner said it was born there (`in_cgroup`) and it is: a refusal
+/// said as the clone's step, as `CLONE_INTO_CGROUP`'s was.
+#[cfg(target_os = "linux")]
+fn place_command(join: &Join, pid: Pid, in_cgroup: bool, context: &FailureContext) -> Result<()> {
+    match &join.cgroup {
+        Some(cgroup) if !(in_cgroup && cgroup.holds(pid)) => {
+            cgroup.add(pid).map_err(|err| match err {
+                crate::cgroup::CgroupError::Io {
+                    errno: errno @ (Errno::EBUSY | Errno::EACCES | Errno::ENOENT),
+                    ..
+                } => describe(
+                    super::failure::ChildFailure {
+                        step: super::failure::ChildStep::ExecClone,
+                        errno,
+                        detail: 0,
+                    },
+                    context,
+                )
+                .into(),
+                _ => Error::from(err),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether `pid` is this process's child: `exec`'s command, which its
+/// joiner clones as this process's (`CLONE_PARENT`), waiting for go. Asked
+/// of the kernel (`waitid`, reaping nothing: `WNOWAIT`), not of `/proc`,
+/// which `hidepid` hides a non-dumpable process in from a rootless caller.
+#[cfg(target_os = "linux")]
+fn own_child(pid: Pid) -> bool {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    waitid(
+        Id::Pid(pid),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+    )
+    .is_ok()
 }
 
 /// Reaps what a joiner cloned before it failed, which it couldn't tell us
@@ -1614,6 +1647,22 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    /// exec's record is taken only for this process's own child (15.6b2):
+    /// a child of the test is one, PID 1 isn't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_our_own_child_is_taken_for_exec_s_command() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        assert!(own_child(pid));
+        assert!(!own_child(Pid::from_raw(1)));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     /// "Gave up" is believed only with the init's setup-failure exit code:
     /// with any other, something else wrote it.

@@ -1187,8 +1187,9 @@ fn exec_step(step: ChildStep, errno: Errno, ctx: &FailureContext) -> SpawnError 
     )
 }
 
-/// `exec`'s joiner couldn't start the command in the container: into its
-/// cgroup (`CLONE_INTO_CGROUP`), its PID namespace, or past its limits.
+/// `exec`'s joiner couldn't start the command in the container: its PID
+/// namespace, past its limits, or into its cgroup (shipyard's own add,
+/// where the joiner couldn't move itself there).
 fn exec_clone(errno: Errno, ctx: &FailureContext) -> SpawnError {
     match errno {
         Errno::EBUSY => SpawnError::new(
