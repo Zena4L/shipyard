@@ -120,6 +120,13 @@ behaviour; each change is listed here).
   monitor's, as counters.
 ### Changed
 
+- **Each release carries the licences of what's built into it, and the guest's
+  sources** (step 15.6b3b): `THIRD-PARTY-LICENSES.html` in every tarball and package
+  and the Mac app's resources (every crate and npm package, each licence's text once),
+  and the source of every package in the Mac's guest (the kernel, busybox and
+  e2fsprogs among them, under the GPL) as `shipyard-VERSION-guest-sources.tar`, each
+  file checked against Alpine's recipe; the guest's `SOURCES` names each package's
+  licence and origin.
 - **A release can be rebuilt after its inputs are gone** (F211, step 15.6b3a): the
   guest's Alpine packages are kept with each release (`…-guest-apks.tar.gz`, which
   `SHIPYARD_GUEST_APKS=` builds from, every package's signature still checked), and

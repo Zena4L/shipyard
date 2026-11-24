@@ -377,9 +377,11 @@ that runs here too:
 
 | Artifact | Script | Built |
 |---|---|---|
-| `shipyard-VERSION-linux-{x86_64,aarch64}.tar.gz`: `shipyard`, `shipyard-runtime` (static, musl), `LICENSE`, `README.md`, `contrib/systemd`, `contrib/apparmor` | `scripts/release/linux.sh OUT [VERSION]` | in the pinned image, the commit exported clean at fixed paths: reproducible, and checked so on another runner (`compare.sh`) |
-| `shipyard-VERSION-guest-arm64.tar.gz` (the Mac's guest, carrying the release's own arm64 `shipyard`), and its packages' list | `scripts/release/guest.sh OUT BINARY [VERSION]` | in the pinned image (`scripts/guest/build.sh`), twice, compared |
-| `shipyard-VERSION-macos-arm64.tar.gz` (`bin/shipyard` and the `guest/` it boots, found beside it: F178), `Shipyard-VERSION-macos-arm64.app.zip` | `scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]` | on a Mac, signed ad hoc (not notarized: D15-2) |
+| `THIRD-PARTY-LICENSES.html` (the binaries' crates, Rust's standard library from the pinned toolchain's `rust-src`, musl's copyright) and `THIRD-PARTY-LICENSES-APP.html` (the app's crates, the standard library, every npm package its bundle holds by its sourcemaps, and its fonts), carried by the artifacts below | `scripts/release/notices.sh OUT [binaries\|app]` (`cargo-about`, `about/`: the accepted licences, the page, `extra.py`; every crate built in checked named) | the workflow's `notices` and `notices-app` jobs, once (only the Mac's part waits for the app's) |
+| `shipyard-VERSION-linux-{x86_64,aarch64}.tar.gz`: `shipyard`, `shipyard-runtime` (static, musl), `LICENSE`, `README.md`, `THIRD-PARTY-LICENSES.html`, `contrib/systemd`, `contrib/apparmor` | `NOTICES=DIR scripts/release/linux.sh OUT [VERSION]` | in the pinned image, the commit exported clean at fixed paths: reproducible, and checked so on another runner (`compare.sh`) |
+| `shipyard-VERSION-guest-arm64.tar.gz` (the Mac's guest, carrying the release's own arm64 `shipyard`, and its `SOURCES`: each package's licence, aports origin and commit), its packages' list and the packages (`…-guest-apks.tar.gz`) | `scripts/release/guest.sh OUT BINARY [VERSION]` | in the pinned image (`scripts/guest/build.sh`), twice, compared, and once from its kept packages |
+| `shipyard-VERSION-guest-sources.tar`: every guest package's APKBUILD and patches (Alpine's aports at its commit) and the sources it names, each checked against its `sha512sums` | `scripts/release/guest-sources.sh OUT GUEST-TARBALL [VERSION]` | Alpine's `abuild fetch verify` in Alpine's image (`ALPINE_IMAGE`), Alpine's distfiles mirror first |
+| `shipyard-VERSION-macos-arm64.tar.gz` (`bin/shipyard` and the `guest/` it boots, found beside it: F178; the notices), `Shipyard-VERSION-macos-arm64.app.zip` (the app's notices in its resources) | `NOTICES=DIR scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]` | on a Mac, signed ad hoc (not notarized: D15-2) |
 | `shipyard_VERSION-1_{amd64,arm64}.deb`, `shipyard-VERSION-1.{x86_64,aarch64}.rpm`: the Linux tarball's binaries in `/usr/bin`, the units in `/usr/lib/systemd/{system,user}` (never enabled), the AppArmor profile (placed in `/etc/apparmor.d` and loaded where AppArmor 4 reads it, never over a copy the package didn't place; warnings for a manual install beside it) | `scripts/release/packages.sh OUT LINUX-TARBALL…` (nfpm, `package/nfpm.yaml`) | in the pinned image, from the reproduced tarballs, twice, compared; installed and run in Ubuntu 24.04 and Fedora 42 (`test-packages.sh`) |
 | `shipyard-VERSION-BINARY-PLATFORM.cdx.json` (CycloneDX 1.5) | `scripts/release/sbom.sh OUT [VERSION]` | `cargo-cyclonedx` |
 | `SHA256SUMS`, and an attestation of every file | the workflow's `attest` job | GitHub's artifact attestations (Sigstore, keyless) |
@@ -403,7 +405,11 @@ gh attestation verify FILE --repo Zena4L/shipyard \
 sha256sum -c SHA256SUMS --ignore-missing         # an older Mac: shasum -a 256 -c …
 # Rebuilt at the tag (Docker), into `again`; then `downloaded` holding only this
 # machine's architecture's tarball:
-scripts/release/linux.sh again 1.0.0
+# (Its notices from the downloaded tarball, outside the checkout: the release
+# scripts refuse a tree with changes.)
+mkdir -p ../notices && tar -xzf downloaded/shipyard-1.0.0-linux-*.tar.gz -C ../notices \
+    --strip-components=1 --wildcards '*/THIRD-PARTY-LICENSES.html'
+NOTICES=../notices scripts/release/linux.sh again 1.0.0
 scripts/release/compare.sh downloaded again
 ```
 

@@ -20,6 +20,9 @@ class Shipyard < Formula
     # The guest the VM boots, beside the binary's own directory, where
     # Shipyard looks for it (F178).
     prefix.install "guest"
+    # The third-party licences of what's built in (LICENSE and NOTICE go in as
+    # Homebrew's own metafiles).
+    prefix.install "THIRD-PARTY-LICENSES.html"
   end
 
   def caveats

@@ -180,3 +180,10 @@ vulnerabilities privately, as [SECURITY.md](SECURITY.md) says.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE).
+
+Each release carries the licences of the software built into it:
+`THIRD-PARTY-LICENSES.html` in every tarball and package (in
+`/usr/share/doc/shipyard/`), and in the Mac app's resources. The Mac's guest is
+built from Alpine Linux's packages (the Linux kernel, busybox and e2fsprogs among
+them, under the GPL): its `SOURCES` names each one, and every release publishes their
+complete source as `shipyard-VERSION-guest-sources.tar`.

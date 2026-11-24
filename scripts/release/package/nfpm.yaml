@@ -54,8 +54,15 @@ contents:
   - src: ${STAGE}/LICENSE
     dst: /usr/share/doc/shipyard/LICENSE
     file_info: { mode: 0644 }
+  - src: ${STAGE}/NOTICE
+    dst: /usr/share/doc/shipyard/NOTICE
+    file_info: { mode: 0644 }
   - src: ${STAGE}/README.md
     dst: /usr/share/doc/shipyard/README.md
+    file_info: { mode: 0644 }
+  # The third-party licences of what's built in (step 15.6b3b).
+  - src: ${STAGE}/THIRD-PARTY-LICENSES.html
+    dst: /usr/share/doc/shipyard/THIRD-PARTY-LICENSES.html
     file_info: { mode: 0644 }
 
 scripts:

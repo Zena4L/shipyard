@@ -47,7 +47,7 @@ name=shipyard-$VERSION-linux-$ARCH
 stage=/tmp/$name
 mkdir -p "$stage/contrib"
 install -m 0755 "$built/shipyard" "$built/shipyard-runtime" "$stage/"
-install -m 0644 LICENSE README.md "$stage/"
+install -m 0644 LICENSE NOTICE README.md /notices/THIRD-PARTY-LICENSES.html "$stage/"
 cp -R contrib/systemd contrib/apparmor "$stage/contrib/"
 tar --create --directory=/tmp --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
     --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX' \

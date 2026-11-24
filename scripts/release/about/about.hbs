@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shipyard: third-party licences</title>
+<style>
+body { font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1b1f24; background: #fff; }
+pre { white-space: pre-wrap; background: #f4f5f7; padding: 1rem; font-size: 13px; }
+@media (prefers-color-scheme: dark) { body { color: #e6e8eb; background: #15181c; } pre { background: #1f2329; } }
+</style>
+</head>
+<body>
+<h1>Third-party licences</h1>
+<p>Shipyard is Apache-2.0. It is built with the software below, under these licences: each licence's text once, with what uses it. Each crate's source, as built, is at https://crates.io/crates/NAME/VERSION (as a licence such as MPL-2.0 asks).</p>
+<ul>
+{{#each overview}}<li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}</ul>
+{{#each licenses}}
+<h2 id="{{id}}">{{name}}</h2>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}<li>{{crate.name}} {{crate.version}}{{#if crate.repository}} (<a href="{{crate.repository}}">{{crate.repository}}</a>){{/if}}</li>
+{{/each}}</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body>
+</html>

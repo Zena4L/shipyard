@@ -58,8 +58,63 @@ jobs:
           fi
           scripts/release/notes.sh "${VERSION#v}" >/dev/null
 
-  linux:
+  # The third-party licence notices (step 15.6b3b), made once from the
+  # commit's lockfiles: the binaries' (each Linux tarball, the packages, the
+  # Mac's tarball) and, apart, the app's (its bundle: only the Mac's part
+  # waits for it, so the npm registry never holds Linux's release).
+  notices:
     needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # As the SBOMs': a tag's run builds its tool afresh.
+      - id: image
+        if: env.VERSION == ''
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - if: env.VERSION == ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tools
+          key: release-notices-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/release/build.env') }}
+      - run: scripts/release/notices.sh "$RUNNER_TEMP/notices" binaries
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notices
+          path: ${{ runner.temp }}/notices/
+          if-no-files-found: error
+
+  notices-app:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: desktop/ui/.nvmrc
+      # As the SBOMs': a tag's run builds its tool afresh.
+      - id: image
+        if: env.VERSION == ''
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - if: env.VERSION == ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tools
+          key: release-notices-app-${{ steps.image.outputs.image }}-${{ hashFiles('scripts/release/build.env') }}
+      - run: scripts/release/notices.sh "$RUNNER_TEMP/notices" app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notices-app
+          path: ${{ runner.temp }}/notices/
+          if-no-files-found: error
+
+  linux:
+    needs: notices
     strategy:
       matrix:
         include:
@@ -73,9 +128,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices
+          path: ${{ runner.temp }}/notices
       # In the pinned image (scripts/release/build.env), the commit exported
       # clean at fixed paths.
-      - run: scripts/release/linux.sh "$RUNNER_TEMP/dist" "${VERSION#v}"
+      - run: NOTICES=$RUNNER_TEMP/notices scripts/release/linux.sh "$RUNNER_TEMP/dist" "${VERSION#v}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-${{ matrix.arch }}
@@ -85,7 +144,7 @@ jobs:
   # The same build, at once, on another runner (another machine, another
   # run): `compare` wants the same bytes.
   reproduce:
-    needs: check
+    needs: notices
     strategy:
       matrix:
         include:
@@ -99,7 +158,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: scripts/release/linux.sh "$RUNNER_TEMP/again" "${VERSION#v}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices
+          path: ${{ runner.temp }}/notices
+      - run: NOTICES=$RUNNER_TEMP/notices scripts/release/linux.sh "$RUNNER_TEMP/again" "${VERSION#v}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: again-linux-${{ matrix.arch }}
@@ -134,7 +197,7 @@ jobs:
   guest:
     needs: linux
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -154,6 +217,9 @@ jobs:
           SHIPYARD_GUEST_APKS=$(echo "$RUNNER_TEMP"/dist/*-guest-apks.tar.gz) \
               scripts/release/guest.sh "$RUNNER_TEMP/kept" "$RUNNER_TEMP/binary/shipyard" "${VERSION#v}"
           scripts/release/compare.sh "$RUNNER_TEMP/dist" "$RUNNER_TEMP/kept"
+          # Its sources, each checked against Alpine's recipe (15.6b3b).
+          scripts/release/guest-sources.sh "$RUNNER_TEMP/dist" \
+              "$(echo "$RUNNER_TEMP"/dist/*-guest-arm64.tar.gz)" "${VERSION#v}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: guest
@@ -205,7 +271,7 @@ jobs:
 
   # The Mac's binary packed with the guest it boots (F178), and the app.
   macos:
-    needs: guest
+    needs: [guest, notices, notices-app]
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -217,10 +283,15 @@ jobs:
           node-version-file: desktop/ui/.nvmrc
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: notices*
+          path: ${{ runner.temp }}/notices
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
           name: guest
           path: ${{ runner.temp }}/guest
       - run: |
-          scripts/release/macos.sh "$RUNNER_TEMP/dist" \
+          NOTICES=$RUNNER_TEMP/notices scripts/release/macos.sh "$RUNNER_TEMP/dist" \
               "$(echo "$RUNNER_TEMP"/guest/*-guest-arm64.tar.gz)" "${VERSION#v}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

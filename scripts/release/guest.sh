@@ -31,7 +31,8 @@ IMAGE=$BUILD_IMAGE SHIPYARD_GUEST_BINARY=$binary REVISION=${commit:0:12} \
 
 name=shipyard-$version-guest-arm64
 mkdir "$built/$name"
-cp "$built/guest/Image" "$built/guest/initramfs.cpio.gz" "$built/guest/manifest.json" "$built/$name/"
+cp "$built/guest/Image" "$built/guest/initramfs.cpio.gz" "$built/guest/manifest.json" \
+    "$built/guest/SOURCES" "$built/$name/"
 apks=shipyard-$version-guest-apks
 cp -R "$built/guest/apks" "$built/$apks"
 # Packed in the pinned image too: the same tar and gzip wherever it's built.

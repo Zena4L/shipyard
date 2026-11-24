@@ -9,7 +9,9 @@
 # the install docs say how to allow it once). The guest is a Linux build's
 # (scripts/release/guest.sh), given as its tarball.
 #
-# usage: scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]   (VERSION as linux.sh's)
+# usage: NOTICES=DIR scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]
+#   (VERSION as linux.sh's; NOTICES: scripts/release/notices.sh's OUT, whose
+#   THIRD-PARTY-LICENSES.html goes in the tarball and -APP.html in the app.)
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 usage="usage: scripts/release/macos.sh OUT GUEST-TARBALL [VERSION]"
@@ -17,6 +19,10 @@ out=${1:?$usage}
 guest=${2:?$usage}
 [ -f "$guest" ] || { echo "no guest tarball at $guest" >&2; exit 1; }
 guest=$(cd "$(dirname "$guest")" && pwd)/$(basename "$guest")
+notices=$(cd "${NOTICES:?NOTICES: the release's notices (scripts/release/notices.sh)}" && pwd)
+for file in THIRD-PARTY-LICENSES.html THIRD-PARTY-LICENSES-APP.html; do
+    [ -f "$notices/$file" ] || { echo "no $file in $notices" >&2; exit 1; }
+done
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 cd "$repo"
@@ -58,7 +64,7 @@ grep -q "\"${commit:0:12}\"" "$stage/$name/guest/manifest.json" || {
     echo "the guest names another commit than ${commit:0:12}" >&2
     exit 1
 }
-cp LICENSE README.md "$stage/$name/"
+cp LICENSE NOTICE README.md "$notices/THIRD-PARTY-LICENSES.html" "$stage/$name/"
 # bsdtar has no --mtime: every entry given the commit's time first.
 stamp=$(TZ=UTC date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)
 TZ=UTC find "$stage/$name" -exec touch -h -t "$stamp" {} +
@@ -73,6 +79,8 @@ chmod -R u=rwX,go=rX "$stage/$name"
 # The desktop app: its page, then its shell, built and signed whole.
 (cd desktop/ui && npm ci --no-audit --no-fund && npm run tauri -- build --bundles app)
 app=desktop/target/release/bundle/macos/Shipyard.app
+# Its notices in its resources, before its signature covers them.
+cp "$notices/THIRD-PARTY-LICENSES-APP.html" "$app/Contents/Resources/THIRD-PARTY-LICENSES.html"
 scripts/macos/sign.sh --bundle "$app"
 codesign --verify --deep --strict "$app"
 ditto -c -k --keepParent --norsrc --noextattr --noqtn --noacl "$app" \

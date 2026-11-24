@@ -6,13 +6,18 @@
 # same bytes on any machine with Docker: the release workflow builds it
 # twice, on two runners, and compares.
 #
-# usage: scripts/release/linux.sh OUT [VERSION]
+# usage: NOTICES=DIR scripts/release/linux.sh OUT [VERSION]
+#   NOTICES: the release's notices (scripts/release/notices.sh's OUT): its
+#   THIRD-PARTY-LICENSES.html is packed beside LICENSE (step 15.6b3b).
 #   VERSION: the tag's (`1.0.0`); else the workspace's and the commit's
 #   (`0.5.0-276b34b1c0de`), for a dry run.
 #   The tree must be clean: a release is a commit, never a working copy.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-out=${1:?usage: scripts/release/linux.sh OUT [VERSION]}
+out=${1:?usage: NOTICES=DIR scripts/release/linux.sh OUT [VERSION]}
+notices=${NOTICES:?NOTICES: the release's notices (scripts/release/notices.sh)}/THIRD-PARTY-LICENSES.html
+[ -f "$notices" ] || { echo "no notices at $notices" >&2; exit 1; }
+notices=$(cd "$(dirname "$notices")" && pwd)/$(basename "$notices")
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 . "$repo/scripts/release/build.env"
@@ -46,6 +51,7 @@ git -C "$repo" archive --format=tar "$commit" | tar -x -C "$src"
 
 timeout 3600 docker run --rm \
     --volume "$src:/build/shipyard:ro" --volume "$out:/out" \
+    --volume "$notices:/notices/THIRD-PARTY-LICENSES.html:ro" \
     --env SOURCE_DATE_EPOCH="$(git -C "$repo" log -1 --format=%ct "$commit")" \
     --env SHIPYARD_REVISION_GIVEN="${commit:0:12}" \
     --env VERSION="$version" --env ARCH="$arch" --env MUSL_TOOLS="$MUSL_TOOLS" \
