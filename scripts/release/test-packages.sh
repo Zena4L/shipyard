@@ -51,7 +51,9 @@ if [ -n "$(find /etc/systemd -name "shipyard*" 2>/dev/null)" ]; then
 fi
 [ -f /usr/share/shipyard/apparmor/shipyard ] || { echo "no AppArmor profile shipped" >&2; exit 1; }
 # (By the package'"'"'s list: a minimised image keeps no /usr/share/doc.)
-$listing | grep -qx /usr/share/doc/shipyard/LICENSE || { echo "no LICENSE in the package" >&2; exit 1; }
+for doc in LICENSE NOTICE THIRD-PARTY-LICENSES.html; do
+    $listing | grep -qx "/usr/share/doc/shipyard/$doc" || { echo "no $doc in the package" >&2; exit 1; }
+done
 shipyard version | grep "Git commit"
 shipyard doctor >/tmp/doctor 2>&1 || true
 grep -q "^host:" /tmp/doctor || { cat /tmp/doctor >&2; exit 1; }

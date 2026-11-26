@@ -130,6 +130,26 @@ elif ! diff -u "$lock" "$work/pinned" >"$work/pinned.diff"; then
   exit 1
 fi
 
+# Where each package's source is (step 15.6b3b): its name, version, licence,
+# and the aports origin and commit it was built from, from apk's database;
+# the guest's tarball carries it as SOURCES, and a release publishes the
+# sources it names (scripts/release/guest-sources.sh).
+{
+  echo "# The guest's packages and their source: Alpine's aports at each commit,"
+  echo "# directory main/ORIGIN (or community/ORIGIN); a Shipyard release publishes"
+  echo "# them all as shipyard-VERSION-guest-sources.tar. Tab-separated:"
+  printf '# %s\t%s\t%s\t%s\t%s\n' name version licence origin commit
+  awk -v OFS='\t' '/^P:/ {p=substr($0,3)} /^V:/ {v=substr($0,3)} /^L:/ {l=substr($0,3)}
+       /^o:/ {o=substr($0,3)} /^c:/ {c=substr($0,3)}
+       /^$/ {if (p != "") print p, v, l, o, c; p=v=l=o=c=""}
+       END {if (p != "") print p, v, l, o, c}' "$root/lib/apk/db/installed" | LC_ALL=C sort
+} >/out/SOURCES
+if awk -F'\t' '!/^#/ && ($4 == "" || $5 == "")' /out/SOURCES | grep -q .; then
+  echo "a package names no origin or commit:" >&2
+  awk -F'\t' '!/^#/ && ($4 == "" || $5 == "")' /out/SOURCES >&2
+  exit 1
+fi
+
 echo "== assembling"
 python3 /src/scripts/guest/assemble.py --root "$root" --binary "$binary" \
     --installed "$work/installed" --out /out --revision "$REVISION" \
