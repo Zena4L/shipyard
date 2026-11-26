@@ -97,14 +97,16 @@ fn archived(image: &str, archive: &Path) -> bool {
         eprintln!("skipping: no network for {from}");
         return false;
     }
-    // A mirror's under its own name (a digest's, a tag's: the part before
-    // `@`), as the tests ask for it.
-    let saved = if from == image {
-        image
+    // A mirror's: by its digest when pinned so (the engine finds BuildKit's
+    // by its manifest's or index's digest, whatever its name: saved by a tag
+    // alone, the index's is lost, and it pulled BuildKit's again from
+    // Docker Hub, the CI run's third image); else under Docker Hub's name,
+    // as the Dockerfiles ask for it.
+    let saved = if from == image || image.contains('@') {
+        from.as_str()
     } else {
-        let named = image.split('@').next().unwrap();
-        ok(&store, &["tag", &from, named]);
-        named
+        ok(&store, &["tag", &from, image]);
+        image
     };
     let partial = archive.with_extension("partial");
     ok(&store, &["save", "-o", partial.to_str().unwrap(), saved]);
