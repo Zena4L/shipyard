@@ -6815,6 +6815,9 @@ mod linux {
         assert!(health.failing_streak >= 3, "{health:?}");
         assert_eq!(health.log[0].output, "sick");
         assert_eq!(health.log[0].exit_code, 1);
+        // Said once it's recorded: the companion writes its health, then its
+        // event (a slow host saw the one without the other yet).
+        eventually("its event", || !health_events(&stores, &id).is_empty());
         assert_eq!(health_events(&stores, &id), ["unhealthy"]);
         // Its results kept once it has ended (F133: Docker's
         // `State.Health` after the end).

@@ -133,10 +133,15 @@ fn a_rootless_container_publishes_ports_through_pasta() {
         let _eighty = Server::start(&netns, 80, "eighty");
         let _local = Server::start(&netns, 81, "local");
         let _random = Server::start(&netns, 82, "random");
-        assert_eq!(
-            fetch_from(upstream.netns(), at(Upstream::HOST, 8080)).as_deref(),
-            Some("eighty")
+        // The first through pasta's forward, tried again until it's there (a
+        // slow host's pasta may not take it yet: the Fedora job's VM).
+        let first = shipyard_test_support::eventually_some(
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_millis(200),
+            "pasta's forward of 8080",
+            || fetch_from(upstream.netns(), at(Upstream::HOST, 8080)),
         );
+        assert_eq!(first, "eighty");
         assert_eq!(
             fetch(at(Ipv4Addr::LOCALHOST, 8081)).as_deref(),
             Some("local")

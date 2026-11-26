@@ -22,6 +22,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # The build tests' two images (BuildKit's, their base) pulled once a run
+  # from Google's mirror of Docker Hub, never Docker Hub (its rate limit, 429,
+  # failed main's CI: 15.6b's review).
+  SHIPYARD_TEST_MIRROR: mirror.gcr.io
 
 # The Rust version comes from rust-toolchain.toml alone: rustup (preinstalled on
 # GitHub runners) installs it, with clippy, rustfmt and the Linux targets, on
@@ -97,20 +101,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # On Linux, each test binary runs in a network namespace of its
-          # own (scripts/ci-netns.sh): as root, `shipyard run` makes a bridge,
-          # firewall rules and turns on forwarding, never on the runner.
-          # Off for now: its run takes too long (the `fedora` job runs the
-          # root tests on Linux).
-          # - os: ubuntu-latest
-          #   runner_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER
-          #   runner: ci-netns
-          - os: macos-latest
-            runner_var: CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER
-            runner: sudo -E
+        # On Linux, each test binary runs in a network namespace of its own
+        # (scripts/ci-netns.sh): as root, `shipyard run` makes a bridge,
+        # firewall rules and turns on forwarding, never on the runner. Linux
+        # only after a merge to main (or by hand), not on a PR (15.6b4,
+        # asked): its run is long, and local verify.sh's root pass is the
+        # check before a PR. (One list per event: a matrix entry can't have
+        # a condition of its own.)
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"macos-latest","runner_var":"CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER","runner":"sudo -E"}]' || '[{"os":"macos-latest","runner_var":"CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER","runner":"sudo -E"},{"os":"ubuntu-latest","runner_var":"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER","runner":"ci-netns"}]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 90 || 20 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -147,7 +147,7 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             cargo test --locked --workspace --no-run
-            scripts/ci/run-logged.sh 600 tests cargo test --locked --workspace -- --include-ignored
+            scripts/ci/run-logged.sh 4800 tests cargo test --locked --workspace --no-fail-fast -- --include-ignored
           else
             cargo test --locked --workspace -- --include-ignored
           fi

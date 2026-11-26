@@ -2364,7 +2364,14 @@ fn update_changes_limits_live() {
     runtime.wait_for("growing", "stopped");
     let call = runtime.call(&["update", "--pids-limit", "10", "growing"]);
     assert_eq!(call.code, Some(1));
-    assert!(call.stderr.contains("is stopped"), "{}", call.stderr);
+    // (`state` says stopped once its init has ended; the runtime's own status
+    // may say stopping until its monitor is done: refused either way.)
+    assert!(
+        call.stderr
+            .contains("; update needs it created, running or paused"),
+        "{}",
+        call.stderr
+    );
 }
 
 /// `ps` lists the container's processes by host PID: its init and the
@@ -2383,9 +2390,13 @@ fn ps_lists_the_containers_processes() {
         (pids.len() == 2).then_some(pids)
     });
     assert!(json.contains(&init), "{json:?}");
-    let table = runtime.call(&["ps", "listed"]).stdout;
+    // Its command once it has exec'd `sleep` (before, it's the shell that
+    // runs it: `[sh]`, on a slow host).
+    let table = eventually("sleep 300 listed", || {
+        let table = runtime.call(&["ps", "listed"]).stdout;
+        table.contains("sleep 300").then_some(table)
+    });
     assert!(table.starts_with("     PID      UID  COMMAND"), "{table}");
-    assert!(table.contains("sleep 300"), "{table}");
 }
 
 /// `events --stats`: the container's use once, as runc's JSON.
