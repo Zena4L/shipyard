@@ -1391,13 +1391,15 @@ fn another_user_is_refused() {
         "{nobody:?}"
     );
     // It reached the socket (no permission refused it): the service closed
-    // on it, unanswered (Go's client says that one of three ways, by when
-    // it sees the close: 11.6a2's root pass saw the third once).
+    // on it, unanswered (Go's client says that one of four ways, by when it
+    // sees the close: 11.6a2's root pass saw the third once, the Fedora
+    // job's slow VM the fourth, closed before its request was written).
     let said = String::from_utf8_lossy(&nobody.stderr);
     assert!(
         (said.contains("connection reset by peer")
             || said.contains("EOF")
-            || said.contains("server closed idle connection"))
+            || said.contains("server closed idle connection")
+            || said.contains("broken pipe"))
             && !said.contains("permission denied"),
         "{said}"
     );

@@ -278,15 +278,19 @@ finds inside with the config.
 
 `.github/workflows/ci.yml`, on every pull request and every push to `main` (the
 repository is public from stage 15, D15-1), and by hand (`gh workflow run CI --ref
-BRANCH`). `check` and `root` run on macOS only for now (their Ubuntu runs took too
-long); the Linux tests run in the `apparmor` job, nightly in Quality's `fedora` job,
-and locally in `scripts/test-linux.sh`.
+BRANCH`). `check` runs on macOS only (its Ubuntu run took too long); `root` runs on
+macOS for a pull request, and on Ubuntu too after each merge to `main` and by hand
+(15.6b4): a pull request's Linux root tests are local `verify.sh`'s, the check of
+record. The Linux tests also run in the `apparmor` job, nightly in Quality's `fedora`
+job, and locally in `scripts/test-linux.sh`. The build tests take BuildKit's image and
+their base image from Google's mirror of Docker Hub (`SHIPYARD_TEST_MIRROR=mirror.gcr.io`,
+once a run), never Docker Hub, whose anonymous rate limit failed CI.
 
 | Job | What it covers |
 |---|---|
 | `fmt`, `musl`, `docs`, `deny` | formatting; clippy for musl; rustdoc and the docs site (`scripts/docs-site.sh`); dependencies |
 | `check` (macOS; Ubuntu off) | clippy and every normal-user test. Rootless tests run the binaries cargo built, so the AppArmor restriction on user namespaces is turned off here |
-| `root` (macOS; Ubuntu off) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
+| `root` (macOS; Ubuntu on `main` and by hand) | the root tests (`--include-ignored`), each test binary in a network namespace of its own (`scripts/ci-netns.sh`) |
 | `apparmor` | **A real Ubuntu host** (H4): the restriction left on, `shipyard` and `shipyard-runtime` installed in `/usr/local/bin` with the profile (`contrib/apparmor/shipyard`), as users install them. `scripts/ci/apparmor-control.sh` first proves the profile is what lets them make user namespaces (unloaded, `shipyard doctor` fails); then `shipyard-cli`'s tests run the installed binaries (the runtime's in-process tests make user namespaces from their own test binary, which no profile covers: they run in `check`) |
 | `conformance` | the OCI conformance suite, as `expected.txt` expects (amd64; recorded on arm64) |
 

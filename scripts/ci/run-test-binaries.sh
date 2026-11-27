@@ -68,6 +68,7 @@ run_one() {
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
             SHIPYARD_TEST_ROOTLESS=required SHIPYARD_TEST_DELEGATED=required \
             SHIPYARD_TEST_TOOLS=required SHIPYARD_TEST_BUILD="${SHIPYARD_TEST_BUILD:-}" \
+            SHIPYARD_TEST_MIRROR="${SHIPYARD_TEST_MIRROR:-}" \
             systemd-run --user --scope --quiet "$test" "$@" </dev/null 3<&-)
     elif [ "$pass" = root ]; then
         # The root tests run rootless commands as `tester` (a sudo from

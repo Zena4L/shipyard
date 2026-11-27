@@ -29,6 +29,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # As ci.yml: the build tests' images from Google's mirror of Docker Hub.
+  SHIPYARD_TEST_MIRROR: mirror.gcr.io
 
 # Every action is pinned by commit (its version beside it), as in ci.yml.
 jobs:

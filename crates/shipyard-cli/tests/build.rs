@@ -42,40 +42,76 @@ const BUILDKIT: &str =
 /// The base image the tests' Dockerfiles build on, pinned.
 const BASE: &str = "busybox:1.37";
 
-/// A store with BuildKit's image in it, ready to build, if the network
-/// (once) lets it be had: loaded from an archive kept in cargo's temporary
-/// directory, made from a pull the first time.
+/// A store with BuildKit's image and the base image in it, ready to build,
+/// if the network (once) lets them be had: each loaded from an archive kept
+/// in cargo's temporary directory, made from a pull the first time. The base
+/// in the store, BuildKit takes it from there (`build/local.rs`), never from
+/// Docker Hub: one pull of each a run, not one a build (CI met Docker Hub's
+/// rate limit, 429). `SHIPYARD_TEST_MIRROR` (a registry host mirroring Docker
+/// Hub: CI's `mirror.gcr.io`) pulls them from there, under their own names.
 fn ready() -> Option<Scratch> {
     if std::env::var("SHIPYARD_TEST_BUILD").as_deref() == Ok("later") {
         // `test-linux.sh`'s main passes: these run on their own after them.
         eprintln!("skipping: the build tests run on their own (SHIPYARD_TEST_BUILD=later)");
         return None;
     }
-    let archive = Path::new(env!("CARGO_TARGET_TMPDIR")).join("buildkit-v0.34.1.tar");
     let store = Scratch::new();
-    if !archive.exists() {
-        // One test makes it (a lock against the others), then all load it.
-        let lock = std::fs::File::create(archive.with_extension("lock")).unwrap();
-        lock.lock().unwrap();
-        if !archive.exists() {
-            let pulled = shipyard(&store, &["pull", "-q", BUILDKIT]);
-            if !pulled.status.success() {
-                assert!(
-                    std::env::var("SHIPYARD_TEST_NETWORK").as_deref() != Ok("required"),
-                    "the network is required here (SHIPYARD_TEST_NETWORK): {}",
-                    text(&pulled).1
-                );
-                eprintln!("skipping: no network for BuildKit's image");
-                return None;
-            }
-            let partial = archive.with_extension("partial");
-            ok(&store, &["save", "-o", partial.to_str().unwrap(), BUILDKIT]);
-            std::fs::rename(&partial, &archive).unwrap();
-            return Some(store);
+    for (image, file) in [(BUILDKIT, "buildkit-v0.34.1"), (BASE, "busybox-1.37")] {
+        let archive = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{file}.tar"));
+        if !archive.exists() && !archived(image, &archive) {
+            return None;
         }
+        ok(&store, &["load", "-q", "-i", archive.to_str().unwrap()]);
     }
-    ok(&store, &["load", "-q", "-i", archive.to_str().unwrap()]);
     Some(store)
+}
+
+/// `image` saved to `archive`, pulled once (a lock against the other tests;
+/// a mirror's when `SHIPYARD_TEST_MIRROR` names one, then named as Docker
+/// Hub's). False, said, without the network.
+fn archived(image: &str, archive: &Path) -> bool {
+    let lock = std::fs::File::create(archive.with_extension("lock")).unwrap();
+    lock.lock().unwrap();
+    if archive.exists() {
+        return true;
+    }
+    let store = Scratch::new();
+    let mirror = std::env::var("SHIPYARD_TEST_MIRROR")
+        .ok()
+        .filter(|host| !host.is_empty());
+    // Docker Hub's official images are `library/NAME` on a mirror.
+    let from = mirror.map_or_else(
+        || image.to_owned(),
+        |host| match image.split_once('/') {
+            Some(_) => format!("{host}/{image}"),
+            None => format!("{host}/library/{image}"),
+        },
+    );
+    let pulled = shipyard(&store, &["pull", "-q", &from]);
+    if !pulled.status.success() {
+        assert!(
+            std::env::var("SHIPYARD_TEST_NETWORK").as_deref() != Ok("required"),
+            "the network is required here (SHIPYARD_TEST_NETWORK): {}",
+            text(&pulled).1
+        );
+        eprintln!("skipping: no network for {from}");
+        return false;
+    }
+    // A mirror's: by its digest when pinned so (the engine finds BuildKit's
+    // by its manifest's or index's digest, whatever its name: saved by a tag
+    // alone, the index's is lost, and it pulled BuildKit's again from
+    // Docker Hub, the CI run's third image); else under Docker Hub's name,
+    // as the Dockerfiles ask for it.
+    let saved = if from == image || image.contains('@') {
+        from.as_str()
+    } else {
+        ok(&store, &["tag", &from, image]);
+        image
+    };
+    let partial = archive.with_extension("partial");
+    ok(&store, &["save", "-o", partial.to_str().unwrap(), saved]);
+    std::fs::rename(&partial, archive).unwrap();
+    true
 }
 
 /// A context directory with `files` (path, contents), its Dockerfile among
@@ -547,10 +583,12 @@ fn a_build_s_files_come_out() {
         })
         .collect();
     assert!(names.iter().any(|name| name == "made"), "{names:?}");
+    // No image made: the store holds what `ready` loaded, BuildKit's and
+    // the base.
     assert_eq!(
         ok(&store, &["images", "-q"]).lines().count(),
-        1,
-        "only BuildKit's"
+        2,
+        "only BuildKit's and the base"
     );
 }
 
