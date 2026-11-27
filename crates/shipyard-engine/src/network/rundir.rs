@@ -225,9 +225,20 @@ impl Drop for RunDir {
 /// one ([`make_runs_dir`] checks it's theirs alone). The first that can be made
 /// is used: a rootless caller's `HOME` may be someone else's (`sudo -u`).
 /// A pasta run's never goes in the image store: under SELinux, pasta
-/// (`pasta_t`) may not reach files under `~/.local` (F32).
+/// (`pasta_t`) may not reach files under `~/.local` (F32). Root's pasta run
+/// goes in the temporary directory's first: Ubuntu 26.04's AppArmor profile
+/// for pasta lets it open its process ID and namespace files only under
+/// `/tmp`, the user's runtime directory and the home, never `/run/shipyard`
+/// (15.6c1: main's first Ubuntu root pass).
 fn runs_dirs(paths: &Paths, for_pasta: bool) -> Vec<PathBuf> {
+    let temporary = paths
+        .temp_dir()
+        .join(format!("shipyard-{}", nix::unistd::geteuid()))
+        .join("runs");
     let mut dirs = Vec::new();
+    if for_pasta && nix::unistd::geteuid().is_root() && host_root() {
+        dirs.push(temporary.clone());
+    }
     // Root in a user namespace of its own (`unshare -U -r`) isn't the
     // host's: `/run/shipyard` and `/var/lib/shipyard` aren't its own. Its
     // runtime directory is, if it has one.
@@ -245,12 +256,9 @@ fn runs_dirs(paths: &Paths, for_pasta: bool) -> Vec<PathBuf> {
             dirs.push(store.join("runs"));
         }
     }
-    dirs.push(
-        paths
-            .temp_dir()
-            .join(format!("shipyard-{}", nix::unistd::geteuid()))
-            .join("runs"),
-    );
+    if !dirs.contains(&temporary) {
+        dirs.push(temporary);
+    }
     dirs
 }
 
@@ -397,6 +405,25 @@ mod tests {
         if !nix::unistd::geteuid().is_root() || host_root() {
             assert!(runs_dirs(&paths, false).contains(&store));
         }
+    }
+
+    /// Root's pasta run goes in the temporary directory's first (Ubuntu
+    /// 26.04's AppArmor profile lets pasta reach `/tmp`, not `/run/shipyard`:
+    /// 15.6c1), any other run in the runtime root's first; the temporary
+    /// directory's is always there, once.
+    #[test]
+    fn roots_pasta_run_goes_in_the_temporary_directory() {
+        let paths = Paths::from_env();
+        let me = nix::unistd::geteuid();
+        let temporary = paths.temp_dir().join(format!("shipyard-{me}")).join("runs");
+        let pasta = runs_dirs(&paths, true);
+        if me.is_root() && host_root() {
+            assert_eq!(pasta.first(), Some(&temporary));
+            assert_ne!(runs_dirs(&paths, false).first(), Some(&temporary));
+        } else {
+            assert_eq!(pasta.last(), Some(&temporary));
+        }
+        assert_eq!(pasta.iter().filter(|dir| **dir == temporary).count(), 1);
     }
 
     /// In the runtime's state root, run directories go where no container

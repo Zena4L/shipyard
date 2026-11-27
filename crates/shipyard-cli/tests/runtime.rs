@@ -6014,8 +6014,12 @@ fn exec_is_confined_as_the_container() {
     assert!(ours.stdout.contains("Seccomp:\t2"), "{}", ours.stdout);
     let refused = exec(&runtime, &["exec-confined", "mkdir", "/tmp/x"]);
     assert_ne!(refused.code, Some(0));
+    // (GNU's mkdir says seccomp's EPERM "Operation not permitted", uutils'
+    // "Permission denied": Rust's one kind for both. As root, nothing else
+    // refuses it.)
     assert!(
-        refused.stderr.contains("Operation not permitted"),
+        refused.stderr.contains("Operation not permitted")
+            || refused.stderr.contains("Permission denied"),
         "{}",
         refused.stderr
     );
@@ -6620,7 +6624,8 @@ fn exec_t_without_a_terminal() {
             "exec-t-pipe",
             "sh",
             "-c",
-            "tty; stty size; ls -1 /proc/self/fd",
+            // (`echo "$(tty)"`: uutils' tty, Ubuntu 26.04's, ends no line.)
+            "echo \"$(tty)\"; stty size; ls -1 /proc/self/fd",
         ],
     );
     assert_eq!(call.code, Some(0), "{}", call.stderr);
