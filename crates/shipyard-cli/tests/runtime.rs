@@ -2374,6 +2374,13 @@ fn update_changes_limits_live() {
     );
 }
 
+/// Whether a refusal says the container has ended: "is stopped", or, in
+/// the moment after `state` says stopped (its init gone) and before its
+/// monitor is done, "is stopping" (CI's Ubuntu root pass saw it).
+fn ended_refusal(stderr: &str) -> bool {
+    stderr.contains("is stopped") || stderr.contains("is stopping")
+}
+
 /// `ps` lists the container's processes by host PID: its init and the
 /// command.
 #[test]
@@ -4995,7 +5002,7 @@ fn attach_ends_with_the_containers_exit_code() {
     // Attached to once it has ended: its code all the same.
     let late = runtime.call(&["attach", "attach-seven"]);
     assert_eq!(late.code, Some(255), "{}", late.stderr);
-    assert!(late.stderr.contains("is stopped"), "{}", late.stderr);
+    assert!(ended_refusal(&late.stderr), "{}", late.stderr);
 }
 
 /// A connection to `attach.sock` that says hello and never reads: the
@@ -5514,7 +5521,7 @@ fn exec_wants_a_created_or_running_container() {
     runtime.wait_for("exec-ended", "stopped");
     let stopped = exec(&runtime, &["exec-ended", "sh", "-c", ":"]);
     assert_eq!(stopped.code, Some(255));
-    assert!(stopped.stderr.contains("is stopped"), "{}", stopped.stderr);
+    assert!(ended_refusal(&stopped.stderr), "{}", stopped.stderr);
 }
 
 /// The command gets the container's process's environment, working
@@ -7599,7 +7606,7 @@ fn cp_wants_a_live_container() {
     runtime.wait_for("cp-ended", "stopped");
     let stopped = cp(&runtime, &[&host.arg("f"), "cp-ended:/work"]);
     assert_eq!(stopped.code, Some(1));
-    assert!(stopped.stderr.contains("is stopped"), "{}", stopped.stderr);
+    assert!(ended_refusal(&stopped.stderr), "{}", stopped.stderr);
 }
 
 /// Into `/proc/sys`: refused (nothing is ever opened for writing in place),
