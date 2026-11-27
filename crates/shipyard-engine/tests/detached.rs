@@ -1336,25 +1336,41 @@ mod linux {
             )
         }
 
-        /// The PID in the `pasta.pid` of a run directory not in `before`.
-        fn pasta_pid(&self, before: &[String]) -> Option<i32> {
-            let runs = self.runtime_root().join(".runs");
-            names(&runs)
-                .iter()
-                .filter(|run| !before.contains(run))
-                .find_map(|run| {
-                    std::fs::read_to_string(runs.join(run).join("pasta.pid"))
-                        .ok()?
-                        .trim()
-                        .parse()
-                        .ok()
-                })
+        /// Where run directories go: the runtime root's, and the temporary
+        /// directory's (root's pasta runs go there first: 15.6c1).
+        fn runs_places(&self) -> [PathBuf; 2] {
+            let me = nix::unistd::geteuid();
+            [
+                self.runtime_root().join(".runs"),
+                self.engine()
+                    .paths()
+                    .temp_dir()
+                    .join(format!("shipyard-{me}"))
+                    .join("runs"),
+            ]
         }
 
-        /// The run directories left under the runtime root.
+        /// The PID in the `pasta.pid` of a run directory not in `before`.
+        fn pasta_pid(&self, before: &[String]) -> Option<i32> {
+            self.runs_places().iter().find_map(|runs| {
+                names(runs)
+                    .iter()
+                    .filter(|run| !before.contains(run))
+                    .find_map(|run| {
+                        std::fs::read_to_string(runs.join(run).join("pasta.pid"))
+                            .ok()?
+                            .trim()
+                            .parse()
+                            .ok()
+                    })
+            })
+        }
+
+        /// The run directories left, in either place.
         fn run_dirs(&self) -> Vec<String> {
-            names(&self.runtime_root().join(".runs"))
-                .into_iter()
+            self.runs_places()
+                .iter()
+                .flat_map(|runs| names(runs))
                 .filter(|name| name != "lock")
                 .collect()
         }
@@ -5620,7 +5636,10 @@ mod linux {
         let stores = Stores::new();
         let engine = stores.engine();
         let ran = stores
-            .foreground(&["-t"], &["sh", "-c", "tty; echo first; exit 4"])
+            .foreground(
+                &["-t"],
+                &["sh", "-c", "echo \"$(tty)\"; echo first; exit 4"],
+            )
             .output()
             .unwrap();
         assert_eq!(ran.status.code(), Some(4), "{ran:?}");

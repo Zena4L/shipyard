@@ -150,6 +150,12 @@ behaviour; each change is listed here).
 
 ### Fixed
 
+- **On Ubuntu 26.04, a root container on `--network pasta` failed** ("pasta couldn't
+  set up the container's network"): the distribution's AppArmor profile for pasta lets it
+  open its files only under `/tmp`, the user's runtime directory and the home, and root's
+  run directory was in `/run/shipyard`. Root's pasta runs now keep their files in a
+  directory of root's in the temporary directory (stage 15.6c1, found by CI's Ubuntu root
+  pass).
 - **A container that joins another's PID namespace** (step 15.3c): two joins of one
   namespace are set up one after the other, so a debugger's (`--cap-add SYS_PTRACE`)
   never starts beside another's set-up (F205); rootless, `--oom-score-adj` with `--pid

@@ -28,8 +28,13 @@ use shipyard_test_support::{Rootless, Run, Shipyard, rootless, run};
 const SHIPYARD: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard"));
 const RUNTIME: Shipyard = Shipyard::at(env!("CARGO_BIN_EXE_shipyard-runtime"));
 
-/// What a refused `open` says.
-const REFUSED: &str = "Operation not permitted";
+/// Whether a line says an `open` was refused (`EPERM`): GNU's coreutils say
+/// "Operation not permitted", uutils' (Ubuntu 26.04's, copied into the
+/// fixture from the host) "Permission denied", Rust's one kind for `EPERM`
+/// and `EACCES`. As root, no permission refuses it: the device program does.
+fn refused(line: &str) -> bool {
+    line.contains("Operation not permitted") || line.contains("Permission denied")
+}
 
 /// `shipyard run FLAGS… sh -c SCRIPT`.
 fn shipyard(flags: &[&str], script: &str) -> Run {
@@ -107,12 +112,9 @@ fn the_defaults_allow_only_the_usual_devices() {
     let run = shipyard(&[], &script);
     let lines: Vec<&str> = run.stdout.lines().collect();
     assert_eq!(lines[..2], ["zero", "made"], "{}", run.stderr);
+    assert!(refused(lines[2]), "the made node opened: {lines:?}");
     assert!(
-        lines[2].contains(REFUSED),
-        "the made node opened: {lines:?}"
-    );
-    assert!(
-        lines[3].contains(REFUSED),
+        refused(lines[3]),
         "a host node outside the list opened: {lines:?}"
     );
 }
@@ -457,7 +459,7 @@ fn a_bundles_allow_rule_is_enforced() {
     let run = run(SHIPYARD.command(&["run", "--bundle", bundle.arg()]));
     let lines: Vec<&str> = run.stdout.lines().collect();
     assert_eq!(lines.first(), Some(&"a"), "{}", run.stderr);
-    assert!(lines[1].contains(REFUSED), "{lines:?}");
+    assert!(refused(lines[1]), "{lines:?}");
 }
 
 // --- Rootless ---------------------------------------------------------------------
