@@ -80,13 +80,19 @@ container's inspector (isolation from the kernel, live numbers, actions with the
 twins), its logs and a real shell, Images, Volumes and Networks; on a Mac (the VM started
 for it) and on Linux (the user's own service started for it).
 
-Stage 9's, 13's and 14's book chapters were skipped (the user's choice). Stage 15,
-hardening and v1.0 (defined in D30), is under way (D15-1..4): the repository goes public
-for CI (D15-1), the Mac app ships locally signed, not notarized (D15-2), the open findings
-are triaged (D15-3), the docs become an mdBook site (D15-4). Open findings with severity and
-home stage: the ROADMAP's [Open findings](docs/ROADMAP.md#open-findings). Once CI runs
-again (15.0), a pull request's checks are its first gate; **local verification stays the
-check of record** (section 7: CI has no VM, no Mac and no real distributions).
+Stage 15, **hardening and v1.0** (D30), is done ([notes](docs/stages/15-hardening.md)): the
+repository public with CI on every pull request (D15-1), the open findings triaged and
+fixed or accepted (D15-3, the ROADMAP's accepted table), `--pid container:` and `host`,
+Docker's API 1.44, Docker's socket in a container on a Mac, the docs as an mdBook site
+(D15-4), reproducible attested releases with `.deb`, `.rpm` and Homebrew (the Mac app
+locally signed, not notarized: D15-2), their inputs kept (Alpine's packages, a Debian
+snapshot), their licence notices and the guest's sources, devcontainers, the performance
+report and the threat model; `exec`'s command confined before anything can see it.
+v1.0.0 is tagged at its release (15.6d, a release candidate first). The book's chapters for
+stages 9, 13, 14 and 15 were skipped (the user's choice). Open findings: the ROADMAP's
+[Open findings](docs/ROADMAP.md#open-findings). A pull request's checks are its first gate;
+**local verification stays the check of record** (section 7: CI has no VM, no Mac and no
+real distributions).
 
 ---
 
