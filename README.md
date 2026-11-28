@@ -5,7 +5,8 @@ alternative to Docker, Podman and OrbStack, for developers on macOS and for Linu
 with a desktop app that maps which of your containers talk to which.
 
 > **Status: v0.5** (0.5.0, an internal milestone; nothing is released yet). Stage 15,
-> hardening and the road to **v1.0, the first public release**, is under way.
+> hardening and the road to **v1.0, the first public release**, is done; v1.0.0 comes
+> with its release (a release candidate first).
 >
 > **What works today:**
 >

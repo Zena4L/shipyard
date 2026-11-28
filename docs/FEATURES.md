@@ -463,8 +463,11 @@ stage 15.
 
 **Correctness**
 
-- Unit tests per stage, and integration tests run in a Linux VM in CI (CI is off until
-  before v1.0, ROADMAP D31: local verification is the check of record until then).
+- Unit tests per stage, and integration tests in CI: on every pull request since stage 15
+  (D15-1: the repository public), macOS, rootless Ubuntu 24.04 and 26.04 with AppArmor
+  on, and OCI conformance; Ubuntu's root pass after each merge to `main`; Fedora with
+  SELinux enforcing nightly. Local verification (`verify.sh`: both Linux passes, the Mac's
+  VM) stays the check of record.
 - Pass the OCI runtime-spec conformance suite
   ([`runtime-tools`](https://github.com/opencontainers/runtime-tools)): it runs since
   stage 8 (H5), gated by `scripts/conformance/expected.txt`. At v1.0 (15.6a), on x86-64:
